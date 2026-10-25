@@ -35,8 +35,7 @@ fn hdr_rolloff(c: vec3<f32>, headroom: f32) -> vec3<f32> {
     return c * mapped / brightest;
 }
 
-@fragment
-fn fs_output(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+fn encode_output(position: vec4<f32>) -> vec4<f32> {
     var color = max(textureLoad(image, vec2<i32>(position.xy), 0).rgb, vec3<f32>(0.0));
     let encoding = u32(settings.values.x);
     if (encoding == 0u || encoding == 3u) {
@@ -67,6 +66,11 @@ fn fs_output(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 }
 
 @fragment
+fn fs_output(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return encode_output(position);
+}
+
+@fragment
 fn fs_ui(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // Egui blends its preferred gamma-space framebuffer using premultiplied
     // alpha. Unpremultiply BEFORE decoding, then premultiply in linear light;
@@ -76,4 +80,23 @@ fn fs_ui(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let gamma = clamp(ui.rgb / ui.a, vec3<f32>(0.0), vec3<f32>(1.0));
     let linear = select(pow((gamma + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), gamma / 12.92, gamma <= vec3<f32>(0.04045));
     return vec4<f32>(linear * ui.a, ui.a);
+}
+
+// Render Studio's isolated character capture retains the scene alpha instead
+// of forcing it opaque like the normal desktop HDR output. The RGB transfer
+// curve is identical to SDR screenshot capture.
+@fragment
+fn fs_capture_alpha(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let scene = textureLoad(image, vec2<i32>(position.xy), 0);
+    let coverage = clamp(scene.a, 0.0, 1.0);
+    // Tone-map normal translucent material in straight light. Uncovered
+    // additive emission instead uses its actual intensity, not a division by
+    // zero coverage. Then convert the displayed light to ordinary RGBA.
+    let reference_alpha = select(1.0,coverage,coverage > 0.00001);
+    let rgb = max(scene.rgb,vec3<f32>(0.0))/reference_alpha;
+    let strength = clamp(settings.values.w, 0.0, 1.0);
+    let premult = clamp(mix(rgb,sdr_tonemap(rgb),strength)*reference_alpha,vec3<f32>(0.0),vec3<f32>(1.0));
+    let minimum_alpha = max(coverage,max(premult.r,max(premult.g,premult.b)));
+    let alpha = ceil(minimum_alpha*255.0)/255.0;
+    return vec4<f32>(premult/max(alpha,0.00001),alpha);
 }

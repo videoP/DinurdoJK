@@ -10,12 +10,20 @@ mod editors;
 mod frontend_pages;
 mod maps;
 mod movement;
+mod neon_main;
 mod profile;
 mod profile_studio;
 mod profile_emotes;
 mod resume;
+mod render_studio;
+mod render_studio_camera;
+mod render_studio_navigation;
+mod render_studio_cinematics;
+mod render_studio_spatial;
+mod render_studio_layout;
 mod screenshots;
 mod servers;
+pub(in crate::app) mod settings_search;
 mod shell;
 mod solo;
 
@@ -34,6 +42,7 @@ use super::egui_theme as theme;
 use super::map_editor::MapEditTool;
 use super::ui_catalog::CatalogPayload;
 use super::*;
+pub(in crate::app) use neon_main::NeonMenuState;
 
 const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
 const SETUP_TABS: [&str; 9] = [
@@ -315,8 +324,8 @@ pub(super) enum VideoSection {
     Display,
     Geometry,
     Lighting,
+    Materials,
     Effects,
-    Shadows,
     PostProcessing,
     Color,
     DebugTools,
@@ -337,7 +346,7 @@ impl VideoSection {
         (Self::Color, "Color & HDR"),
         (Self::Geometry, "Geometry"),
         (Self::Lighting, "Lighting"),
-        (Self::Shadows, "Shadows"),
+        (Self::Materials, "Material rendering"),
         (Self::Effects, "Effects"),
         (Self::PostProcessing, "Post processing"),
         (Self::Physics, "Physics"),

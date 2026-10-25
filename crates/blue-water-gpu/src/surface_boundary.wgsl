@@ -2,6 +2,8 @@
 // Blue Water material shades a fragment. The upstream shader file is unchanged.
 struct JkaWaterBoundary {
     bounds: vec4<f32>,
+    // Bottom relative to the water plane in metres; y enables floor clipping.
+    depth: vec4<f32>,
     // triangle count, sky segment count, PVS enabled, unused.
     counts: vec4<u32>,
     // JKA units per metre and shoreline tolerance in JKA units.
@@ -13,6 +15,11 @@ struct JkaWaterBoundary {
     candidates: array<vec4<u32>, 128>,
 }
 @group(1) @binding(16) var<uniform> jka_boundary: JkaWaterBoundary;
+
+fn jka_water_column_contains(position: vec3<f32>) -> bool {
+    return (jka_boundary.depth.y < 0.5 || position.y >= jka_boundary.depth.x)
+        && jka_water_contains(position.xz);
+}
 
 fn jka_water_contains(grid: vec2<f32>) -> bool {
     // Diagnostic modes are runtime uniform gates (no change to the upstream shader).

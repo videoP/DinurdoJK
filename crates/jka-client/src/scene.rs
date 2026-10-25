@@ -32,6 +32,7 @@ mod reflections;
 mod shader_remap;
 mod source;
 mod source_map;
+mod saber_color;
 mod vegetation;
 pub mod surface_sprite_bake;
 mod visibility;
@@ -575,6 +576,8 @@ pub fn select_spawn_index(
 /// same protocol/CGame boundary as a remote game server.
 #[derive(Debug, Clone)]
 pub struct MapFxRunner {
+    /// Untargeted continuous fixtures can supply a stable optional lightmap baseline.
+    pub bake_static: bool,
     /// Original BSP entity index. Used only by the local-server shim to preserve
     /// G_EffectIndex registration order with fx_rain/fx_snow/fx_wind.
     pub source_entity_index: usize,
@@ -970,12 +973,15 @@ impl DynamicLightFalloff {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DynamicLight {
     pub position: [f32; 3],
     pub color: [f32; 3],
     pub radius: f32,
     pub intensity: f32,
+    /// Area-integrated luminance for inferred lamp-shadow selection. Does not
+    /// add illumination. Zero for ordinary runtime lights.
+    pub shadow_power: f32,
     pub falloff: DynamicLightFalloff,
     /// q3map2 lightJunior contributes to the lightgrid, but not directly to surfaces.
     /// Keeping it in the source list still lets voxel/probe GI consume it.
@@ -1529,6 +1535,8 @@ pub struct PreparedMap {
     /// Server CS_BSP_MODELS assets, in the order used for collision/render handles.
     pub sub_bsp_names: Vec<String>,
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
+    /// Real water brush bounds in renderer coordinates, independent of visible faces.
+    pub water_brush_bounds: Vec<crate::ocean::WaterVolume>,
     pub movement: Option<jka_movement::PmoveContext>,
     pub collision: Option<jka_movement::CollisionWorld>,
     /// Drawn-and-markable world surfaces (OpenJK R_MarkFragments), shared by
@@ -1601,6 +1609,8 @@ pub struct PreparedMap {
     pub steam_audio_bake_request: Option<crate::steam_audio::SteamAudioBakeRequest>,
     pub visibility: Option<Visibility>,
     pub lights: Vec<DynamicLight>,
+    /// Full emitter pool for the change-triggered lightmap bake; independent of runtime caps.
+    pub static_bake_lights: Vec<DynamicLight>,
     /// Global q3map2 source-.map lighting controls. Compiled BSPs keep zeroes.
     pub source_map_lighting: SourceMapLighting,
     pub sun: Option<DirectionalSun>,
@@ -1641,6 +1651,9 @@ pub struct PreparedMap {
     /// Entity blueprint (entities, target links, floor plan) for the
     /// `entities` overlay. Shared so the restart cache clone stays cheap.
     pub entity_graph: Option<Arc<crate::entity_graph::EntityGraph>>,
+    /// The exact `music` string from worldspawn, sent as CS_MUSIC by the local server.
+    /// None means the authored map did not specify music; do not invent a track.
+    pub worldspawn_music: Option<String>,
     /// Authored worldspawn far-plane / visibility distance in JKA map units.
     /// `None` means the map did not provide a usable distancecull-style key.
     pub distance_cull: Option<f32>,

@@ -237,7 +237,7 @@ fn entry_impact(
 }
 
 /// Reject discontinuities before deriving velocity. No speed from render FPS.
-fn movement(previous: ActorSample, current: ActorSample) -> Option<Vec3> {
+pub(super) fn movement(previous: ActorSample, current: ActorSample) -> Option<Vec3> {
     let dt = (current.time_ms - previous.time_ms) as f32 * 0.001;
     let delta = Vec3::from_array(current.origin) - Vec3::from_array(previous.origin);
     if current.continuity != previous.continuity

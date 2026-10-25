@@ -237,6 +237,7 @@ fn mask_pipeline(
 impl WorldPipeline {
     pub(in crate::renderer) fn capture_geometry(
         &self,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         optics: &crate::ocean::optics::Resources,
         camera: &wgpu::BindGroup,
@@ -340,14 +341,19 @@ impl WorldPipeline {
                 );
             }
         }
+        // Bound both screen-space passes to what covered glass can read.
+        let radius = self.settings.edge_radius(optics.key.0, optics.key.1);
+        let blur_levels = self.settings.blur_levels(optics.blur_levels());
+        let reach = crate::glass::edges::Reach {
+            edge: crate::glass::edges::edge_pad(radius),
+            blur: self.settings.blur_reach(blur_levels),
+        };
+        edges.locate(queue, encoder, reach, optics.key.2 == 1);
         if self.settings.needs_edges() {
-            edges.resolve(
-                encoder,
-                self.settings.edge_radius(optics.key.0, optics.key.1),
-            );
+            edges.resolve(encoder, radius);
         }
         if self.settings.needs_blur() {
-            optics.blur(encoder);
+            optics.blur(encoder, blur_levels);
         }
     }
 }

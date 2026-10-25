@@ -109,7 +109,8 @@ fn shadow_visibility(world: vec3<f32>, camera_depth: f32) -> f32 {
         clamp(i32(uv.x * f32(map_size)), 0, map_size - 1),
         clamp(i32(uv.y * f32(map_size)), 0, map_size - 1)
     );
-    let stored_depth = textureLoad(shadow_texture, pixel, i32(cascade), 0);
+    var stored_depth = textureLoad(shadow_texture, pixel, i32(cascade), 0);
+    if settings.shadow_params.w > 0.5 && textureNumLayers(shadow_texture) >= 9u { stored_depth = max(stored_depth,textureLoad(shadow_texture,pixel,i32(cascade)+5i,0)); }
     if (settings.grid.w > 0u) {
         let sky_depth = textureLoad(sky_admission_texture, pixel, i32(cascade), 0);
         let reverse_z = settings.shadow_params.w > 0.5;
@@ -410,6 +411,7 @@ fn local_light_scattering(
             continue;
         }
         let light = dynamic_lights[light_index];
+        if light.shape.w < -0.5 {continue;}
         if (light.shadow.y > 0.5) {
             // Source-map q3map lights represent baked surface irradiance. Their
             // compiler-space photon units must not leak into modern volumetric fog.

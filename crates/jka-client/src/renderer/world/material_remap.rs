@@ -352,7 +352,7 @@ impl Renderer {
                         &self.device, &self.surface_layout, &self.white, &self.missing,
                         &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
                         &self.pbr_repeat_sampler, &self.pbr_clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, detail_texture, &textures, &world.lightmaps,
+                        &self.sky_sampler, detail_texture, &textures, &world.lightmaps, &[],
                         &world.deluxemaps, &texture_clamp, primary_skybox, &marks,
                         &world.reflection_probes, stage, &material_buffer, &additive_uniforms,
                         fog_buffer, self.surface_deformation.buffer(),
@@ -363,7 +363,7 @@ impl Renderer {
                     create_fast_world_bind_group(
                         &self.device, &self.fast_surface_layout, &self.white, &self.missing,
                         &self.repeat_sampler, &self.clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, &textures, &world.lightmaps, &texture_clamp,
+                        &self.sky_sampler, &textures, &world.lightmaps, &[], &texture_clamp,
                         primary_skybox, &marks, stage, &material_buffer, &additive_uniforms,
                         self.surface_deformation.buffer(), self.surface_deformation.field_views(),
                         self.surface_deformation.field_sampler(),
@@ -657,6 +657,7 @@ impl Renderer {
         world.compact_groups = compact_groups;
         world.animated_batches = None;
         world.active_selection_key = None;
+        world.inline_pvs.dirty = true;
         world.last_cluster = None;
         world.ocean_gate_cache = None;
         world.coarse_all_batches = (0..world.coarse_batches.len()).collect();
@@ -668,6 +669,7 @@ impl Renderer {
         for (model, (coarse_range, full_range)) in world.inline_models.iter_mut().zip(model_ranges) {
             model.coarse_batches = coarse_range;
             model.full_batches = full_range;
+            model.pvs_bounds_dirty = true;
         }
         world.patch_lod.clear_batch_bindings();
         world.patch_lod.bind(&mut world.coarse_batches, 0);
@@ -757,6 +759,12 @@ impl Renderer {
         }
         world.has_glass_primary = world.coarse_batches.iter().any(|b| b.source.glass_primary);
         world.material_debug = map.base.material_debug.clone();
+        let mut sun_textures=map.base.textures.as_ref().clone();
+        sun_textures.extend(map.replacement_textures.iter().cloned());
+        world.static_sun.replace_geometry(crate::renderer::lighting::lightmap_sun::Geometry::new(
+            Arc::new(map.base.vertices.clone()),map.batches.clone(),Arc::new(sun_textures),&map.base.material_debug));
+        if let Some(cache)=world.baked_sun_cache.as_mut() {cache.strength=None;}
+
         // Batch keys changed in place: renumber slots before any frame uses them.
         world.refresh_pso_slots();
         // Shader stage changes may introduce new PSO keys. Rebuild PSOs only
@@ -770,6 +778,10 @@ impl Renderer {
         self.map_has_water = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b| b.source.water));
         self.map_has_snow_surfaces = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b|
             u32::from(b.source.surface_material) == crate::renderer::MATERIAL_SNOW && b.source.pipeline.class != DrawClass::Sky));
+        // Alpha cutouts, blending, and opaque/sky classification may change
+        // without rebuilding the BSP. All cached static shadow depths must
+        // be recaptured before they can be sampled again.
+        self.shadow_resources.static_cascades = [None; crate::renderer::SHADOW_CASCADES];
         rverbose!(1, "[SHADER REMAP] live stage replacement completed in {:.2} ms; BSP vertex/index buffers, PVS, RT source and map state retained", started.elapsed().as_secs_f64() * 1000.0);
         Ok(WorldUploadTimings::default())
     }

@@ -20,7 +20,7 @@ impl Renderer {
             // q3map_surfacelight, authored lighting wins while that path is on.
             // Turning authored area lights off exposes the promotion candidate
             // immediately for A/B testing without rebuilding the map.
-            && !(self.emissive_area_lights_enabled
+            && !((self.emissive_area_lights_enabled || (self.baked_local_lights && self.baked_local_sources & super::lightmap_local::AUTHORED != 0))
                 && (light.shader_promotion_mask
                     & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP)
                     != 0)
@@ -62,22 +62,7 @@ impl Renderer {
         let Some(world) = self.world.as_ref() else {
             return 0;
         };
-        world
-            .dynamic_lights
-            .iter()
-            .filter(|light| {
-                let is_area = light
-                    .emitter_normal
-                    .iter()
-                    .any(|component| component.abs() > 1.0e-6);
-                if is_area {
-                    self.static_area_light_enabled(light) && light.surface_lighting
-                } else {
-                    self.static_point_lighting_enabled() && light.surface_lighting
-                }
-            })
-            .take(MAX_DYNAMIC_LIGHTS)
-            .count()
+        world.dynamic_lights.iter().enumerate().filter(|(index,light)| self.static_gpu_light_enabled(world,*index,light)).take(MAX_DYNAMIC_LIGHTS).count()
     }
 
     pub(in crate::renderer) fn active_transient_light_count(&self) -> usize {
@@ -86,6 +71,7 @@ impl Renderer {
         }
         self.transient_lights
             .iter()
+            .filter(|light|!self.baked_fx_duplicate(light))
             .map(|light| {
                 if self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware {
                     light
@@ -126,7 +112,8 @@ impl Renderer {
             return stats;
         }
 
-        let lights = &self.transient_lights[..transient_count];
+        let filtered: Vec<_> = self.transient_lights.iter().filter(|light|!self.baked_fx_duplicate(light)).take(transient_count).cloned().collect();
+        let lights=filtered.as_slice();
         let mut surfaces_per_light = vec![0u32; transient_count];
         for light in lights {
             stats.radius_sum += f64::from(light.radius.max(0.0));
@@ -206,24 +193,26 @@ impl Renderer {
     /// model prepare. `rt_per_pixel` is true when the RT model receivers will
     /// light this frame's models per pixel, which already includes these lights.
     pub(in crate::renderer) fn sync_entity_dlights(&mut self, rt_per_pixel: bool) {
-        let enabled = self.runtime_transient_lights_enabled();
-        let brightness = self.dynamic_light_brightness;
-        let models = &mut self.dynamic_model_renderer;
-        models.entity_dlights_rt_per_pixel = rt_per_pixel;
-        models.entity_dlights.clear();
-        if !enabled {
-            return;
+        let enabled=self.runtime_transient_lights_enabled();
+        let baked=self.baked_local_lightmap_active();
+        let brightness=self.dynamic_light_brightness;
+        let models=&mut self.dynamic_model_renderer;
+        models.entity_dlights_rt_per_pixel=rt_per_pixel;models.entity_dlights.clear();
+        if enabled {
+            models.entity_dlights.extend(self.transient_lights.iter().take(MAX_ENTITY_DLIGHTS).map(|light| EntityDlight {
+                position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*(light.intensity.max(0.0)*brightness),radius:light.radius.max(0.0),
+            }));
         }
-        models.entity_dlights.extend(
-            self.transient_lights
-                .iter()
-                .take(MAX_ENTITY_DLIGHTS)
-                .map(|light| EntityDlight {
-                    position: Vec3::from_array(light.position),
-                    color: Vec3::from_array(light.color) * (light.intensity.max(0.0) * brightness),
-                    radius: light.radius.max(0.0),
-                }),
-        );
+        if baked && !rt_per_pixel {
+            if let Some(world)=self.world.as_ref() {
+                // Existing classic entity lighting remains live; static world
+                // receivers alone consume the baked lightmap.
+                let remaining=MAX_ENTITY_DLIGHTS.saturating_sub(models.entity_dlights.len());
+                models.entity_dlights.extend(world.static_sun.local_lights.iter()
+                    .filter(|(_,light)| !(enabled && light.shader_promotion_mask & super::lightmap_local::FX != 0))
+                    .take(remaining).map(|(_,light)| EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0)}));
+            }
+        }
     }
 
     pub(in crate::renderer) fn update_legacy_dlight_surface_masks(&self) {
@@ -241,11 +230,10 @@ impl Renderer {
             .active_transient_light_count()
             .min(32)
             .min(self.transient_lights.len());
-        super::legacy_dlight_lists::update_legacy_dlight_masks(
-            &self.queue,
-            world,
-            &self.transient_lights[..transient_count],
-        );
+        if self.baked_local_lightmap_active() && self.baked_local_sources & super::lightmap_local::FX != 0 {
+            let filtered:Vec<_>=self.transient_lights.iter().filter(|light|!self.baked_fx_duplicate(light)).take(transient_count).cloned().collect();
+            super::legacy_dlight_lists::update_legacy_dlight_masks(&self.queue,world,&filtered);
+        } else { super::legacy_dlight_lists::update_legacy_dlight_masks(&self.queue,world,&self.transient_lights[..transient_count]); }
     }
 
     pub(in crate::renderer) fn upload_light_buffer(&self) {
@@ -254,7 +242,7 @@ impl Renderer {
         };
 
         let mut shadow_slot_by_light = vec![0_u32; world.dynamic_lights.len()];
-        if self.local_light_shadows_enabled {
+        if self.local_light_shadows_enabled || self.baked_local_shadows {
             for (slot, entry) in world.local_shadows.cache_entries.iter().enumerate() {
                 let Some(light_index) = entry.light_index else {
                     continue;
@@ -275,16 +263,11 @@ impl Renderer {
         // for runtime-authored RE_AddLightToScene/FX sources. Area lights remain independently gated.
         let mut gpu_lights = Vec::with_capacity(MAX_DYNAMIC_LIGHTS);
         for (index, light) in world.dynamic_lights.iter().enumerate() {
-            let is_area = light
-                .emitter_normal
-                .iter()
-                .any(|component| component.abs() > 1.0e-6);
-            if !light.surface_lighting
-                || (is_area && !self.static_area_light_enabled(light))
-                || (!is_area && !self.static_point_lighting_enabled())
-            {
-                continue;
-            }
+            let baked_layer = if self.baked_local_lightmap_active() { world.static_sun.local_lights.iter().position(|(source,_)|*source==index) } else { None };
+            if !self.static_gpu_light_enabled(world,index,light) {continue;}
+            let is_area=light.emitter_normal.iter().any(|v|v.abs()>1e-6);
+            let shadow_only = baked_layer.is_none() && self.inferred_shadow_source_enabled(world,index)
+                && !self.static_runtime_light_enabled(world,index,light);
             gpu_lights.push(GpuPointLight {
                 position_radius: [
                     light.position[0],
@@ -324,10 +307,12 @@ impl Renderer {
                     },
                 ],
                 shape: [
-                    0.0,
-                    0.0,
+                    -1.0 - world.local_shadows.cache_entries.iter().position(|entry| entry.light_index == Some(index))
+                        .map_or(0,|slot| world.local_shadows.moving_face_masks[slot]
+                            | (world.local_shadows.moving_octant_masks[slot] << 6)) as f32,
+                    if light.shadow_power > 0.0 { light.shadow_power } else { light.intensity * light.radius.powi(2) * 0.35 },
                     (light.shader_promotion_mask & crate::materials::SHADER_LIGHT_ALL) as f32,
-                    0.0,
+                    baked_layer.map_or(if shadow_only { -1.0 } else { 0.0 },|i| (i+1) as f32),
                 ],
                 shadow: [
                     shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
@@ -363,6 +348,7 @@ impl Renderer {
             gpu_lights.extend(
                 self.transient_lights
                     .iter()
+                    .filter(|light|!self.baked_fx_duplicate(light))
                     .flat_map(|light| {
                         transient_light_samples(
                             light,
@@ -431,6 +417,7 @@ impl Renderer {
                     && world.sun.is_some_and(|sun| sun.direction == cache.direction)
             })
         });
+        let (baked_shadow_ids,all_local_baked)=self.baked_local_shader_inputs();
         let settings = LightingSettings {
             values: [
                 u32::from(direct_local_lighting_enabled && light_count != 0),
@@ -440,8 +427,8 @@ impl Renderer {
             ],
             local_shadows: [
                 u32::from(
-                    direct_local_lighting_enabled
-                        && self.local_light_shadows_enabled
+                    (direct_local_lighting_enabled || self.baked_local_shadows)
+                        && (self.local_light_shadows_enabled || self.baked_local_shadows)
                         && shadowed_count != 0,
                 ),
                 shadowed_count,
@@ -500,9 +487,9 @@ impl Renderer {
             baked_indirect_curve: [
                 self.baked_indirect_power,
                 self.baked_indirect_highlight_preserve,
-                0.0, 0.0,
+                baked_shadow_ids[0], baked_shadow_ids[1],
             ],
-            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), 0, 0],
+            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)],
             runtime_sun_direction: {
                 let toward = -Vec3::from_array(self.active_sun().direction);
                 [toward.x, toward.y, toward.z, 0.0]

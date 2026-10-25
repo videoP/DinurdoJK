@@ -56,7 +56,9 @@ impl App {
             ))
             .as_secs_f32()
         });
-        let phase = frontend_motion_phase(seconds);
+        let sway = crate::scene::menu_stage(super::constants::FRONTEND_BACKGROUND_MAP)
+            .is_none_or(|stage| stage.camera_sway);
+        let phase = if sway { frontend_motion_phase(seconds) } else { 0.0 };
         self.camera.position = glam::Vec3::from_array(cinematic.position);
         self.camera.position.y += (phase * 0.32).sin() * 0.65;
         self.camera.yaw = cinematic.yaw + (phase * 0.115).sin() * 0.28;
@@ -84,6 +86,13 @@ impl App {
             }
         }
         self.poll_background_results();
+        // Still drain map-worker results needed to make the replacement frame,
+        // but do not run CGame, local Pmove, demo advancement, audio or network
+        // usercmd generation while the graphics subsystem is unavailable.
+        if self.renderer_restart_suspended {
+            self.previous_tick = Instant::now();
+            return;
+        }
         let input_diag_notices = self
             .render
             .as_ref()
@@ -97,6 +106,12 @@ impl App {
             self.publish_ui();
         }
         let commands_executed = self.process_console_command_buffer();
+        // /vid_restart may have executed inside Cbuf_Execute; stop this very
+        // frame before it can send one more +attack or advance local physics.
+        if self.renderer_restart_suspended {
+            self.previous_tick = Instant::now();
+            return;
+        }
         // A console `quit` runs here, mid-tick, after request_quit has hidden
         // the window. Running the rest of the frame (UI publish, network, render
         // hand-off) against a hidden exclusive-fullscreen window is what made
@@ -295,6 +310,10 @@ impl App {
             self.force_select_until = None;
             self.publish_transient_ui();
         }
+        if self.weapon_select_until.is_some_and(|until| now >= until) {
+            self.weapon_select_until = None;
+            self.publish_transient_ui();
+        }
 
         self.tick_water_wetness(now);
         self.refresh_authored_oceans();
@@ -369,6 +388,7 @@ impl App {
         self.ensure_inline_instance_capacity();
         self.publish_snapshot();
         self.queue_demo_video_capture();
+        self.tick_render_studio_export();
 
         let follow_name = self.current_follow_name();
         let game_timer = self.game_timer_text();

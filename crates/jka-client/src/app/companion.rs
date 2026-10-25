@@ -190,6 +190,7 @@ impl App {
     /// Surface is also created here (through `RenderThread::create_companion`)
     /// before the already-created surface is handed to the sleeping render worker.
     pub(super) fn sync_companion_window(&mut self, event_loop: &ActiveEventLoop) {
+        if super::lifecycle::headless() { return; }
         if self.companion_target_enabled && self.companion.is_none() {
             let mut attributes = Window::default_attributes()
                 .with_title("DinurdoJK Companion")

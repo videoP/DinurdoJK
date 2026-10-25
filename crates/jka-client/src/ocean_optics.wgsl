@@ -343,7 +343,7 @@ fn sky_fog_column(span: vec2<f32>, origin: vec2<f32>, delta: vec2<f32>,
 
 // The optical medium must agree with the extended clipmap mask. Original
 // bounded water boxes above remain unchanged; only the added sky-contact
-// columns are semi-infinite below their water surface. Adjacent quadrants
+// columns keep their source pool's authored floor. Adjacent quadrants
 // are admitted only when both touched sky walls meet at a real corner.
 fn add_sky_ocean_spans(delta: vec3<f32>) {
     if (JKA_SUBMERGED_FOG) { return; }
@@ -351,7 +351,8 @@ fn add_sky_ocean_spans(delta: vec3<f32>) {
     let direction = delta.xz;
     for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
         let top = optics.sky_regions[i].plane.x;
-        let wet = jka_wave_wet_span(vec2<f32>(0.0, 1.0), delta, top);
+        let above_floor = sky_fog_clip(vec2<f32>(0.0, 1.0), -optics.eye.y, -delta.y, -optics.sky_regions[i].plane.w);
+        let wet = jka_wave_wet_span(above_floor, delta, top);
         if (wet.y <= wet.x) { continue; }
         for (var j = 0u; j < u32(optics.sky_regions[i].plane.y); j += 1u) {
             let seg = optics.sky_regions[i].segments[j];
@@ -573,8 +574,10 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
         // the water top; what lies past it is behind the drawn surface.
         let top = optics.eye.w;
         water_fraction = select(1.0, clamp((top - optics.eye.y) / delta.y, 0.0, 1.0), delta.y > 0.0);
+        let floor_span = sky_fog_clip(vec2<f32>(0.0, water_fraction), -optics.eye.y, -delta.y, -optics.forward.w);
+        water_fraction = max(floor_span.y - floor_span.x, 0.0);
         eye_depth = max(top - optics.eye.y, 0.0);
-        if (caustic_receiver_in_range) {
+        if (caustic_receiver_in_range && world.y >= optics.forward.w - CAUSTIC_RECEIVER_MARGIN) {
             bottom_depth = max(top - world.y, 0.0);
         }
     }

@@ -152,7 +152,7 @@ mod win {
             let path = exe
                 .parent()
                 .ok_or("missing executable directory")?
-                .join("dinurdo_openal_soft.dll");
+                .join("OpenALSoft.x86_64.dll");
             Self::new_with_path(rate, &path)
         }
         pub(crate) fn new_with_path(rate: u32, path: &Path) -> Result<Self, String> {
@@ -171,7 +171,7 @@ mod win {
                 );
                 if module.is_null() {
                     return Err(
-                        "dinurdo_openal_soft.dll not available; place the OpenAL Soft runtime beside DinurdoJK.exe"
+                        "OpenALSoft.x86_64.dll not available; run build.ps1 -Fast or install the packaged OpenAL Soft runtime beside DinurdoJK.exe"
                             .into(),
                     );
                 }
@@ -265,7 +265,15 @@ mod win {
                     if has(c"AL_EXT_FLOAT32".as_ptr()) == 0 {
                         return Err("OpenAL missing float PCM support".into());
                     }
+                    if has(c"EAX4.0".as_ptr()) == 0 {
+                        return Err("OpenAL runtime lacks EAX 4.0; rebuild the packaged EAX-enabled OpenAL Soft runtime".into());
+                    }
                     let get: FnProc = symbol(module, b"alGetProcAddress\0")?;
+                    for name in [c"EAXSet", c"EAXGet"] {
+                        if get(name.as_ptr()).is_null() {
+                            return Err(format!("OpenAL missing {}", name.to_string_lossy()));
+                        }
+                    }
                     let gen_sources: FnGen = symbol(module, b"alGenSources\0")?;
                     let del_sources: FnDel = symbol(module, b"alDeleteSources\0")?;
                     let gen_buffers: FnGen = symbol(module, b"alGenBuffers\0")?;
@@ -394,7 +402,7 @@ mod win {
                 };
                 if w.len() == 28 {
                     // EAX 3 layout from EalMan_DataTypes.h / EAXListenerProperties.
-                    set(1, cl((f(1) / 7.5).powi(3), 0.0, 1.0));
+                    set(1, super::eax_environment_density(f(1)));
                     set(2, cl(f(2), 0.0, 1.0));
                     set(3, cl(gain(mb(3)), 0.0, 1.0));
                     set(4, cl(gain(mb(4)), 0.0, 1.0));
@@ -419,7 +427,7 @@ mod win {
                     (self.effect_i)(self.effect, 23, if mb(27) & 0x20 != 0 { 1 } else { 0 });
                 } else if w.len() == 14 {
                     // EAX 2 layout (no room LF, echo or modulation properties).
-                    set(1, cl((f(10) / 7.5).powi(3), 0.0, 1.0));
+                    set(1, super::eax_environment_density(f(10)));
                     set(2, cl(f(11), 0.0, 1.0));
                     set(3, cl(gain(mb(0)), 0.0, 1.0));
                     set(4, cl(gain(mb(1)), 0.0, 1.0));
@@ -523,9 +531,21 @@ fn millibels_to_gain(value: f32) -> f32 {
     }
 }
 
+fn eax_environment_density(size: f32) -> f32 {
+    // OpenAL Soft's EAX-to-EFX conversion (al/effects/reverb.cpp).
+    if size.is_finite() { (size.powi(3) / 16.0).clamp(0.0, 1.0) } else { 0.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_authored_rooms_keep_openal_eax_density() {
+        assert!((eax_environment_density(1.4) - 0.1715).abs() < 0.000001);
+        assert!((eax_environment_density(1.8) - 0.3645).abs() < 0.000001);
+        assert_eq!(eax_environment_density(7.5), 1.0);
+        assert_eq!(eax_environment_density(f32::NAN), 0.0);
+    }
     #[test]
     fn floating_point_air_absorption_and_positive_reverb_levels() {
         assert!((millibels_to_gain(-5.0) - 0.9942601).abs() < 0.000001);

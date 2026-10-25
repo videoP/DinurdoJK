@@ -45,6 +45,7 @@ struct ProjectileLightDriver {
 
 #[derive(Clone, Copy, Debug)]
 struct MaterialLightAnalysis {
+    static_emission: bool,
     score: i16,
     texture_color: [f32; 3],
     rgb_vertex: bool,
@@ -60,6 +61,7 @@ struct MaterialLightAnalysis {
 #[derive(Clone, Debug, Default)]
 pub struct FxLightPromotionCatalog {
     effects: HashMap<String, AutoLightProfile>,
+    fixed_effects: HashMap<String, (scene::DynamicLight, f32)>,
     materials: HashMap<String, Option<MaterialLightAnalysis>>,
     scanned_effects: usize,
     semantic_candidates: usize,
@@ -80,6 +82,18 @@ impl FxLightPromotionCatalog {
             .get(&scene::canonical_shader_name(shader))
             .copied()
             .flatten()
+    }
+
+    /// Only untargeted, continuously active fixtures with a stable point emitter
+    /// are eligible. No projectile, short pulse, spot or moving particle is baked.
+    pub fn static_runner_lights(&self, runners: &[scene::MapFxRunner]) -> Vec<scene::DynamicLight> {
+        runners.iter().filter_map(|runner| {
+            if !runner.bake_static || runner.spawnflags & 3 != 0 || runner.random_ms != 0 { return None; }
+            let (mut light,life)=*self.fixed_effects.get(&effect_relative_key(&runner.effect))?;
+            if life < runner.delay_ms.max(1) as f32 { return None; }
+            light.position=scene::render_position(runner.origin);
+            Some(light)
+        }).collect()
     }
 
     pub fn scanned_effects(&self) -> usize {
@@ -222,11 +236,14 @@ where
                 // into an emissive stage, and the cold remap path intentionally
                 // falls back to live material analysis.
                 let prefixed = format!("effects/{relative}");
-                catalog.effects.insert(relative, profile);
+                catalog.effects.insert(relative.clone(), profile);
                 catalog.effects.insert(prefixed, profile);
                 if final_candidate {
                     catalog.promotable_effects += 1;
                 }
+            }
+            if let Some(fixed) = fixed_light_profile(&template,&catalog) {
+                catalog.fixed_effects.insert(relative, fixed);
             }
         }
 
@@ -309,7 +326,7 @@ fn analyze_shader_material(
                 };
                 color
             };
-            let Some(analysis) = material_analysis(
+            let Some(mut analysis) = material_analysis(
                 blend,
                 stage.glow,
                 texture_color,
@@ -324,6 +341,11 @@ fn analyze_shader_material(
             ) else {
                 continue;
             };
+            analysis.static_emission=stage.animation.is_none() && !stage.video && !stage.alpha_portal
+                && !matches!(stage.rgb_gen,RgbGen::Wave(_)|RgbGen::LightingDiffuse|RgbGen::LightingDiffuseEntity)
+                && !matches!(stage.alpha_gen,AlphaGen::Wave(_)|AlphaGen::LightingSpecular)
+                && matches!(stage.tc_gen,jka_assets::shader::TcGen::Base|jka_assets::shader::TcGen::Vector(..))
+                && stage.tc_mods.iter().all(|m|matches!(m,jka_assets::shader::TcMod::Scale(..)|jka_assets::shader::TcMod::Transform(..)));
             if best.map_or(true, |current| analysis.score > current.score) {
                 best = Some(analysis);
             }
@@ -366,6 +388,7 @@ fn material_analysis(
         score += 6;
     }
     (score >= 0).then_some(MaterialLightAnalysis {
+        static_emission: true,
         score,
         texture_color,
         rgb_vertex,
@@ -816,7 +839,7 @@ mod promotion_level_tests {
     fn aggressive_is_less_restrictive_without_changing_conservative() {
         let mut catalog = FxLightPromotionCatalog::default();
         catalog.materials.insert(scene::canonical_shader_name("gfx/effects/testglow"),
-            Some(MaterialLightAnalysis { score: 6, texture_color: [1.0; 3],
+            Some(MaterialLightAnalysis { static_emission: true, score: 6, texture_color: [1.0; 3],
                 rgb_vertex: true, rgb_const: [1.0; 3], alpha_vertex: false,
                 alpha_const: 1.0, blend: FxBlend::Add }));
         let mut promoter = FxLightPromoter::default();
@@ -830,7 +853,7 @@ mod promotion_level_tests {
     fn minimum_light_life_does_not_extend_visual_primitives() {
         let mut catalog = FxLightPromotionCatalog::default();
         catalog.materials.insert(scene::canonical_shader_name("gfx/effects/testglow"),
-            Some(MaterialLightAnalysis { score: 6, texture_color: [1.0; 3],
+            Some(MaterialLightAnalysis { static_emission: true, score: 6, texture_color: [1.0; 3],
                 rgb_vertex: true, rgb_const: [1.0; 3], alpha_vertex: false,
                 alpha_const: 1.0, blend: FxBlend::Add }));
         let mut promoter = FxLightPromoter::default();
@@ -839,5 +862,61 @@ mod promotion_level_tests {
         assert_eq!(promoter.promote(&[candidate()], &mut no_materials, 1000, 2).len(), 1);
         assert_eq!(promoter.promote(&[], &mut no_materials, 1020, 2).len(), 1);
         assert!(promoter.promote(&[], &mut no_materials, 1031, 2).is_empty());
+    }
+}
+
+fn fixed_light_profile(effect: &template::EffectTemplate, catalog: &FxLightPromotionCatalog) -> Option<(scene::DynamicLight,f32)> {
+    let authored=effect.primitives.iter().find(|p|p.kind==PrimType::Light);
+    let p=authored.or_else(|| {
+        let profile=effect.auto_light?;
+        if profile.spot.is_some() { return None; }
+        effect.primitives.get(profile.driver_primitive)
+    })?;
+    if !matches!(p.kind,PrimType::Light|PrimType::Particle|PrimType::OrientedParticle) {return None;}
+    let fixed=|range:template::Range|range.min.is_finite() && range.min==range.max;
+    let zero=|range:template::Range|fixed(range) && range.min==0.0;
+    if !p.velocity.iter().chain(p.acceleration.iter()).chain(p.origin1.iter()).all(|v|zero(*v))
+        || !zero(p.gravity) || !zero(p.spawn_delay)
+        || !fixed(p.spawn_count) || p.spawn_count.min!=1.0
+        || !fixed(p.life) || !fixed(p.size_start) || p.size_start!=p.size_end
+        || p.rgb_start!=p.rgb_end || !p.rgb_start.iter().all(|v|fixed(*v))
+        || !fixed(p.alpha_start) || p.alpha_start!=p.alpha_end {return None;}
+    let mut color=p.rgb_start.map(|v|v.min.max(0.0));
+    let radius=if authored.is_some() {p.size_start.min} else {
+        if p.media.len()!=1 { return None; }
+        let analysis=catalog.material_analysis(&p.media[0])?;
+        let profile=effect.auto_light?;
+        if !analysis.static_emission || profile.score+analysis.score<FINAL_PROMOTION_SCORE {return None;}
+        for i in 0..3 {color[i]=analysis.texture_color[i]*if analysis.rgb_vertex {color[i]} else {analysis.rgb_const[i]};}
+        let alpha=if analysis.alpha_vertex {p.alpha_start.min} else {analysis.alpha_const};
+        if matches!(analysis.blend,FxBlend::AddAlpha|FxBlend::Alpha) { for v in &mut color {*v *= alpha.clamp(0.0,1.0);} }
+        (56.0+p.size_start.min.abs().max(1.0)*8.0).clamp(48.0,384.0)
+    };
+    if !radius.is_finite() || radius<=0.0 || color.iter().all(|v|*v<=0.0) {return None;}
+    Some((scene::DynamicLight {position:[0.0;3],color,radius,intensity:1.0,shadow_power:radius*radius*0.35,
+        falloff:scene::DynamicLightFalloff::Smooth,surface_lighting:true,emitter_normal:[0.0;3],
+        emitter_two_sided:false,angle_attenuation:true,angle_scale:0.0,extra_distance:0.0,
+        shader_promotion_mask:1<<4},p.life.min))
+}
+
+#[cfg(test)]
+mod static_bake_tests {
+    use super::*;
+    #[test]
+    fn baked_local_fx_accepts_only_fixed_continuous_untargeted_runners() {
+        let effect=template::parse_effect("fixed",&super::super::gp2::parse(b"Light {\nlife 1000\nsize {\nstart 128\nend 128\n}\n}\n"));
+        let mut catalog=FxLightPromotionCatalog::default();
+        let profile=fixed_light_profile(&effect,&catalog).expect("fixed authored point light");
+        catalog.fixed_effects.insert("fixed".into(),profile);
+        let runner=scene::MapFxRunner {bake_static:true,source_entity_index:0,effect:"effects/fixed.efx".into(),origin:[10.0,20.0,30.0],angles:[0.0;3],delay_ms:200,random_ms:0,spawnflags:0};
+        let lights=catalog.static_runner_lights(std::slice::from_ref(&runner));
+        assert_eq!(lights.len(),1);assert_eq!(lights[0].position,scene::render_position(runner.origin));
+        for changed in [scene::MapFxRunner {bake_static:false,..runner.clone()},scene::MapFxRunner {spawnflags:1,..runner.clone()},scene::MapFxRunner {spawnflags:2,..runner.clone()},scene::MapFxRunner {random_ms:20,..runner.clone()},scene::MapFxRunner {delay_ms:2000,..runner.clone()}] {
+            assert!(catalog.static_runner_lights(&[changed]).is_empty());
+        }
+        let mut moving=effect.clone();moving.primitives[0].velocity[0]=template::Range::fixed(1.0);
+        assert!(fixed_light_profile(&moving,&catalog).is_none());
+        let mut flicker=effect;flicker.primitives[0].rgb_end[0]=template::Range::fixed(0.0);
+        assert!(fixed_light_profile(&flicker,&catalog).is_none());
     }
 }

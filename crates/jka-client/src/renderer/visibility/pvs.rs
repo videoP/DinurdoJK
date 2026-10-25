@@ -65,6 +65,7 @@ pub(in crate::renderer) fn refresh_auto4_lazy_collapse(
     let Some(plan_id) = plan_id else {
         if !world.auto4_active_plan.is_empty() {
             world.auto4_active_plan.clear();
+            world.inline_pvs.dirty = true;
             world.active_selection_key = None;
         }
         world.auto4_collapse_cache.current_cluster = None;
@@ -197,6 +198,7 @@ pub(in crate::renderer) fn refresh_auto4_lazy_collapse(
 
     if active != world.auto4_active_plan {
         world.auto4_active_plan = active;
+        world.inline_pvs.dirty = true;
         world.active_selection_key = None;
     }
     let stats_changed = stats != world.auto4_collapse_cache.stats;
@@ -232,7 +234,86 @@ pub(in crate::renderer) struct ActiveBatchSelection<'a> {
     pub(in crate::renderer) candidate_count: usize,
 }
 
+/// Only raster selection is filtered: retain offscreen geometry for shadows,
+/// reflections and sky-portal views. Storage is reused across camera changes.
+#[derive(Default)]
+pub(in crate::renderer) struct InlinePvsSelection {
+    key: Option<(PvsMode, Option<usize>, Option<[u8; 32]>)>,
+    pub(in crate::renderer) dirty: bool,
+    indices: Vec<usize>,
+    pub(in crate::renderer) area_rejected_count: usize,
+}
+
+pub(in crate::renderer) fn refresh_inline_pvs(
+    world: &mut WorldGpu, mode: PvsMode, area_mask: Option<&[u8; 32]>,
+) {
+    if world.inline_models.is_empty() { return; }
+    let cluster = if mode == PvsMode::Off { None } else { world.last_cluster.flatten() };
+    if cluster.is_none() || world.visibility.is_none() {
+        if world.inline_pvs.key.take().is_some() { world.active_selection_key = None; }
+        world.inline_pvs.area_rejected_count = 0;
+        return; // PVS OFF / unknown view uses the original unfiltered list directly.
+    }
+    let area_mask = effective_area_mask(world, mode, area_mask).copied();
+    let key = (mode, cluster, area_mask);
+    let view_changed = world.inline_pvs.key != Some(key);
+    let mut changed = view_changed || world.inline_pvs.dirty;
+    for model in &mut world.inline_models {
+        if !view_changed && !model.pvs_bounds_dirty && model.pvs_visible.is_some() { continue; }
+        let mut area_rejected = false;
+        let visible = model.uploaded.flatten().is_some_and(|p| p.is_portal_entity)
+            || world.visibility.as_ref().is_none_or(|vis| {
+                model.coarse_batches.first().and_then(|&i| world.coarse_batches.get(i))
+                    .is_none_or(|batch| {
+                        // Bounds are Y-up renderer coordinates; the BSP is Z-up.
+                        let mins = [batch.bounds_min[0], -batch.bounds_max[2], batch.bounds_min[1]];
+                        let maxs = [batch.bounds_max[0], -batch.bounds_min[2], batch.bounds_max[1]];
+                        let visible = vis.box_visible(cluster, mins, maxs, area_mask.as_ref());
+                        // Distinguish a closed area from a missing PVS bit in
+                        // diagnostics. The extra walk occurs only for rejected
+                        // bounds when an area mask is present, on cache refresh.
+                        area_rejected = !visible && area_mask.is_some()
+                            && vis.box_visible(cluster, mins, maxs, None);
+                        visible
+                    })
+            });
+        changed |= model.pvs_visible != Some(visible) || model.pvs_area_rejected != area_rejected;
+        model.pvs_visible = Some(visible);
+        model.pvs_area_rejected = area_rejected;
+        model.pvs_bounds_dirty = false;
+    }
+    if !changed { return; }
+    let mut indices = std::mem::take(&mut world.inline_pvs.indices);
+    indices.clear();
+    let active = unfiltered_active_batch_selection(world, mode);
+    let mut area_rejected_count = 0;
+    for &index in active.indices {
+        let model = world.inline_models.get(active.batches[index].inline_model_slot as usize);
+        if model.is_some_and(|model| model.pvs_visible == Some(false)) {
+            area_rejected_count += usize::from(model.is_some_and(|model| model.pvs_area_rejected));
+        } else {
+            indices.push(index);
+        }
+    }
+    world.inline_pvs.indices = indices;
+    world.inline_pvs.area_rejected_count = area_rejected_count;
+    world.inline_pvs.key = Some(key);
+    world.inline_pvs.dirty = false;
+    world.active_selection_key = None;
+}
+
 pub(in crate::renderer) fn active_batch_selection(
+    world: &WorldGpu, mode: PvsMode,
+) -> ActiveBatchSelection<'_> {
+    let mut active = unfiltered_active_batch_selection(world, mode);
+    if world.inline_pvs.key.is_some_and(|key| key.0 == mode && key.1 ==
+        if mode == PvsMode::Off { None } else { world.last_cluster.flatten() }) {
+        active.indices = &world.inline_pvs.indices;
+    }
+    active
+}
+
+fn unfiltered_active_batch_selection(
     world: &WorldGpu,
     mode: PvsMode,
 ) -> ActiveBatchSelection<'_> {
@@ -390,7 +471,8 @@ pub(in crate::renderer) fn update_active_cull_indices(
             // active list was rejected before GPU frustum/Hi-Z culling.
             for batch in active.batches {
                 if let Some(reason) = reasons.get_mut(batch.cull_index as usize) {
-                    *reason = 3;
+                    *reason = if world.inline_models.get(batch.inline_model_slot as usize)
+                        .is_some_and(|model| model.pvs_area_rejected) { 4 } else { 3 };
                 }
             }
             for &batch_index in active.indices {

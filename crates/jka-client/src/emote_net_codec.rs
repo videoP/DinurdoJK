@@ -8,6 +8,20 @@
 pub const EMOTE_ID_BITS: u32 = 13;
 pub const ANGLE_PAYLOAD_BITS: u32 = 11;
 pub const EMOTE_CAPACITY: u16 = 1 << EMOTE_ID_BITS;
+// Reserved v2 IDs. 8191 remains STOP. 8128..8159 reference a player
+// instead of a catalog emote, retaining the existing aim-angle transport.
+pub const MATCH_BASE_ID: u16 = 8128;
+pub const MATCH_CLIENT_COUNT: u16 = 32;
+
+pub fn match_reference_id(client: u16) -> Option<u16> {
+    (client < MATCH_CLIENT_COUNT).then(|| MATCH_BASE_ID + client)
+}
+
+pub fn match_source_client(id: u16) -> Option<u16> {
+    (MATCH_BASE_ID..MATCH_BASE_ID + MATCH_CLIENT_COUNT)
+        .contains(&id)
+        .then(|| id - MATCH_BASE_ID)
+}
 pub const SIGNATURE: u16 = 0x16d; // version 2; immutable once deployed
 const MASK: u16 = (1 << ANGLE_PAYLOAD_BITS) - 1;
 const PERIOD: i32 = 1 << ANGLE_PAYLOAD_BITS;
@@ -70,6 +84,22 @@ pub fn decode_snapshot_angles(yaw_degrees: f32, pitch_degrees: f32) -> Option<u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_refs_round_trip_without_overlapping_stop() {
+        for client in 0..MATCH_CLIENT_COUNT {
+            let id = match_reference_id(client).unwrap();
+            assert_eq!(match_source_client(id), Some(client));
+            let mut cmd = [2048, 16384, 0];
+            assert!(encode_cmd_angles(&mut cmd, [0; 3], id));
+            let pitch = short_to_signed_degrees(cmd[0]) as f32;
+            let yaw = (cmd[1] as f64 * (360.0 / 65536.0)) as f32;
+            assert_eq!(match_source_client(decode_snapshot_angles(yaw, pitch).unwrap()), Some(client));
+        }
+        assert_eq!(match_reference_id(32), None);
+        assert_eq!(match_source_client(8191), None); // STOP
+        assert_eq!(match_source_client(4200), None); // ordinary catalog ID
+    }
 
     #[test]
     fn all_emotes_and_aim_quadrants_round_trip() {

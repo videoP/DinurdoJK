@@ -1438,17 +1438,26 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn set_cascaded_shadows(&mut self, mode: DynamicShadowsMode) {
+        if self.cascaded_shadow_mode != mode {
+            // Entity-map mode overwrites layer zero. Recapture static depths
+            // before CSM uses those layers again; lightmap pixels remain valid.
+            self.shadow_resources.rendered_generations = [0; SHADOW_CASCADES];
+            self.shadow_resources.last_csm_mode = None;
+        }
         self.cascaded_shadow_mode = mode;
+        // Shadow-mode transitions must synchronously rebuild lamp pipeline
+        // specialization and GPU inputs. UI greying alone is not a gate.
+        self.set_baked_local_lights(self.baked_local_lights, self.baked_local_sources);
         self.update_lighting_settings();
         // The Entity map is receiver-compatible with the cascade path (same
         // shader variant, one cascade), so it shares the enabled flag.
         self.cascaded_shadows_enabled = matches!(
             mode,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::EntityMap
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities | DynamicShadowsMode::EntityMap
         );
         // Re-aim on entry instead of easing from a stale light.
         self.entity_shadow.initialized = false;
-        let rt_active = if mode == DynamicShadowsMode::RayTraced {
+        let rt_active = if matches!(mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities) {
             let active = self.ensure_ray_traced_shadow_resources();
             if active {
                 if let Some(rt) = self.ray_traced_shadows.as_ref() {

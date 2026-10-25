@@ -106,6 +106,7 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) player_position: Option<glam::Vec3>,
     pub(in crate::app) ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
     pub(in crate::app) ocean_interaction_enabled: bool,
+    pub(in crate::app) lake_wakes_enabled: bool,
     pub(in crate::app) water_wake_mode: u8,
     pub(in crate::app) water_wake: super::water_wake::WaterWakeTracker,
     /// Canonical current player, analogous to cg.predictedPlayerState. Computed
@@ -185,6 +186,8 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) promote_fx_lights: u8,
     /// This frame's FX primitives, tessellated once the final camera is known.
     pub(in crate::app) fx_draws: Vec<crate::fx::system::FxDraw>,
+    pub(in crate::app) fx_runner_draws: Vec<(usize, u16)>,
+    pub(in crate::app) fx_runner_cull: crate::fx::runner_cull::RunnerCullScratch,
     pub(in crate::app) gpu_commands: Option<crate::fx::gpu_sparks::GpuSparkCommands>,
     pub(in crate::app) gpu_draw_indices: Vec<(usize, u64)>,
     pub(in crate::app) gpu_pool: crate::fx::gpu_sparks::GpuSparkPool,

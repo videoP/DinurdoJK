@@ -102,6 +102,12 @@ impl Renderer {
         let surface_view = self.surface_texture_view(&frame);
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback=self.prepare_screenshot_readback();
+        let clean_video_frame = screenshot_readback.as_ref().is_some_and(|readback|
+            matches!(&readback.destination, crate::renderer::ScreenshotDestination::VideoFrame { .. }));
+        let transparent_capture = screenshot_readback.as_ref().is_some_and(|readback|
+            matches!(&readback.destination, crate::renderer::ScreenshotDestination::VideoFrame { alpha: true, .. }));
+        let depth_capture = screenshot_readback.as_ref().is_some_and(|readback| readback.depth_requested);
+        if transparent_capture {self.dynamic_model_renderer.prepare_studio_capture(&self.device);}
 
         let encode_started = Instant::now();
         let mut encoder = self
@@ -122,7 +128,9 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(if transparent_capture {
+                            wgpu::Color::TRANSPARENT
+                        } else { wgpu::Color::BLACK }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -148,22 +156,59 @@ impl Renderer {
                     1.0,
                 );
                 pass.set_scissor_rect(viewport[0], viewport[1], viewport[2], viewport[3]);
-                if let Some(background)=&self.asset_preview_background{background.draw(&mut pass);}
-                self.dynamic_model_renderer
-                    .draw(&mut pass, &self.camera_bind_group);
+                if !transparent_capture {
+                    if let Some(background)=&self.asset_preview_background {
+                        if background.visible_in_capture(clean_video_frame) {background.draw(&mut pass);}
+                    }
+                }
+                if transparent_capture {
+                    self.dynamic_model_renderer.draw_studio_capture(&mut pass,&self.camera_bind_group);
+                } else {
+                    self.dynamic_model_renderer.draw(&mut pass,&self.camera_bind_group);
+                }
             }
+        }
+        // Single-sampled radial-depth prepass for isolated studio exports.
+        // Reuse the existing skinned Ghoul2/MD3 pipelines and the same
+        // 1,000,000-unit background convention used by demo depth EXRs.
+        if depth_capture {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Studio radial depth"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.linear_depth_render_view,
+                    depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1_000_000.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.targets.ao_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            });
+            pass.set_viewport(viewport[0] as f32, viewport[1] as f32, viewport[2] as f32, viewport[3] as f32, 0.0, 1.0);
+            pass.set_scissor_rect(viewport[0], viewport[1], viewport[2], viewport[3]);
+            if draw_preview { self.dynamic_model_renderer.draw_rain_prepass(&mut pass, &self.camera_bind_group); }
         }
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
         self.queue.submit([encoder.finish()]);
-        self.submit_egui(&frame_view);
-        if self.egui_active {
-            self.submit_ui_overlay(&frame_view);
+        if !clean_video_frame {
+            self.submit_egui(&frame_view);
+            if self.egui_active {
+                self.submit_ui_overlay(&frame_view);
+            }
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
         if let Some(output) = &self.hdr_output {
-            output.submit(&self.device, &self.queue, &surface_view, screenshot_readback.is_some());
+            output.submit_with_alpha(&self.device, &self.queue, &surface_view, screenshot_readback.is_some(), transparent_capture);
         }
         // After the HDR output pass: its capture texture holds the final image.
         if let Some(readback)=&mut screenshot_readback{self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture),readback);}

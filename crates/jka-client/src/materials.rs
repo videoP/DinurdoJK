@@ -192,7 +192,7 @@ pub const SHADER_LIGHT_AUTHORED_OVERLAP: u32 = 1 << 31;
 pub const SHADER_LIGHT_ALL: u32 =
     SHADER_LIGHT_GLOW | SHADER_LIGHT_ADDITIVE | SHADER_LIGHT_EMISSIVE_COMPANION;
 
-static GLASS_PROMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GLASS_PROMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `r_glassPromotion`: promote `q3map_material Glass` shaders to transmissive
 /// draws. Read while materials compile and models load, so a change applies
@@ -214,6 +214,8 @@ pub struct ShaderLightPromotion {
     /// still produces one emitter; source toggles select it when any enabled
     /// evidence bit matches.
     pub reasons: u32,
+    /// Emission evidence that is independent of time, camera and entity lighting.
+    pub bake_reasons: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -762,12 +764,23 @@ pub struct Textures {
     video_cache: BTreeMap<String, Option<usize>>,
 }
 
-/// A looping RoQ cinematic bound to one entry of [`Textures::images`].
+/// A `videoMap` texture. MP4 sources keep the original RoQ as a fallback
+/// so that a decoder failure never silently removes vanilla cinematics.
+#[derive(Debug, Clone)]
+pub enum VideoSourceData {
+    Roq(Arc<[u8]>),
+    Mp4 {
+        bytes: Arc<[u8]>,
+        info: crate::media_mp4::Mp4Info,
+        fallback_roq: Option<Arc<[u8]>>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoSource {
     pub texture: usize,
     pub name: String,
-    pub data: Arc<[u8]>,
+    pub data: VideoSourceData,
 }
 
 impl Textures {
@@ -833,58 +846,99 @@ impl Textures {
         variant
     }
 
-    /// Register a `videoMap` cinematic and return its placeholder texture index.
-    /// The placeholder is single-mip black at the video's size; the renderer
-    /// streams decoded frames into it. Like the engine, a missing `.roq`
-    /// extension is defaulted.
+    /// A legacy `videoMap` may name `foo` or `foo.roq`. Prefer `foo.mp4`
+    /// (H.264 only) when Windows Media Foundation can play it; otherwise keep
+    /// the original RoQ. The material's shader syntax never changes.
     pub fn load_video(&mut self, assets: &mut AssetSearchPath, path: &str) -> Option<usize> {
         let path = path.replace('\\', "/").to_ascii_lowercase();
         if let Some(value) = self.video_cache.get(&path) {
             return *value;
         }
-        let name = if path.ends_with(".roq") { path.clone() } else { format!("{path}.roq") };
-        let value = match assets.read(&name, MAX_VIDEO_FILE_BYTES) {
-            Ok(Some(asset)) => {
-                let bytes: Arc<[u8]> = asset.bytes.into();
-                match jka_assets::roq::RoqVideo::open(Arc::clone(&bytes)) {
-                Ok(video) => {
-                    let (width, height) = (video.width(), video.height());
-                    let mut rgba = vec![0u8; (width * height * 4) as usize];
-                    rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
-                    let index = self.images.len();
-                    self.push_image(TextureData {
-                        label: format!("{name} [video]"),
-                        source: Some(asset.source),
-                        width,
-                        height,
-                        rgba,
-                        rgba16f: None,
-                        mip_level_count: 1,
-                        clamp: false,
-                        srgb: true,
-                    });
-                    self.videos.push(VideoSource {
-                        texture: index,
-                        name: name.clone(),
-                        data: bytes,
-                    });
-                    Some(index)
+        let stem = path.strip_suffix(".roq")
+            .or_else(|| path.strip_suffix(".mp4"))
+            .unwrap_or(&path);
+        let mp4_name = format!("{stem}.mp4");
+        let roq_name = format!("{stem}.roq");
+
+        // The backend opens on a worker; decoding failure falls back to RoQ.
+        // On non-Windows targets RoQ remains the portable default.
+        let mut promoted = None;
+        if cfg!(windows) {
+            match assets.read(&mp4_name, MAX_VIDEO_FILE_BYTES) {
+                Ok(Some(asset)) => match crate::media_mp4::probe_h264_mp4(&asset.bytes) {
+                    Ok(info) => {
+                        // Read fallback now while the asset VFS is available;
+                        // the GPU/render thread has no AssetSearchPath handle.
+                        let fallback_roq = assets.read(&roq_name, MAX_VIDEO_FILE_BYTES)
+                            .ok().flatten()
+                            .and_then(|fallback| {
+                                let bytes: Arc<[u8]> = fallback.bytes.into();
+                                jka_assets::roq::RoqVideo::open(Arc::clone(&bytes))
+                                    .ok().map(|_| bytes)
+                            });
+                        promoted = Some((
+                            mp4_name.clone(), asset.source, info.width, info.height,
+                            VideoSourceData::Mp4 {
+                                bytes: asset.bytes.into(), info, fallback_roq,
+                            },
+                        ));
+                    }
+                    Err(error) => self.warnings.push(format!(
+                        "{mp4_name}: MP4 promotion rejected ({error}); trying RoQ"
+                    )),
+                },
+                Ok(None) => {}, // Optional promotion: normal for vanilla maps.
+                Err(error) => self.warnings.push(format!(
+                    "{mp4_name}: {error}; trying RoQ"
+                )),
+            }
+        }
+
+        let source = if let Some(source) = promoted {
+            Some(source)
+        } else {
+            match assets.read(&roq_name, MAX_VIDEO_FILE_BYTES) {
+                Ok(Some(asset)) => {
+                    let bytes: Arc<[u8]> = asset.bytes.into();
+                    match jka_assets::roq::RoqVideo::open(Arc::clone(&bytes)) {
+                        Ok(video) => Some((
+                            roq_name.clone(), asset.source, video.width(), video.height(),
+                            VideoSourceData::Roq(bytes),
+                        )),
+                        Err(error) => {
+                            self.warnings.push(format!("{roq_name}: {error}"));
+                            None
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.warnings.push(format!("{name}: {error}"));
+                Ok(None) => {
+                    self.warnings.push(format!("{roq_name}: video not found"));
                     None
                 }
+                Err(error) => {
+                    self.warnings.push(format!("{roq_name}: {error}"));
+                    None
                 }
             }
-            Ok(None) => {
-                self.warnings.push(format!("{name}: video not found"));
-                None
-            }
-            Err(error) => {
-                self.warnings.push(format!("{name}: {error}"));
-                None
-            }
         };
+        let value = source.map(|(name, physical_source, width, height, data)| {
+            let mut rgba = vec![0u8; (width * height * 4) as usize];
+            rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+            let index = self.images.len();
+            self.push_image(TextureData {
+                label: format!("{name} [video]"),
+                source: Some(physical_source),
+                width,
+                height,
+                rgba,
+                rgba16f: None,
+                mip_level_count: 1,
+                clamp: false,
+                srgb: true,
+            });
+            self.videos.push(VideoSource { texture: index, name, data });
+            index
+        });
         self.video_cache.insert(path, value);
         value
     }
@@ -2290,6 +2344,7 @@ fn shader_stage_light_stats(stage: &MaterialStage, textures: &Textures) -> Optio
 
 fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Option<ShaderLightPromotion> {
     let mut reasons = 0_u32;
+    let mut bake_reasons = 0_u32;
     let mut weighted = [0.0_f32; 3];
     let mut total_weight = 0.0_f32;
     let mut strongest = 0.0_f32;
@@ -2308,9 +2363,15 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
     };
 
     for stage in stages {
+        let fixed = stage.animation.is_none()
+            && matches!(stage.rgb_gen, RgbGen::Identity | RgbGen::IdentityLighting | RgbGen::Const)
+            && matches!(stage.alpha_gen, AlphaGen::Identity | AlphaGen::Const)
+            && matches!(stage.tc_gen, TcGen::Base | TcGen::Lightmap | TcGen::Vector(..))
+            && stage.tc_mods.iter().all(|m|matches!(m,TcMod::Scale(..)|TcMod::Transform(..)));
         if stage.glow {
             if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
                 add_candidate(SHADER_LIGHT_GLOW, color, value * 1.15);
+                if fixed { bake_reasons |= SHADER_LIGHT_GLOW; }
             }
         }
 
@@ -2322,6 +2383,7 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
         if additive {
             if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
                 add_candidate(SHADER_LIGHT_ADDITIVE, color, value);
+                if fixed { bake_reasons |= SHADER_LIGHT_ADDITIVE; }
             }
         }
 
@@ -2332,6 +2394,7 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
                 .and_then(emissive_surface_light_stats)
             {
                 add_candidate(SHADER_LIGHT_EMISSIVE_COMPANION, color, value);
+                if fixed { bake_reasons |= SHADER_LIGHT_EMISSIVE_COMPANION; }
             }
         }
     }
@@ -2351,6 +2414,7 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
         color,
         subdivide: 120.0,
         reasons,
+        bake_reasons,
     })
 }
 
@@ -3505,6 +3569,16 @@ blendFunc GL_ONE GL_ONE
         let once = MaterialAnimation { one_shot: true, ..looping };
         assert_eq!(once.frame_index(0.400), 3);
         assert_eq!(once.frame_index(90.0), 3);
+    }
+
+    #[test]
+    fn baked_local_promotion_rejects_time_dependent_emission() {
+        let fixed=material("test {\n{\nmap $whiteimage\nglow\n}\n}");
+        assert_ne!(fixed.shader_light.unwrap().bake_reasons & SHADER_LIGHT_GLOW,0);
+        let animated=material("test {\n{\nmap $whiteimage\nglow\nrgbGen wave sin 0.5 0.5 0 2\n}\n}");
+        let promoted=animated.shader_light.unwrap();
+        assert_ne!(promoted.reasons & SHADER_LIGHT_GLOW,0);
+        assert_eq!(promoted.bake_reasons,0,"flickering glow stays in the runtime pool");
     }
 
     #[test]

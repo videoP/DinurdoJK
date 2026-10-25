@@ -1103,6 +1103,16 @@ fn authored_baked_sun_removes_known_photons_on_gpu() {
         let enabled = if enabled { 1.0 } else { 0.0 };
         cases.push_str(&format!("if (id.x == {index}u) {{ input.world_normal = vec3<f32>(0.0, 1.0, 0.0); lighting_settings.baked_sun_direction_strength.w = {strength:?}; lighting_settings.runtime_sun_direction = vec4<f32>({direction}, 0.0); lighting_settings.runtime_sun_radiance = vec4<f32>({:?}, {:?}, {:?}, {enabled:?}); test_visibility = {visibility:?}; output[{index}] = vec4<f32>(light_bsp_surface(vec3<f32>(0.1, 0.15, 0.05), 0.0, input), 1.0); }}\n", radiance[0] * gain, radiance[1] * gain, radiance[2] * gain));
     }
+    // A composed lightmap already contains static sunlight. Moving occlusion
+    // may remove only that contribution; it must leave indirect light intact.
+    for (enabled,visibility) in [(true,0.0f32),(true,0.5),(true,1.0),(false,0.0),(false,1.0)] {
+        let index=expected.len();let flux=if enabled {1.0}else{0.3};
+        let rgb=if enabled {[1.6,1.4,1.2]}else{[1.0;3]};
+        expected.push(std::array::from_fn(|c|if enabled {rgb[c]-[0.6,0.4,0.2][c]*flux*(1.0-visibility)}else{rgb[c]*(1.0-flux*(1.0-visibility))}));
+        cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_debug_mode.z=1u; lighting_settings.runtime_sun_radiance=vec4<f32>(0.6,0.4,0.2,{:?}); test_visibility={visibility:?}; output[{index}]=vec4<f32>(light_bsp_surface(vec3<f32>({:?},{:?},{:?}),{flux:?},input),1.0); }}\n",if enabled {1.0}else{0.0},rgb[0],rgb[1],rgb[2]));
+    }
+    let composed=crate::renderer::rt_models::declaration(include_str!("../lighting/lightmap_sun.wgsl"),"fn shade_composed_sun(").unwrap();
+    let live_helper=format!("{live_helper}\n{composed}");
     let source = format!("{}\n{}\n{}\n{}", r#"
 struct Settings { baked_sun_direction_strength: vec4<f32>, baked_sun_radiance: vec4<f32>, baked_sun_debug_mode: vec4<u32>, runtime_sun_direction: vec4<f32>, runtime_sun_radiance: vec4<f32> }
 var<private> lighting_settings: Settings;
@@ -1114,6 +1124,12 @@ fn baked_luminance(rgb: vec3<f32>) -> f32 { return dot(rgb, vec3<f32>(0.2126, 0.
 fn baked_indirect_tone(rgb: vec3<f32>) -> vec3<f32> { return rgb; }
 fn remove_baked_sun(rgb: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> { return rgb; }
 fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(test_visibility); }
+fn static_sun_lightmap_receiver(input: VertexOut) -> bool { return lighting_settings.baked_sun_debug_mode.z != 0u; }
+fn lightmap_moving_sun_visibility(input: VertexOut) -> f32 { return test_visibility; }
+fn composed_lightmap_receiver(input: VertexOut) -> bool { return static_sun_lightmap_receiver(input); }
+fn baked_local_total(input: VertexOut) -> vec3<f32> { return vec3(0.0); }
+fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> { return lightmap; }
+
 "#, helpers, live_helper, format!("@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ var input: VertexOut; lighting_settings.baked_sun_radiance = vec4<f32>(900.0 / 255.0, 900.0 / 255.0, 900.0 / 255.0, 0.0); {cases} }}"));
     crate::renderer::block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });

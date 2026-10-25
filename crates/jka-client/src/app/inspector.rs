@@ -458,7 +458,7 @@ impl App {
         let static_override = if settings.dynamic == 2 {
             matches!(viewer.weapon, 0 | 1 | 2 | 3)
                 || ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
-                || self.strafe_helper.flags & (ui::SHELPER_UPDATED | ui::SHELPER_CGAZ) != 0
+                || self.strafe_helper.flags & (ui::SHELPER_UPDATED | ui::SHELPER_CGAZ | ui::SHELPER_XONOTIC | ui::SHELPER_Q3DF | ui::SHELPER_WARSOW_HUD) != 0
         } else {
             false
         };

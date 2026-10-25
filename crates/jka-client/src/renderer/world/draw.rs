@@ -1,7 +1,7 @@
 //! World draw.
 use crate::renderer::WorldBatch;
 
-/// Whether the FFT ocean owns this authored water batch, so the ordinary passes
+/// Whether promoted water owns this authored water batch, so ordinary and wireframe passes
 /// must not draw it. Suppress sibling passes only when their face actually
 /// received a replacement. Rejected faces and faces past the cap keep every
 /// authored stage, so enabling the feature cannot remove unpromoted water.

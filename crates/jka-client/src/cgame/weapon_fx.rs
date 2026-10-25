@@ -12,7 +12,7 @@ use super::player_presenter::PlayerFxRequest;
 use super::saber_melt::SaberMelt;
 use crate::{
     fx::{
-        system::{EffectId, FxBlade, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem, FxAutoLightCandidate},
+        system::{EffectId, FxBlade, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem, FxAutoLightCandidate, FxDecalSpawn},
         template::{Rng, PrimType},
     },
     ui::{FootprintMode, SaberMarkMode},
@@ -130,7 +130,7 @@ enum FxWorkerCommand {
     PlayDir { name: String, origin: [f32; 3], dir: [f32; 3] },
     PlayDirClass { name: String, origin: [f32; 3], dir: [f32; 3], class: FxClass },
     PlayAxis { name: String, origin: [f32; 3], axis: [[f32; 3]; 3] },
-    Frame { saber_impact_fx: bool, reply: mpsc::SyncSender<(FxFrame, FxStats)> },
+    Frame { saber_impact_fx: bool, runner_culling: bool, reply: mpsc::SyncSender<(FxFrame, FxStats)> },
     RefreshAssets { reply: mpsc::SyncSender<Result<usize, String>> },
     Shutdown,
 }
@@ -168,7 +168,9 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
             FxWorkerCommand::PlayDir { name, origin, dir } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir(id, origin, dir); } }
             FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
             FxWorkerCommand::PlayAxis { name, origin, axis } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect(id, origin, axis); } }
-            FxWorkerCommand::Frame { saber_impact_fx, reply } => { let frame = worker.fx.frame_with_visibility(saber_impact_fx); let _ = reply.send((frame, worker.fx.stats())); }
+            FxWorkerCommand::Frame { saber_impact_fx, runner_culling, reply } => { let frame = if runner_culling {
+                worker.fx.frame_with_runner_tracking(saber_impact_fx)
+            } else { worker.fx.frame_with_visibility(saber_impact_fx) }; let _ = reply.send((frame, worker.fx.stats())); }
             FxWorkerCommand::RefreshAssets { reply } => {
                 let retried = worker.missing.len();
                 let result = worker
@@ -319,14 +321,14 @@ pub fn profile_saber_blade_draws(
             rgba: glow_full,
             shader: glow_shader.to_owned(),
         });
-        draws.push(FxDraw::Sprite {
+        draws.push(FxDraw::Sprite { shader_time: 0.0,
             origin,
             radius: (radius * 1.5).max(5.5),
             rotation: 0.0,
             rgba: glow_soft,
             shader: glow_shader.to_owned(),
         });
-        draws.push(FxDraw::Sprite {
+        draws.push(FxDraw::Sprite { shader_time: 0.0,
             origin: tip,
             radius: radius * 0.9,
             rotation: 0.0,
@@ -689,6 +691,21 @@ struct FootMark {
 /// The prints kept at once; the oldest give way.
 const FOOT_MARK_MAX: usize = 512;
 
+/// World-space EFX Decal, projected and clipped only once on spawn.
+/// One mark retains its fragments as an indexed mesh so the count limit
+/// measures actual mark instances rather than renderer triangles.
+#[derive(Clone, Debug)]
+struct EfxWorldMark {
+    born: i32,
+    end: i32,
+    shader: String,
+    rgba: [u8; 4],
+    positions: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<u32>,
+}
+
+
 #[derive(Clone, Debug)]
 struct Puff {
     start_time: i32,
@@ -906,6 +923,7 @@ pub struct WeaponFx {
     /// saber-on-saber EV_SABER_BLOCK EFX. Existing tagged primitives remain
     /// alive so a paused demo can hide/show the exact same population.
     saber_impact_fx: bool,
+    runner_culling: bool,
     saber_marks: SaberMarkMode,
     collision_world: Option<CollisionWorld>,
     /// Drawn, markable world surfaces (R_MarkFragments). `None` keeps the plain
@@ -915,6 +933,8 @@ pub struct WeaponFx {
     saber_wall_marks: Vec<SaberWallMark>,
     /// Footprints (`_PlayerFootStep`'s CG_ImpactMark) and how they are styled.
     foot_marks: Vec<FootMark>,
+    efx_world_marks: Vec<EfxWorldMark>,
+    mark_count: usize,
     footprints: FootprintMode,
     melt: SaberMelt,
     last_melt_spark_ms: i32,
@@ -993,11 +1013,14 @@ impl WeaponFx {
             modern_sabers: false,
             rt_lighting: false,
             saber_impact_fx: true,
+            runner_culling: false,
             saber_marks: SaberMarkMode::Legacy,
             collision_world: None,
             saber_contact_history: HashMap::new(),
             saber_wall_marks: Vec::new(),
             foot_marks: Vec::new(),
+            efx_world_marks: Vec::new(),
+            mark_count: 100,
             footprints: FootprintMode::default(),
             mark_surfaces: None,
             melt: SaberMelt::new(),
@@ -1042,6 +1065,10 @@ impl WeaponFx {
         self.rt_lighting = enabled;
     }
 
+    pub fn set_runner_culling(&mut self, enabled: bool) {
+        self.runner_culling = enabled;
+    }
+
     pub fn set_saber_impact_fx(&mut self, enabled: bool) {
         self.saber_impact_fx = enabled;
     }
@@ -1073,6 +1100,19 @@ impl WeaponFx {
         self.mark_surfaces = surfaces;
         self.saber_wall_marks.clear();
         self.foot_marks.clear();
+        self.efx_world_marks.clear();
+    }
+
+    /// TaystJK r_markcount defaults to 100. This limits persistent EFX wall
+    /// decals, and a setting of zero disables them without disabling impact FX.
+    pub fn set_mark_count(&mut self, count: usize) {
+        self.mark_count = count.min(4096);
+        if self.mark_count == 0 {
+            self.efx_world_marks.clear();
+        } else if self.efx_world_marks.len() > self.mark_count {
+            let excess = self.efx_world_marks.len() - self.mark_count;
+            self.efx_world_marks.drain(..excess);
+        }
     }
 
     pub fn set_saber_trail(&mut self, value: i32) {
@@ -1179,6 +1219,7 @@ impl WeaponFx {
         self.pending_gibs.clear();
         self.pending_glass.clear();
         self.foot_marks.clear();
+        self.efx_world_marks.clear();
         self.plums.clear();
         self.shards.clear();
         self.immediate_draws.clear();
@@ -1219,6 +1260,7 @@ impl WeaponFx {
             self.saber_clash_flare = None;
             self.saber_contact_history.clear();
             self.saber_wall_marks.clear();
+            self.efx_world_marks.clear();
             self.melt.clear();
         }
         self.missile_fx.retain(|_, state| {
@@ -1367,7 +1409,7 @@ impl WeaponFx {
             let count = digits.len();
             for i in 0..count {
                 let position = madd3(origin, side, (count as f32 / 2.0 - i as f32) * NUMBER_SIZE);
-                frame.draws.push(FxDraw::Sprite {
+                frame.draws.push(FxDraw::Sprite { shader_time: 0.0,
                     origin: position,
                     radius: NUMBER_SIZE / 2.0,
                     rotation: 0.0,
@@ -1590,7 +1632,7 @@ impl WeaponFx {
     /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
     pub fn end_frame(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
-        let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { saber_impact_fx: self.saber_impact_fx, reply }).is_ok() {
+        let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { saber_impact_fx: self.saber_impact_fx, runner_culling: self.runner_culling, reply }).is_ok() {
             match recv.recv() { Ok((frame, stats)) => { self.cached_stats = stats; frame }, Err(_) => FxFrame::default() }
         } else { FxFrame::default() };
         let time = self.time;
@@ -1621,6 +1663,13 @@ impl WeaponFx {
             .retain(|_, history| time <= history.last_time.saturating_add(2500));
         self.saber_contact_history
             .retain(|_, history| time <= history.last_time.saturating_add(2500));
+        // New Decal{} primitives travel worker -> presenter once, then live in
+        // an r_markcount-bounded buffer until their authored lifetime expires.
+        for decal in std::mem::take(&mut frame.decals) {
+            if decal.ghoul2 { frame.ghoul2_decals.push(decal.clone()); }
+            self.spawn_efx_mark(decal);
+        }
+        self.append_efx_marks(&mut frame);
         self.append_saber_wall_marks(&mut frame);
         self.append_foot_marks(&mut frame);
         self.append_glass_shards(&mut frame);
@@ -1688,7 +1737,7 @@ impl WeaponFx {
                 return false; // the view is inside the sprite
             }
             let rgb = puff.color.map(|value| (value * c).clamp(0.0, 255.0) as u8);
-            frame.draws.push(FxDraw::Sprite {
+            frame.draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin,
                 radius: puff.radius * (1.0 - c) + 8.0,
                 rotation: puff.rotation,
@@ -1886,7 +1935,13 @@ impl WeaponFx {
         let Some(name) = game.effect_qpath(effect_index) else { return; };
         let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
         if dir == [0.0; 3] { dir[1] = 1.0; }
-        let _ = self.play(&name, entity.origin, dir);
+        if state.field_i32("pos.trType").unwrap_or(TR_STATIONARY) == TR_STATIONARY {
+            let _ = self.worker_tx.send(FxWorkerCommand::PlayDirClass {
+                name, origin: entity.origin, dir, class: FxClass::MapRunner(entity.number),
+            });
+        } else {
+            let _ = self.play(&name, entity.origin, dir);
+        }
     }
 
     /// OpenJK CG_DoSaber / CG_DoSaberLight dynamic-light submission. Sabers
@@ -2107,7 +2162,7 @@ impl WeaponFx {
             }
             PlayerFxRequest::HeadSprite { origin, shader } => {
                 // CG_PlayerFloatSprite: RT_SPRITE, radius 10, opaque white.
-                self.immediate_draws.push(FxDraw::Sprite {
+                self.immediate_draws.push(FxDraw::Sprite { shader_time: 0.0,
                     origin: *origin,
                     radius: 10.0,
                     rotation: 0.0,
@@ -2306,12 +2361,17 @@ impl WeaponFx {
                     .as_ref()
                     .is_none_or(|surfaces| surfaces.has_markable_surface(hit.end, hit_normal));
                 if can_mark && markable {
-                    let heat = self.melt.contact(
+                    // Sample only at the contact point (not on the main
+                    // render path). Colors are cached in touched melt chunks.
+                    let wall_color = self.mark_surfaces.as_ref()
+                        .and_then(|surfaces| surfaces.sample_base_color(hit.end, hit_normal));
+                    let heat = self.melt.contact_colored(
                         melt_stroke_id(key),
                         hit.end,
                         hit_normal,
                         self.time,
                         self.collision_world.as_mut(),
+                        wall_color,
                     );
                     if previous.have_old_pos && self.time.saturating_sub(previous.last_sound_time) >= 100 {
                         let variant = self.runner_rng.irand(1, 3);
@@ -2396,6 +2456,80 @@ impl WeaponFx {
             self.saber_wall_marks.drain(..excess);
         }
         true
+    }
+
+    /// CG_ImpactMark / R_MarkFragments for an authored EFX Decal{}.
+    fn spawn_efx_mark(&mut self, decal: FxDecalSpawn) {
+        if self.mark_count == 0 || decal.radius <= 0.0 || decal.shader.is_empty() {
+            return;
+        }
+        let Some(surfaces) = &self.mark_surfaces else { return; };
+        let normal = normalize3(decal.normal);
+        let tang0 = perpendicular3(normal);
+        let tang1 = rotate_about3(tang0, normal, decal.rotation);
+        let tang0 = cross3(normal, tang1);
+        let radius = decal.radius;
+        let corner = |x: f32, y: f32| {
+            add3(decal.origin, add3(scale3(tang0, x * radius), scale3(tang1, y * radius)))
+        };
+        let quad = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+        let mut projected = jka_assets::bsp::MarkBuffer::default();
+        surfaces.project(&quad, scale3(normal, -20.0), &mut projected);
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut indices = Vec::new();
+        for (fragment, face_normal) in projected.iter() {
+            if fragment.len() < 3 { continue; }
+            let base = positions.len() as u32;
+            for point in fragment {
+                let delta = sub3(*point, decal.origin);
+                uvs.push([0.5 + dot3(delta, tang0) / (2.0 * radius),
+                          0.5 + dot3(delta, tang1) / (2.0 * radius)]);
+                positions.push(add3(*point, scale3(face_normal, 0.04)));
+            }
+            for i in 1..fragment.len() as u32 - 1 {
+                indices.extend_from_slice(&[base, base + i, base + i + 1]);
+            }
+        }
+        if indices.is_empty() { return; }
+        if self.efx_world_marks.len() >= self.mark_count {
+            self.efx_world_marks.remove(0);
+        }
+        self.efx_world_marks.push(EfxWorldMark {
+            born: self.time,
+            end: self.time.saturating_add(decal.life_ms.max(1)),
+            shader: decal.shader,
+            rgba: decal.rgba,
+            positions,
+            uvs,
+            indices,
+        });
+    }
+
+    fn append_efx_marks(&mut self, frame: &mut FxFrame) {
+        let now = self.time;
+        // Batch per shader to keep hundreds of wall hits at O(materials) draws.
+        let mut batches: HashMap<String, (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u8; 4]>, Vec<u32>)> = HashMap::new();
+        self.efx_world_marks.retain(|mark| {
+            if now >= mark.end || now < mark.born { return false; }
+            let remaining = mark.end - now;
+            let fade = if remaining < 1000 { remaining as f32 / 1000.0 } else { 1.0 };
+            // FX Scheduler requests alphaFade=true; retain RGB and fade alpha.
+            let rgba = [
+                mark.rgba[0], mark.rgba[1], mark.rgba[2],
+                (mark.rgba[3] as f32 * fade) as u8,
+            ];
+            let batch = batches.entry(mark.shader.clone()).or_default();
+            let start = batch.0.len() as u32;
+            batch.0.extend_from_slice(&mark.positions);
+            batch.1.extend_from_slice(&mark.uvs);
+            batch.2.resize(batch.0.len(), rgba);
+            batch.3.extend(mark.indices.iter().map(|i| start + i));
+            true
+        });
+        for (shader, (positions, uvs, rgba, indices)) in batches {
+            frame.draws.push(FxDraw::Mesh { positions, uvs, rgba, indices, shader });
+        }
     }
 
     /// Every live mark is folded into two meshes (burn, then glow) with per-vertex
@@ -2617,14 +2751,14 @@ impl WeaponFx {
                 rgba: glow_full,
                 shader: glow_shader.to_owned(),
             });
-            self.immediate_draws.push(FxDraw::Sprite {
+            self.immediate_draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin,
                 radius: (radius * 1.5).max(5.5),
                 rotation: 0.0,
                 rgba: glow_soft,
                 shader: glow_shader.to_owned(),
             });
-            self.immediate_draws.push(FxDraw::Sprite {
+            self.immediate_draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin: tip,
                 radius: radius * 0.9,
                 rotation: 0.0,
@@ -3826,6 +3960,34 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_efx_marks_respect_world_geometry_count_and_lifetime() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        let tris = [
+            ([[ -100.0, -100.0, 0.0 ], [100.0, -100.0, 0.0], [100.0, 100.0, 0.0]], [0.0, 0.0, 1.0]),
+            ([[ -100.0, -100.0, 0.0 ], [100.0, 100.0, 0.0], [-100.0, 100.0, 0.0]], [0.0, 0.0, 1.0]),
+        ];
+        fx.set_mark_surfaces(Some(std::sync::Arc::new(jka_assets::bsp::MarkSurfaces::from_world_triangles(tris))));
+        fx.set_mark_count(1);
+        fx.begin_frame(1000);
+        let mark = |x: f32| FxDecalSpawn {
+            origin: [x, 0.0, 0.0], normal: [0.0, 0.0, 1.0],
+            radius: 8.0, rotation: 0.0, shader: "gfx/damage/bullet_mrk".to_owned(),
+            rgba: [255, 255, 255, 255], life_ms: 10_000, class: FxClass::General, ghoul2: false,
+        };
+        fx.spawn_efx_mark(mark(0.0));
+        assert_eq!(fx.efx_world_marks.len(), 1, "markable BSP receives the decal");
+        assert!(!fx.efx_world_marks[0].indices.is_empty());
+        fx.spawn_efx_mark(mark(25.0));
+        assert_eq!(fx.efx_world_marks.len(), 1, "oldest decal recycled at r_markcount");
+        assert!(fx.efx_world_marks[0].positions.iter().all(|p| p[0] > 15.0));
+        fx.set_mark_count(0);
+        assert!(fx.efx_world_marks.is_empty());
+        fx.spawn_efx_mark(mark(0.0));
+        assert!(fx.efx_world_marks.is_empty(), "zero disables wall decals");
+    }
 
     #[test]
     fn vehicle_missiles_use_vwp_indices_not_effect_configstrings() {

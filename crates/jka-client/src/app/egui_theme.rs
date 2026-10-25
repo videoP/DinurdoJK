@@ -897,6 +897,22 @@ pub(super) fn row_with_note<R>(
     row_inner(ui, text, tip, reset, true, Some(note), add)
 }
 
+#[derive(Clone)]
+struct SearchJump {
+    label: String,
+    until: f64,
+    scrolled: bool,
+}
+
+fn search_jump_id() -> egui::Id { egui::Id::new("jka_settings_jump") }
+
+pub(super) fn jump_to_setting(ctx: &egui::Context, label: &str) {
+    let until = ctx.input(|input| input.time) + 2.0;
+    ctx.data_mut(|data| data.insert_temp(search_jump_id(), SearchJump {
+        label: label.to_owned(), until, scrolled: false,
+    }));
+}
+
 fn row_inner<R>(
     ui: &mut egui::Ui,
     text: &str,
@@ -912,6 +928,22 @@ fn row_inner<R>(
     let height = ROW_H + note_h;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter().clone();
+    // The search result takes the user to the original, live control instead
+    // of creating a second copy of the setting and risking setter divergence.
+    let jump = ui.ctx().data(|data| data.get_temp::<SearchJump>(search_jump_id()));
+    if let Some(mut jump) = jump {
+        if jump.label == text && ui.ctx().input(|input| input.time) < jump.until {
+            if !jump.scrolled {
+                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                jump.scrolled = true;
+                ui.ctx().data_mut(|data| data.insert_temp(search_jump_id(), jump));
+            }
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, CONTROL_SELECTED);
+            painter.rect_stroke(rect, egui::CornerRadius::ZERO,
+                egui::Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+            ui.ctx().request_repaint();
+        }
+    }
 
     // Only the label column is interactive, so resting on (or clicking) a
     // slider or meter is never intercepted by the label behind it.

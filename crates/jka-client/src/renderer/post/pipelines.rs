@@ -8,6 +8,10 @@ use crate::renderer::{
 #[path = "depth_resolve_tests.rs"]
 mod depth_resolve_tests;
 
+#[cfg(test)]
+#[path = "cull_debug_tests.rs"]
+mod cull_debug_tests;
+
 pub(in crate::renderer) fn create_planar_debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -478,6 +482,7 @@ pub(in crate::renderer) fn create_cull_debug_pipeline(
     shader: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
+    hiz_only: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA cull rejection debug pipeline"),
@@ -516,11 +521,12 @@ pub(in crate::renderer) fn create_cull_debug_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(if hiz_only { "fs_hiz_main" } else { "fs_main" }),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                // Disjoint opaque dots bound coverage regardless of rejected-layer count.
+                blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

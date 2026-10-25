@@ -8,6 +8,51 @@ use crate::renderer::{
     RT_SUN_ANGULAR_DIAMETER_RADIANS, SHADOW_CASCADES, SHADOW_MAP_SIZE,
 };
 
+/// Conservative light-space footprint of the live caster pass. Empty regions
+/// skip all PCF reads on baked static receivers. GPU skinning uses conservative
+/// resident-mesh/bone bounds without skinning its vertices again on the CPU.
+pub(in crate::renderer) fn live_csm_region(
+    world: &crate::renderer::world::types::WorldGpu,
+    renderer: &crate::renderer::DynamicModelRenderer,
+    matrix: Mat4,
+    models: &[crate::renderer::DynamicModelSurface],
+    include_models: bool,
+    include_inline: bool,
+    include_grass: bool,
+) -> [f32; 4] {
+    if include_grass { return [-1.0,-1.0,1.0,1.0]; }
+    let mut low=Vec3::splat(f32::INFINITY); let mut high=Vec3::splat(f32::NEG_INFINITY);
+    let mut add_box=|min:[f32;3], max:[f32;3]| {
+        for x in [min[0],max[0]] {for y in [min[1],max[1]] {for z in [min[2],max[2]] {
+            let p=matrix.transform_point3(Vec3::new(x,y,z)); low=low.min(p); high=high.max(p);
+        }}}
+    };
+    if include_inline {
+        for batch in &world.coarse_batches {
+            if (batch.is_inline_entity || crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered)) && !crate::renderer::hidden_inline_batch(batch,&world.inline_models)
+                && crate::renderer::aabb_intersects_shadow_frustum(batch.bounds_min,batch.bounds_max,matrix,true) {
+                add_box(batch.bounds_min,batch.bounds_max);
+            }
+        }
+    }
+    if include_models {
+        let mut min=Vec3::splat(f32::INFINITY); let mut max=Vec3::splat(f32::NEG_INFINITY);
+        for model in models.iter().filter(|m|m.raster_visible && matches!(m.alpha_mode,
+            crate::renderer::DynamicModelAlphaMode::Opaque | crate::renderer::DynamicModelAlphaMode::Mask)) {
+            if let Some(skin)=model.ghoul2_gpu.as_ref() {
+                let Some((origin,radius))=renderer.shadow_skin_sphere(skin) else {return [-1.0,-1.0,1.0,1.0];};
+                add_box((origin-Vec3::splat(radius)).to_array(),(origin+Vec3::splat(radius)).to_array());continue;
+            }
+            if model.fx_gpu_sprites.is_some() {return [-1.0,-1.0,1.0,1.0];}
+            for vertex in model.vertices.iter() {let p=Vec3::from_array(vertex.position);min=min.min(p);max=max.max(p);}
+        }
+        if min.is_finite() {add_box(min.to_array(),max.to_array());}
+    }
+    if !low.is_finite() {return [1.0,1.0,-1.0,-1.0];}
+    let pad=0.02;
+    [low.x-pad,low.y-pad,high.x+pad,high.y+pad]
+}
+
 /// Entity shadow state: per-cascade light-camera uniforms (the entity shaders take
 /// the light's view-projection through the ordinary camera slot) plus the smoothed
 /// light the Entity map is aimed with.
@@ -25,7 +70,10 @@ impl EntityShadowState {
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
     ) -> Self {
-        let cameras = (0..ENTITY_SHADOW_CAMERAS)
+        Self::with_count(device,camera_layout,ENTITY_SHADOW_CAMERAS)
+    }
+    pub(in crate::renderer) fn with_count(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, count: usize) -> Self {
+        let cameras = (0..count)
             .map(|_| {
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("JKA entity shadow light camera"),
@@ -260,6 +308,7 @@ impl Renderer {
         let forward = camera.forward();
         let texel_size = (2.0 * ENTITY_SHADOW_RADIUS) / SHADOW_MAP_SIZE as f32;
         let receiver = ShadowReceiverUniform {
+            dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| {
                 if index == 0 {
                     frame.view_proj
@@ -387,6 +436,7 @@ impl Renderer {
         let light_direction = Vec3::from_array(sun.direction).normalize_or_zero();
         let intensity_scale = (sun.intensity / 250.0).max(0.0).sqrt().clamp(0.0, 1.5);
         let receiver = ShadowReceiverUniform {
+            dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
             split_depths: *splits,
             light_direction_enabled: [

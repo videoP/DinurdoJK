@@ -92,7 +92,7 @@ impl Settings {
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct SkyFogRegion {
     pub bounds: [f32; 4],
-    pub plane: [f32; 4], // top Y, segment count, corner bitmask, enabled
+    pub plane: [f32; 4], // top Y, segment count, corner bitmask, bottom Y
     pub segments: [[f32; 4]; 16],
 }
 
@@ -101,7 +101,7 @@ pub struct SkyFogRegion {
 pub struct Uniform {
     pub inverse_view_projection: [[f32; 4]; 4],
     pub eye: [f32; 4],
-    pub forward: [f32; 4],
+    pub forward: [f32; 4], // xyz view direction, w fixed floor below the submerged eye
     pub fog: [f32; 4], // linear color, absorption distance
     pub params: [f32; 4], // darkening distance, refraction, caustics, volume count
     pub minimum: [[f32; 4]; 8],
@@ -117,6 +117,19 @@ pub struct Uniform {
     /// Hybrid wave optics: x = correction added to the shader's two-cascade wave
     /// height near the eye (JKA units), y = 1 when the CPU probe is valid.
     pub eye_wave: [f32; 4],
+}
+
+impl Uniform {
+    /// Find this surface's floor in the shared authored/promoted volume list.
+    pub fn surface_bottom(&self, surface: super::OceanSurface) -> f32 {
+        (0..(self.params[3] as usize).min(8)).filter(|&i| {
+            (self.maximum[i][1] - surface.plane_height).abs() <= 1.0
+                && self.minimum[i][0] <= surface.minimum[0] + 0.75
+                && self.minimum[i][2] <= surface.minimum[1] + 0.75
+                && self.maximum[i][0] >= surface.maximum[0] - 0.75
+                && self.maximum[i][2] >= surface.maximum[1] - 0.75
+        }).map(|i| self.minimum[i][1]).reduce(f32::min).unwrap_or(surface.plane_height)
+    }
 }
 
 pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -190,6 +203,12 @@ pub struct Resources {
     blit: wgpu::RenderPipeline,
 }
 impl Resources {
+    /// Hybrid fog capture, reusable by the animated lake underside without
+    /// another scene copy. Depth is linear in host world units; sky is 1e6.
+    pub fn submerged_scene(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
+        (&self.capture_color, &self.depth)
+    }
+
     pub fn new(device: &wgpu::Device, output_layout: &wgpu::BindGroupLayout,
         ocean_layout: &wgpu::BindGroupLayout, key: (u32, u32, u32, wgpu::TextureFormat)) -> Self {
         let (width, height, samples, format) = key;
@@ -285,6 +304,9 @@ impl Resources {
             texture_entry(2, false), texture_entry(3, false), texture_entry(4, false),
             wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            // Glass bounds: each level draws only the rectangle glass can sample.
+            wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
         ] });
         let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Foreground-safe glass blur"), source: wgpu::ShaderSource::Wgsl(include_str!("../glass_blur.wgsl").into()) });
         let blur_first = pipeline(device, &blur_shader, &[&blur_layout], "fs_first", &[optical_format], 1);
@@ -301,6 +323,7 @@ impl Resources {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&edges.mask) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&background) },
                 wgpu::BindGroupEntry { binding: 5, resource: glass_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: edges.bounds().as_entire_binding() },
             ] }));
             blur_inputs.push(input);
             blur_outputs.push(mip_view(mip));
@@ -329,6 +352,7 @@ impl Resources {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.edges.mask) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.background) },
                 wgpu::BindGroupEntry { binding: 5, resource: self.glass_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.edges.bounds().as_entire_binding() },
             ],
         })).collect();
     }
@@ -493,8 +517,14 @@ impl Resources {
         self.procedural.ensure_generated(device, encoder);
     }
 
-    pub fn blur(&self, encoder: &mut wgpu::CommandEncoder) {
-        for (index, (group, output)) in self.blur_groups.iter().zip(&self.blur_outputs).enumerate() {
+    /// Blurred levels above mip 0; glass_shade clamps its lod to this.
+    pub fn blur_levels(&self) -> usize {
+        self.blur_groups.len()
+    }
+
+    /// Builds mips 1..=`levels` over the rectangle from `edges.locate`.
+    pub fn blur(&self, encoder: &mut wgpu::CommandEncoder, levels: usize) {
+        for (index, (group, output)) in self.blur_groups.iter().zip(&self.blur_outputs).take(levels).enumerate() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Glass Gaussian pyramid"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: output, depth_slice: None, resolve_target: None,
@@ -503,7 +533,9 @@ impl Resources {
             });
             pass.set_pipeline(if index == 0 { &self.blur_first } else { &self.blur_next });
             pass.set_bind_group(0, group, &[]);
-            pass.draw(0..3, 0..1);
+            // The instance index is the output mip level (see glass_blur.wgsl).
+            let level = index as u32 + 1;
+            pass.draw(0..6, level..level + 1);
         }
     }
 
@@ -682,6 +714,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_surface_selects_its_own_authored_floor() {
+        let mut volumes = Uniform::zeroed();
+        volumes.params[3] = 2.0;
+        volumes.minimum[0] = [0.0,-56.0,0.0,0.0];
+        volumes.maximum[0] = [100.0,0.0,100.0,0.0];
+        volumes.minimum[1] = [200.0,-4000.0,0.0,0.0];
+        volumes.maximum[1] = [300.0,0.0,100.0,0.0];
+        let surface = super::super::OceanSurface { plane_height:0.0, minimum:[0.0,0.0], maximum:[100.0,100.0] };
+        assert_eq!(volumes.surface_bottom(surface), -56.0);
+    }
+
+    #[test]
     fn hybrid_wave_optics_shaders_validate() {
         // The Hybrid specialization samples Blue Water's adapter displacement
         // with no additional binding layout. Validate both MSAA variants.
@@ -747,7 +791,7 @@ mod tests {
             let layout = layout(&device);
             let extent = wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 };
             for samples in [1, 4] {
-                let resources = Resources::new(&device, &layout, &ocean_layout, (8, 8, samples, wgpu::TextureFormat::Rgba8Unorm));
+                let mut resources = Resources::new(&device, &layout, &ocean_layout, (8, 8, samples, wgpu::TextureFormat::Rgba8Unorm));
                 let texture = |format, samples, usage| device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Optics GPU test target"), size: extent, mip_level_count: 1, sample_count: samples,
                     dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
@@ -771,20 +815,30 @@ mod tests {
                     (2, 10.0, 1.0, 10.0, 0.0, 1.0, 0.5, false), (1, 0.25, 0.5, 10.0, 0.0, 0.5, 0.5, false),
                     (1, 10.0, 0.5, -0.0625, 0.0, 0.5, 0.5, false), (1, 10.0, 0.5, -0.0625, 0.1, 1.0, 0.5, false),
                     (1, 10.0, 1.0, 10.0, 0.0, 1.0, 0.0, false), (1, 10.0, 1.0, 10.0, 0.0, 1.0, 0.0, true),
+                    // The camera is under the top but below the finite brush:
+                    // neither ordinary nor sky-connected water fogs this ray.
+                    (1, 10.0, 0.0, 12.0, 0.0, 0.0, 0.5, false),
+                    (1, 10.0, 0.0, 12.0, 0.0, 0.0, 0.5, true),
+                    // The specialized submerged pass must also stop at the
+                    // floor halfway along this downward ray.
+                    (1, 10.0, 0.5, 13.0, 0.0, 0.5, 0.5, false),
                 ] {
                     let mut uniform = Uniform::zeroed();
                     uniform.inverse_view_projection = glam::Mat4::IDENTITY.to_cols_array_2d();
                     uniform.forward = [0.0,0.0,1.0,0.0];
+                    uniform.eye[3] = top;
                     uniform.fog[3] = 20.0;
                     uniform.params = [20.0,0.0,0.0,volumes as f32];
                     for i in 0..volumes {
-                        uniform.minimum[i] = [-10.0,-10.0,-10.0,0.0];
+                        let bottom = if top == 12.0 { 1.0 } else if top == 13.0 { -0.0625 } else { -10.0 };
+                        uniform.minimum[i] = [-10.0,bottom,-10.0,0.0];
                         uniform.maximum[i] = [10.0,top,surface_z,0.0];
+                        uniform.forward[3] = bottom;
                     }
                     if open {
                         uniform.sky_info[0] = 1.0;
                         uniform.sky_regions[0].bounds = [-10.0, -10.0, 10.0, 10.0];
-                        uniform.sky_regions[0].plane = [top, 1.0, 0.0, 1.0];
+                        uniform.sky_regions[0].plane = [top, 1.0, 0.0, uniform.minimum[0][1]];
                         uniform.sky_regions[0].segments[0] = [10.0, -10.0, 10.0, 2.0];
                     }
                     queue.write_buffer(&resources.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -798,7 +852,8 @@ mod tests {
                         });
                     }
                     let capture_color = if samples == 1 { &color_view } else { &msaa_view };
-                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true, false, false);
+                    if top == 13.0 { resources.ensure_submerged_fog_capture(&device, &ocean_layout); }
+                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true, false, top == 13.0);
                     resources.capture_water_distance(&device, &queue, &mut encoder, capture_color, &depth_view, &ocean, [top, crest, 0.0, 0.0]);
                     resources.composite(&mut encoder, output, resolve);
                     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,
@@ -833,10 +888,12 @@ mod tests {
                     // The inert adapter's map scale is zero: the distance pass
                     // still uses JKA's fixed metre conversion, even without waves.
                     let bounded = if receiver_depth == 0.0 {
-                        if open { 400000.0 } else { 200.0_f32.sqrt() }
+                        // This fixture's sky continuation has the same floor
+                        // as its pool, so the downward ray exits at Y=-10.
+                        200.0_f32.sqrt()
                     } else { ray * distance_fraction } / crate::ocean::OCEAN_UNITS_PER_METER;
                     assert!((actual - bounded).abs() < 1e-3,
-                        "samples={samples} volumes={volumes}: bounded length {actual}");
+                        "samples={samples} volumes={volumes} top={top} open={open}: bounded length {actual}, expected {bounded}");
                     for (channel, ratio) in [38.0/7.5, 38.0/22.0, 1.0].iter().enumerate() {
                         let expected = (-4.321928 * ratio * distance / 20.0).exp2();
                         let actual = bytes[4*256+4*4+channel] as f32 / 255.0;

@@ -19,8 +19,9 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::Display => "Display & graphics",
         VideoSection::Geometry => "Geometry",
         VideoSection::Lighting => "Lighting",
+        VideoSection::Materials => "Material rendering",
         VideoSection::Effects => "Effects",
-        VideoSection::Shadows => "Shadows",
+
         VideoSection::Color => "Color & HDR",
         VideoSection::PostProcessing => "Post processing",
         VideoSection::DebugTools => "Debug & tools",
@@ -57,12 +58,13 @@ impl App {
                 "GEOMETRY",
                 "World visibility, curved surfaces and model rendering.",
             ),
-            VideoSection::Lighting => ("LIGHTING", "Ambient, dynamic and indirect lighting."),
+            VideoSection::Lighting => ("LIGHTING", "Ambient, local lights, sun and entity shadows."),
+            VideoSection::Materials => ("MATERIAL RENDERING", "Physically based material shading and texture sources."),
             VideoSection::Effects => (
                 "EFFECTS",
                 "Particles, saber effects, flares and reflections.",
             ),
-            VideoSection::Shadows => ("SHADOWS", "Dynamic and local shadowing."),
+
             VideoSection::Color => (
                 "COLOR & HDR",
                 "HDR precision, grading, split toning and output brightness.",
@@ -109,8 +111,18 @@ impl App {
             .fill(theme::RAIL_FILL)
             .stroke(egui::Stroke::new(1.0, theme::LINE))
             .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| self.egui_preset_header(ui));
+            .show(ui, |ui| {
+                crate::app::egui_menu::settings_search::search_bar(ui);
+                ui.add_space(5.0);
+                self.egui_preset_header(ui);
+            });
         ui.add_space(10.0);
+        if !crate::app::egui_menu::settings_search::current_query(ui.ctx()).trim().is_empty() {
+            self.egui_settings_search_results(ui);
+            theme::clear_pending_resets(ui.ctx());
+            theme::clear_preset_preview(ui.ctx());
+            return;
+        }
         theme::page_title(ui, title, detail);
 
         egui::ScrollArea::vertical()
@@ -127,11 +139,11 @@ impl App {
                     self.egui_models(ui);
                 }
                 VideoSection::Lighting => self.egui_lighting(ui),
+                VideoSection::Materials => self.egui_material_rendering(ui),
                 VideoSection::Effects => {
                     self.egui_effects(ui);
                     self.egui_reflections(ui);
                 }
-                VideoSection::Shadows => self.egui_shadows(ui),
                 VideoSection::PostProcessing => self.egui_post_processing(ui),
                 VideoSection::Color => self.egui_color_settings(ui),
                 VideoSection::DebugTools => self.egui_debug_tools(ui),

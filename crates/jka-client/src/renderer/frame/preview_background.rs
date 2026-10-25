@@ -12,6 +12,11 @@ struct Vertex { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>
     v.position=vec4(p,0.0,1.0); v.uv=vec2(p.x*0.5+0.5,0.5-p.y*0.5);return v;
 }
 @fragment fn fs(v:Vertex)->@location(0) vec4<f32> {
+    if crop.z > 0.5 {
+        let cell=vec2<u32>(floor(v.uv*crop.xy/12.0));
+        let shade=select(1.0,0.70,(cell.x+cell.y)%2u==1u);
+        return vec4(vec3(shade),1.0);
+    }
     let uv=(v.uv-vec2(0.5))*crop.xy+vec2(0.5);
     return vec4(textureSample(backdrop,linear_sampler,uv).rgb*0.72,1.0);
 }
@@ -26,6 +31,7 @@ pub(in crate::renderer) struct PreviewBackground {
     format: wgpu::TextureFormat,
     samples: u32,
     image_size: [u32; 2],
+    checkerboard: bool,
 }
 fn pipeline(
     device: &wgpu::Device,
@@ -75,6 +81,15 @@ fn pipeline(
     })
 }
 impl PreviewBackground {
+    pub fn checkerboard(device: &wgpu::Device, queue: &wgpu::Queue,
+        format: wgpu::TextureFormat, samples: u32) -> Result<Self, String> {
+        let mut background=Self::new(device,queue,format,samples,[1,1],&[255;4])?;
+        background.checkerboard=true;
+        Ok(background)
+    }
+    pub fn visible_in_capture(&self, clean_capture: bool) -> bool {
+        !clean_capture || !self.checkerboard
+    }
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -191,6 +206,7 @@ impl PreviewBackground {
             format,
             samples,
             image_size: size,
+            checkerboard: false,
         })
     }
     pub fn prepare(
@@ -208,7 +224,9 @@ impl PreviewBackground {
         }
         let image_aspect = self.image_size[0] as f32 / self.image_size[1] as f32;
         let view_aspect = viewport[0].max(1) as f32 / viewport[1].max(1) as f32;
-        let scale = if view_aspect > image_aspect {
+        let scale = if self.checkerboard {
+            [viewport[0].max(1) as f32,viewport[1].max(1) as f32,1.0,0.0]
+        } else if view_aspect > image_aspect {
             [1.0, image_aspect / view_aspect, 0.0, 0.0]
         } else {
             [view_aspect / image_aspect, 1.0, 0.0, 0.0]
@@ -238,9 +256,15 @@ mod tests {
             let format = wgpu::TextureFormat::Rgba8Unorm;
             assert!(PreviewBackground::new(&device, &queue, format, 1, [0, 1], &[]).is_err());
             assert!(PreviewBackground::new(&device, &queue, format, 1, [1, 1], &[255]).is_err());
-            let mut background =
+            for checkerboard in [false,true] {
+            let mut background = if checkerboard {
+                PreviewBackground::checkerboard(&device,&queue,format,1).unwrap()
+            } else {
                 PreviewBackground::new(&device, &queue, format, 1, [1, 1], &[255, 0, 0, 255])
-                    .unwrap();
+                    .unwrap()
+            };
+            assert!(background.visible_in_capture(false));
+            assert_eq!(background.visible_in_capture(true),!checkerboard);
             for samples in [1, 4] {
                 background.prepare(&device, &queue, format, samples, [24, 24]);
                 let desc = wgpu::TextureDescriptor {
@@ -338,8 +362,16 @@ mod tests {
                 let data = pixels.slice(..).get_mapped_range().unwrap();
                 assert_eq!(&data[..4], &[0, 0, 0, 255]);
                 let center = 16 * 256 + 16 * 4;
-                assert!((data[center] as i32 - 184).abs() <= 1);
-                assert_eq!(&data[center + 1..center + 4], &[0, 0, 255]);
+                if checkerboard {
+                    assert_eq!(&data[center..center+4],&[255,255,255,255]);
+                    let gray=16*256+5*4;
+                    for channel in &data[gray..gray+3] {assert!((*channel as i32-179).abs()<=1);}
+                    assert_eq!(data[gray+3],255);
+                } else {
+                    assert!((data[center] as i32 - 184).abs() <= 1);
+                    assert_eq!(&data[center + 1..center + 4], &[0, 0, 255]);
+                }
+            }
             }
         });
     }

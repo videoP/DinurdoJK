@@ -7,6 +7,7 @@ license = "GPL-2.0-only"
 
 [dependencies]
 jka-assets = { path = "../jka-assets" }
+log = "=0.4.34"
 
 [build-dependencies]
 cc = "=1.4.6"

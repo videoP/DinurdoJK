@@ -1634,13 +1634,13 @@ settings_cvars! { NetworkSettings;
                 }),
                 archive: Some((313, |state| {
                     let presentation = state.presentation;
-                    crate::global_cosmetics::encode(presentation.network.color1, &presentation.network.global_hat)
+                    presentation.network.color1_value()
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_COLOR1 = APP_COLOR1
                 .bind(
-                    |state: &NetworkSettings| CvarValue::String(crate::global_cosmetics::encode(state.color1, &state.global_hat)),
+                    |state: &NetworkSettings| CvarValue::String(state.color1_value()),
                     |state, value| {
                         NetworkSettings::cvar_set_color1(state, APP_COLOR1.entry.name, &value.to_string())
                     },
@@ -1649,10 +1649,18 @@ settings_cvars! { NetworkSettings;
         implementations: [
             impl NetworkSettings {
                 fn cvar_set_color1(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    if let Some((color, _cosmetics)) = crate::profile_wire::decode_cosmetics(value.as_bytes()) {
+                        self.color1 = u8::try_from(color).map_err(|_| format!("{name}: invalid color"))?;
+                        self.color1_packed = Some(value.to_owned());
+                        return Ok(());
+                    }
                     let (color, hat) = crate::global_cosmetics::parse_cvar(value)
                         .map_err(|error| format!("{name}: {error}"))?;
+                    // Reserve the z1 prefix for the validated DinurdoJK payload.
+                    if hat.starts_with("z1") { return Err(format!("{name}: malformed z1 payload")); }
                     self.color1 = color;
                     self.global_hat = hat;
+                    self.color1_packed = None;
                     Ok(())
                 }
             }
@@ -1662,6 +1670,7 @@ settings_cvars! { NetworkSettings;
                 }
                 fn cvar_set_color1(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_COLOR1.set_text.unwrap())(&mut self.network, name, value)?;
+                    if self.network.color1_packed.is_none() { self.sync_packed_cosmetics_cvar()?; }
                     self.mark_config_dirty();
                     self.request_userinfo_send();
 
@@ -1690,13 +1699,13 @@ settings_cvars! { NetworkSettings;
                 }),
                 archive: Some((314, |state| {
                     let presentation = state.presentation;
-                    crate::global_cosmetics::encode(presentation.network.color2, &presentation.network.global_cape)
+                    presentation.network.color2_value()
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_COLOR2 = APP_COLOR2
                 .bind(
-                    |state: &NetworkSettings| CvarValue::String(crate::global_cosmetics::encode(state.color2, &state.global_cape)),
+                    |state: &NetworkSettings| CvarValue::String(state.color2_value()),
                     |state, value| {
                         NetworkSettings::cvar_set_color2(state, APP_COLOR2.entry.name, &value.to_string())
                     },
@@ -1705,10 +1714,17 @@ settings_cvars! { NetworkSettings;
         implementations: [
             impl NetworkSettings {
                 fn cvar_set_color2(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    if let Some((color, _body)) = crate::profile_wire::BodyWire::decode(value.as_bytes()) {
+                        self.color2 = u8::try_from(color).map_err(|_| format!("{name}: invalid color"))?;
+                        self.color2_packed = Some(value.to_owned());
+                        return Ok(());
+                    }
                     let (color, cape) = crate::global_cosmetics::parse_cvar(value)
                         .map_err(|error| format!("{name}: {error}"))?;
+                    if cape.starts_with("z3") { return Err(format!("{name}: malformed z3 payload")); }
                     self.color2 = color;
                     self.global_cape = cape;
+                    self.color2_packed = None;
                     Ok(())
                 }
             }
@@ -1718,6 +1734,30 @@ settings_cvars! { NetworkSettings;
                 }
                 fn cvar_set_color2(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_COLOR2.set_text.unwrap())(&mut self.network, name, value)?;
+                    if let Some((_, body)) = crate::profile_wire::BodyWire::decode(value.as_bytes()) {
+                        // Explicit /color2 z3 pastes should affect the local player
+                        // as well as the transmitted cvar, not just remote players.
+                        let tuning = body.to_tuning();
+                        self.video.body_muscle = tuning.body_shape.muscle;
+                        self.video.body_weight = tuning.body_shape.weight;
+                        self.video.body_proportions = tuning.body_shape.proportions;
+                        self.video.body_height = tuning.body_shape.height;
+                        self.video.body_age = tuning.body_shape.age;
+                        self.video.body_details = tuning.body_details;
+                        self.video.jiggle_breast_size = tuning.breast_size;
+                        self.video.jiggle_glute_size = tuning.glute_size;
+                        self.video.jiggle_breast_remesh_bottom_z = tuning.breast_bottom_z;
+                        self.video.jiggle_breast_remesh_top_z = tuning.breast_top_z;
+                        self.video.jiggle_glute_remesh_bottom_z = tuning.glute_bottom_z;
+                        self.video.jiggle_glute_remesh_top_z = tuning.glute_top_z;
+                        self.last_profile_wire = Some(crate::profile_wire::BodyWire::from_tuning(self.current_profile_tuning()));
+                        self.profile_preview_key = None;
+                        self.publish_ui();
+                    } else if self.network.color2_packed.is_none() {
+                        self.sync_packed_body_cvar()?;
+                    }
+                    // A TaystJK cape still contributes to DinurdoJK's color1.
+                    self.sync_packed_cosmetics_cvar()?;
                     self.mark_config_dirty();
                     self.request_userinfo_send();
 
@@ -1836,6 +1876,7 @@ settings_cvars! { NetworkSettings;
                 }
                 fn cvar_set_cp_cosmetics(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_CP_COSMETICS.set_text.unwrap())(&mut self.network, name, value)?;
+                    self.sync_packed_cosmetics_cvar()?;
                     self.mark_config_dirty();
                     self.request_userinfo_send();
 

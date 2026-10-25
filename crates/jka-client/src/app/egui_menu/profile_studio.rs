@@ -131,6 +131,11 @@ impl App {
                     for (section, title) in STUDIO_NAV {
                         if studio_button(ui, title, self.profile_selected_section == section, false, nav_w) {
                             self.profile_selected_section = section;
+                            let group = if section == PROFILE_MODEL {
+                                ui.ctx().data_mut(|data| data.get_temp::<BodyEditor>(body_editor_id()))
+                                    .map_or(String::new(), |editor| editor.group)
+                            } else { String::new() };
+                            self.focus_profile_studio_camera(&group);
                             self.profile_preview_key = None;
                             if section != PROFILE_EMOTES {
                                 crate::emotes::stop();
@@ -521,6 +526,7 @@ impl App {
         // in Whole body so a previous named region cannot leak across rigs.
         ctx.data_mut(|data| data.remove::<BodyEditor>(body_editor_id()));
         self.profile_body_highlight = None;
+        self.focus_profile_studio_camera("");
         self.profile_model_staged = if value.eq_ignore_ascii_case(&self.solo_client_info.model_cvar()) {
             None
         } else { Some(value.to_owned()) };
@@ -599,6 +605,7 @@ impl App {
         let available = self.asset_preview_player_presenter.as_ref()
             .is_some_and(|presenter| presenter.profile_body_shape_available(&info));
         let mut editor = ui.ctx().data_mut(|d| d.get_temp::<BodyEditor>(body_editor_id())).unwrap_or_default();
+        let previous_group = editor.group.clone();
         cap(ui, "BODY SHAPE", if editor.group.is_empty() { "Whole body" } else { &editor.group });
         // The two pre-existing jiggle offsets stay on the stage beside Anny,
         // not in the model browser. Preserve per-model anchor availability.
@@ -677,10 +684,21 @@ impl App {
                 }
             }
             }
+            // Anny normalizes the three artist-authored ancestry blends.
+            // Display only the two independent degrees of freedom; the third
+            // ratio is the remainder. Keep named cvar serialization backward
+            // compatible for archived profiles.
+            if show_global && (!searching || ["african", "asian", "caucasian", "blend", "ancestry"]
+                .iter().any(|name| name.contains(needle.as_str()))) {
+                cap(ui, "ANNY APPEARANCE BLEND", "2 controls");
+                label(ui, "Artistic morph presets; not a measure of ancestry or identity.", 10.0, MUTED);
+                Self::studio_anny_ancestry_slider(ui, &mut details, 0);
+                Self::studio_anny_ancestry_slider(ui, &mut details, 1);
+            }
             if editor.group == "breast" || editor.group == "all" {
             if !show_global { cap(ui, "BREAST PHENOTYPES", "Anny"); }
             for (i, name) in EXTRA_CONTROLS.iter().enumerate() {
-                if i == 0 {continue;} // Pinned above the part filter.
+                if i == 0 || (3..=5).contains(&i) {continue;} // Gender pinned, ancestry combined above.
                 if editor.group != "all" && !matches!(i, 1 | 2) {continue;}
                 if searching && !format!("{name} {}", studio_anny_detail_title(name)).to_ascii_lowercase().contains(&needle) {continue;}
                 Self::studio_anny_detail_slider(ui, &mut details, i, name, defaults.0[i]);
@@ -743,6 +761,9 @@ impl App {
             // Reset must also clear a slider's uncommitted drag value.
             for i in 0..details.0.len() {ui.ctx().data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_detail",i))));}
         }
+        if editor.group != previous_group {
+            self.focus_profile_studio_camera(&editor.group);
+        }
         ui.ctx().data_mut(|d|d.insert_temp(body_editor_id(),editor));
     }
 
@@ -758,6 +779,52 @@ impl App {
             ctx.data_mut(|d|d.remove::<f32>(egui::Id::new(("anny_detail", i))));
         }
         self.profile_preview_key = None;
+    }
+
+    /// A simplex blend: changing one axis rescales the remaining two while
+    /// preserving their ratio, so neither control can push the sum over 100%.
+    fn studio_anny_ancestry_slider(ui: &mut egui::Ui,
+        details: &mut jka_assets::body_shape::anny::Details, which: usize) {
+        let sum: f32 = details.0[3..6].iter().sum();
+        let ratios = if sum > 0.0 {
+            [details.0[3] / sum, details.0[4] / sum, details.0[5] / sum]
+        } else { [1.0 / 3.0; 3] };
+        let current = ratios[which];
+        let id = egui::Id::new(("anny_ancestry_mix", which));
+        let mut value = ui.ctx().data_mut(|d|d.get_temp::<f32>(id)).unwrap_or(current);
+        let title = if which == 0 { "African blend" } else { "Asian blend" };
+        let reset_label = studio_deformation_reset_label(ui, title)
+            .on_hover_text("Reset all three Anny ancestry blend weights to equal values");
+        let response = ui.add(egui::Slider::new(&mut value, 0.0..=1.0).step_by(1.0 / 63.0)
+            .custom_formatter(|x, _| format!("{:.0}%", x * 100.0)))
+            .on_hover_text("The third blend weight is inferred automatically; release to apply.");
+        let response = response.labelled_by(reset_label.id);
+        let reset = reset_label.clicked() || studio_deformation_slider_reset(&response);
+        if reset {
+            details.0[3..6].fill(0.5);
+            ui.ctx().data_mut(|d| {
+                d.remove::<f32>(egui::Id::new(("anny_ancestry_mix", 0)));
+                d.remove::<f32>(egui::Id::new(("anny_ancestry_mix", 1)));
+            });
+        } else if response.dragged() {
+            ui.ctx().data_mut(|d|d.insert_temp(id, value));
+        } else {
+            ui.ctx().data_mut(|d|d.remove::<f32>(id));
+            if (current-value).abs() > 0.00001 {
+                let remaining = 1.0 - value;
+                let other_total = 1.0 - current;
+                let mut result = ratios;
+                result[which] = value;
+                for i in 0..3 {
+                    if i != which {
+                        result[i] = remaining * if other_total > 0.00001 {
+                            ratios[i] / other_total
+                        } else { 0.5 };
+                    }
+                }
+                details.0[3..6].copy_from_slice(&result);
+            }
+        }
     }
 
     fn studio_anny_detail_slider(ui: &mut egui::Ui, details: &mut jka_assets::body_shape::anny::Details,
@@ -795,6 +862,9 @@ impl App {
             if ui.selectable_label(active == mode, title).clicked() {
                 picked = Some(mode);
             }
+        }
+        if picked.is_some() {
+            self.focus_profile_studio_camera("saber:both");
         }
         if let Some(mode) = picked.filter(|mode| *mode != active) {
             let singles: Vec<_> = self.profile_sabers.iter()
@@ -853,6 +923,9 @@ impl App {
                         }
                     });
                 }).response;
+            if combo.clicked() || combo.clicked_by(egui::PointerButton::Middle) || selected != current {
+                self.focus_profile_studio_camera(if hand == 0 { "saber:right" } else { "saber:left" });
+            }
             if combo.clicked_by(egui::PointerButton::Middle) {
                 selected = if hand == 0 { "single_1".to_owned() } else { "none".to_owned() };
             }
@@ -885,6 +958,9 @@ impl App {
                 ((packed >> 16) & 255) as f32 / 255.0];
             let picker = ui.color_edit_button_rgb(&mut rgb)
                 .on_hover_text("Blade color · Middle-click to restore blue");
+            if picker.clicked() || picker.clicked_by(egui::PointerButton::Middle) {
+                self.focus_profile_studio_camera(if hand == 0 { "saber:right" } else { "saber:left" });
+            }
             if picker.changed() {
                 let bytes = rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u32);
                 let packed = bytes[0] | bytes[1] << 8 | bytes[2] << 16;
@@ -935,12 +1011,14 @@ impl App {
             let dx = ui.ctx().input(|input| input.pointer.delta().x);
             if dx.abs() > 0.01 && dt > 0.0001 {
                 self.profile_preview_yaw = (self.profile_preview_yaw + dx * 0.42).rem_euclid(360.0);
+                self.profile_studio_camera.target_yaw = self.profile_preview_yaw;
                 self.profile_studio_spin_velocity = (dx * 0.42 / dt).clamp(-560.0, 560.0);
                 self.profile_preview_key = None;
             }
         } else if self.profile_studio_spin_velocity.abs() > 0.08 {
             let velocity = self.profile_studio_spin_velocity;
             self.profile_preview_yaw = (self.profile_preview_yaw + velocity * dt).rem_euclid(360.0);
+            self.profile_studio_camera.target_yaw = self.profile_preview_yaw;
             self.profile_studio_spin_velocity *= (-3.4 * dt).exp();
             self.profile_preview_key = None;
         }
@@ -949,9 +1027,14 @@ impl App {
             if scroll.abs() > 0.01 {
                 self.profile_preview_zoom = (self.profile_preview_zoom * (-scroll * 0.0015).exp())
                     .clamp(0.45, 2.5);
+                self.profile_studio_camera.target_zoom = self.profile_preview_zoom;
                 self.profile_preview_key = None;
             }
         }
+        // Eye position, angular orbit and distance all interpolate together.
+        // Keep the existing live preview/render frame cap as the clock source.
+        // Any dragged or inertial orbit has already replaced the angular goal.
+        self.tick_profile_studio_camera(dt);
         // JKA's Ghoul2 cranium/cervical post-multiplication path is applied in
         // present_profile_player_preview, after animation but before skinning.
         let target = if response.hovered() && !response.dragged() {
@@ -1016,6 +1099,7 @@ impl App {
                     if editor.group != group {
                         editor.group = group.to_owned();
                         editor.search.clear();
+                        self.focus_profile_studio_camera(group);
                     }
                     ui.ctx().data_mut(|d|d.insert_temp(body_editor_id(),editor));
                     if picked.is_some() { self.profile_studio_spin_velocity=0.0; }
@@ -1058,7 +1142,7 @@ impl App {
         // Saber modes stay in the stage. Both hand dropdowns and their RGB
         // editors below edit the original, authoritative saber cvars directly.
         let mode_area = egui::Rect::from_min_size(
-            egui::pos2(frame.right() - 267.0, frame.top() + 14.0), egui::vec2(251.0, 58.0));
+            egui::pos2(frame.right() - 267.0, frame.top() + 14.0), egui::vec2(251.0, 92.0));
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio_stage_saber_mode")
             .max_rect(mode_area), |ui| {
             ui.horizontal(|ui| self.studio_saber_mode(ui));
@@ -1069,7 +1153,40 @@ impl App {
                 } else { !self.profile_studio_show_saber };
                 self.profile_preview_key = None;
             }
+            ui.horizontal(|ui| {
+                let mut active = crate::cgame::player_presenter::saber_preview_debug_enabled();
+                if ui.checkbox(&mut active, "Saber debug").changed() {
+                    crate::cgame::player_presenter::set_saber_preview_debug(active);
+                    self.profile_preview_key = None;
+                }
+                if active && ui.small_button("Copy log").clicked() {
+                    ui.ctx().copy_text(
+                        crate::cgame::player_presenter::saber_preview_debug_snapshot());
+                }
+            });
         });
+        if crate::cgame::player_presenter::saber_preview_debug_enabled() {
+            let report = crate::cgame::player_presenter::saber_preview_debug_snapshot();
+            let panel = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(17.0, 166.0),
+                egui::vec2((rect.width() * 0.60).min(710.0).max(180.0), 207.0));
+            ui.scope_builder(egui::UiBuilder::new()
+                .id_salt("studio_saber_attachment_debug").max_rect(panel), |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(8, 16, 24, 240))
+                    .stroke(egui::Stroke::new(1.0, SKY))
+                    .inner_margin(egui::Margin::same(9))
+                    .show(ui, |ui| {
+                        ui.set_width((panel.width() - 18.0).max(1.0));
+                        label(ui, "SABER BOLT -> HILT -> BLADE (WORLD SPACE)", 11.0, SKY_SOFT);
+                        egui::ScrollArea::both().max_height(175.0).show(ui, |ui| {
+                            ui.monospace(if report.is_empty() {
+                                "Waiting for the next preview frame…"
+                            } else { report.as_str() });
+                        });
+                    });
+            });
+        }
 
         // Callout positions remain legible. Their connector endpoints come
         // exclusively from animated Ghoul2 bolt matrices, projected through
@@ -1095,11 +1212,17 @@ impl App {
                 .stroke(egui::Stroke::new(1.0, EDGE)))
                 .on_hover_text("Middle-click to remove");
             if button.clicked_by(egui::PointerButton::Middle) {
+                self.focus_profile_studio_camera(match group {
+                    1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
+                });
                 if let Err(error) = self.studio_set_cosmetic_group(group, None) {
                     self.console_status = error;
                 }
                 self.profile_preview_key = None;
             } else if button.clicked() {
+                self.focus_profile_studio_camera(match group {
+                    1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
+                });
                 self.profile_studio_cosmetic_group =
                     if self.profile_studio_cosmetic_group == group { 0 } else { group };
             }
@@ -1181,6 +1304,9 @@ impl App {
                                     .any(|item| self.network.cosmetics & item.bit !=0),
                             };
                             if ui.selectable_label(chosen,title).clicked() {
+                                self.focus_profile_studio_camera(match group {
+                                    1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
+                                });
                                 if let Err(error)=self.studio_set_cosmetic_group(group,bit) {
                                     self.console_status=error;
                                 }

@@ -26,18 +26,17 @@ pub const SUBMERGED_MIN_CULL: f32 = 256.0;
 ///
 /// `surface_offset` is how far the real (animated) surface over the eye sits above
 /// the volume's flat top, in render units. The eye is under water exactly when it is
-/// under `top + surface_offset`, i.e. when `eye.y - surface_offset` is under the top.
-/// Pass 0 for a flat plane. Distances are still measured from the true eye.
+/// under `top + surface_offset` and above the fixed authored floor.
+/// Pass 0 for a flat plane. Distances are measured from the true eye.
 pub fn submerged_cull_radius(
     eye: [f32; 3], volumes: &[WaterVolume], masks: &OceanMasks, distance: f32, surface_offset: f32,
 ) -> Option<f32> {
     if !(distance > 0.0) {
         return None;
     }
-    let wet_point = [eye[0], eye[1] - surface_offset, eye[2]];
     volumes
         .iter()
-        .any(|v| wet_point[1] < v.maximum[1] && v.contains(wet_point, masks))
+        .any(|v| eye[1] < v.maximum[1] + surface_offset && v.contains_displaced(eye, masks, surface_offset))
         .then(|| distance.max(SUBMERGED_MIN_CULL))
 }
 
@@ -125,6 +124,16 @@ mod tests {
         // A trough of -60: an eye at -30 is below the plane but in air.
         assert!(submerged_cull_radius([0.0, -30.0, 0.0], &[sea()], &masks, 2000.0, -60.0).is_none());
         assert!(submerged_cull_radius([0.0, -30.0, 0.0], &[sea()], &masks, 2000.0, 0.0).is_some());
+    }
+
+    #[test]
+    fn authored_floor_stays_fixed_under_crests_and_troughs() {
+        let masks = OceanMasks::default();
+        let shallow = WaterVolume { minimum:[-100.0,-56.0,-100.0],
+            maximum:[100.0,0.0,100.0], mask_slot:None };
+        assert!(submerged_cull_radius([0.0,-80.0,0.0], &[shallow], &masks, 2000.0, -40.0).is_none());
+        assert!(submerged_cull_radius([0.0,-40.0,0.0], &[shallow], &masks, 2000.0, 40.0).is_some());
+        assert!(submerged_cull_radius([0.0,-3273.0,0.0], &[shallow], &masks, 2000.0, 0.0).is_none());
     }
 
     #[test]

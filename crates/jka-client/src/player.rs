@@ -983,6 +983,31 @@ mod tests {
     }
 
     #[test]
+    fn local_emote_without_native_taunt_cancels_on_tapped_attack_and_force() {
+        let emote = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[{
+            "id":"local_cancel", "name":"Local cancel", "gla":"test.gla",
+            "first_frame":0, "end_frame":300, "fps":30, "loop":true
+        }]})).unwrap().remove(0);
+        for button in [jka_movement::BUTTON_ATTACK, jka_movement::BUTTON_ALT_ATTACK, 64, 512, 1024, 2048] {
+            let (mut player, _) = local();
+            crate::emotes::stop();
+            crate::emotes::play_world(emote.clone());
+            crate::emotes::poll_audio();
+            // The lightweight local server supplies no native taunt to bind.
+            player.update(Duration::from_millis(8), &HashSet::from([KeyCode::ControlLeft]), (0.0, 0.0), UserCmd::default()).unwrap();
+            assert!(!crate::emote_net::is_normal_taunt(player.view().torso_anim));
+            assert!(crate::emotes::active_preview().is_some());
+            // A one-frame tap must survive until the next authored command.
+            player.update(Duration::from_millis(1), &HashSet::new(), (0.0, 0.0), UserCmd { buttons: button, ..Default::default() }).unwrap();
+            assert!(crate::emotes::active_preview().is_some());
+            player.update(Duration::from_millis(7), &HashSet::new(), (0.0, 0.0), UserCmd::default()).unwrap();
+            assert!(crate::emotes::active_preview().is_none(), "button {button} did not stop the local emote");
+            assert!(crate::emotes::poll_audio().iter().any(|command| matches!(command, crate::emotes::AudioCommand::StopAll)));
+        }
+        crate::emotes::stop();
+    }
+
+    #[test]
     fn local_saber_attack_cycle_runs_through_server_side_generic_command_path() {
         // protocol-26 playerStateFields slot 23 is fd.saberAnimLevel.
         const SABER_ANIM_LEVEL_FIELD: usize = 23;

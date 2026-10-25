@@ -88,10 +88,13 @@ impl App {
     }
 
     pub(in crate::app) fn reset_asset_catalogs_for_game_change(&mut self) {
+        self.extensions.set_game(self.game.clone());
         self.refresh_color_luts();
         self.prepared_map_cache = None;
         self.stringed = None;
         self.ui_catalog.reset();
+        self.render_studio.cinematic_preview=None;
+        self.render_studio.cinematics=Default::default();
         self.profile_background_maps=None;
         self.profile_background_requested=None;
         self.profile_background_available=false;

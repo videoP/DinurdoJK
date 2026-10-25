@@ -2,6 +2,117 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_CG_BOBUP {
+        runtime: CvarDef::new(
+            "cg_bobUp", "0", "number", "TaystJK vertical walking/running view bob.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{}", app.view_bob.bob_up)),
+            |app, value| {
+                app.view_bob.bob_up = App::parse_cvar_finite("cg_bobUp", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() { settings.view_bob.bob_up = value; }
+                }
+            }),
+            archive: Some((28000, |state| state.presentation.view_bob.bob_up.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_BOBPITCH {
+        runtime: CvarDef::new(
+            "cg_bobPitch", "0", "number", "TaystJK bobCycle-driven first-person pitch.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{}", app.view_bob.bob_pitch)),
+            |app, value| {
+                app.view_bob.bob_pitch = App::parse_cvar_finite("cg_bobPitch", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() { settings.view_bob.bob_pitch = value; }
+                }
+            }),
+            archive: Some((28001, |state| state.presentation.view_bob.bob_pitch.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_BOBROLL {
+        runtime: CvarDef::new(
+            "cg_bobRoll", "0", "number", "TaystJK alternating footstep view roll.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{}", app.view_bob.bob_roll)),
+            |app, value| {
+                app.view_bob.bob_roll = App::parse_cvar_finite("cg_bobRoll", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() { settings.view_bob.bob_roll = value; }
+                }
+            }),
+            archive: Some((28002, |state| state.presentation.view_bob.bob_roll.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_RUNPITCH {
+        runtime: CvarDef::new(
+            "cg_runPitch", "0", "number", "TaystJK forward-velocity first-person pitch tilt.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{}", app.view_bob.run_pitch)),
+            |app, value| {
+                app.view_bob.run_pitch = App::parse_cvar_finite("cg_runPitch", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() { settings.view_bob.run_pitch = value; }
+                }
+            }),
+            archive: Some((28003, |state| state.presentation.view_bob.run_pitch.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_RUNROLL {
+        runtime: CvarDef::new(
+            "cg_runRoll", "0", "number", "TaystJK lateral-velocity first-person roll tilt.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{}", app.view_bob.run_roll)),
+            |app, value| {
+                app.view_bob.run_roll = App::parse_cvar_finite("cg_runRoll", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(value) = value.parse::<f32>() {
+                    if value.is_finite() { settings.view_bob.run_roll = value; }
+                }
+            }),
+            archive: Some((28004, |state| state.presentation.view_bob.run_roll.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_UI_GAMELAUNCHSCREEN {
         runtime: CvarDef::new("ui_gameLaunchScreen", "main", "main|play|solo|servers|demo|profile|controls|setup|chatlogs|screenshots|devtools|assets|maps", "Menu to open on the next game launch without a map.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.game_launch_screen.page_name().to_owned()),
@@ -829,7 +940,7 @@ app_cvars! {
     APP_CG_SWIMTILT {
         runtime: CvarDef::new(
             "cg_swimTilt", "0.9", "0..1",
-            "Client-only direction-based swim body tilt (0 stock OpenJK, 1 full; fractional strengths allowed). Keeps the stock swim animations and never alters collision, movement, or server state.",
+            "Client-only direction-based swim body tilt (0 stock OpenJK, 1 full; fractional strengths allowed), with a gradual head-up lift near the water surface. Keeps the stock swim animations and never alters collision, movement, or server state.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.swim_tilt.to_string()),
             |app, value| App::cvar_set_cg_swimtilt(app, APP_CG_SWIMTILT.entry.name, &value.to_string()),
@@ -866,7 +977,7 @@ app_cvars! {
     APP_CG_SWIMTURNBANK {
         runtime: CvarDef::new(
             "cg_swimTurnBank", "1", "0..1",
-            "Client-only swim banking up to 45 degrees in response to changes in horizontal travel direction (0 off, 1 full). cg_swimTilt 0 disables all swim orientation changes; does not affect physics or camera.",
+            "Client-only swim banking up to 60 degrees in response to changes in horizontal travel direction (0 off, 1 full). cg_swimTilt 0 disables all swim orientation changes; does not affect physics or camera.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.swim_turn_bank.to_string()),
             |app, value| App::cvar_set_cg_swimturnbank(app, APP_CG_SWIMTURNBANK.entry.name, &value.to_string()),

@@ -134,6 +134,7 @@ impl PlayerPresenter {
     pub fn set_gore_limit(&mut self, limit: usize) {
         self.gore_limit = limit.min(64);
         if self.gore_limit == 0 {
+            self.pending_gore.clear();
             self.gore.clear();
             self.last_gpu.clear();
         }
@@ -594,6 +595,47 @@ impl PlayerPresenter {
         }
     }
 
+    /// Sample player hulls before stepping so first-person prediction and remote
+    /// interpolation can both push client-side corpses.
+    pub(crate) fn prepare_corpse_player_contacts(
+        &mut self,
+        entities: &[PresentedEntity],
+        local: Option<&PresentedEntity>,
+        local_hull_height: f32,
+        local_can_push: bool,
+        current_time: i32,
+    ) {
+        use crate::cgame::ragdoll::PhysicsPlayer;
+        let mut players = Vec::new();
+        if self.ragdolls.active() {
+            for entity in entities.iter().filter(|entity| Some(entity.number) != local.map(|e| e.number))
+                .chain(local.into_iter().filter(|_| local_can_push)) {
+                if entity.entity_type != ET_PLAYER || entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
+                    || entity.state.field_i32("m_iVehicleNum").unwrap_or(0) != 0 {
+                    continue;
+                }
+                let is_local = Some(entity.number) == local.map(|e| e.number);
+                let (mins, maxs) = if is_local {
+                    // BG_PlayerStateToEntityState does not encode solid. The
+                    // caller supplies playerState's standing/crouched height.
+                    ([-15.0, -15.0, -24.0], [15.0, 15.0, local_hull_height])
+                } else {
+                    let solid = entity.state.field_i32("solid").unwrap_or(0);
+                    if solid == 0 || solid == 0xffffff { continue; }
+                    let radius = (solid & 255) as f32;
+                    let below = ((solid >> 8) & 255) as f32;
+                    let above = ((solid >> 16) & 255) as f32 - 32.0;
+                    ([-radius, -radius, -below], [radius, radius, above])
+                };
+                players.push(PhysicsPlayer {
+                    entity: entity.number, origin: entity.origin, mins, maxs,
+                    teleport_bit: entity.state.field_i32("eFlags").unwrap_or(0) & 8,
+                });
+            }
+        }
+        self.ragdolls.set_players(&players, current_time);
+    }
+
     /// Advance the visual physics world exactly once for this presentation frame.
     /// Ragdolls spawned later in the frame start from the exact current Ghoul2 pose.
     pub fn begin_physics_frame(&mut self, current_time: i32) {
@@ -637,15 +679,15 @@ impl PlayerPresenter {
     /// Begin one CG_AddEntities blob-shadow collection pass. All eligible
     /// players/NPCs are packed into one dynamic surface so the OpenJK visual
     /// costs one draw rather than one temporary-poly draw per character.
-    pub fn begin_blob_shadow_frame(&mut self, enabled: bool) {
-        self.blob_shadows_enabled = enabled;
+    pub fn begin_blob_shadow_frame(&mut self, opacity: f32) {
+        self.blob_shadow_opacity = opacity.clamp(0.0, 1.0);
         self.blob_shadow_instances.clear();
     }
 
     /// Finish cg_shadows 1. Keep the stock `markShadow` image *and its authored
     /// first-stage blend mode*, while batching all blobs into one surface.
     pub fn finish_blob_shadow_frame(&mut self) -> Option<DynamicModelSurface> {
-        if !self.blob_shadows_enabled || self.blob_shadow_instances.is_empty() {
+        if self.blob_shadow_opacity <= 0.0 || self.blob_shadow_instances.is_empty() {
             return None;
         }
         if !self.blob_shadow_texture_resolved {

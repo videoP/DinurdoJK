@@ -407,6 +407,7 @@ fn append_emitting_triangle(
                 color,
                 radius,
                 intensity,
+                shadow_power: 0.0,
                 falloff: DynamicLightFalloff::Smooth,
                 surface_lighting: true,
                 emitter_normal: emitter_normal.to_array(),
@@ -443,14 +444,20 @@ pub(in crate::scene) fn append_surface_light_triangle(
 pub(in crate::scene) fn bsp_surface_lights(
     mesh: &jka_assets::bsp::Mesh,
     materials: &[SurfaceMaterial],
-) -> (Vec<DynamicLight>, Vec<DynamicLight>, SurfaceLightBuildStats) {
+) -> (Vec<DynamicLight>, Vec<DynamicLight>, SurfaceLightBuildStats, Vec<DynamicLight>) {
     let mut authored_candidates = Vec::new();
     let mut promoted_candidates = Vec::new();
+    let mut static_promoted_candidates = Vec::new();
+    let mut static_authored_candidates = Vec::new();
     for batch in &mesh.batches {
         let Some(material) = materials.get(batch.shader) else {
             continue;
         };
+        if material.surface_light.is_none() && material.shader_light.is_none() { continue; }
         let two_sided = material.cull == CullMode::None;
+        // A lamp is a connected fixture patch, not one cubemap per subdivided
+        // triangle. Keep the original samples for the opt-in runtime/GI paths.
+        let mut patches = Vec::new();
         for triangle in mesh.indices[batch.indices.clone()].as_chunks::<3>().0 {
             let vertices = (*triangle).map(|index| &mesh.vertices[index as usize]);
             let positions =
@@ -460,6 +467,7 @@ pub(in crate::scene) fn bsp_surface_lights(
                 .into_iter()
                 .sum::<Vec3>()
                 .normalize_or_zero();
+            patches.push((positions, normal));
             if let Some(authored) = material.surface_light {
                 append_surface_light_triangle(
                     &mut authored_candidates,
@@ -487,6 +495,15 @@ pub(in crate::scene) fn bsp_surface_lights(
                 );
             }
         }
+        if let Some(authored) = material.surface_light {
+            append_emitting_patches(&mut static_authored_candidates, &patches,
+                authored.value, authored.color, authored.subdivide, two_sided, 0);
+        }
+        if let Some(promoted) = material.shader_light.filter(|p| p.bake_reasons != 0) {
+            let overlap = if material.surface_light.is_some() { materials::SHADER_LIGHT_AUTHORED_OVERLAP } else { 0 };
+            append_emitting_patches(&mut static_promoted_candidates, &patches,
+                promoted.value, promoted.color, promoted.subdivide, two_sided, promoted.bake_reasons | overlap);
+        }
     }
 
     let mut stats = SurfaceLightBuildStats {
@@ -496,6 +513,7 @@ pub(in crate::scene) fn bsp_surface_lights(
     };
     authored_candidates.sort_by(|a, b| b.weight.total_cmp(&a.weight));
     promoted_candidates.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+    static_promoted_candidates.sort_by(|a,b|b.weight.total_cmp(&a.weight));
 
     // Preserve independent real-time pools so authored q3map emitters and
     // shader-promoted emitters remain live A/B testable. Do not carry the old
@@ -513,6 +531,10 @@ pub(in crate::scene) fn bsp_surface_lights(
         .take(MAX_VOXEL_GI_SURFACE_LIGHTS)
         .map(|candidate| candidate.light)
         .collect::<Vec<_>>();
+    let mut bake_candidates:Vec<_>=static_authored_candidates.into_iter()
+        .chain(static_promoted_candidates).collect();
+    bake_candidates.sort_by(|a,b|b.weight.total_cmp(&a.weight));
+    let static_bake_lights=bake_candidates.into_iter().map(|candidate|candidate.light).collect();
     authored_candidates.truncate(MAX_REALTIME_SURFACE_LIGHTS);
     promoted_candidates.truncate(MAX_REALTIME_SURFACE_LIGHTS);
     stats.authored_selected = authored_candidates.len();
@@ -521,7 +543,89 @@ pub(in crate::scene) fn bsp_surface_lights(
     let mut lights = Vec::with_capacity(stats.authored_selected + stats.promoted_selected);
     lights.extend(authored_candidates.into_iter().map(|candidate| candidate.light));
     lights.extend(promoted_candidates.into_iter().map(|candidate| candidate.light));
-    (lights, gi_authored_lights, stats)
+    (lights, gi_authored_lights, stats, static_bake_lights)
+}
+
+/// Merge triangles sharing an edge and emitting in the same direction. A
+/// fixture's energy and centroid are independent of BSP triangle subdivision.
+fn append_emitting_patches(
+    candidates: &mut Vec<SurfaceLightCandidate>,
+    triangles: &[([Vec3; 3], Vec3)],
+    value: f32, color: [f32; 3], subdivide: f32, two_sided: bool, mask: u32,
+) {
+    use std::collections::HashMap;
+    fn root(parents: &mut [usize], mut i: usize) -> usize {
+        while parents[i] != i { parents[i] = parents[parents[i]]; i = parents[i]; }
+        i
+    }
+    let mut parents: Vec<_> = (0..triangles.len()).collect();
+    let mut edges = HashMap::<([i32;3],[i32;3]), Vec<usize>>::new();
+    for (i, (p, n)) in triangles.iter().enumerate() {
+        let keys = p.map(|p| p.to_array().map(|v| (v * 16.0).round() as i32));
+        for (a,b) in [(0,1),(1,2),(2,0)] {
+            let edge = if keys[a] < keys[b] { (keys[a],keys[b]) } else { (keys[b],keys[a]) };
+            for &j in edges.entry(edge).or_default().iter() {
+                if n.dot(triangles[j].1) > 0.0 {
+                    let a = root(&mut parents,i); let b = root(&mut parents,j); parents[a] = b;
+                }
+            }
+            edges.get_mut(&edge).unwrap().push(i);
+        }
+    }
+    let mut groups = std::collections::BTreeMap::<usize,(Vec3,Vec3,f32)>::new();
+    for (i,(p,n)) in triangles.iter().enumerate() {
+        let area = (p[1]-p[0]).cross(p[2]-p[0]).length()*0.5;
+        if !area.is_finite() || area <= 0.01 { continue; }
+        let group = groups.entry(root(&mut parents,i)).or_insert((Vec3::ZERO,Vec3::ZERO,0.0));
+        group.0 += (p[0]+p[1]+p[2])*(area/3.0); group.1 += *n*area; group.2 += area;
+    }
+    for (_, (centroid,normal,area)) in groups {
+        let normal = normal.normalize_or_zero();
+        let intensity = (value/300.0*area/subdivide.max(16.0).powi(2)).clamp(0.0,8.0);
+        if normal.length_squared() < 1e-6 || intensity <= 1e-5 { continue; }
+        candidates.push(SurfaceLightCandidate {
+            light: DynamicLight {
+                position: (centroid/area + normal*8.0).to_array(), color,
+                radius: value.max(subdivide*2.0).clamp(64.0,4096.0), intensity,
+                shadow_power: (value/300.0)*area*surface_light_luminance(color).max(0.0)*1.5,
+                falloff: DynamicLightFalloff::Smooth, surface_lighting: true,
+                emitter_normal: normal.to_array(), emitter_two_sided: two_sided,
+                angle_attenuation:true,angle_scale:0.0,extra_distance:0.0,shader_promotion_mask:mask,
+            }, weight:area*surface_light_luminance(color).max(0.0)*value,
+        });
+    }
+}
+
+#[cfg(test)]
+mod static_lamp_tests {
+    use super::*;
+
+    #[test]
+    fn connected_lamp_is_one_source_and_separate_fixtures_stay_separate() {
+        let n=Vec3::Y;
+        let a=Vec3::ZERO; let b=Vec3::X*64.0; let c=Vec3::Z*32.0; let d=b+c;
+        let triangles=vec![([a,b,c],n),([b,d,c],n),([a+Vec3::X*256.0,b+Vec3::X*256.0,c+Vec3::X*256.0],n)];
+        let mut lamps=Vec::new();
+        append_emitting_patches(&mut lamps,&triangles,300.0,[1.0;3],120.0,false,materials::SHADER_LIGHT_GLOW);
+        assert_eq!(lamps.len(),2);
+        assert!((lamps[0].light.intensity-2048.0/14400.0).abs()<1e-6);
+        assert_eq!(lamps[0].light.position,[32.0,8.0,16.0]);
+    }
+
+    #[test]
+    #[ignore = "requires the existing retail assets; run explicitly for the reported lamp location"]
+    fn retail_ffa3_baked_glow_fixture_catalog() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/base");
+        let map=crate::scene::prepare(&root,None,"mp/ffa3").unwrap();
+        let eye=Vec3::from_array(render_position([1860.0,1949.0,34.0]));
+        let lamps:Vec<_>=map.static_bake_lights.iter().filter(|l|
+            l.shader_promotion_mask & materials::SHADER_LIGHT_GLOW != 0).collect();
+        println!("FFA3: {} static fixtures, {} glow fixtures",map.static_bake_lights.len(),lamps.len());
+        assert!(lamps.len()<=253,"glow catalog must fit the device's retained bake layers");
+        let nearby:Vec<_>=lamps.iter().enumerate().filter(|(_,l)|Vec3::from_array(l.position).distance(eye)<280.0).collect();
+        for (i,l) in &nearby { println!("Nearby glow layer {i}: JKA {:?}, intensity {}, radius {}",crate::scene::jka_position(l.position),l.intensity,l.radius); }
+        assert!(nearby.len()>=2,"both wall fixtures at the reported location must survive selection");
+    }
 }
 
 pub(in crate::scene) fn voxel_gi_index(x: u32, y: u32, z: u32, bounds: [u32; 3]) -> usize {

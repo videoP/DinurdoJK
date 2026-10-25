@@ -15,6 +15,9 @@ use super::rt_diagnostics::{self, ReceiverFeatures};
 #[cfg(test)]
 #[path = "rt_glass_tests.rs"]
 mod rt_glass_tests;
+#[cfg(test)]
+#[path = "rt_compile_probe_tests.rs"]
+mod rt_compile_probe_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::renderer) struct RayTracedRigidMeshKey {
@@ -1003,14 +1006,14 @@ impl Renderer {
             update_mode: wgpu::AccelerationStructureUpdateMode::Build,
         });
         let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        tlas[0] = Some(wgpu::TlasInstance::new(&blas, identity, 0, 0xff));
+        tlas[0] = Some(wgpu::TlasInstance::new(&blas, identity, 0, 0x01));
         let mut inline_base = 1usize;
         if let Some(mask) = static_mask_blas.as_ref() {
             tlas[1] = Some(wgpu::TlasInstance::new(
                 &mask.blas,
                 identity,
                 mask.geometry_base,
-                0xff,
+                0x01,
             ));
             inline_base += 1;
         }
@@ -1027,7 +1030,7 @@ impl Renderer {
                     &caster.blas,
                     pose.rt_transform(),
                     0,
-                    0xff,
+                    0x02,
                 ));
             }
             if let Some(caster) = inline_mask_blas[slot].as_ref() {
@@ -1035,7 +1038,7 @@ impl Renderer {
                     &caster.blas,
                     pose.rt_transform(),
                     caster.geometry_base,
-                    0xff,
+                    0x02,
                 ));
             }
         }
@@ -1629,14 +1632,14 @@ impl Renderer {
                 rt.inline_blas
                     .get(slot)
                     .and_then(Option::as_ref)
-                    .map(|caster| wgpu::TlasInstance::new(&caster.blas, transform, 0, 0xff))
+                    .map(|caster| wgpu::TlasInstance::new(&caster.blas, transform, 0, 0x02))
             });
             rt._tlas[base + 1] = pose.and_then(|transform| {
                 rt.inline_mask_blas
                     .get(slot)
                     .and_then(Option::as_ref)
                     .map(|caster| {
-                        wgpu::TlasInstance::new(&caster.blas, transform, caster.geometry_base, 0xff)
+                        wgpu::TlasInstance::new(&caster.blas, transform, caster.geometry_base, 0x02)
                     })
             });
         }
@@ -1686,7 +1689,7 @@ impl Renderer {
                 0
             };
             let instance = rt.skinned_blas_cache.get(&caster.key).map(|resource| {
-                wgpu::TlasInstance::new(&resource.blas, identity, custom_data, 0xff)
+                wgpu::TlasInstance::new(&resource.blas, identity, custom_data, 0x02)
             });
             rt._tlas[index] = instance;
             active_skinned_triangles =
@@ -1745,7 +1748,7 @@ impl Renderer {
                                 &caster.blas,
                                 source.transform,
                                 custom_data,
-                                0xff,
+                                0x02,
                             )),
                             caster.triangle_count,
                         )
@@ -1908,11 +1911,22 @@ pub(in crate::renderer) fn rt_sampled_light_loops(source: &str) -> Result<String
 /// variant shares (the weather maths and forward weather shading, and surface
 /// deformation).
 pub(in crate::renderer) fn compose_world_shader(base: &str) -> String {
+    // Raster BSP shaders do not declare ENABLE_RAY_TRACED_SHADOWS. Only the
+    // RT-transformed shader has that override, so specialize this guard while
+    // assembling the shared lamp-shadow receiver module. A runtime `if` cannot
+    // hide an undeclared WGSL identifier from the shader parser.
+    // Inferred map lamps always use raster moving-caster visibility, including
+    // when transient lights or the sun use RT.
+    let raster_receiver_guard =
+        "fn lamp_raster_receiver_culling_safe() -> bool { return true; }";
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         weather::with_world_weather(base),
         include_str!("../../surface_deformation.wgsl"),
-        include_str!("../../sky_fractal.wgsl")
+        include_str!("../../sky_fractal.wgsl"),
+        include_str!("lightmap_sun.wgsl"),
+        raster_receiver_guard,
+        include_str!("lightmap_local.wgsl")
     )
 }
 
@@ -2001,7 +2015,7 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     source = source.replacen(
         CASCADE_FN,
         &format!(
-            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
+            "{rt_visibility}{CASCADE_FN}\n    if (ENABLE_RAY_TRACED_SUN && !ENABLE_CASCADED_SHADOWS) {{\n        return ray_traced_shadow_visibility(input, normal);\n    }}"
         ),
         1,
     );
@@ -2009,10 +2023,24 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     source = source.replacen(
         LOCAL_FN,
         &format!(
-            "{LOCAL_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS) {{\n        return ray_traced_local_shadow_visibility(light, world_position, receiver_normal);\n    }}"
+            "{LOCAL_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS && light.shadow.w >= 0.5) {{\n        return ray_traced_local_shadow_visibility(light, world_position, receiver_normal);\n    }}"
         ),
         1,
     );
+
+    // Static point/area lights retain cubemap shadows and raster glass. Only
+    // the runtime transient marker selects hardware local-light visibility.
+    const LOCAL_RGB_FN: &str = "fn local_light_shadow_rgb(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> vec3<f32> {";
+    source = source.replacen(LOCAL_RGB_FN,
+        &format!("{LOCAL_RGB_FN}\n    if (ENABLE_RAY_TRACED_SHADOWS && light.shadow.w >= 0.5) {{\n        return rt_local_shadow_rgb(light, world_position, receiver_normal);\n    }}"), 1);
+
+    // Preserve the authored CSM + glass response in hybrid, then multiply by
+    // RT visibility for dynamic blockers. Calling the original function via a
+    // cloned declaration avoids bypassing static glass/Bevy filtering.
+    const SUN_RECEIVER: &str = "fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {";
+    let csm_receiver = rt_models::declaration(&source, SUN_RECEIVER)?;
+    source = source.replacen(SUN_RECEIVER,
+        &format!("{}\n{SUN_RECEIVER}", csm_receiver.replacen("fn sun_shadow_transmission(", "fn csm_sun_shadow_transmission(", 1)), 1);
 
     // RGB sun queries go through the same RT BLAS/TLAS and material flags as
     // local shadows. Enabled mode bypasses the scalar sun cache because its
@@ -2022,7 +2050,7 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
         return Err("RGB sunlight receiver hook not found".to_string());
     }
     source = source.replacen(SUN_RGB_FN,
-        &format!("{SUN_RGB_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{ return rt_sun_shadow_rgb(input, normal); }}"), 1);
+        &format!("{SUN_RGB_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{\n        if (ENABLE_CASCADED_SHADOWS) {{\n            let static_visibility = csm_sun_shadow_transmission(input, normal);\n            if (all(static_visibility <= vec3<f32>(0.0))) {{ return static_visibility; }}\n            return static_visibility * rt_sun_shadow_rgb(input, normal);\n        }}\n        return rt_sun_shadow_rgb(input, normal);\n    }}"), 1);
 
     // The lean shader compiles the sun-shadow darkening out unless a cascade is
     // enabled. The RT sun is not a cascade, so open that gate for it. Absent in
@@ -2053,15 +2081,7 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     source.push_str(include_str!("../../rt_resolution_read.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_surface.wgsl"));
     source.push_str(include_str!("../../rt_local_rate_read.wgsl"));
-    source.push_str("\nfn rt_rate_local_shadow_rgb(light: PointLight, input: VertexOut, normal: vec3<f32>, slot: u32, sample_index: u32) -> vec3<f32> {\n    let cached = rt_rate_local_visibility(input, normal, slot, sample_index);\n    if (cached >= 0.0 && ((rt_shadow_flags.flags.z != 0u) == ENABLE_MAP_LIGHT_SIMULATION)) { return vec3<f32>(cached); }\n    return rt_local_shadow_rgb(light, input.world_position, normal);\n}\n");
-    if features.glass {
-        for n in ["normal", "n"] {
-            source = source.replace(
-                &format!("local_light_shadow_rgb(light, input.world_position, {n})"),
-                &format!("rt_local_shadow_rgb(light, input.world_position, {n})"),
-            );
-        }
-    }
+    source.push_str("\nfn rt_rate_local_shadow_rgb(light: PointLight, input: VertexOut, normal: vec3<f32>, slot: u32, sample_index: u32) -> vec3<f32> {\n    if (light.shadow.w < 0.5) { return local_light_shadow_rgb(light, input.world_position, normal); }\n    let cached = rt_rate_local_visibility(input, normal, slot, sample_index);\n    if (cached >= 0.0 && ((rt_shadow_flags.flags.z != 0u) == ENABLE_MAP_LIGHT_SIMULATION)) { return vec3<f32>(cached); }\n    return rt_local_shadow_rgb(light, input.world_position, normal);\n}\n");
 
     // The enhanced ocean path has one outer guard that bypasses the common
     // visibility helper. Let the RT variant enter that same authoritative path.
@@ -2183,7 +2203,7 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
     scene: RtReceiverScene<'_>,
     sun_shadow_history: &rt_resolution::RtSunShadowHistory,
 ) -> wgpu::BindGroup {
-    let shadow_sampler = if cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps {
+    let shadow_sampler = if matches!(cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities) {
         &shadow.bevy_sampler
     } else {
         &shadow.legacy_sampler
@@ -2335,3 +2355,22 @@ pub(in crate::renderer) fn create_shadow_receiver_bind_group(
         ],
     })
 }
+
+#[cfg(test)]
+mod hybrid_sun_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_world_shader_retains_csm_and_dynamic_ray_query() {
+        let source = ray_traced_world_shader_source(include_str!("../../bsp.wgsl"))
+            .expect("hybrid RT shader generation must preserve CSM receiver");
+        assert!(source.contains("fn csm_sun_shadow_transmission("));
+        assert!(source.contains("static_visibility * rt_sun_shadow_rgb(input, normal)"));
+        assert!(source.contains("fn rt_sun_trace_mask() -> u32"));
+        assert!(source.contains("RayDesc(ray_flags, instance_mask,"));
+    }
+}
+
+#[cfg(test)]
+#[path = "transient_rt_tests.rs"]
+mod transient_rt_tests;

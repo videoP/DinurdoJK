@@ -12,6 +12,7 @@ use crate::app::{
 fn frontend_scene_camera(mut camera: crate::camera::Camera) -> crate::camera::Camera {
     camera.set_presentation_fov(super::constants::FRONTEND_SCENE_FOV);
     camera.shake = Default::default();
+    camera.clear_first_person_bob();
     camera
 }
 
@@ -450,6 +451,40 @@ impl App {
         })
     }
 
+    pub(in crate::app) fn weapon_select_ui(&self, now: Instant) -> Option<ui::UiWeaponSelect> {
+        if now >= self.weapon_select_until? { return None; }
+        let ps = self.live_player_state()?;
+        const PMF_FOLLOW: i32 = 4096;
+        const PM_SPECTATOR: i32 = 4;
+        if ps.stats[0] <= 0 || ps.persistant[3] == 3
+            || ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0
+            || ps.field_i32("pm_type").unwrap_or(0) == PM_SPECTATOR
+            || ps.field_i32("emplacedIndex").unwrap_or(0) != 0
+        { return None; }
+        let mut selectable_bits = 0_u32;
+        let mut ammo_available_bits = 0_u32;
+        for weapon in 1..=16 {
+            let Some((ammo_index, primary_cost, alt_cost)) = jka_movement::weapon_info(weapon) else {
+                continue;
+            };
+            let ammo = ps.ammo.get(ammo_index.max(0) as usize).copied().unwrap_or(0);
+            let has_ammo = ammo >= primary_cost || ammo >= alt_cost;
+            let detpack_valid = weapon != 14 || ammo > 0
+                || ps.field_i32("hasDetPackPlanted").unwrap_or(0) != 0;
+            if has_ammo { ammo_available_bits |= 1 << weapon; }
+            if ps.stats[4] & (1 << weapon) != 0 && has_ammo && detpack_valid {
+                selectable_bits |= 1 << weapon;
+            }
+        }
+        Some(ui::UiWeaponSelect {
+            selected: self.live_input.weapon_select,
+            owned_bits: ps.stats[4] as u32,
+            selectable_bits,
+            ammo_available_bits,
+            saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
+        })
+    }
+
     pub(in crate::app) fn publish_transient_ui(&self) {
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
         let mut console_notify_lines = self.console_notify_ui_snapshot();
@@ -467,6 +502,7 @@ impl App {
         let scoreboard = self.visible_scoreboard();
         let scoreboard_focus_client = self.scoreboard_focus_client();
         let force_select = self.force_select_ui(Instant::now());
+        let weapon_select = self.weapon_select_ui(Instant::now());
         if self.overlay == OverlayMode::HudEdit {
             self.hud_edit_transient_samples(
                 &mut chat_lines,
@@ -489,6 +525,7 @@ impl App {
             prediction_debug,
             crosshair_target,
             force_select,
+            weapon_select,
             follow_name,
             game_timer: self.game_timer_text(),
             mini_scores: self.mini_scores_ui(),
@@ -497,7 +534,7 @@ impl App {
             scoreboard,
             scoreboard_focus_client,
             speedometer,
-            lagometer: self.lagometer_ui.clone(),
+            lagometer: self.current_lagometer_ui(),
             team_overlay,
         });
     }

@@ -1,3 +1,4 @@
+mod settings_search_codegen;
 use std::{
     env, fs,
     io::{BufReader, Write},
@@ -16,11 +17,25 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../icon.png");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=DINURDOJK_UPDATE_PUBLIC_KEY_HEX");
     emit_build_timestamp();
+    settings_search_codegen::generate(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("settings_search_index.rs"),
+    ).expect("generate Settings search index");
 
     if env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return;
     }
+
+    println!("cargo:rerun-if-changed=native");
+    println!("cargo:rerun-if-changed=../../vendor/ealman");
+    cc::Build::new()
+        .cpp(true).std("c++17").define("EAXMANVERSION", "3")
+        .include("../../vendor/ealman")
+        .files(["native/eal_scene.cpp", "../../vendor/ealman/EalMan.cpp", "../../vendor/ealman/Chunk.cpp"])
+        .flag_if_supported("/EHsc")
+        .compile("djk_eal_scene");
 
     if let Err(error) = build_windows_icon() {
         panic!("failed to embed ../../icon.png as the DinurdoJK executable icon: {error}");

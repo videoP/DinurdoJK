@@ -23,6 +23,7 @@ use crate::renderer::{
 };
 use bytemuck::Zeroable;
 use crate::renderer::world::inline_models::sky_portal_inline_eligible;
+use crate::renderer::lighting::shadow_resources::{CachedStaticCascade, padded_static_shadow_matrix, static_shadow_covers_camera};
 
 /// `JKA_FIXED_SHADER_TIME=<seconds>` freezes the renderer clock so captures from
 /// different shader modes or builds compare without animation (benchmarks only).
@@ -89,6 +90,7 @@ impl Renderer {
         }
 
         self.sync_sun_bake();
+        self.sync_static_sun_lightmaps();
         self.sync_baked_sun_lightmap_cache();
 
         if self.baked_brightness.busy {
@@ -177,16 +179,16 @@ impl Renderer {
         // PSO and native surface agree that ocean support is live; until then
         // authored water remains, including its normal geometry and optics.
         let render_ocean = self.ocean_enabled && native_ocean_ready && active_world_variant.is_some_and(|key| key.ocean);
-        if render_ocean && self.ocean_sky_infinite {
+        if render_ocean && self.ocean_sky_infinite && self.ocean_settings.backend != 3 {
             self.ensure_ocean_far_pipeline();
         }
         if render_ocean && self.ocean_settings.backend == 2 && self.ocean_settings.blue_water_underwater_mode == 4 {
             self.ensure_ocean_native_mesh_pipelines(self.wireframe_mask & ui::wireframe::OCEAN != 0);
         }
-        let native_submerged_mesh_ready = self.native_submerged_mesh_ready();
+        let native_submerged_mesh_ready = self.ocean_settings.backend == 2 && self.native_submerged_mesh_ready();
         let ocean_clipmap =
             render_ocean.then(|| usize::from(self.ocean_settings.mesh_quality.min(1)));
-        self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean && self.ocean_settings.backend != 3);
+        self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean);
         let topology_started=render_ocean.then(Instant::now);
         self.refresh_eye_wave_offset(camera.position);
         // BSP water volumes are valid even with the promoted ocean renderer
@@ -208,8 +210,7 @@ impl Renderer {
         if render_ocean {
             let prepare_godot_geometry = self.ocean_settings.backend == 0
                 || self.ocean_settings.blue_water_prepare_godot_mesh
-                || (self.ocean_settings.backend == 2
-                    && self.ocean_settings.blue_water_underwater_mode == 4
+                || (self.ocean_settings.uses_godot_submerged_mesh()
                     && self.camera_water_surface > crate::renderer::NO_WATER_SURFACE
                     && !native_submerged_mesh_ready);
             // Native Bluewater still needs camera-snapped centres, extension
@@ -223,10 +224,13 @@ impl Renderer {
         let menu_backdrop_requested = self.menu_backdrop_requested();
         if menu_backdrop_requested {
             self.ensure_menu_backdrop_resources();
+            if self.neon_menu_wanted() {
+                self.prepare_neon_menu();
+            }
         }
         // The first menu frame is allowed to render directly while the backdrop
         // PSO/resources compile in the background; never block gameplay/UI.
-        let menu_backdrop_active = menu_backdrop_requested && self.menu_backdrop.is_some();
+        let menu_backdrop_active = menu_backdrop_requested && self.menu_backdrop_ready();
 
         let crt_active = self.crt_scope != ui::CrtScope::Off;
         if crt_active {
@@ -478,6 +482,12 @@ impl Renderer {
             // the eye (`ensure_submerged_fog_capture`); eye.w is otherwise unused.
             if self.camera_water_surface > crate::renderer::NO_WATER_SURFACE {
                 uniform.eye[3] = self.camera_water_surface + self.eye_wave_offset;
+                uniform.forward[3] = self.water_boxes.iter().filter(|volume| {
+                    (volume.maximum[1] - self.camera_water_surface).abs() < 0.75
+                        && volume.contains_displaced(camera.position.to_array(),
+                            self.world.as_ref().unwrap().ocean_masks.as_ref(), self.eye_wave_offset)
+                }).map(|volume| volume.minimum[1]).reduce(f32::min)
+                    .unwrap_or(self.camera_water_surface);
             }
             godot_receiver_live = self.ocean_settings.backend != 0
                 && matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4)
@@ -518,9 +528,13 @@ impl Renderer {
                             if region.contains([x, z]) { corner_bits |= 1 << c; }
                         }
                         let next = uniform.sky_info[0] as usize;
+                        if (surface.plane_height - self.camera_water_surface).abs() < 0.75
+                            && region.contains([camera.position.x, camera.position.z]) {
+                            uniform.forward[3] = world.ocean_bottoms[slot];
+                        }
                         uniform.sky_regions[next] = crate::ocean::optics::SkyFogRegion {
                             bounds: region.bounds,
-                            plane: [surface.plane_height, region.count as f32, corner_bits as f32, 1.0],
+                            plane: [surface.plane_height, region.count as f32, corner_bits as f32, world.ocean_bottoms[slot]],
                             segments: region.segments,
                         };
                         uniform.sky_info[0] += 1.0;
@@ -539,7 +553,7 @@ impl Renderer {
             {
                 self.ocean_optics.ensure_hybrid_wave_capture(&self.device, &self.ocean_layout);
             }
-            if self.ocean_settings.backend == 2 && self.ocean_settings.blue_water_underwater_mode == 4 {
+            if self.ocean_settings.uses_godot_underwater() {
                 self.ocean_optics.ensure_submerged_fog_capture(&self.device, &self.ocean_layout);
             }
             if godot_receiver_live && self.ocean_settings.optics_receiver_only {
@@ -770,12 +784,49 @@ impl Renderer {
             None
         } else if self.cascaded_shadows_enabled {
             let sun = self.active_sun();
-            let (matrices, splits, texel_sizes) = bevy_cascade_shadow_matrices(
+            let (mut matrices, splits, mut texel_sizes) = bevy_cascade_shadow_matrices(
                 camera,
                 self.config.width,
                 self.config.height,
                 Vec3::from_array(sun.direction),
             );
+            // Static CSM baking: capture enlarged projections once, then keep
+            // the exact cached light matrix while the new camera frustum fits.
+            // It must never be rewritten to the new camera matrix without also
+            // rebuilding the depth texture, or stationary shadows will slide.
+            let world_key = self.world.as_ref().map(|world| world.remap_asset_hash).unwrap_or(0);
+            for cascade in 0..SHADOW_CASCADES {
+                let retained = self.shadow_resources.static_cascades[cascade].filter(|cached| {
+                    cached.map_id == world_key
+                        && cached.sun_direction == sun.direction
+                        && cached.visibility == self.sun_visibility
+                        && cached.draw_inline_models == self.draw_inline_models
+                        && cached.draw_bsp_model_surfaces == self.draw_bsp_model_surfaces
+                        && cached.tinted_glass == self.tinted_glass_enabled
+                        && static_shadow_covers_camera(cached.matrix, camera,
+                            self.config.width, self.config.height, cascade)
+                });
+                if let Some(cached) = retained {
+                    matrices[cascade] = cached.matrix;
+                    texel_sizes[cascade] = cached.texel_size;
+                } else {
+                    matrices[cascade] = padded_static_shadow_matrix(matrices[cascade]);
+                    texel_sizes[cascade] /= 0.80;
+                    self.shadow_resources.next_generation =
+                        self.shadow_resources.next_generation.wrapping_add(1).max(1);
+                    self.shadow_resources.static_cascades[cascade] = Some(CachedStaticCascade {
+                        matrix: matrices[cascade],
+                        texel_size: texel_sizes[cascade],
+                        map_id: world_key,
+                        sun_direction: sun.direction,
+                        visibility: self.sun_visibility,
+                        draw_inline_models: self.draw_inline_models,
+                        draw_bsp_model_surfaces: self.draw_bsp_model_surfaces,
+                        tinted_glass: self.tinted_glass_enabled,
+                        generation: self.shadow_resources.next_generation,
+                    });
+                }
+            }
             self.write_shadow_uniforms(
                 &matrices,
                 &splits,
@@ -860,6 +911,7 @@ impl Renderer {
                 auto4_area_mask,
                 self.cull_debug_mode != CullDebugMode::Off,
             );
+            crate::renderer::visibility::pvs::refresh_inline_pvs(world, self.pvs_mode, area_mask);
             info.patch_lod = crate::renderer::world::patch_lod::update(
                 &self.queue, world, camera, self.pvs_mode, area_mask, camera.view_projection(self.config.width,self.config.height),
                 self.patch_curve_error, self.patch_no_curves, self.patch_speeds, self.dynamic_lights_mode == DynamicLightsMode::Legacy,
@@ -880,7 +932,8 @@ impl Renderer {
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             if self.cull_debug_mode != CullDebugMode::Off {
                 info.cull_pvs_rejected =
-                    u32::try_from(active.candidate_count.saturating_sub(active.indices.len()))
+                    u32::try_from(active.candidate_count.saturating_sub(active.indices.len())
+                        .saturating_sub(world.inline_pvs.area_rejected_count))
                         .unwrap_or(u32::MAX);
                 info.cull_area_rejected = u32::try_from(
                     active
@@ -889,7 +942,7 @@ impl Renderer {
                         .filter(|&&batch_index| {
                             !batch_area_visible(&active.batches[batch_index], effective_area_mask)
                         })
-                        .count(),
+                        .count().saturating_add(world.inline_pvs.area_rejected_count),
                 )
                 .unwrap_or(u32::MAX);
             }
@@ -967,6 +1020,7 @@ impl Renderer {
                         self.planar_reflection_mode,
                         self.reflection_quality,
                         render_ocean,
+                        (self.ocean_settings.backend == 3).then(|| self.lake_planar_enabled()),
                         &self.planar_slot_history,
                     )
                 })
@@ -1130,7 +1184,7 @@ impl Renderer {
             .duration_since(prep_reflection_started)
             .as_secs_f64()
             * 1000.0;
-        self.update_local_shadow_selection(camera);
+        self.update_local_shadow_selection(camera,player_position);
         self.ensure_local_shadow_cache();
         prep_shadow_ms += prep_local_shadow_started.elapsed().as_secs_f64() * 1000.0;
         info.prep_shadow_ms = prep_shadow_ms;
@@ -1521,22 +1575,53 @@ impl Renderer {
         // Build the authored-sun static visibility once per BSP, independently
         // of the user's current sun angle and of the four runtime cascades.
         self.encode_original_sun_shadow(&mut encoder, camera_pos_time);
+        self.encode_baked_local_moving_shadows(&mut encoder, dynamic_models);
+        // Keep legacy CSM entity casters while the asynchronous hybrid RT
+        // shader is compiling, or if RT allocation/compilation has failed.
+        let hybrid_sun = self.cascaded_shadow_mode == DynamicShadowsMode::HybridCsmRtEntities
+            && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun);
         let csm_entity_casters = match shadow_matrices.as_ref() {
+            _ if hybrid_sun => false,
             Some(matrices) => self.prepare_entity_cascade_casters(matrices),
             None => false,
         };
 
+        let mut live_csm_regions = [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES];
         if let Some(shadow_matrices) = shadow_matrices.as_ref() {
+            self.shadow_resources.ensure_sky_snapshot(&self.device);
             if let Some(world) = &self.world {
                 for cascade in 0..SHADOW_CASCADES {
-                    if self.sun_visibility != SunVisibilityMode::Legacy {
+                    let cache_generation = self.shadow_resources.static_cascades[cascade]
+                        .expect("CSM matrices must publish a cache record").generation;
+                    let rebuild_static = self.shadow_resources.rendered_generations[cascade] != cache_generation;
+                    self.shadow_resources.cache_debug_captures += u32::from(rebuild_static);
+                    let inline_casters = world.coarse_batches.iter()
+                        .any(|batch| ((batch.is_inline_entity && self.draw_inline_models)
+                            || (!batch.is_inline_entity && crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility)))
+                            && !hidden_inline_batch(batch, &world.inline_models)
+                            && aabb_intersects_shadow_frustum(batch.bounds_min, batch.bounds_max,
+                                shadow_matrices[cascade], true));
+                    let inline_sky_casters = !hybrid_sun && self.draw_inline_models && self.sun_visibility != SunVisibilityMode::Legacy
+                        && world.coarse_batches.iter().any(|b| b.is_inline_entity
+                            && b.source.pipeline.class == DrawClass::Sky
+                            && !matches!(b.source.tc_gen, TcGen::SkyCloud(_))
+                            && !hidden_inline_batch(b, &world.inline_models));
+                    let models_in_cascade = !hybrid_sun && csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS;
+                    let grass_in_cascade = cascade == 0 && self.grass_enabled
+                        && world.grass.is_some() && prepared_grass.is_some();
+                    let dynamic_overlay = (!hybrid_sun && (inline_casters || models_in_cascade)) || grass_in_cascade;
+                    live_csm_regions[cascade] = crate::renderer::lighting::entity_shadows::live_csm_region(
+                        world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models, models_in_cascade, !hybrid_sun && inline_casters, grass_in_cascade);
+                    // Static world depth and live caster depth have separate layers.
+
+                    if rebuild_static && self.sun_visibility != SunVisibilityMode::Legacy {
                         if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                         let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("JKA shader-sun sky admission"),
                             color_attachments: &[],
                             depth_stencil_attachment: Some(
                                 wgpu::RenderPassDepthStencilAttachment {
-                                    view: &self.shadow_resources.sky_layer_views[cascade],
+                                    view: &self.shadow_resources.sky_snapshot.as_ref().expect("static CSM cache initialized").sky_layer_views[cascade],
                                     depth_ops: Some(wgpu::Operations {
                                         load: wgpu::LoadOp::Clear(0.0),
                                         store: wgpu::StoreOp::Store,
@@ -1567,7 +1652,7 @@ impl Renderer {
                             wgpu::IndexFormat::Uint32,
                         );
                         for batch in &world.coarse_batches {
-                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            if batch.is_inline_entity || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                                 || (batch.is_inline_entity && !self.draw_inline_models)
                                 || hidden_inline_batch(batch, &world.inline_models) {
                                 continue;
@@ -1584,6 +1669,57 @@ impl Renderer {
                         }
                     }
 
+                    if (rebuild_static || inline_sky_casters || (self.shadow_resources.dynamic_sky_layers & (1u32 << cascade)) != 0
+                        || self.shadow_resources.last_csm_mode != Some(self.cascaded_shadow_mode))
+                        && self.sun_visibility != SunVisibilityMode::Legacy {
+                        self.shadow_resources.cache_debug_sky_copies += 1;
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &self.shadow_resources.sky_snapshot.as_ref().expect("static CSM cache initialized").sky_depth,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x: 0, y: 0, z: cascade as u32 },
+                                aspect: wgpu::TextureAspect::DepthOnly,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &self.shadow_resources._sky_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d { x: 0, y: 0, z: cascade as u32 },
+                                aspect: wgpu::TextureAspect::DepthOnly,
+                            },
+                            wgpu::Extent3d { width: crate::renderer::SHADOW_MAP_SIZE,
+                                height: crate::renderer::SHADOW_MAP_SIZE, depth_or_array_layers: 1 },
+                        );
+                    }
+                    if inline_sky_casters {
+                        // Reapply mover sky admission every frame over the
+                        // static sky snapshot, without polluting the cache.
+                        let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("JKA CSM dynamic inline sky admission"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.shadow_resources.sky_layer_views[cascade],
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                        sky_pass.set_pipeline(&self.shadow_resources.bevy_sky_pipeline);
+                        sky_pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
+                        sky_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        sky_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        for batch in &world.coarse_batches {
+                            if batch.is_inline_entity && self.draw_inline_models
+                                && batch.source.pipeline.class == DrawClass::Sky
+                                && !matches!(batch.source.tc_gen, TcGen::SkyCloud(_))
+                                && !hidden_inline_batch(batch, &world.inline_models)
+                            { draw_world_batch_secondary(&mut sky_pass, batch, 0..1, None); }
+                        }
+                    }
+                    if inline_sky_casters { self.shadow_resources.dynamic_sky_layers |= 1u32 << cascade; }
+                    else { self.shadow_resources.dynamic_sky_layers &= !(1u32 << cascade); }
+                    if rebuild_static {
                     if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("JKA cascaded sun shadow"),
@@ -1617,6 +1753,9 @@ impl Renderer {
                             || hidden_inline_batch(batch, &world.inline_models) {
                             continue;
                         }
+                        // In hybrid the CSM is a static-only atlas. Moving inline
+                        // BSP objects are represented by TLAS dynamic instances.
+                        if batch.is_inline_entity || crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility) { continue; }
                         // A depthFunc equal stage is only an overlay on pixels admitted
                         // by an earlier stage. Rendering it as an independent caster
                         // would fill the holes of an alpha-tested first stage.
@@ -1674,34 +1813,110 @@ impl Renderer {
                             _ => {}
                         }
                     }
+                    self.shadow_resources.rendered_generations[cascade] = cache_generation;
+                }
 
-                    // The source GodotGrass demo enables full grass shadow mapping,
-                    // but explicitly notes its high cost. Only the closest grass
-                    // contributes here, through the existing first sun cascade and
-                    // with the source one-triangle low blade as a depth-only proxy.
-                    if cascade == 0 && self.grass_enabled {
-                        if let (Some(grass), Some(prepared)) =
-                            (world.grass.as_ref(), prepared_grass.as_ref())
-                        {
-                            self.grass_renderer.draw_shadow(
-                                &mut pass,
-                                &self.shadow_resources.caster_bind_groups[cascade],
-                                grass,
-                                prepared,
-                                true,
-                            );
+                    {
+                        if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("JKA CSM live casters"),
+                            color_attachments: &[],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.shadow_resources.layer_views[SHADOW_CASCADES + 1 + cascade],
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0),
+                                    store: wgpu::StoreOp::Store }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.shadow_resources.bevy_pipeline);
+                        pass.set_bind_group(0, &self.shadow_resources.caster_bind_groups[cascade], &[]);
+                        pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        // Inline BSP movers are *not* baked, even in regular CSM.
+                        // They have to be redrawn over the static snapshot.
+                        if dynamic_overlay && !hybrid_sun && inline_casters {
+                            let mut mask_pipeline_active = false;
+                            for batch in &world.coarse_batches {
+                                if (!batch.is_inline_entity && !crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility))
+                                    || (batch.is_inline_entity && !self.draw_inline_models)
+                                    || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                                    || hidden_inline_batch(batch, &world.inline_models)
+                                    || batch.source.pipeline.depth_equal
+                                    || (self.tinted_glass_enabled
+                                        && crate::renderer::lighting::glass_transmission::classify_glass(
+                                            &batch.source,
+                                            batch.source.texture.and_then(|index| world.glass_texture_names.get(index)).map(String::as_str),
+                                            None, true).is_some())
+                                    || (batch.source.pipeline.blend != BlendMode::Opaque
+                                        && self.sun_visibility != SunVisibilityMode::Filtered)
+                                    || !aabb_intersects_shadow_frustum(
+                                        batch.bounds_min, batch.bounds_max, shadow_matrices[cascade], true)
+                                { continue; }
+                                match batch.source.pipeline.class {
+                                    DrawClass::Opaque if batch.source.alpha_cutoff == 0.0 => {
+                                        if mask_pipeline_active {
+                                            pass.set_pipeline(&self.shadow_resources.bevy_pipeline);
+                                            mask_pipeline_active = false;
+                                        }
+                                        draw_world_batch_secondary(&mut pass, batch, 0..1, None);
+                                    }
+                                    DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => {
+                                        if !mask_pipeline_active {
+                                            pass.set_pipeline(&self.shadow_resources.bevy_mask_pipeline);
+                                            mask_pipeline_active = true;
+                                        }
+                                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                                        draw_world_batch_secondary(&mut pass, batch, 0..1, None);
+                                    }
+                                    DrawClass::Transparent
+                                        if self.sun_visibility == SunVisibilityMode::Filtered => {
+                                            pass.set_pipeline(&self.shadow_resources.bevy_translucent_pipeline);
+                                            mask_pipeline_active = true;
+                                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                                            draw_world_batch_secondary(&mut pass, batch, 0..1, None);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if grass_in_cascade {
+                            if let (Some(grass), Some(prepared)) =
+                                (world.grass.as_ref(), prepared_grass.as_ref())
+                            {
+                                self.grass_renderer.draw_shadow(&mut pass,
+                                    &self.shadow_resources.caster_bind_groups[cascade], grass,
+                                    prepared, true);
+                            }
+                        }
+                        if models_in_cascade {
+                            self.dynamic_model_renderer.draw_entity_shadow(&mut pass,
+                                &self.entity_shadow.cameras[cascade].1, true);
                         }
                     }
-
-                    // Players, NPCs and models cast into the near/mid cascades too.
-                    if csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS {
-                        self.dynamic_model_renderer.draw_entity_shadow(
-                            &mut pass,
-                            &self.entity_shadow.cameras[cascade].1,
-                            true,
-                        );
-                    }
                 }
+            }
+            self.queue.write_buffer(&self.shadow_resources.receiver_buffer,
+                std::mem::offset_of!(crate::renderer::ShadowReceiverUniform, dynamic_regions) as u64,
+                bytemuck::cast_slice(&live_csm_regions));
+            self.shadow_resources.last_csm_mode = Some(self.cascaded_shadow_mode);
+            self.shadow_resources.cache_debug_frames += 1;
+            static CSM_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CSM_DEBUG.get_or_init(|| std::env::var("JKA_CSM_CACHE_DEBUG").ok().as_deref() == Some("1"))
+                && self.shadow_resources.cache_debug_epoch.elapsed().as_secs_f32() >= 1.0
+            {
+                println!("[CSM STATIC CACHE] mode={:?} frames={} static_passes_skipped={} static_recaptures={} depth_copies=0 sky_copies={} extra_vram=128MiB",
+                    self.cascaded_shadow_mode,
+                    self.shadow_resources.cache_debug_frames,
+                    self.shadow_resources.cache_debug_frames.saturating_mul(SHADOW_CASCADES as u32)
+                        .saturating_sub(self.shadow_resources.cache_debug_captures),
+                    self.shadow_resources.cache_debug_captures,
+                    self.shadow_resources.cache_debug_sky_copies);
+                self.shadow_resources.cache_debug_epoch = std::time::Instant::now();
+                self.shadow_resources.cache_debug_frames = 0;
+                self.shadow_resources.cache_debug_captures = 0;
+                self.shadow_resources.cache_debug_sky_copies = 0;
             }
         }
 
@@ -2901,7 +3116,10 @@ impl Renderer {
                         self.blue_water_sky.as_ref().filter(|_| self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled).map(|sky| sky.clouds.shadow()), optical_volumes.as_ref().expect("active water volumes"),
                         godot_receiver_live.then_some(&self.ocean_optics.receiver_color), self.weather.fog.legacy_self_fog(),
                         if self.blue_water_environment.weather_backend == 1 { self.blue_water_environment.rain } else { 0.0 },
-                        &mut info.ocean.native_cpu, perf_timing);
+                        &mut info.ocean.native_cpu, perf_timing, frame_time,
+                        self.planar_reflection.active.then_some((&self.planar_reflection._color_array_view,
+                            &self.planar_reflection._sampler, &self.planar_slot_history)),
+                        Some(self.ocean_optics.submerged_scene()));
                     if let Some(started) = native_prepare_started {
                         info.ocean.native_cpu.prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
                     }
@@ -4682,9 +4900,9 @@ impl Renderer {
                 // Submerged Hybrid mode 4 draws neither the native surface nor its
                 // underwater medium: nothing reads the copy.
                 let hybrid_godot_submerged = self.camera_water_surface > crate::renderer::NO_WATER_SURFACE
-                    && self.ocean_settings.backend == 2
-                    && self.ocean_settings.blue_water_underwater_mode == 4;
-                let native_capture_needed = (self.ocean_settings.surface_pixels && !hybrid_godot_submerged)
+                    && self.ocean_settings.uses_godot_underwater();
+                let lake_needs_copy = self.ocean_settings.backend != 3 || self.ocean_settings.lake.needs_scene_copy();
+                let native_capture_needed = (self.ocean_settings.surface_pixels && !hybrid_godot_submerged && lake_needs_copy)
                     || native_submerged_capture;
                 // Include the original material's scene copy in optics timing.
                 if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0 && native_capture_needed) {
@@ -4722,10 +4940,9 @@ impl Renderer {
                 // Preserve existing CPU-controlled Godot mesh selection.
                 // Only the optical capture/composite becomes wave-aware.
                 let hybrid_godot_surface = submerged
-                    && self.ocean_settings.backend == 2
-                    && self.ocean_settings.blue_water_underwater_mode == 4;
-                // Submerged Hybrid draws Blue Water's own mesh with the Godot material
-                // (`vs_ocean_native`); the Godot clipmap only until that can draw.
+                    && self.ocean_settings.uses_godot_submerged_mesh();
+                // Hybrid reuses its native mesh with the Godot material. Cheapwater
+                // retains its animated lake mesh and ripple normals on both sides.
                 let native_submerged = hybrid_godot_surface && native_submerged_mesh_ready;
                 let mut submerged_batches = [None; 8];
                 if self.ocean_settings.backend == 2 {
@@ -4934,7 +5151,7 @@ impl Renderer {
                             scissor,
                             godot_receiver_live,
                             hybrid_wave_optics,
-                            hybrid_godot_surface,
+                            submerged && self.ocean_settings.uses_godot_underwater(),
                         );
                     }
                 }
@@ -4959,8 +5176,7 @@ impl Renderer {
                 // pixel where the camera ray doesn't actually enter water.
                 if !skip_capture && (hybrid_wave_optics ||
                     (submerged && (!self.ocean.as_ref().is_some_and(|gpu| gpu.original_underwater_active())
-                        || (self.ocean_settings.backend == 2
-                            && self.ocean_settings.blue_water_underwater_mode == 4)))) {
+                        || self.ocean_settings.uses_godot_underwater()))) {
                     self.ocean_optics
                         .composite(&mut encoder, color_view, resolve_target);
                 }
@@ -5222,7 +5438,7 @@ impl Renderer {
                 // Draw the pre-existing geometric clipmap first. The analytic
                 // tail then fills only the exterior and cannot occlude displaced
                 // near-water triangles.
-                if self.ocean_sky_infinite && self.ocean_settings.surface_pixels {
+                if self.ocean_sky_infinite && self.ocean_settings.surface_pixels && self.ocean_settings.backend != 3 {
                     if let Some(far_pipeline) = active_pipeline_variant.ocean_far_pipeline.as_ref() {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(far_pipeline);
@@ -5339,7 +5555,7 @@ impl Renderer {
                 );
                 }
                 self.glass_world.as_ref().expect("glass pipeline").capture_geometry(
-                    &mut encoder, &self.ocean_optics, &self.camera_bind_group, world,
+                    &self.queue, &mut encoder, &self.ocean_optics, &self.camera_bind_group, world,
                     &active.batches, &active.indices, &deferred_transparent,
                     &self.dynamic_model_renderer, self.gpu_driven_enabled,
                 );
@@ -5810,11 +6026,15 @@ impl Renderer {
                                 mask & ui::wireframe::MAP != 0
                             };
                             if category_enabled
+                                && (!batch.is_inline_entity || (self.draw_inline_models
+                                    && !hidden_inline_batch(batch, &world.inline_models)))
                                 // World wireframe must follow the resolved remap, not
                                 // resurrect framebuffer/depth no-op shaders (e.g. clear).
                                 && batch.source.contributes_to_world_wireframe()
                                 && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
-                                && (!render_ocean || batch.ocean_clipmap.is_none())
+                                // Replacement ownership includes sibling stages and overlays,
+                                // even when they do not carry the primary face's clipmap.
+                                && !ocean_suppresses_batch(render_ocean, batch)
                                 && batch.source.pipeline.class != DrawClass::Sky
                                 && batch_area_visible(batch, effective_area_mask)
                                 && aabb_intersects_clip_frustum(
@@ -5853,8 +6073,7 @@ impl Renderer {
                 let variant_family = variant_key.family();
                 let hybrid_godot_surface = optical_volumes.is_some()
                     && self.camera_water_surface > crate::renderer::NO_WATER_SURFACE
-                    && self.ocean_settings.backend == 2
-                    && self.ocean_settings.blue_water_underwater_mode == 4;
+                    && self.ocean_settings.uses_godot_submerged_mesh();
                 let native_submerged = hybrid_godot_surface && native_submerged_mesh_ready;
                 if let Some(pipeline) = self.world_wireframe_pipelines.get(&variant_key) {
                     // Until its native mesh can draw, submerged Hybrid falls back
@@ -6179,8 +6398,8 @@ impl Renderer {
                     pass.draw_indexed(indices, 0, 0..1);
                 }
             }
-            if let (CullDebugMode::RejectionReasons, Some(cull_debug_pipeline)) =
-                (self.cull_debug_mode, self.cull_debug_pipeline.as_ref())
+            if let (true, Some(cull_debug_pipeline)) =
+                (self.cull_debug_mode.draws_overlay(), self.cull_debug_pipeline.as_ref())
             {
                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                 pass.set_pipeline(cull_debug_pipeline);
@@ -6188,10 +6407,14 @@ impl Renderer {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(1, &world.cull_debug_bind_group, &[]);
-                // Draw the entire PVS representation, not merely its active
-                // subset. The shader discards visible records and colors only
-                // the rejection stage recorded for each batch.
-                for batch in active.batches {
+                // A Hi-Z rejection can only come from the PVS candidate list.
+                // Do not replay thousands of PVS-rejected batches just to discard
+                // them in the Hi-Z-only fragment shader. All-reasons mode still
+                // includes the full representation for its PVS/area diagnostics.
+                let hiz_only = self.cull_debug_mode == CullDebugMode::HiZOnly;
+                let overlay_count = if hiz_only { active.indices.len() } else { active.batches.len() };
+                for index in 0..overlay_count {
+                    let batch = &active.batches[if hiz_only { active.indices[index] } else { index }];
                     if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                         || batch.source.pipeline.class == DrawClass::Sky {
                         continue;
@@ -7564,7 +7787,7 @@ impl Renderer {
         if menu_backdrop_active {
             // In Everything mode the backdrop itself is part of the CRT source;
             // otherwise it goes straight to the swapchain as before.
-            self.submit_menu_backdrop(ui_composite_target);
+            self.submit_menu_backdrop(ui_composite_target, scene_snapshot_requested);
         }
         if scene_snapshot_requested {
             // When CRT includes UI, render a separate scene-only CRT image for
@@ -7592,6 +7815,10 @@ impl Renderer {
                 // The dedicated pre-egui submission already performed the copy.
                 // The regular after-UI screenshot stage must not copy again.
                 readback.inline_copy = true;
+            }
+            if menu_backdrop_active && self.neon_menu_wanted() {
+                // The capture took the plain scene; now draw the page over it.
+                self.submit_menu_backdrop(ui_composite_target, false);
             }
         }
         self.submit_egui(ui_composite_target);

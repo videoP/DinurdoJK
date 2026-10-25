@@ -18,68 +18,129 @@ pub(super) struct EmoteWheel {
 }
 
 impl EmoteWheel {
+    // The IDs of the original four categories are retained: a saved manual
+    // assignment must never silently move to a different category.
     fn default_categories() -> Vec<Category> {
         [
-            ("taunt", "Taunt"),
-            ("flex", "Flex"),
-            ("dance", "Dance"),
-            ("misc", "Miscellaneous"),
+            ("dance-street", "Street & Hip-Hop"),
+            ("dance-pop", "Pop & Choreo"),
+            ("dance-party", "Party & Club"),
+            ("dance-goofy", "Goofy & Meme"),
+            ("dance", "Other Dances"),
+            ("music", "Music & Instruments"),
+            ("taunt", "Taunts & Trolling"),
+            ("celebrate", "Celebrations & Victory"),
+            ("social", "Greetings & Social"),
+            ("reaction", "Reactions & Moods"),
+            ("flex", "Poses & Flex"),
+            ("action", "Action & Acrobatics"),
+            ("props", "Props & Activities"),
+            ("misc", "Other Emotes"),
         ]
         .into_iter()
-        .map(|(id, name)| Category {
-            id: id.into(),
-            name: name.into(),
-        })
+        .map(|(id, name)| Category { id: id.into(), name: name.into() })
         .collect()
     }
+
     pub fn category_for(&self, emote: &crate::emotes::Emote) -> String {
-        let assigned = std::iter::once(&emote.id)
+        // Explicit profile assignments (including an alias/variant assignment)
+        // always take precedence over automatic classification.
+        if let Some(assigned) = std::iter::once(&emote.id)
             .chain(emote.catalog_aliases.iter())
             .chain(emote.variants.iter().map(|v| &v.id))
             .find_map(|id| self.assignments.get(id))
-            .filter(|id| self.categories.iter().any(|c| &c.id == *id));
-        if let Some(id) = assigned {
-            return id.clone();
+            .filter(|id| self.categories.iter().any(|c| &c.id == *id))
+        {
+            return assigned.clone();
         }
-        let title = crate::emotes::display_title(emote).to_lowercase();
-        let category = if ["taunt", "laugh", "take the l", "facepalm", "boo!"]
-            .iter()
-            .any(|s| title.contains(s))
-        {
+        let title = crate::emotes::display_title(emote).to_ascii_lowercase();
+        let id = emote.id.to_ascii_lowercase();
+        let matches = |words: &[&str]| words.iter().any(|word| title.contains(*word) || id.contains(*word));
+        let music = std::iter::once(emote).chain(emote.variants.iter())
+            .any(|e| e.audio.iter().any(|a| a.lane == crate::emotes::AudioLane::Music));
+        let prop = std::iter::once(emote).chain(emote.variants.iter())
+            .any(|e| !e.props.is_empty());
+
+        // These are intentionally high-confidence display-name/ID heuristics,
+        // not invented Fortnite metadata. Unrecognized musical emotes go to
+        // Other Dances, which the radial breaks into bounded browse sections.
+        let target = if matches(&[
+            "take the l", "taunt", "troll", "mock", "boo!", "laugh", "laughter",
+            "raspberry", "jeer", "sneer", "loser", "clown", "slow clap",
+        ]) {
             "taunt"
-        } else if ["flex", "muscle", "weightlift", "bodybuild"]
-            .iter()
-            .any(|s| title.contains(s))
-        {
+        } else if matches(&[
+            "victory", "winner", "champion", "celebrat", "applause", "cheer",
+            "triumph", "trophy", "goal", "confetti", "congrat", "fireworks",
+        ]) {
+            "celebrate"
+        } else if matches(&[
+            "hello", "goodbye", "good bye", "greet", "handshake", "high five", "highfive",
+            "hug", "kiss", "salute", "wave hello", "heart sign", "heartsign", "valentine",
+        ]) {
+            "social"
+        } else if matches(&[
+            "facepalm", "shrug", "cry", "sad", "angry", "rage", "scared",
+            "confused", "surprise", "shock", "thinking", "disappoint", "nervous",
+            "yawn", "sigh", "nope", "hmm", "sulk",
+        ]) {
+            "reaction"
+        } else if matches(&[
+            "flex", "muscle", "bodybuild", "weightlift", "posing", "pose", "selfie",
+            "model stance", "power stance", "hero stance",
+        ]) {
             "flex"
-        } else if [
-            "dance", "floss", "boogie", "bounce", "shuffle", "twist", "groove", "the worm", "bop",
-        ]
-        .iter()
-        .any(|s| title.contains(s))
-            || std::iter::once(emote)
-                .chain(emote.variants.iter())
-                .any(|e| {
-                    e.audio
-                        .iter()
-                        .any(|a| a.lane == crate::emotes::AudioLane::Music)
-                })
-        {
+        } else if matches(&[
+            "flip", "acrobat", "parkour", "cartwheel", "somersault", "backflip",
+            "frontflip", "karate", "martial", "kickbox", "boxing", "handstand",
+            "pushup", "push-up", "situp", "sit-up", "sprint", "workout",
+        ]) {
+            "action"
+        } else if matches(&[
+            "guitar", "piano", "drum", "sax", "trumpet", "trombone", "violin",
+            "ukulele", "banjo", "flute", "harp", "instrument", "lute", "keyboard",
+            "beatbox", "sing along", "singalong", "concert",
+        ]) {
+            "music"
+        } else if matches(&[
+            "breakdance", "break dance", "hip hop", "hiphop", "freestyle", "street dance",
+            "shuffle", "poplock", "pop lock", "b-boy", "bboy", "crisscross", "criss cross",
+        ]) {
+            "dance-street"
+        } else if matches(&[
+            "k-pop", "kpop", "choreo", "idol", "pop dance", "ballet", "waltz",
+            "tango", "ribbon dance", "ribbondance", "jazz hands", "jazzhands",
+        ]) {
+            "dance-pop"
+        } else if matches(&[
+            "disco", "rave", "club", "party", "boogie", "groove", "salsa",
+            "conga", "line dance", "linedance", "dancefloor", "dance floor",
+        ]) {
+            "dance-party"
+        } else if matches(&[
+            "floss", "the worm", "chicken dance", "robot dance", "meme",
+            "goofy", "silly", "rickroll", "rick roll", "dabbing", "dab dance",
+            "flailing", "banana dance",
+        ]) {
+            "dance-goofy"
+        } else if music || matches(&["dance", "twist", "bop", "bounce"]) {
             "dance"
+        } else if prop || matches(&[
+            "sit", "sleep", "read", "cook", "fishing", "eat", "drink", "paint",
+            "skate", "toy", "phone", "swing", "chair", "campfire",
+        ]) {
+            "props"
         } else {
             "misc"
         };
-        self.categories
-            .iter()
-            .find(|c| c.id == category)
-            .or_else(|| self.categories.iter().find(|c| c.id == "misc"))
+        self.categories.iter().find(|c| c.id == target)
+            .or_else(|| self.categories.iter().find(|c| c.id == if music { "dance" } else { "misc" }))
             .or_else(|| self.categories.first())
-            .map(|c| c.id.clone())
-            .unwrap_or_default()
+            .map(|c| c.id.clone()).unwrap_or_default()
     }
     fn settings(&self) -> serde_json::Value {
         serde_json::json!({"favorites":self.favorites,"variants":self.variants,
-            "categories":self.categories.iter().map(|c|serde_json::json!({"id":c.id,"name":c.name})).collect::<Vec<_>>(),"assignments":self.assignments,"profile_background":self.profile_background})
+            "categories":self.categories.iter().map(|c|serde_json::json!({"id":c.id,"name":c.name})).collect::<Vec<_>>(),"category_schema":2,"assignments":self.assignments,"profile_background":self.profile_background})
     }
     fn from_settings(data: &serde_json::Value) -> Self {
         let mut categories: Vec<Category> = data["categories"]
@@ -105,6 +166,27 @@ impl EmoteWheel {
         categories.retain(|c| seen.insert(c.id.clone()));
         if categories.is_empty() {
             categories = Self::default_categories();
+        } else if data["category_schema"].as_u64().unwrap_or(1) < 2 {
+            // One-time migration of existing favorites.json files. Retain
+            // stable IDs, renamed legacy categories, and all user additions.
+            let mut legacy = categories;
+            let mut merged = Vec::new();
+            for mut category in Self::default_categories() {
+                if let Some(index) = legacy.iter().position(|c| c.id == category.id) {
+                    let previous = legacy.remove(index);
+                    let default_old_name = match category.id.as_str() {
+                        "taunt" => "Taunt", "flex" => "Flex", "dance" => "Dance",
+                        "misc" => "Miscellaneous", _ => "",
+                    };
+                    if previous.name != default_old_name {
+                        category.name = previous.name;
+                    }
+                }
+                merged.push(category);
+            }
+            merged.extend(legacy);
+            merged.truncate(32);
+            categories = merged;
         }
         let assignments = data["assignments"]
             .as_object()
@@ -198,6 +280,38 @@ impl App {
         crate::emotes::stop();
     }
 
+    /// Join a referenced player at their timeline phase and broadcast the
+    /// reference through protocol 26's existing angle-based taunt transport.
+    pub(in crate::app) fn match_crosshair_emote(&mut self) {
+        if !self.live_connected() {
+            self.push_console_line("^3MATCH:^7 Connect to a game and aim at a dancing player.");
+            return;
+        }
+        // Ordinary crosshair scans are suspended while the wheel is open.
+        // Force the same fresh trace that message-mode 3 uses, rather than
+        // reusing a stale HUD last-seen client or the last aimed-at entity.
+        self.update_crosshair_target_for_chat(Instant::now());
+        let target = self.crosshair_seen
+            .filter(|seen| seen.on_target && !seen.is_pilot)
+            .and_then(|seen| u16::try_from(seen.entity).ok())
+            .filter(|&client| client < 32);
+        let Some(preview) = target.and_then(crate::emotes::network::match_target_preview) else {
+            self.push_console_line("^3MATCH:^7 Aim directly at someone playing a Fortnite emote.");
+            return;
+        };
+        // Send a MATCH reference, not the copied emote ID. Other clients can
+        // inherit the source player's server-time origin as well as its variant.
+        let Some(reference) = target.and_then(crate::emote_net_codec::match_reference_id) else {
+            return;
+        };
+        if !self.live_input.queue_emote_taunt(reference) {
+            self.push_console_line("^3MATCH:^7 Could not send the emote taunt.");
+            return;
+        }
+        crate::emotes::play_world_matched(preview.emote, preview.elapsed_ms);
+        self.close_emote_radial();
+    }
+
     /// In-game selections share the same taunt transport; Profile previews stay local.
     pub(in crate::app) fn play_game_emote(&mut self, emote: crate::emotes::Emote) {
         if self.live_connected() {
@@ -276,6 +390,28 @@ impl App {
 mod tests {
     use super::*;
     #[test]
+    fn old_profile_categories_upgrade_without_losing_manual_classification() {
+        let old = serde_json::json!({
+            "categories": [
+                {"id": "taunt", "name": "My Taunts"},
+                {"id": "dance", "name": "Dance"},
+                {"id": "category-1", "name": "Custom"}
+            ],
+            "favorites": ["EID_Floss"],
+            "assignments": {"EID_Floss": "category-1"}
+        });
+        let migrated = EmoteWheel::from_settings(&old);
+        assert_eq!(migrated.categories.len(), 15);
+        assert_eq!(migrated.categories.iter().find(|c| c.id == "taunt").unwrap().name, "My Taunts");
+        assert_eq!(migrated.categories.iter().find(|c| c.id == "dance").unwrap().name, "Other Dances");
+        assert_eq!(migrated.assignments["EID_Floss"], "category-1");
+        assert_eq!(migrated.favorites, ["EID_Floss"]);
+        let roundtrip = EmoteWheel::from_settings(&migrated.settings());
+        assert_eq!(roundtrip.categories, migrated.categories);
+        assert_eq!(roundtrip.assignments, migrated.assignments);
+    }
+
+    #[test]
     fn library_includes_unstarred_emotes_and_honors_categories_and_variants() {
         let mut catalog = jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[
             {"id":"laugh","name":"Laugh","gla":"models/a.gla","first_frame":0,"end_frame":30,"fps":30},
@@ -289,9 +425,9 @@ mod tests {
         }));
         let ids = |emotes: Vec<crate::emotes::Emote>| emotes.into_iter().map(|e| e.id).collect::<Vec<_>>();
         assert_eq!(ids(wheel.wheel_emotes(&catalog)), ["laugh"]);
-        assert_eq!(ids(wheel.catalog_emotes(&catalog, Some("dance"))), ["floss-alt"]);
+        assert_eq!(ids(wheel.catalog_emotes(&catalog, Some("dance-goofy"))), ["floss-alt"]);
         assert_eq!(ids(wheel.catalog_emotes(&catalog, Some("flex"))), ["laugh"]);
-        assert!(wheel.catalog_emotes(&catalog, Some("taunt")).is_empty());
+        assert!(wheel.catalog_emotes(&catalog, Some("dance")).is_empty());
         assert_eq!(ids(wheel.catalog_emotes(&catalog, None)), ["laugh", "floss-alt"]);
     }
 
@@ -299,10 +435,10 @@ mod tests {
     fn legacy_favorites_and_category_renames_preserve_assignments() {
         let legacy = serde_json::json!({"favorites":["EID_Floss","EID_Floss"],"variants":{"EID_Floss":2},"opacity":0.3});
         let mut wheel = EmoteWheel::from_settings(&legacy);
-        assert_eq!(wheel.categories.len(), 4);
+        assert_eq!(wheel.categories.len(), 14);
         assert_eq!(wheel.favorites, vec!["EID_Floss"]);
         let emote=jka_emotes::manifest::parse_manifest(&serde_json::json!({"emotes":[{"id":"EID_Floss","name":"Floss","gla":"models/test.gla","first_frame":0,"end_frame":30,"fps":30}]})).unwrap().remove(0);
-        assert_eq!(wheel.category_for(&emote), "dance");
+        assert_eq!(wheel.category_for(&emote), "dance-goofy");
         wheel.categories.push(Category {
             id: "custom".into(),
             name: "Party".into(),
@@ -316,11 +452,11 @@ mod tests {
         assert_eq!(loaded.variants[&emote.id], 2);
         assert_eq!(loaded.profile_background.as_deref(), Some("mp/ffa3"));
         wheel.categories.pop();
-        assert_eq!(wheel.category_for(&emote), "dance");
+        assert_eq!(wheel.category_for(&emote), "dance-goofy");
     }
     #[test]
     fn malformed_categories_and_backgrounds_are_bounded() {
-        let data = serde_json::json!({"categories":[{"id":"a","name":"One"},{"id":"a","name":"Two"},{"id":"b","name":" "}],"assignments":{"bad":"missing"},"profile_background":"../../secret"});
+        let data = serde_json::json!({"categories":[{"id":"a","name":"One"},{"id":"a","name":"Two"},{"id":"b","name":" "}],"assignments":{"bad":"missing"},"profile_background":"../../secret","category_schema":2});
         let wheel = EmoteWheel::from_settings(&data);
         assert_eq!(wheel.categories.len(), 1);
         assert!(wheel.assignments.is_empty());
@@ -333,6 +469,6 @@ mod tests {
             {"id":"EID_Floss","name":"Floss","gla":"models/b.gla","first_frame":0,"end_frame":30,"fps":30}]})).unwrap();
         let wheel = EmoteWheel::from_settings(&serde_json::json!({"favorites":["EID_Floss","EID_Missing","EID_Laugh"]}));
         let ids: Vec<_> = wheel.wheel_emotes(&catalog).into_iter().map(|e| e.id).collect();
-        assert_eq!(ids, ["EID_Laugh", "EID_Floss"]);
+        assert_eq!(ids, ["EID_Floss", "EID_Laugh"]);
     }
 }

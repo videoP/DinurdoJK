@@ -225,6 +225,7 @@ struct RagdollInstance {
     grip_anchor: Option<GripAnchor>,
     torso_anchor: Option<TorsoAnchor>,
     spawned_at: i32,
+    lifetime_slept: bool,
     /// Last authoritative/interpolated entity origin supplied by cgame. Rapier
     /// owns the articulation, but the server remains authoritative for gross
     /// corpse displacement (Force push, knockback, movers, etc.).
@@ -296,6 +297,24 @@ struct GlassBody {
     expires_at: i32,
 }
 
+/// Presentation-only player hull in JKA world coordinates.
+pub(crate) struct PhysicsPlayer {
+    pub entity: u16,
+    pub origin: [f32; 3],
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    pub teleport_bit: i32,
+}
+
+struct PlayerCollider {
+    body: RigidBodyHandle,
+    collider: ColliderHandle,
+    target: Vector,
+    half_extents: Vector,
+    teleport_bit: i32,
+    sampled_at: i32,
+}
+
 pub struct RagdollWorld {
     config: RagdollConfig,
     pipeline: PhysicsPipeline,
@@ -311,6 +330,7 @@ pub struct RagdollWorld {
     static_world_ready: bool,
     previous_body_poses: HashMap<RigidBodyHandle, Pose>,
     instances: HashMap<u16, RagdollInstance>,
+    player_colliders: HashMap<u16, PlayerCollider>,
     detached_limbs: HashMap<u16, DetachedLimbBody>,
     debris: Vec<DebrisBody>,
     glass: Vec<GlassBody>,
@@ -345,6 +365,7 @@ impl RagdollWorld {
             static_world_ready: false,
             previous_body_poses: HashMap::new(),
             instances: HashMap::new(),
+            player_colliders: HashMap::new(),
             detached_limbs: HashMap::new(),
             debris: Vec::new(),
             glass: Vec::new(),
@@ -399,6 +420,7 @@ impl RagdollWorld {
 
     /// Drop only dynamic ragdoll state; keep the map collider and configuration.
     pub fn reset_dynamic_for_seek(&mut self) {
+        self.clear_player_colliders();
         self.clear_instances();
         self.clear_detached_limbs();
         self.clear_debris();
@@ -458,6 +480,7 @@ impl RagdollWorld {
         // collider remains installed; only dynamic ragdoll instances are reset.
         if was_enabled && !self.config.enabled {
             self.clear_instances();
+            self.clear_player_colliders();
         }
         if physics_was_enabled && !self.config.physics_enabled {
             self.clear_detached_limbs();
@@ -518,6 +541,74 @@ impl RagdollWorld {
         Ok(())
     }
 
+    /// Players are kinematic in this visual world: they transfer motion to
+    /// corpses without feeding any forces back into authoritative pmove.
+    pub(crate) fn set_players(&mut self, players: &[PhysicsPlayer], current_time: i32) {
+        if !self.active() {
+            self.clear_player_colliders();
+            return;
+        }
+        let mut live = HashSet::new();
+        for player in players {
+            if !player.origin.iter().chain(&player.mins).chain(&player.maxs)
+                .all(|value| value.is_finite()) {
+                continue;
+            }
+            let mins = Vector::from_array(player.mins);
+            let maxs = Vector::from_array(player.maxs);
+            let half_extents = (maxs - mins) * (0.5 * JKA_TO_RAPIER);
+            if half_extents.min_element() <= 0.0 { continue; }
+            let target = (Vector::from_array(player.origin) + (mins + maxs) * 0.5) * JKA_TO_RAPIER;
+            live.insert(player.entity);
+            if let Some(proxy) = self.player_colliders.get_mut(&player.entity) {
+                let elapsed = current_time.saturating_sub(proxy.sampled_at);
+                // Teleports, seeks and loading gaps must not sweep a hull
+                // through every corpse between unrelated positions.
+                if proxy.teleport_bit != player.teleport_bit || elapsed > 100 || elapsed < 0
+                    || (target - proxy.target).length_squared() > (128.0 * JKA_TO_RAPIER).powi(2) {
+                    if let Some(body) = self.bodies.get_mut(proxy.body) {
+                        body.set_translation(target, true);
+                        body.set_next_kinematic_translation(target);
+                    }
+                }
+                if proxy.half_extents != half_extents {
+                    self.colliders[proxy.collider].set_shape(SharedShape::cuboid(
+                        half_extents.x, half_extents.y, half_extents.z,
+                    ));
+                }
+                proxy.target = target;
+                proxy.half_extents = half_extents;
+                proxy.teleport_bit = player.teleport_bit;
+                proxy.sampled_at = current_time;
+                continue;
+            }
+            let body = self.bodies.insert(RigidBodyBuilder::kinematic_position_based().translation(target));
+            let collider = self.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z)
+                    .friction(0.0).restitution(0.0)
+                    .collision_groups(InteractionGroups::new(
+                        Group::GROUP_3, Group::GROUP_2, InteractionTestMode::default(),
+                    )),
+                body, &mut self.bodies,
+            );
+            self.player_colliders.insert(player.entity, PlayerCollider {
+                body, collider, target, half_extents,
+                teleport_bit: player.teleport_bit, sampled_at: current_time,
+            });
+        }
+        let stale = self.player_colliders.keys().filter(|entity| !live.contains(entity))
+            .copied().collect::<Vec<_>>();
+        for entity in stale {
+            if let Some(proxy) = self.player_colliders.remove(&entity) { self.remove_body(proxy.body); }
+        }
+    }
+
+    fn clear_player_colliders(&mut self) {
+        for (_, proxy) in std::mem::take(&mut self.player_colliders) {
+            self.remove_body(proxy.body);
+        }
+    }
+
     pub fn begin_frame(&mut self, current_time: i32) {
         self.living_recoveries.retain(|_, recovery| {
             current_time.saturating_sub(recovery.started_at) < recovery.duration_ms
@@ -533,6 +624,7 @@ impl RagdollWorld {
             self.clear_detached_limbs();
             self.clear_debris();
             self.clear_glass();
+            self.clear_player_colliders();
             self.accumulator = 0.0;
             return;
         }
@@ -559,7 +651,19 @@ impl RagdollWorld {
         self.accumulator += frame_dt;
 
         let mut steps = 0;
+        let step_count = (((self.accumulator + 1.0e-6) / step_dt) as u32).min(self.config.max_substeps);
+        let player_paths = self.player_colliders.values().filter_map(|proxy| {
+            self.bodies.get(proxy.body).map(|body| (proxy.body, body.translation(), proxy.target))
+        }).collect::<Vec<_>>();
         while self.accumulator + 1.0e-6 >= step_dt && steps < self.config.max_substeps {
+            // Spread frame movement across fixed steps, including frames that
+            // accumulated several render samples before the first physics tick.
+            let fraction = (steps + 1) as f32 / step_count.max(1) as f32;
+            for &(handle, start, target) in &player_paths {
+                if let Some(body) = self.bodies.get_mut(handle) {
+                    body.set_next_kinematic_translation(start + (target - start) * fraction);
+                }
+            }
             self.capture_previous_poses();
             self.pipeline.step(
                 Vector::new(0.0, 0.0, -JKA_GRAVITY * JKA_TO_RAPIER),
@@ -1011,15 +1115,10 @@ impl RagdollWorld {
                     .insert(body, spawned.position().clone());
             }
 
-            let dynamic_groups = if self.config.self_collision {
-                InteractionGroups::new(
-                    Group::GROUP_2,
-                    Group::GROUP_1 | Group::GROUP_2,
-                    InteractionTestMode::default(),
-                )
-            } else {
-                InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::default())
-            };
+            let mut filter = Group::GROUP_1;
+            if self.config.self_collision { filter |= Group::GROUP_2; }
+            if kind == RagdollKind::Corpse { filter |= Group::GROUP_3; }
+            let dynamic_groups = InteractionGroups::new(Group::GROUP_2, filter, InteractionTestMode::default());
             let collider = if let Some(end_name) = spec.end {
                 let endpoint = bone_index(gla, end_name)
                     .and_then(|end_index| posed_bone_matrix(gla, pose, end_index))
@@ -1191,6 +1290,7 @@ impl RagdollWorld {
             grip_anchor,
             torso_anchor,
             spawned_at: current_time,
+            lifetime_slept: false,
             last_authoritative_origin: origin,
             last_applied_pose: spawn_pose.clone(),
             spawn_pose,
@@ -1337,10 +1437,13 @@ impl RagdollWorld {
     fn sleep_expired(&mut self, current_time: i32) {
         if self.config.lifetime_seconds > 0.0 {
             let lifetime_ms = (self.config.lifetime_seconds * 1000.0) as i32;
-            for instance in self.instances.values() {
-                if current_time.saturating_sub(instance.spawned_at) < lifetime_ms {
+            for instance in self.instances.values_mut() {
+                if instance.lifetime_slept || current_time.saturating_sub(instance.spawned_at) < lifetime_ms {
                     continue;
                 }
+                // Apply the lifetime sleep once; later player contact must be
+                // able to wake the corpse and keep it moving on following frames.
+                instance.lifetime_slept = true;
                 for driven in &instance.driven {
                     if let Some(body) = self.bodies.get_mut(driven.body) {
                         body.sleep();
@@ -1902,6 +2005,7 @@ impl RagdollWorld {
         self.static_world_ready = false;
         self.previous_body_poses.clear();
         self.instances.clear();
+        self.player_colliders.clear();
         self.detached_limbs.clear();
         self.debris.clear();
         self.glass.clear();
@@ -2023,7 +2127,7 @@ fn ragdoll_driver_for_bone(
 
 /// Drop only scale/shear from an affine Ghoul2 bone transform while preserving
 /// its model-space translation. Rapier can represent this rigid part exactly.
-fn rigidify_affine(matrix: &Matrix3x4) -> Matrix3x4 {
+pub(crate) fn rigidify_affine(matrix: &Matrix3x4) -> Matrix3x4 {
     pose_to_matrix(&matrix_to_pose(matrix))
 }
 
@@ -2142,6 +2246,147 @@ fn pose_to_matrix(pose: &Pose) -> Matrix3x4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contact_world() -> RagdollWorld {
+        let mut world = RagdollWorld::new();
+        world.set_config(RagdollConfig {
+            physics_enabled: true, enabled: true, lifetime_seconds: 0.1,
+            ..RagdollConfig::default()
+        });
+        world.set_map_mesh(&PhysicsMapMesh::from_jka_mesh(
+            vec![[-512.0, -512.0, 0.0], [512.0, -512.0, 0.0],
+                 [512.0, 512.0, 0.0], [-512.0, 512.0, 0.0]],
+            vec![[0, 1, 2], [0, 2, 3]],
+        ).unwrap()).unwrap();
+        world
+    }
+
+    fn contact_player(x: f32) -> PhysicsPlayer {
+        PhysicsPlayer {
+            entity: 0, origin: [x, 0.0, 24.0],
+            mins: [-15.0, -15.0, -24.0], maxs: [15.0, 15.0, 32.0], teleport_bit: 0,
+        }
+    }
+
+    #[test]
+    fn corpse_skinning_scale_is_preserved_during_player_contact() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+        for rig_kind in [HumanoidRig::Jka53, HumanoidRig::Jk2_72] {
+            for scale in [0.65, 1.0, 1.5] {
+                let mut world = contact_world();
+                let rig = humanoid_reference(rig_kind);
+                let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+                let frozen = vec![identity; rig.skeleton.len()];
+                let mut state = EntityState { number: 1, fields: [0; ENTITY_FIELDS.len()] };
+                state.fields[ENTITY_FIELDS.iter().position(|(name, _)| *name == "clientNum").unwrap()] = 1;
+                let entity = PresentedEntity {
+                    number: 1, entity_type: crate::cgame::ET_BODY,
+                    origin: [0., 0., 24.], angles: [0.; 3], state,
+                };
+                let axis = [[0., 1., 0.], [-1., 0., 0.], [0., 0., 1.]];
+                let mut pose = frozen.clone();
+                world.apply_to_pose(&entity, "size-test", &rig, &mut pose, axis,
+                    entity.origin, scale, RagdollMode::Corpse, None, 0).unwrap();
+                let mut worst_scale_error = 0.0_f32;
+                world.begin_frame(0);
+                for frame in 0..300 {
+                    let now = frame * 17;
+                    let player = contact_player(-100.0 + frame as f32 * 2.0);
+                    world.set_players(&[player], now);
+                    world.begin_frame(now);
+                    pose.clone_from(&frozen);
+                    world.apply_to_pose(&entity, "size-test", &rig, &mut pose, axis,
+                        entity.origin, scale, RagdollMode::Corpse, None, now).unwrap();
+                    for index in 0..rig.skeleton.len() {
+                        for column in 0..3 {
+                            let length = Vector::new(pose[index][0][column], pose[index][1][column], pose[index][2][column]).length();
+                            worst_scale_error = worst_scale_error.max((length - 1.0).abs());
+                        }
+                    }
+                }
+                assert!(worst_scale_error < 0.001,
+                    "{rig_kind:?} scale={scale}: bone skinning scale changed by {worst_scale_error}");
+            }
+        }
+    }
+
+    #[test]
+    fn walking_player_pushes_sleeping_articulated_corpse_after_lifetime() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        for frame_ms in [8, 16, 33] {
+            let mut world = contact_world();
+            let rig = humanoid_reference(HumanoidRig::Jka53);
+            let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+            let corpse = world.spawn_instance(
+                "test", &rig, &vec![identity; rig.skeleton.len()],
+                [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 24.], 1.0,
+                CorpseGeneration { client_num: 1, body_queue_time: 0 },
+                RagdollKind::Corpse, Vector::ZERO, 0,
+            ).unwrap();
+            let pelvis = corpse.driven[0].body;
+            world.instances.insert(1, corpse);
+            world.begin_frame(0);
+            for time in 1..=300 { world.begin_frame(time * 17); }
+            // Force a fully sleeping articulation, as with a settled corpse.
+            for bone in &world.instances[&1].driven { world.bodies[bone.body].sleep(); }
+            let start = world.bodies[pelvis].translation() * RAPIER_TO_JKA;
+            let mut now = 5100;
+            let duration = 1500;
+            for elapsed in (0..=duration).step_by(frame_ms as usize) {
+                now = 5100 + elapsed;
+                let mut player = contact_player(start.x - 48.0 + elapsed as f32 * 0.08);
+                player.origin[1] = start.y;
+                world.set_players(&[player], now);
+                world.begin_frame(now);
+            }
+            let end = world.bodies[pelvis].translation() * RAPIER_TO_JKA;
+            assert!(end.x > start.x + 10.0, "{frame_ms}ms frames: {start:?} -> {end:?} at {now}");
+            assert!(world.bodies[pelvis].translation().is_finite());
+        }
+    }
+
+    #[test]
+    fn player_hulls_accumulate_motion_and_do_not_sweep_teleports() {
+        let mut world = contact_world();
+        world.set_players(&[contact_player(0.0)], 0);
+        world.begin_frame(0);
+        let handle = world.player_colliders[&0].body;
+        world.set_players(&[contact_player(1.0)], 4);
+        world.begin_frame(4);
+        world.set_players(&[contact_player(2.0)], 8);
+        world.begin_frame(8);
+        assert_eq!(world.bodies[handle].translation().x, 0.0);
+        world.set_players(&[contact_player(4.0)], 17);
+        world.begin_frame(17);
+        assert!((world.bodies[handle].translation().x * RAPIER_TO_JKA - 4.0).abs() < 0.01);
+        let mut teleported = contact_player(90.0);
+        teleported.teleport_bit = 8;
+        world.set_players(&[teleported], 34);
+        world.begin_frame(34);
+        assert!(world.bodies[handle].linvel().length() < 0.01, "teleports impart no sweep velocity");
+        world.set_players(&[], 35);
+        assert!(world.player_colliders.is_empty());
+        assert!(world.bodies.is_empty());
+    }
+
+    #[test]
+    fn player_hulls_are_cleared_on_disable_seek_and_map_change() {
+        let mut world = contact_world();
+        world.set_players(&[contact_player(0.0)], 0);
+        world.set_config(RagdollConfig::default());
+        assert!(world.player_colliders.is_empty());
+        assert!(world.bodies.is_empty());
+        world = contact_world();
+        world.set_players(&[contact_player(0.0)], 0);
+        world.reset_dynamic_for_seek();
+        assert!(world.player_colliders.is_empty());
+        assert!(world.bodies.is_empty());
+        world.set_players(&[contact_player(0.0)], 0);
+        world.set_map_mesh(&PhysicsMapMesh::default()).unwrap();
+        assert!(world.player_colliders.is_empty());
+        assert!(world.bodies.is_empty());
+    }
 
     #[test]
     fn debris_uses_existing_rapier_world_and_respects_budgets_and_expiry() {

@@ -155,7 +155,7 @@ impl GpuSparkSpawn {
         };
         let rotation = self.start_rotation + self.rotation_delta * (10.0 / 0.7)
             * (1.0 - (-0.7 * elapsed).exp());
-        super::system::FxDraw::Sprite {
+        super::system::FxDraw::Sprite { shader_time: 0.0,
             origin, radius, rotation, rgba, shader: self.shader.clone(),
         }
     }

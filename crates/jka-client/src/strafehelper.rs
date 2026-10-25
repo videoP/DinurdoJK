@@ -25,6 +25,9 @@ use crate::ui::{
 };
 
 /// `SCREEN_WIDTH` / `SCREEN_HEIGHT`: the virtual space every coordinate here uses.
+mod extended;
+pub use extended::{extended_hud, ExtendedHud, StrafeFill, StrafeLabel, StrafeTriangle};
+
 pub const SCREEN_WIDTH: f32 = 640.0;
 pub const SCREEN_HEIGHT: f32 = 480.0;
 /// `state.strafeHelper.LINE_HEIGHT`: the screen midpoint.
@@ -151,6 +154,9 @@ pub struct GroundTracker {
     command_time: Option<i32>,
     grounded: bool,
     was_grounded: bool,
+    speed_xy: f32,
+    accel_bar_width: f32,
+    accel_command_time: Option<i32>,
 }
 
 impl GroundTracker {
@@ -161,6 +167,24 @@ impl GroundTracker {
         }
         self.grounded = grounded;
         self.was_grounded
+    }
+
+    /// Q3DF CGaz_StrafeHud.c: cache speed delta only on a new usercmd;
+    /// preserve the last result while presentation draws extra frames.
+    pub fn q3df_accel_width(&mut self, command_time: i32, speed: f32, grounded: bool) -> f32 {
+        // Own the sampling clock: calling update() first must not discard a
+        // sample. A demo seek/map restart must also discard stale feedback.
+        if self.accel_command_time == Some(command_time) { return self.accel_bar_width; }
+        self.accel_bar_width = self.accel_command_time
+            .and_then(|previous| command_time.checked_sub(previous))
+            .filter(|dt| *dt > 0 && *dt <= 1000)
+            .map_or(0.0, |dt| {
+                let width = (speed - self.speed_xy) / dt as f32 * 256.0;
+                if grounded { width * 0.1 } else { width }
+            });
+        self.accel_command_time = Some(command_time);
+        self.speed_xy = speed;
+        self.accel_bar_width
     }
 }
 
@@ -1276,6 +1300,24 @@ mod tests {
         assert!(tracker.update(108, true));
         assert!(tracker.update(116, false));
         assert!(!tracker.update(124, false));
+    }
+
+    #[test]
+    fn acceleration_samples_commands_independently_of_render_count_and_ground_update() {
+        let mut tracker = GroundTracker::default();
+        tracker.update(100, false);
+        assert_eq!(tracker.q3df_accel_width(100, 700.0, false), 0.0);
+        tracker.update(108, false);
+        assert_eq!(tracker.q3df_accel_width(108, 702.0, false), 64.0);
+        for _ in 0..32 {
+            // Display-only provisional movement must not resample the command.
+            assert_eq!(tracker.q3df_accel_width(108, 703.0, false), 64.0);
+        }
+        assert_eq!(tracker.q3df_accel_width(116, 700.0, false), -64.0);
+        assert!((tracker.q3df_accel_width(124, 702.0, true) - 6.4).abs() < 0.001);
+        assert_eq!(tracker.q3df_accel_width(10, 250.0, false), 0.0);
+        assert_eq!(tracker.q3df_accel_width(18, 252.0, false), 64.0);
+        assert_eq!(tracker.q3df_accel_width(5000, 700.0, false), 0.0);
     }
 
     #[test]

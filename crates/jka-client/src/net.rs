@@ -42,6 +42,10 @@ pub struct NetworkSettings {
     pub saber2: String,
     pub color1: u8,
     pub color2: u8,
+    /// The actual CVAR_USERINFO text when using DinurdoJK's versioned wire
+    /// format. Numeric/legacy values continue to use the typed fields below.
+    pub color1_packed: Option<String>,
+    pub color2_packed: Option<String>,
     /// TaystJK global hat appended to color1 on non-jaPRO servers.
     pub global_hat: String,
     /// TaystJK global cape appended to color2 on non-jaPRO servers.
@@ -147,6 +151,8 @@ impl Default for NetworkSettings {
             saber2: "none".into(),
             color1: 4,
             color2: 4,
+            color1_packed: None,
+            color2_packed: None,
             global_hat: String::new(),
             global_cape: String::new(),
             sb_rgb1: 0,
@@ -192,6 +198,24 @@ impl Default for NetworkSettings {
 }
 
 impl NetworkSettings {
+    /// Console, config archive and userinfo must all see the exact same cvar.
+    pub fn color1_value(&self) -> String {
+        self.color1_packed.clone().unwrap_or_else(||
+            crate::global_cosmetics::encode(self.color1, &self.global_hat))
+    }
+
+    pub fn color2_value(&self) -> String {
+        self.color2_packed.clone().unwrap_or_else(||
+            crate::global_cosmetics::encode(self.color2, &self.global_cape))
+    }
+
+    /// On servers without extended RGB, change *only* the numeric saber prefix;
+    /// never drop an authored z1/z3 or TaystJK cosmetic suffix.
+    fn color_value_with_base(value: &str, base: u8) -> String {
+        let digits = value.bytes().take_while(|c| c.is_ascii_digit()).count();
+        format!("{base}{}", &value[digits..])
+    }
+
     #[cfg(test)]
     pub fn cvar_value(&self, name: &str) -> Option<String> {
         crate::app::network_cvars::settings_registry().get(self, name).map(|value| value.to_string())
@@ -216,8 +240,8 @@ impl NetworkSettings {
             ("teamoverlay", u8::from(self.team_overlay).to_string()),
             ("sex", self.sex.clone()),
             ("handicap", self.handicap.to_string()),
-            ("color2", crate::global_cosmetics::encode(self.color2, &self.global_cape)),
-            ("color1", crate::global_cosmetics::encode(self.color1, &self.global_hat)),
+            ("color2", self.color2_value()),
+            ("color1", self.color1_value()),
             ("forcepowers", self.forcepowers.clone()),
             ("model", model.to_owned()),
             ("snaps", self.snaps.to_string()),
@@ -269,8 +293,8 @@ impl NetworkSettings {
                     _ => color,
                 }
             };
-            set_info_value(&mut info, b"color1", crate::global_cosmetics::encode(base(self.color1, self.sb_rgb1), &self.global_hat).as_bytes());
-            set_info_value(&mut info, b"color2", crate::global_cosmetics::encode(base(self.color2, self.sb_rgb2), &self.global_cape).as_bytes());
+            set_info_value(&mut info, b"color1", Self::color_value_with_base(&self.color1_value(), base(self.color1, self.sb_rgb1)).as_bytes());
+            set_info_value(&mut info, b"color2", Self::color_value_with_base(&self.color2_value(), base(self.color2, self.sb_rgb2)).as_bytes());
         }
         // TaystJK declares cjp_client CVAR_USERINFO|CVAR_ROM, so it is present
         // on every connect. JA+ uses the value to enable plugin behavior including
@@ -692,6 +716,16 @@ impl LiveInput {
             self.generic_command = None;
         }
         self.emote_tx = Some((crate::emotes::network::STOP_ID, Instant::now()));
+    }
+
+    /// Drop unsent one-shot actions when the client temporarily stops creating
+    /// usercmds (vid_restart). Preserve view angles and weapon selection: this
+    /// is a renderer restart, not a respawn or a new network session.
+    pub fn cancel_pending_actions(&mut self) {
+        self.was_pressed = 0;
+        self.generic_command = None;
+        self.emote_tx = None;
+        self.move_priority = [0; 3];
     }
 
     /// IN_KeyDown's wasPressed: a button tapped between frames still fires.
@@ -1524,6 +1558,22 @@ fn set_origin(ps: &mut PlayerState, origin: [f32; 3]) {
     }
 }
 
+fn validate_prediction_snapshot(snapshot: &Snapshot) -> Result<(), String> {
+    for field in ["origin", "velocity", "viewangles"] {
+        let values: [f32; 3] = std::array::from_fn(|axis| {
+            snapshot.player_state.field_f32(&format!("{field}[{axis}]")).unwrap_or(0.0)
+        });
+        if !values.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "Non-finite authoritative snapshot before Pmove: message={} serverTime={} commandTime={} {field}={values:?}; origin={:?}. Respawn or server teleport may be needed to reset the player state",
+                snapshot.message_num, snapshot.server_time,
+                snapshot.player_state.field_i32("commandTime").unwrap_or(0), origin(&snapshot.player_state),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// CG_Trace / CG_PointContents: the world plus CG_ClipMoveToEntities.
 pub struct PredictionWorld<'a> {
     pub world: &'a mut CollisionWorld,
@@ -1622,6 +1672,7 @@ impl TraceWorld for PredictionTraceWorld<'_, '_> {
 #[derive(Default)]
 pub struct Predictor {
     native: Option<NativePlayerState>,
+    failure_logged_at: Option<Instant>,
     /// cg.predictedPlayerState from committed usercmds only; the base for
     /// OpenJK's prediction-error detection.
     predicted: Option<PlayerState>,
@@ -1745,6 +1796,18 @@ pub struct PredictionInput<'a> {
 impl Predictor {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn report_failure(&mut self, error: &str) {
+        let now = Instant::now();
+        if self.failure_logged_at.is_none_or(|last| now.duration_since(last).as_secs() >= 1) {
+            eprintln!("PREDICTION FAILED (falling back to interpolation): {error}");
+            self.failure_logged_at = Some(now);
+        }
+    }
+
+    pub fn clear_failure(&mut self) {
+        self.failure_logged_at = None;
     }
 
     /// Install the predicted client's equipped sabers (what CG_NewClientInfo's
@@ -1926,6 +1989,9 @@ impl Predictor {
         let latest = command(current);
         let using_next = next.filter(|_| !next_frame_teleport && !self.this_frame_teleport);
         let base = using_next.unwrap_or(snap);
+        // Validate the decoded authoritative state before installing it in the
+        // native player. This separates bad input from a local replay failure.
+        validate_prediction_snapshot(base)?;
         let base_ps = &base.player_state;
         let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
         prediction_settings.plugin_disable = settings.plugin_disable;
@@ -2471,7 +2537,70 @@ impl Predictor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_restart_drops_pending_usercmd_actions_but_preserves_view_and_selection() {
+        let mut input = super::LiveInput::default();
+        input.view_angles = [23.0, 127.0, 0.0];
+        input.weapon_select = 8;
+        input.note_pressed("+attack");
+        input.note_movement_button_press("+forward");
+        input.queue_generic_command(4);
+        assert_ne!(input.was_pressed, 0);
+        assert_eq!(input.generic_command, Some(4));
+        input.cancel_pending_actions();
+        assert_eq!(input.was_pressed, 0);
+        assert_eq!(input.generic_command, None);
+        assert_eq!(input.move_priority, [0; 3]);
+        assert_eq!(input.view_angles, [23.0, 127.0, 0.0]);
+        assert_eq!(input.weapon_select, 8);
+    }
+    #[test]
+    fn profile_color_cvars_are_the_actual_userinfo_and_archive_values() {
+        let mut network = super::NetworkSettings::default();
+        let packed_cosmetics = crate::profile_wire::encode_cosmetics(4,
+            crate::profile_wire::PackedCosmetics {
+                mask: 7,
+                hat: crate::profile_wire::cosmetic_id("santahat"),
+                cape: crate::profile_wire::cosmetic_id("vadercape"),
+            });
+        let mut body = crate::profile_wire::BodyWire::neutral();
+        body.channels[0] = 10;
+        let packed_body = body.encode(4).expect("small body profile must fit");
+        network.set_cvar("color1", &packed_cosmetics).expect("registered cvar").expect("valid cvar");
+        network.set_cvar("color2", &packed_body).expect("registered cvar").expect("valid cvar");
+        assert_eq!(network.cvar_value("color1").as_deref(), Some(packed_cosmetics.as_str()));
+        assert_eq!(network.cvar_value("color2").as_deref(), Some(packed_body.as_str()));
+        let info = network.userinfo("kyle/default");
+        assert_eq!(jka_protocol::commands::info_value(&info, b"color1"), Some(packed_cosmetics.as_bytes()));
+        assert_eq!(jka_protocol::commands::info_value(&info, b"color2"), Some(packed_body.as_bytes()));
+        let mut cfg = String::new();
+        network.write_cfg(&mut cfg);
+        assert!(cfg.contains(&format!("seta color1 \"{packed_cosmetics}\"")));
+        assert!(cfg.contains(&format!("seta color2 \"{packed_body}\"")));
+        let rebase = super::NetworkSettings::color_value_with_base(&packed_body, 2);
+        assert_eq!(rebase, format!("2{}", &packed_body[1..]));
+        network.set_cvar("color2", "3vadercape").expect("registered cvar").expect("legacy cape");
+        assert_eq!(network.color2_value(), "3vadercape");
+    }
     use super::*;
+
+    #[test]
+    fn non_finite_authoritative_snapshot_is_identified_before_local_pmove() {
+        let mut snapshot = Snapshot {
+            server_time: 6825220, message_num: 42, delta_num: 41, snap_flags: 0,
+            ping: 0, server_command_num: 0, area_mask: [0; 32],
+            player_state: PlayerState::default(), vehicle_player_state: None, entities: vec![],
+        };
+        snapshot.player_state.set_field_bits("commandTime", 6825217);
+        assert!(validate_prediction_snapshot(&snapshot).is_ok());
+        snapshot.player_state.set_field_bits("velocity[0]", f32::NAN.to_bits());
+        let error = validate_prediction_snapshot(&snapshot).unwrap_err();
+        assert!(error.contains("authoritative snapshot before Pmove"), "{error}");
+        assert!(error.contains("message=42"), "{error}");
+        assert!(error.contains("velocity=[NaN"), "{error}");
+        snapshot.player_state.set_field_bits("velocity[0]", 0.0f32.to_bits());
+        assert!(validate_prediction_snapshot(&snapshot).is_ok());
+    }
 
     fn mover_entity(number: u16, entity_type: i32, base: [f32; 3], delta: [f32; 3]) -> crate::cgame::PresentedEntity {
         use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};

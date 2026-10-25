@@ -79,7 +79,7 @@ pub(in crate::cgame::player_presenter) const EF_RAG: i32 = 1 << 6;
 pub(in crate::cgame::player_presenter) const EF2_SHIP_DEATH: i32 = 1 << 7;
 
 // OpenJK MP CG_PlayerShadow / bg_public.h / teams.h values. Blob shadows are
-// deliberately a CGame presentation feature, not part of the CSM/RT paths.
+// a CGame presentation feature; subtle contact blobs may supplement CSM/RT.
 pub(in crate::cgame::player_presenter) const PW_CLOAKED: i32 = 11;
 
 pub(in crate::cgame::player_presenter) const CLASS_REMOTE: i32 = 39;

@@ -144,6 +144,8 @@ pub struct EntityPresenter {
     md3_chains: HashMap<String, Md3Chain>,
     md3_worker: md3_lod::Worker,
     md3_lod_view: Option<Ghoul2PresentationView>,
+    entity_pvs_enabled: bool,
+    entity_area_mask: Option<[u8; 32]>,
     md3_lod_scale: f32,
     md3_lod_bias: i32,
     md3_auto_lod: bool,
@@ -183,6 +185,13 @@ pub struct EntityPresenter {
     static_draw_order: Vec<StaticDrawRef>,
     /// Per-frame LOD chosen for each static prop (`u8::MAX` = culled).
     static_lod_scratch: Vec<u8>,
+    static_candidate_scratch: Vec<usize>,
+    /// Immutable, map-local spatial hierarchy of misc_model_static bounds.
+    /// The tree prunes whole frustum/distance/PVS groups before LOD selection;
+    /// every surviving prop still runs the exact original per-prop tests.
+    static_visibility_tree: StaticVisibilityTree,
+    static_md3_bvh: bool,
+    occlusion_stats: bool,
     /// Whether `static_props` carry RT caster sources (they must be rebuilt when
     /// hardware RT shadows are toggled).
     static_props_rt: bool,
@@ -235,6 +244,145 @@ struct StaticProp {
     radius: f32,
 }
 
+
+/// A CPU broad phase. Bounds enclose both the authored origin and the
+/// zoffset-adjusted cull origin, plus the full MD3 radius. An invalid radius
+/// disables group rejection, rather than allowing an invisible prop.
+#[derive(Default)]
+struct StaticVisibilityTree {
+    nodes: Vec<StaticVisibilityNode>,
+    prop_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct StaticVisibilityNode {
+    center: [f32; 3],
+    radius: f32,
+    /// If all children share one valid cluster, PVS can reject the group.
+    shared_cluster: Option<usize>,
+    start: usize,
+    end: usize,
+    children: Option<[usize; 2]>,
+    /// Cannot reject any subtree containing a prop with unknown bounds.
+    bounds_valid: bool,
+}
+
+impl StaticVisibilityTree {
+    const LEAF_SIZE: usize = 12;
+
+    fn build(props: &[StaticProp]) -> Self {
+        if props.is_empty() { return Self::default(); }
+        let mut result = Self {
+            nodes: Vec::new(),
+            prop_indices: (0..props.len()).collect(),
+        };
+        result.build_node(props, 0, props.len());
+        result
+    }
+
+    fn build_node(&mut self, props: &[StaticProp], start: usize, end: usize) -> usize {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        let mut bounds_valid = true;
+        let mut shared_cluster = props[self.prop_indices[start]].cull_cluster;
+        for &prop_index in &self.prop_indices[start..end] {
+            let prop = &props[prop_index];
+            if !prop.radius.is_finite() || prop.radius <= 0.0
+                || !prop.origin.iter().chain(prop.cull_origin.iter()).all(|v| v.is_finite()) {
+                bounds_valid = false;
+            }
+            if shared_cluster != prop.cull_cluster { shared_cluster = None; }
+            for axis in 0..3 {
+                let lower = prop.origin[axis].min(prop.cull_origin[axis]) - prop.radius;
+                let upper = prop.origin[axis].max(prop.cull_origin[axis]) + prop.radius;
+                lo[axis] = lo[axis].min(lower);
+                hi[axis] = hi[axis].max(upper);
+            }
+        }
+        if lo.iter().chain(hi.iter()).any(|x| !x.is_finite()) { bounds_valid = false; }
+        let center = std::array::from_fn(|axis| (lo[axis] * 0.5) + (hi[axis] * 0.5));
+        let radius = ((0..3).map(|axis| (hi[axis] - center[axis]).powi(2)).sum::<f32>()).sqrt()
+            + 1.0; // absorb rounding on the broad-phase enclosure
+        if !radius.is_finite() { bounds_valid = false; }
+        let node_index = self.nodes.len();
+        self.nodes.push(StaticVisibilityNode {
+            center, radius, shared_cluster, start, end, children: None, bounds_valid,
+        });
+        if end - start > Self::LEAF_SIZE {
+            let axis = (0..3).max_by(|&a, &b| {
+                (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b]))
+            }).unwrap_or(0);
+            self.prop_indices[start..end].sort_unstable_by(|&a, &b| {
+                props[a].cull_origin[axis].total_cmp(&props[b].cull_origin[axis])
+            });
+            let mid = start + (end - start) / 2;
+            let left = self.build_node(props, start, mid);
+            let right = self.build_node(props, mid, end);
+            self.nodes[node_index].children = Some([left, right]);
+        }
+        node_index
+    }
+
+    fn candidates(
+        &self,
+        view: Ghoul2PresentationView,
+        visibility: Option<&jka_assets::bsp::Visibility>,
+        view_cluster: Option<usize>,
+        output: &mut Vec<usize>,
+    ) -> (usize, usize) {
+        // Not a visibility *decision*: returns conservative candidates for
+        // the original per-prop culling. The array is never used as draw order.
+        let mut checked = 0;
+        let mut rejected = 0;
+        if !self.nodes.is_empty() {
+            self.gather(0, view, visibility, view_cluster, output, &mut checked, &mut rejected);
+        }
+        (checked, rejected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather(
+        &self, index: usize, view: Ghoul2PresentationView,
+        visibility: Option<&jka_assets::bsp::Visibility>, view_cluster: Option<usize>,
+        output: &mut Vec<usize>, checked: &mut usize, rejected: &mut usize,
+    ) {
+        *checked += 1;
+        let node = self.nodes[index];
+        let outside = node.bounds_valid && (
+            view.sphere_outside(node.center, node.radius)
+            || (view.distance_cull() > 0.0
+                && view.distance_to(node.center) - node.radius > view.distance_cull())
+        );
+        let pvs_hidden = node.shared_cluster.is_some_and(|cluster| {
+            visibility.is_some_and(|vis| !vis.r_in_pvs(view_cluster, Some(cluster)))
+        });
+        if outside || pvs_hidden { *rejected += 1; return; }
+        if let Some([left, right]) = node.children {
+            self.gather(left, view, visibility, view_cluster, output, checked, rejected);
+            self.gather(right, view, visibility, view_cluster, output, checked, rejected);
+        } else {
+            output.extend_from_slice(&self.prop_indices[node.start..node.end]);
+        }
+    }
+}
+
+/// Transform all eight corners, including rotated and negative-scale models.
+fn md3_world_bounds(mins: [f32; 3], maxs: [f32; 3], origin: [f32; 3],
+                    axis: [[f32; 3]; 3], scale: f32) -> ([f32; 3], [f32; 3]) {
+    let mut low = [f32::INFINITY; 3];
+    let mut high = [f32::NEG_INFINITY; 3];
+    for corner in 0..8 {
+        let local: [f32; 3] = std::array::from_fn(|i|
+            if corner & (1 << i) == 0 { mins[i] * scale } else { maxs[i] * scale });
+        for i in 0..3 {
+            let value = origin[i] + (0..3).map(|j| axis[j][i] * local[j]).sum::<f32>();
+            low[i] = low[i].min(value);
+            high[i] = high[i].max(value);
+        }
+    }
+    (low, high)
+}
+
 impl EntityPresenter {
     pub fn new(mut assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
         let mut shader_warnings = Vec::new();
@@ -260,6 +408,8 @@ impl EntityPresenter {
             md3_chains: HashMap::new(),
             md3_worker: md3_lod::Worker::new(),
             md3_lod_view: None,
+            entity_pvs_enabled: true,
+            entity_area_mask: None,
             md3_lod_scale: 5.0,
             md3_lod_bias: 0,
             md3_auto_lod: false,
@@ -286,6 +436,10 @@ impl EntityPresenter {
             static_props: None,
             static_draw_order: Vec::new(),
             static_lod_scratch: Vec::new(),
+            static_candidate_scratch: Vec::new(),
+            static_visibility_tree: StaticVisibilityTree::default(),
+            static_md3_bvh: false,
+            occlusion_stats: false,
             static_props_rt: false,
             shield_hits: HashMap::new(),
             material_clock: std::time::Instant::now(),
@@ -409,6 +563,22 @@ impl EntityPresenter {
         }
     }
 
+    /// Runtime switch; the original per-prop scan is restored immediately at 0.
+    /// The tree can stay cached for the next A/B switch without affecting draws.
+    pub fn set_static_md3_bvh(&mut self, enabled: bool) {
+        if enabled && !self.static_md3_bvh && self.static_visibility_tree.nodes.is_empty() {
+            if let Some(props) = &self.static_props {
+                self.static_visibility_tree = StaticVisibilityTree::build(props);
+            }
+        }
+        self.static_md3_bvh = enabled;
+    }
+
+    pub fn set_occlusion_stats(&mut self, enabled: bool) {
+        self.occlusion_stats = enabled;
+        if enabled { self.md3_static_report_at = None; }
+    }
+
     pub fn set_md3_geometry_cache(&mut self, enabled: bool) {
         if self.md3_geometry_cache_enabled != enabled {
             self.md3_geometry.clear();
@@ -482,6 +652,7 @@ impl EntityPresenter {
         if !self.draw_map_models || self.static_model_source.placements.is_empty() {
             return Vec::new();
         }
+        let present_started = self.occlusion_stats.then(Instant::now);
         if self.static_props.is_none() || self.static_props_rt != self.rt_rigid_casters_enabled {
             self.static_props_rt = self.rt_rigid_casters_enabled;
             let props = self.build_static_props();
@@ -490,14 +661,28 @@ impl EntityPresenter {
         // R_inPVS(vieworg, cullorg): the view cluster's PVS row, areamask
         // ignored as in jaPRO. A view in solid (no cluster) keeps every prop,
         // like the world path does.
-        let pvs = self.static_model_source.visibility.as_ref();
+        let pvs = self.static_model_source.visibility.as_ref().filter(|_| self.entity_pvs_enabled);
         let view_cluster =
             view.and_then(|view| pvs.and_then(|vis| vis.cluster_at(view.jka_position())));
         let Some(props) = self.static_props.as_ref() else { return Vec::new() };
         let mut chosen = std::mem::take(&mut self.static_lod_scratch);
         chosen.clear();
         let mut lod_counts = [0usize; 3];
-        for prop in props {
+        let mut candidates = std::mem::take(&mut self.static_candidate_scratch);
+        let tree_started = self.occlusion_stats.then(Instant::now);
+        let (tree_tested, tree_pruned) = if self.static_md3_bvh {
+            candidates.clear();
+            if let Some(view) = view {
+                self.static_visibility_tree.candidates(view, pvs, view_cluster, &mut candidates)
+            } else {
+                candidates.extend(0..props.len());
+                (0, 0)
+            }
+        } else { (0, 0) };
+        let tree_us = tree_started.map(|now| now.elapsed().as_micros()).unwrap_or(0);
+        let candidate_count = if self.static_md3_bvh { candidates.len() } else { props.len() };
+        let hierarchy_skipped_props = props.len().saturating_sub(candidate_count);
+        let mut select_lod = |prop: &StaticProp| {
             let culled = view.is_some_and(|view| {
                 let distance_cull = view.distance_cull();
                 (prop.radius > 0.0 && view.sphere_outside(prop.cull_origin, prop.radius))
@@ -505,17 +690,20 @@ impl EntityPresenter {
                     || (distance_cull > 0.0
                         && view.distance_to(prop.origin) - prop.radius > distance_cull)
             });
-            if culled {
-                chosen.push(u8::MAX);
-                continue;
-            }
+            if culled { return u8::MAX; }
             let lod = md3_lod_for_view(
                 view, prop.origin, prop.lod_radius, prop.lod_count,
                 self.md3_lod_scale, self.md3_lod_bias, false,
             );
             lod_counts[lod] += 1;
-            // A missing generated level falls back to the authored surfaces.
-            chosen.push(if lod != 0 && prop.lods[lod - 1].is_none() { 0 } else { lod as u8 });
+            if lod != 0 && prop.lods[lod - 1].is_none() { 0 } else { lod as u8 }
+        };
+        if self.static_md3_bvh {
+            chosen.resize(props.len(), u8::MAX);
+            for &prop_index in &candidates { chosen[prop_index] = select_lod(&props[prop_index]); }
+        } else {
+            // Original direct scan: no candidate fill or extra full-array initialization.
+            for prop in props { chosen.push(select_lod(prop)); }
         }
         let mut draws = Vec::new();
         for entry in &self.static_draw_order {
@@ -556,10 +744,14 @@ impl EntityPresenter {
             }
         }
         self.static_lod_scratch = chosen;
-        if self.md3_lod_debug && self.md3_static_report_at
+        self.static_candidate_scratch = candidates;
+        if (self.md3_lod_debug || self.occlusion_stats) && self.md3_static_report_at
             .is_none_or(|instant| instant.elapsed().as_secs_f32() >= 1.0) {
-            println!("MD3 STATIC LOD: visible LOD0={} LOD1={} LOD2={} (auto={})",
-                lod_counts[0], lod_counts[1], lod_counts[2], self.md3_auto_lod);
+            println!("MD3 STATIC A/B: BVH={} total_props={} candidates={} nodes_tested={} nodes_pruned={} props_pruned={} broadphase_us={} visible_LODs=[{},{},{}] submitted_surfaces={} total_present_us={} (MD3 Hi-Z NOT wired)",
+                u8::from(self.static_md3_bvh), props.len(), candidate_count,
+                tree_tested, tree_pruned, hierarchy_skipped_props, tree_us,
+                lod_counts[0], lod_counts[1], lod_counts[2], draws.len(),
+                present_started.map(|t| t.elapsed().as_micros()).unwrap_or(0));
             self.md3_static_report_at = Some(Instant::now());
         }
         draws
@@ -664,6 +856,9 @@ impl EntityPresenter {
                 layers,
             });
         }
+        self.static_visibility_tree = if self.static_md3_bvh {
+            StaticVisibilityTree::build(&props)
+        } else { StaticVisibilityTree::default() };
         self.static_draw_order = static_draw_order(&props);
         if self.static_md3_instances {
             devprintln!(1, "STATIC MD3 INSTANCES: {} eligible surface placements (across LODs), {} unique resident meshes; RT shadows automatically use CPU baseline",
@@ -980,6 +1175,12 @@ impl EntityPresenter {
             return Ok(Vec::new());
         }
         let materials = self.fx_material_stages(shader_name);
+        // The override shader owns cull state (halfShieldShell is `cull
+        // twosided`); the model's own surface shaders do not apply here.
+        let effective = self.shader_remaps.effective_name(shader_name);
+        let two_sided = jka_assets::shader::find_shader(&self.shaders, &effective).is_some_and(|shader| {
+            matches!(shader.cull.trim().to_ascii_lowercase().as_str(), "none" | "twosided" | "two-sided" | "disable")
+        });
         let mut draws = Vec::with_capacity(asset.surfaces.len() * materials.len().max(1));
         for surface_asset in &asset.surfaces {
             let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else { continue };
@@ -997,6 +1198,7 @@ impl EntityPresenter {
                 let (vertices, indices) = self.md3_geometry(
                     &asset, surface_asset, entity_num, stage, 0, axis, origin,
                     1.0, color, 0.0);
+                let indices = md3_two_sided_indices(&indices, two_sided);
                 draws.push(DynamicModelSurface {
                     geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 authored_lighting: false,
@@ -1622,6 +1824,9 @@ impl EntityPresenter {
         let scale_int = entity.state.field_i32("iModelScale").unwrap_or(0);
         let scale = if scale_int == 0 { 1.0 } else { scale_int as f32 / 100.0 };
         let color = entity_color(entity);
+        let raster_visible = entity.state.field_i32("isPortalEnt").unwrap_or(0) != 0
+            || self.entity_md3_visible(&base.model, frame, entity.origin, axis, scale);
+        if !raster_visible && !self.rt_rigid_casters_enabled { return Ok(Vec::new()); }
         let asset = self.select_md3(qpath, entity.origin, frame, scale.abs(), None, false)?;
         let frame = frame.min(asset.model.frames.len().saturating_sub(1));
 
@@ -1682,6 +1887,9 @@ impl EntityPresenter {
                 &mut draws, &asset, surface_asset, entity.number, frame, axis,
                 entity.origin, scale, color, 0.0,
             );
+        }
+        if !raster_visible {
+            for draw in &mut draws { draw.raster_visible = false; }
         }
         Ok(draws)
     }
@@ -2196,6 +2404,24 @@ impl EntityPresenter {
 
     /// CGame may correct camera pose after prediction (and suppress it during
     /// teleports). Use that same final view for MD3 and Ghoul2 LOD decisions.
+    pub fn set_entity_pvs_enabled(&mut self, enabled: bool) {
+        self.entity_pvs_enabled = enabled;
+    }
+
+    pub fn update_entity_area_mask(&mut self, mask: Option<[u8; 32]>) {
+        self.entity_area_mask = mask;
+    }
+
+    fn entity_md3_visible(&self, model: &Md3Model, frame: usize,
+                          origin: [f32; 3], axis: [[f32; 3]; 3], scale: f32) -> bool {
+        if !self.entity_pvs_enabled { return true; }
+        let Some(vis) = self.static_model_source.visibility.as_ref() else { return true };
+        let Some(view) = self.md3_lod_view else { return true };
+        let Some(frame) = model.frames.get(frame) else { return true };
+        let (mins, maxs) = md3_world_bounds(frame.mins, frame.maxs, origin, axis, scale);
+        vis.box_visible(vis.cluster_at(view.jka_position()), mins, maxs, self.entity_area_mask.as_ref())
+    }
+
     pub fn update_md3_lod_view(&mut self, view: Option<Ghoul2PresentationView>) {
         self.md3_lod_view = view;
     }
@@ -3070,6 +3296,94 @@ mod tests {
         (fixture, presenter)
     }
 
+    fn two_room_visibility() -> jka_assets::bsp::Visibility {
+        let ints = |v: &[i32]| v.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<u8>>();
+        let mut lumps = vec![Vec::new(); 18];
+        lumps[0] = b"{\n\"classname\" \"worldspawn\"\n}\n".to_vec();
+        lumps[2] = [1.0f32, 0.0, 0.0, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        lumps[3] = ints(&[0, -1, -2, 0, 0, 0, 0, 0, 0]);
+        lumps[4] = ints(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                         1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        lumps[7] = vec![0; 40];
+        lumps[16] = ints(&[2, 1]);
+        lumps[16].extend([1, 2]);
+        let mut bytes = vec![0; 152];
+        bytes[..4].copy_from_slice(b"RBSP");
+        bytes[4..8].copy_from_slice(&1i32.to_le_bytes());
+        for (i, lump) in lumps.iter().enumerate() {
+            let start = bytes.len() as i32;
+            bytes[8+i*8..12+i*8].copy_from_slice(&start.to_le_bytes());
+            bytes[12+i*8..16+i*8].copy_from_slice(&(lump.len() as i32).to_le_bytes());
+            bytes.extend(lump);
+        }
+        let bsp = jka_assets::bsp::Bsp::parse(&bytes).unwrap();
+        let source = bsp.static_models();
+        assert!(source.placements.is_empty());
+        source.visibility.expect("entity MD3s need PVS even without misc_model_static")
+    }
+
+    #[test]
+    fn entity_md3_pvs_rejects_hidden_rooms_preserves_rt_and_obeys_off() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(Arc::new(StaticModels {
+            placements: Vec::new(), visibility: Some(two_room_visibility()),
+        }));
+        presenter.update_md3_lod_view(Some(Ghoul2PresentationView::new(
+            scene::render_position([100.0, 0.0, 0.0]), [-1.0, 0.0, 0.0], 1.2, 1.0, 0.0,
+        )));
+        let mut entity = PresentedEntity {
+            number: 1, entity_type: super::super::ET_GENERAL,
+            origin: [-100.0, 0.0, 0.0], angles: [0.0; 3],
+            state: jka_protocol::gamestate::EntityState {
+                number: 1, fields: [0; jka_protocol::gamestate::ENTITY_FIELDS.len()],
+            },
+        };
+        assert!(presenter.present_md3(&entity, "synthetic.md3").unwrap().is_empty());
+        presenter.rt_rigid_casters_enabled = true;
+        let hidden = presenter.present_md3(&entity, "synthetic.md3").unwrap();
+        assert!(!hidden.is_empty());
+        assert!(hidden.iter().all(|draw| !draw.raster_visible && draw.rt_rigid.is_some()));
+        presenter.set_entity_pvs_enabled(false);
+        assert!(presenter.present_md3(&entity, "synthetic.md3").unwrap().iter().all(|d| d.raster_visible));
+        presenter.set_entity_pvs_enabled(true);
+        presenter.rt_rigid_casters_enabled = false;
+        entity.origin[0] = -5.0; // origin hidden, but bounds cross into visible room
+        assert!(!presenter.present_md3(&entity, "synthetic.md3").unwrap().is_empty());
+        entity.origin[0] = 100.0;
+        let mut mask = [0; 32]; mask[0] = 1;
+        presenter.update_entity_area_mask(Some(mask));
+        assert!(presenter.present_md3(&entity, "synthetic.md3").unwrap().is_empty());
+        presenter.update_md3_lod_view(None);
+        assert!(!presenter.present_md3(&entity, "synthetic.md3").unwrap().is_empty());
+    }
+
+    #[test]
+    fn entity_md3_bounds_include_rotation_and_negative_scale() {
+        let (mins, maxs) = md3_world_bounds([0.0; 3], [10.0, 20.0, 30.0],
+            [100.0, 200.0, 300.0], [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], -2.0);
+        assert_eq!(mins, [100.0, 180.0, 240.0]);
+        assert_eq!(maxs, [140.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock PK3s"]
+    fn t2_rancor_model_pvs_at_reported_viewpos() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        let file = assets.read("maps/t2_rancor.bsp", 128 << 20).unwrap().unwrap();
+        let bsp = jka_assets::bsp::Bsp::parse(&file.bytes).unwrap();
+        let vis = bsp.visibility.as_ref().unwrap();
+        let cluster = vis.cluster_at([-3476.0, 3503.0, 1170.0]);
+        assert!(cluster.is_some());
+        let (mut visible, mut rejected) = (0, 0);
+        for model in bsp.models.iter().skip(1) {
+            if vis.box_visible(cluster, model.mins, model.maxs, None) { visible += 1; }
+            else { rejected += 1; }
+        }
+        println!("t2_rancor view cluster {cluster:?}: compiled inline bounds visible={visible}, PVS-rejected={rejected}; no area mask/frustum/Hi-Z");
+        assert!(visible > 0 && rejected > 0);
+    }
+
     fn shader_def(name: &str, stage: &str) -> String {
         format!("{name}\n{{\n{{\n{stage}\n}}\n}}\n")
     }
@@ -3084,6 +3398,100 @@ mod tests {
                 zoffset: 0.0, cull_cluster: None,
             }).collect(), visibility: None,
         })
+    }
+
+    #[test]
+    fn static_bvh_preserves_every_original_frustum_and_distance_candidate() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(256));
+        let props = presenter.build_static_props();
+        let tree = StaticVisibilityTree::build(&props);
+        let camera_origin = scene::render_position([0.0, 0.0, 0.0]);
+        let forward = scene::render_position([1.0, 0.0, 0.0]);
+        for max_dist in [0.0, 256.0, 2048.0] {
+            let view = Ghoul2PresentationView::new(camera_origin, forward, 1.2, 16.0/9.0, max_dist);
+            let mut candidates = Vec::new();
+            let (_, pruned) = tree.candidates(view, None, None, &mut candidates);
+            let set: HashSet<usize> = candidates.into_iter().collect();
+            for (index, prop) in props.iter().enumerate() {
+                let baseline_visible = !(prop.radius > 0.0
+                    && view.sphere_outside(prop.cull_origin, prop.radius))
+                    && !(max_dist > 0.0
+                        && view.distance_to(prop.origin) - prop.radius > max_dist);
+                if baseline_visible {
+                    assert!(set.contains(&index), "BVH dropped originally visible static MD3 {index}");
+                }
+            }
+            if max_dist == 256.0 { assert!(pruned > 0); }
+        }
+    }
+
+    #[test]
+    fn static_bvh_never_prunes_unknown_md3_bounds() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(48));
+        let mut props = presenter.build_static_props();
+        props[30].radius = 0.0; // the reference code disables frustum for this placement
+        props[30].origin = [-9000.0, 0.0, 0.0];
+        props[30].cull_origin = [-9000.0, 0.0, 100.0];
+        let tree = StaticVisibilityTree::build(&props);
+        let view = Ghoul2PresentationView::new(
+            scene::render_position([0.0; 3]), scene::render_position([1.0, 0.0, 0.0]),
+            1.2, 1.6, 0.0,
+        );
+        let mut candidates = Vec::new();
+        tree.candidates(view, None, None, &mut candidates);
+        assert!(candidates.contains(&30));
+    }
+
+    #[test]
+    fn static_md3_bvh_runtime_toggle_matches_original_surface_order() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(128));
+        let signature = |draws: &[DynamicModelSurface]| draws.iter().map(|draw| {
+            (draw.entity_num, bytemuck::cast_slice::<_, u8>(draw.vertices.as_slice()).to_vec(),
+                draw.indices.as_ref().clone(), draw.alpha_mode as u8, draw.lighting_origin,
+                draw.raster_visible, draw.authored_glow, draw.rt_rigid.is_some(),
+                draw.ghoul2_gpu.as_ref().map(|g| g.mesh_key.clone()))
+        }).collect::<Vec<_>>();
+        for rt in [false, true] {
+            for instanced in [false, true] {
+                presenter.rt_rigid_casters_enabled = rt;
+                presenter.set_static_md3_instances(instanced);
+                for forward in [[1.0,0.0,0.0],[-1.0,0.0,0.0],[0.0,0.0,1.0]] {
+                    let view = Ghoul2PresentationView::new(
+                        scene::render_position([0.0; 3]), scene::render_position(forward),
+                        1.2, 16.0 / 9.0, 800.0,
+                    );
+                    presenter.set_static_md3_bvh(false);
+                    let original = presenter.present_static_models(Some(view));
+                    presenter.set_static_md3_bvh(true);
+                    let accelerated = presenter.present_static_models(Some(view));
+                    presenter.set_static_md3_bvh(false);
+                    let restored = presenter.present_static_models(Some(view));
+                    assert_eq!(signature(&original), signature(&accelerated), "BVH changed geometry/order/RT: rt={rt} instances={instanced}");
+                    assert_eq!(signature(&original), signature(&restored), "disable must restore baseline");
+                    if rt {
+                        assert_eq!(original.iter().filter(|d| d.rt_rigid.is_some()).count(), 128);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn static_bvh_off_does_not_build_or_fill_hierarchy_storage() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_static_models(test_static_props(128));
+        presenter.present_static_models(None);
+        assert!(presenter.static_visibility_tree.nodes.is_empty());
+        assert_eq!(presenter.static_candidate_scratch.capacity(), 0);
+        presenter.set_static_md3_bvh(true);
+        assert!(!presenter.static_visibility_tree.nodes.is_empty());
+        presenter.set_static_md3_bvh(false);
+        presenter.set_static_models(test_static_props(2));
+        presenter.present_static_models(None);
+        assert!(presenter.static_visibility_tree.nodes.is_empty(), "OFF rebuild must not build the tree");
     }
 
     #[test]

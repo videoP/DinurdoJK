@@ -298,6 +298,7 @@ impl DynamicModelRenderer {
                             usage: wgpu::BufferUsages::INDEX,
                         });
                     Ghoul2GpuMesh {
+                        bind_radius: skin.vertices.iter().map(|v|Vec3::from_array(v.position).length()).fold(0.0,f32::max),
                         vertex_buffer,
                         index_buffer,
                         index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
@@ -734,9 +735,20 @@ impl DynamicModelRenderer {
         camera: &'a wgpu::BindGroup,
         depth_writing_phase: bool,
         rt_receivers: Option<(&'a rt_models::RtModelReceivers, &'a wgpu::BindGroup)>,
-        mut gpu_profiler: Option<&mut GpuProfiler>,
+        gpu_profiler: Option<&mut GpuProfiler>,
         excluded_entity: Option<u16>,
         authored_glow_only: bool,
+    ) {
+        self.draw_phase_inner(pass,camera,depth_writing_phase,rt_receivers,gpu_profiler,
+            excluded_entity,authored_glow_only,false);
+    }
+
+    fn draw_phase_inner<'a>(
+        &'a self, pass:&mut wgpu::RenderPass<'a>, camera:&'a wgpu::BindGroup,
+        depth_writing_phase:bool,
+        rt_receivers:Option<(&'a rt_models::RtModelReceivers,&'a wgpu::BindGroup)>,
+        mut gpu_profiler:Option<&mut GpuProfiler>, excluded_entity:Option<u16>,
+        authored_glow_only:bool,studio_capture:bool,
     ) {
         let capture_calls = crate::renderer::diagnostics::perf_capture::enabled();
         let mut calls = self.perf_phase_calls.get();
@@ -754,7 +766,9 @@ impl DynamicModelRenderer {
                 self.draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
             ).filter(|(mode, _)| self.model_alpha_mask & (1 << mode.index()) != 0)
             {
-                let pipeline = if authored_glow_only {
+                let pipeline = if studio_capture {
+                    self.studio_capture_pipelines[alpha_mode.index()].as_ref()
+                } else if authored_glow_only {
                     self.model_glow_pipelines[alpha_mode.index()].as_ref()
                 } else {
                     self.model_pipelines[alpha_mode.index()].as_ref()
@@ -762,7 +776,7 @@ impl DynamicModelRenderer {
                 let Some(pipeline) = pipeline else {
                     continue;
                 };
-                if alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
+                if !studio_capture && alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
                     && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
                 {
                     if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
@@ -1074,6 +1088,12 @@ impl DynamicModelRenderer {
         }
     }
 
+    pub(in crate::renderer) fn draw_studio_capture<'a>(&'a self,pass:&mut wgpu::RenderPass<'a>,camera:&'a wgpu::BindGroup) {
+        for phase in [true,false] {
+            self.draw_phase_inner(pass,camera,phase,None,None,None,false,true);
+        }
+    }
+
     pub(in crate::renderer) fn draw_excluding_entity<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
@@ -1263,6 +1283,22 @@ impl DynamicModelRenderer {
         camera: &'a wgpu::BindGroup,
         pipelines: [(&'a wgpu::RenderPipeline, &'a wgpu::RenderPipeline); 2],
     ) {
+        self.draw_depth_only_filtered(pass,camera,pipelines,None);
+    }
+
+    pub(in crate::renderer) fn draw_local_entity_shadow<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup,
+        entities: &std::collections::HashSet<u16>,
+    ) {
+        let Some([md3,md3_mask,skin,skin_mask]) = self.entity_shadow_pipelines[0].as_ref() else { return; };
+        self.draw_depth_only_filtered(pass,camera,[(md3,skin),(md3_mask,skin_mask)],Some(entities));
+    }
+
+    fn draw_depth_only_filtered<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup,
+        pipelines: [(&'a wgpu::RenderPipeline, &'a wgpu::RenderPipeline); 2],
+        entities: Option<&std::collections::HashSet<u16>>,
+    ) {
         let prepass_modes = [
             (
                 DynamicModelAlphaMode::Opaque,
@@ -1280,7 +1316,8 @@ impl DynamicModelRenderer {
                 let mut bound = false;
                 let masked = alpha_mode == DynamicModelAlphaMode::Mask;
                 for (draw, indices) in super::submission::depth_runs(
-                    self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode),
+                    self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode
+                        && entities.is_none_or(|e| e.contains(&draw.entity_num))),
                     self.dynamic_batch_draws,
                     masked,
                 ) {
@@ -1332,12 +1369,21 @@ impl DynamicModelRenderer {
                     }
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(
-                        0..mesh.index_count,
-                        0,
-                        draw.first_instance
-                            ..draw.first_instance.saturating_add(draw.instance_count),
-                    );
+                    let end = draw.first_instance.saturating_add(draw.instance_count);
+                    if entities.is_none() {
+                        pass.draw_indexed(0..mesh.index_count,0,draw.first_instance..end);
+                        continue;
+                    }
+                    let mut start = draw.first_instance;
+                    while start < end {
+                        let eligible = |instance: u32| entities.is_none_or(|e|
+                            self.skin_instance_entities.get(instance as usize).is_none_or(|id| e.contains(id)));
+                        if !eligible(start) { start += 1; continue; }
+                        let mut run_end = start + 1;
+                        while run_end < end && eligible(run_end) { run_end += 1; }
+                        pass.draw_indexed(0..mesh.index_count,0,start..run_end);
+                        start = run_end;
+                    }
                 }
             }
         }

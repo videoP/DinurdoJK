@@ -66,15 +66,26 @@ impl App {
             &self.perf,
             self.threads.len(),
             &self.japro_cg,
+            self.strafe_helper,
         );
-        // The profiler panel is huge; register it first so the elements it
-        // overlaps stay on top and remain grabbable.
+        // Register broad panels first so small readouts remain grabbable when
+        // their bounds overlap a graph, compass, guide, or profiler panel.
         let mut draw_order = HudElementId::ALL.to_vec();
-        draw_order.sort_by_key(|id| *id != HudElementId::Fps);
+        draw_order.sort_by(|a, b| {
+            let area = |id| {
+                let bounds = ui::hud_element_rect(id, self.hud_layout.element(id), &rect_ctx, size.width, size.height);
+                bounds.width * bounds.height
+            };
+            area(*b).total_cmp(&area(*a))
+        });
 
         let mut layout_changed = false;
         let mut drag_ended = false;
         for id in draw_order {
+            if !self.hud_edit_element_enabled(id) {
+                if self.hud_edit_selected == Some(id) { self.hud_edit_selected = None; }
+                continue;
+            }
             // An extension replaced this element: nothing is drawn to grab.
             if ui::hud_element_replaced(self.extensions.native_hidden, self.video.draw_hud, id) {
                 if self.hud_edit_selected == Some(id) {

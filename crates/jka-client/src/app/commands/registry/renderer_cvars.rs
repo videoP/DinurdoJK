@@ -58,10 +58,10 @@ app_cvars! {
                             None => value
                                 .trim()
                                 .parse::<u8>()
-                                .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                                .map_err(|_| format!("{name}: expected 0..4 (off/on are also accepted)"))?,
                         };
                         if level > 3 {
-                            return Err(format!("{name}: expected 0..3"));
+                            return Err(format!("{name}: expected 0..4"));
                         }
                         self.video.developer_level = level;
                         self.video.developer_tools = level != 0;
@@ -235,7 +235,7 @@ app_cvars! {
             |app, value| App::cvar_set_r_gpuadapter(app, APP_R_GPUADAPTER.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_r_gpuadapter, Some(|name, value| {
             crate::renderer::gpu_adapter::parse(value)
-                .map(|v| v.to_string()).ok_or_else(|| format!("{name}: expected 0..3 (auto/dedicated/integrated/software)"))
+                .map(|v| v.to_string()).ok_or_else(|| format!("{name}: expected 0..4 (auto/dedicated/integrated/software)"))
         })),
         config: CvarBinding {
             load_video: Some(|video, _name, value, _context| {
@@ -251,7 +251,7 @@ app_cvars! {
             impl App {
                 fn cvar_set_r_gpuadapter(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.gpu_adapter = crate::renderer::gpu_adapter::parse(value)
-                        .ok_or_else(|| format!("{name}: expected 0..3"))?;
+                        .ok_or_else(|| format!("{name}: expected 0..4"))?;
                     self.mark_config_dirty();
                     self.console_status = format!("GRAPHICS PROCESSOR: {} (APPLY VIDEO SETTINGS OR VID_RESTART)",
                         crate::renderer::gpu_adapter::label(self.video.gpu_adapter));
@@ -1195,7 +1195,7 @@ app_cvars! {
                 "r_dynamicLights",
                 "",
                 "off|legacy|vertex|clustered_lite|forward_plus|ray_traced",
-                "Dynamic-lighting technique for runtime-authored lights.",
+                "Dynamic-lighting technique. ray_traced traces transient lights (sabers, blasters, FX); static map lights use raster lighting and optional cubemap shadows.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1314,6 +1314,145 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_R_BAKEDLOCALLIGHTS {
+        runtime: CvarDef::new("r_bakedLocalLights", "", "0..1", "Experimental added lamp illumination over the original lightmap baseline. Leave off for shadows only; not required for inferred lamp shadows.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocallights(app)),
+            |app, value| App::cvar_set_r_bakedlocallights(app, APP_R_BAKEDLOCALLIGHTS.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocallights, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { settings.baked_local_lights = parse_bool(value).unwrap_or(settings.baked_local_lights); }),
+            archive: Some((14300, |state| format!("{}", u8::from(state.video.baked_local_lights)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocallights(&self) -> String { bool_value(self.video.baked_local_lights) }
+            fn cvar_set_r_bakedlocallights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                self.video.baked_local_lights = on;
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_LAMPSHADOWAB {
+        runtime: CvarDef::new("r_lampShadowAB", "", "0..4", "Session-only, no update-rate cap: 0 original cubemaps, 1 receiver octant rejection, 2 per-lamp caster prefilter, 3 combined, 4 conservative receiver early-out. Use perfcapture and r_gpuTimings to compare.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.video.lamp_shadow_ab.to_string()),
+            |app, value| App::cvar_set_r_lampshadowab(app, APP_R_LAMPSHADOWAB.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_lampshadowab, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_lampshadowab(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().map_err(|_| format!("{name}: expected 0..4"))?;
+                if mode > 4 { return Err(format!("{name}: expected 0..4")); }
+                self.video.lamp_shadow_ab = mode;
+                self.render_command(RenderCommand::SetLampShadowAB(mode));
+                self.console_status = format!("Lamp shadow A/B: {mode} (0=baseline; 1=receiver; 2=caster prep; 3=both; 4=receiver early-out)");
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALGLOW {
+        runtime: CvarDef::new("r_bakedLocalGlow", "", "0..1", "Use static shader glow emitters as lamp-shadow sources; also shared with experimental added lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocalglow(app)),
+            |app, value| App::cvar_set_r_bakedlocalglow(app, APP_R_BAKEDLOCALGLOW.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocalglow, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 1; } else { settings.baked_local_sources &= !1; } } }),
+            archive: Some((14302, |state| format!("{}", u8::from(state.video.baked_local_sources & 1 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocalglow(&self) -> String { bool_value(self.video.baked_local_sources & 1 != 0) }
+            fn cvar_set_r_bakedlocalglow(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 1; } else { self.video.baked_local_sources &= !1; }
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALADDITIVE {
+        runtime: CvarDef::new("r_bakedLocalAdditive", "", "0..1", "Infer static lamp-shadow sources from additive stages; broad inference, disabled by default.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocaladditive(app)),
+            |app, value| App::cvar_set_r_bakedlocaladditive(app, APP_R_BAKEDLOCALADDITIVE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocaladditive, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 2; } else { settings.baked_local_sources &= !2; } } }),
+            archive: Some((14303, |state| format!("{}", u8::from(state.video.baked_local_sources & 2 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocaladditive(&self) -> String { bool_value(self.video.baked_local_sources & 2 != 0) }
+            fn cvar_set_r_bakedlocaladditive(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 2; } else { self.video.baked_local_sources &= !2; }
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALEMISSIVE {
+        runtime: CvarDef::new("r_bakedLocalEmissive", "", "0..1", "Use emissive companion textures as static lamp-shadow sources.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocalemissive(app)),
+            |app, value| App::cvar_set_r_bakedlocalemissive(app, APP_R_BAKEDLOCALEMISSIVE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocalemissive, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 4; } else { settings.baked_local_sources &= !4; } } }),
+            archive: Some((14304, |state| format!("{}", u8::from(state.video.baked_local_sources & 4 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocalemissive(&self) -> String { bool_value(self.video.baked_local_sources & 4 != 0) }
+            fn cvar_set_r_bakedlocalemissive(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 4; } else { self.video.baked_local_sources &= !4; }
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALSURFACELIGHT {
+        runtime: CvarDef::new("r_bakedLocalSurfacelight", "", "0..1", "Use authored q3map_surfacelight as an inferred shadow source. Adds light only if the separate experimental r_bakedLocalLights mode is enabled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocalsurfacelight(app)),
+            |app, value| App::cvar_set_r_bakedlocalsurfacelight(app, APP_R_BAKEDLOCALSURFACELIGHT.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocalsurfacelight, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 8; } else { settings.baked_local_sources &= !8; } } }),
+            archive: Some((14305, |state| format!("{}", u8::from(state.video.baked_local_sources & 8 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocalsurfacelight(&self) -> String { bool_value(self.video.baked_local_sources & 8 != 0) }
+            fn cvar_set_r_bakedlocalsurfacelight(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 8; } else { self.video.baked_local_sources &= !8; }
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALFX {
+        runtime: CvarDef::new("r_bakedLocalFx", "", "0..1", "Use fixed continuously active EFX as lamp-shadow sources. Moving, triggered and intermittent effects are excluded.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocalfx(app)),
+            |app, value| App::cvar_set_r_bakedlocalfx(app, APP_R_BAKEDLOCALFX.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocalfx, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 16; } else { settings.baked_local_sources &= !16; } } }),
+            archive: Some((14306, |state| format!("{}", u8::from(state.video.baked_local_sources & 16 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocalfx(&self) -> String { bool_value(self.video.baked_local_sources & 16 != 0) }
+            fn cvar_set_r_bakedlocalfx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 16; } else { self.video.baked_local_sources &= !16; }
+                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
     }
 
     APP_R_PROMOTESHADERLIGHTS {
@@ -1477,7 +1616,7 @@ app_cvars! {
                         self.video.dynamic_shadows = DynamicShadowsMode::from_config(value)
                             .ok_or_else(|| format!("{name}: expected off|blob|entity|csm|ray_traced"))?;
                         self.video.cascaded_shadows =
-                            self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                            matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
                         self.sync_cascaded_shadows();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -1687,8 +1826,30 @@ app_cvars! {
         ]
     }
 
+    APP_R_PLAYERCONTACTSHADOWS {
+        runtime: CvarDef::new("r_playerContactShadows", "", "0|1", "Subtle projected foot-contact blobs under players/NPCs, independent of CSM, RT and lamp shadows. Fades with height. Classic Blob mode keeps its original drop shadow. Default 1.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.player_contact_shadows)),
+            |app, value| App::cvar_set_r_playercontactshadows(app, APP_R_PLAYERCONTACTSHADOWS.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_playercontactshadows, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(on) = parse_bool(value) { settings.player_contact_shadows = on; }
+            }),
+            archive: Some((26047, |state| bool_value(state.video.player_contact_shadows))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_set_r_playercontactshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.player_contact_shadows = Self::parse_cvar_bool(name, value)?;
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
     APP_R_BAKEDSUNCACHE {
-        runtime: CvarDef::new("r_bakedSunCache", "", "0|1", "Cache projected BSP sunlight subtraction in GPU lightmaps when the removal amount or source changes. 0 evaluates per pixel; 1 uses cached filtered lightmaps. Preview remains live. Unsupported bake formats use the shader path. Default 1.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.baked_sun_cache { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_bakedsuncache(app, APP_R_BAKEDSUNCACHE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsuncache, None),
+        runtime: CvarDef::new("r_bakedSunCache", "", "0|1", "Bake supported static BSP sunlight into GPU lightmaps: original-sun removal, indirect controls and CSM sunlight share one compositor. Players, doors and animated cutouts stay live. 0 keeps live evaluation; 1 bakes when inputs change. Unsupported receivers keep live shading. Default 1.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.baked_sun_cache { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_bakedsuncache(app, APP_R_BAKEDSUNCACHE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsuncache, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Some(v) = parse_bool(value) { settings.baked_sun_cache = v; }
@@ -2868,6 +3029,67 @@ app_cvars! {
         }]
     }
 
+    // All four occlusion controls are session-only. No undocumented silent fallbacks:
+    // GPU modes are rejected until the GPU probe is dispatched and draw results consumed.
+    APP_R_STATICMD3BVH {
+        runtime: CvarDef::new("r_staticMd3Bvh", "", "0..1", "Static misc_model_static A/B: 0 original per-prop scan, 1 cached conservative BVH broad phase. Changes are immediate; defaults 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.static_md3_bvh)),
+            |app, value| App::cvar_set_r_staticmd3bvh(app, APP_R_STATICMD3BVH.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_staticmd3bvh, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.static_md3_bvh)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_staticmd3bvh(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.static_md3_bvh = enabled;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.entity_presenter.set_static_md3_bvh(enabled);
+                }
+                if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+                    presenter.set_static_md3_bvh(enabled);
+                }
+                self.console_status = format!("STATIC MD3 BVH: {} (0=baseline, 1=hierarchy)", u8::from(enabled));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_MD3OCCLUSION {
+        runtime: CvarDef::new("r_md3Occlusion", "", "0 only (1/2 reserved)", "GPU MD3 wall Hi-Z is NOT wired up in phase 1. 0 baseline, 1 GPU Hi-Z and 2 Hi-Z+hierarchy reserved; nonzero values return an error rather than silently doing nothing.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.md3_occlusion.to_string()),
+            |app, value| App::cvar_set_r_md3occlusion(app, APP_R_MD3OCCLUSION.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_md3occlusion, None),
+        config: CvarBinding { default: Some(|state| state.video.md3_occlusion.to_string()), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_md3occlusion(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                if value.trim() != "0" {
+                    return Err("r_md3Occlusion 1/2 unavailable: MD3 GPU Hi-Z probe and draw integration are not implemented yet".to_owned());
+                }
+                self.video.md3_occlusion = 0;
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_OCCLUSIONSTATS {
+        runtime: CvarDef::new("r_occlusionStats", "", "0..1", "Sample and print MD3 BVH and FX CPU grouping stats once/sec. Counts are CPU candidate pruning, NOT GPU wall Hi-Z rejections. Off by default for unbiased benchmark runs.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.occlusion_stats)),
+            |app, value| App::cvar_set_r_occlusionstats(app, APP_R_OCCLUSIONSTATS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_occlusionstats, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.occlusion_stats)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_occlusionstats(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.occlusion_stats = enabled;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.entity_presenter.set_occlusion_stats(enabled);
+                }
+                self.console_status = format!("OCCLUSION CPU STATS: {}", if enabled {"ON"} else {"OFF"});
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_MD3GEOMETRYCACHE {
         runtime: CvarDef::new("r_md3GeometryCache", "", "0..1", "A/B reuse unchanged transformed/lit MD3 geometry and resident GPU stream ranges. Animation/transforms/lights invalidate exact cached inputs. Raster stream cache; RT keeps its original preparation. Session-only A/B override; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.md3_geometry_cache)),
@@ -3072,9 +3294,9 @@ app_cvars! {
                 "r_gpuTimings",
                 "",
                 "0..1",
-                "GPU timestamp-query profiler; no per-frame query/readback cost when disabled.",
+                "Session-only GPU timestamp-query profiler; resets off on restart and has no per-frame query/readback cost when disabled.",
                 CvarType::String,
-                CvarFlags::ARCHIVE,
+                CvarFlags::NONE,
                 LatchScope::None,
                 |app| CvarValue::String(App::cvar_get_r_gputimings(app)),
                 |app, value| {
@@ -3082,16 +3304,7 @@ app_cvars! {
                 },
             )
             .with_text_setter(App::cvar_set_r_gputimings, None),
-        config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    settings.gpu_timings = parse_bool(value).unwrap_or(settings.gpu_timings);
-                }),
-                archive: Some((23, |state| {
-                    let settings = state.video;
-                    format!("{}", u8::from(settings.gpu_timings))
-                })),
-                ..CvarBinding::NONE
-            },
+        config: CvarBinding::NONE,
         implementations: [
             impl App {
                 fn cvar_get_r_gputimings(&self) -> String {
@@ -3101,7 +3314,6 @@ app_cvars! {
                     {
                         self.video.gpu_timings = Self::parse_cvar_bool(name, value)?;
                         self.render_command(RenderCommand::SetGpuTimings(self.video.gpu_timings));
-                        self.mark_config_dirty();
                         self.publish_ui();
                     }
                     Ok(())
@@ -3831,7 +4043,7 @@ app_cvars! {
                 "r_localLightShadows",
                 "",
                 "0..1",
-                "Cubemap shadows for selected local lights.",
+                "Cached cubemap shadows for selected static local lights, including with RT dynamic lighting. RT transient shadows are independent.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -5040,10 +5252,10 @@ app_cvars! {
                             None => value
                                 .trim()
                                 .parse::<u8>()
-                                .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                                .map_err(|_| format!("{name}: expected 0..4 (off/on are also accepted)"))?,
                         };
                         if level > 3 {
-                            return Err(format!("{name}: expected 0..3"));
+                            return Err(format!("{name}: expected 0..4"));
                         }
                         self.video.renderer_verbose = level;
                         crate::logging::set_renderer_verbose_level(level);

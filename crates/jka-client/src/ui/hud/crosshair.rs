@@ -161,12 +161,15 @@ pub(in crate::ui) fn build_force_select(
     let y = 425.0;
 
     let draw_icon = |out: &mut Vec<UiVertex>, power: u8, x: f32, y: f32, size: f32| {
-        let (uv0, uv1) = icon_cell_uv(ICON_FORCE_BASE + usize::from(power));
+        let (uv0, uv1) = ui.icon_uv(ICON_FORCE_BASE + usize::from(power));
+        // Virtual 640x480 UI coordinates, but preserve square image pixels
+        // on widescreen: the old `sx` made Force icons 33% wider at 16:9.
+        let x_px = w as f32 * 0.5 + (x - 320.0) * sy;
         textured_rect_with_source(
             out,
-            x * sx,
+            x_px,
             y * sy,
-            size * sx,
+            size * sy,
             size * sy,
             uv0,
             uv1,
@@ -253,7 +256,7 @@ pub fn build_crosshair_vertices(
         crosshair.style = CROSSHAIR_STYLE_LINE;
         crosshair.image = 0;
     }
-    build_crosshair(
+    build_crosshair_impl(
         out,
         crosshair,
         ui.crosshair_target.color,
@@ -261,6 +264,7 @@ pub fn build_crosshair_vertices(
         ui.strafe_helper.line_width,
         w,
         h,
+        Some(&ui.icon_atlas_uvs),
     );
 }
 
@@ -272,6 +276,19 @@ pub(in crate::ui) fn build_crosshair(
     line_width: f32,
     w: u32,
     h: u32,
+) {
+    build_crosshair_impl(out, crosshair, target_color, screen_position, line_width, w, h, None);
+}
+
+fn build_crosshair_impl(
+    out: &mut Vec<UiVertex>,
+    crosshair: CrosshairSettings,
+    target_color: Option<[f32; 3]>,
+    screen_position: Option<[f32; 2]>,
+    line_width: f32,
+    w: u32,
+    h: u32,
+    atlas_uvs: Option<&[([f32; 2], [f32; 2])]>,
 ) {
     if crosshair.style == 0 {
         return;
@@ -312,7 +329,9 @@ pub(in crate::ui) fn build_crosshair(
         // The retail artwork carries transparent padding, so the image is drawn
         // `size` pixels square, which matches the apparent size of the shapes above.
         let side = crosshair.size.clamp(4.0, 96.0);
-        let (uv0, uv1) = icon_cell_uv(ICON_CROSSHAIR_BASE + usize::from(crosshair.image) - 1);
+        let index = ICON_CROSSHAIR_BASE + usize::from(crosshair.image) - 1;
+        let (uv0, uv1) = atlas_uvs.and_then(|uvs| uvs.get(index).copied())
+            .unwrap_or_else(|| icon_cell_uv(index));
         // The stock artwork is thin and translucent. Above 100% strength the same
         // image is drawn again, each pass raising the coverage of its faint pixels;
         // up to three extra passes at the maximum, the last one fractional.
@@ -403,5 +422,29 @@ pub(in crate::ui) fn build_crosshair(
         _ => {
             rect_outline(out, cx - half, cy - half, size, size, thickness, c, w, h);
         }
+    }
+}
+
+#[cfg(test)]
+mod icon_aspect_tests {
+    use super::*;
+
+    #[test]
+    fn force_selector_artwork_remains_square_on_widescreen() {
+        let mut ui = UiSnapshot::default();
+        ui.force_select = Some(crate::ui::UiForceSelect {
+            selected: 5, known_bits: (1 << 5) | (1 << 2),
+        });
+        let (w, h) = (1920_u32, 1080_u32);
+        let mut vertices = Vec::new();
+        build_force_select(&mut vertices, &ui, None, w, h);
+        let quad = &vertices[0..6];
+        let xx = quad.iter().map(|v| (v.position[0] + 1.0) * w as f32 / 2.0).collect::<Vec<_>>();
+        let yy = quad.iter().map(|v| (1.0 - v.position[1]) * h as f32 / 2.0).collect::<Vec<_>>();
+        let rw = xx.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            - xx.iter().cloned().fold(f32::INFINITY, f32::min);
+        let rh = yy.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            - yy.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!((rw - rh).abs() < 0.01);
     }
 }

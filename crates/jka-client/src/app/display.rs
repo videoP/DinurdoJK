@@ -784,7 +784,7 @@ impl App {
                 match name.as_str() {
                     "r_glasspromotion" => add("glass_promotion", "Glass promotion",
                         format!("{} -> {}", on_off(crate::materials::glass_promotion_enabled()),
-                            on_off(Self::parse_cvar_bool("r_glassPromotion", value).unwrap_or(true)))),
+                            on_off(Self::parse_cvar_bool("r_glassPromotion", value).unwrap_or(false)))),
                     "r_gpuadapter" => add("gpu_adapter", "Graphics processor",
                         format!("{} -> {}", crate::renderer::gpu_adapter::label(self.applied_gpu_adapter),
                             crate::renderer::gpu_adapter::label(target.gpu_adapter))),
@@ -1196,6 +1196,9 @@ impl App {
     ) {
         self.renderer_restart_started = None;
         self.show_window_after_restart();
+        if !confirm_on_change {
+            self.resume_client_after_video_restart();
+        }
         self.console_status = format!("VID_RESTART DISPLAY APPLY FAILED: {error}");
         self.push_console_line(format!("^1{}", self.console_status));
         if confirm_on_change {
@@ -1309,6 +1312,9 @@ impl App {
                 self.renderer_restart_started = None;
                 self.preserve_game_state_on_next_map_upload = false;
                 self.show_window_after_restart();
+                if !confirm_on_change {
+                    self.resume_client_after_video_restart();
+                }
                 self.console_status = format!("VID_RESTART FAILED: {error}");
                 self.push_console_line(format!("^1{}", self.console_status));
                 if confirm_on_change {
@@ -1387,6 +1393,7 @@ impl App {
         }
         let Some(window) = self.window.clone() else {
             self.renderer_restart_started = None;
+            self.resume_client_after_video_restart();
             self.console_status = "VID_RESTART: WINDOW DISAPPEARED DURING TRANSITION".into();
             self.push_console_line(format!("^1{}", self.console_status));
             self.publish_ui();
@@ -1482,6 +1489,77 @@ impl App {
         }
     }
 
+    /// TaystJK's CL_Vid_Restart_f synchronously calls S_StopAllSounds and
+    /// tears down CGame before returning. Our renderer shutdown is staged over
+    /// multiple winit turns, so explicitly suspend the equivalent client-frame
+    /// and input paths without disconnecting or changing the playerstate.
+    pub(in crate::app) fn suspend_client_for_video_restart(&mut self) {
+        if self.renderer_restart_suspended {
+            return; // Preserve the barrier across a failed-mode rollback.
+        }
+        self.renderer_restart_suspended = true;
+
+        // IN_KeyUp/Key_ClearStates semantics: do not let a held +forward or
+        // +attack survive as a synthetic usercmd when the first frame returns.
+        // Directly clear active kbuttons rather than queuing release commands
+        // behind a suspended command buffer.
+        self.keys.clear();
+        self.modifiers = winit::keyboard::ModifiersState::empty();
+        self.mouse_buttons_down.clear();
+        self.movement_keys.clear();
+        self.live_buttons.clear();
+        self.live_button_sources.clear();
+        self.live_input.cancel_pending_actions();
+        if let Some(server) = self.local_server.as_mut() {
+            server.pause(); // Discard buffered local Pmove time/one-shots.
+        }
+        self.live_provisional = None;
+        self.noclip_primary_down = false;
+        self.noclip_alt_down = false;
+        self.scores_showing = false;
+        self.japro_flipkick_moveup = false;
+        self.japro_flipkick_frames = 0;
+        self.japro_flipkick_jumps = 0;
+        self.last_mouse_motion_at = None;
+        self.last_command_at = None;
+        self.next_command_time = None;
+        self.set_capture(false);
+
+        // S_StopAllSounds equivalent, including voices, event loops, weather,
+        // ambient, EAL wet tails, music and profile/menu preview sounds.
+        if let Some(session) = self.game_session.as_mut() {
+            if let Some(sound) = session.sound_presenter.as_mut() {
+                sound.clear();
+            }
+        }
+        if let Some(sound) = self.menu_emote_sound.as_mut() {
+            sound.clear();
+        }
+    }
+
+    /// Resume at the *first presented frame*, not when RenderThread::spawn
+    /// returns and not after the user's 15-second mode confirmation.
+    pub(in crate::app) fn resume_client_after_video_restart(&mut self) {
+        if !self.renderer_restart_suspended {
+            return;
+        }
+        self.renderer_restart_suspended = false;
+        self.previous_tick = Instant::now();
+        self.last_mouse_motion_at = None;
+        self.last_command_at = None;
+        self.next_command_time = None;
+        // CGame will rebuild positional/entity loops on its next frame. Music
+        // was explicitly stopped and must be re-registered once, from CS_MUSIC.
+        if let Some(session) = self.game_session.as_mut() {
+            if let Some(sound) = session.sound_presenter.as_mut() {
+                sound.resume_after_video_restart(&session.client_game);
+            }
+        }
+        if self.overlay == super::OverlayMode::None && self.window_focused {
+            self.set_capture(true);
+        }
+    }
+
     pub(in crate::app) fn restart_renderer_internal(&mut self, confirm_on_change: bool) {
         self.restore_gamma_before_restart();
         let previous = self.applied_video_mode();
@@ -1536,6 +1614,7 @@ impl App {
             self.mark_config_dirty();
         }
 
+        self.suspend_client_for_video_restart();
         let restart_started = Instant::now();
         self.renderer_restart_started = Some(restart_started);
 

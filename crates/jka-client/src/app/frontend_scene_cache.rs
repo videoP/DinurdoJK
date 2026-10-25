@@ -173,6 +173,7 @@ pub(super) fn path(base: &Path, game: Option<&Path>, scene: &str, video: &crate:
 impl App {
     pub(super) fn load_frontend_scene_cache(&mut self) {
         self.frontend_scene_texture = None;
+        self.render_command(crate::renderer::RenderCommand::SetNeonMenuCache(None));
         self.frontend_scene_cache_generation = self.frontend_scene_cache_generation.wrapping_add(1);
         let generation = self.frontend_scene_cache_generation;
         let Some(path) = self.frontend_scene_cache_path.clone() else { return; };
@@ -220,6 +221,17 @@ impl App {
             eprintln!("[MENU CACHE] failed to spawn decoder: {error}");
             self.frontend_stage.cache_pending = false;
         }
+    }
+
+    /// Independent background handoff. UI/neon animation must never wait for it.
+    pub(super) fn frontend_scene_handoff(&self, now: Instant) -> f32 {
+        self.frontend_cinematic
+            .and_then(|cinematic| cinematic.fade_started)
+            .map_or(0.0, |started| {
+                let started = self.frontend_visual_handoff_start(started);
+                smoothstep01(now.saturating_duration_since(started).as_secs_f32()
+                    / crate::app::egui_menu::FRONTEND_SCENE_FADE_IN_SECS)
+            })
     }
 
     /// Match the photograph-to-live handoff to the *presented* cached scene,

@@ -18,6 +18,7 @@ pub(crate) use rain::{
     RAIN_PUDDLE_EPSILON, RAIN_SKY_BLEND_CEILING, RAIN_SKY_BLEND_WINDOW, RAIN_WETNESS_EPSILON,
     RAIN_WETNESS_FADE_END, RAIN_WETNESS_FADE_START,
 };
+pub(crate) use rain_glass::RainGlassResources;
 pub(crate) use snow::SnowSystem;
 pub(crate) use wind_visuals::WindVisualSystem;
 

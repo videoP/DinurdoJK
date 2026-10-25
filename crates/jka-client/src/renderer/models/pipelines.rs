@@ -11,7 +11,34 @@ use crate::renderer::{
 };
 use crate::renderer::lighting::rt_diagnostics;
 
+fn studio_capture_blend(mode:DynamicModelAlphaMode, mut blend:Option<wgpu::BlendState>, capture:bool) -> Option<wgpu::BlendState> {
+    if capture && matches!(mode, DynamicModelAlphaMode::AdditiveOne|DynamicModelAlphaMode::Additive
+        |DynamicModelAlphaMode::Modulate|DynamicModelAlphaMode::DstColorAdd
+        |DynamicModelAlphaMode::Modulate2x|DynamicModelAlphaMode::Darken) {
+        if let Some(blend)=&mut blend {
+            // Retain the exact authored RGB equation, including SrcAlpha FX.
+            // Light and color modifiers do not create geometric coverage.
+            blend.alpha=wgpu::BlendComponent {src_factor:wgpu::BlendFactor::Zero,
+                dst_factor:wgpu::BlendFactor::One,operation:wgpu::BlendOperation::Add};
+        }
+    }
+    blend
+}
+
 impl DynamicModelRenderer {
+    pub(in crate::renderer) fn prepare_studio_capture(&mut self, device:&wgpu::Device) {
+        // Render Studio deliberately CPU-skins the actors and tessellates its
+        // attached FX. Compile only the material modes in this captured frame.
+        for mode in self.draws.iter().map(|draw|draw.alpha_mode) {
+            let slot=&mut self.studio_capture_pipelines[mode.index()];
+            if slot.is_none() {
+                let layout=if mode==DynamicModelAlphaMode::Glass {&self.glass_pipeline_layout}else{&self.pipeline_layout};
+                *slot=Some(create_dynamic_model_pipeline_inner(device,layout,&self.shader,
+                    self.fx_sprite_surface_format,self.fx_sprite_samples,mode,
+                    self.legacy_fog_compiled,self.model_wet_compiled,false,false,true));
+            }
+        }
+    }
     pub(in crate::renderer) fn rebuild_pipelines(
         &mut self,
         _device: &wgpu::Device,
@@ -27,6 +54,7 @@ impl DynamicModelRenderer {
         // ensure_model_pipelines for only the modes that have draws.
         self.model_bundles.clear();
         self.model_pipelines = Default::default();
+        self.studio_capture_pipelines = Default::default();
         self.model_glow_pipelines = Default::default();
         self.model_alpha_mask = 0;
         self.fx_sprite_opaque_pipeline = None;
@@ -878,7 +906,9 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
                     0.5 + delta.dot(u_axis) * inverse_diameter,
                     0.5 + delta.dot(v_axis) * inverse_diameter,
                 ],
-                color: [shade, shade, shade, 1.0],
+                // Stock markShadow uses alphaGen vertex and source-alpha
+                // blending. RGB-only fading does nothing to its black image.
+                color: [shade, shade, shade, shade],
                 depth_hack: 0.0,
                 water_wetness: 0.0,
             });
@@ -1080,6 +1110,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline(
         model_wet,
         false,
         false,
+        false,
     )
 }
 
@@ -1104,6 +1135,7 @@ pub(in crate::renderer) fn create_dynamic_model_glow_pipeline(
         model_wet,
         false,
         true,
+        false,
     )
 }
 
@@ -1119,6 +1151,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     model_wet: bool,
     rt_receiver: bool,
     force_fog_black: bool,
+    studio_capture: bool,
 ) -> wgpu::RenderPipeline {
     let mut fragment_constants = vec![
         ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
@@ -1126,6 +1159,10 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     ];
     if !rt_receiver {
         fragment_constants.push(("ENABLE_MODEL_WET", f64::from(u8::from(model_wet))));
+    }
+    if studio_capture {
+        fragment_constants.push(("CAPTURE_OPAQUE_ALPHA",f64::from(u8::from(matches!(alpha_mode,
+            DynamicModelAlphaMode::Opaque|DynamicModelAlphaMode::Mask)))));
     }
     let vertex_layouts = [
         Some(wgpu::VertexBufferLayout {
@@ -1215,6 +1252,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
         }),
         _ => None,
     };
+    let blend=studio_capture_blend(alpha_mode,blend,studio_capture);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(match alpha_mode {
             DynamicModelAlphaMode::Opaque => "JKA dynamic model opaque pipeline",

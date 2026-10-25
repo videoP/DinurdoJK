@@ -39,6 +39,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", md3_geometry_cache: false", "")
         .replace(", md3_geometry_cache: true", "")
         .replace(", static_md3_instances: false", "")
+        .replace(", static_md3_bvh: false, fx_occlusion: 0, md3_occlusion: 0, occlusion_stats: false", "")
         .replace(", surface_sprites_gpu: true, surface_sprites: true", "")
         .replace(", md3_auto_lod: false, md3_lod_debug: false", "")
         .replace(", md3_auto_lod: true, bsp_model_lod: true, md3_lod_debug: false", "")
@@ -617,6 +618,39 @@ fn shared_auto_lod_default_and_archive_round_trip() {
     ).unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("seta r_md3AutoLod \"0\""));
     assert!(!config::load_video_settings(&path).md3_auto_lod);
+}
+
+#[test]
+fn cheapwater_promoted_defaults_match_console_resets_and_archive_without_overriding_saved_choices() {
+    let defaults = crate::ui::VideoSettings::default();
+    assert!(defaults.ocean);
+    assert_eq!(defaults.ocean_settings.backend, 3);
+    assert_eq!(defaults.ocean_settings.lake.shader, 1);
+    assert_eq!(defaults.ocean_settings.map_size, 128);
+    assert_eq!(crate::app::cvar_registry().find("r_oceanType").unwrap().entry.default, "4");
+    let fixture = Fixture::new();
+    let path = fixture.0.join("cheapwater.cfg");
+    let mut from_console = defaults;
+    let mut context = config::cvars::VideoLoadState::default();
+    for def in crate::app::cvar_definitions().iter().filter(|d|
+        d.runtime.entry.name.starts_with("r_lake") && d.config.archive.is_some()) {
+        let cvar = crate::app::cvar_registry().find(def.runtime.entry.name).unwrap();
+        def.config.load_video.unwrap()(&mut from_console, cvar.entry.name, cvar.entry.default, &mut context);
+    }
+    assert_eq!(from_console.ocean_settings.lake, defaults.ocean_settings.lake,
+        "console resets and slider resets must select the same Cheapwater preset");
+    config::save_video_settings(&path, defaults, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
+    let loaded = config::load_video_settings(&path);
+    assert!(loaded.ocean);
+    assert_eq!(loaded.ocean_settings.backend, 3);
+    assert_eq!(loaded.ocean_settings.lake, defaults.ocean_settings.lake);
+    assert_eq!(loaded.ocean_settings.map_size, 128);
+    fs::write(&path, "seta r_oceanType \"1\"\nseta r_lakeShader \"0\"\nseta r_lakeAmplitude \"2\"\n").unwrap();
+    let previous = config::load_video_settings(&path);
+    assert_eq!(previous.ocean_settings.backend, 0, "keep an explicitly saved Godot selection");
+    assert_eq!(previous.ocean_settings.lake.shader, 0);
+    assert_eq!(previous.ocean_settings.lake.amplitude, 2.0);
 }
 
 #[test]

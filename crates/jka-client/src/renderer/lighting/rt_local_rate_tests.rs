@@ -20,6 +20,7 @@ fn counted_source() -> String {
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
         "rt_trace_shadow_query",
+        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_visibility",
     ] {
         let anchor = format!("fn {name}(");
@@ -161,13 +162,20 @@ fn rt_local_rate_gpu_counts_rays_and_rejects_invalid_history() {
         light.position_radius = [0.0, 0.0, 20.0, 100.0];
         light.color_intensity = [1.0; 4];
         light.shadow = [0.0, 0.0, 0.1, 1.0];
+        let mut static_point = light;
+        static_point.shadow = [1.0, 0.0, 0.0, 0.0];
+        let mut static_area = static_point;
+        static_area.emitter = [0.0, 0.0, -1.0, 1.0];
         let lights = buffer(
-            bytemuck::bytes_of(&light),
+            bytemuck::cast_slice(&[light, static_point, static_area]),
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let mut clusters = vec![0u32; CLUSTER_COUNT as usize * 33];
         for cluster in clusters.chunks_exact_mut(33) {
-            cluster[0] = 1;
+            cluster[0] = 3;
+            cluster[1] = 0;
+            cluster[2] = 1;
+            cluster[3] = 2;
         }
         let clusters = buffer(bytemuck::cast_slice(&clusters), wgpu::BufferUsages::STORAGE);
         let stats = buffer(
@@ -313,6 +321,8 @@ fn rt_local_rate_gpu_counts_rays_and_rejects_invalid_history() {
                             x % 2 == 0 && y % 2 == 0
                         };
                         assert_eq!(records[y * 8 + x][3] & 1, u32::from(scheduled));
+                        assert_eq!(records[y * 8 + x][3] & 6, 0,
+                            "static point/area lights never enter the RT cache");
                     }
                 }
                 settings.flags[1] = 0;

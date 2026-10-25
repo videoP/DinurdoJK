@@ -252,8 +252,8 @@ mod tests {
             let bindings = UnderwaterBindings::new(&device, &pipelines, &surface, &scene.depth, &distance_view);
             let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256 * 17,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-            for case in 0..6 {
-                let wet = case == 1 || case == 2 || case == 5;
+            for case in 0..8 {
+                let wet = case == 1 || case == 2 || case == 5 || case == 7;
                 let position = glam::Vec3::new(0.0, if case == 0 { 2.0 } else if case == 5 { 0.0 } else { -2.0 }, 0.0);
                 let view = glam::Mat4::look_to_rh(position, -glam::Vec3::Z, glam::Vec3::Y);
                 let projection = glam::Mat4::perspective_rh(1.0, 1.0, 1000.0, 0.025);
@@ -269,6 +269,11 @@ mod tests {
                 surface.write_camera(&queue, &camera);
                 let boundary = SurfaceBoundary { bounds: if case == 3 { [4000.0, 4000.0, 8000.0, 8000.0] }
                     else { [-4000.0, -4000.0, 4000.0, 4000.0] }, scale: [40.0, 0.75, 0.0, 0.0], ..SurfaceBoundary::zeroed() };
+                let boundary = SurfaceBoundary {
+                    depth: if case == 6 { [-1.0,1.0,0.0,0.0] }
+                        else if case == 7 { [-3.0,1.0,0.0,0.0] } else { [0.0;4] },
+                    ..boundary
+                };
                 surface.write_boundary(&queue, &boundary);
                 let appearance = SurfaceAppearance { pigment: [0.0; 3], ..Default::default() };
                 bindings.write(&queue, &camera, appearance, [0.0, 1.0, 0.0], [1.0; 3], case != 4);
@@ -313,7 +318,7 @@ mod tests {
                     assert_eq!(probe & 0x8000 == 0, wet, "case {case}: probe sign");
                     for (channel, absorption) in appearance.absorption.into_iter().enumerate() {
                         let attenuated = (-absorption * 10.0 * 0.15).exp();
-                        let expected = if case == 2 { attenuated }
+                        let expected = if case == 2 || case == 7 { attenuated }
                             else if case == 5 { attenuated * 0.15 + appearance.transmission[channel] * 0.85 }
                             else { 1.0 };
                         let actual = f32::from(bytes[8 * 256 + 8 * 4 + channel]) / 255.0;

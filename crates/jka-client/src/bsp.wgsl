@@ -115,6 +115,7 @@ struct ShadowSettings {
     camera_forward: vec4<f32>,
     cascade_texel_sizes: vec4<f32>,
     bevy_params: vec4<f32>, // depth bias, normal bias, overlap proportion, cascade count
+    dynamic_regions: array<vec4<f32>, 4>,
 };
 struct SurfaceFogSettings {
     color_depth: vec4<f32>,
@@ -283,6 +284,7 @@ override PBR_VERTEX_LIGHTGRID: bool = false;
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
+@group(1) @binding(34) var baked_local_texture: texture_2d_array<f32>;
 @group(1) @binding(2) var lightmap_texture: texture_2d<f32>;
 @group(1) @binding(3) var lightmap_sampler: sampler;
 @group(1) @binding(4) var<uniform> material: Material;
@@ -1511,7 +1513,7 @@ fn sample_cascade_shadow_bevy(input: VertexOut, normal: vec3<f32>, cascade: i32)
         return 1.0;
     }
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    return sample_shadow_map_bevy_castano(uv, ndc.z, cascade);
+    return min(sample_shadow_map_bevy_castano(uv, ndc.z, cascade), sample_dynamic_cascade(input.world_position, normal, cascade));
 }
 
 fn shader_sun_sky_admission(input: VertexOut, cascade: i32) -> f32 {
@@ -1622,7 +1624,7 @@ fn cluster_for_fragment(input: VertexOut) -> ClusterRecord {
     return light_clusters[cluster_index];
 }
 
-fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {
+fn sample_local_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {
     if (!ENABLE_LOCAL_SHADOWS || lighting_settings.local_shadows.x == 0u || light.shadow.x < 0.5) {
         return 1.0;
     }
@@ -1637,23 +1639,63 @@ fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, r
     if (major_distance <= LOCAL_SHADOW_NEAR) {
         return 1.0;
     }
-    let depth_ref = far_plane / (far_plane - LOCAL_SHADOW_NEAR)
-        - (far_plane * LOCAL_SHADOW_NEAR) / ((far_plane - LOCAL_SHADOW_NEAR) * major_distance);
-    let to_light = normalize(-from_light);
+    let direction = from_light / radial_distance;
+    let to_light = -direction;
     let slope = 1.0 - max(dot(normalize(receiver_normal), to_light), 0.0);
-    let bias = 0.0012 + 0.0025 * slope;
-    let direction = normalize(from_light);
+    // Bias in world units. A fixed normalized-depth bias erases human-sized
+    // shadows at distance because perspective depth is reciprocal distance.
+    let biased_distance=max(major_distance-(0.5+1.0*slope),LOCAL_SHADOW_NEAR);
+    let depth_ref = far_plane / (far_plane - LOCAL_SHADOW_NEAR)
+        - (far_plane * LOCAL_SHADOW_NEAR) / ((far_plane - LOCAL_SHADOW_NEAR) * biased_distance);
     let helper = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(direction.y) < 0.9);
     let tangent = normalize(cross(direction, helper));
     let bitangent = normalize(cross(direction, tangent));
     let spread = 1.6 / f32(max(lighting_settings.local_shadows.z, 1u));
     let shadow_index = u32(light.shadow.x - 1.0);
     var visibility = 0.0;
-    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, normalize(direction + tangent * spread + bitangent * spread), shadow_index, depth_ref - bias);
-    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, normalize(direction - tangent * spread + bitangent * spread), shadow_index, depth_ref - bias);
-    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, normalize(direction + tangent * spread - bitangent * spread), shadow_index, depth_ref - bias);
-    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, normalize(direction - tangent * spread - bitangent * spread), shadow_index, depth_ref - bias);
+    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, direction + tangent * spread + bitangent * spread, shadow_index, depth_ref);
+    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, direction - tangent * spread + bitangent * spread, shadow_index, depth_ref);
+    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, direction + tangent * spread - bitangent * spread, shadow_index, depth_ref);
+    visibility += textureSampleCompareLevel(local_shadow_texture, local_shadow_sampler, direction - tangent * spread - bitangent * spread, shadow_index, depth_ref);
     return visibility * 0.25;
+}
+fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {
+    let stationary=sample_local_shadow_visibility(light,world_position,receiver_normal);
+    if (lighting_settings.baked_sun_debug_mode.w & 1u) == 0u { return stationary; }
+    return min(stationary,baked_local_moving_visibility(light,world_position,receiver_normal));
+}
+// Cheap conservative test reused by the receiver early-out. It cannot
+// reject a sample unless the existing face/octant metadata already says
+// that no moving caster can affect that lamp-to-receiver direction.
+fn baked_local_moving_maybe(light: PointLight, position: vec3<f32>) -> bool {
+    if !ENABLE_LOCAL_SHADOWS || (lighting_settings.baked_sun_debug_mode.w & 1u) == 0u || light.shadow.x < 0.5 { return false; }
+    if light.shape.x < 0.0 {
+        let d=position-light.position_radius.xyz; let a=abs(d);
+        var face=select(1u,0u,d.x>=0.0);
+        if a.y>a.x && a.y>=a.z { face=select(3u,2u,d.y>=0.0); }
+        if a.z>a.x && a.z>a.y { face=select(5u,4u,d.z>=0.0); }
+        let packed = u32(-light.shape.x - 1.0);
+        if (packed & (1u << face)) == 0u { return false; }
+        // AABB-conservative moving-caster octants, generated only by A/B
+        // variant B. A ray cannot be occluded by geometry in another octant.
+        // Mask zero is the legacy unfiltered path, so old saves/variants match.
+        let octants = (packed >> 6u) & 255u;
+        if octants != 0u {
+            let octant = select(0u, 1u, d.x >= 0.0)
+                | select(0u, 2u, d.y >= 0.0)
+                | select(0u, 4u, d.z >= 0.0);
+            if (octants & (1u << octant)) == 0u { return false; }
+        }
+    }
+    return true;
+}
+fn baked_local_moving_visibility(light: PointLight, position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    if !baked_local_moving_maybe(light,position) { return 1.0; }
+    var moving=light;
+    let cubes=textureNumLayers(local_shadow_texture);
+    if cubes < 16u { return 1.0; }
+    moving.shadow.x += 8.0;
+    return sample_local_shadow_visibility(moving,position,normal);
 }
 
 
@@ -1817,6 +1859,8 @@ fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
 }
 
 fn direct_light_source_enabled(light: PointLight) -> bool {
+    if light.shape.w < -0.5 {return false;}
+    if light.shape.w > 0.5 { return true; }
     let is_area_light = light.emitter.w >= 0.5 && light.emitter.w < 2.5;
     if (is_area_light) {
         return ENABLE_AREA_LIGHTS;
@@ -2120,12 +2164,15 @@ fn clustered_dynamic_light_legacy(input: VertexOut, weather: WeatherSurfaceRespo
     if (!(ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS) || camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
         return result;
     }
+    if baked_local_receiver(input) && (lighting_settings.baked_sun_debug_mode.w & 2u) != 0u && !(ENABLE_WEATHER_SURFACE && (weather.wetness > 0.001 || weather.puddle > 0.001)) { return result; }
     let cluster = cluster_for_fragment(input);
     let normal = normalize(input.world_normal);
     let specular_normal = weather_reflection_normal(normal, weather);
     let view_direction = normalize(camera.camera_pos_time.xyz - input.world_position);
     for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {
         let light = dynamic_lights[cluster.indices[i]];
+        let already_baked=local_light_already_baked(light,input);
+        if already_baked && !(ENABLE_WEATHER_SURFACE && (weather.wetness > 0.001 || weather.puddle > 0.001)) { continue; }
         if (!direct_light_source_enabled(light)) {
             continue;
         }
@@ -2158,7 +2205,7 @@ fn clustered_dynamic_light_legacy(input: VertexOut, weather: WeatherSurfaceRespo
                 * attenuation
                 * emission_visibility
                 * shadow_visibility;
-            result.diffuse_factor += energy * ndotl * local_light_surface_scale(light);
+            result.diffuse_factor += select(energy * ndotl * local_light_surface_scale(light),vec3(0.0),already_baked);
         }
         if (ENABLE_WEATHER_SURFACE && (weather.wetness > 0.001 || weather.puddle > 0.001) && ndotl > 0.0) {
             result.wet_specular += energy
@@ -2645,6 +2692,9 @@ fn clustered_dynamic_light_pbr(
     if (!(ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS) || camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
         return vec3<f32>(0.0);
     }
+    if baked_local_receiver(input) && (lighting_settings.baked_sun_debug_mode.w & 2u) != 0u && !dynamic_light_debug_enabled() {
+        return vec3<f32>(0.0);
+    }
     let cluster = cluster_for_fragment(input);
     let surface = pbr_surface_for_path(input, albedo, uv, weather, shared_frame, shared_surface);
     let n = surface.n;
@@ -2653,6 +2703,7 @@ fn clustered_dynamic_light_pbr(
     var illumination = vec3<f32>(0.0);
     for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {
         let light = dynamic_lights[cluster.indices[i]];
+        if local_light_already_baked(light,input) { continue; }
         if (!direct_light_source_enabled(light)) {
             continue;
         }
@@ -2700,7 +2751,7 @@ fn clustered_dynamic_light_pbr(
         let specular = (ndf * g / denominator) * f;
         let kd = (vec3<f32>(1.0) - f) * (1.0 - surface.metallic);
         let diffuse = kd * albedo / 3.14159265359;
-        illumination += diffuse * radiance * ndotl + specular * radiance * spec_ndotl;
+        illumination += select(diffuse * radiance * ndotl,vec3(0.0),local_light_already_baked(light,input)) + specular * radiance * spec_ndotl;
     }
     return illumination;
 }
@@ -3364,7 +3415,8 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         let texels_per_pixel = metres_per_pixel * texels_per_metre;
         let cascade_weight = 1.0 - smoothstep(0.75, 2.25, texels_per_pixel);
         let detail_mode = tuned_foam_detail;
-        if (cascade_weight > 0.001 || detail_mode > 0.5) {
+        if ((cascade_weight > 0.001 || detail_mode > 0.5)
+            && (abs(scale.w) > 0.0 || ocean.foam_color.a > 0.5)) {
             let bilinear_weight = min(1.0, map_size * min(scale.x, scale.y) * 0.1);
             var sample = vec4<f32>(0.0);
             if (bilinear_weight >= 0.94 || (texels_per_pixel >= 0.70 && detail_mode < 1.5)) {
@@ -3790,7 +3842,7 @@ fn sample_authored_baked_sun(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32>
 fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
     if (!ENABLE_BAKED_SUN_RELIGHT) { return lightmap; }
     // A change-triggered compute pass already subtracted each original luxel.
-    if (lighting_settings.baked_sun_debug_mode.y != 0u && input.baked_sun_fit.z == 4.0) { return baked_indirect_tone(lightmap); }
+    if (lighting_settings.baked_sun_debug_mode.y != 0u && input.baked_sun_fit.z == 4.0 && input.shell_kind == 0u) { return baked_indirect_tone(lightmap); }
     if (input.baked_sun_fit.z == 4.0) { return sample_authored_baked_sun(lightmap, input); }
     let strength = lighting_settings.baked_sun_direction_strength.w;
     var remaining = lightmap;
@@ -3863,7 +3915,8 @@ fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f3
 // Runtime sunlight is evaluated AFTER cached subtraction/filtering and indirect
 // tone controls. Its direction/intensity never modify the original-sun cache.
 fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
-    let remaining = remove_baked_sun(lightmap, flux, input);
+    if static_sun_lightmap_receiver(input) { return shade_baked_local(shade_composed_sun(lightmap,flux,input),input); }
+    let remaining = shade_baked_local(select(remove_baked_sun(lightmap, flux, input),lightmap,composed_lightmap_receiver(input)),input);
     if (lighting_settings.baked_sun_debug_mode.x != 0u || lighting_settings.runtime_sun_radiance.w < 0.5) {
         return remaining;
     }
@@ -4113,7 +4166,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         if (lighting_settings.baked_sun_debug_mode.x != 0u) {
             return vec4<f32>(baked, source_sample.a);
         }
-        source_sample = vec4<f32>(baked, select(source_sample.a, 1.0, input.baked_sun_fit.z == 4.0));
+        source_sample = vec4<f32>(baked, select(source_sample.a, 1.0, input.baked_sun_fit.z == 4.0 || composed_lightmap_receiver(input)));
     }
     // q3map vertex-lit faces have no lightmap. Only touch the authored vertex
     // color path, never unrelated animated/non-lightmapped shader stages.
@@ -4266,7 +4319,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         base = vec4<f32>(base.rgb + voxel_probe_indirect(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
         // When direct sun is added explicitly, its visibility already casts
         // shadows. Legacy mode instead darkens the existing baked illumination.
-        if (lighting_settings.runtime_sun_radiance.w < 0.5) {
+        if (lighting_settings.runtime_sun_radiance.w < 0.5 && !static_sun_lightmap_receiver(input)) {
         let shadow_rgb = sun_shadow_transmission(input, input.world_normal);
         let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);

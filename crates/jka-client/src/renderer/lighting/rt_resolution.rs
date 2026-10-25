@@ -151,6 +151,7 @@ impl Renderer {
     /// Request the scalar sun cache independently of local-light visibility.
     pub(super) fn rt_sun_cache_wanted(&self) -> bool {
         self.rt_trace_rate > 1 && !self.tinted_glass_enabled
+            && self.cascaded_shadow_mode != DynamicShadowsMode::HybridCsmRtEntities
             && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun)
     }
 

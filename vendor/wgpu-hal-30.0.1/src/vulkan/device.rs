@@ -253,6 +253,8 @@ struct CompiledStage {
     create_info: vk::PipelineShaderStageCreateInfo<'static>,
     _entry_point: CString,
     temp_raw_module: Option<vk::ShaderModule>,
+    /// DinurdoJK patch: identity of the SPIR-V for `pipeline_disk_cache`.
+    spirv_hash: u64,
 }
 
 struct MemoryProperties {
@@ -745,8 +747,8 @@ impl super::Device {
         binding_map: &naga::back::spv::BindingMap,
     ) -> Result<CompiledStage, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
-        let vk_module = match *stage.module {
-            super::ShaderModule::Raw(raw) => raw,
+        let (vk_module, spirv_hash) = match *stage.module {
+            super::ShaderModule::Raw(raw, hash) => (raw, hash),
             super::ShaderModule::Intermediate {
                 ref naga_shader,
                 runtime_checks,
@@ -824,7 +826,10 @@ impl super::Device {
                     naga::back::spv::write_vec(&module, &info, options, Some(&pipeline_options))
                 }
                 .map_err(|e| crate::PipelineError::Linkage(stage_flags, format!("{e}")))?;
-                self.create_shader_module_impl(&spv, &None)?
+                (
+                    self.create_shader_module_impl(&spv, &None)?,
+                    super::pipeline_disk_cache::spirv_hash(&spv),
+                )
             }
         };
 
@@ -846,9 +851,10 @@ impl super::Device {
             create_info,
             _entry_point: entry_point,
             temp_raw_module: match *stage.module {
-                super::ShaderModule::Raw(_) => None,
+                super::ShaderModule::Raw(..) => None,
                 super::ShaderModule::Intermediate { .. } => Some(vk_module),
             },
+            spirv_hash,
         })
     }
 
@@ -1938,10 +1944,16 @@ impl crate::Device for super::Device {
                     None,
                 )
                 .map_err(|e| crate::ShaderError::Compilation(format!("{e}")))?;
-                super::ShaderModule::Raw(self.create_shader_module_impl(&spv, &desc.label)?)
+                super::ShaderModule::Raw(
+                    self.create_shader_module_impl(&spv, &desc.label)?,
+                    super::pipeline_disk_cache::spirv_hash(&spv),
+                )
             }
             crate::ShaderInput::SpirV(data) => {
-                super::ShaderModule::Raw(self.create_shader_module_impl(data, &desc.label)?)
+                super::ShaderModule::Raw(
+                    self.create_shader_module_impl(data, &desc.label)?,
+                    super::pipeline_disk_cache::spirv_hash(data),
+                )
             }
             crate::ShaderInput::MetalLib { .. }
             | crate::ShaderInput::Msl { .. }
@@ -1957,7 +1969,7 @@ impl crate::Device for super::Device {
 
     unsafe fn destroy_shader_module(&self, module: super::ShaderModule) {
         match module {
-            super::ShaderModule::Raw(raw) => {
+            super::ShaderModule::Raw(raw, _) => {
                 unsafe { self.shared.raw.destroy_shader_module(raw, None) };
             }
             super::ShaderModule::Intermediate { .. } => {}
@@ -2213,20 +2225,48 @@ impl crate::Device for super::Device {
                 .render_pass(raw_pass)
         }];
 
+        // DinurdoJK patch: without an explicit cache, use this pipeline's own
+        // file in `pipeline_disk_cache` (see there).
+        let disk_slot = if desc.cache.is_none() {
+            let stage_keys = [&compiled_vs, &compiled_ts, &compiled_ms, &compiled_fs]
+                .map(|stage| stage.as_ref().map(|s| (s.spirv_hash, s._entry_point.clone())));
+            let vertex_buffers = match &desc.vertex_processor {
+                crate::VertexProcessor::Standard { vertex_buffers, .. } => alloc::format!("{vertex_buffers:?}"),
+                crate::VertexProcessor::Mesh { .. } => alloc::string::String::new(),
+            };
+            let state = alloc::format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{vertex_buffers}|{shader_stats}",
+                desc.primitive, desc.depth_stencil, desc.multisample, desc.color_targets,
+                desc.multiview_mask,
+            );
+            super::pipeline_disk_cache::open(
+                &self.shared.raw,
+                self.shared.pipeline_cache_validation_key,
+                ("render", self.shared.vendor_id, stage_keys, state),
+            )
+        } else {
+            None
+        };
         let pipeline_cache = desc
             .cache
             .map(|it| it.raw)
+            .or(disk_slot.as_ref().map(|slot| slot.cache))
             .unwrap_or(vk::PipelineCache::null());
 
-        let mut raw_vec = {
+        let raw_vec = {
             profiling::scope!("vkCreateGraphicsPipelines");
             unsafe {
                 self.shared
                     .raw
                     .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
                     .map_err(|(_, e)| super::map_pipeline_err(e))
-            }?
+            }
         };
+        let succeeded = raw_vec.is_ok();
+        if let Some(slot) = disk_slot {
+            super::pipeline_disk_cache::close(&self.shared.raw, slot, succeeded);
+        }
+        let mut raw_vec = raw_vec?;
 
         let raw = raw_vec.pop().unwrap();
         if let Some(label) = desc.label {
@@ -2299,20 +2339,36 @@ impl crate::Device for super::Device {
                 .stage(compiled.create_info)
         }];
 
+        // DinurdoJK patch: see `pipeline_disk_cache`.
+        let disk_slot = if desc.cache.is_none() {
+            super::pipeline_disk_cache::open(
+                &self.shared.raw,
+                self.shared.pipeline_cache_validation_key,
+                ("compute", self.shared.vendor_id, compiled.spirv_hash, compiled._entry_point.clone()),
+            )
+        } else {
+            None
+        };
         let pipeline_cache = desc
             .cache
             .map(|it| it.raw)
+            .or(disk_slot.as_ref().map(|slot| slot.cache))
             .unwrap_or(vk::PipelineCache::null());
 
-        let mut raw_vec = {
+        let raw_vec = {
             profiling::scope!("vkCreateComputePipelines");
             unsafe {
                 self.shared
                     .raw
                     .create_compute_pipelines(pipeline_cache, &vk_infos, None)
                     .map_err(|(_, e)| super::map_pipeline_err(e))
-            }?
+            }
         };
+        let succeeded = raw_vec.is_ok();
+        if let Some(slot) = disk_slot {
+            super::pipeline_disk_cache::close(&self.shared.raw, slot, succeeded);
+        }
+        let mut raw_vec = raw_vec?;
 
         let raw = raw_vec.pop().unwrap();
         if let Some(label) = desc.label {

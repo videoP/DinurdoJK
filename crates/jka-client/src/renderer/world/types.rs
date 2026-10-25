@@ -433,6 +433,10 @@ pub(in crate::renderer) struct PlanarReflectionResources {
 /// Runtime state of one inline BSP model whose vertices live in a private
 /// (never de-duplicated) region of the world vertex buffer.
 pub(in crate::renderer) struct InlineModelGpu {
+    /// Cached for the current view cluster/areamask; recompute for a changed pose.
+    pub(in crate::renderer) pvs_visible: Option<bool>,
+    pub(in crate::renderer) pvs_bounds_dirty: bool,
+    pub(in crate::renderer) pvs_area_rejected: bool,
     pub(in crate::renderer) model: u32,
     pub(in crate::renderer) gpu_vertex_start: u32,
     /// Compiled render-space vertices, in GPU order.
@@ -530,6 +534,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) sky_covers_background: bool,
     /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
     pub(in crate::renderer) ocean_surfaces: Vec<crate::ocean::OceanSurface>,
+    /// Conservative authored floor for each promoted surface, in slot order.
+    pub(in crate::renderer) ocean_bottoms: Vec<f32>,
     /// Whether FFT clipmaps were prepared when the map was loaded.
     pub(in crate::renderer) ocean_meshes_built: bool,
     /// All eligible faces (including candidates rejected by the surface cap).
@@ -600,6 +606,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) legacy_dlight_triangle_surfaces: Vec<u32>,
     pub(in crate::renderer) legacy_dlight_surfaces: Vec<scene::LegacyDlightSurface>,
     pub(in crate::renderer) dynamic_lights: Vec<scene::DynamicLight>,
+    pub(in crate::renderer) runtime_light_count: usize,
+    pub(in crate::renderer) static_bake_sources: Vec<(usize, scene::DynamicLight)>,
     pub(in crate::renderer) cluster_compute_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) lighting_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) lighting_bind_group_lean: wgpu::BindGroup,
@@ -620,6 +628,7 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) sun_bake: crate::renderer::lighting::sun_bake::SunBake,
     pub(in crate::renderer) baked_sun_encoding: Option<scene::BakedSunEncoding>,
     pub(in crate::renderer) baked_sun_cache: Option<crate::renderer::lighting::baked_sun_cache::LightmapCache>,
+    pub(in crate::renderer) static_sun: crate::renderer::lighting::lightmap_sun::StaticSun,
     pub(in crate::renderer) grass: Option<GrassMapGpu>,
     pub(in crate::renderer) surface_sprite_effects: Vec<SurfaceSpriteEffectGpu>,
     /// Map-load instances for vegetation surfaceSprites (r_surfaceSpritesGpu).
@@ -639,6 +648,7 @@ pub(in crate::renderer) struct WorldGpu {
     /// Exact PVS-signature sub-batches referencing subranges of the same vertex buffer.
     pub(in crate::renderer) full_batches: Vec<WorldBatch>,
     pub(in crate::renderer) visibility: Option<jka_assets::bsp::Visibility>,
+    pub(in crate::renderer) inline_pvs: crate::renderer::visibility::pvs::InlinePvsSelection,
     pub(in crate::renderer) coarse_visible_batches_by_cluster: Vec<Vec<usize>>,
     pub(in crate::renderer) full_visible_batches_by_cluster: Vec<Vec<usize>>,
     /// AUTO representation. `[0, auto4_variant_base)` is a shallow alias of

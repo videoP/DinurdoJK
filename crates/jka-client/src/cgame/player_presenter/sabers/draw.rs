@@ -1,6 +1,7 @@
 //! Sabers draw.
 use crate::cgame::player_presenter::{
     angles_to_axis, blade_angles, blade_color, is_asset_pending, model_bolt_matrix_timed,
+    saber_hand_bolt_matrix_timed,
     normalize_vec3, record_pose_eval, saber_blade_fx_request, transform_jka_model_point,
     transform_jka_model_vector, Arc, ClientGameState, DynamicModelSurface, Ghoul2Animator, Instant,
     Matrix3x4, PlayerModelAsset, PlayerPresenter, PresentedEntity, SaberBladeLengthKey,
@@ -122,10 +123,9 @@ impl PlayerPresenter {
         }
 
         for (saber_num, saber_name, saber_color, hand_name, definition) in sabers {
-            let Some(hand_bolt) = model_bolt_matrix_timed(
+            let Some(hand_bolt) = saber_hand_bolt_matrix_timed(
                 &mut self.perf,
-                &player_model.glm,
-                &player_model.gla,
+                player_model,
                 player_pose,
                 hand_name,
             )?

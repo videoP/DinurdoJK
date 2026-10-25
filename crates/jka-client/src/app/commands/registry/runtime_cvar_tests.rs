@@ -3,6 +3,58 @@ use crate::cvar_compatibility::{assert_snapshot, digest, Fixture, INPUTS};
 use std::fs;
 
 #[test]
+#[ignore = "requires default audio device, EAL_TEST_MAP and EAL_TEST_OPENAL_DLL"]
+fn local_game_loads_eal_before_live_toggles_and_sound_restart() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.0.join("eagle")).unwrap();
+    fs::create_dir_all(fixture.0.join("models/players/_humanoid")).unwrap();
+    fs::write(fixture.0.join("models/players/_humanoid/animation.cfg"), "BOTH_STAND1 0 1 -1 20\n").unwrap();
+    fs::copy(std::env::var_os("EAL_TEST_MAP").expect("EAL_TEST_MAP"), fixture.0.join("eagle/ffa3.eal")).unwrap();
+    fs::write(fixture.0.join("DinurdoJK.cfg"), "seta s_steamAudio 0\nseta s_eal 0\n").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    let server = crate::local_server::LocalServer::new(
+        "mp/ffa3", None, None, crate::scene::SpawnPoint::default(), &app.solo_client_info,
+        [jka_movement::SaberMovementInfo::equipped_default(), jka_movement::SaberMovementInfo::default()],
+        &[], &[], &[], None, None,
+    ).unwrap();
+    let session = app.build_local_game_session(&server).unwrap();
+    let info = session.sound_presenter.as_ref().unwrap().info().unwrap();
+    assert_eq!(info.eal_file.as_deref(), Some("eagle/ffa3.eal"));
+    assert!(!info.eal_effects_active);
+    app.game_session = Some(session);
+    for enabled in [true, false, true] {
+        app.set_console_cvar("s_eal", if enabled { "1" } else { "0" }).unwrap();
+        let info = app.game_session.as_ref().unwrap().sound_presenter.as_ref().unwrap().info().unwrap();
+        assert_eq!(info.eal_effects_active, enabled, "{:?}", info.eal_effects_error);
+        assert_eq!(info.eal_file.as_deref(), Some("eagle/ffa3.eal"));
+    }
+    app.set_console_cvar("s_ealHrtf", "1").unwrap();
+    assert!(!app.audio.steam_audio);
+    let wait_for_hrtf = |app:&App| {
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        loop {
+            let info=app.game_session.as_ref().unwrap().sound_presenter.as_ref().unwrap().info().unwrap();
+            if info.eal_hrtf { assert_eq!(info.eal_transport,1);break; }
+            assert!(std::time::Instant::now()<deadline,"independent HRTF did not become active: {:?}",info.eal_effects_error);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    wait_for_hrtf(&app);
+    app.restart_sound_subsystem();
+    wait_for_hrtf(&app);
+    let info = app.game_session.as_ref().unwrap().sound_presenter.as_ref().unwrap().info().unwrap();
+    assert!(info.eal_effects_active, "{:?}", info.eal_effects_error);
+    assert_eq!(info.eal_file.as_deref(), Some("eagle/ffa3.eal"));
+    app.flush_config();
+    assert!(crate::config::load_audio_settings(&fixture.0.join("DinurdoJK.cfg")).eal_enabled);
+    assert!(crate::config::load_audio_settings(&fixture.0.join("DinurdoJK.cfg")).eal_hrtf);
+}
+
+#[test]
 fn hybrid_breaker_applies_live_and_round_trips_without_changing_sea_state() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
@@ -104,12 +156,48 @@ fn lake_promotion_switches_live_and_round_trips_without_overwriting_ocean() {
     app.set_console_cvar("r_lakeWindSpeed","7.5").unwrap();
     app.set_console_cvar("r_lakeDirection","-35").unwrap();
     app.set_console_cvar("r_lakeTransparency","2").unwrap();
-    app.set_console_cvar("r_lakeSalt","1").unwrap();
+    app.set_console_cvar("r_lakeReflections","0.35").unwrap();
+    app.set_console_cvar("r_lakeSpeed","1.8").unwrap();
+    app.set_console_cvar("r_lakeTint","0.4 0.8 0.9").unwrap();
+    app.set_console_cvar("r_reflectionQuality","off").unwrap();
+    app.set_console_cvar("r_lakeReflectionMode","2").unwrap();
+    assert_eq!(app.video.ocean_settings.lake.reflection_mode,2);
+    assert_eq!(app.video.reflection_quality,crate::ui::ReflectionQuality::Off);
+    app.set_console_cvar("r_lakeShader","1").unwrap();
+    app.set_console_cvar("r_lakeTransmission","0.65").unwrap();
+    app.set_console_cvar("r_lakeRefraction","0.02").unwrap();
+    app.set_console_cvar("r_lakeOpaqueDepth","12.5").unwrap();
+    app.set_console_cvar("r_lakeWake","0.6").unwrap();
+    assert_eq!(app.video.ocean_settings.lake.wake_strength,0.6);
+    assert_eq!(app.video.ocean_settings.lake.opaque_depth,12.5);
+    app.set_console_cvar("r_lakeDepthColor","0.8").unwrap();
+    app.set_console_cvar("r_lakeColorDepth","6").unwrap();
+    app.set_console_cvar("r_lakeShallowColor","0.3 0.6 0.5").unwrap();
+    app.set_console_cvar("r_lakeDeepColor","0.02 0.1 0.2").unwrap();
+    assert_eq!(app.video.ocean_settings.lake.depth_color_strength,0.8);
+    assert_eq!(app.video.ocean_settings.lake.color_depth,6.0);
+    assert_eq!(app.video.ocean_settings.lake.shallow_color,[0.3,0.6,0.5]);
+    assert_eq!(app.video.ocean_settings.lake.deep_color,[0.02,0.1,0.2]);
+    assert_eq!(app.video.ocean_settings.lake.cheap_transmission,0.65);
+    assert_eq!(app.video.ocean_settings.lake.cheap_refraction,0.02);
+    app.set_console_cvar("r_lakeReflectionMode","1").unwrap();
+    app.set_console_cvar("r_lakeAmplitude","12").unwrap();
+    app.set_console_cvar("r_lakeWaterColor","0.2 0.5 0.8").unwrap();
+    app.set_console_cvar("r_lakeFogColor","0.1 0.3 0.4").unwrap();
+    assert_eq!(app.video.ocean_settings.lake.amplitude,12.0);
+    assert_eq!(app.video.ocean_settings.lake.reflections,0.35);
+    assert_eq!(app.video.ocean_settings.lake.speed,1.8);
+    assert_eq!(app.video.ocean_settings.lake.tint_color,[0.4,0.8,0.9]);
+    assert_eq!(app.video.ocean_settings.lake.shader,1);
+    assert_eq!(app.video.ocean_settings.lake.reflection_mode,1);
+    assert_eq!(app.video.reflection_quality,crate::ui::ReflectionQuality::Off);
+    assert_eq!(app.video.ocean_settings.lake.water_color,[0.2,0.5,0.8]);
     assert!(app.video.ocean);
     assert_eq!(app.video.ocean_settings.backend,3);
     let resolved=app.video.ocean_settings.resolved_for_gpu();
     assert!(!resolved.blue_water_adapter && !resolved.interaction);
     assert_eq!(resolved.blue_water_caustics_mode,2);
+    assert_eq!(resolved.optics.fog_color,[0.1,0.3,0.4]);
     app.flush_config();
     let saved=crate::config::load_video_settings(&path);
     assert!(saved.ocean);
@@ -339,6 +427,9 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         ("r_modelPrepareThreads", "2", "0"),
         ("r_md3GeometryCache", "1", "0"),
         ("r_staticMd3Instances", "0", "1"),
+        ("r_staticMd3Bvh", "0", "1"),
+        ("r_occlusionStats", "0", "1"),
+        ("r_fxOcclusion", "0", "1"),
         ("r_modelRenderBundles", "0", "1"),
         ("r_encoderFinishThreads", "2", "0"),
         ("r_modelIndexUploadCache", "0", "1"),
@@ -370,4 +461,113 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         assert!(app.set_console_cvar("r_modelPrepareThreads", value).is_err());
         assert_eq!(app.video.model_prepare_threads, 2);
     }
+}
+
+#[test]
+fn movement_components_match_editor_selection_and_archive() {
+    use crate::ui::{HudElementId as Id, movement_components as components};
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    app.set_console_cvar("cg_speedometer", "0").unwrap();
+    app.set_console_cvar("cg_strafeHelper", "0").unwrap();
+    for id in [Id::Speedometer, Id::AccelMeter, Id::StrafeGuide, Id::VelocityCompass, Id::SpeedGraph,
+        Id::GroundSpeed, Id::JumpHeight, Id::JumpDistance, Id::VerticalSpeed, Id::YawSpeed, Id::SpeedometerJumps] {
+        assert!(!app.hud_edit_element_enabled(id), "off {id:?}");
+    }
+    app.set_console_cvar("cg_speedometer", "65").unwrap();
+    app.set_console_cvar("cg_strafeHelper", &(crate::ui::SHELPER_Q3DF_SPEED | crate::ui::SHELPER_Q3DF_ACCEL | crate::ui::SHELPER_WARSOW_HUD).to_string()).unwrap();
+    assert_eq!(app.japro_cg.speedometer.flags & 65, 0);
+    assert_eq!(components::selected(Id::Speedometer, app.strafe_helper.flags, app.japro_cg.speedometer.flags), 2);
+    assert!(app.hud_edit_element_enabled(Id::Speedometer));
+    assert!(app.hud_edit_element_enabled(Id::AccelMeter));
+    app.set_console_cvar("cg_speedometer", "64").unwrap();
+    assert_eq!(app.strafe_helper.flags & crate::ui::SHELPER_Q3DF_ACCEL, 0);
+    assert_ne!(app.strafe_helper.flags & crate::ui::SHELPER_Q3DF_SPEED, 0);
+    for id in [Id::AccelMeter, Id::StrafeGuide, Id::VelocityCompass, Id::GroundSpeed, Id::JumpHeight,
+        Id::JumpDistance, Id::VerticalSpeed, Id::YawSpeed] {
+        app.set_console_cvar(id.cvar_name(), "tl 17 -12 1.25").unwrap();
+    }
+    app.overlay = crate::ui::OverlayMode::HudEdit;
+    let snapshot = app.ui_snapshot();
+    let native = snapshot.speedometer.as_ref().unwrap();
+    assert!(native.texts.is_empty());
+    app.flush_config();
+    let loaded = crate::config::load_client_presentation_settings(&path);
+    for id in [Id::AccelMeter, Id::StrafeGuide, Id::VelocityCompass, Id::GroundSpeed, Id::JumpHeight,
+        Id::JumpDistance, Id::VerticalSpeed, Id::YawSpeed] {
+        let layout = loaded.hud_layout.element(id);
+        assert_eq!(layout.offset, [17.0,-12.0], "{id:?}");
+        assert_eq!(layout.scale, 1.25);
+    }
+    app.set_console_cvar("cg_strafeHelper", "0").unwrap();
+    app.set_console_cvar("cg_speedometer", "0").unwrap();
+    assert!(app.ui_snapshot().speedometer.is_none());
+}
+
+#[test]
+fn occlusion_ab_cvars_fail_closed_on_unwired_gpu_modes() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let mut app = App::new(fixture.0.clone(), None,
+        crate::scene::MapSource::Bsp("mp/ffa3".into()), false,
+        event_loop.create_proxy()).unwrap();
+    for name in ["r_staticMd3Bvh", "r_fxOcclusion", "r_md3Occlusion", "r_occlusionStats"] {
+        let definition = crate::app::cvar_registry().find(name).unwrap();
+        assert!(!definition.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE));
+        assert_eq!(definition.entry.latch, crate::console::LatchScope::None);
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some("0"));
+    }
+    app.config_dirty = false;
+    for name in ["r_staticMd3Bvh", "r_fxOcclusion", "r_occlusionStats"] {
+        app.set_console_cvar(name, "1").unwrap();
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some("1"));
+        app.set_console_cvar(name, "0").unwrap();
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some("0"));
+        assert!(!app.config_dirty, "session-only switch must not dirty config");
+    }
+    assert_eq!(app.console_cvar_value("r_md3Occlusion").as_deref(), Some("0"));
+    assert_eq!(app.console_cvar_value("r_fxOcclusion").as_deref(), Some("0"));
+    for invalid in ["1", "2", "999", "-1", "nonsense"] {
+        assert!(app.set_console_cvar("r_md3Occlusion", invalid).is_err());
+    }
+    for invalid in ["2", "3", "-1", "nonsense"] {
+        assert!(app.set_console_cvar("r_fxOcclusion", invalid).is_err());
+    }
+    assert_eq!(app.console_cvar_value("r_md3Occlusion").as_deref(), Some("0"));
+    assert_eq!(app.console_cvar_value("r_fxOcclusion").as_deref(), Some("0"));
+}
+
+#[test]
+fn baked_local_controls_apply_live_and_round_trip_independently() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop=winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event().with_any_thread(true).build().unwrap();
+    let fixture=Fixture::new();let path=fixture.0.join("DinurdoJK.cfg");fs::write(&path,"").unwrap();
+    let mut app=App::new(fixture.0.clone(),None,crate::scene::MapSource::Bsp("mp/ffa3".into()),false,event_loop.create_proxy()).unwrap();
+    let runtime_promotion=(app.video.promote_shader_lights,app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights);
+    for (name,value) in [("r_bakedLocalLights","1"),("r_bakedLocalGlow","0"),("r_bakedLocalEmissive","0"),("r_bakedLocalAdditive","1"),("r_bakedLocalSurfacelight","1"),("r_bakedLocalFx","1")] {
+        assert_eq!(crate::app::cvar_registry().find(name).unwrap().entry.latch,crate::console::LatchScope::None);
+        app.set_console_cvar(name,value).unwrap();
+    }
+    assert!(app.video.baked_local_lights);assert_eq!(app.video.baked_local_sources,2|8|16);
+    app.set_console_cvar("r_playerContactShadows","0").unwrap();
+    assert!(!app.video.player_contact_shadows);
+    assert!(crate::app::cvar_registry().find("r_bakedLocalShadows").is_none(), "master cvar was removed");
+    assert_eq!(runtime_promotion,(app.video.promote_shader_lights,app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights));
+    app.flush_config();let restored=crate::config::load_video_settings(&path);
+    assert!(restored.baked_local_lights);assert_eq!(restored.baked_local_sources,2|8|16);
+    assert!(!restored.player_contact_shadows);
+    assert!(app.set_console_cvar("r_bakedLocalLights","banana").is_err());
+    app.set_console_cvar("r_bakedLocalLights","0").unwrap();assert!(!app.video.baked_local_lights);assert_eq!(app.video.baked_local_sources,2|8|16);
+    // Selecting a lamp source does not turn on experimental illumination.
+    assert!(!app.video.baked_local_lights && app.video.baked_local_sources == 2|8|16);
+    app.flush_config();let shadows_only=crate::config::load_video_settings(&path);
+    assert!(!shadows_only.baked_local_lights && shadows_only.baked_local_sources == 2|8|16);
 }

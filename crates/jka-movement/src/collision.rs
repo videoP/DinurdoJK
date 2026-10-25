@@ -444,6 +444,18 @@ impl CollisionWorld {
     /// CM_TransformedBoxTrace against one entity. `entity` stays ENTITY_NONE;
     /// the caller assigns the entity number like CG_ClipMoveToEntities.
     pub fn trace_entity(&mut self, q: TraceQuery, clip: EntityClip) -> TraceResult {
+        if !q.is_finite() {
+            log::warn!("Rejected non-finite entity collision query: {q:?}");
+            return TraceResult::blocked(q.start);
+        }
+        let valid_clip = match &clip {
+            EntityClip::InlineModel { origin, angles, .. } => origin.iter().chain(angles).all(|v| v.is_finite()),
+            EntityClip::Box { mins, maxs, origin } => mins.iter().chain(maxs).chain(origin).all(|v| v.is_finite()),
+        };
+        if !valid_clip {
+            log::warn!("Skipped non-finite collision entity: {clip:?}");
+            return TraceResult::clear(q.end);
+        }
         if self.is_source_map() {
             return match clip {
                 EntityClip::InlineModel { .. } => {
@@ -521,6 +533,14 @@ impl CollisionWorld {
 
     /// CM_TransformedPointContents for an inline model.
     pub fn inline_model_contents(&mut self, point: [f32; 3], index: i32, origin: [f32; 3], angles: [f32; 3]) -> i32 {
+        if !point.iter().all(|v| v.is_finite()) {
+            log::warn!("Rejected non-finite inline contents query: point={point:?} index={index}");
+            return 1; // CONTENTS_SOLID
+        }
+        if !origin.iter().chain(&angles).all(|v| v.is_finite()) {
+            log::warn!("Skipped non-finite inline contents transform: index={index} origin={origin:?} angles={angles:?}");
+            return 0;
+        }
         let CollisionBackend::Native(native) = &*self.backend else {
             return 0;
         };
@@ -631,13 +651,12 @@ fn source_trace_brush(q: TraceQuery, brush: &SourceCollisionBrush, best: &mut Tr
 
 impl TraceWorld for CollisionWorld {
     fn trace(&mut self, q: TraceQuery) -> TraceResult {
-        assert!(q
-            .start
-            .iter()
-            .chain(&q.end)
-            .chain(&q.mins)
-            .chain(&q.maxs)
-            .all(|v| v.is_finite()));
+        // Camera/effect traces also call this outside the caught Pmove
+        // callbacks. Bad coordinates must not terminate the client there.
+        if !q.is_finite() {
+            log::warn!("Rejected non-finite world collision query: {q:?}");
+            return TraceResult::blocked(q.start);
+        }
 
         if self.is_source_map() {
             let mut query_min = [0.0; 3];
@@ -685,7 +704,10 @@ impl TraceWorld for CollisionWorld {
     }
 
     fn point_contents(&mut self, point: [f32; 3], _pass: i32) -> i32 {
-        assert!(point.iter().all(|v| v.is_finite()));
+        if !point.iter().all(|v| v.is_finite()) {
+            log::warn!("Rejected non-finite contents query: point={point:?}");
+            return 1; // CONTENTS_SOLID
+        }
         if self.is_source_map() {
             let candidates = self.source_candidates(point, point);
             let CollisionBackend::Source(world) = &*self.backend else { unreachable!() };

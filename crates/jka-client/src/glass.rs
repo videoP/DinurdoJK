@@ -194,6 +194,25 @@ impl Settings {
             + 4.0)
             .ceil() as u32
     }
+    /// Blurred mips glass_shade can sample, of `available` above mip 0. Mirrors
+    /// glass_common.wgsl: radius = blur + roughness term (depth >= 32) + edge
+    /// blur, capped at 64; lod = clamp(log2(max(radius, 2)), 1, available).
+    /// Trilinear filtering also reads the level above floor(lod).
+    pub fn blur_levels(self, available: usize) -> usize {
+        let corrected = self.roughness * (self.ior * 2.0 - 2.0).clamp(0.0, 1.0);
+        let radius = (self.blur.max(0.0) + corrected * corrected * 1600.0 / 32.0 + self.edge_blur.max(0.0))
+            .min(64.0);
+        let lod = radius.max(2.0).log2().clamp(1.0, available.max(1) as f32);
+        (lod.floor() as usize + 1).min(available)
+    }
+    /// Full-res pixels around covered glass that the blur pyramid must hold:
+    /// the clamped refraction offset with dispersion, plus each level's
+    /// bilinear and 3x3 Gaussian footprint (under 2^(levels+2) pixels).
+    pub fn blur_reach(self, levels: usize) -> u32 {
+        let displacement =
+            self.max_displacement.max(0.0) * (1.0 + (self.dispersion * self.dispersion_base).abs());
+        displacement.ceil() as u32 + 6 + (4u32 << levels.min(16))
+    }
     pub fn uniform(self, sky: [f32; 3]) -> Uniform {
         Uniform {
             optical: [self.ior, self.thickness, self.distortion, self.blur],
@@ -424,4 +443,30 @@ pub fn world_shader() -> String {
         include_str!("glass_world.wgsl"),
         shader_bindings(2)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blur_levels_cover_every_lod_glass_shade_can_sample() {
+        // (preset, available, expected): radius 0.72 -> lod 1; 4.12 -> 2.04;
+        // Frosted 29.1 -> 4.86. Trilinear needs floor(lod) + 1.
+        for (style, expected) in [(Style::Bevy, 2), (Style::Liquid, 3), (Style::Frosted, 5)] {
+            assert_eq!(Settings::preset(style).blur_levels(6), expected, "{style:?}");
+        }
+        let mut wide = Settings::preset(Style::Frosted);
+        wide.blur = 500.0;
+        assert_eq!(wide.blur_levels(6), 6, "radius caps at 64 = lod 6, all levels");
+        assert_eq!(wide.blur_levels(3), 3, "never more than the pyramid holds");
+    }
+
+    #[test]
+    fn blur_reach_holds_dispersed_displacement_and_pyramid_footprint() {
+        let liquid = Settings::preset(Style::Liquid);
+        // 32 * (1 + 0.06) = 33.92 -> 34, + 6 margin, + 2^(3 + 2).
+        assert_eq!(liquid.blur_reach(3), 34 + 6 + 32);
+        assert!(edges::edge_pad(liquid.edge_radius(2560, 1440)) >= 2 * liquid.edge_radius(2560, 1440));
+    }
 }

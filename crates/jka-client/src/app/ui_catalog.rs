@@ -42,6 +42,7 @@ pub(super) enum CatalogRequest {
     Levelshot { source: bool, map_name: String },
     ProfileBackground { map_name: String },
     ProfileBackgroundMaps,
+    StudioCinematics {token:u64,allow_overrides:bool},
     ProfileIcon { key: String, model: String, skin: String },
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
     CrosshairImage { index: u8 },
@@ -67,6 +68,7 @@ pub(super) enum CatalogPayload {
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
     ProfileBackground { map_name: String, image: Option<DecodedImage> },
     ProfileBackgroundMaps(Vec<String>),
+    StudioCinematics {token:u64,catalog:Result<super::render_studio_cinematics::StudioCinematicCatalog,String>},
     ProfileIcon { key: String, image: Option<DecodedImage> },
     CrosshairImage { index: u8, image: Option<DecodedImage> },
     ShaderNames(Vec<String>),
@@ -112,6 +114,7 @@ pub(super) struct UiCatalog {
 }
 
 impl UiCatalog {
+    pub fn generation(&self)->u64 {self.generation}
     pub fn spawn() -> Result<Self, String> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (result_tx, result_rx) = mpsc::channel::<CatalogResult>();
@@ -281,6 +284,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         }
                         CatalogRequest::ProfileBackground {map_name}=>Some(CatalogPayload::ProfileBackground{map_name,image:None}),
                         CatalogRequest::ProfileBackgroundMaps=>Some(CatalogPayload::ProfileBackgroundMaps(Vec::new())),
+                        CatalogRequest::StudioCinematics {token,..}=>Some(CatalogPayload::StudioCinematics {token,catalog:Err(error)}),
                         CatalogRequest::ProfileIcon { key, .. } => {
                             Some(CatalogPayload::ProfileIcon { key, image: None })
                         }
@@ -327,6 +331,10 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 "profile",
                 CatalogPayload::Profile(frontend::scan_profile_catalog(assets)),
             ),
+            CatalogRequest::StudioCinematics {token,allow_overrides}=>{
+                let mut reader=assets.fork();reader.set_allow_asset_overrides(allow_overrides);
+                ("studio cinematics",CatalogPayload::StudioCinematics {token,catalog:super::render_studio_cinematics::scan(&mut reader)})
+            }
             CatalogRequest::SoloMaps => (
                 "solo maps",
                 CatalogPayload::SoloMaps(Ok(frontend::scan_solo_maps(assets))),

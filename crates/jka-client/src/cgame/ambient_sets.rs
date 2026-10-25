@@ -159,6 +159,7 @@ impl AmbientSets {
 /// One looping ambient sound this frame (`S_AddAmbientLoopingSound`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AmbientLoop {
+    pub emitter: u64,
     pub qpath: String,
     pub origin: [f32; 3],
     /// 0..=255, as in the engine.
@@ -278,7 +279,7 @@ impl AmbientRuntime {
         let master = self.volumes.get(name).map_or(MAX_SET_VOLUME, |&(master, _)| master);
         if let Some(wave) = &set.looped_wave {
             if master > 0 {
-                out.loops.push(AmbientLoop { qpath: wave.clone(), origin, volume: master.clamp(0, 255) as u8 });
+                out.loops.push(AmbientLoop { emitter: u64::MAX, qpath: wave.clone(), origin, volume: master.clamp(0, 255) as u8 });
             }
         }
         if now - *last < self.irand(set.time_start, set.time_end) * 1000 {
@@ -315,7 +316,7 @@ impl AmbientRuntime {
         let mut volume = if !(0.0..=1.0).contains(&dist_scale) { 0 } else { (MAX_SET_VOLUME as f32 * dist_scale) as i32 };
         if let Some(wave) = &set.looped_wave {
             if volume > 0 {
-                out.loops.push(AmbientLoop { qpath: wave.clone(), origin, volume: volume.clamp(0, 255) as u8 });
+                out.loops.push(AmbientLoop { emitter: (1u64<<63) | u64::from(entity), qpath: wave.clone(), origin, volume: volume.clamp(0, 255) as u8 });
             }
         }
         let last = self.local_times.get(&entity).copied().unwrap_or(0);

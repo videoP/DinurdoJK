@@ -1,3 +1,20 @@
+#[test]
+fn local_body_deformation_stays_on_connection_owned_player() {
+    use super::presentation::local_body_for_entity as owned;
+    // Connection client 2; camera is following client 3.
+    assert!(owned(ET_PLAYER, 2, 2, Some(Some(2)), 3));
+    assert!(!owned(ET_PLAYER, 3, 3, Some(Some(2)), 3));
+    // An NPC or body queue corpse must not become local, even at slot 2.
+    assert!(!owned(ET_NPC, 2, 2, Some(Some(2)), 2));
+    assert!(!owned(ET_BODY, 2, 2, Some(Some(2)), 2));
+    assert!(!owned(ET_PLAYER, 12, 2, Some(Some(2)), 2));
+    // No connection owner in demo playback: nobody inherits our body sliders.
+    assert!(!owned(ET_PLAYER, 2, 2, Some(None), 2));
+    // Legacy standalone previews/tests without App ownership keep their fallback.
+    assert!(owned(ET_PLAYER, 0, 0, None, -1));
+    assert!(owned(ET_PLAYER, 2, 2, None, 2));
+}
+
 use super::*;
 use super::submission::mesh::append_surface_indices;
 
@@ -280,7 +297,7 @@ fn compact_emote_renders_in_profile_and_world() {
                             .unwrap_or_else(|err| panic!("world {id}/{}: {err}", variant.variant_name))
                     } else {
                         presenter.present_profile_player_preview(&info, [0.; 3], axis, time,
-                            "BOTH_STAND1", false, [1.; 3], 0, [0.; 2], false, None)
+                            "BOTH_STAND1", false, [1.; 3], 0, [0.; 2], false, None, None)
                             .unwrap_or_else(|err| panic!("profile {id}/{}: {err}", variant.variant_name)).0
                     };
                     assert!(!draws.is_empty(), "no geometry: {id}");
@@ -295,7 +312,7 @@ fn compact_emote_renders_in_profile_and_world() {
     }
     // Stopping the override must still restore the stock Ghoul2 stand path.
     assert!(!presenter.present_profile_player_preview(&info, [0.; 3], axis, 1200,
-        "BOTH_STAND1", false, [1.; 3], 0, [0.5; 2], false, None).unwrap().0.is_empty());
+        "BOTH_STAND1", false, [1.; 3], 0, [0.5; 2], false, None, None).unwrap().0.is_empty());
     // A broken visual animator cannot abort the live-session caller. Its state
     // is recreated next frame while model caches and authoritative state stay.
     let runtime=presenter.entities.get_mut(&0).unwrap();
@@ -324,7 +341,7 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
         body_shape_binding: None,
         key: "test".into(), glm: Arc::new(glm.clone()), gla: mesh,
         animation_gla: Arc::clone(&animation), retargeter: plan,
-        source_native_pivots: None, source_jiggles: None,
+        source_native_pivots: None, source_imported: false, source_jiggles: None,
         source_jiggles_enabled: false, humanoid: true, animations: None,
         emote_contacts: Default::default(),
         anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,

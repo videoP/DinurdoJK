@@ -6,6 +6,7 @@ mod source_vtf;
 mod assets;
 pub(crate) use assets::types::EMOTE_GROUND_SHIFT_MAX;
 mod attachments;
+mod breath;
 mod bodies;
 mod cloth;
 mod cosmetics;
@@ -17,6 +18,9 @@ mod pose;
 mod powerups;
 mod presentation;
 mod previews;
+mod studio_camera;
+pub(crate) use studio_camera::ProfileAttachmentFrame;
+pub(crate) use previews::{saber_preview_debug_enabled, saber_preview_debug_snapshot, set_saber_preview_debug};
 mod profile_selection;
 mod emote_props;
 mod emote_effects;
@@ -50,13 +54,14 @@ use bodies::dismemberment::{
     BodyQueueCopyState, DetachedLimbVisual, DismemberPart, DismemberSourceSnap,
 };
 pub use cosmetics::apply_profile_studio_light;
-use cosmetics::{cosmetic_draws_for_mask, global_cosmetic_draw, model_bolt_matrix_timed, VehicleSnap};
+use cosmetics::{cosmetic_draws_for_mask, global_cosmetic_draw, model_bolt_matrix_timed,
+    saber_hand_bolt_matrix_timed, VehicleSnap};
 pub use diagnostics::Ghoul2PerfStats;
 use diagnostics::{record_motion_pose_eval, record_pose_eval};
 #[cfg(test)]
 use effects::glm_indices_for_wgpu;
 use effects::{
-    angles_to_axis, blade_color, flatten_matrix3x4, force_grip_target_alive,
+    angles_to_axis, blade_color, entity_is_mind_tricked, flatten_matrix3x4, force_grip_target_alive,
     force_grip_target_still_valid, impulse_weapon_is_explosive, infer_force_grip_target,
     normalize_vec3, openjk_look_target_origin, openjk_player_entity_needs_reset,
     smooth_head_look_yaw,
@@ -153,12 +158,51 @@ use std::{
     time::Instant,
 };
 
+/// TaystJK CG_Player: when the viewer bit is in an entity's mind-trick masks,
+/// fade its Ghoul2 body at 0.5 alpha bytes/ms and ultimately suppress the
+/// draw. When unmasked, restore alpha at 1 byte/ms. Track *server/game* time
+/// so high render FPS and 26 demo replay speed do not affect the transition.
+#[derive(Clone, Copy, Debug)]
+struct MindTrickFade {
+    alpha: f32,
+    time: i32,
+}
+
+impl MindTrickFade {
+    fn advance(prior: Option<Self>, time: i32, hidden: bool) -> Self {
+        let Some(prior) = prior.filter(|prior| time >= prior.time) else {
+            // When a demo begins inside an existing mind trick/JA+ dimension,
+            // mirror CG_Player's initial `iwantout` behavior: invisible, not
+            // a briefly fully-visible model.
+            return Self { alpha: if hidden { 1.0 } else { 255.0 }, time };
+        };
+        let elapsed = (i64::from(time) - i64::from(prior.time)) as f32;
+        Self {
+            alpha: if hidden {
+                (prior.alpha - elapsed * 0.5).max(1.0)
+            } else {
+                (prior.alpha + elapsed).min(255.0)
+            },
+            time,
+        }
+    }
+}
+
 /// Asset/runtime state corresponding to the player-model subset of OpenJK cgame.
 /// Models and textures are cached by qpath; animation state is kept per entity,
 /// matching the persistent `centity_t` ownership in the original client.
 pub struct PlayerPresenter {
     /// This frame's force-power FX requests (drained by the caller).
     fx_requests: Vec<PlayerFxRequest>,
+    /// TaystJK cent->breathPuffTime, separate per client, in server milliseconds.
+    breath_puff_times: HashMap<u16, i32>,
+    /// Per-entity S_GetVoiceVolume > 0, sampled from the existing audio backend.
+    breath_talking: HashSet<u16>,
+    /// CG_ParseWeatherEffect's map-latched flag, mirrored from CGame.
+    cold_breath_effects: bool,
+    /// cg.refdef.viewContents sampled at the camera rather than the target's
+    /// mouth (that is how TaystJK chooses underwater bubbles).
+    breath_view_contents: i32,
     /// `animevents.cfg` of the stock humanoid skeleton: where footsteps fall in
     /// each animation.
     anim_events: jka_assets::animevents::AnimEvents,
@@ -187,6 +231,11 @@ pub struct PlayerPresenter {
     japro: crate::japro_cg::JaproCgame,
     /// The viewer's state as `CG_Player` reads it to cull and restyle others.
     viewer_style: crate::japro_cg::StyleViewer,
+    /// CG_Player `cent->trickAlpha` and `trickAlphaTime`, keyed by network entity.
+    /// The supplied JA+ demo masks a player from our viewer using the
+    /// per-client trickedentindex flags, despite having no advertised
+    /// EF_ALT_DIM / jp_cinfo capability.
+    mind_trick_fades: HashMap<u16, MindTrickFade>,
     /// Appearance of the player currently being presented (set per entity).
     look: crate::japro_cg::Appearance,
     /// jaPRO `jcinfo2` feature bits used by CG_Player presentation. In
@@ -197,7 +246,7 @@ pub struct PlayerPresenter {
     head_look_mode: u8,
     /// cg_swimTilt, client-side visual strength.
     swim_tilt: f32,
-    /// cg_swimTurnBank, bank into the curvature of swim velocity (max 45°).
+    /// cg_swimTurnBank, bank into the curvature of swim velocity (max 60°).
     swim_turn_bank: f32,
     /// cg_moveLean (0..1): airborne acceleration-first cosmetic lean.
     move_lean: f32,
@@ -219,6 +268,9 @@ pub struct PlayerPresenter {
     local_global_cape: String,
     /// Cached TaystJK `.cosmetic` offsets, keyed per model + skin.
     global_cosmetic_offsets: HashMap<(u8, String, String, String), [f32; 3]>,
+    /// Packed cosmetics map stable 20-bit hashes to locally installed MD3s.
+    /// None indicates a collision; it must not resolve to an arbitrary model.
+    packed_cosmetic_assets: Option<HashMap<(u8, u32), Option<String>>>,
     /// `cp_cosmetics` this client last sent a jaPRO server, to spot the server
     /// relaying (`c5`) something else, e.g. after stripping locked cosmetics.
     sent_cosmetics: u32,
@@ -232,6 +284,7 @@ pub struct PlayerPresenter {
     /// `cg_ghoul2Marks`: burn marks kept per model (0 disables them).
     gore_limit: usize,
     gore: Vec<super::player_gore::Gore>,
+    pending_gore: Vec<super::player_gore::PendingGore>,
     gore_next_id: u32,
     /// GPU-skinned body surfaces of each player's last presented frame.
     last_gpu: HashMap<u16, Vec<super::player_gore::GpuSnap>>,
@@ -269,6 +322,10 @@ pub struct PlayerPresenter {
     /// are not part of the authoritative snapshot list but still own persistent
     /// Ghoul2 animation/model state across frames.
     external_live_entities: HashSet<u16>,
+    /// Some(owner) means App supplied a connection-owned slot for this frame;
+    /// Some(None) means there is no local player (e.g. demo playback).
+    /// None retains the standalone/tool presenter's historical fallback.
+    local_body_owner: Option<Option<usize>>,
     /// Lightweight post-Ghoul2 soft-tissue secondary motion. Stock `_humanoid`
     /// models auto-compile chest/glute masks.
     jiggle: AsyncJiggleSystem,
@@ -331,7 +388,7 @@ pub struct PlayerPresenter {
     /// Map-scoped collision clone used only by OpenJK cg_shadows 1. Like the
     /// original CM_Trace call this traces static BSP collision, not entities.
     collision_world: Option<CollisionWorld>,
-    blob_shadows_enabled: bool,
+    blob_shadow_opacity: f32,
     blob_shadow_instances: Vec<FxGpuSpriteInstance>,
     blob_shadow_texture: Option<Arc<TextureData>>,
     blob_shadow_alpha_mode: DynamicModelAlphaMode,

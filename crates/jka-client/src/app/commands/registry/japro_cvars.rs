@@ -1059,6 +1059,16 @@ settings_cvars! { JaproCgame;
                 }
                 fn cvar_set_cg_speedometer(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_CG_SPEEDOMETER.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    // The provider most recently selected wins, including console
+                    // commands. Speed and acceleration remain independent.
+                    if self.japro_cg.speedometer.flags & crate::speedometer::flag::ENABLE != 0 {
+                        self.strafe_helper.flags &= !ui::SHELPER_Q3DF_SPEED;
+                    }
+                    if self.japro_cg.speedometer.flags & crate::speedometer::flag::ACCELMETER != 0 {
+                        self.strafe_helper.flags &= !(ui::SHELPER_Q3DF_ACCEL | ui::SHELPER_ACCELMETER);
+                    }
+                    ui::movement_components::normalize(&mut self.strafe_helper.flags,
+                        &mut self.japro_cg.speedometer.flags);
                     if let Some(session) = self.game_session.as_mut() {
                         session.apply_client_options(
                             self.screen_shake,
@@ -1568,8 +1578,57 @@ settings_cvars! { JaproCgame;
         ]
     }
 
+    APP_CP_ALTDIMALPHA {
+        runtime: CvarDef::new("cp_altDimAlpha", "", "1..255", "TaystJK JA+: alpha byte for players in the other dimension (default 40).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cp_altdimalpha(app)), |app, value| App::cvar_set_cp_altdimalpha(app, APP_CP_ALTDIMALPHA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cp_altdimalpha, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.japro.set_cvar(name, value);
+                }),
+                archive: Some((10426, |state| {
+                    format!("{}", state.presentation.japro.alt_dim_alpha)
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CP_ALTDIMALPHA = APP_CP_ALTDIMALPHA
+                .bind(
+                    |state: &JaproCgame| CvarValue::String(state.alt_dim_alpha.to_string()),
+                    |state, value| JaproCgame::cvar_set_cp_altdimalpha(state, APP_CP_ALTDIMALPHA.entry.name, &value.to_string()),
+                )
+                .with_text_setter(JaproCgame::cvar_set_cp_altdimalpha, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cp_altdimalpha(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    japro_integer(name, value).map(|value| {
+                        self.alt_dim_alpha = value.clamp(1, 255) as u8;
+                    })
+                }
+            }
+            impl App {
+                fn cvar_get_cp_altdimalpha(&self) -> String {
+                    (SETTINGS_CP_ALTDIMALPHA.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cp_altdimalpha(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CP_ALTDIMALPHA.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.apply_client_options(
+                            self.screen_shake,
+                            self.audio.game,
+                            self.video.footprints,
+                            self.japro_cg,
+                            self.network.plugin_disable,
+                        );
+                    }
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_STYLEPLAYER {
-        runtime: CvarDef::new("cg_stylePlayer", "", "bit mask", "jaPRO player styling bits: 2 duel shell, 4 hide duelers, 8 hide racers in FFA, 16 hide non-racers while racing, 32 hide racers while racing, 64 solid racers, 128 solid FFA players while racing, 256 ghost duelers, 1024 hide non-duelers while dueling (stock servers), 65536 hide cosmetics, 1048576 seasonal cosmetics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_styleplayer(app)), |app, value| App::cvar_set_cg_styleplayer(app, APP_CG_STYLEPLAYER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_styleplayer, None),
+        runtime: CvarDef::new("cg_stylePlayer", "", "bit mask", "jaPRO player styling bits: 2 duel shell, 4 hide duelers, 8 hide racers in FFA, 16 hide non-racers while racing, 32 hide racers while racing, 64 solid racers, 128 solid FFA players while racing, 256 ghost duelers, 1024 hide non-duelers while dueling (stock servers), 65536 hide cosmetics, 131072 disable breathing effects, 1048576 seasonal cosmetics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_styleplayer(app)), |app, value| App::cvar_set_cg_styleplayer(app, APP_CG_STYLEPLAYER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_styleplayer, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.japro.set_cvar(name, value);

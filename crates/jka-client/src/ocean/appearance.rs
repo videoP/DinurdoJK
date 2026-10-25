@@ -214,6 +214,12 @@ pub struct PromotedOcean {
     pub heuristic: WaveHeuristic,
     pub color: [f32; 3],
     pub roughness: Option<f32>,
+    /// Geometric deformation as authored, without the ocean's minimum-height
+    /// heuristic. A flat Quake pond must not inherit a 10-unit ocean swell.
+    pub source_deformation: Option<f32>,
+    /// Actual authored alpha, only for standard source-alpha blending. Additive,
+    /// screen and opaque stages do not encode optical transparency in alpha.
+    pub source_alpha: Option<f32>,
     /// World-space swell heading recovered from the authored water stage's
     /// tcMod scroll, when its base UV mapping gives us a stable direction.
     pub swell_direction: Option<f32>,
@@ -492,6 +498,7 @@ pub(super) mod tests {
             heuristic: wave_heuristic(variation, None),
             color: [0.1, 0.2, 0.3],
             roughness: Some(0.4),
+            source_deformation: None, source_alpha: None,
             swell_direction: None,
         }
     }

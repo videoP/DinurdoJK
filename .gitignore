@@ -2,6 +2,9 @@
 /.references/
 /Development Docs/
 /.ocean-work/
+/base/
+/assets/
+/scripts/
 /.codex/
 *.zip
 /tools/
@@ -13,15 +16,7 @@
 *.log
 
 # Keep the Anny v1 authoring tool reproducible; generated data stays local.
-!/tools/
 /tools/*
-!/tools/dinurdojk_release.py
-!/tools/jiggle-shape-preview/
-/tools/jiggle-shape-preview/*
-!/tools/jiggle-shape-preview/anny/
-/tools/jiggle-shape-preview/anny/*
-!/tools/jiggle-shape-preview/anny/*.py
-!/tools/jiggle-shape-preview/anny/README.md
 # Emote bundles and libraries are build artefacts (large); they are produced
 # with djk-fnemote and installed into a game `base`, never committed.
 /base/emotes/*.djk_fnemote

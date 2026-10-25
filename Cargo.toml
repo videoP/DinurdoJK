@@ -3,6 +3,9 @@ members = ["crates/blue-water-core", "crates/blue-water-gpu", "crates/blue-water
     "crates/blue-water-clouds", "crates/blue-water-fx", "crates/jka-protocol", "crates/jka-probe", "crates/jka-assets", "crates/jka-client", "crates/jka-cloth-core", "crates/jka-movement", "crates/jka-water", "crates/jka-ue-assets", "crates/jka-ue-runtime", "crates/jka-emotes"]
 resolver = "2"
 
+[workspace.dependencies]
+glam = "=0.33.9"
+
 [workspace.package]
 edition = "2021"
 publish = false

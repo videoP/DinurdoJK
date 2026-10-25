@@ -73,7 +73,7 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps {
+                if matches!(self.cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities) {
                     1.0
                 } else {
                     0.0

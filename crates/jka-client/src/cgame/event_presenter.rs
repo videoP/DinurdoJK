@@ -94,9 +94,14 @@ pub(crate) fn prepare_event_visual(
         | EntityEvent::EV_SABER_BLOCK
         | EntityEvent::EV_SABER_CLASHFLARE => (EventDispatchResult::Unhandled, None),
         EntityEvent::EV_SABER_UNHOLSTER => (EventDispatchResult::Partial("SABER_UNHOLSTER_NO_AUDIO"), None),
+        // TaystJK CG_EntityEvent -> CG_PlayerShieldHit, then CG_PlayerHitFX /
+        // CG_DrawPlayerShield: the armor hit renders the directional half-shield
+        // model, not an untextured blue additive billboard. That model is
+        // already emitted by EntityPresenter::present_shield_hits for both
+        // remote players and the local third-person body.
         EntityEvent::EV_SHIELD_HIT => (
-            EventDispatchResult::Handled("SHIELD_HIT_FLASH"),
-            Some(PreparedFlash { duration_ms: 120, radius: 13.0, color: [0.25, 0.55, 1.0] }),
+            EventDispatchResult::Handled("SHIELD_HIT_MODEL"),
+            None,
         ),
         EntityEvent::EV_GENERAL_SOUND | EntityEvent::EV_GLOBAL_SOUND | EntityEvent::EV_ENTITY_SOUND => {
             let result = if game.sound_qpath(event.parm).is_some() {
@@ -486,6 +491,36 @@ fn add_scaled(
         origin[1] + a[1] * sa + b[1] * sb,
         origin[2] + a[2] * sa + b[2] * sb,
     ]
+}
+
+#[cfg(test)]
+mod armor_shield_event_tests {
+    use super::*;
+    use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+
+    #[test]
+    fn armor_hit_uses_half_shield_model_without_blue_placeholder() {
+        // Reproduces the local third-person event-only hit: client/other 0,
+        // eventParm 58. EntityPresenter owns the world-space MD3 shell.
+        let event = PresentationEvent {
+            receive_sequence: 13,
+            source_entity_num: 49,
+            entity_num: 49,
+            event: EntityEvent::EV_SHIELD_HIT,
+            raw_event: EntityEvent::EV_SHIELD_HIT.as_i32(),
+            parm: 58,
+            position: [2191.0, 959.0, 248.0],
+            event_only_entity: true,
+            server_time: 1_626_850,
+            state: EntityState {
+                number: 49,
+                fields: [0; ENTITY_FIELDS.len()],
+            },
+        };
+        let prepared = prepare_event_visual(&event, &ClientGameState::new());
+        assert_eq!(prepared.result, EventDispatchResult::Handled("SHIELD_HIT_MODEL"));
+        assert!(prepared.flash.is_none(), "armor hits must not spawn the placeholder blue planes");
+    }
 }
 
 #[cfg(test)]

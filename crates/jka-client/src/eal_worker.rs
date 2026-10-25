@@ -1,6 +1,9 @@
 //! Bounded EAL effects transport. Native OpenAL work and teardown stay on a
 //! dedicated thread. The playback callback only exchanges fixed-size blocks.
-use crate::{eal::EalMap, eal_openal::WetReverb};
+use crate::{
+    eal::EalMap,
+    eal_native::{NativeScene, SceneFrame},
+};
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -15,13 +18,12 @@ use std::{
 pub(crate) const BLOCK_FRAMES: usize = 256;
 pub(crate) const LATENCY_BLOCKS: u64 = 2;
 const QUEUE_BLOCKS: usize = 8;
-const ROOM_FADE_SECONDS: f32 = 0.25;
 
 // Exactly one producer and one consumer, neither clonable. A release of write
 // publishes a slot; a release of read permits reuse. Operations never wait,
 // allocate, or acquire a mutex. The handles require &mut access to exchange data.
 struct Ring<T: Copy + Send> {
-    slots: [UnsafeCell<MaybeUninit<T>>; QUEUE_BLOCKS],
+    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
     read: AtomicUsize,
     write: AtomicUsize,
 }
@@ -32,7 +34,10 @@ struct Producer<T: Copy + Send>(Arc<Ring<T>>);
 struct Consumer<T: Copy + Send>(Arc<Ring<T>>);
 fn ring<T: Copy + Send>() -> (Producer<T>, Consumer<T>) {
     let state = Arc::new(Ring {
-        slots: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+        slots: (0..QUEUE_BLOCKS)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         read: AtomicUsize::new(0),
         write: AtomicUsize::new(0),
     });
@@ -68,9 +73,10 @@ impl<T: Copy + Send> Consumer<T> {
 #[derive(Clone, Copy)]
 struct InputBlock {
     sequence: u64,
-    environment: i32,
     enabled: bool,
+    #[cfg(test)]
     samples: [f32; BLOCK_FRAMES],
+    frame: SceneFrame,
 }
 #[derive(Clone, Copy)]
 struct OutputBlock {
@@ -84,6 +90,22 @@ pub(crate) struct WorkerStatus {
     pub underruns: AtomicU64,
     pub overflows: AtomicU64,
     pub max_render_us: AtomicU64,
+    pub sources: AtomicU64,
+    pub rooms: AtomicU64,
+    pub filtered_sources: AtomicU64,
+    pub diffracted_sources: AtomicU64,
+    pub directional_rooms: AtomicU64,
+    pub hrtf: AtomicBool,
+    pub queue_starves: AtomicU64,
+    pub restarts: AtomicU64,
+    pub multi_processed: AtomicU64,
+    pub buffer_reuse: AtomicU64,
+    pub input_edge_bits: AtomicUsize,
+    pub output_edge_bits: AtomicUsize,
+    pub callback_underfeed_samples: AtomicU64,
+    pub callback_dropped_samples: AtomicU64,
+    pub transport: AtomicU64,
+    pub hrtf_status: AtomicU64,
     error: Mutex<Option<String>>,
 }
 impl WorkerStatus {
@@ -107,94 +129,136 @@ pub(crate) struct EalWorker {
 }
 impl EalWorker {
     pub fn new(rate: u32, map: Arc<EalMap>) -> Result<Self, String> {
-        Self::spawn(move || {
-            let mut engines = [WetReverb::new(rate)?, WetReverb::new(rate)?];
-            let mut active = 0usize;
-            let mut fading = 1.0f32;
-            let fade_step = 1.0 / (ROOM_FADE_SECONDS * rate as f32).max(1.0);
-            let mut last_id = i32::MIN;
-            let mut output_gain = 0.0f32;
-            let gain_step = 1.0 / (0.02 * rate as f32).max(1.0);
+        Self::spawn_with_status(move |status| {
+            let mut scene = NativeScene::new(rate, &map)?;
             let mut previous_sequence: Option<u64> = None;
             Ok(
                 move |job: InputBlock| -> Result<[f32; BLOCK_FRAMES * 2], String> {
                     let mut output = [0.0; BLOCK_FRAMES * 2];
-                    if !job.enabled && output_gain == 0.0 {
-                        // Freeze no stale tail: the next enabled block resets its room.
-                        last_id = i32::MIN;
-                        previous_sequence = Some(job.sequence);
-                        return Ok(output);
-                    }
-                    if job.environment != last_id {
-                        let preset = map.preset_by_id(job.environment).unwrap_or(&map.default);
-                        if last_id == i32::MIN {
-                            engines[active].set_preset(preset)?;
-                            fading = 1.0;
-                        } else if fading >= 1.0 {
-                            active = 1 - active;
-                            engines[active].set_preset(preset)?;
-                            fading = 0.0;
-                        } else {
-                            // Finish the current fade before applying another room.
-                            // This keeps rapid boundary oscillations from resetting
-                            // audible effect state on every game frame.
-                            let _ = preset;
-                        }
-                        if fading == 0.0 || fading == 1.0 {
-                            last_id = job.environment;
+                    let mut frame = job.frame;
+                    if !job.enabled {
+                        for voice in &mut frame.voices {
+                            voice.active = 0;
                         }
                     }
-                    let mut older = [0.0; BLOCK_FRAMES * 2];
-                    // Advance lost input time with silence. Bound recovery after a
-                    // severe worker stall; such a stall is reported by the transport.
+                    // Advance native effect time after missed blocks instead of
+                    // replaying old source PCM. Recovery is bounded.
                     if let Some(previous) = previous_sequence {
-                        let missing = job.sequence.saturating_sub(previous + 1);
-                        if missing > QUEUE_BLOCKS as u64 {
-                            engines[active]
-                                .set_preset(map.preset_by_id(last_id).unwrap_or(&map.default))?;
-                            fading = 1.0;
-                        } else {
-                            for _ in 0..missing {
-                                engines[active].render(&[0.0; BLOCK_FRAMES], &mut output)?;
-                                if fading < 1.0 {
-                                    engines[1 - active].render(&[0.0; BLOCK_FRAMES], &mut older)?;
-                                }
-                            }
+                        let missing = job
+                            .sequence
+                            .saturating_sub(previous + 1)
+                            .min(QUEUE_BLOCKS as u64);
+                        let mut silent = frame;
+                        for voice in &mut silent.voices {
+                            voice.pcm.fill(0.0);
+                        }
+                        for _ in 0..missing {
+                            scene.render(&silent, &mut output)?;
                         }
                     }
                     previous_sequence = Some(job.sequence);
-                    let samples = if job.enabled {
-                        job.samples
+                    // PCM reference bypasses OpenAL, EAX and EalMan, but keeps
+                    // the EAL per-source sample clocks, worker queue and
+                    // Rodio playback/crossfade entirely unchanged. Test this
+                    // before changing EAX or audio-device buffering.
+                    let stats = if frame.debug_mode == 1 {
+                        let mut stats = crate::eal_native::SceneStats::default();
+                        for voice in &frame.voices {
+                            if voice.active == 0 {
+                                continue;
+                            }
+                            stats.sources += 1;
+                            for (i, &sample) in voice.pcm.iter().enumerate() {
+                                output[2 * i] += sample * 0.5;
+                                output[2 * i + 1] += sample * 0.5;
+                            }
+                        }
+                        stats
                     } else {
-                        [0.0; BLOCK_FRAMES]
+                        scene.render(&frame, &mut output)?
                     };
-                    engines[active].render(&samples, &mut output)?;
-                    if fading < 1.0 {
-                        engines[1 - active].render(&samples, &mut older)?;
-                    }
-                    for frame in 0..BLOCK_FRAMES {
-                        for channel in 0..2 {
-                            let i = frame * 2 + channel;
-                            output[i] =
-                                (older[i] * (1.0 - fading) + output[i] * fading) * output_gain;
-                        }
-                        fading = (fading + fade_step).min(1.0);
-                        let target = if job.enabled { 1.0 } else { 0.0 };
-                        if output_gain < target {
-                            output_gain = (output_gain + gain_step).min(target);
-                        } else {
-                            output_gain = (output_gain - gain_step).max(target);
-                        }
-                    }
+                    status
+                        .sources
+                        .store(stats.sources as u64, Ordering::Relaxed);
+                    status.rooms.store(stats.rooms as u64, Ordering::Relaxed);
+                    status
+                        .filtered_sources
+                        .store(stats.filtered_sources as u64, Ordering::Relaxed);
+                    status
+                        .diffracted_sources
+                        .store(stats.diffracted_sources as u64, Ordering::Relaxed);
+                    status
+                        .directional_rooms
+                        .store(stats.directional_rooms as u64, Ordering::Relaxed);
+                    status.hrtf.store(stats.hrtf != 0, Ordering::Relaxed);
+                    status
+                        .callback_underfeed_samples
+                        .store(stats.callback_underfeed_samples, Ordering::Relaxed);
+                    status
+                        .callback_dropped_samples
+                        .store(stats.callback_dropped_samples, Ordering::Relaxed);
+                    status
+                        .transport
+                        .store(u64::from(stats.transport), Ordering::Relaxed);
+                    status
+                        .hrtf_status
+                        .store(u64::from(stats.hrtf_status), Ordering::Relaxed);
+                    status
+                        .queue_starves
+                        .store(u64::from(stats.queue_starves), Ordering::Relaxed);
+                    status
+                        .restarts
+                        .store(u64::from(stats.restarts), Ordering::Relaxed);
+                    status
+                        .multi_processed
+                        .store(u64::from(stats.multi_processed), Ordering::Relaxed);
+                    status
+                        .buffer_reuse
+                        .store(u64::from(stats.buffer_reuse), Ordering::Relaxed);
+                    status
+                        .input_edge_bits
+                        .store(stats.input_edge_max.to_bits() as usize, Ordering::Relaxed);
+                    status
+                        .output_edge_bits
+                        .store(stats.output_edge_max.to_bits() as usize, Ordering::Relaxed);
                     Ok(output)
                 },
             )
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_silent() -> Self {
+        Self::spawn(|| {
+            let mut previous = [0.0; BLOCK_FRAMES * 2];
+            Ok(move |job: InputBlock| {
+                let mut output = [0.0; BLOCK_FRAMES * 2];
+                for voice in &job.frame.voices {
+                    if voice.active != 0 {
+                        for i in 0..BLOCK_FRAMES {
+                            output[i * 2] += voice.pcm[i];
+                            output[i * 2 + 1] += voice.pcm[i];
+                        }
+                    }
+                }
+                Ok(std::mem::replace(&mut previous, output))
+            })
+        })
+        .unwrap()
+    }
+
+    #[cfg(test)]
     fn spawn<F, P>(setup: F) -> Result<Self, String>
     where
         F: FnOnce() -> Result<P, String> + Send + 'static,
+        P: FnMut(InputBlock) -> Result<[f32; BLOCK_FRAMES * 2], String> + 'static,
+    {
+        Self::spawn_with_status(move |_| setup())
+    }
+
+    fn spawn_with_status<F, P>(setup: F) -> Result<Self, String>
+    where
+        F: FnOnce(Arc<WorkerStatus>) -> Result<P, String> + Send + 'static,
         P: FnMut(InputBlock) -> Result<[f32; BLOCK_FRAMES * 2], String> + 'static,
     {
         let (input, mut requests) = ring::<InputBlock>();
@@ -206,10 +270,11 @@ impl EalWorker {
         let (ready, initialized) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("eal-effects".into())
+            .stack_size(4 * 1024 * 1024)
             .spawn(move || {
                 // P may contain !Send OpenAL handles; it is constructed here and
                 // never crosses a thread boundary, including during cleanup.
-                let mut process = match setup() {
+                let mut process = match setup(Arc::clone(&worker_status)) {
                     Ok(process) => process,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -270,25 +335,66 @@ impl EalWorker {
         }
     }
 
-    pub fn process(
+    pub fn process_scene(
         &mut self,
-        samples: [f32; BLOCK_FRAMES],
-        environment: i32,
+        frame: SceneFrame,
         enabled: bool,
         output: &mut [f32; BLOCK_FRAMES * 2],
         offline: bool,
     ) -> bool {
+        self.exchange(
+            InputBlock {
+                sequence: 0,
+                #[cfg(test)]
+                samples: [0.0; BLOCK_FRAMES],
+                enabled,
+                frame,
+            },
+            output,
+            offline,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn process(
+        &mut self,
+        samples: [f32; BLOCK_FRAMES],
+        _environment: i32,
+        enabled: bool,
+        output: &mut [f32; BLOCK_FRAMES * 2],
+        offline: bool,
+    ) -> bool {
+        let mut frame = SceneFrame::silent();
+        frame.voices[0].active = 1;
+        frame.voices[0].id = 1;
+        frame.voices[0].position = [100.0, 0.0, 0.0];
+        frame.voices[0].pcm = samples;
+        self.exchange(
+            InputBlock {
+                sequence: 0,
+                samples,
+                enabled,
+                frame,
+            },
+            output,
+            offline,
+        )
+    }
+
+    fn exchange(
+        &mut self,
+        mut input: InputBlock,
+        output: &mut [f32; BLOCK_FRAMES * 2],
+        offline: bool,
+    ) -> bool {
+        let enabled = input.enabled;
         output.fill(0.0);
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         self.receive(sequence);
         if self.status.running.load(Ordering::Acquire) {
-            if !self.input.push(InputBlock {
-                sequence,
-                environment,
-                enabled,
-                samples,
-            }) {
+            input.sequence = sequence;
+            if !self.input.push(input) {
                 self.status.overflows.fetch_add(1, Ordering::Relaxed);
             } else {
                 // Wake without waiting for the worker; no timer-resolution

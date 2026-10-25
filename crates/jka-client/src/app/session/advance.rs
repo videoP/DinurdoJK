@@ -20,7 +20,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadows_enabled: bool,
+        blob_shadow_opacity: f32,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         if self.phase != SessionPhase::Playing {
             return Err("DEMO PLAYBACK ADVANCED BEFORE MAP LOAD".to_owned());
@@ -40,7 +40,7 @@ impl GameSession {
             event_workers_enabled,
             ghoul2_view,
             rt_rigid_casters_enabled,
-            blob_shadows_enabled,
+            blob_shadow_opacity,
             false,
             None,
             None,
@@ -58,7 +58,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadows_enabled: bool,
+        blob_shadow_opacity: f32,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.advance_to_with_prediction(
             target_server_time,
@@ -70,7 +70,7 @@ impl GameSession {
             event_workers_enabled,
             ghoul2_view,
             rt_rigid_casters_enabled,
-            blob_shadows_enabled,
+            blob_shadow_opacity,
             false,
             None,
             Some(PlayerPresentationInput::Local(view_angles)),
@@ -90,7 +90,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadows_enabled: bool,
+        blob_shadow_opacity: f32,
         no_predict: bool,
         predict: Option<
             &mut dyn FnMut(
@@ -106,7 +106,7 @@ impl GameSession {
         self.player_presenter
             .set_rt_shadow_casters_enabled(rt_rigid_casters_enabled);
         self.player_presenter
-            .begin_blob_shadow_frame(blob_shadows_enabled);
+            .begin_blob_shadow_frame(blob_shadow_opacity);
         self.client_perf.ghoul2_skinning_mode = self.player_presenter.skinning_mode();
         let snapshot_started = Instant::now();
         let current_time = self
@@ -304,6 +304,9 @@ impl GameSession {
             ghoul2_view
         };
         self.entity_presenter.update_md3_lod_view(ghoul2_view);
+        self.entity_presenter.update_entity_area_mask(
+            self.current_snapshot.as_ref().map(|snapshot| snapshot.area_mask),
+        );
         let audio_started = Instant::now();
         if !self.suppress_audio {
             if let Some(sound) = &mut self.sound_presenter {
@@ -328,6 +331,11 @@ impl GameSession {
                     &self.presented_entities,
                     followed_entity.as_ref(),
                 );
+                // TaystJK CG_Init invokes CG_StartMusic(qfalse) from the
+                // initial CS_MUSIC gamestate. Live sessions previously never
+                // called our update_announcer, so only a later `cs 2` update
+                // could start music. This also restores normal announcer ticks.
+                sound.update_announcer(&self.client_game, &self.siege_classes, target_server_time);
             }
         }
         self.client_perf.audio_ms += audio_started.elapsed().as_secs_f64() * 1000.0;
@@ -506,7 +514,7 @@ impl GameSession {
         // surface. Explicit identity also covers first/third-person prediction.
         let actors = Arc::make_mut(&mut self.ocean_actors);
         actors.clear();
-        if self.ocean_interaction_enabled || self.water_wake_mode != 0 {
+        if self.ocean_interaction_enabled || self.lake_wakes_enabled || self.water_wake_mode != 0 {
         if sample.policy.pm_type < 2 && self.presented_player_state.as_ref()
             .is_none_or(|ps| ps.field_i32("m_iVehicleNum").unwrap_or(0) == 0) {
             actors.push(crate::ocean::interaction::ActorSample {
@@ -619,6 +627,22 @@ impl GameSession {
                 .spawn_physics_glass(&new_glass, target_server_time);
             self.weapon_fx.resolve_glass_promotion(promoted);
         }
+        let local_hull_height = self.presented_player_state().map_or(40.0, |ps| {
+            let crouched = ps.field_i32("pm_flags").unwrap_or(0)
+                & (jka_movement::PMF_DUCKED | jka_movement::PMF_ROLLING) != 0;
+            if crouched {
+                ps.field_i32("crouchheight").filter(|height| *height > 0).unwrap_or(16) as f32
+            } else {
+                ps.field_i32("standheight").filter(|height| *height > 0).unwrap_or(40) as f32
+            }
+        });
+        self.player_presenter.prepare_corpse_player_contacts(
+            &self.presented_entities,
+            followed_entity.as_ref(),
+            local_hull_height,
+            sample.policy.pm_type < 2,
+            target_server_time,
+        );
         self.player_presenter
             .begin_physics_frame(target_server_time);
 
@@ -652,6 +676,17 @@ impl GameSession {
         }
         self.player_presenter
             .set_external_live_entities(self.race_ghosts.iter().map(|ghost| ghost.entity_num));
+        // TaystJK CG_BreathPuffs queries S_GetVoiceVolume each frame, and
+        // switches 3-second breathing to 300 ms during a spoken voice line.
+        // Only the small set of players (plus a synthesized local player) is
+        // sampled, and absent audio backends report no active voice.
+        let talking = self.sound_presenter.as_ref().map(|sound| {
+            self.presented_entities.iter().map(|e| e.number)
+                .chain(followed_entity_num)
+                .filter(|&id| sound.voice_active(id))
+                .collect::<std::collections::HashSet<_>>()
+        }).unwrap_or_default();
+        self.player_presenter.set_breath_talking(talking);
         let player_present_started = Instant::now();
         dynamic_models.extend(
             self.player_presenter.present_snapshot_players(
@@ -938,6 +973,10 @@ impl GameSession {
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
         self.weapon_fx.set_fx_light_promotion_level(self.promote_fx_lights);
         let mut fx_frame = self.weapon_fx.end_frame();
+        // A Decal{} with ghoul2decals may also mark an animated character.
+        // This is a model-space projection, not an extra billboard in the FX pass.
+        self.player_presenter.add_authored_ghoul2_decals(&fx_frame.ghoul2_decals, target_server_time);
+
         let (emote_draws, emote_lights) = self.player_presenter.drain_emote_fx();
         fx_frame.draws.extend(emote_draws);
         fx_frame.lights.extend(emote_lights);
@@ -992,6 +1031,7 @@ impl GameSession {
         }
         self.gpu_commands = fx_frame.gpu_sparks.take();
         self.gpu_draw_indices = std::mem::take(&mut fx_frame.gpu_sprite_draw_indices);
+        self.fx_runner_draws = fx_frame.runner_draws;
         self.fx_draws = fx_frame.draws;
         self.fx_blades = Arc::new(
             fx_frame

@@ -33,11 +33,14 @@ mod asset_jobs;
 mod audio;
 mod emotes;
 mod eal;
+mod eal_native;
+#[cfg(test)]
 mod eal_openal;
 mod eal_worker;
 mod camera;
 mod cgame;
 mod global_cosmetics;
+mod profile_wire;
 mod chat_log;
 mod clipboard;
 mod cloud_noise;
@@ -54,6 +57,7 @@ mod console;
 mod crash;
 mod credential_store;
 mod download;
+mod updater;
 mod entity_graph;
 mod extensions;
 mod fx;
@@ -67,8 +71,10 @@ mod logging;
 mod local_server;
 mod map_jobs;
 mod materials;
+mod media_mp4;
 mod model_frame_log;
 mod net;
+mod neon_menu;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;
@@ -292,8 +298,19 @@ fn is_screenshot_path(path: &std::path::Path) -> bool {
 
 fn main() -> std::process::ExitCode {
     crate::startup_timeline::start();
+    if let Some(code) = updater::helper_entry() {
+        return std::process::ExitCode::from(code as u8);
+    }
+    // Other private helpers (notably the gamma guardian) must be routed
+    // BEFORE checking pending updates, or those child processes would attempt
+    // to launch the game updater too.
     if let Some(code) = display_gamma::helper_entry() {
         return std::process::ExitCode::from(code as u8);
+    }
+    match updater::apply_pending_on_launch() {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {},
+        Err(e) => std::eprintln!("Pending update could not start: {e}"),
     }
 
     crate::startup_console::prepare_own_console();

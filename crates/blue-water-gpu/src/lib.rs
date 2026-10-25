@@ -17,6 +17,7 @@ pub mod shader_composer;
 pub mod original_surface;
 pub mod submerged_mesh;
 pub mod scene_copy;
+pub mod lake_ripples;
 pub mod reflection_tiles;
 pub mod map_environment;
 pub mod underwater;

@@ -1222,4 +1222,148 @@ app_cvars! {
             }
         ]
     }
+    APP_CG_HUDSTRAFEGUIDE {
+        runtime: CvarDef::new("cg_hudStrafeGuide", "tl 0 0 1", "anchor x y scale", "STRAFE GUIDE layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::StrafeGuide).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::StrafeGuide) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::StrafeGuide) = layout; }
+            }),
+            archive: Some((800, |state| state.presentation.hud_layout.element(HudElementId::StrafeGuide).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDACCELMETER {
+        runtime: CvarDef::new("cg_hudAccelMeter", "tl 0 0 1", "anchor x y scale", "ACCELERATION METER layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::AccelMeter).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::AccelMeter) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::AccelMeter) = layout; }
+            }),
+            archive: Some((801, |state| state.presentation.hud_layout.element(HudElementId::AccelMeter).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDVELOCITYCOMPASS {
+        runtime: CvarDef::new("cg_hudVelocityCompass", "tl 0 0 1", "anchor x y scale", "VELOCITY COMPASS layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::VelocityCompass).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::VelocityCompass) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::VelocityCompass) = layout; }
+            }),
+            archive: Some((802, |state| state.presentation.hud_layout.element(HudElementId::VelocityCompass).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDGROUNDSPEED {
+        runtime: CvarDef::new("cg_hudGroundSpeed", "tl 0 0 1", "anchor x y scale", "PRE-SPEED layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::GroundSpeed).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::GroundSpeed) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::GroundSpeed) = layout; }
+            }),
+            archive: Some((803, |state| state.presentation.hud_layout.element(HudElementId::GroundSpeed).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDJUMPHEIGHT {
+        runtime: CvarDef::new("cg_hudJumpHeight", "tl 0 0 1", "anchor x y scale", "JUMP HEIGHT layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::JumpHeight).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::JumpHeight) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::JumpHeight) = layout; }
+            }),
+            archive: Some((804, |state| state.presentation.hud_layout.element(HudElementId::JumpHeight).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDJUMPDISTANCE {
+        runtime: CvarDef::new("cg_hudJumpDistance", "tl 0 0 1", "anchor x y scale", "JUMP DISTANCE layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::JumpDistance).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::JumpDistance) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::JumpDistance) = layout; }
+            }),
+            archive: Some((805, |state| state.presentation.hud_layout.element(HudElementId::JumpDistance).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDVERTICALSPEED {
+        runtime: CvarDef::new("cg_hudVerticalSpeed", "tl 0 0 1", "anchor x y scale", "VERTICAL SPEED layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::VerticalSpeed).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::VerticalSpeed) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::VerticalSpeed) = layout; }
+            }),
+            archive: Some((806, |state| state.presentation.hud_layout.element(HudElementId::VerticalSpeed).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDYAWSPEED {
+        runtime: CvarDef::new("cg_hudYawSpeed", "tl 0 0 1", "anchor x y scale", "YAW SPEED layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::YawSpeed).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::YawSpeed) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::YawSpeed) = layout; }
+            }),
+            archive: Some((807, |state| state.presentation.hud_layout.element(HudElementId::YawSpeed).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
 }

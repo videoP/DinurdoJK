@@ -94,6 +94,57 @@ fn hdr_display_shader_validates() {
     .unwrap();
 }
 
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn studio_alpha_hdr_capture_preserves_emission_and_translucent_edges() {
+    fn decode(c:u8) -> f32 {
+        let c=c as f32/255.0;
+        if c<=0.04045 {c/12.92}else{((c+0.055)/1.055).powf(2.4)}
+    }
+    crate::renderer::block_on(async {
+        let instance=wgpu::Instance::new(wgpu::InstanceDescriptor {backends:wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()});
+        let adapter=instance.request_adapter(&Default::default()).await.unwrap();
+        let (device,queue)=adapter.request_device(&Default::default()).await.unwrap();
+        let selection=select(&capabilities(true),1,None).unwrap();
+        let mut output=HdrOutput::new(&device,selection,1,1,1);
+        let surface=target(&device,1,1,selection.format);
+        let surface_view=surface.create_view(&Default::default());
+        for display_rolloff in [0.0f32,1.0] {
+            output.write_settings(&queue,200.0,1000.0,display_rolloff);
+            // SDR file capture has its own fixed tone-map settings, independent
+            // of the monitor's HDR rolloff preference.
+            let strength=1.0f32;
+            for input in [[0.0,0.0,0.0,0.0],[0.05,0.0,0.0,0.0],[0.1,0.0,0.2,0.0],
+                [0.05,0.125,0.225,0.25],[0.02,0.02,0.02,1.0],[4.0,4.0,4.0,0.0]] {
+                let mut encoder=device.create_command_encoder(&Default::default());
+                {
+                    let _pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:None,
+                        color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:&output.view,depth_slice:None,resolve_target:None,
+                            ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color {r:input[0] as f64,g:input[1] as f64,b:input[2] as f64,a:input[3] as f64}),store:wgpu::StoreOp::Store}})],
+                        depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None,multiview_mask:None});
+                }
+                queue.submit([encoder.finish()]);
+                output.submit_with_alpha(&device,&queue,&surface_view,true,true);
+                let pixel=read(&device,&queue,&output.capture,4); // BGRA, straight sRGB.
+                let alpha=pixel[3] as f32/255.0;
+                assert!(alpha+0.001>=input[3]);
+                let reference=if input[3]>0.00001 {input[3]}else{1.0};
+                for channel in 0..3 {
+                    let linear=input[channel]/reference;
+                    let mapped=(linear*(2.51*linear+0.03)/(linear*(2.43*linear+0.59)+0.14)).clamp(0.0,1.0);
+                    let expected=((linear*(1.0-strength)+mapped*strength)*reference).clamp(0.0,1.0);
+                    let actual=decode(pixel[2-channel])*alpha;
+                    assert!((actual-expected).abs()<0.008,"input={input:?}, output={pixel:?}, strength={strength}");
+                }
+                if input==[0.0;4] {assert_eq!(pixel,vec![0,0,0,0]);}
+                if input[0]==0.05 && input[3]==0.0 {assert!(pixel[3]>0 && pixel[3]<20);}
+                if input[3]==1.0 {assert_eq!(pixel[3],255);}
+            }
+        }
+    });
+}
+
 fn read(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

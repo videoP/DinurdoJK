@@ -11,7 +11,7 @@ use std::{
     hash::{Hash, Hasher},
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
@@ -44,6 +44,29 @@ pub(crate) fn hash_config<T: Hash>(value: &T) -> u64 {
 /// Live diagnostic toggle; the fast path is one relaxed load per pipeline/job,
 /// not per rendered frame. Kept independent of `r_verbose` to avoid flooding.
 static PIPELINE_TRACE: AtomicBool = AtomicBool::new(false);
+
+/// Pipeline-building jobs running right now (job workers plus load-time
+/// parallel compiles), so a slow native compile can report its competition.
+static ACTIVE_COMPILES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct ActiveCompileGuard;
+
+impl ActiveCompileGuard {
+    pub(crate) fn begin() -> Self {
+        ACTIVE_COMPILES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ActiveCompileGuard {
+    fn drop(&mut self) {
+        ACTIVE_COMPILES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn active_compiles() -> usize {
+    ACTIVE_COMPILES.load(Ordering::Relaxed)
+}
 
 pub(crate) fn pipeline_trace_enabled() -> bool {
     PIPELINE_TRACE.load(Ordering::Relaxed)
@@ -256,8 +279,10 @@ impl PipelineJobManager {
                                 key.family, key.slot, key.config, thread::current().name());
                         }
                         let started = Instant::now();
+                        let active = ActiveCompileGuard::begin();
                         let result =
                             panic::catch_unwind(AssertUnwindSafe(build)).map_err(panic_message);
+                        drop(active);
                         if traced || pipeline_trace_enabled() {
                             println!("[pipeline job END] id={id} family={} slot={} hash={:016x} label={label} elapsed={:.1}ms result={}",
                                 key.family, key.slot, key.config, started.elapsed().as_secs_f64() * 1000.0,
@@ -494,13 +519,25 @@ impl PipelineJobManager {
 impl Drop for PipelineJobManager {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
+        // Cancel in-flight jobs too, not only queued ones. A world variant
+        // checks this token between native PSOs; without it a vid_restart's
+        // retiring renderer kept compiling the whole variant (tens of seconds
+        // per hardware-RT PSO), past the 8 s abandon timeout, while the new
+        // renderer compiled the same variant again beside it.
+        for state in self.states.values() {
+            if let JobState::Compiling { cancelled, .. } = state {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
         for _ in 0..self.workers.len() {
             let _ = self.work_tx.send(WorkMessage::Shutdown);
         }
         let _ = self.world_work_tx.send(WorkMessage::Shutdown);
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        // Detach rather than join: a worker inside a native compile cannot be
+        // interrupted, and waiting for it made renderer teardown exceed the
+        // vid_restart abandon timeout. Each worker owns its device handles and
+        // exits after its current pipeline.
+        self.workers.clear();
     }
 }
 

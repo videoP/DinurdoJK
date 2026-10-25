@@ -130,7 +130,7 @@ impl Renderer {
             && self.ray_tracing_supported
             && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
             && !self.asset_preview_mode
-            && self.active_light_count() > 0
+            && self.active_transient_light_count() > 0
             && self
                 .world
                 .as_ref()
@@ -423,6 +423,7 @@ fn shader_source() -> Result<String, String> {
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
         "rt_trace_shadow_query",
+        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_visibility",
         "rt_trace_local_visibility",
         "ray_traced_local_shadow_visibility",

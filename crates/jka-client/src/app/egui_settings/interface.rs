@@ -8,7 +8,7 @@ impl App {
         theme::page_title(
             ui,
             "INTERFACE / HUD",
-            "HUD presentation. This is the home for crosshair, movement helpers and the future drag/snap HUD editor.",
+            "Choose one style per movement component. Position and scale enabled components with HUD Edit.",
         );
 
         egui::ScrollArea::vertical()
@@ -19,7 +19,7 @@ impl App {
                 theme::row(
                     ui,
                     "HUD layout",
-                    "Open HUD Edit Mode. Drag Health, Shield, Ammo and Force directly over the game; positions/scales are cached as typed runtime data and archived through cg_hud* cvars.",
+                    "Open HUD Edit Mode. Only enabled components appear; drag each one and use its scale control. Layouts are saved independently.",
                     theme::Reset::None,
                     |ui| {
                         let response = ui.add_enabled(!self.front_end, egui::Button::new("EDIT HUD"));
@@ -38,7 +38,167 @@ impl App {
                         }
                     },
                 );
-                self.egui_japro_hud_settings(ui);
+
+                theme::section(
+                    ui,
+                    "MOVEMENT COMPONENTS",
+                    "Choose one style for each component. Off hides it in both gameplay and HUD Edit Mode.",
+                );
+                use crate::ui::{HudElementId, movement_components as components};
+                self.movement_component_dropdown(ui, "Strafehelper", HudElementId::StrafeGuide, components::GUIDE_CHOICES);
+                self.movement_component_dropdown(ui, "Speedometer", HudElementId::Speedometer, components::READOUT_CHOICES);
+                self.movement_component_dropdown(ui, "Accel meter", HudElementId::AccelMeter, components::READOUT_CHOICES);
+                self.movement_component_dropdown(ui, "Velocity compass", HudElementId::VelocityCompass, components::COMPASS_CHOICES);
+                let style = match components::selected(HudElementId::StrafeGuide, self.strafe_helper.flags, self.japro_cg.speedometer.flags) {
+                    crate::ui::SHELPER_ORIGINAL => 1, crate::ui::SHELPER_UPDATED => 2,
+                    crate::ui::SHELPER_CGAZ => 3, crate::ui::SHELPER_CINEMATIC => 4,
+                    crate::ui::SHELPER_XONOTIC => 5, crate::ui::SHELPER_Q3DF => 6,
+                    crate::ui::SHELPER_WARSOW_HUD => 7, _ => 0,
+                };
+                if style == 4 {
+                    theme::banner(ui, "Cinematic draws in the world. Precision sets its length; HUD Edit moves the 2D components.", theme::WARNING);
+                }
+                if style == 5 {
+                    theme::row(ui, "Center", "Xonotic StrafeHUD: view-centered versus velocity-centered display.", theme::Reset::None, |ui| {
+                        let selected = self.strafe_helper.flags & crate::ui::SHELPER_XONOTIC_VELOCITY != 0;
+                        if theme::chip(ui, "Velocity centered", selected).clicked() {
+                            let _ = self.set_console_cvar("cg_strafeHelper", &(self.strafe_helper.flags ^ crate::ui::SHELPER_XONOTIC_VELOCITY).to_string());
+                        }
+                    });
+                    theme::row(ui, "Projection", "Xonotic source: linear, tangent perspective, or panoramic half-tangent.", theme::Reset::None, |ui| {
+                        let flags = self.strafe_helper.flags;
+                        let current = if flags & crate::ui::SHELPER_XONOTIC_PANORAMIC != 0 { 2 }
+                            else if flags & crate::ui::SHELPER_XONOTIC_PERSPECTIVE != 0 { 1 } else { 0 };
+                        for (choice, label) in [(0, "Linear"), (1, "Perspective"), (2, "Panoramic")] {
+                            if theme::chip(ui, label, current == choice).clicked() && current != choice {
+                                let bit = match choice { 1 => crate::ui::SHELPER_XONOTIC_PERSPECTIVE,
+                                    2 => crate::ui::SHELPER_XONOTIC_PANORAMIC, _ => 0 };
+                                let updated = (flags & !(crate::ui::SHELPER_XONOTIC_PERSPECTIVE | crate::ui::SHELPER_XONOTIC_PANORAMIC)) | bit;
+                                let _ = self.set_console_cvar("cg_strafeHelper", &updated.to_string());
+                            }
+                            ui.add_space(3.0);
+                        }
+                    });
+                }
+                if (1..=4).contains(&style) {
+                    theme::row(ui, "Directions", "Direction bits inside cg_strafeHelper. Defaults match TaystJK: WA, WD, A, D and Center.", theme::Reset::None, |ui| {
+                        let mut flags = self.strafe_helper.flags;
+                        for (bit, label) in [
+                            (crate::ui::SHELPER_W, "W"),
+                            (crate::ui::SHELPER_WA, "WA"),
+                            (crate::ui::SHELPER_WD, "WD"),
+                            (crate::ui::SHELPER_A, "A"),
+                            (crate::ui::SHELPER_D, "D"),
+                            (crate::ui::SHELPER_CENTER, "Center"),
+                        ] {
+                            let enabled = flags & bit != 0;
+                            if theme::chip(ui, label, enabled).clicked() { flags ^= bit; }
+                            ui.add_space(3.0);
+                        }
+                        if flags != self.strafe_helper.flags {
+                            let _ = self.set_console_cvar("cg_strafeHelper", &flags.to_string());
+                        }
+                    });
+                    theme::row(ui, "Offset", "cg_strafeHelperOffset. TaystJK stores hundredths of a degree; default 75 = 0.75 degrees.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.offset;
+                        let readout = format!("{:.2}°", value * 0.01);
+                        if theme::slider(ui, &mut value, -500.0..=500.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelperOffset", &value.to_string());
+                        }
+                    });
+                    theme::row(ui, "Line width", "cg_strafeHelperLineWidth.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.line_width;
+                        let readout = format!("{value:.2}");
+                        if theme::slider(ui, &mut value, 0.25..=5.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelperLineWidth", &value.to_string());
+                        }
+                    });
+                    theme::row(ui, "Precision", "cg_strafeHelperPrecision. TaystJK uses this as the world-space distance before projecting a guide. Cinematic keeps that distance directly as its 3D line length.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.precision as f32;
+                        let readout = format!("{value:.0}");
+                        if theme::slider(ui, &mut value, 100.0..=10000.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelperPrecision", &(value.round() as u32).to_string());
+                        }
+                    });
+                    theme::row(ui, "Cutoff", "cg_strafeHelperCutoff. Controls 2D style clipping; Cinematic uses Precision for its 3D length.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.cutoff;
+                        let readout = format!("{value:.0}");
+                        if theme::slider(ui, &mut value, 0.0..=480.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelperCutoff", &value.to_string());
+                        }
+                    });
+                    theme::row(ui, "Inactive alpha", "cg_strafeHelperInactiveAlpha.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.inactive_alpha as f32;
+                        let readout = format!("{value:.0}");
+                        if theme::slider(ui, &mut value, 0.0..=255.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelperInactiveAlpha", &(value.round() as u8).to_string());
+                        }
+                    });
+                    theme::row(ui, "Active color", "cg_strafeHelperActiveColor.", theme::Reset::None, |ui| {
+                        let mut rgb = [
+                            f32::from(self.strafe_helper.active_color[0]) / 255.0,
+                            f32::from(self.strafe_helper.active_color[1]) / 255.0,
+                            f32::from(self.strafe_helper.active_color[2]) / 255.0,
+                        ];
+                        if ui.color_edit_button_rgb(&mut rgb).changed() {
+                            let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                            let a = self.strafe_helper.active_color[3];
+                            let value = format!("{} {} {} {}", to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a);
+                            let _ = self.set_console_cvar("cg_strafeHelperActiveColor", &value);
+                        }
+                    });
+                }
+                if style != 0 {
+                    theme::row(ui, "Physics FPS", "cg_strafeHelper_FPS. Auto uses movement command cadence/server fixed Pmove for the strafe bars. TaystJK styles retain com_maxfps, or 125 when uncapped.", theme::Reset::None, |ui| {
+                        let mut value = self.strafe_helper.fps;
+                        let readout = if value < 1.0 { "Auto".to_owned() } else { format!("{value:.0}") };
+                        if theme::slider(ui, &mut value, 0.0..=1000.0, &readout) {
+                            let _ = self.set_console_cvar("cg_strafeHelper_FPS", &value.to_string());
+                        }
+                    });
+                }
+
+                theme::section(ui, "SPEED & DIRECTION", "One style per component. Off hides it in the game and HUD Edit Mode. Move and scale each enabled component with EDIT HUD.");
+                self.movement_component_dropdown(ui, "Pre-speed", HudElementId::GroundSpeed, components::NATIVE_CHOICES);
+                self.movement_component_dropdown(ui, "Jump-speed history", HudElementId::SpeedometerJumps, components::NATIVE_CHOICES);
+                self.movement_component_dropdown(ui, "Vertical speed", HudElementId::VerticalSpeed, components::NATIVE_CHOICES);
+                self.movement_component_dropdown(ui, "Yaw speed", HudElementId::YawSpeed, components::NATIVE_CHOICES);
+                self.movement_component_dropdown(ui, "Speed graph", HudElementId::SpeedGraph, components::GRAPH_CHOICES);
+                theme::section(ui, "JUMP METRICS", "Independent jump measurements; each has its own HUD Edit position and scale.");
+                self.movement_component_dropdown(ui, "Jump height", HudElementId::JumpHeight, components::NATIVE_CHOICES);
+                self.movement_component_dropdown(ui, "Jump distance", HudElementId::JumpDistance, components::NATIVE_CHOICES);
+                theme::section(ui, "RACE", "The timer and start-speed readout are separate components.");
+                for (label, cvar, enabled) in [("Race timer", "cg_raceTimer", self.japro_cg.race_timer != 0), ("Start speed", "cg_raceStart", self.japro_cg.race_start)] {
+                    theme::row(ui, label, "Choose a readout, then position it in HUD Edit Mode.", theme::Reset::None, |ui| {
+                        let mut choice = u32::from(enabled);
+                        egui::ComboBox::from_id_salt(cvar).selected_text(if enabled {"jaPRO"} else {"Off"}).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut choice, 0, "Off"); ui.selectable_value(&mut choice, 1, "jaPRO");
+                        });
+                        if choice != u32::from(enabled) { let _ = self.set_console_cvar(cvar, &choice.to_string()); }
+                    });
+                }
+
+                theme::section(
+                    ui,
+                    "MOVEMENT KEYS",
+                    "TaystJK-compatible cg_movementKeys overlay controls. Position is handled by HUD Edit Mode.",
+                );
+                const MOVEMENT_KEY_MODES: [(u8, &str); 5] = [
+                    (0, "Off"), (1, "Original"), (2, "+ Attack"), (3, "Compact"), (4, "Movable"),
+                ];
+                theme::row(ui, "Movement keys", "Choose one keyboard overlay style; Off also hides it from HUD Edit Mode.", theme::Reset::None, |ui| {
+                    let mut mode = self.movement_keys_hud.mode;
+                    egui::ComboBox::from_id_salt("movement_keys_component").selected_text(MOVEMENT_KEY_MODES.iter().find(|(value,_)| *value == mode).map(|(_,label)| *label).unwrap_or("Off"))
+                        .show_ui(ui, |ui| { for (value,label) in MOVEMENT_KEY_MODES { ui.selectable_value(&mut mode,value,label); } });
+                    if mode != self.movement_keys_hud.mode { let _ = self.set_console_cvar("cg_movementKeys", &mode.to_string()); }
+                });
+                theme::row(ui, "Walk key", "cg_movementKeysWalk. Include the walk/run state in the overlay.", theme::Reset::None, |ui| {
+                    if let Some(value) = theme::switch(ui, self.movement_keys_hud.walk) {
+                        let _ = self.set_console_cvar("cg_movementKeysWalk", if value { "1" } else { "0" });
+                    }
+                });
+
+                ui.collapsing("Readout formatting & network graph", |ui| self.egui_japro_hud_settings(ui));
 
                 theme::section(
                     ui,
@@ -193,127 +353,6 @@ impl App {
                         }
                     },
                 );
-
-                theme::section(
-                    ui,
-                    "MOVEMENT KEYS",
-                    "TaystJK-compatible cg_movementKeys overlay controls. Position is handled by HUD Edit Mode.",
-                );
-                const MOVEMENT_KEY_MODES: [(u8, &str); 5] = [
-                    (0, "Off"), (1, "Original"), (2, "+ Attack"), (3, "Compact"), (4, "Movable"),
-                ];
-                if let Some(mode) = segmented_row(
-                    ui, "Mode", "cg_movementKeys. Uses TaystJK's 0..4 display modes.",
-                    theme::Reset::None, self.movement_keys_hud.mode, &MOVEMENT_KEY_MODES,
-                ) {
-                    let _ = self.set_console_cvar("cg_movementKeys", &mode.to_string());
-                }
-                theme::row(ui, "Walk key", "cg_movementKeysWalk. Include the walk/run state in the overlay.", theme::Reset::None, |ui| {
-                    if let Some(value) = theme::switch(ui, self.movement_keys_hud.walk) {
-                        let _ = self.set_console_cvar("cg_movementKeysWalk", if value { "1" } else { "0" });
-                    }
-                });
-
-                theme::section(
-                    ui,
-                    "STRAFEHELPER",
-                    "TaystJK CGAZ/Strafehelper controls. Direction bits remain available through cg_strafeHelper.",
-                );
-                const STRAFE_STYLES: [(u8, &str); 5] = [
-                    (0, "Off"), (1, "Original"), (2, "Updated"), (3, "CGAZ"), (4, "Cinematic"),
-                ];
-                let style = if self.strafe_helper.flags & crate::ui::SHELPER_CINEMATIC != 0 { 4 }
-                    else if self.strafe_helper.flags & crate::ui::SHELPER_CGAZ != 0 { 3 }
-                    else if self.strafe_helper.flags & crate::ui::SHELPER_UPDATED != 0 { 2 }
-                    else if self.strafe_helper.flags & crate::ui::SHELPER_ORIGINAL != 0 { 1 }
-                    else { 0 };
-                if let Some(selected) = segmented_row(
-                    ui, "Style", "Visual style inside cg_strafeHelper. Cinematic keeps TaystJK strafe math but presents it as depth-tested glowing lines in 3D world space.",
-                    theme::Reset::None, style, &STRAFE_STYLES,
-                ) {
-                    let style_bit = match selected {
-                        1 => crate::ui::SHELPER_ORIGINAL,
-                        2 => crate::ui::SHELPER_UPDATED,
-                        3 => crate::ui::SHELPER_CGAZ,
-                        4 => crate::ui::SHELPER_CINEMATIC,
-                        _ => 0,
-                    };
-                    let flags = (self.strafe_helper.flags & !crate::ui::SHELPER_STYLE_MASK) | style_bit;
-                    let _ = self.set_console_cvar("cg_strafeHelper", &flags.to_string());
-                }
-                theme::row(ui, "Directions", "Direction bits inside cg_strafeHelper. Defaults match TaystJK: WA, WD, A, D and Center.", theme::Reset::None, |ui| {
-                    let mut flags = self.strafe_helper.flags;
-                    for (bit, label) in [
-                        (crate::ui::SHELPER_W, "W"),
-                        (crate::ui::SHELPER_WA, "WA"),
-                        (crate::ui::SHELPER_WD, "WD"),
-                        (crate::ui::SHELPER_A, "A"),
-                        (crate::ui::SHELPER_D, "D"),
-                        (crate::ui::SHELPER_CENTER, "Center"),
-                    ] {
-                        let enabled = flags & bit != 0;
-                        if theme::chip(ui, label, enabled).clicked() { flags ^= bit; }
-                        ui.add_space(3.0);
-                    }
-                    if flags != self.strafe_helper.flags {
-                        let _ = self.set_console_cvar("cg_strafeHelper", &flags.to_string());
-                    }
-                });
-                theme::row(ui, "Offset", "cg_strafeHelperOffset. TaystJK stores hundredths of a degree; default 75 = 0.75 degrees.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.offset;
-                    let readout = format!("{:.2}°", value * 0.01);
-                    if theme::slider(ui, &mut value, -500.0..=500.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelperOffset", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Line width", "cg_strafeHelperLineWidth.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.line_width;
-                    let readout = format!("{value:.2}");
-                    if theme::slider(ui, &mut value, 0.25..=5.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelperLineWidth", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Precision", "cg_strafeHelperPrecision. TaystJK uses this as the world-space distance before projecting a guide. Cinematic keeps that distance directly as its 3D line length.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.precision as f32;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, 100.0..=10000.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelperPrecision", &(value.round() as u32).to_string());
-                    }
-                });
-                theme::row(ui, "Physics FPS", "cg_strafeHelper_FPS. Zero follows com_maxfps like TaystJK; uncapped falls back to 125.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.fps;
-                    let readout = if value < 1.0 { "Auto (125)".to_owned() } else { format!("{value:.0}") };
-                    if theme::slider(ui, &mut value, 0.0..=1000.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelper_FPS", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Cutoff", "cg_strafeHelperCutoff. Controls 2D style clipping; Cinematic uses Precision for its 3D length.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.cutoff;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, 0.0..=480.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelperCutoff", &value.to_string());
-                    }
-                });
-                theme::row(ui, "Inactive alpha", "cg_strafeHelperInactiveAlpha.", theme::Reset::None, |ui| {
-                    let mut value = self.strafe_helper.inactive_alpha as f32;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, 0.0..=255.0, &readout) {
-                        let _ = self.set_console_cvar("cg_strafeHelperInactiveAlpha", &(value.round() as u8).to_string());
-                    }
-                });
-                theme::row(ui, "Active color", "cg_strafeHelperActiveColor.", theme::Reset::None, |ui| {
-                    let mut rgb = [
-                        f32::from(self.strafe_helper.active_color[0]) / 255.0,
-                        f32::from(self.strafe_helper.active_color[1]) / 255.0,
-                        f32::from(self.strafe_helper.active_color[2]) / 255.0,
-                    ];
-                    if ui.color_edit_button_rgb(&mut rgb).changed() {
-                        let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-                        let a = self.strafe_helper.active_color[3];
-                        let value = format!("{} {} {} {}", to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a);
-                        let _ = self.set_console_cvar("cg_strafeHelperActiveColor", &value);
-                    }
-                });
 
                 theme::section(ui, "CHAT", "The say / say_team input line.");
                 theme::row(
@@ -588,6 +627,26 @@ impl App {
         }
         if next_image != image {
             let _ = self.set_console_cvar("cg_crosshairImage", &next_image.to_string());
+        }
+    }
+}
+
+impl App {
+    fn movement_component_dropdown(&mut self, ui: &mut egui::Ui, label: &str, id: crate::ui::HudElementId, choices: &[(u32,&str)]) {
+        use crate::ui::movement_components as components;
+        let current = components::selected(id, self.strafe_helper.flags, self.japro_cg.speedometer.flags);
+        let mut choice = current;
+        theme::row(ui, label, "Select one style for this component. Off hides it; HUD Edit Mode moves and scales enabled components.", theme::Reset::None, |ui| {
+            egui::ComboBox::from_id_salt(("movement_component",id))
+                .selected_text(choices.iter().find(|(value,_)| *value == current).map(|(_,label)| *label).unwrap_or("Off"))
+                .show_ui(ui, |ui| { for (value,label) in choices { ui.selectable_value(&mut choice, *value, *label); } });
+        });
+        if choice != current {
+            let (mut helper, mut native) = (self.strafe_helper.flags, self.japro_cg.speedometer.flags);
+            components::select(id, choice, &mut helper, &mut native);
+            // Apply both final masks: neither setter can retain an old provider.
+            let _ = self.set_console_cvar("cg_speedometer", &native.to_string());
+            let _ = self.set_console_cvar("cg_strafeHelper", &helper.to_string());
         }
     }
 }

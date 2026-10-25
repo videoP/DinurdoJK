@@ -19,6 +19,7 @@ pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) 
 unsafe extern "C" {
     pub fn jka_full_body_taunt(torso_anim: i32, legs_anim: i32) -> i32;
     pub fn jka_taunt_should_cancel(torso_anim: i32, legs_anim: i32, buttons: i32, upmove: i32) -> i32;
+    pub fn jka_taunt_action_should_cancel(buttons: i32) -> i32;
     fn jka_lock();
     fn jka_unlock();
     #[cfg(test)]
@@ -221,18 +222,18 @@ impl Drop for NativeGuard {
 thread_local! { static IN_CALLBACK: Cell<bool> = const { Cell::new(false) }; }
 pub(crate) struct Callbacks<'a, W> {
     world: &'a mut W,
-    failed: bool,
+    failure: Option<String>,
 }
 impl<'a, W> Callbacks<'a, W> {
     pub fn new(world: &'a mut W) -> Self {
         Self {
             world,
-            failed: false,
+            failure: None,
         }
     }
     pub fn finish(self) -> Result<(), String> {
-        if self.failed {
-            Err("Collision callback failed".into())
+        if let Some(failure) = self.failure {
+            Err(failure)
         } else {
             Ok(())
         }
@@ -265,6 +266,13 @@ pub(crate) unsafe extern "C" fn trace_callback<W: TraceWorld>(
             mask,
         }
     };
+    // Pmove can keep tracing after an error. Never call collision with NaNs,
+    // and never feed the invalid start back into native movement as a hit.
+    if callbacks.failure.is_some() || !query.is_finite() {
+        callbacks.failure.get_or_insert_with(|| format!("Non-finite collision query: {query:?}"));
+        unsafe { *out = TraceResult::blocked(query.start); }
+        return;
+    }
     IN_CALLBACK.set(true);
     let result = catch_unwind(AssertUnwindSafe(|| callbacks.world.trace(query)));
     IN_CALLBACK.set(false);
@@ -278,13 +286,12 @@ pub(crate) unsafe extern "C" fn trace_callback<W: TraceWorld>(
         {
             trace
         }
-        _ => {
-            callbacks.failed = true;
-            let mut t = TraceResult::clear(query.start);
-            t.all_solid = 1;
-            t.start_solid = 1;
-            t.fraction = 0.0;
-            t
+        other => {
+            callbacks.failure = Some(match other {
+                Ok(trace) => format!("Invalid collision result {trace:?} for query {query:?}"),
+                Err(_) => format!("Collision callback panicked for query {query:?}"),
+            });
+            TraceResult::blocked(query.start)
         }
     };
     unsafe {
@@ -297,18 +304,97 @@ pub(crate) unsafe extern "C" fn contents_callback<W: TraceWorld>(
     pass: i32,
 ) -> i32 {
     let callbacks = unsafe { &mut *context.cast::<Callbacks<'_, W>>() };
+    let point = unsafe { vector(point) };
+    if callbacks.failure.is_some() || !point.iter().all(|v| v.is_finite()) {
+        callbacks.failure.get_or_insert_with(|| format!("Non-finite contents query: point={point:?} pass={pass}"));
+        return 1; // CONTENTS_SOLID
+    }
     IN_CALLBACK.set(true);
     let result = catch_unwind(AssertUnwindSafe(|| {
         callbacks
             .world
-            .point_contents(unsafe { vector(point) }, pass)
+            .point_contents(point, pass)
     }));
     IN_CALLBACK.set(false);
     match result {
         Ok(contents) => contents,
         Err(_) => {
-            callbacks.failed = true;
+            callbacks.failure = Some(format!("Contents callback panicked: point={point:?} pass={pass}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CountingWorld { calls: usize, invalid_result: bool }
+    impl TraceWorld for CountingWorld {
+        fn trace(&mut self, query: TraceQuery) -> TraceResult {
+            self.calls += 1;
+            let mut result = TraceResult::clear(query.end);
+            if self.invalid_result { result.normal[0] = f32::NAN; }
+            result
+        }
+        fn point_contents(&mut self, _: [f32; 3], _: i32) -> i32 {
+            self.calls += 1;
+            0
+        }
+    }
+
+    fn run_trace(callbacks: &mut Callbacks<'_, CountingWorld>, start: [f32; 3]) -> TraceResult {
+        let zero = [0.0; 3];
+        let mut result = TraceResult::clear(zero);
+        unsafe {
+            trace_callback::<CountingWorld>((callbacks as *mut Callbacks<'_, CountingWorld>).cast(),
+                &mut result, start.as_ptr(), zero.as_ptr(), zero.as_ptr(), zero.as_ptr(), 0, 1);
+        }
+        result
+    }
+
+    #[test]
+    fn invalid_queries_are_rejected_before_calling_world_and_latch_first_error() {
+        let mut world = CountingWorld { calls: 0, invalid_result: false };
+        let mut callbacks = Callbacks::new(&mut world);
+        let result = run_trace(&mut callbacks, [f32::NAN; 3]);
+        assert_eq!(result.fraction, 0.0);
+        assert!(result.end.iter().all(|v| v.is_finite()));
+        // Even valid subsequent calls are blocked until Pmove returns.
+        run_trace(&mut callbacks, [0.0; 3]);
+        let zero = [0.0; 3];
+        let contents = unsafe {
+            contents_callback::<CountingWorld>((&mut callbacks as *mut Callbacks<'_, CountingWorld>).cast(), zero.as_ptr(), 0)
+        };
+        assert_eq!(contents, 1);
+        let error = callbacks.finish().unwrap_err();
+        assert!(error.contains("Non-finite collision query"), "{error}");
+        assert!(error.contains("NaN"), "{error}");
+        assert_eq!(world.calls, 0);
+        assert!(!in_callback());
+    }
+
+    #[test]
+    fn invalid_contents_query_is_rejected_before_calling_world() {
+        let mut world = CountingWorld { calls: 0, invalid_result: false };
+        let mut callbacks = Callbacks::new(&mut world);
+        let point = [f32::INFINITY; 3];
+        let contents = unsafe {
+            contents_callback::<CountingWorld>((&mut callbacks as *mut Callbacks<'_, CountingWorld>).cast(), point.as_ptr(), 2)
+        };
+        assert_eq!(contents, 1);
+        assert!(callbacks.finish().unwrap_err().contains("Non-finite contents query"));
+        assert_eq!(world.calls, 0);
+    }
+
+    #[test]
+    fn invalid_callback_result_is_replaced_with_a_finite_blocked_trace() {
+        let mut world = CountingWorld { calls: 0, invalid_result: true };
+        let mut callbacks = Callbacks::new(&mut world);
+        let result = run_trace(&mut callbacks, [1.0, 2.0, 3.0]);
+        assert_eq!(result.end, [1.0, 2.0, 3.0]);
+        assert_eq!(result.fraction, 0.0);
+        assert!(callbacks.finish().unwrap_err().contains("Invalid collision result"));
+        assert_eq!(world.calls, 1);
     }
 }

@@ -803,6 +803,10 @@ impl App {
         ));
     }
 
+    pub(in crate::app) fn sync_baked_local_lights(&self) {
+        self.render_command(RenderCommand::SetBakedLocalLights { enabled: self.video.baked_local_lights, sources: self.video.baked_local_sources });
+    }
+
     pub(in crate::app) fn sync_shader_light_promotion(&self) {
         let mut mask = 0_u32;
         if self.video.promote_shader_glow {
@@ -1062,6 +1066,12 @@ impl App {
                     match self.video.promote_fx_lights { 0 => "OFF", 1 => "CONSERVATIVE", _ => "AGGRESSIVE" }
                 );
             }
+            ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS => { self.video.baked_local_lights = !self.video.baked_local_lights; self.sync_baked_local_lights(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources ^= 1; self.sync_baked_local_lights(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources ^= 2; self.sync_baked_local_lights(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources ^= 4; self.sync_baked_local_lights(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources ^= 8; self.sync_baked_local_lights(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources ^= 16; self.sync_baked_local_lights(); self.mark_config_dirty(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
                 self.video.promote_shader_lights = !self.video.promote_shader_lights;
                 self.sync_shader_light_promotion();
@@ -1214,7 +1224,7 @@ impl App {
                     (current + direction).rem_euclid(DynamicShadowsMode::ALL.len() as i32) as usize;
                 self.video.dynamic_shadows = DynamicShadowsMode::ALL[next];
                 self.video.cascaded_shadows =
-                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                    matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
                 if self.video.dynamic_shadows == DynamicShadowsMode::Blob {
@@ -1223,9 +1233,11 @@ impl App {
                 } else if self.video.dynamic_shadows == DynamicShadowsMode::EntityMap {
                     self.console_status =
                         "DYNAMIC SHADOWS: ENTITY MAP - PLAYERS/NPCS CAST FROM THE BAKED LIGHTGRID DIRECTION".to_string();
+                } else if self.video.dynamic_shadows == DynamicShadowsMode::HybridCsmRtEntities {
+                    self.console_status = "SUN SHADOWS: HYBRID - CSM STATIC CASTERS + RT MOVING CASTERS".to_string();
                 } else if self.video.dynamic_shadows == DynamicShadowsMode::RayTraced {
                     self.console_status =
-                        "DYNAMIC SHADOWS: RAY TRACED SHADOWS - HARDWARE RAY QUERY (STATIC OPAQUE BSP CASTERS)".to_string();
+                        "DYNAMIC SHADOWS: RAY TRACED SHADOWS - HARDWARE RAY QUERY (BSP + MOVING CASTERS)".to_string();
                 }
             }
             ui::VIDEO_ROW_ENTITY_SHADOW_LIGHT => {
@@ -1393,10 +1405,8 @@ impl App {
                 }
             }
             ui::VIDEO_ROW_CULL_DEBUG => {
-                self.video.cull_debug = match self.video.cull_debug {
-                    CullDebugMode::Off => CullDebugMode::RejectionReasons,
-                    CullDebugMode::RejectionReasons => CullDebugMode::Off,
-                };
+                let next=(self.video.cull_debug.index() as i32 + direction).rem_euclid(CullDebugMode::ALL.len() as i32) as usize;
+                self.video.cull_debug = CullDebugMode::ALL[next];
                 self.sync_cull_debug();
             }
             ui::VIDEO_ROW_DRAW_FPS => {
@@ -1429,7 +1439,6 @@ impl App {
             ui::VIDEO_ROW_GPU_TIMINGS => {
                 self.video.gpu_timings = !self.video.gpu_timings;
                 self.render_command(RenderCommand::SetGpuTimings(self.video.gpu_timings));
-                self.mark_config_dirty();
             }
             ui::VIDEO_ROW_FX_GEOMETRY => {
                 let current = FxGeometryMode::ALL
@@ -1748,6 +1757,7 @@ impl App {
 
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
+            session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
             session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
@@ -2007,6 +2017,7 @@ impl App {
             ui::ENV_ROW_OCEAN => {
                 self.video.ocean = !self.video.ocean;
                 if let Some(session) = self.game_session.as_mut() {
+                    session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
                     session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                 }

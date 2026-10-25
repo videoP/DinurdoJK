@@ -52,14 +52,14 @@ impl DemoVideoPreset {
         }
     }
 
-    fn extension(self) -> &'static str {
+    pub(in crate::app) fn extension(self) -> &'static str {
         match self {
             Self::H264High | Self::H264Max => "mp4",
             Self::ProRes422 | Self::ProRes444 => "mov",
         }
     }
 
-    fn ffmpeg_video_args(self) -> &'static [&'static str] {
+    pub(in crate::app) fn ffmpeg_video_args(self) -> &'static [&'static str] {
         match self {
             Self::H264High => &[
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
@@ -441,7 +441,7 @@ impl App {
                 .then_some((export.frame_index, export.depth))
         });
         if let Some((frame_index, depth)) = frame {
-            self.render_command(RenderCommand::CaptureVideoFrame { frame_index, depth });
+            self.render_command(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha: false });
             if let Some(export) = self.demo_video_export.as_mut() {
                 export.capture_queued = true;
             }

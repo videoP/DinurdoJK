@@ -67,6 +67,7 @@ fn tiled_bank() -> (Atlas, PromotedOcean) {
         heuristic: super::super::appearance::wave_heuristic(0.0, None),
         color: [0.1, 0.2, 0.3],
         roughness: None,
+        source_deformation: None, source_alpha: None,
         swell_direction: None,
     };
     ocean.surface.plane_height = 0.0;
@@ -430,6 +431,7 @@ fn coastal_large_pool_runtime_maps() {
                             heuristic: appearance.heuristic,
                             color: [0.1; 3],
                             roughness: None,
+                            source_deformation: None, source_alpha: None,
                             swell_direction: None,
                         };
                         let baked = atlas.grids.iter().filter(|g| g.slot == slot as u32).count();
@@ -546,6 +548,7 @@ fn coastal_racepack6_pool3_runtime_adapter() {
         heuristic: appearance.heuristic,
         color: [0.1; 3],
         roughness: None,
+        source_deformation: None, source_alpha: None,
         swell_direction: None,
     };
     let job = map.coastal_bathymetry.as_ref().unwrap();

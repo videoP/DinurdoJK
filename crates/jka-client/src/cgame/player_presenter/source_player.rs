@@ -703,6 +703,7 @@ fn finish_source_player_model(
         animation_gla,
         retargeter,
         source_native_pivots,
+        source_imported: true,
         source_jiggles,
         source_jiggles_enabled: descriptor.jigglebones,
         emote_contacts: Default::default(),

@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 /// headers, but TaystJK deliberately does not expose them for jaPRO, so they
 /// are not part of [`JAPRO_PLUGIN_DISABLE_OPTIONS`].
 pub mod plugin_disable {
+    /// TaystJK bg_public.h: on JA+ allow seeing non-opponents during a duel.
+    pub const DUEL_SEE_OTHERS: i32 = 1 << 1;
     pub const BLACK_SABERS_DISABLE: i32 = 1 << 3;
     pub const BHOP: i32 = 1 << 19;
     pub const NO_ROLL: i32 = 1 << 20;
@@ -138,14 +140,23 @@ pub mod style {
     pub const NONRACER_VFX_DISABLE: u32 = 1 << 7;
     /// Draw duelers as translucent ghosts instead of dark models with a bubble.
     pub const VFX_DUELERS: u32 = 1 << 8;
+    /// Defined upstream; current CG_Player alt-dim uses cp_altDimAlpha instead.
+    pub const VFX_ALT_DIM: u32 = 1 << 9;
     /// Base/JA+: hide everyone but your opponent while you duel.
     pub const HIDE_NONDUELERS: u32 = 1 << 10;
     pub const HIDE_COSMETICS: u32 = 1 << 16;
+    /// TaystJK JAPRO_STYLE_DISABLEBREATHING (cg_stylePlayer bit 17).
+    pub const DISABLE_BREATHING: u32 = 1 << 17;
     pub const SEASONAL_COSMETICS: u32 = 1 << 20;
 }
 
 /// Bit, menu label, tooltip for the `cg_stylePlayer` switches DinurdoJK acts on.
 pub const STYLE_TOGGLES: &[(u32, &str, &str)] = &[
+    (
+        style::DISABLE_BREATHING,
+        "Disable breathing effects",
+        "Hide TaystJK cold breath and underwater bubbles on player models.",
+    ),
     (
         style::SHELL,
         "Duel glow shell",
@@ -204,6 +215,8 @@ pub struct JaproCgame {
     pub remaps: i32,
     /// `cg_stylePlayer` bit mask (see [`style`]).
     pub style_player: u32,
+    /// TaystJK JA+ cp_altDimAlpha: 1..255 alpha byte for other dimensions.
+    pub alt_dim_alpha: u8,
     /// `cg_raceTimer`: 0 off, 1 time, 2 time + max/avg/start speed, 3 same with milliseconds.
     pub race_timer: u8,
     pub race_timer_size: f32,
@@ -236,6 +249,7 @@ impl Default for JaproCgame {
         Self {
             remaps: 1,
             style_player: 0,
+            alt_dim_alpha: 40,
             race_timer: 2,
             race_timer_size: 0.75,
             race_timer_x: 5.0,
@@ -290,6 +304,12 @@ impl JaproCgame {
 pub struct StyleViewer {
     /// The connected server is jaPRO (racemode/duel culling are jaPRO-only).
     pub japro: bool,
+    /// JA+ mod detection, independent of whether jp_cinfo is zero.
+    pub japlus: bool,
+    /// TaystJK cgs.jpDuelAlpha, parsed from JA+ serverinfo.
+    pub japlus_duel_alpha: i32,
+    /// cp_pluginDisable; bit DUEL_SEE_OTHERS disables JA+ bystander culling.
+    pub plugin_disable: i32,
     pub style_player: u32,
     /// `cg.snap->ps.clientNum`.
     pub client_num: i32,
@@ -321,10 +341,12 @@ pub struct Appearance {
     pub dim: bool,
     /// Dark 50/255 tint plus the sight bubble on a dueler seen from outside.
     pub duel_bubble: bool,
+    /// JA+ RF_FORCE_ENT_ALPHA, byte used only with the normal player skin.
+    pub force_alpha: Option<u8>,
 }
 
 impl Appearance {
-    pub const NORMAL: Self = Self { visible: true, ghost: Ghost::None, dim: false, duel_bubble: false };
+    pub const NORMAL: Self = Self { visible: true, ghost: Ghost::None, dim: false, duel_bubble: false, force_alpha: None };
     const HIDDEN: Self = Self { visible: false, ..Self::NORMAL };
 }
 
@@ -371,6 +393,25 @@ pub fn integer_to_race_name(style: i32, dueling: bool, partner_name: Option<&str
         None => format!("{name} (co-op)"),
     }
 }
+/// TaystJK cg_local.h JAPLUS_CINFO_ALTDIM and bg_public.h EF_ALT_DIM.
+pub const JAPLUS_CINFO_ALTDIM: i32 = 1 << 17;
+pub const EF_ALT_DIM: i32 = 1 << 15;
+
+/// TaystJK CG_JAPlusInOtherDimension uses predicted viewer eFlags XOR target
+/// entity eFlags, not bolt1 or bolt2. Capability and other-client gates apply.
+pub fn ja_plus_other_dimension(
+    japlus_cinfo: i32,
+    viewer_client: i32,
+    viewer_eflags: i32,
+    target_client: i32,
+    target_eflags: i32,
+) -> bool {
+    japlus_cinfo & JAPLUS_CINFO_ALTDIM != 0
+        && (0..64).contains(&target_client)
+        && target_client != viewer_client
+        && (target_eflags ^ viewer_eflags) & EF_ALT_DIM != 0
+}
+
 pub const STAT_RACEMODE: usize = 11;
 pub const STAT_MOVEMENTSTYLE: usize = 13;
 
@@ -385,7 +426,14 @@ pub fn classify(viewer: &StyleViewer, target_number: i32, bolt1: i32, dead: bool
 
     if viewer.dueling {
         if target_number != viewer.duel_index {
-            if !viewer.free_spectator && (viewer.japro || bit(style::HIDE_NONDUELERS)) {
+            // TaystJK CG_Player: jp_DuelAlpha is a bystander-visibility rule,
+            // not the translucency byte. JA+ ignores HIDE_NONDUELERS.
+            let hide_non_dueler = (viewer.japlus
+                && viewer.japlus_duel_alpha >= 0
+                && viewer.plugin_disable & plugin_disable::DUEL_SEE_OTHERS == 0)
+                || viewer.japro
+                || (!viewer.japlus && bit(style::HIDE_NONDUELERS));
+            if !viewer.free_spectator && hide_non_dueler {
                 return Appearance::HIDDEN;
             }
             appearance.dim = true;
@@ -403,12 +451,16 @@ pub fn classify(viewer: &StyleViewer, target_number: i32, bolt1: i32, dead: bool
         if bit(style::HIDE_NONRACERS_IF_RACER) {
             return Appearance::HIDDEN;
         }
-        if !viewer.coop_race
-            && ((bolt1 == 0 && !bit(style::NONRACER_VFX_DISABLE)) || !bit(style::RACER_VFX_DISABLE))
-        {
-            appearance.ghost = Ghost::Race;
+        if !viewer.coop_race {
+            if (bolt1 == 0 && !bit(style::NONRACER_VFX_DISABLE))
+                || !bit(style::RACER_VFX_DISABLE)
+            {
+                appearance.ghost = Ghost::Race;
+            }
+            return appearance;
         }
-        return appearance;
+        // TaystJK skips race presentation in MV_COOP_JKA but then proceeds
+        // to normal FFA presentation, while retaining the racer culling gates.
     }
 
     if bit(style::HIDE_DUELERS) && bolt1 == 1 {
@@ -432,8 +484,9 @@ pub fn classify(viewer: &StyleViewer, target_number: i32, bolt1: i32, dead: bool
 /// Constant colour of the ghost shaders' first stage (`rgbGen const`).
 pub fn ghost_color(ghost: Ghost) -> [f32; 4] {
     match ghost {
-        Ghost::Race => [0.1, 0.1, 1.0, 1.0],
-        Ghost::Duel => [0.1, 0.1, 0.4, 1.0],
+        // TaystJK CG_Player sets shaderRGBA[3] to 50 and 100, respectively.
+        Ghost::Race => [0.1, 0.1, 1.0, 50.0 / 255.0],
+        Ghost::Duel => [0.1, 0.1, 0.4, 100.0 / 255.0],
         Ghost::None => [1.0; 4],
     }
 }
@@ -538,9 +591,6 @@ impl RaceStats {
                         (self.max_speed as f32 + 0.5) as i32,
                         self.displacement / self.samples
                     );
-                }
-                if elapsed < 3000 && !settings.race_start {
-                    let _ = write!(ui.timer_text, "\nStart: {}", self.start_speed);
                 }
             }
         }
@@ -850,9 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn coop_racers_are_not_ghosted() {
+    fn coop_uses_ordinary_ffa_presentation() {
         let v = StyleViewer { racemode: true, coop_race: true, ..viewer() };
-        assert_eq!(classify(&v, 3, 2, false).ghost, Ghost::None);
+        assert_eq!(classify(&v, 3, 2, false).ghost, Ghost::Race);
+        assert_eq!(classify(&v, 4, 0, false).ghost, Ghost::None);
     }
 
     #[test]
@@ -878,6 +929,44 @@ mod tests {
     fn the_viewer_is_never_restyled() {
         let v = StyleViewer { racemode: true, style_player: style::HIDE_NONRACERS_IF_RACER, ..viewer() };
         assert_eq!(classify(&v, 0, 0, false), Appearance::NORMAL);
+    }
+
+    #[test]
+    fn taystjk_ja_plus_alt_dimension_gate() {
+        let bit = JAPLUS_CINFO_ALTDIM;
+        assert!(ja_plus_other_dimension(bit, 2, 0, 3, EF_ALT_DIM));
+        assert!(ja_plus_other_dimension(bit, 2, EF_ALT_DIM, 3, 0));
+        assert!(!ja_plus_other_dimension(bit, 2, EF_ALT_DIM, 3, EF_ALT_DIM));
+        assert!(!ja_plus_other_dimension(0, 2, 0, 3, EF_ALT_DIM));
+        assert!(!ja_plus_other_dimension(bit, 2, 0, 2, EF_ALT_DIM));
+        assert!(!ja_plus_other_dimension(bit, 2, 0, 64, EF_ALT_DIM));
+    }
+
+    #[test]
+    fn taystjk_duel_alpha_and_plugin_visibility() {
+        let ja = StyleViewer {
+            japro: false, japlus: true, dueling: true, duel_index: 7,
+            client_num: 2, japlus_duel_alpha: 0,
+            ..StyleViewer::default()
+        };
+        assert!(!classify(&ja, 8, 0, false).visible);
+        assert!(classify(&ja, 7, 1, false).visible);
+        let neg = StyleViewer { japlus_duel_alpha: -1, ..ja };
+        let look = classify(&neg, 8, 0, false);
+        assert!(look.visible && look.dim);
+        let allow = StyleViewer { plugin_disable: plugin_disable::DUEL_SEE_OTHERS, ..ja };
+        assert!(classify(&allow, 8, 0, false).visible);
+        let style = StyleViewer { style_player: style::HIDE_NONDUELERS, ..neg };
+        assert!(classify(&style, 8, 0, false).visible);
+        assert!(classify(&StyleViewer { free_spectator: true, ..ja }, 8, 0, false).visible);
+        assert!(!classify(&StyleViewer { japro: true, japlus: false, ..ja }, 8, 0, false).visible);
+    }
+
+    #[test]
+    fn taystjk_ghost_alpha_bytes() {
+        assert_eq!(ghost_color(Ghost::Race)[3], 50.0 / 255.0);
+        assert_eq!(ghost_color(Ghost::Duel)[3], 100.0 / 255.0);
+        assert_eq!(JaproCgame::default().alt_dim_alpha, 40);
     }
 
     #[test]
@@ -928,11 +1017,16 @@ mod tests {
     }
 
     #[test]
-    fn race_timer_shows_the_start_speed_for_the_first_three_seconds() {
-        let settings = JaproCgame::default();
+    fn race_timer_respects_the_separate_start_speed_selection() {
+        let mut settings = JaproCgame::default();
         let mut stats = RaceStats::default();
         let early = stats.frame(&settings, true, 10_000, 11_000, 480.0, 250.0).unwrap();
-        assert!(early.timer_text.ends_with("Start: 480"), "{}", early.timer_text);
+        assert!(!early.timer_text.contains("Start"), "{}", early.timer_text);
+        assert!(early.start_text.is_empty());
+        settings.race_start = true;
+        let enabled = stats.frame(&settings, true, 10_000, 11_100, 500.0, 250.0).unwrap();
+        assert!(!enabled.timer_text.contains("Start"));
+        assert_eq!(enabled.start_text, "Start: 480");
         let late = stats.frame(&settings, true, 10_000, 14_000, 700.0, 250.0).unwrap();
         assert!(!late.timer_text.contains("Start"));
         assert!(late.timer_text.contains("Max: 700"));

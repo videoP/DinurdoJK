@@ -1,7 +1,7 @@
 //! Models state.
 use crate::renderer::{
     create_entity_prepass_pipeline, create_entity_rain_prepass_pipeline,
-    dynamic_model_writes_depth, sampler_entry,
+    dynamic_model_writes_depth, sampler_entry, scene, Vec3,
     storage_buffer_entry, texture_entry, uniform_entry, upload_texture, Arc,
     DynamicEntityLightingUniform, DynamicGpuTexture, DynamicModelAlphaMode, DynamicModelRenderer,
     DynamicModelVertex, EntityAmbientLightingMode, EntityLegacyFog, EntityWeather, Entry,
@@ -306,6 +306,7 @@ impl DynamicModelRenderer {
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
+            studio_capture_pipelines: Default::default(),
             model_glow_pipelines: Default::default(),
             model_alpha_mask: 0,
             fx_sprite_shader: None,
@@ -976,6 +977,22 @@ impl DynamicModelRenderer {
 
     /// True when this frame's prepared entities include any depth-writing
     /// geometry, i.e. something the Entity map shadow pass would draw.
+    pub(in crate::renderer) fn shadow_skin_sphere(&self, skin:&crate::renderer::Ghoul2GpuSkinning)->Option<(Vec3,f32)> {
+        let mesh=self.ghoul2_meshes.get(&skin.mesh_key)?;
+        // Frobenius norms bound arbitrary rotations/scales. Convex blend weights
+        // cannot exceed the largest individual bone bound.
+        let norm=|a:[f32;3],b:[f32;3],c:[f32;3]|(Vec3::from_array(a).length_squared()+Vec3::from_array(b).length_squared()+Vec3::from_array(c).length_squared()).sqrt();
+        let mut radius=0.0f32;
+        for bone in skin.bones.iter() {
+            let linear=norm([bone.row0[0],bone.row0[1],bone.row0[2]],[bone.row1[0],bone.row1[1],bone.row1[2]],[bone.row2[0],bone.row2[1],bone.row2[2]]);
+            radius=radius.max(linear*mesh.bind_radius+Vec3::new(bone.row0[3],bone.row1[3],bone.row2[3]).length());
+        }
+        let jiggle=skin.jiggle_offsets.iter().map(|v|Vec3::new(v[0],v[1],v[2]).length()+v[3].abs()).fold(0.0,f32::max);
+        radius=(radius+jiggle+skin.bulge_height.abs())*norm(skin.axis[0],skin.axis[1],skin.axis[2]);
+        let origin=Vec3::from_array(scene::render_position(skin.origin));
+        (radius.is_finite() && origin.is_finite()).then_some((origin,radius+4.0))
+    }
+
     pub(in crate::renderer) fn has_depth_casters(&self) -> bool {
         self.draws
             .iter()

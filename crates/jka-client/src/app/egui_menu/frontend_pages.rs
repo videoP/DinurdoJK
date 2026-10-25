@@ -1,15 +1,23 @@
 //! Frontend.
 use crate::app::egui_menu::{
     menu_action, theme, App, FrontendPage, OverlayMode, RenderCommand, CONTENT_MAX_W,
-    FRONTEND_SCENE_FADE_IN_SECS, GUTTER, SETUP_TAB_VIDEO,
+    GUTTER, SETUP_TAB_VIDEO,
 };
 use crate::app::frontend_scene_cache::{
-    smoothstep01, FRONTEND_CHROME_FADE_IN_SECS, FRONTEND_STAGE_FADE_IN_SECS,
+    FRONTEND_CHROME_FADE_IN_SECS, FRONTEND_STAGE_FADE_IN_SECS,
 };
 
 impl App {
     pub(in crate::app::egui_menu) fn build_egui_frontend_menu(&mut self, ui: &mut egui::Ui) {
         self.egui_frontend_scene_fade(ui);
+        // Main is drawn by the renderer (rainy café window); egui only routes
+        // its input. Settings opens over it with the regular chrome.
+        if self.frontend_page == FrontendPage::Main && self.egui_display_overlay() != OverlayMode::Video {
+            self.draw_neon_main_menu(ui);
+            self.egui_disconnect_notice(ui);
+            return;
+        }
+        self.release_neon_main_menu();
         self.egui_frontend_header(ui);
         if self.egui_display_overlay() == OverlayMode::Video {
             self.egui_setup_tabs(ui);
@@ -96,19 +104,12 @@ impl App {
     pub(in crate::app::egui_menu) fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
         if matches!(
             self.frontend_page,
-            FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::Screenshots
+            FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::RenderStudio | FrontendPage::Screenshots
         ) {
             return;
         }
         let now = std::time::Instant::now();
-        let handoff = self
-            .frontend_cinematic
-            .and_then(|cinematic| cinematic.fade_started)
-            .map_or(0.0, |started| {
-                let started = self.frontend_visual_handoff_start(started);
-                smoothstep01(now.saturating_duration_since(started).as_secs_f32()
-                    / FRONTEND_SCENE_FADE_IN_SECS)
-            });
+        let handoff = self.frontend_scene_handoff(now);
         let image_expected =
             self.frontend_scene_texture.is_some() || self.frontend_stage.cache_pending;
         // Main displays the art-directed scene without artificial darkening.
@@ -123,8 +124,15 @@ impl App {
         let image_alpha = 1.0 - handoff;
         let rect = root.max_rect();
         let mut painted_image = false;
+        // Before the WGPU compositor is ready, keep showing the existing egui
+        // still as a safe fallback. Once ready, only WGPU blends the still
+        // *under* the neon, rain, glass and CRT passes.
+        // Settings over Main suspends the compositor, so egui keeps the still.
+        let egui_owns_image = self.frontend_page != FrontendPage::Main
+            || !self.neon_menu.renderer_ready
+            || self.egui_display_overlay() == OverlayMode::Video;
         if let Some(image) = &self.frontend_scene_texture {
-            if image_alpha > 0.001 {
+            if egui_owns_image && image_alpha > 0.001 {
                 // Cover/crop, not stretch: resizing the window should never
                 // deform the levelshot, even when the cached aspect differs.
                 let size = image.size_vec2();
@@ -182,6 +190,7 @@ impl App {
                             FrontendPage::AssetViewer => "ASSET VIEWER",
                             FrontendPage::Screenshots => "SCREENSHOTS",
                             FrontendPage::MapViewer => "MAP VIEWER",
+                            FrontendPage::RenderStudio => "RENDER STUDIO",
                         }
                     };
                     theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
@@ -228,7 +237,7 @@ impl App {
                             "ESC returns to the main menu."
                         }
                         FrontendPage::DeveloperTools => "ESC returns to the main menu.",
-                        FrontendPage::AssetViewer | FrontendPage::MapViewer => {
+                        FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::RenderStudio => {
                             "ESC returns to Developer Tools."
                         }
                         FrontendPage::Screenshots => "ESC returns to the main menu.",
@@ -258,6 +267,7 @@ impl App {
                         | FrontendPage::AssetViewer
                         | FrontendPage::Screenshots
                         | FrontendPage::MapViewer
+                        | FrontendPage::RenderStudio
                 ) {
                     ui.available_width()
                 } else {
@@ -276,7 +286,7 @@ impl App {
                         .max_rect(rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
-                        let frame = if self.frontend_page == FrontendPage::Profile {
+                        let frame = if matches!(self.frontend_page, FrontendPage::Profile | FrontendPage::RenderStudio) {
                             // Match the in-game Profile layout: the right half is a
                             // renderer-owned 3D viewport, while the controls pane
                             // paints its own opaque surface.
@@ -286,7 +296,7 @@ impl App {
                                 .fill(
                                     if matches!(
                                         self.frontend_page,
-                                        FrontendPage::AssetViewer | FrontendPage::Screenshots
+                                        FrontendPage::AssetViewer | FrontendPage::Screenshots | FrontendPage::RenderStudio
                                     ) {
                                         egui::Color32::TRANSPARENT
                                     } else {
@@ -321,6 +331,7 @@ impl App {
             FrontendPage::AssetViewer => self.egui_asset_viewer_page(ui),
             FrontendPage::Screenshots => self.egui_screenshot_browser_page(ui),
             FrontendPage::MapViewer => self.egui_map_viewer_page(ui),
+            FrontendPage::RenderStudio => self.egui_render_studio_page(ui),
         }
     }
 
@@ -465,6 +476,15 @@ impl App {
             self.asset_preview_viewport_key = None;
             self.clear_asset_preview_runtime();
             self.egui_repaint_requested = true;
+            return;
+        }
+        if menu_action(
+            ui,
+            "Render Studio",
+            "Animate a character or Fortnite emote, trim frames and export clean videos for editing.",
+            true,
+        ) {
+            self.open_render_studio();
             return;
         }
         if menu_action(

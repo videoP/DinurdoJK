@@ -6,6 +6,7 @@ Run: python tools/jiggle-shape-preview/anny/export_runtime.py D:/Code/anny-main
 """
 import argparse
 import hashlib
+import io
 import json
 from itertools import product
 from pathlib import Path
@@ -13,9 +14,10 @@ import zipfile
 
 import numpy as np
 from anny_data import AnnyData, VARIATIONS, bone_mapping
+from trim_runtime import ROOT, pack_bytes
 
 
-def export(checkout, destination):
+def export(checkout, destination, full=False):
     source = AnnyData(checkout, gender=0.5)
     # full_model.load_mesh(eyes=True, tongue=True), with mesh_utils._split_quad's
     # shorter-diagonal rule. Joint helper cubes never enter the projection mesh.
@@ -47,7 +49,7 @@ def export(checkout, destination):
         value = np.asarray(value, dtype=dtype)
         offset = len(arrays)
         # Lossless byte shuffle groups IEEE exponent/sign bytes for deflate.
-        # It substantially reduces the embedded data without quantizing targets.
+        # It reduces the asset data without quantizing targets.
         arrays.extend(np.frombuffer(value.tobytes(), dtype=np.uint8).reshape(-1, 4).T.tobytes())
         blocks.append([offset, value.size])
         return [offset, value.size]
@@ -129,7 +131,8 @@ def export(checkout, destination):
                     weights=weights, bones=bones, targets=targets, controls=controls, facial=facial,
                     variations=VARIATIONS, blocks=blocks, oracle=oracle)
     destination.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(destination / "anny_targets.zip", "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         archive.writestr("model.json", json.dumps(metadata, separators=(",", ":")))
         archive.writestr("arrays.bin", arrays)
         archive.write(Path(checkout) / "LICENSE", "Anny-LICENSE.txt")
@@ -142,16 +145,24 @@ def export(checkout, destination):
     catalog += ["];", "pub const FACIAL_CONTROLS: [&str; FACIAL_COUNT] = ["]
     catalog += [f'    "{c["label"]}",' for c in facial]
     catalog += ["];", ""]
-    (destination / "catalog.rs").write_text("\n".join(catalog))
-    digest = hashlib.sha256((destination / "anny_targets.zip").read_bytes()).hexdigest()
-    print(json.dumps(dict(local=len(controls), facial=len(facial), macro=len(targets),
-                          bytes=(destination / "anny_targets.zip").stat().st_size, sha256=digest)))
+    catalog_path = destination / "catalog.rs"
+    catalog_text = "\n".join(catalog)
+    if not catalog_path.exists() or catalog_path.read_text() != catalog_text:
+        catalog_path.write_text(catalog_text)
+    if full:
+        (destination / "anny_targets.zip").write_bytes(bundle.getvalue())
+        print(json.dumps(dict(local=len(controls), facial=len(facial), macro=len(targets),
+                              bytes=len(bundle.getvalue()), sha256=hashlib.sha256(bundle.getvalue()).hexdigest())))
+    else:
+        pack_bytes(bundle.getvalue(), ROOT / "assets/dinurdo-assets.pk3",
+                   ROOT / "crates/jka-assets/tests/data/anny-neutral-oracle.bin")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkout", type=Path)
+    parser.add_argument("--full", action="store_true", help="Write the full offline authoring archive instead of updating runtime assets")
     parser.add_argument("--destination", type=Path,
                         default=Path(__file__).resolve().parents[3] / "crates/jka-assets/src/body_shape/anny")
     args = parser.parse_args()
-    export(args.checkout, args.destination)
+    export(args.checkout, args.destination, args.full)

@@ -203,6 +203,7 @@ pub(in crate::renderer) fn classic_vertex_illumination(
 }
 
 pub(in crate::renderer) struct Ghoul2GpuMesh {
+    pub(in crate::renderer) bind_radius: f32,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_count: u32,
@@ -431,6 +432,9 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) wireframe_pipeline: Option<wgpu::RenderPipeline>,
     /// Lazy per-alpha-mode pipelines; built only for modes with draws.
     pub(in crate::renderer) model_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Capture variants keep material coverage separate from additive light.
+    pub(in crate::renderer) studio_capture_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Lazy authored-glow replay variants. They preserve each stage's normal
     /// blend/depth/material behavior but force the OpenJK glow-pass black fog.

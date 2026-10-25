@@ -159,7 +159,8 @@ impl App {
         // In the Dev wheel, physical gameplay keys must reach the raw
         // dispatcher so held WASD/+movement keys remain live and can be
         // released while the wheel is showing. Egui must not swallow them.
-        if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial)
+        if (self.overlay == OverlayMode::DevRadial
+            || (self.overlay == OverlayMode::EmoteRadial && !self.emote_radial_search.pinned))
             && matches!(event, WindowEvent::KeyboardInput { .. })
         {
             return false;
@@ -183,6 +184,30 @@ impl App {
             )
         {
             return false;
+        }
+
+        // Studio keeps objects in its own clipboard. egui-winit suppresses the
+        // C/V key events and emits no Paste at all when the OS clipboard is
+        // empty, so queue the editor commands before that translation.
+        if self.overlay == OverlayMode::Game
+            && self.frontend_page == FrontendPage::RenderStudio
+            && !self.egui_ctx.text_edit_focused()
+            && self.modifiers.control_key()
+        {
+            if let WindowEvent::KeyboardInput { event, .. } = event {
+                let command = match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyC) => Some(egui::Event::Copy),
+                    PhysicalKey::Code(KeyCode::KeyV) => Some(egui::Event::Paste(String::new())),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        state.egui_input_mut().events.push(command);
+                        self.egui_repaint_requested = true;
+                    }
+                    return true;
+                }
+            }
         }
 
         let response = state.on_window_event(window, event);
@@ -273,7 +298,8 @@ impl App {
                 return false;
             }
             if (self.overlay == OverlayMode::DevRadial && self.key_bound_to_dev(code))
-                || (self.overlay == OverlayMode::EmoteRadial && self.key_bound_to_emote(code))
+                || (self.overlay == OverlayMode::EmoteRadial && !self.emote_radial_search.pinned
+                    && self.key_bound_to_emote(code))
             {
                 return false;
             }
@@ -416,6 +442,7 @@ impl App {
             }
             return;
         }
+        self.egui_update_notice(ui);
         let painted_overlay = self.egui_display_overlay();
         if self.server_password_prompt.is_some() {
             self.egui_server_password_dialog(ui);
@@ -610,6 +637,9 @@ impl App {
 
     pub(in crate::app::egui_menu) fn select_top_menu(&mut self, index: usize) {
         self.controls_waiting_for_key = false;
+        if index != TOP_SETUP {
+            super::settings_search::clear_query(&self.egui_ctx);
+        }
         if index == TOP_PROFILE && (self.menu_selected != TOP_PROFILE || self.overlay != OverlayMode::Game) {
             self.open_profile_studio(None);
         }
@@ -683,6 +713,10 @@ impl App {
                 Some("assets") => FrontendPage::AssetViewer,
                 Some("screenshots") | Some("shots") => FrontendPage::Screenshots,
                 Some("maps") => FrontendPage::MapViewer,
+                Some("renderstudio") => {
+                    self.open_render_studio();
+                    FrontendPage::RenderStudio
+                },
                 Some("setup") => {
                     self.setup_selected = self.setup_tab_index(tab.as_deref());
                     self.set_overlay(OverlayMode::Video);
@@ -690,7 +724,7 @@ impl App {
                 }
                 _ => {
                     self.console_status =
-                        "USAGE: uipage main|play|servers|solo|demo|profile|controls|movement|chatlogs|devtools|assets|screenshots|maps|setup [tab]".into();
+                        "USAGE: uipage main|play|servers|solo|demo|profile|controls|movement|chatlogs|devtools|assets|screenshots|maps|renderstudio|setup [tab]".into();
                     return;
                 }
             };
@@ -822,6 +856,7 @@ impl App {
                 if let Some(index) = clicked {
                     if self.setup_selected != index {
                         self.setup_selected = index;
+                        super::settings_search::clear_query(ui.ctx());
                         self.egui_repaint_requested = true;
                         self.publish_ui();
                     }
@@ -991,6 +1026,16 @@ impl App {
 
     pub(in crate::app::egui_menu) fn egui_page(&mut self, ui: &mut egui::Ui) {
         if self.egui_display_overlay() == OverlayMode::Video {
+            // Video keeps search alongside its pinned quality-preset toolbar.
+            // Other Setup pages render the same field above their page title.
+            if self.setup_selected != SETUP_TAB_VIDEO {
+                let searching = super::settings_search::search_bar(ui);
+                ui.add_space(10.0);
+                if searching {
+                    self.egui_settings_search_results(ui);
+                    return;
+                }
+            }
             match self.setup_selected {
                 SETUP_TAB_GAME => self.egui_game_settings(ui),
                 SETUP_TAB_MOVEMENT => self.egui_movement_page(ui),
@@ -1063,6 +1108,7 @@ impl App {
         if let Some(section) = target {
             if self.video_section != section {
                 self.video_section = section;
+                super::settings_search::clear_query(root.ctx());
                 self.egui_repaint_requested = true;
                 self.publish_ui();
             }

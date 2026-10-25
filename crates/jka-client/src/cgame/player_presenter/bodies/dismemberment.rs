@@ -425,14 +425,25 @@ pub(in crate::cgame::player_presenter) fn presentation_matrix(
     ]
 }
 
-pub(in crate::cgame::player_presenter) fn scaled_bone_matrix(
-    mut matrix: Matrix3x4,
-    scale: f32,
+fn detached_limb_spawn_matrix(
+    source_world: &Matrix3x4,
+    bone_model: &Matrix3x4,
 ) -> Matrix3x4 {
-    matrix[0][3] *= scale;
-    matrix[1][3] *= scale;
-    matrix[2][3] *= scale;
-    matrix
+    // source_world already contains modelScale. Keep it on the frozen entity
+    // transform, while the reference body must match Rapier's rigid frame.
+    // Inverting a scaled/sheared reference against a rigid solved body would
+    // rescale the severed mesh as soon as physics takes ownership.
+    crate::cgame::ragdoll::rigidify_affine(&multiply_3x4(source_world, bone_model))
+}
+
+fn detached_limb_render_matrix(
+    spawn_entity: &Matrix3x4,
+    spawn_body: &Matrix3x4,
+    current_body: &Matrix3x4,
+) -> Matrix3x4 {
+    affine_inverse_3x4(spawn_body)
+        .map(|inverse| multiply_3x4(&multiply_3x4(current_body, &inverse), spawn_entity))
+        .unwrap_or(*spawn_entity)
 }
 
 pub(in crate::cgame::player_presenter) fn affine_inverse_3x4(
@@ -589,10 +600,7 @@ impl PlayerPresenter {
                 ));
             };
             let source_world = presentation_matrix(source.axis, source.origin);
-            let spawn_body_matrix = multiply_3x4(
-                &source_world,
-                &scaled_bone_matrix(bone_model, source.model_scale),
-            );
+            let spawn_body_matrix = detached_limb_spawn_matrix(&source_world, &bone_model);
             let spawn_entity_matrix = source_world;
 
             let capsule_local = if let Some(end_name) = spec.collider_b {
@@ -607,7 +615,6 @@ impl PlayerPresenter {
                         bone,
                     )?
                     .map(|matrix| {
-                        let matrix = scaled_bone_matrix(matrix, source.model_scale);
                         affine_point(&source_world, [matrix[0][3], matrix[1][3], matrix[2][3]])
                     }))
                 };
@@ -731,14 +738,11 @@ impl PlayerPresenter {
                 matrix[2][3] = entity.origin[2];
                 matrix
             });
-        let render_matrix = affine_inverse_3x4(&visual.spawn_body_matrix)
-            .map(|inverse| {
-                multiply_3x4(
-                    &multiply_3x4(&current_body, &inverse),
-                    &visual.spawn_entity_matrix,
-                )
-            })
-            .unwrap_or(visual.spawn_entity_matrix);
+        let render_matrix = detached_limb_render_matrix(
+            &visual.spawn_entity_matrix,
+            &visual.spawn_body_matrix,
+            &current_body,
+        );
         let (axis, origin) = presentation_axis_origin(&render_matrix);
         let lod = view.map_or(0, |view| {
             ghoul2_lod_for_view(
@@ -828,5 +832,83 @@ impl PlayerPresenter {
             }
         }
         Ok(draws)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cgame::ragdoll::{PhysicsMapMesh, RagdollConfig, RagdollWorld};
+    use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+    use glam::Vec3;
+
+    #[test]
+    fn severed_parts_preserve_size_and_position_at_handoff_and_while_tumbling() {
+        for rig_kind in [HumanoidRig::Jka53, HumanoidRig::Jk2_72] {
+            let rig = humanoid_reference(rig_kind);
+            for scale in [0.65, 1.0, 1.5] {
+                let mut world = RagdollWorld::new();
+                world.set_config(RagdollConfig {
+                    physics_enabled: true, dismemberment: 2,
+                    ..RagdollConfig::default()
+                });
+                world.set_map_mesh(&PhysicsMapMesh::from_jka_mesh(
+                    vec![[-512., -512., -256.], [512., -512., -256.], [0., 512., -256.]],
+                    vec![[0, 1, 2]],
+                ).unwrap()).unwrap();
+                let axis = [
+                    [0.8 * scale, 0.6 * scale, 0.],
+                    [-0.6 * scale, 0.8 * scale, 0.],
+                    [0., 0., scale],
+                ];
+                let source_world = presentation_matrix(axis, [100., -30., 80.]);
+                // Ghoul2 animation interpolation and body-shape bindings can
+                // contain scale/shear; those must remain on the frozen skin.
+                let skin = [[0.8, -0.03, 0.02, 1.], [0.01, 0.9, 0.04, -2.], [0., 0.02, 0.7, 3.]];
+                for (index, name) in ["pelvis", "thoracic", "cranium", "rhumerus", "rfemurYZ"].iter().enumerate() {
+                    world.reset_dynamic_for_seek();
+                    let bone = rig.skeleton.iter().find(|bone| bone.name.eq_ignore_ascii_case(name)).unwrap();
+                    let bone_model = multiply_3x4(&skin, &bone.base_pose);
+                    let spawn_body = detached_limb_spawn_matrix(&source_world, &bone_model);
+                    let expected_sever = affine_point(&source_world,
+                        [bone_model[0][3], bone_model[1][3], bone_model[2][3]]);
+                    let actual_sever = [spawn_body[0][3], spawn_body[1][3], spawn_body[2][3]];
+                    assert!((Vec3::from_array(expected_sever) - Vec3::from_array(actual_sever)).length() < 0.001,
+                        "{rig_kind:?} {name} scale={scale}: sever position was scaled twice");
+                    let generation = DetachedLimbGeneration {
+                        source_entity: 1, kind: index as u8, trajectory_time: 0,
+                    };
+                    assert!(world.ensure_detached_limb(DetachedLimbSpawn {
+                        entity: index as u16 + 2, generation, body_world: spawn_body,
+                        capsule_local: None, radius: 3. * scale, mass_kg: 4.,
+                        linear_velocity: [20., 0., 30.], angular_velocity: [1.3, -0.7, 2.],
+                    }, 0));
+                    let point_a = affine_point(&skin, [3., -2., 5.]);
+                    let point_b = affine_point(&skin, [7., 4., -3.]);
+                    let expected_a = Vec3::from_array(affine_point(&source_world, point_a));
+                    let expected_b = Vec3::from_array(affine_point(&source_world, point_b));
+                    let mut fallback = spawn_body;
+                    for row in 0..3 { fallback[row][3] += [12., -6., 3.][row]; }
+                    let fallback_render = detached_limb_render_matrix(&source_world, &spawn_body, &fallback);
+                    let fallback_a = Vec3::from_array(affine_point(&fallback_render, point_a));
+                    assert!((fallback_a - expected_a - Vec3::new(12., -6., 3.)).length() < 0.001,
+                        "{rig_kind:?} {name} scale={scale}: server-physics fallback changed size or position");
+                    world.begin_frame(0);
+                    for now in [0, 17, 34, 51] {
+                        world.begin_frame(now);
+                        let solved = world.detached_limb_matrix(index as u16 + 2, generation).unwrap();
+                        let render = detached_limb_render_matrix(&source_world, &spawn_body, &solved);
+                        let actual_a = Vec3::from_array(affine_point(&render, point_a));
+                        let actual_b = Vec3::from_array(affine_point(&render, point_b));
+                        if now == 0 {
+                            assert!((actual_a - expected_a).length() < 0.001,
+                                "{rig_kind:?} {name} scale={scale}: severed part jumped at handoff");
+                        }
+                        assert!(((actual_a - actual_b).length() - (expected_a - expected_b).length()).abs() < 0.001,
+                            "{rig_kind:?} {name} scale={scale}: severed part changed size at {now}ms");
+                    }
+                }
+            }
+        }
     }
 }

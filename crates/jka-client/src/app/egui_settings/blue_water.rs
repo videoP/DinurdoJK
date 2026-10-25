@@ -3,18 +3,51 @@ use crate::app::egui_settings::{theme, App};
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_lakes(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "BLUE WATER LAKES & PONDS", "Flat water with wind ripples, sky reflections, sun glitter, shallow transmission and soft shore edges. Each pool keeps its map height and outline.");
+        theme::section(ui, "BLUE WATER LAKES & PONDS", "Moving water with gentle relief, wind ripples, world reflections and soft shore edges. Each pool keeps its map level and shore outline; sky-connected water can continue to the horizon.");
         let mut settings = self.video.ocean_settings;
         let d = crate::ocean::LakeSettings::default();
         let mut changed = false;
-        super::ocean_slider_d(ui, "Lake wind speed (m/s)", "Controls analytic ripples and reflection roughness; no ocean FFT is simulated.", &mut settings.lake.wind_speed, d.wind_speed, 0.0..=40.0, &mut changed);
-        super::ocean_slider_d(ui, "Lake wind direction", "Direction ripples travel, in degrees from +X toward world +Z.", &mut settings.lake.direction, d.direction, -180.0..=180.0, &mut changed);
-        super::ocean_slider_d(ui, "Lake transparency", "Optical clarity multiplier. 1 preserves the original lake coefficients.", &mut settings.lake.transparency, d.transparency, 0.1..=10.0, &mut changed);
-        theme::row(ui, "Lake water", "Freshwater is brown-green; lagoons and salt ponds use the original turquoise optics. This applies to all promoted pools for the A/B.", theme::Reset::None, |ui| {
-            for (salt,label) in [(false,"Freshwater"),(true,"Lagoon / salt pond")] {
-                if theme::chip(ui,label,settings.lake.salt == salt).clicked() { settings.lake.salt=salt;changed=true; }
+        theme::row(ui, "Lake shader", "Compare the original depth-aware water with Cheapwater's water surface and three moving normal-map layers. Movement and reflection selection stay the same when switching.", theme::Reset::None, |ui| {
+            for (mode,label) in [(0,"Original"),(1,"Cheapwater")] {
+                if theme::chip(ui,label,settings.lake.shader == mode).clicked() { settings.lake.shader=mode;changed=true; }
             }
         });
+        theme::row(ui, "Source shader hints", "When enabled, each automatically promoted pool inherits color, alpha-blend clarity, roughness and movement cues from its original JKA shader. Off restores the shared Lake appearance for A/B tests.", theme::Reset::None, |ui| {
+            if theme::chip(ui, "On", settings.lake.source_hints).clicked() { settings.lake.source_hints = true; changed = true; }
+            if theme::chip(ui, "Off", !settings.lake.source_hints).clicked() { settings.lake.source_hints = false; changed = true; }
+        });
+        super::ocean_slider_d(ui, "Lake amplitude (inches)", "Maximum movement above and below the map level. Zero makes the geometry flat; ripple normals remain animated.", &mut settings.lake.amplitude, d.amplitude, 0.0..=12.0, &mut changed);
+        super::ocean_slider_d(ui, "Lake movement speed", "How quickly the surface rolls and changes shape. Default 1 visibly animates; zero freezes the deformation. No FFT simulation is needed.", &mut settings.lake.speed, d.speed, 0.0..=3.0, &mut changed);
+        ui.add_enabled_ui(settings.lake.shader == 0, |ui| {
+        super::ocean_slider_d(ui, "Lake wind speed (m/s)", "Controls analytic ripples and reflection roughness; no ocean FFT is simulated.", &mut settings.lake.wind_speed, d.wind_speed, 0.0..=40.0, &mut changed);
+        super::ocean_slider_d(ui, "Lake wind direction", "Direction ripples travel, in degrees from +X toward world +Z.", &mut settings.lake.direction, d.direction, -180.0..=180.0, &mut changed);
+        });
+        if settings.lake.shader == 1 {
+            super::ocean_slider_d(ui, "Cheapwater player wakes", "Expanding ripples from players moving through or entering the water. Higher strength bends reflections and refraction more, at the same rendering cost. Zero disables the effect.", &mut settings.lake.wake_strength, d.wake_strength, 0.0..=10.0, &mut changed);
+            super::ocean_slider_d(ui, "Lake transparency", "Maximum bed visibility in very shallow water: 0 is opaque, 1 is clear. Visibility falls smoothly to zero at Opaque depth.", &mut settings.lake.cheap_transmission, d.cheap_transmission, 0.0..=1.0, &mut changed);
+            super::ocean_slider_d(ui, "Opaque depth (feet)", "Vertical bed depth where visibility is exactly zero. Default 8 feet leaves 3-inch water almost fully clear, then fades smoothly to opaque. Independent of depth clarity and color depth.", &mut settings.lake.opaque_depth, d.opaque_depth, 0.25..=100.0, &mut changed);
+            super::ocean_slider_d(ui, "Cheapwater refraction", "Small screen-space distortion driven by the existing scrolling normals. No extra noise samples or ray tracing. Only applies with transparency above zero.", &mut settings.lake.cheap_refraction, d.cheap_refraction, 0.0..=0.05, &mut changed);
+        }
+        super::ocean_slider_d(ui, if settings.lake.shader == 1 { "Depth clarity" } else { "Lake transparency" }, "Absorption clarity before the bed fades out. Higher values reduce absorption tint; Cheapwater still becomes fully opaque at Opaque depth.", &mut settings.lake.transparency, d.transparency, 0.1..=10.0, &mut changed);
+        super::color_row(ui, "Lake water color", if settings.lake.shader == 1 { "Cheapwater body color. Reflections and sun highlights keep the light source color, independent of water color." } else { "The optical water color: controls how light is absorbed and scattered through the depth. Independent of surface tint and underwater fog." }, theme::Reset::None, &mut settings.lake.water_color, &mut changed);
+        super::color_row(ui, "Lake surface tint", "Additional surface tint; white is neutral. Cheapwater multiplies its body color; Original tints the water body and transmitted bed.", theme::Reset::None, &mut settings.lake.tint_color, &mut changed);
+        if settings.lake.shader == 1 {
+            super::ocean_slider_d(ui, "Depth coloring", "Blend from the existing water color to your shallow/deep colors. Zero preserves the current appearance and avoids the depth copy unless another effect needs it.", &mut settings.lake.depth_color_strength, d.depth_color_strength, 0.0..=1.0, &mut changed);
+            super::color_row(ui, "Shallow color", "Cheapwater color near the bed and shoreline; multiplied by surface tint.", theme::Reset::None, &mut settings.lake.shallow_color, &mut changed);
+            super::color_row(ui, "Deep color", "Cheapwater color in deep water, including the open horizon.", theme::Reset::None, &mut settings.lake.deep_color, &mut changed);
+            super::ocean_slider_d(ui, "Color depth (m)", "Vertical bed depth where the deep color is fully reached. Independent of camera angle and depth clarity.", &mut settings.lake.color_depth, d.color_depth, 0.1..=100.0, &mut changed);
+        }
+        super::color_row(ui, "Lake fog color", "The underwater fog color, independent of the lake surface color.", theme::Reset::None, &mut settings.lake.fog_color, &mut changed);
+        super::ocean_slider_d(ui, "Lake reflections", "World/sky reflection and sun glitter strength. Zero removes reflections.", &mut settings.lake.reflections, d.reflections, 0.0..=1.0, &mut changed);
+        theme::row(ui, "Lake reflection source", "Independent of global reflection settings. Sky uses the environment. SSR traces the visible scene and falls back to sky on misses. Planar renders a reduced-resolution world view and can include off-screen objects.", theme::Reset::None, |ui| {
+            for (mode,label) in [(0,"Sky"),(1,"SSR"),(2,"Planar")] {
+                if theme::chip(ui,label,settings.lake.reflection_mode == mode).clicked() { settings.lake.reflection_mode=mode;changed=true; }
+            }
+        });
+        if theme::ghost_button(ui, "RESET LAKE").clicked() {
+            settings.lake = d;
+            changed = true;
+        }
         if changed {self.video.ocean_settings=settings;self.commit_ocean_settings();}
     }
 

@@ -7,11 +7,23 @@
 @group(0) @binding(4) var world_background: texture_2d<f32>;
 // Matches the nine vec4 fields of GlassSettings. Recovery is highlights.w.
 @group(0) @binding(5) var<uniform> glass_settings: array<vec4<f32>,9>;
+// glass_bounds.wgsl result; [2] is the full-res rectangle [x0, y0, x1, y1) that
+// glass can sample, already padded for displacement and the pyramid footprint.
+// [3].xy is the full resolution. Draws pass the output mip level as the instance.
+@group(0) @binding(6) var<uniform> bounds: array<vec4<u32>,4>;
 struct VertexOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VertexOut {
-    let positions = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));
-    var out: VertexOut; out.position=vec4<f32>(positions[i],0.0,1.0);
-    out.uv=positions[i]*vec2<f32>(0.5,-0.5)+0.5; return out;
+// Six vertices: a quad over the rectangle in this level's texels. Empty bounds
+// give a zero-area quad, so the level costs only its clear.
+@vertex fn vs_main(@builtin(vertex_index) i: u32, @builtin(instance_index) mip: u32) -> VertexOut {
+    let full=vec2<f32>(max(bounds[3].xy,vec2<u32>(1u)));
+    let level=vec2<f32>(max(bounds[3].xy>>vec2<u32>(mip),vec2<u32>(1u)));
+    let lo=floor(vec2<f32>(bounds[2].xy)*level/full);
+    let hi=min(ceil(vec2<f32>(bounds[2].zw)*level/full),level);
+    let corners=array<vec2<f32>,6>(vec2<f32>(0.0,0.0),vec2<f32>(1.0,0.0),vec2<f32>(0.0,1.0),
+        vec2<f32>(0.0,1.0),vec2<f32>(1.0,0.0),vec2<f32>(1.0,1.0));
+    let uv=mix(lo,max(hi,lo),corners[i])/level;
+    var out: VertexOut; out.position=vec4<f32>(uv*vec2<f32>(2.0,-2.0)+vec2<f32>(-1.0,1.0),0.0,1.0);
+    out.uv=uv; return out;
 }
 fn coverage(uv: vec2<f32>) -> vec4<f32> {
     let dims=vec2<i32>(textureDimensions(glass_coverage));

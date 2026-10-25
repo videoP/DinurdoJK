@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "target/release/base".into());
     let mut assets = AssetSearchPath::open_game(Path::new(&base), None)?;
     assets.set_allow_asset_overrides(true);
+    anny::configure_assets(&assets);
     let mut read = |q: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         Ok(assets
             .read(q, 128 * 1024 * 1024)?

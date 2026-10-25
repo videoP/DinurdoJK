@@ -9,19 +9,37 @@ use crate::renderer::{
 use wgpu::util::DeviceExt;
 
 impl Renderer {
+    pub(in crate::renderer) fn lake_planar_enabled(&self) -> bool {
+        self.ocean_enabled
+            && self.ocean_settings.backend == 3
+            && self.ocean_settings.lake.reflection_mode == 2
+            && self.ocean_settings.lake.reflections > 0.0
+    }
+
     pub(in crate::renderer) fn rebuild_planar_reflection_resources(&mut self) {
+        let lake_planar = (self.ocean_settings.backend == 3).then(|| self.lake_planar_enabled());
         for flare_view in &mut self.world_flares_planar {
             flare_view.invalidate_depth_binding();
         }
         let planar_budget = self
             .reflection_quality
             .planar_slot_budget()
+            .max(usize::from(lake_planar == Some(true)))
             .min(PLANAR_REFLECTION_SLOTS);
         let active = planar_budget > 0
             && self.world.as_ref().is_some_and(|world| {
                 world.planar_reflectors.iter().any(|reflector| {
                     (reflector.kind != PlanarReflectorKind::Ocean || self.ocean_enabled)
-                        && planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
+                        && if reflector.kind == PlanarReflectorKind::Ocean {
+                            lake_planar.unwrap_or_else(|| {
+                                planar_reflector_enabled(
+                                    self.planar_reflection_mode,
+                                    reflector.kind,
+                                )
+                            })
+                        } else {
+                            planar_reflector_enabled(self.planar_reflection_mode, reflector.kind)
+                        }
                 })
             });
         // Promoted tcGen-environment surfaces are intentionally broad/rough
@@ -40,6 +58,7 @@ impl Renderer {
             PLANAR_AUTHORED_SCALE_DIVISOR
         } else {
             match self.reflection_quality {
+                _ if lake_planar == Some(true) => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
                 ReflectionQuality::Ultra => PLANAR_AUTHORED_SCALE_DIVISOR,
                 _ => PLANAR_ENVIRONMENT_SCALE_DIVISOR,
             }
@@ -487,10 +506,12 @@ pub(in crate::renderer) fn select_planar_reflection_views(
     planar_mode: PlanarReflectionMode,
     reflection_quality: ReflectionQuality,
     ocean_enabled: bool,
+    lake_planar: Option<bool>,
     previous_planes: &[Option<[f32; 4]>; PLANAR_REFLECTION_SLOTS],
 ) -> [Option<PlanarReflectionView>; PLANAR_REFLECTION_SLOTS] {
     let planar_budget = reflection_quality
         .planar_slot_budget()
+        .max(usize::from(lake_planar == Some(true)))
         .min(PLANAR_REFLECTION_SLOTS);
     if planar_budget == 0 {
         return [None; PLANAR_REFLECTION_SLOTS];
@@ -512,7 +533,11 @@ pub(in crate::renderer) fn select_planar_reflection_views(
     let mut candidates: Vec<(u8, bool, f32, PlanarReflector, [f32; 4], (Vec2, Vec2))> = Vec::new();
     for reflector in &world.planar_reflectors {
         if (reflector.kind == PlanarReflectorKind::Ocean && !ocean_enabled)
-            || !planar_reflector_enabled(planar_mode, reflector.kind)
+            || !(if reflector.kind == PlanarReflectorKind::Ocean {
+                lake_planar.unwrap_or_else(|| planar_reflector_enabled(planar_mode, reflector.kind))
+            } else {
+                planar_reflector_enabled(planar_mode, reflector.kind)
+            })
             || !active_coarse.contains(&reflector.coarse_batch_index)
             || world
                 .coarse_batches
@@ -549,18 +574,21 @@ pub(in crate::renderer) fn select_planar_reflection_views(
         };
         let (contains_centre, screen_importance) =
             planar_importance_from_ndc_rect(ndc_rect.0, ndc_rect.1);
-        let minimum_screen_importance = if reflector.kind == PlanarReflectorKind::Authored {
-            // Authored `portal` mirrors are baseline JKA content. If their plane
-            // is actually visible, keep them eligible regardless of enhanced
-            // reflection quality. The slot budget still limits total cost.
-            0.0
-        } else {
-            match reflection_quality {
-                ReflectionQuality::High => 0.015,
-                ReflectionQuality::Ultra => 0.002,
-                _ => 1.0,
-            }
-        };
+        let minimum_screen_importance =
+            if lake_planar == Some(true) && reflector.kind == PlanarReflectorKind::Ocean {
+                0.015
+            } else if reflector.kind == PlanarReflectorKind::Authored {
+                // Authored `portal` mirrors are baseline JKA content. If their plane
+                // is actually visible, keep them eligible regardless of enhanced
+                // reflection quality. The slot budget still limits total cost.
+                0.0
+            } else {
+                match reflection_quality {
+                    ReflectionQuality::High => 0.015,
+                    ReflectionQuality::Ultra => 0.002,
+                    _ => 1.0,
+                }
+            };
         if screen_importance < minimum_screen_importance {
             continue;
         }
@@ -572,6 +600,7 @@ pub(in crate::renderer) fn select_planar_reflection_views(
         // map sky as the camera moves. Keep JKA-authored mirrors highest, oceans
         // next, and generic environment candidates last.
         let priority = match reflector.kind {
+            PlanarReflectorKind::Ocean if lake_planar == Some(true) => 3,
             PlanarReflectorKind::Authored => 2,
             PlanarReflectorKind::Ocean => 1,
             PlanarReflectorKind::Environment => 0,
@@ -647,6 +676,19 @@ pub(in crate::renderer) fn select_planar_reflection_views(
             .then_with(|| b_score.total_cmp(&a_score))
             .then_with(|| b.1.cmp(&a.1))
     });
+    if lake_planar == Some(true) {
+        // The lake owns one capture regardless of global quality. Keep its slot
+        // ahead of global mirrors and avoid increasing lake cost at Ultra.
+        let mut have_lake = false;
+        candidates.retain(|candidate| {
+            if candidate.3.kind != PlanarReflectorKind::Ocean {
+                return true;
+            }
+            let keep = !have_lake;
+            have_lake = true;
+            keep
+        });
+    }
     candidates.truncate(planar_budget);
 
     // Preserve the relative order of surviving planes so a plane normally keeps

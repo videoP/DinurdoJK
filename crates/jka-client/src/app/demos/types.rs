@@ -25,6 +25,7 @@ pub(in crate::app) struct DemoCameraSample {
     pub(in crate::app) velocity: [f32; 3],
     /// OpenJK playerState bobCycle; CG_CalculateWeaponPosition derives bob parity/phase from it.
     pub(in crate::app) bob_cycle: i32,
+    pub(in crate::app) pm_flags: i32,
     pub(in crate::app) view_height: i32,
     pub(in crate::app) dead_yaw: f32,
     pub(in crate::app) client_num: i32,

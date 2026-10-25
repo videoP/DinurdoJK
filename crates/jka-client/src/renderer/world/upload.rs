@@ -167,6 +167,7 @@ pub(in crate::renderer) fn build_world(
         static_bsp_ao_cache,
         visibility,
         lights: dynamic_lights,
+        static_bake_lights,
         source_map_lighting,
         baked_sun_encoding,
         sun,
@@ -182,6 +183,7 @@ pub(in crate::renderer) fn build_world(
         inline_batches: inline_batch_sources,
         inline_models: inline_model_sources,
         mark_surfaces,
+        water_brush_bounds,
         ..
     } = map;
     // Decide texture usages immediately after receiving the prepared map. BC
@@ -243,7 +245,7 @@ pub(in crate::renderer) fn build_world(
     let texture_classify_ms = texture_classify_started.elapsed().as_secs_f64() * 1000.0;
     // No sunlight tracing, calibration or cache I/O on the upload thread.
     // Retain cheap material metadata plus shared inputs for a requested bake.
-    let sun_bake_batches = if !source_map && sun.is_some() {
+    let sun_bake_batches = if !source_map {
         coarse_sources.clone()
     } else { Vec::new() };
     let may_project_authored_sun = !source_map && sun.is_some() && baked_sun_encoding.is_some()
@@ -416,6 +418,7 @@ pub(in crate::renderer) fn build_world(
     // outline travels as triangle masks the fragment shader cuts back to.
     let mut ocean_clipmaps = BTreeMap::<[u32; 6], ([std::ops::Range<u32>; 2], u8)>::new();
     let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
+    let mut ocean_bottoms = Vec::new();
     let mut ocean_promotion_decisions = BTreeMap::<[u32; 6], OceanPromotionDecision>::new();
     let mut ocean_appearances = BTreeMap::new();
     let mut ocean_masks = crate::ocean::OceanMasks::default();
@@ -460,6 +463,12 @@ pub(in crate::renderer) fn build_world(
                 .chunks_exact(3)
                 .map(|triangle| [triangle[0].position,triangle[1].position,triangle[2].position])
                 .collect::<Vec<_>>())
+            .collect();
+        let sky_blockers: Vec<crate::ocean::sky_extend::SkyTriangle> = coarse_sources.iter()
+            .filter(|s| s.pipeline.class == DrawClass::Opaque && !s.water)
+            .flat_map(|source| vertices[source.vertices.start as usize..source.vertices.end as usize]
+                .chunks_exact(3)
+                .map(|triangle| [triangle[0].position,triangle[1].position,triangle[2].position]))
             .collect();
         let footprints = crate::ocean::build_water_footprints(
             &water_faces,
@@ -518,7 +527,7 @@ pub(in crate::renderer) fn build_world(
             // BSP sky wall at the same height. Never derive this from coastal
             // banks, bathymetry or the shoreline solver.
             let sky_candidate = (!authored).then(||
-                crate::ocean::sky_extend::detect(footprint, &sky_triangles)
+                crate::ocean::sky_extend::detect(footprint, &sky_triangles, &sky_blockers)
             ).flatten();
             // Keep two fully independent masks, so r_oceanSkyExtend 0 restores
             // the exact original source-water outline without a map reload.
@@ -627,6 +636,9 @@ pub(in crate::renderer) fn build_world(
                     surface: crate::ocean::OceanSurface { plane_height:footprint.plane, minimum:footprint.minimum, maximum:footprint.maximum },
                     heuristic:appearance.heuristic,
                     roughness:(appearance.material[3] >= 0.0).then_some(appearance.material[3]),
+                    source_deformation:source.water_deformed.then_some(source.water_amplitude),
+                    source_alpha:(appearance.waves[2] == 5.0 && appearance.waves[3] == 5.0)
+                        .then_some(appearance.color[3].clamp(0.0, 1.0)),
                     color:crate::ocean::appearance::linear_to_srgb([appearance.color[0],appearance.color[1],appearance.color[2]]),
                     swell_direction:crate::ocean::appearance::swell_direction_from_stage(source, &vertices),
                 });
@@ -642,6 +654,7 @@ pub(in crate::renderer) fn build_world(
                 minimum: footprint.minimum,
                 maximum: footprint.maximum,
             });
+            ocean_bottoms.push(crate::ocean::volume::promoted_bottom(footprint, &water_brush_bounds));
         }
     }
     if build_ocean_meshes {
@@ -1111,7 +1124,7 @@ pub(in crate::renderer) fn build_world(
                 sky_sampler,
                 selected_detail_texture,
                 &textures,
-                &lightmaps,
+                &lightmaps, &[],
                 &deluxemaps,
                 &texture_clamp,
                 primary_skybox,
@@ -1184,7 +1197,7 @@ pub(in crate::renderer) fn build_world(
                     sky_sampler,
                     selected_detail_texture,
                     &textures,
-                    &lightmaps,
+                    &lightmaps, &[],
                     &deluxemaps,
                     &texture_clamp,
                     primary_skybox,
@@ -1215,7 +1228,7 @@ pub(in crate::renderer) fn build_world(
                     sky_sampler,
                     selected_detail_texture,
                     &textures,
-                    &lightmaps,
+                    &lightmaps, &[],
                     &deluxemaps,
                     &texture_clamp,
                     primary_skybox,
@@ -1240,7 +1253,7 @@ pub(in crate::renderer) fn build_world(
                 lightmap_sampler,
                 sky_sampler,
                 &textures,
-                &lightmaps,
+                &lightmaps, &[],
                 &texture_clamp,
                 primary_skybox,
                 &footprint_marks,
@@ -1258,14 +1271,14 @@ pub(in crate::renderer) fn build_world(
                         device, surface_layout, white, missing, flat_normal,
                         repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                         lightmap_sampler, sky_sampler, selected_detail_texture,
-                        &textures, &lightmaps, &deluxemaps, &texture_clamp,
+                        &textures, &lightmaps, &[], &deluxemaps, &texture_clamp,
                         primary_skybox, &footprint_marks, &reflection_probes,
                         frame_source, &material_buffer, &additive_uniforms, &fog_buffer,
                         surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
                     ),
                     fast: create_fast_world_bind_group(
                         device, fast_surface_layout, white, missing, repeat_sampler,
-                        clamp_sampler, lightmap_sampler, sky_sampler, &textures, &lightmaps,
+                        clamp_sampler, lightmap_sampler, sky_sampler, &textures, &lightmaps, &[],
                         &texture_clamp, primary_skybox, &footprint_marks, frame_source,
                         &material_buffer, &additive_uniforms, surface_deformation_buffer,
                         deformation_field_views, deformation_field_sampler,
@@ -1275,7 +1288,7 @@ pub(in crate::renderer) fn build_world(
                             device, surface_layout, white, missing, flat_normal,
                             repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                             lightmap_sampler, sky_sampler, selected_detail_texture,
-                            &textures, &lightmaps, &deluxemaps, &texture_clamp,
+                            &textures, &lightmaps, &[], &deluxemaps, &texture_clamp,
                             primary_skybox, &footprint_marks, &reflection_probes,
                             frame_source, &material_buffer, &additive_uniforms, glow_fog_buffer,
                             surface_deformation_buffer, deformation_field_views,
@@ -1648,6 +1661,9 @@ pub(in crate::renderer) fn build_world(
         .zip(inline_rt_masks)
         .map(
             |(((model, gpu_vertex_start), rt_indices), rt_mask_sources)| InlineModelGpu {
+                pvs_visible: None,
+                pvs_bounds_dirty: true,
+                pvs_area_rejected: false,
                 model: model.model,
                 gpu_vertex_start,
                 base: inline_vertices[model.vertices.start as usize..model.vertices.end as usize]
@@ -1860,15 +1876,21 @@ pub(in crate::renderer) fn build_world(
             MAX_DYNAMIC_LIGHTS
         );
     }
-    let dynamic_lights = dynamic_lights
+    let mut dynamic_lights = dynamic_lights
         .into_iter()
         .take(MAX_DYNAMIC_LIGHTS)
         .collect::<Vec<_>>();
+    let runtime_light_count = dynamic_lights.len();
+    let mut static_bake_sources=Vec::new();
+    for light in static_bake_lights {
+        if let Some(index)=dynamic_lights.iter().position(|l| { let mut candidate=*l; candidate.shader_promotion_mask=light.shader_promotion_mask; candidate==light }) { static_bake_sources.push((index,light)); }
+        else { static_bake_sources.push((dynamic_lights.len(),light)); dynamic_lights.push(light); }
+    }
     let light_count = u32::try_from(dynamic_lights.len()).unwrap_or(0);
     let shadow_slot_by_light = vec![0_u32; dynamic_lights.len()];
     // Static map lights occupy the prefix; transient CGame/FX lights use the
     // remaining slots at runtime without reallocating this storage buffer.
-    let mut gpu_lights = gpu_point_lights(&dynamic_lights, &shadow_slot_by_light);
+    let mut gpu_lights = gpu_point_lights(&dynamic_lights[..runtime_light_count], &shadow_slot_by_light);
     gpu_lights.resize(MAX_DYNAMIC_LIGHTS, GpuPointLight::zeroed());
     let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA dynamic point lights"),
@@ -2403,6 +2425,9 @@ pub(in crate::renderer) fn build_world(
         lightmap_sizes: Arc::new(static_ao_lightmap_sizes),
         lightmap_bases: Arc::new(static_ao_lightmap_bases),
     });
+    let static_sun = crate::renderer::lighting::lightmap_sun::StaticSun::new( static_ao_source.as_ref().filter(|_| !source_map).map(|source|
+            crate::renderer::lighting::lightmap_sun::Geometry::new(
+                Arc::clone(&source.vertices), sun_bake_batches.clone(), Arc::clone(&texture_data), &material_debug)));
     let sun_bake = crate::renderer::lighting::sun_bake::SunBake::new(
         static_ao_source.as_ref(), sun, baked_sun_encoding, sun_bake_batches,
         texture_data, Arc::clone(&lightmap_data),
@@ -2443,6 +2468,7 @@ pub(in crate::renderer) fn build_world(
             primary_skybox,
             sky_covers_background,
             ocean_surfaces,
+            ocean_bottoms,
             ocean_meshes_built: build_ocean_meshes,
             ocean_promotion_decisions,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
@@ -2492,6 +2518,8 @@ pub(in crate::renderer) fn build_world(
             legacy_dlight_triangle_surfaces: legacy_triangle_surfaces,
             legacy_dlight_surfaces,
             dynamic_lights,
+        runtime_light_count,
+        static_bake_sources,
             cluster_compute_bind_group,
             lighting_bind_group,
             lighting_bind_group_lean,
@@ -2507,6 +2535,7 @@ pub(in crate::renderer) fn build_world(
             sun_bake,
             baked_sun_encoding: None,
             baked_sun_cache: None,
+            static_sun,
             grass,
             surface_sprite_effects,
             surface_sprite_resident,
@@ -2520,6 +2549,7 @@ pub(in crate::renderer) fn build_world(
             coarse_batches,
             full_batches,
             visibility,
+            inline_pvs: Default::default(),
             coarse_visible_batches_by_cluster,
             full_visible_batches_by_cluster,
             auto4_batches,

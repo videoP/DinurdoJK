@@ -1174,7 +1174,14 @@ pub(in crate::cgame::player_presenter) fn is_asset_pending(error: &str) -> bool 
 pub(in crate::cgame::player_presenter) fn player_model_key(
     info: &crate::cgame::ClientInfo,
 ) -> String {
-    format!("{}|{}", info.model_qpath(), info.skin_qpath()).to_ascii_lowercase()
+    let base = format!("{}|{}", info.model_qpath(), info.skin_qpath()).to_ascii_lowercase();
+    if info.local_body {
+        format!("{base}|body_local")
+    } else if let Some(ref profile) = info.body_wire {
+        format!("{base}|body_v1_{:016x}", profile.fingerprint())
+    } else {
+        format!("{base}|body_default")
+    }
 }
 
 pub(in crate::cgame::player_presenter) fn sibling_default_skin_qpath(

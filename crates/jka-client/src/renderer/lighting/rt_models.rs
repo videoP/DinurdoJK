@@ -72,6 +72,18 @@ impl Renderer {
                         binding: 2,
                         resource: self.lighting_settings_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&world.local_shadows.cube_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&world.local_shadows.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 17,
+                        resource: world.local_shadows.glass_buffer.as_entire_binding(),
+                    },
                 ],
             });
             if let Some(rt) = self.ray_traced_shadows.as_mut() {
@@ -112,7 +124,7 @@ impl Renderer {
                 });
                 let pipeline = |alpha| {
                     create_dynamic_model_pipeline_inner(
-                        &device, &layout, &shader, key.0, key.1, alpha, key.2, true, true, false,
+                        &device, &layout, &shader, key.0, key.1, alpha, key.2, true, true, false, false,
                     )
                 };
                 CompiledRtModelReceivers {
@@ -139,22 +151,46 @@ fn discard_incompatible_receivers(
 }
 
 fn light_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("RT model local lights"),
-        entries: &std::array::from_fn::<_, 3, _>(|binding| wgpu::BindGroupLayoutEntry {
-            binding: binding as u32,
+    let mut entries = std::array::from_fn::<_, 3, _>(|binding| wgpu::BindGroupLayoutEntry {
+        binding: binding as u32,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: if binding == 2 {
+                wgpu::BufferBindingType::Uniform
+            } else {
+                wgpu::BufferBindingType::Storage { read_only: true }
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }).to_vec();
+    entries.extend([
+        wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::CubeArray,
+                multisampled: false,
+            },
+            count: None,
+        },
+        comparison_sampler_entry(5),
+        wgpu::BindGroupLayoutEntry {
+            binding: 17,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
-                ty: if binding == 2 {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage { read_only: true }
-                },
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
-        }),
+        },
+    ]);
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("RT model local lights"),
+        entries: &entries,
     })
 }
 
@@ -232,7 +268,10 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         "\n@group(2) @binding(0) var<storage, read> dynamic_lights: array<PointLight>;\n\
         @group(2) @binding(1) var<storage, read> light_clusters: array<ClusterRecord>;\n\
         @group(2) @binding(2) var<uniform> lighting_settings: LightingSettings;\n\
+        @group(2) @binding(4) var local_shadow_texture: texture_depth_cube_array;\n\
+        @group(2) @binding(5) var local_shadow_sampler: sampler_comparison;\n\
         const ENABLE_LOCAL_SHADOWS: bool = true;\n\
+        const ENABLE_RAY_TRACED_SHADOWS: bool = true;\n\
         const ENABLE_CLUSTERED_LITE_DLIGHTS: bool = false;\n",
     );
     source.push_str(&format!(
@@ -240,7 +279,7 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
     ));
     for line in donor
         .lines()
-        .filter(|line| line.starts_with("const CLUSTER_"))
+        .filter(|line| line.starts_with("const CLUSTER_") || line.starts_with("const LOCAL_SHADOW_NEAR:"))
     {
         source.push_str(line);
         source.push('\n');
@@ -262,10 +301,16 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         "rt_candidate_glass_throughput",
         "rt_trace_shadow_throughput",
         "rt_trace_shadow_query",
+        "rt_trace_shadow_query_mask",
         "rt_local_shadow_rgb",
         "rt_trace_shadow_visibility",
         "ray_traced_local_shadow_visibility",
         "rt_trace_local_visibility",
+        "sample_local_shadow_visibility",
+        "baked_local_moving_maybe",
+        "baked_local_moving_visibility",
+        "local_light_shadow_visibility",
+        "local_light_shadow_rgb",
         "q3map_effective_distance",
         "q3map_surface_angle",
         "local_light_attenuation",
@@ -280,6 +325,15 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             continue;
         }
         source.push_str(declaration(&donor, &format!("fn {name}("))?);
+        source.push('\n');
+    }
+    if crate::renderer::lighting::rt_diagnostics::config().receiver.glass {
+        for name in ["RasterGlassTriangle", "RasterGlassSlot"] {
+            source.push_str(declaration(&donor, &format!("struct {name} "))?);
+            source.push_str(";\n");
+        }
+        source.push_str("@group(2) @binding(17) var<storage, read> raster_glass_slots: array<RasterGlassSlot>;\n");
+        source.push_str(declaration(&donor, "fn raster_glass_throughput(")?);
         source.push('\n');
     }
     for (from, to, count) in [
@@ -471,7 +525,7 @@ mod tests {
                         DynamicModelAlphaMode::MaskBlend,
                     ] {
                         create_dynamic_model_pipeline_inner(
-                            &device, &layout, &shader, format, samples, alpha, fog, true, true, false,
+                            &device, &layout, &shader, format, samples, alpha, fog, true, true, false, false,
                         );
                     }
                 }

@@ -517,10 +517,11 @@ impl Renderer {
             }
         }
 
-        if self.cull_debug_mode == CullDebugMode::RejectionReasons
+        if self.cull_debug_mode.draws_overlay()
             && self.cull_debug_pipeline.is_none()
         {
-            let key = PipelineJobKey::new("cull-debug", 0, pipeline_hash(&(scene_format, samples)));
+            let hiz_only = self.cull_debug_mode == CullDebugMode::HiZOnly;
+            let key = PipelineJobKey::new("cull-debug", 0, pipeline_hash(&(scene_format, samples, hiz_only)));
             if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
                 self.cull_debug_pipeline = Some(pipeline);
             } else {
@@ -529,7 +530,7 @@ impl Renderer {
                 let shader = self.cull_debug_shader.clone();
                 self.pipeline_jobs
                     .request(key, "cull rejection debug", move || {
-                        create_cull_debug_pipeline(&device, &layout, &shader, scene_format, samples)
+                        create_cull_debug_pipeline(&device, &layout, &shader, scene_format, samples, hiz_only)
                     });
             }
         }
@@ -1485,11 +1486,14 @@ fn compile_cached_world_pass<K: Sync + std::fmt::Debug>(
             (i + 1) as u32, jobs.len() as u32, format!("{label}: {concise}"),
         );
         let began = Instant::now();
+        // This worker's own job is one of the active compiles.
+        let others_at_start = crate::pipeline_jobs::active_compiles().saturating_sub(1);
         let pipeline = create(job);
         let elapsed = began.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
-            eprintln!("[SLOW WORLD PIPELINE] {label} {}/{} {} {:.1} ms",
-                i + 1, jobs.len(), concise, elapsed.as_secs_f64() * 1000.0);
+            eprintln!("[SLOW WORLD PIPELINE] {label} {}/{} {} {:.1} ms (other compiles: {} at start, {} at end)",
+                i + 1, jobs.len(), concise, elapsed.as_secs_f64() * 1000.0, others_at_start,
+                crate::pipeline_jobs::active_compiles().saturating_sub(1));
         }
         created_cache.insert(key, pipeline.clone());
         outputs.push(pipeline);
@@ -1517,7 +1521,9 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     if shader_variant.ocean {
         base_jobs.push((ocean_pipeline_key(), false));
     }
-    let pipelines = compile_cached_world_pass("world-runtime", &base_jobs, reusable, cancelled,
+    // The variant's enabled features, so a slow-compile line says what it built.
+    let base_label = format!("world-runtime [{}]", shader_variant.short_label());
+    let pipelines = compile_cached_world_pass(&base_label, &base_jobs, reusable, cancelled,
         |&(key, fog)| WorldPassPipelineIdentity::new(
             shader_variant, WorldPipelinePass::Base { authored_fog: fog },
             key, surface_format, msaa_samples),
@@ -1593,7 +1599,8 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
         let started = Instant::now();
         let (unique, slots) = specialized_pipeline_plan(&plan.material_jobs, shader_variant);
         let modules = super::programs::ProgramModules::default();
-        let compiled = compile_cached_world_pass("world-specialized-runtime", &unique, reusable, cancelled,
+        let label = format!("world-specialized-runtime [{}]", shader_variant.short_label());
+        let compiled = compile_cached_world_pass(&label, &unique, reusable, cancelled,
             |&(key, material)| WorldPassPipelineIdentity::specialized(
                 shader_variant, shader_variant.legacy_fog, key, material,
                 super::programs::uses_minimal_entry(material), surface_format, msaa_samples),
@@ -1745,6 +1752,8 @@ where
             let Some(job) = jobs.get(index) else {
                 break;
             };
+            let _active = (!on_runtime_pipeline_worker)
+                .then(crate::pipeline_jobs::ActiveCompileGuard::begin);
             let job_started = Instant::now();
             // The single world worker compiles a whole set of native PSOs as
             // one outer job. Publish the inner index and material class while

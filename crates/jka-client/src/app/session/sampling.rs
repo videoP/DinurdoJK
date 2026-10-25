@@ -25,18 +25,60 @@ impl GameSession {
         prediction: Option<&crate::app::LivePredictionFrame>,
         input: Option<PlayerPresentationInput>,
     ) -> Option<DemoCameraSample> {
-        let ps = present_player_state(
+        let mut ps = present_player_state(
             self.current_snapshot.as_ref(),
             self.next_snapshot.as_ref(),
             presentation_time_ms,
             prediction,
             input,
         )?;
+        // Prediction failures fall back to snapshots, which can themselves
+        // contain NaNs. Keep those out of the camera, models and audio too.
+        let fallback = self.current_snapshot.as_ref()
+            .map(|snapshot| &snapshot.player_state)
+            .filter(|state| finite_playerstate_vec3(state, "origin").is_some())
+            .or(self.presented_player_state.as_ref());
+        repair_presentation_coordinates(&mut ps, fallback);
         let error = prediction.map_or([0.0; 3], |prediction| prediction.error);
         let mut sample = sample_player_state(&ps, server_time, teleported, error)?;
         sample.presentation_time_ms = presentation_time_ms;
         self.presented_player_state = Some(ps);
         Some(sample)
+    }
+}
+
+fn finite_playerstate_vec3(ps: &jka_protocol::server::PlayerState, field: &str) -> Option<[f32; 3]> {
+    playerstate_vec3(ps, field).filter(|values| values.iter().all(|v| v.is_finite()))
+}
+
+/// Only repair the render copy. Preserve the decoder's exact snapshot/delta
+/// history and leave authority with the server until a valid state arrives.
+fn repair_presentation_coordinates(
+    ps: &mut jka_protocol::server::PlayerState,
+    previous: Option<&jka_protocol::server::PlayerState>,
+) {
+    let previous = previous.filter(|previous| previous.field_i32("clientNum") == ps.field_i32("clientNum"));
+    if finite_playerstate_vec3(ps, "origin").is_none() {
+        // A reconnect can start with an already-invalid player. Keep a finite
+        // render-only placeholder then, so the connection/console stays usable
+        // for /kill instead of failing camera setup before a respawn can arrive.
+        let origin = previous.and_then(|previous| finite_playerstate_vec3(previous, "origin"))
+            .unwrap_or([0.0; 3]);
+        for (axis, value) in origin.into_iter().enumerate() {
+            ps.set_field_bits(&format!("origin[{axis}]"), value.to_bits());
+        }
+    }
+    for field in ["velocity", "viewangles"] {
+        if finite_playerstate_vec3(ps, field).is_none() {
+            let values = if field == "viewangles" {
+                previous.and_then(|previous| finite_playerstate_vec3(previous, field)).unwrap_or([0.0; 3])
+            } else {
+                [0.0; 3]
+            };
+            for (axis, value) in values.into_iter().enumerate() {
+                ps.set_field_bits(&format!("{field}[{axis}]"), value.to_bits());
+            }
+        }
     }
 }
 
@@ -137,9 +179,10 @@ pub(in crate::app) fn sample_player_state(
     teleported: bool,
     error: [f32; 3],
 ) -> Option<DemoCameraSample> {
-    let origin = playerstate_vec3(ps, "origin")?;
-    let view_angles = playerstate_vec3(ps, "viewangles")?;
-    let velocity = playerstate_vec3(ps, "velocity").unwrap_or([0.0; 3]);
+    let origin = finite_playerstate_vec3(ps, "origin")?;
+    let view_angles = finite_playerstate_vec3(ps, "viewangles")?;
+    let velocity = finite_playerstate_vec3(ps, "velocity").unwrap_or([0.0; 3]);
+    let error = if error.iter().all(|v| v.is_finite()) { error } else { [0.0; 3] };
     let view_height = ps.field_i32("viewheight").unwrap_or(0);
     let policy = PlayerViewPolicyState::from_player_state(ps);
     let view_origin = [
@@ -160,6 +203,7 @@ pub(in crate::app) fn sample_player_state(
         view_angles,
         velocity,
         bob_cycle: ps.field_i32("bobCycle").unwrap_or(0),
+        pm_flags: ps.field_i32("pm_flags").unwrap_or(0),
         view_height,
         dead_yaw: ps.stats.get(6).copied().unwrap_or(0) as f32,
         client_num: ps.field_i32("clientNum").unwrap_or(0),
@@ -211,6 +255,43 @@ mod tests {
     use super::*;
     use crate::app::LivePredictionFrame;
     use jka_protocol::server::PlayerState;
+
+    #[test]
+    fn non_finite_snapshot_presentation_holds_last_position_and_recovers_on_respawn() {
+        let mut previous = PlayerState::default();
+        previous.set_field_bits("origin[0]", (-60.261955f32).to_bits());
+        previous.set_field_bits("origin[1]", (-2554.4631f32).to_bits());
+        previous.set_field_bits("origin[2]", (-1934.9353f32).to_bits());
+        let mut bad = previous.clone();
+        bad.set_field_bits("origin[0]", f32::NAN.to_bits());
+        bad.set_field_bits("origin[2]", (-2147483600.0f32).to_bits());
+        bad.set_field_bits("velocity[0]", f32::NAN.to_bits());
+        let wire = bad.clone();
+        assert!(sample_player_state(&bad, 10, false, [0.0; 3]).is_none());
+        repair_presentation_coordinates(&mut bad, Some(&previous));
+        let sample = sample_player_state(&bad, 10, false, [f32::NAN; 3]).unwrap();
+        assert_eq!(sample.native_origin, playerstate_vec3(&previous, "origin").unwrap());
+        assert_eq!(sample.velocity, [0.0; 3]);
+        assert!(wire.field_f32("origin[0]").unwrap().is_nan());
+        // A valid respawn is used immediately, without retaining the old hold.
+        let mut respawn = PlayerState::default();
+        respawn.set_field_bits("origin[0]", 500.0f32.to_bits());
+        let expected = respawn.clone();
+        repair_presentation_coordinates(&mut respawn, Some(&bad));
+        assert_eq!(respawn, expected);
+        assert_eq!(sample_player_state(&respawn, 20, true, [0.0; 3]).unwrap().native_origin, [500.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn non_finite_presentation_does_not_borrow_another_players_position() {
+        let mut previous = PlayerState::default();
+        previous.set_field_bits("origin[0]", 123.0f32.to_bits());
+        let mut bad = previous.clone();
+        bad.set_field_bits("clientNum", 2);
+        bad.set_field_bits("origin[1]", f32::INFINITY.to_bits());
+        repair_presentation_coordinates(&mut bad, Some(&previous));
+        assert_eq!(sample_player_state(&bad, 10, false, [0.0; 3]).unwrap().native_origin, [0.0; 3]);
+    }
 
     fn prediction() -> LivePredictionFrame {
         let mut display = PlayerState::default();

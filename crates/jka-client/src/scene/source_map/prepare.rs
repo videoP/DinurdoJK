@@ -277,6 +277,10 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
     }
 
     let world = &document.entities[world_index];
+    // Source .map previews must publish the same worldspawn music as compiled BSPs.
+    let worldspawn_music = world.properties.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("music"))
+        .map(|(_, value)| value.clone());
     let distance_cull = map_worldspawn_distance_cull(world, &mut warnings);
     let mut static_entity_indices = Vec::with_capacity(1 + grouped_world_indices.len());
     static_entity_indices.push(world_index);
@@ -302,6 +306,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         reconstruct_source_brushes(Arc::clone(&document), &static_entity_indices, jobs)?;
     let reconstruction_ms = reconstruction_started.elapsed().as_secs_f64() * 1000.0;
     let mut source_collision_brushes = Vec::new();
+    let mut water_brush_bounds = Vec::new();
 
     for item in reconstructed_brushes {
         let entity_index = item.entity_index;
@@ -332,6 +337,10 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         // utility-surface filter below. Caulk/nodraw/playerclip must stay in CM
         // even though they never consume a WGPU draw batch.
         if let Some(collision_brush) = source_collision_brush(brush, &reconstructed, &library) {
+            if collision_brush.contents & jka_assets::bsp::bathymetry::CONTENTS_WATER as i32 != 0 {
+                water_brush_bounds.push(crate::ocean::volume::from_jka_bounds(
+                    collision_brush.mins, collision_brush.maxs));
+            }
             source_collision_brushes.push(collision_brush);
         }
 
@@ -666,6 +675,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
         authored_oceans: Vec::new(),
+        water_brush_bounds,
         vertices,
         legacy_dlight_triangle_surfaces: Vec::new(),
         bsp_compiled_model_surfaces: Vec::new(),
@@ -695,6 +705,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         steam_audio_bake_request: None,
         visibility: None,
         lights,
+        static_bake_lights: Vec::new(),
         source_map_lighting,
         sun,
         baked_sun_encoding: None,
@@ -712,6 +723,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         world_effect_registrations,
         brush_entities: Vec::new(),
         entity_graph: None,
+        worldspawn_music,
         distance_cull,
         sky_portal: None,
         triangles,

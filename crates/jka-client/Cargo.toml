@@ -21,7 +21,9 @@ fastnoise-lite = "=1.1.1"
 egui = "=0.36.2"
 egui-wgpu = { version = "=0.36.2", default-features = false }
 egui-winit = "=0.36.2"
-glam = "=0.32.1"
+taffy = { version = "=0.15.0", default-features = false, features = ["std", "flexbox", "taffy_tree"] }
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
+glam.workspace = true
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "tga", "hdr"] }
 image_dds = { version = "=0.7.2", default-features = false, features = ["ddsfile"] }
 libjpeg-turbo-rs = "=0.8.0"
@@ -36,9 +38,12 @@ meshopt = "=0.6.2"
 oximedia-lut = "=0.2.1"
 smaa = { path = "../../vendor/smaa-0.21.0" }
 serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+ed25519-dalek = "=2.2.0"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 rodio = { version = "=0.22.2", default-features = false, features = ["playback", "wav", "mp3", "flac", "vorbis"] }
 audionimbus = { version = "=0.16.0", features = ["auto-install"] }
-rayon = "=1.11.0"
+rayon = "=1.12.0"
 rhai = "=1.26.1"
 serde = { version = "=1.0.228", features = ["derive"] }
 toml = "=0.9.8"
@@ -55,6 +60,10 @@ naga = { version = "=30.0.0", features = ["wgsl-in"] }
 
 [build-dependencies]
 png = "=0.18.1"
+cc = "=1.4.6"
 
 [target.'cfg(windows)'.dependencies]
+# H.264 MP4 videoMap promotion through native Windows Media Foundation + DXVA.
+# MP4 demuxing is built into Windows; no Alhazen/FFmpeg/NASM.
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Security"] }

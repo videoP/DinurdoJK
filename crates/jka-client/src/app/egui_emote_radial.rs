@@ -15,6 +15,51 @@ const EMOTE_INNER: f32 = 0.315;
 const LIBRARY_CATEGORY_OUTER: f32 = 0.55;
 const LIBRARY_EMOTE_INNER: f32 = 0.575;
 const SECTOR_GAP: f32 = 0.016;
+// A wheel with hundreds of individually clickable wedges cannot be used.
+// The library is grouped into at most 12 alphabetic sections, then into
+// pages of at most 24 *real emotes*; no installed emote is omitted.
+const MAX_EMOTES_PER_RING: usize = 24;
+const MAX_BROWSE_SECTIONS: usize = 12;
+
+/// Session-only keyboard browser. A pinned browser must never synthesize
+/// +movement/+attack or trap the mouse cursor like the regular radial wheel.
+#[derive(Default)]
+pub(in crate::app) struct EmoteRadialSearch {
+    pub(in crate::app) pinned: bool,
+    pub(in crate::app) query: String,
+    pub(in crate::app) selection: usize,
+    pub(in crate::app) request_focus: bool,
+    pub(in crate::app) scroll_to_selection: bool,
+    cached_query: String,
+    cached_catalog_ptr: usize,
+    cached_hits: std::sync::Arc<Vec<SearchHit>>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchHit {
+    id: String,
+    title: String,
+    category: String,
+    favorite: bool,
+    rank: u8,
+}
+
+/// Match all query words against the displayed title or stable animation ID.
+/// Give exact/prefix title matches priority over arbitrary substrings.
+fn emote_search_rank(title: &str, id: &str, query: &str) -> Option<u8> {
+    let title = title.to_lowercase();
+    let id = id.to_lowercase();
+    let query = query.trim().to_lowercase();
+    if query.is_empty() { return Some(3); }
+    if !query.split_whitespace().all(|term| title.contains(term) || id.contains(term)) {
+        return None;
+    }
+    Some(if title == query { 0 }
+        else if title.starts_with(&query) { 1 }
+        else if title.contains(&query) { 2 }
+        else { 3 })
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum EmoteCategory {
@@ -22,6 +67,8 @@ pub(in crate::app) enum EmoteCategory {
     Standard,
     Library,
     LibraryCategory(usize),
+    LibraryGroup(usize, usize),
+    LibraryPage(usize, usize, usize),
     Favorites,
 }
 
@@ -29,6 +76,8 @@ impl EmoteCategory {
     fn parent(self) -> Option<Self> {
         match self {
             Self::LibraryCategory(_) => Some(Self::Library),
+            Self::LibraryGroup(category, _) => Some(Self::LibraryCategory(category)),
+            Self::LibraryPage(category, group, _) => Some(Self::LibraryGroup(category, group)),
             _ => None,
         }
     }
@@ -40,6 +89,7 @@ enum Action {
     Command(&'static str),
     /// An installed emote, by catalog ID.
     Emote(String),
+    Match,
     Disabled,
 }
 
@@ -145,12 +195,13 @@ fn standard_catalog(server_mod: ServerMod) -> &'static [Entry] {
     }
 }
 
-fn categories() -> [Entry; 4] {
+fn categories() -> [Entry; 5] {
     [
         Entry::new("TAUNTS", "SABER + GESTURES", Action::Category(EmoteCategory::Taunts)),
         Entry::new("STANDARD", "SERVER MOD", Action::Category(EmoteCategory::Standard)),
         Entry::new("LIBRARY", "BROWSE CATEGORIES", Action::Category(EmoteCategory::Library)),
         Entry::new("FAVORITES", "STARRED EMOTES", Action::Category(EmoteCategory::Favorites)),
+        Entry::new("MATCH", "SYNC WITH AIMED PLAYER", Action::Match),
     ]
 }
 
@@ -166,7 +217,7 @@ fn entries<'a>(category: EmoteCategory, server_mod: ServerMod, library: &'a [Ent
             Entry::cmd("MEDITATE", "meditate"),
         ] },
         EmoteCategory::Standard => standard_catalog(server_mod),
-        EmoteCategory::Library | EmoteCategory::LibraryCategory(_) | EmoteCategory::Favorites => library,
+        EmoteCategory::Library | EmoteCategory::LibraryCategory(_) | EmoteCategory::LibraryGroup(_, _) | EmoteCategory::LibraryPage(_, _, _) | EmoteCategory::Favorites => library,
     }
 }
 
@@ -182,6 +233,60 @@ fn library_entries(favorites: Result<Vec<crate::emotes::Emote>, &'static str>) -
             })
             .collect(),
         Err(reason) => vec![Entry::new(reason, "PROFILE > EMOTES", Action::Disabled)],
+    }
+}
+
+// Split an alphabetically ordered category into at most 12 equally sized
+// sections. A section with more than 24 emotes gets one final page tier.
+// Integer partitioning guarantees that all positions are covered exactly once.
+fn category_sections(len: usize) -> Vec<std::ops::Range<usize>> {
+    if len == 0 { return Vec::new(); }
+    if len <= MAX_EMOTES_PER_RING { return vec![0..len]; }
+    let count = len.div_ceil(MAX_EMOTES_PER_RING).min(MAX_BROWSE_SECTIONS);
+    (0..count).map(|i| len * i / count .. len * (i + 1) / count).collect()
+}
+
+fn section_pages(section: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
+    (section.start..section.end).step_by(MAX_EMOTES_PER_RING)
+        .map(|start| start..(start + MAX_EMOTES_PER_RING).min(section.end)).collect()
+}
+
+fn category_wheel_label(category: &super::emote_wheel::Category) -> String {
+    // Short built-in labels keep a 14-way category wheel readable, while a
+    // custom name in Profile is always respected verbatim.
+    let short = match (category.id.as_str(), category.name.as_str()) {
+        ("dance-street", "Street & Hip-Hop") => Some("STREET"),
+        ("dance-pop", "Pop & Choreo") => Some("POP"),
+        ("dance-party", "Party & Club") => Some("PARTY"),
+        ("dance-goofy", "Goofy & Meme") => Some("GOOFY"),
+        ("dance", "Other Dances") => Some("DANCES"),
+        ("music", "Music & Instruments") => Some("MUSIC"),
+        ("taunt", "Taunts & Trolling") => Some("TAUNTS"),
+        ("celebrate", "Celebrations & Victory") => Some("VICTORY"),
+        ("social", "Greetings & Social") => Some("SOCIAL"),
+        ("reaction", "Reactions & Moods") => Some("MOODS"),
+        ("flex", "Poses & Flex") => Some("POSES"),
+        ("action", "Action & Acrobatics") => Some("ACTION"),
+        ("props", "Props & Activities") => Some("PROPS"),
+        ("misc", "Other Emotes") => Some("OTHER"),
+        _ => None,
+    };
+    short.map(str::to_owned).unwrap_or_else(|| category.name.to_uppercase())
+}
+
+fn short_initial(emote: &crate::emotes::Emote) -> String {
+    crate::emotes::display_title(emote).trim_start().chars()
+        .filter(|c| c.is_alphanumeric()).take(2)
+        .collect::<String>().to_uppercase()
+}
+
+fn range_entry(ordered: &[&crate::emotes::Emote], range: std::ops::Range<usize>, index: usize, count: usize, action: Action) -> Entry {
+    let first = short_initial(ordered[range.start]);
+    let last = short_initial(ordered[range.end - 1]);
+    Entry {
+        label: Cow::Owned(format!("{:02}  {}–{}", index + 1, first, last)),
+        sub: Cow::Owned(format!("{} EMOTES · {}/{}", range.len(), index + 1, count)),
+        action,
     }
 }
 
@@ -236,6 +341,169 @@ fn emote_font_size(painter: &egui::Painter, label: &str, radial_space: f32) -> f
 }
 
 impl App {
+    /// Every installed Fortnite emote is searchable, not just favorites or
+    /// the current radial category. Keep only lightweight labels/IDs per hit.
+    fn emote_radial_search_hits(&mut self) -> std::sync::Arc<Vec<SearchHit>> {
+        let Ok(catalog) = crate::emotes::catalog(&self.base) else {
+            self.emote_radial_search.cached_catalog_ptr = 0;
+            return std::sync::Arc::new(Vec::new());
+        };
+        let ptr = std::sync::Arc::as_ptr(&catalog) as usize;
+        if self.emote_radial_search.cached_catalog_ptr == ptr
+            && self.emote_radial_search.cached_query == self.emote_radial_search.query
+        {
+            return self.emote_radial_search.cached_hits.clone();
+        }
+        let mut hits: Vec<SearchHit> = catalog.iter().filter_map(|root| {
+            let variant_index = self.emote_wheel.variants.get(&root.id).copied()
+                .unwrap_or_else(|| crate::emotes::default_variant_index(root));
+            let selected = root.variants.get(variant_index).unwrap_or(root);
+            let title = crate::emotes::display_title(selected);
+            let rank = emote_search_rank(title, &selected.id, &self.emote_radial_search.query)
+                .or_else(|| emote_search_rank(crate::emotes::display_title(root), &root.id,
+                    &self.emote_radial_search.query))?;
+            let category_id = self.emote_wheel.category_for(root);
+            let category = self.emote_wheel.categories.iter()
+                .find(|c| c.id == category_id).map(|c| c.name.clone())
+                .unwrap_or_else(|| "Other Emotes".into());
+            let favorite = std::iter::once(&root.id).chain(root.catalog_aliases.iter())
+                .chain(root.variants.iter().map(|v| &v.id))
+                .any(|id| self.emote_wheel.favorites.contains(id));
+            Some(SearchHit {
+                id: selected.id.clone(), title: title.to_owned(), category,
+                favorite, rank,
+            })
+        }).collect();
+        hits.sort_by(|a, b| a.rank.cmp(&b.rank)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id)));
+        self.emote_radial_search.cached_query = self.emote_radial_search.query.clone();
+        self.emote_radial_search.cached_catalog_ptr = ptr;
+        self.emote_radial_search.cached_hits = std::sync::Arc::new(hits);
+        self.emote_radial_search.cached_hits.clone()
+    }
+
+    pub(in crate::app) fn emote_radial_search_move(&mut self, step: isize) {
+        if !self.emote_radial_search.pinned { return; }
+        let count = self.emote_radial_search_hits().len();
+        if count == 0 { return; }
+        let current = self.emote_radial_search.selection.min(count - 1);
+        self.emote_radial_search.selection = current.saturating_add_signed(step).min(count - 1);
+        self.emote_radial_search.scroll_to_selection = true;
+        self.egui_repaint_requested = true;
+    }
+
+    pub(in crate::app) fn activate_emote_radial_search_selection(&mut self) {
+        if !self.emote_radial_search.pinned { return; }
+        let hits = self.emote_radial_search_hits();
+        if let Some(hit) = hits.get(self.emote_radial_search.selection) {
+            // Unlike the hold-to-open wheel, pinned browsing stays visible so
+            // another emote can be previewed/played without reopening it.
+            self.play_wheel_emote(&hit.id);
+        }
+    }
+
+    /// A pinned wheel becomes an egui text browser with a real, unlocked
+    /// pointer. Virtualized results keep a 1,800+ item catalog responsive.
+    fn egui_pinned_emote_search(&mut self, root: &mut egui::Ui) {
+        let rect = root.max_rect();
+        root.painter().rect_filled(rect, egui::CornerRadius::ZERO,
+            egui::Color32::from_black_alpha(185));
+        let hits = self.emote_radial_search_hits();
+        if self.emote_radial_search.selection >= hits.len() {
+            self.emote_radial_search.selection = hits.len().saturating_sub(1);
+        }
+        let width = (rect.width() - 48.0).clamp(260.0, 720.0);
+        let mut selected_id = None;
+        let scroll_to_selection = std::mem::take(&mut self.emote_radial_search.scroll_to_selection);
+        let selected_index = self.emote_radial_search.selection;
+        let mut unpin = false;
+        let mut close = false;
+        root.vertical_centered(|ui| {
+            ui.add_space((rect.height() * 0.065).min(55.0));
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(16, 23, 33))
+                .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(18.0)
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.heading("FORTNITE EMOTES");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕ Close").clicked() { close = true; }
+                            if ui.button("Unpin / Wheel").clicked() { unpin = true; }
+                        });
+                    });
+                    ui.label(egui::RichText::new("PINNED SEARCH  ·  Type an emote name or ID")
+                        .color(theme::TEXT_DIM).size(11.0));
+                    ui.add_space(8.0);
+                    let search = ui.add(egui::TextEdit::singleline(&mut self.emote_radial_search.query)
+                        .hint_text("Search any installed emote (e.g. Floss, EID_...)")
+                        .desired_width(f32::INFINITY));
+                    if self.emote_radial_search.request_focus {
+                        search.request_focus();
+                        self.emote_radial_search.request_focus = false;
+                    }
+                    if search.changed() {
+                        self.emote_radial_search.selection = 0;
+                        self.emote_radial_search.scroll_to_selection = true;
+                        self.egui_repaint_requested = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} matches", hits.len()));
+                        ui.label(egui::RichText::new("↑↓ navigate   ·   Enter play   ·   Tab wheel   ·   Esc close")
+                            .color(theme::TEXT_DIM).size(10.0));
+                    });
+                    ui.separator();
+                    if hits.is_empty() {
+                        ui.add_space(20.0);
+                        ui.label(if self.emote_radial_search.query.trim().is_empty() {
+                            "No installed Fortnite emotes are loaded."
+                        } else { "No matching installed emotes." });
+                    } else {
+                        // Fixed-height rows let egui skip drawing thousands
+                        // of offscreen results while preserving full scroll.
+                        let mut area = egui::ScrollArea::vertical()
+                            .id_salt("pinned_emote_results")
+                            .max_height((rect.height() - 240.0).clamp(120.0, 580.0));
+                        if scroll_to_selection {
+                            area = area.vertical_scroll_offset(selected_index as f32 * 35.0);
+                        }
+                        area.show_rows(ui, 31.0, hits.len(), |ui, range| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                for index in range {
+                                    let hit = &hits[index];
+                                    let text = format!("{}{}    ·    {}", if hit.favorite { "★ " } else { "" },
+                                        hit.title, hit.category);
+                                    let row = ui.add_sized(
+                                        [ui.available_width(), 31.0],
+                                        egui::Button::new(text)
+                                            .selected(self.emote_radial_search.selection == index),
+                                    );
+                                    if row.clicked() {
+                                        self.emote_radial_search.selection = index;
+                                        self.emote_radial_search.request_focus = true;
+                                        selected_id = Some(hit.id.clone());
+                                    }
+                                    if row.hovered() {
+                                        row.on_hover_text(hit.id.as_str());
+                                    }
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new(
+                        "Click a result or press Enter to play. The browser remains open until closed."
+                    ).color(theme::TEXT_DIM).size(11.0));
+                });
+        });
+        if close { self.close_emote_radial(); }
+        else if unpin { self.toggle_emote_radial_search(); }
+        else if let Some(id) = selected_id { self.play_wheel_emote(&id); }
+    }
+
     pub(in crate::app) fn emote_radial_back(&mut self) {
         if self.emote_radial_category.is_some() {
             self.emote_radial_category = self.emote_radial_category.and_then(EmoteCategory::parent);
@@ -277,35 +545,106 @@ impl App {
                 self.close_emote_radial();
                 self.play_wheel_emote(&id);
             }
+            Action::Match => self.match_crosshair_emote(),
             Action::Disabled => {}
         }
     }
 
     fn radial_library_entries(&self, category: EmoteCategory) -> Vec<Entry> {
-        match category {
-            EmoteCategory::Library => self.emote_wheel.categories.iter().enumerate()
-                .map(|(index, category)| Entry {
-                    label: Cow::Owned(category.name.to_uppercase()),
-                    sub: Cow::Borrowed("BROWSE EMOTES"),
-                    action: Action::Category(EmoteCategory::LibraryCategory(index)),
-                }).collect(),
-            EmoteCategory::LibraryCategory(index) => {
-                let Some(category) = self.emote_wheel.categories.get(index) else {
-                    return library_entries(Err("CATEGORY UNAVAILABLE"));
-                };
-                library_entries(crate::emotes::catalog(&self.base)
-                    .map_err(|_| "EMOTE LIBRARY LOADING OR UNAVAILABLE")
-                    .and_then(|catalog| {
-                        let emotes = self.emote_wheel.catalog_emotes(&catalog, Some(&category.id));
-                        if emotes.is_empty() { Err("NO EMOTES IN THIS CATEGORY") } else { Ok(emotes) }
-                    }))
-            }
-            EmoteCategory::Favorites => library_entries(self.wheel_favorite_emotes()),
-            _ => Vec::new(),
+        if category == EmoteCategory::Library {
+            let counts = crate::emotes::catalog(&self.base).ok().map(|catalog| {
+                let mut counts = std::collections::HashMap::<String, usize>::new();
+                for emote in catalog.iter() {
+                    *counts.entry(self.emote_wheel.category_for(emote)).or_default() += 1;
+                }
+                counts
+            });
+            return self.emote_wheel.categories.iter().enumerate().map(|(index, category)| Entry {
+                label: Cow::Owned(category_wheel_label(category)),
+                sub: Cow::Owned(match &counts {
+                    Some(counts) => format!("{} · {} EMOTES", category.name.to_uppercase(),
+                        counts.get(&category.id).copied().unwrap_or(0)),
+                    None => format!("{} · LOADING", category.name.to_uppercase()),
+                }),
+                action: Action::Category(EmoteCategory::LibraryCategory(index)),
+            }).collect();
         }
+        if category == EmoteCategory::Favorites {
+            return library_entries(self.wheel_favorite_emotes());
+        }
+        let category_index = match category {
+            EmoteCategory::LibraryCategory(index)
+            | EmoteCategory::LibraryGroup(index, _)
+            | EmoteCategory::LibraryPage(index, _, _) => index,
+            _ => return Vec::new(),
+        };
+        let Some(selected_category) = self.emote_wheel.categories.get(category_index) else {
+            return library_entries(Err("CATEGORY UNAVAILABLE"));
+        };
+        let Ok(catalog) = crate::emotes::catalog(&self.base) else {
+            return library_entries(Err("EMOTE LIBRARY LOADING OR UNAVAILABLE"));
+        };
+        // Keep source references instead of cloning every animation/prop/pose
+        // just to build a list of browse labels at the menu refresh rate.
+        // The catalogue is already title-sorted in emotes::group_titles;
+        // retain that order instead of re-sorting thousands of rows each frame.
+        let ordered: Vec<_> = catalog.iter()
+            .filter(|emote| self.emote_wheel.category_for(emote) == selected_category.id)
+            .collect();
+        if ordered.is_empty() {
+            return library_entries(Err("NO EMOTES IN THIS CATEGORY"));
+        }
+        let sections = category_sections(ordered.len());
+        let display_range = match category {
+            EmoteCategory::LibraryCategory(index) if ordered.len() > MAX_EMOTES_PER_RING => {
+                return sections.iter().enumerate().map(|(i, range)| {
+                    range_entry(&ordered, range.clone(), i, sections.len(),
+                        Action::Category(EmoteCategory::LibraryGroup(index, i)))
+                }).collect();
+            }
+            EmoteCategory::LibraryCategory(_) => 0..ordered.len(),
+            EmoteCategory::LibraryGroup(index, group) => {
+                let Some(section) = sections.get(group) else {
+                    return library_entries(Err("SECTION UNAVAILABLE"));
+                };
+                let pages = section_pages(section.clone());
+                if pages.len() > 1 {
+                    return pages.iter().enumerate().map(|(i, range)| {
+                        range_entry(&ordered, range.clone(), i, pages.len(),
+                            Action::Category(EmoteCategory::LibraryPage(index, group, i)))
+                    }).collect();
+                }
+                section.clone()
+            }
+            EmoteCategory::LibraryPage(_, group, page) => {
+                let Some(section) = sections.get(group) else {
+                    return library_entries(Err("SECTION UNAVAILABLE"));
+                };
+                let pages = section_pages(section.clone());
+                let Some(range) = pages.get(page) else {
+                    return library_entries(Err("PAGE UNAVAILABLE"));
+                };
+                range.clone()
+            }
+            _ => unreachable!(),
+        };
+        ordered[display_range].iter().map(|root| {
+            let variant = self.emote_wheel.variants.get(&root.id).copied()
+                .unwrap_or_else(|| crate::emotes::default_variant_index(root));
+            let selected = root.variants.get(variant).unwrap_or(root);
+            Entry {
+                label: Cow::Owned(crate::emotes::display_title(selected).to_uppercase()),
+                sub: Cow::Owned(selected.id.clone()),
+                action: Action::Emote(selected.id.clone()),
+            }
+        }).collect()
     }
 
     pub(super) fn egui_emote_radial(&mut self, root: &mut egui::Ui) {
+        if self.emote_radial_search.pinned {
+            self.egui_pinned_emote_search(root);
+            return;
+        }
         let rect = root.max_rect();
         let center = rect.center();
         // Keep the outer tier on screen at low resolution. At 1080p it has
@@ -321,7 +660,7 @@ impl App {
             (!items.is_empty()).then(|| selected_sector(self.dev_radial_offset, items.len()))
         });
         let selected_inner = if chosen_category.is_none() {
-            Some(selected_sector(self.dev_radial_offset, 4))
+            Some(selected_sector(self.dev_radial_offset, categories().len()))
         } else { None };
 
         painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_black_alpha(92));
@@ -331,7 +670,8 @@ impl App {
         // slice has an individually visible full label even with 30+ emotes.
         // Keep the Library categories in their own middle band when the
         // selected category's emotes open in a third, separate outer band.
-        let library_categories = if matches!(chosen_category, Some(EmoteCategory::LibraryCategory(_))) {
+        let library_categories = if matches!(chosen_category, Some(EmoteCategory::LibraryCategory(_)
+            | EmoteCategory::LibraryGroup(_, _) | EmoteCategory::LibraryPage(_, _, _))) {
             self.radial_library_entries(EmoteCategory::Library)
         } else { Vec::new() };
         let mut rings = Vec::with_capacity(2);
@@ -341,7 +681,8 @@ impl App {
                     rings.push((items, outer * EMOTE_INNER, outer * LIBRARY_CATEGORY_OUTER, selected_outer));
                 }
             }
-            Some(EmoteCategory::LibraryCategory(index)) => {
+            Some(EmoteCategory::LibraryCategory(index) | EmoteCategory::LibraryGroup(index, _)
+                | EmoteCategory::LibraryPage(index, _, _)) => {
                 rings.push((library_categories.as_slice(), outer * EMOTE_INNER,
                     outer * LIBRARY_CATEGORY_OUTER, Some(index)));
                 if let Some(items) = catalog {
@@ -429,6 +770,10 @@ impl App {
             Some(EmoteCategory::Library) => "LIBRARY / CATEGORIES".to_owned(),
             Some(EmoteCategory::LibraryCategory(index)) => self.emote_wheel.categories.get(index)
                 .map(|c| format!("LIBRARY / {}", c.name.to_uppercase())).unwrap_or_default(),
+            Some(EmoteCategory::LibraryGroup(index, group)) => self.emote_wheel.categories.get(index)
+                .map(|c| format!("{} / SECTION {}", c.name.to_uppercase(), group + 1)).unwrap_or_default(),
+            Some(EmoteCategory::LibraryPage(index, group, page)) => self.emote_wheel.categories.get(index)
+                .map(|c| format!("{} / SECTION {} / PAGE {}", c.name.to_uppercase(), group + 1, page + 1)).unwrap_or_default(),
             Some(EmoteCategory::Favorites) => "FAVORITES".to_owned(),
             _ => String::new(),
         };
@@ -452,8 +797,8 @@ impl App {
         painter.text(center + egui::vec2(0.0, outer + 17.0), egui::Align2::CENTER_CENTER,
             footer, egui::FontId::proportional(12.0), theme::TEXT);
         painter.text(center + egui::vec2(0.0, outer + 33.0), egui::Align2::CENTER_CENTER,
-            if chosen_category.is_some() { "LEFT CLICK SELECT  ·  RIGHT CLICK BACK  ·  RELEASE CANCELS" }
-            else { "LEFT CLICK OPEN  ·  RIGHT CLICK CLOSE  ·  RELEASE CANCELS" },
+            if chosen_category.is_some() { "LEFT CLICK SELECT  ·  RIGHT CLICK BACK  ·  TAB PIN + SEARCH  ·  RELEASE CANCELS" }
+            else { "LEFT CLICK OPEN  ·  TAB PIN + SEARCH  ·  RELEASE CANCELS" },
             egui::FontId::proportional(9.0), theme::TEXT_DIM);
     }
 }
@@ -461,12 +806,49 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_is_case_insensitive_and_ranked() {
+        assert_eq!(emote_search_rank("Floss", "EID_Floss", "FLOSS"), Some(0));
+        assert_eq!(emote_search_rank("Flossing", "EID_Flossing", "flo"), Some(1));
+        assert_eq!(emote_search_rank("Windmill Floss", "EID_WindmillFloss", "floss"), Some(2));
+        assert_eq!(emote_search_rank("Dance", "EID_OrangeJustice", "orange"), Some(3));
+        assert_eq!(emote_search_rank("Dance", "EID_Wave", "no match"), None);
+        assert_eq!(emote_search_rank("Windmill Floss", "EID_Windmill", "wind floss"), Some(3));
+    }
+
     use std::collections::HashSet;
 
     #[test]
+    fn huge_library_has_small_complete_non_overlapping_browse_rings() {
+        for size in [1, 24, 25, 100, 288, 1852, 4500] {
+            let sections = category_sections(size);
+            assert!(sections.len() <= MAX_BROWSE_SECTIONS);
+            let mut recovered = Vec::new();
+            for section in sections {
+                let pages = section_pages(section);
+                assert!(pages.len() <= MAX_EMOTES_PER_RING);
+                for range in pages {
+                    assert!(range.len() <= MAX_EMOTES_PER_RING);
+                    recovered.extend(range);
+                }
+            }
+            assert_eq!(recovered, (0..size).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn nested_library_backtracks_one_level_at_a_time() {
+        assert_eq!(EmoteCategory::LibraryPage(3, 2, 5).parent(), Some(EmoteCategory::LibraryGroup(3, 2)));
+        assert_eq!(EmoteCategory::LibraryGroup(3, 2).parent(), Some(EmoteCategory::LibraryCategory(3)));
+        assert_eq!(EmoteCategory::LibraryCategory(3).parent(), Some(EmoteCategory::Library));
+    }
+
+    #[test]
     fn no_navigation_sectors_and_complete_standard_catalogs() {
-        assert_eq!(categories().len(), 4);
+        assert_eq!(categories().len(), 5);
         assert_eq!(categories()[3].action, Action::Category(EmoteCategory::Favorites));
+        assert_eq!(categories()[4].action, Action::Match);
         assert_eq!(standard_catalog(ServerMod::Japlus).len(), 29);
         assert_eq!(standard_catalog(ServerMod::Japro).len(), 32);
         assert!(standard_catalog(ServerMod::Base).is_empty());
@@ -512,11 +894,8 @@ mod tests {
 
     #[test]
     fn sectors_are_stable_with_large_catalogs() {
-        assert_eq!(selected_sector([0.0, -0.28], 4), 0);
-        assert_eq!(selected_sector([1.0, 0.0], 4), 1);
-        assert_eq!(selected_sector([0.0, 1.0], 4), 2);
-        assert_eq!(selected_sector([-1.0, 0.0], 4), 3);
-        for n in [5, 29, 32] {
+        assert_eq!(selected_sector([0.0, -0.28], 5), 0);
+        for n in [4, 5, 29, 32] {
             for i in 0..n {
                 let angle = -FRAC_PI_2 + i as f32 * 2.0 * PI / n as f32;
                 assert_eq!(selected_sector([angle.cos(), angle.sin()], n), i);

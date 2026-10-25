@@ -17,6 +17,20 @@ use crate::cgame::player_presenter::{
     MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_SKIN_BYTES, OPENJK_DEFAULT_GLA_NAME,
 };
 
+/// NPC topology is authored by the server-selected GLM, never by local
+/// Profile sliders. Shared by both the synchronous and worker load paths.
+fn npc_remesh_tuning() -> JiggleRemeshTuning {
+    JiggleRemeshTuning::default()
+}
+
+#[cfg(test)]
+#[test]
+fn npc_remesh_tuning_is_neutral() {
+    let user_tuning = JiggleRemeshTuning { breast_size: 2.0, glute_size: 3.0, ..Default::default() };
+    assert_ne!(user_tuning, npc_remesh_tuning());
+    assert_eq!(npc_remesh_tuning(), JiggleRemeshTuning::default());
+}
+
 pub(in crate::cgame::player_presenter) enum ModelLookup {
     Ready(Arc<PlayerModelAsset>),
     Pending,
@@ -977,6 +991,7 @@ fn build_character_model(
         animation_gla,
         retargeter,
         source_native_pivots: body_shape_pivots,
+        source_imported: false,
         source_jiggles: None,
         source_jiggles_enabled: false,
         emote_contacts: Default::default(),
@@ -1260,7 +1275,9 @@ impl PlayerPresenter {
             ModelLookup::Pending | ModelLookup::Missing => {}
         }
 
-        let jiggle_remesh = self.jiggle_remesh;
+        // NPC models must retain their authored geometry. The presenter's
+        // remesh settings belong exclusively to the connection-owned player.
+        let jiggle_remesh = npc_remesh_tuning();
         let result = build_npc_model(
             &mut SyncModelSource { presenter: self },
             request,
@@ -1338,7 +1355,9 @@ impl PlayerPresenter {
         info: &crate::cgame::ClientInfo,
         key: String,
     ) -> Result<PlayerModelAsset, String> {
-        let jiggle_remesh = self.jiggle_remesh;
+        let jiggle_remesh = if info.local_body { self.jiggle_remesh }
+            else { info.body_wire.as_ref().map_or_else(JiggleRemeshTuning::default,
+                crate::profile_wire::BodyWire::to_tuning) };
         build_player_model(
             &mut SyncModelSource { presenter: self },
             info,
@@ -1380,7 +1399,9 @@ impl PlayerPresenter {
         let shared = Arc::clone(&self.load_shared);
         let job_info = info.clone();
         let job_key = key.to_owned();
-        let jiggle_remesh = self.jiggle_remesh;
+        let jiggle_remesh = if info.local_body { self.jiggle_remesh }
+            else { info.body_wire.as_ref().map_or_else(JiggleRemeshTuning::default,
+                crate::profile_wire::BodyWire::to_tuning) };
         let requested = self
             .async_models
             .request(key, AssetPriority::High, move || {
@@ -1420,7 +1441,8 @@ impl PlayerPresenter {
         let shared = Arc::clone(&self.load_shared);
         let job_request = request.clone();
         let job_key = key.to_owned();
-        let jiggle_remesh = self.jiggle_remesh;
+        // Match the synchronous NPC path: no local-only body remesh on NPCs.
+        let jiggle_remesh = npc_remesh_tuning();
         let requested = self.async_models.request(key, AssetPriority::High, move || {
             asset_jobs::with_worker_vfs(&source, |vfs| {
                 build_npc_model(

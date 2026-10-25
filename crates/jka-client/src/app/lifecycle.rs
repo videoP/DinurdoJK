@@ -81,11 +81,17 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        if headless() {
+            self.window_focused = false;
+            self.video.fullscreen = FullscreenMode::Windowed;
+            self.applied_fullscreen = FullscreenMode::Windowed;
+        }
         // Set up placement/fullscreen while hidden, then show the native window
         // before graphics initialization so startup is not console-only.
         let mut attributes = Window::default_attributes()
             .with_title("DinurdoJK")
             .with_visible(false)
+            .with_active(!headless())
             .with_inner_size(PhysicalSize::new(
                 self.video.resolution[0],
                 self.video.resolution[1],
@@ -102,7 +108,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::WindowCreated);
-        if !self.video.fullscreen.is_windowed() {
+        if !self.video.fullscreen.is_windowed() && !headless() {
             if let Err(error) = Self::apply_fullscreen_mode(
                 &window,
                 self.video.fullscreen,
@@ -167,6 +173,9 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Event,
         );
         match event {
+            UserEvent::Update(event) => {
+                self.handle_update_event(event);
+            }
             UserEvent::SavedAccountsReady(result) => {
                 // An account edit (possibly a save) may have happened while
                 // the worker was enumerating. Never overwrite that newer UI
@@ -188,6 +197,10 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.frontend_stage.cache_pending = false;
                     if let Some(image) = image {
+                        // One decoded bitmap feeds the normal egui fallback AND
+                        // the WGPU compositor. The copy/upload is on the render
+                        // thread, never the UI frame loop.
+                        self.render_command(crate::renderer::RenderCommand::SetNeonMenuCache(Some(image.clone())));
                         self.frontend_scene_texture = Some(self.egui_ctx.load_texture(
                             "frontend-scene-snapshot", image, egui::TextureOptions::LINEAR,
                         ));
@@ -196,6 +209,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::FrontendStagePresented(token) => self.on_frontend_stage_presented(token),
+            UserEvent::NeonMenuCompositorReady => {
+                self.neon_menu.renderer_ready = true;
+                self.egui_repaint_requested = true;
+            },
             UserEvent::GammaPrepared(generation) => self.on_gamma_prepared(generation),
             UserEvent::HardwareGamma(status) => self.on_hardware_gamma(status),
             UserEvent::ConsoleCommand(command) => {
@@ -240,10 +257,18 @@ impl ApplicationHandler<UserEvent> for App {
                         bgra,
                         depth_f32le,
                     }) => {
-                        self.on_demo_video_frame(frame_index, width, height, bgra, depth_f32le);
+                        if self.render_studio.still.is_some() {
+                            self.on_render_studio_still_frame(frame_index, width, height, bgra, depth_f32le);
+                        } else if self.render_studio.export.is_some() {
+                            self.on_render_studio_frame(frame_index, width, height, bgra, depth_f32le);
+                        } else if self.demo_video_export.is_some() {
+                            self.on_demo_video_frame(frame_index, width, height, bgra, depth_f32le);
+                        }
                     }
                     Err(error) => {
-                        if self.demo_video_export.is_some() {
+                        if self.render_studio.export.is_some() || self.render_studio.still.is_some() {
+                            self.fail_render_studio_export(format!("frame capture failed: {error}"));
+                        } else if self.demo_video_export.is_some() {
                             self.fail_demo_video_export(format!("frame capture failed: {error}"));
                         } else {
                             self.console_status = format!("SCREENSHOT CAPTURE FAILED: {error}");
@@ -354,6 +379,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::BlueWaterThunder(volume) => {
+                if self.renderer_restart_suspended {
+                    return;
+                }
                 if self.video.blue_water_environment.weather_backend==1 {
                     if let Some(sound)=self.game_session.as_mut().and_then(|s|s.sound_presenter.as_mut()) {sound.play_weather_thunder(volume);}
                 }
@@ -379,12 +407,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 total_ms
                             );
                         }
+                        self.resume_client_after_video_restart();
                         self.begin_pending_video_confirmation();
                         self.publish_ui();
                     }
                     return;
                 }
                 self.startup_first_frame_seen = true;
+                if self.updater.auto_check && !headless() && !self.video.skip_ui {
+                    self.check_for_updates(false);
+                }
                 if self.front_end {
                     self.console_status = "MAIN MENU".into();
                     self.publish_ui();
@@ -534,6 +566,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.console_status = format!("RENDERER ERROR: {error}");
                 self.push_console_line(format!("^1{}", self.console_status));
 
+                // Without a fallback, unblock input so the user can quit or
+                // recover from console rather than being trapped in restart.
+                if self.pending_renderer_restart.is_none()
+                    && self.pending_video_confirmation.is_none()
+                    && self.video_confirmation.is_none()
+                {
+                    self.resume_client_after_video_restart();
+                }
                 // A renderer restart can fail asynchronously after RenderThread::spawn
                 // has returned (for example a DXGI surface/configuration failure).
                 // Do not leave the user staring at a dead renderer until the normal
@@ -1234,6 +1274,7 @@ impl ApplicationHandler<UserEvent> for App {
                             &map.fx_runners,
                             &map.world_effect_registrations,
                             &map.brush_entities,
+                            map.worldspawn_music.as_deref(),
                             map.visibility
                                 .as_ref()
                                 .map(jka_assets::bsp::Visibility::area_locator),
@@ -1371,6 +1412,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pending_frontend_map_launch = false;
                 self.preserve_game_state_on_next_map_upload = false;
                 self.renderer_restart_started = None;
+                if self.pending_video_confirmation.is_none() && self.video_confirmation.is_none() {
+                    self.resume_client_after_video_restart();
+                }
                 eprintln!(
                     "Map load failed for {name} after {:.1} ms: {error}",
                     started.elapsed().as_secs_f64() * 1000.0
@@ -1840,6 +1884,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // the demo clock from the first snapshot now.
                 self.start_demo_after_map_load(&name);
 
+                // The world is now actually visible. Restore gameplay/audio
+                // before the separate keep/revert confirmation window begins.
+                self.resume_client_after_video_restart();
                 // Start the keep/revert clock only after a real world frame has
                 // been rendered. This gives the user the full timeout to inspect
                 // the new mode instead of spending it on adapter/device/pipeline
@@ -1886,6 +1933,39 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Input,
         );
 
+        if self.renderer_restart_suspended {
+            // Still service native window/display events so wgpu surface
+            // replacement and CloseRequested continue working. Ignore ALL
+            // gameplay/UI keyboard, mouse and wheel actions (including Alt+Enter).
+            if let WindowEvent::Focused(focused) = &event {
+                self.window_focused = *focused;
+                self.sync_gamma_focus();
+                self.set_capture(false);
+                return;
+            }
+            if matches!(&event,
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::ModifiersChanged(..)
+            ) {
+                return;
+            }
+        }
+
+        if self.video_confirmation.is_some()
+            && matches!(&event,
+                WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorMoved { .. }
+            )
+        {
+            return;
+        }
+
+        if self.studio_navigation_window_event(&event) { return; }
+
         // A focused Remap Editor text field owns *every* typed key before
         // global shortcuts and Dev-bind dismissal. Otherwise a shader path
         // containing a key bound to /dev (or the console toggle) would close
@@ -1901,6 +1981,43 @@ impl ApplicationHandler<UserEvent> for App {
         {
             let _ = self.route_egui_window_event(&event);
             return;
+        }
+
+        // Pinned search is a modal text-input owner. Process navigation here,
+        // before global binds, and send every other keystroke to egui. While
+        // it is pinned the original emote key can be released safely.
+        if self.overlay == OverlayMode::EmoteRadial {
+            if let WindowEvent::KeyboardInput { event: key, .. } = &event {
+                if let PhysicalKey::Code(code) = key.physical_key {
+                    if key.state == ElementState::Pressed && code == KeyCode::Tab {
+                        if !key.repeat { self.toggle_emote_radial_search(); }
+                        return;
+                    }
+                    if self.emote_radial_search.pinned {
+                        if self.key_bound_to_emote(code) && key.state == ElementState::Released {
+                            self.keys.remove(&code);
+                            self.execute_binding_release_from(
+                                keybinds::bind_key_for_code(code), BindKey::Keyboard(code));
+                        }
+                        if key.state == ElementState::Pressed {
+                            match code {
+                                KeyCode::Escape if !key.repeat => { self.close_emote_radial(); return; }
+                                KeyCode::Enter | KeyCode::NumpadEnter if !key.repeat => {
+                                    self.activate_emote_radial_search_selection(); return;
+                                }
+                                KeyCode::ArrowUp => { self.emote_radial_search_move(-1); return; }
+                                KeyCode::ArrowDown => { self.emote_radial_search_move(1); return; }
+                                _ => {}
+                            }
+                        }
+                        let _ = self.route_egui_window_event(&event);
+                        return;
+                    }
+                } else if self.emote_radial_search.pinned {
+                    let _ = self.route_egui_window_event(&event);
+                    return;
+                }
+            }
         }
 
         // Alt+Enter is an application-level display shortcut. Handle it before
@@ -1945,9 +2062,31 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // In pinned search the OS cursor and egui own clicks; only release
+        // a held emote mouse bind silently (do NOT close the pinned browser).
+        if self.overlay == OverlayMode::EmoteRadial && self.emote_radial_search.pinned {
+            if let WindowEvent::MouseInput { state: ElementState::Released, button, .. } = &event {
+                if self.mouse_button_bound_to_emote(*button) {
+                    let number = match button {
+                        MouseButton::Left => Some(1), MouseButton::Right => Some(2),
+                        MouseButton::Middle => Some(3), MouseButton::Back => Some(4),
+                        MouseButton::Forward => Some(5), _ => None,
+                    };
+                    if let Some(number) = number {
+                        self.mouse_buttons_down.remove(&number);
+                        self.execute_binding_release(BindKey::Mouse(number));
+                    }
+                }
+            }
+            if matches!(&event, WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }) {
+                let _ = self.route_egui_window_event(&event);
+                return;
+            }
+        }
+
         // Both wheels own their mouse input before egui/gameplay. A category
         // click stays in the same captured overlay; only a command click commits.
-        if self.overlay == OverlayMode::EmoteRadial {
+        if self.overlay == OverlayMode::EmoteRadial && !self.emote_radial_search.pinned {
             if let WindowEvent::MouseInput { state, button, .. } = &event {
                 if *state == ElementState::Released && self.mouse_button_bound_to_emote(*button) {
                     let number = match button {
@@ -2215,7 +2354,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_gamma_focus();
                 self.apply_audio_mix();
 
-                if focused {
+                if focused && !headless() {
                     if let Some(window) = self.window.as_ref() {
                         // Cancel any outstanding taskbar/dock attention request
                         // as soon as the user returns to the game.
@@ -2814,11 +2953,22 @@ impl ApplicationHandler<UserEvent> for App {
         device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        if self.demo_video_export.is_some() {
+        if headless() || self.demo_video_export.is_some() || self.renderer_restart_suspended {
+            return;
+        }
+        if self.render_studio.navigation.looking {
+            if !self.studio_navigation_available() {
+                self.set_studio_mouse_look(false);
+            } else if let DeviceEvent::MouseMotion { delta } = event {
+                self.render_studio.navigation.raw_delta[0] += delta.0 as f32;
+                self.render_studio.navigation.raw_delta[1] += delta.1 as f32;
+                self.egui_repaint_requested = true;
+            }
             return;
         }
         if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial) {
-            if self.window_focused {
+            if self.window_focused && (self.overlay != OverlayMode::EmoteRadial
+                || !self.emote_radial_search.pinned) {
                 if let DeviceEvent::MouseMotion { delta } = event {
                     // Raw relative mouse movement drives a virtual stick.
                     // Clamp its *length*, not X/Y independently: this avoids

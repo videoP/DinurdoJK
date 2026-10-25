@@ -62,6 +62,7 @@ impl PlayerPresenter {
 
     /// `CG_G2MarkEvent`: burn a decal onto the hit player's model.
     pub(in crate::cgame::player_presenter) fn add_gore_mark(&mut self, event: &PresentationEvent) {
+        const WP_SABER: i32 = 3;
         const WP_BRYAR_PISTOL: i32 = 4;
         const WP_BLASTER: i32 = 5;
         const WP_DISRUPTOR: i32 = 6;
@@ -71,7 +72,8 @@ impl PlayerPresenter {
         const WP_THERMAL: i32 = 12;
         const WP_CONCUSSION: i32 = 15;
         const WP_BRYAR_OLD: i32 = 16;
-        const WP_TURRET: i32 = 17;
+        const WP_EMPLACED_GUN: i32 = 17;
+        const WP_TURRET: i32 = 18;
         if self.gore_limit == 0 {
             return;
         }
@@ -81,47 +83,58 @@ impl PlayerPresenter {
         };
         let (size, shader) = match state.field_i32("weapon").unwrap_or(0) {
             WP_BRYAR_PISTOL | WP_CONCUSSION | WP_BRYAR_OLD | WP_BLASTER | WP_DISRUPTOR
-            | WP_BOWCASTER | WP_REPEATER | WP_TURRET => (4.0, "gfx/damage/bodyburnmark1"),
+            | WP_BOWCASTER | WP_REPEATER | WP_EMPLACED_GUN | WP_TURRET => (4.0, "gfx/damage/bodyburnmark1"),
+            WP_SABER => (6.0, "gfx/damage/bodyburnmark1"),
             WP_ROCKET_LAUNCHER | WP_THERMAL => (24.0, "gfx/damage/bodybigburnmark1"),
             _ => return,
         };
-        let Some(snaps) = self.last_gpu.get(&target) else {
-            return;
-        };
         let origin = crate::cgame::entity_vec3(state, "origin").unwrap_or(event.position);
         let predicted = crate::cgame::entity_vec3(state, "origin2").unwrap_or(origin);
-        let id = self.gore_next_id;
-        self.gore_next_id = self.gore_next_id.wrapping_add(1);
-        let surfaces = crate::cgame::player_gore::build_gore(
-            snaps,
-            id,
-            origin,
-            predicted,
-            event.parm != 0,
-            size,
-        );
-        if surfaces.is_empty() {
-            return;
-        }
-        while self
-            .gore
-            .iter()
-            .filter(|gore| gore.entity == target)
-            .count()
-            >= self.gore_limit
-        {
-            let Some(oldest) = self.gore.iter().position(|gore| gore.entity == target) else {
-                break;
-            };
-            self.gore.remove(oldest);
-        }
-        self.gore.push(crate::cgame::player_gore::Gore {
-            entity: target,
-            start_time: event.server_time,
-            life_ms: 10_000 + (event.receive_sequence.wrapping_mul(7919) % 10_001) as i32,
-            shader,
-            surfaces,
+        // Events may precede the player's first presented skinned frame (also
+        // true after teleport/demo seeks). Do not throw a valid server mark away.
+        self.pending_gore.push(crate::cgame::player_gore::PendingGore {
+            entity: target, start: origin, end: predicted,
+            trace: event.parm != 0, size, shader: shader.to_owned(),
+            time: event.server_time, sequence: event.receive_sequence,
         });
+        if self.pending_gore.len() > 256 { self.pending_gore.remove(0); }
+    }
+
+    /// FX_GHOUL2_DECALS / SFxHelper::AddGhoul2Decal: project the authored
+    /// impact shader onto a nearby player's actual GPU-skinned triangles.
+    /// The short ray must hit skinned geometry: mere proximity to a player
+    /// must never paint them through BSP walls.
+    pub(crate) fn add_authored_ghoul2_decals(&mut self, decals: &[crate::fx::system::FxDecalSpawn], now: i32) {
+        if self.gore_limit == 0 { return; }
+        for decal in decals {
+            let normal = decal.normal;
+            let start = std::array::from_fn(|i| decal.origin[i] + normal[i] * 8.0);
+            let end = std::array::from_fn(|i| decal.origin[i] - normal[i] * 16.0);
+            let mut nearest: Option<(u16, f32, Vec<crate::cgame::player_gore::GoreSurface>)> = None;
+            for (&entity, snaps) in &self.last_gpu {
+                if snaps.is_empty() { continue; }
+                // Cheap coarse rejection before per-triangle skinning; model
+                // origins are typically at the feet, so leave headroom.
+                if !snaps[0].origin.iter().zip(decal.origin.iter()).all(|(a,b)| (a-b).abs() < 150.0) { continue; }
+                let id = self.gore_next_id;
+                let surfaces = crate::cgame::player_gore::build_gore(snaps, id, start, end, true, decal.radius);
+                if surfaces.is_empty() { continue; }
+                let sq = snaps[0].origin.iter().zip(decal.origin.iter()).map(|(a,b)| (a-b)*(a-b)).sum::<f32>();
+                if nearest.as_ref().is_none_or(|(_, dist, _)| sq < *dist) {
+                    nearest = Some((entity, sq, surfaces));
+                }
+            }
+            if let Some((entity, _, surfaces)) = nearest {
+                self.gore_next_id = self.gore_next_id.wrapping_add(1);
+                while self.gore.iter().filter(|g| g.entity == entity).count() >= self.gore_limit {
+                    if let Some(i) = self.gore.iter().position(|g| g.entity == entity) { self.gore.remove(i); } else { break; }
+                }
+                self.gore.push(crate::cgame::player_gore::Gore {
+                    entity, start_time: now, life_ms: decal.life_ms,
+                    shader: decal.shader.clone(), surfaces,
+                });
+            }
+        }
     }
 
     /// Draw this entity's burn marks through the same GPU skinning as its body.
@@ -131,15 +144,44 @@ impl PlayerPresenter {
         now: i32,
         draws: &mut Vec<DynamicModelSurface>,
     ) {
-        self.gore
-            .retain(|gore| now - gore.start_time < gore.life_ms);
+        self.gore.retain(|gore| now - gore.start_time < gore.life_ms);
+        // Now that a GPU skin snapshot is available, resolve pending hit rays
+        // against the same skinned geometry used to render this frame.
+        let mut hits = Vec::new();
+        let have_snapshot = self.last_gpu.contains_key(&entity);
+        self.pending_gore.retain(|hit| {
+            if now.saturating_sub(hit.time) > 1500 { return false; }
+            if hit.entity == entity && hit.time <= now && have_snapshot {
+                hits.push(hit.clone());
+                false
+            } else { true }
+        });
+        if let Some(snaps) = self.last_gpu.get(&entity) {
+            for hit in hits {
+                let id = self.gore_next_id;
+                self.gore_next_id = self.gore_next_id.wrapping_add(1);
+                let surfaces = crate::cgame::player_gore::build_gore(
+                    snaps, id, hit.start, hit.end, hit.trace, hit.size,
+                );
+                if surfaces.is_empty() { continue; }
+                while self.gore.iter().filter(|g| g.entity == entity).count() >= self.gore_limit {
+                    let Some(oldest) = self.gore.iter().position(|g| g.entity == entity) else { break; };
+                    self.gore.remove(oldest);
+                }
+                self.gore.push(crate::cgame::player_gore::Gore {
+                    entity, start_time: hit.time,
+                    life_ms: 10_000 + (hit.sequence.wrapping_mul(7919) % 10_001) as i32,
+                    shader: hit.shader, surfaces,
+                });
+            }
+        }
         let marks: Vec<_> = self
             .gore
             .iter()
             .filter(|gore| gore.entity == entity && now >= gore.start_time)
             .map(|gore| {
                 (
-                    gore.shader,
+                    gore.shader.clone(),
                     gore.life_ms - (now - gore.start_time),
                     gore.surfaces.clone(),
                 )
@@ -152,7 +194,7 @@ impl PlayerPresenter {
             } else {
                 1.0
             };
-            let (texture, alpha_mode, _) = self.custom_shader_material(shader);
+            let (texture, alpha_mode, _) = self.custom_shader_material(&shader);
             for surface in surfaces {
                 let Some(body) = draws.iter().find(|draw| {
                     draw.ghoul2_gpu

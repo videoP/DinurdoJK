@@ -311,10 +311,25 @@ pub fn tessellate(
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    let mut batches: HashMap<(String, usize), (FxMaterial, Batch)> = HashMap::new();
+    tessellate_impl::<false>(draws, view, materials, &[])
+}
+
+pub fn tessellate_masked(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
+    tessellate_impl::<true>(draws, view, materials, visible)
+}
+
+fn tessellate_impl<const FILTER: bool>(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
+    let mut batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
     let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
-    for draw in draws {
+    for (draw_index, draw) in draws.iter().enumerate() {
+        if FILTER && visible.get(draw_index) == Some(&false) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -335,7 +350,7 @@ pub fn tessellate(
             .or_insert_with(|| materials(shader));
         for (stage_index, mat) in stages.iter().enumerate() {
             let entry = batches
-                .entry((shader_key.clone(), stage_index))
+                .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                 .or_insert_with(|| (mat.clone(), Batch::default()));
             append_draw(draw, view, mat, &mut entry.1);
         }
@@ -343,7 +358,7 @@ pub fn tessellate(
     let mut surfaces: Vec<_> = batches
         .into_iter()
         .filter(|(_, (_, batch))| !batch.indices.is_empty())
-        .map(|(_, (mat, batch))| DynamicModelSurface {
+        .map(|((_, _, slot), (mat, batch))| DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::Fx,
             authored_lighting: false,
             material_trace: None,
@@ -357,7 +372,7 @@ pub fn tessellate(
             rt_skinned_key: None,
             ghoul2_gpu: None,
             fx_gpu_sprites: None,
-            texture: mat.texture_at_time(view.seconds),
+            texture: slot_texture(&mat, slot, view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
         })
@@ -381,18 +396,33 @@ pub fn tessellate_workers(
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
+    tessellate_workers_impl::<false>(draws, view, materials, &[])
+}
+
+pub fn tessellate_workers_masked(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
+    tessellate_workers_impl::<true>(draws, view, materials, visible)
+}
+
+fn tessellate_workers_impl<const FILTER: bool>(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
     const PARALLEL_MIN_DRAWS: usize = 64;
     const PARALLEL_CHUNK_DRAWS: usize = 64;
 
     if draws.len() < PARALLEL_MIN_DRAWS {
-        return tessellate(draws, view, materials);
+        return tessellate_impl::<FILTER>(draws, view, materials, visible);
     }
 
-    let mut groups: HashMap<(String, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
+    let mut groups: HashMap<(String, usize, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
     let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
 
     for (draw_index, draw) in draws.iter().enumerate() {
+        if FILTER && visible.get(draw_index) == Some(&false) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -413,7 +443,7 @@ pub fn tessellate_workers(
             .or_insert_with(|| materials(shader));
         for (stage_index, mat) in stages.iter().enumerate() {
             groups
-                .entry((shader_key.clone(), stage_index))
+                .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                 .or_insert_with(|| (mat.clone(), Vec::new()))
                 .1
                 .push(draw_index);
@@ -421,14 +451,14 @@ pub fn tessellate_workers(
     }
 
     let Some(pool) = fx_tess_worker_pool() else {
-        return tessellate(draws, view, materials);
+        return tessellate_impl::<FILTER>(draws, view, materials, visible);
     };
 
     let mut surfaces: Vec<_> = pool.install(|| groups
         .into_iter()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .filter_map(|(_, (mat, draw_indices))| {
+        .filter_map(|((_, _, slot), (mat, draw_indices))| {
             let batch = if draw_indices.len() < PARALLEL_MIN_DRAWS {
                 let mut batch = Batch::default();
                 for draw_index in draw_indices {
@@ -468,7 +498,7 @@ pub fn tessellate_workers(
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
-                texture: mat.texture_at_time(view.seconds),
+                texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
             })
@@ -510,12 +540,27 @@ pub fn tessellate_gpu_particles(
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    let mut cpu_batches: HashMap<(String, usize), (FxMaterial, Batch)> = HashMap::new();
-    let mut sprite_batches: HashMap<(String, usize), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
+    tessellate_gpu_particles_impl::<false>(draws, view, materials, &[])
+}
+
+pub fn tessellate_gpu_particles_masked(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
+    tessellate_gpu_particles_impl::<true>(draws, view, materials, visible)
+}
+
+fn tessellate_gpu_particles_impl<const FILTER: bool>(
+    draws: &[FxDraw], view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
+) -> Vec<DynamicModelSurface> {
+    let mut cpu_batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
+    let mut sprite_batches: HashMap<(String, usize, usize), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
     let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
 
-    for draw in draws {
+    for (draw_index, draw) in draws.iter().enumerate() {
+        if FILTER && visible.get(draw_index) == Some(&false) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -540,7 +585,7 @@ pub fn tessellate_gpu_particles(
             // use the shared CPU path so tcMods match all FX backends.
             if !mat.tc_mods.is_empty() {
                 let entry = cpu_batches
-                    .entry((shader_key.clone(), stage_index))
+                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Batch::default()));
                 append_draw(draw, view, mat, &mut entry.1);
                 continue;
@@ -550,7 +595,7 @@ pub fn tessellate_gpu_particles(
             // four CPU vertices and indexed triangles every presentation frame.
             if let FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } = draw {
                 let instances = &mut sprite_batches
-                    .entry((shader_key.clone(), stage_index))
+                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1;
                 let color = mat.vertex_color(*rgba, view.seconds);
@@ -598,13 +643,13 @@ pub fn tessellate_gpu_particles(
             };
             if let Some((origin, left, up, rgba)) = billboard {
                 sprite_batches
-                    .entry((shader_key.clone(), stage_index))
+                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1
-                    .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, view.seconds)));
+                    .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, draw_seconds(draw, view))));
             } else {
                 let entry = cpu_batches
-                    .entry((shader_key.clone(), stage_index))
+                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Batch::default()));
                 append_draw(draw, view, mat, &mut entry.1);
             }
@@ -614,7 +659,7 @@ pub fn tessellate_gpu_particles(
     let mut surfaces: Vec<DynamicModelSurface> = cpu_batches
         .into_iter()
         .filter(|(_, (_, batch))| !batch.indices.is_empty())
-        .map(|(_, (mat, batch))| DynamicModelSurface {
+        .map(|((_, _, slot), (mat, batch))| DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::Fx,
             authored_lighting: false,
             material_trace: None,
@@ -628,7 +673,7 @@ pub fn tessellate_gpu_particles(
             rt_skinned_key: None,
             ghoul2_gpu: None,
             fx_gpu_sprites: None,
-            texture: mat.texture_at_time(view.seconds),
+            texture: slot_texture(&mat, slot, view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
         })
@@ -638,7 +683,7 @@ pub fn tessellate_gpu_particles(
         sprite_batches
             .into_iter()
             .filter(|(_, (_, instances))| !instances.is_empty())
-            .map(|(_, (mat, instances))| DynamicModelSurface {
+            .map(|((_, _, slot), (mat, instances))| DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Fx,
                 authored_lighting: false,
                 material_trace: None,
@@ -653,7 +698,7 @@ pub fn tessellate_gpu_particles(
                 ghoul2_gpu: None,
                 fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None, instances: Arc::new(instances), blob_shadow: false }),
-                texture: mat.texture_at_time(view.seconds),
+                texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
             }),
@@ -689,7 +734,7 @@ pub fn tessellate_resident_sprites(
     let mut accepted = Vec::new();
     let mut warm = Vec::new();
     for &(index, slot, draw) in candidates {
-        let FxDraw::Sprite { origin, radius, rotation, rgba, shader } = draw else { continue; };
+        let FxDraw::Sprite { origin, radius, rotation, rgba, shader, .. } = draw else { continue; };
         // A full shader is atomic: partial promotion could silently remove an
         // unsupported second stage (glow/tcMod/animation).
         let key = shader.to_ascii_lowercase();
@@ -784,7 +829,7 @@ pub fn tessellate_resident_sprites(
     (surfaces, accepted, warm)
 }
 
-/// A `LitMesh` becomes its own alpha-blended, light-grid-lit surface: it needs
+/// A `LitMesh` becomes its own *opaque*, depth-writing, light-grid-lit surface: it needs
 /// real normals and a lighting origin, which the shared unlit FX batches lack.
 /// Back-face culling is on in the dynamic pipeline, so one winding is enough.
 fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
@@ -838,10 +883,38 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
         ghoul2_gpu: None,
         fx_gpu_sprites: None,
         texture: None,
-        alpha_mode: DynamicModelAlphaMode::Blend,
+        alpha_mode: DynamicModelAlphaMode::Opaque,
 
         authored_glow: false,
     })
+}
+
+/// Shader clock for one draw: refdef time minus refEntity_t::shaderTime.
+fn draw_seconds(draw: &FxDraw, view: &FxView) -> f32 {
+    match draw {
+        FxDraw::Sprite { shader_time, .. } | FxDraw::OrientedQuad { shader_time, .. } if *shader_time != 0.0 => {
+            view.seconds - shader_time
+        }
+        _ => view.seconds,
+    }
+}
+
+/// Batch slot for one stage. Draws on their own shader clock (setShaderTime)
+/// can sit on different animMap frames, which cannot share a batch texture.
+/// Zero is the shared global-clock batch.
+fn frame_slot(draw: &FxDraw, view: &FxView, mat: &FxMaterial) -> usize {
+    match (&mat.animation, draw) {
+        (Some(animation), FxDraw::Sprite { shader_time, .. } | FxDraw::OrientedQuad { shader_time, .. })
+            if *shader_time != 0.0 => 1 + animation.frame_index(mat.shader_time(view.seconds - shader_time)),
+        _ => 0,
+    }
+}
+
+fn slot_texture(mat: &FxMaterial, slot: usize, seconds: f32) -> Option<Arc<TextureData>> {
+    if let Some(texture) = slot.checked_sub(1).and_then(|frame| mat.animation.as_ref()?.frames.get(frame)) {
+        return Some(Arc::clone(texture));
+    }
+    mat.texture_at_time(seconds)
 }
 
 fn append_batch(dst: &mut Batch, mut src: Batch) {
@@ -853,17 +926,18 @@ fn append_batch(dst: &mut Batch, mut src: Batch) {
 
 fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch) {
     let first_vertex = batch.vertices.len();
+    let seconds = draw_seconds(draw, view);
     match draw {
         FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, view.seconds));
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, seconds));
         }
         FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } => {
             // TaystJK/OpenJK RB_SurfaceSaberGlow. The renderer receives one
             // RT_SABER_GLOW entity, then walks billboards from blade tip back
             // toward the hilt. Radius grows by exactly 0.017 per blob and the
             // step is exactly 65% of the current radius; do not clamp it here.
-            let color = mat.vertex_color(*rgba, view.seconds);
+            let color = mat.vertex_color(*rgba, seconds);
             let mut distance = *length;
             let mut glow_radius = *radius;
             while distance > 0.0 {
@@ -882,7 +956,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
         }
         FxDraw::Billboard { origin, half, rotation, uv, rgba, align, facing, ground, pivot, .. } => {
-            let color = mat.vertex_color(*rgba, view.seconds);
+            let color = mat.vertex_color(*rgba, seconds);
             let (left, up) = match (facing, align) {
                 // Custom facing: quad in the plane perpendicular to the facing
                 // vector; long axis from the alignment, else rotation about it.
@@ -923,12 +997,12 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         }
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, view.seconds));
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, seconds));
         }
         FxDraw::Line { start, end, width, rgba, .. } => {
             // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
             let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
-            let color = mat.vertex_color(*rgba, view.seconds);
+            let color = mat.vertex_color(*rgba, seconds);
             let v0 = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
             let v1 = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
             let v2 = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
@@ -937,7 +1011,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             batch.triangle(v2, v1, v3);
         }
         FxDraw::Quad { positions, uvs, rgba, .. } => {
-            let color = mat.vertex_color(*rgba, view.seconds);
+            let color = mat.vertex_color(*rgba, seconds);
             let v0 = batch.vertex(positions[0], uvs[0], color);
             let v1 = batch.vertex(positions[1], uvs[1], color);
             let v2 = batch.vertex(positions[2], uvs[2], color);
@@ -956,7 +1030,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
             let base = batch.vertices.len() as u32;
             for ((position, uv), color) in positions.iter().zip(uvs).zip(rgba) {
-                batch.vertex(*position, *uv, mat.vertex_color(*color, view.seconds));
+                batch.vertex(*position, *uv, mat.vertex_color(*color, seconds));
             }
             for triangle in indices.chunks_exact(3) {
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
@@ -968,7 +1042,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         // Built into its own lit surface by the tessellators, never batched.
         FxDraw::LitMesh { .. } => {}
         FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
-            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba, view.seconds), view);
+            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba, seconds), view);
         }
     }
     for modifier in &mat.tc_mods {
@@ -977,7 +1051,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
                 vertex.uv,
                 vertex.position,
                 *modifier,
-                mat.shader_time(view.seconds),
+                mat.shader_time(seconds),
             );
         }
     }
@@ -1161,6 +1235,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saber_melt_lit_skin_writes_depth_and_is_not_alpha_blended() {
+        let draw = FxDraw::LitMesh {
+            positions: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: vec![[1.0, 0.0, 0.0]; 3],
+            rgba: vec![[24, 20, 17, 255]; 3],
+            indices: vec![0, 1, 2],
+            lighting_origin: [0.0, 0.0, 0.0],
+        };
+        let surface = lit_mesh_surface(&draw).expect("melt relief mesh must be drawable");
+        assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::Opaque);
+        assert!(surface.vertices.iter().all(|v| v.color[3] == 1.0));
+    }
+
+    #[test]
+    fn runner_mask_all_tessellators_preserve_stages_geometry_and_restore_baseline() {
+        fn build(mode: u8, draws: &[FxDraw], mask: Option<&[bool]>) -> Vec<DynamicModelSurface> {
+            let mut materials = |_: &str| vec![white(FxBlend::Alpha), white(FxBlend::AddAlpha)];
+            match (mode, mask) {
+                (0, None) => tessellate(draws, &view(), &mut materials),
+                (0, Some(m)) => tessellate_masked(draws, &view(), &mut materials, m),
+                (1, None) => tessellate_workers(draws, &view(), &mut materials),
+                (1, Some(m)) => tessellate_workers_masked(draws, &view(), &mut materials, m),
+                (_, None) => tessellate_gpu_particles(draws, &view(), &mut materials),
+                (_, Some(m)) => tessellate_gpu_particles_masked(draws, &view(), &mut materials, m),
+            }
+        }
+        let signature = |surfaces: &[DynamicModelSurface]| surfaces.iter().map(|s| (
+            s.alpha_mode as u8, s.authored_glow, s.raster_visible,
+            bytemuck::cast_slice::<_,u8>(s.vertices.as_slice()).to_vec(), s.indices.as_ref().clone(),
+            s.fx_gpu_sprites.as_ref().map(|g| bytemuck::cast_slice::<_,u8>(g.instances.as_slice()).to_vec()),
+        )).collect::<Vec<_>>();
+        let draws: Vec<_> = (0..96).map(|i| FxDraw::Sprite { shader_time: 0.0,
+            origin: [if i < 64 {-600.0} else {600.0}, i as f32, 0.0], radius: 2.0,
+            rotation: i as f32, rgba: [255;4], shader: "runner".into(),
+        }).collect();
+        let owners: Vec<_> = (0..96).map(|i| (i, if i < 64 {1} else {2})).collect();
+        let mut scratch = crate::fx::runner_cull::RunnerCullScratch::default();
+        let mask = scratch.mask(&draws, &owners, &view(), false);
+        for mode in 0..3 {
+            let a = build(mode, &draws, None);
+            let b = build(mode, &draws, Some(mask));
+            let expected = build(mode, &draws[64..], None);
+            assert_eq!(signature(&b), signature(&expected), "mode {mode} changed visible stage/geometry order");
+            assert_eq!(signature(&a), signature(&build(mode, &draws, Some(&[true;96]))));
+            assert_eq!(signature(&a), signature(&build(mode, &draws, None)), "OFF restoration");
+        }
+    }
+
+    #[test]
     fn stretch_uses_phase_and_scales_about_the_texture_center() {
         use jka_assets::shader::{TcMod, Wave, WaveFunc};
         let stretch = TcMod::Stretch(Wave {
@@ -1219,7 +1342,7 @@ mod tests {
             shader_time_offset: 0.25, shader_clamp_time: Some(0.25),
             ..white(FxBlend::AddAlpha)
         };
-        let draws = [FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
+        let draws = [FxDraw::Sprite { shader_time: 0.0, origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
             rgba: [64, 128, 192, 255], shader: "test".into() }];
         let camera = FxView { seconds: 3.0, ..view() };
         let cpu = tessellate(&draws, &camera, &mut |_| vec![material.clone()]);
@@ -1258,6 +1381,36 @@ mod tests {
 
     fn view() -> FxView {
         FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 }
+    }
+
+    #[test]
+    fn set_shader_time_runs_oneshot_animmaps_from_each_particles_birth() {
+        // effects/rocket/explosion OrangeGlow: setShaderTime + oneshotanimmap
+        // ending on black. On the global clock it is stuck on the black frame.
+        let frames: Vec<Arc<TextureData>> = (0..4).map(|_| {
+            Arc::new(crate::materials::missing_texture_data())
+        }).collect();
+        let mat = FxMaterial {
+            animation: Some(FxTextureAnimation { fps: 10.0, one_shot: true, frames: frames.clone() }),
+            ..white(FxBlend::Add)
+        };
+        let sprite = |shader_time: f32, x: f32| FxDraw::Sprite { shader_time, origin: [100.0, x, 0.0],
+            radius: 2.0, rotation: 0.0, rgba: [255; 4], shader: "exp".into() };
+        let camera = FxView { seconds: 500.05, ..view() };
+        let draws = [sprite(500.0, 0.0), sprite(499.8, 1.0), sprite(0.0, 2.0)];
+        let quads = vec![sprite(500.0, 0.0); 64];
+        for mode in 0..3 {
+            let surfaces = match mode {
+                0 => tessellate(&draws, &camera, &mut |_| vec![mat.clone()]),
+                1 => tessellate_workers(&[&draws[..], &quads[..]].concat(), &camera, &mut |_| vec![mat.clone()]),
+                _ => tessellate_gpu_particles(&draws, &camera, &mut |_| vec![mat.clone()]),
+            };
+            assert_eq!(surfaces.len(), 3, "mode {mode}: one batch per animMap frame");
+            for frame in [0, 2, 3] {
+                assert!(surfaces.iter().any(|s| Arc::ptr_eq(s.texture.as_ref().unwrap(), &frames[frame])),
+                    "mode {mode}: frame {frame} missing");
+            }
+        }
     }
 
     #[test]
@@ -1308,7 +1461,7 @@ mod tests {
             shader_time_offset: 1.0, shader_clamp_time: Some(0.25),
             ..white(FxBlend::Alpha)
         };
-        let draw = FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
+        let draw = FxDraw::Sprite { shader_time: 0.0, origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
             rgba: [255; 4], shader: "test".into() };
         // Reach the worker implementation rather than its small-input fallback.
         let draws = vec![draw; 64];
@@ -1346,7 +1499,7 @@ mod tests {
 
     #[test]
     fn sprite_faces_view_with_radius_half_extent_and_add_ignores_alpha_byte() {
-        let draws = [FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255, 128, 0, 0], shader: "a".into() }];
+        let draws = [FxDraw::Sprite { shader_time: 0.0, origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255, 128, 0, 0], shader: "a".into() }];
         let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Add)]);
         let surface = &surfaces[0];
         assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::AdditiveOne);
@@ -1383,7 +1536,7 @@ mod tests {
     #[test]
     fn worker_tessellation_matches_reference_sprite_geometry() {
         let draws = (0..128)
-            .map(|index| FxDraw::Sprite {
+            .map(|index| FxDraw::Sprite { shader_time: 0.0,
                 origin: [100.0 + index as f32, 0.0, 0.0],
                 radius: 2.0,
                 rotation: index as f32,
@@ -1407,7 +1560,7 @@ mod tests {
 
     #[test]
     fn gpu_particle_path_preserves_sprite_basis_and_material() {
-        let draws = [FxDraw::Sprite {
+        let draws = [FxDraw::Sprite { shader_time: 0.0,
             origin: [100.0, 0.0, 0.0],
             radius: 2.0,
             rotation: 0.0,
@@ -1467,7 +1620,7 @@ mod tests {
             tc_mods: vec![TcMod::Scroll(-0.4, 0.0), TcMod::Scale(2.0, 1.0)],
             ..white(FxBlend::Modulate2x)
         };
-        let sprite = FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255; 4], shader: "animated".into() };
+        let sprite = FxDraw::Sprite { shader_time: 0.0, origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255; 4], shader: "animated".into() };
         let cpu = tessellate(&[sprite.clone()], &view, &mut |_| vec![scroll_then_scale.clone()]);
         let gpu = tessellate_gpu_particles(&[sprite], &view, &mut |_| vec![scroll_then_scale.clone()]);
         assert!(gpu[0].fx_gpu_sprites.is_none(), "animated sprites use the UV-capable path");
@@ -1599,8 +1752,8 @@ mod tests {
     #[test]
     fn batches_by_shader_and_cylinder_rings_use_both_radii() {
         let draws = [
-            FxDraw::Sprite { origin: [10.0, 0.0, 0.0], radius: 1.0, rotation: 30.0, rgba: [255; 4], shader: "x".into() },
-            FxDraw::Sprite { origin: [20.0, 0.0, 0.0], radius: 1.0, rotation: 0.0, rgba: [255; 4], shader: "X".into() },
+            FxDraw::Sprite { shader_time: 0.0, origin: [10.0, 0.0, 0.0], radius: 1.0, rotation: 30.0, rgba: [255; 4], shader: "x".into() },
+            FxDraw::Sprite { shader_time: 0.0, origin: [20.0, 0.0, 0.0], radius: 1.0, rotation: 0.0, rgba: [255; 4], shader: "X".into() },
             FxDraw::Cylinder { start: [0.0; 3], end: [0.0, 0.0, 10.0], axis: [0.0, 0.0, 1.0], start_radius: 1.0, end_radius: 3.0, rgba: [255; 4], shader: "c".into() },
         ];
         let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::Alpha)]);
@@ -1634,7 +1787,7 @@ mod resident_fx_tests {
 
     #[test]
     fn material_atomicity_and_original_indices() {
-        let draw = FxDraw::Sprite {
+        let draw = FxDraw::Sprite { shader_time: 0.0,
             origin: [10.0, 5.0, 1.0], radius: 4.0,
             rotation: 33.0, rgba: [80, 90, 120, 255], shader: "testfx".into(),
         };
@@ -1669,7 +1822,7 @@ mod resident_fx_tests {
             fov_x: 90.0,
             seconds: 0.0,
         };
-        let draw = FxDraw::Sprite {
+        let draw = FxDraw::Sprite { shader_time: 0.0,
             origin: [1.0, 2.0, 3.0], radius: 8.0,
             rotation: 22.0, rgba: [255; 4], shader: "testfx".into(),
         };

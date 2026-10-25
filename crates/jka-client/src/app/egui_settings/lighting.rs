@@ -1,7 +1,7 @@
 //! Lighting.
 use crate::app::egui_settings::{
     mode_index, mode_row, quality_row, segmented_row, theme, ui, App, DynamicLightsMode,
-    EntityAmbientLightingMode,
+    EntityAmbientLightingMode, DynamicShadowsMode,
 };
 
 impl App {
@@ -36,63 +36,6 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_ENTITY_AMBIENT_LIGHTING;
             self.change_video_setting(target as i32 - current as i32);
         }
-
-        self.egui_toggle_row(
-            ui,
-            "Physically based rendering (PBR)",
-            "Master switch for the complete Rend2-style PBR material profile. \
-             Disabling it turns off PBR companion-map shading, parallax occlusion, \
-             PBR lightgrid/probe response, dynamic-light PBR BRDF shading and \
-             emissive companion shading together.",
-            ui::VIDEO_ROW_PBR,
-            self.video.pbr,
-        );
-        self.egui_toggle_row(
-            ui,
-            "Allow asset overrides",
-            "JKA/OpenJK VFS compatibility policy. When enabled, higher-priority addon PK3s \
-             and loose files may replace assets from retail assets0.pk3 through assets3.pk3. \
-             When disabled, ordinary lookups protect those retail qpaths. Active PBR .mtr \
-             materials may still load their explicitly referenced base/normal/RMO/etc. \
-             textures from the same package as the material. While a map is loaded, Apply Video Settings reloads it with the new setting.",
-            ui::VIDEO_ROW_ASSET_OVERRIDES,
-            self.video.allow_asset_overrides,
-        );
-        self.egui_toggle_row(
-            ui,
-            "Generate normal maps",
-            "Rend2 compatibility fallback. Synthesize a normal map from diffuse luminance \
-             only when no authored normal map exists; with a map loaded, Apply Video \
-             Settings reloads it with the new setting. Useful for old assets, \
-             but authored normals are better.",
-            ui::VIDEO_ROW_GEN_NORMAL_MAPS,
-            self.video.gen_normal_maps,
-        );
-        self.egui_toggle_row(
-            ui,
-            "Deluxe mapping",
-            "Use q3map2 directional lightmaps for normal/specular response when \
-             present. Maps without deluxemaps retain the existing BSP-lightgrid \
-             directional fallback.",
-            ui::VIDEO_ROW_DELUXE_MAPPING,
-            self.video.deluxe_mapping,
-        );
-        theme::row(
-            ui,
-            "Deluxe specular",
-            "Scales only the specular lobe produced by directional baked lighting. \
-             0 disables baked-direction specular while keeping diffuse deluxe relighting.",
-            theme::Reset::Video(ui::VIDEO_ROW_DELUXE_SPECULAR),
-            |ui| {
-                let mut value = self.video.deluxe_specular;
-                let readout = format!("{value:.2}×");
-                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
-                    self.video.deluxe_specular = value;
-                    self.sync_pbr();
-                    self.mark_config_dirty();
-                }
-            },
-        );
 
         // Classic world lighting is one three-state control. `Off` maps to
         // r_fullbright 1; once enabled, the meter chooses between the cheap
@@ -148,7 +91,7 @@ impl App {
             (
                 DynamicLightsMode::RayTracedHardware,
                 "Ray traced",
-                "Direct local lighting with hardware ray-traced shadows, independent of sun shadows. Falls back to Forward+ when RT is unavailable.",
+                "Ray-traced shadows for transient lights such as sabers, blasters and explosions. Static map lights use raster lighting and optional cached shadow cubemaps. Sun shadows are separate. Falls back to Forward+ when RT is unavailable.",
             ),
         ];
         if let Some(target) = mode_row(
@@ -165,6 +108,9 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        theme::section(ui, "SUN & ENTITY SHADOWS", "Static BSP shadows use CSM; ray queries can optionally cover moving entities. Inferred original-lighting lamp shadows are available only in CSM/Hybrid CSM.");
+        self.egui_shadows(ui);
+
         self.egui_toggle_row(
             ui,
             "Dynamic light debug view",
@@ -172,6 +118,36 @@ impl App {
             ui::VIDEO_ROW_DYNAMIC_LIGHT_DEBUG,
             self.video.dynamic_light_debug,
         );
+
+        theme::section(ui, "LAMP SHADOWS", "No master switch: inferred moving-object shadows follow the individual lamp-source toggles. Only CSM and Hybrid CSM use them; original map lightmaps remain intact.");
+        let lamp_shadow_mode = matches!(self.video.dynamic_shadows,
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
+        ui.add_enabled_ui(lamp_shadow_mode, |ui| {
+            self.egui_toggle_row(ui, "Source: glow stages", "Use static shader glow emitters as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_GLOW, self.video.baked_local_sources & 1 != 0);
+            self.egui_toggle_row(ui, "Source: additive stages", "Infer lamps from additive stages; broad inference, disabled by default.", ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE, self.video.baked_local_sources & 2 != 0);
+            self.egui_toggle_row(ui, "Source: emissive maps", "Use emissive companion textures as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE, self.video.baked_local_sources & 4 != 0);
+            self.egui_toggle_row(ui, "Source: authored surfacelight", "Use authored q3map_surfacelight lamps as shadow sources; this switch alone adds no light.", ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, self.video.baked_local_sources & 8 != 0);
+            self.egui_toggle_row(ui, "Source: fixed continuous EFX", "Use fixed continuously active EFX lamps. Moving, triggered and intermittent effects are excluded.", ui::VIDEO_ROW_BAKED_LOCAL_FX, self.video.baked_local_sources & 16 != 0);
+        });
+        if !lamp_shadow_mode {
+            ui.small("Select Cascaded maps (CSM) or Hybrid CSM + RT entities to use these lamp shadows.");
+        }
+        const LAMP_SHADOW_AB: [(u8, &str, &str); 5] = [
+            (0, "A: Cubes", "Original six-face cubemap generation and sampling (reference)."),
+            (1, "B: Receiver", "Conservative per-octant caster test before sampling dynamic shadow cubemaps."),
+            (2, "C: Casters", "Pre-filter models and BSP movers against each lamp before testing the six faces."),
+            (3, "B+C", "Apply both experimental optimizations; shadows still update at frame rate."),
+            (4, "Receiver early-out", "B plus a conservative per-pixel precheck: skip all inferred-lamp weight/PCF evaluation if no selected moving caster can shadow that pixel."),
+        ];
+        ui.add_enabled_ui(lamp_shadow_mode && self.video.baked_local_sources != 0, |ui| {
+            if let Some(target) = mode_row(ui, "Lamp shadow A/B experiment",
+                "Session-only. GPU timings/perfcapture; no update-rate cap. Octahedral shadow maps are NOT implemented by these variants.",
+                theme::Reset::None, self.video.lamp_shadow_ab, &LAMP_SHADOW_AB) {
+                let _ = self.set_console_cvar("r_lampShadowAB", &LAMP_SHADOW_AB[target].0.to_string());
+            }
+        });
+        theme::section(ui, "EXPERIMENTAL ADDED LAMP LIGHTING", "Separate work in progress. Adds inferred illumination over the original lightmap baseline and may duplicate existing baked lamps. Leave off for shadows only.");
+        self.egui_toggle_row(ui, "Add lamp lighting to lightmap (experimental)", "Separate from lamp shadows. Adds illumination over the original baseline; not required for player shadows.", ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS, self.video.baked_local_lights);
 
         const FX_OPTIONS: [(u8, &str, &str); 3] = [
             (0, "Off", "Authored FX lights and faithful missile/entity lights still work."),

@@ -8,7 +8,7 @@ use crate::app::{
     KeyCode, LivePredictionFrame, MapLoadingState, MissingMapPrompt, OverlayMode, Path,
     PresentationViewer, PresentedEntity, ProtocolSnapshot, RagdollConfig, ServerMessageDecoder,
     SessionPhase, SpectatorCameraMode, ThirdPersonViewInput, UiScoreEntry, UiScoreboard,
-    ViewLatchMode, DEMO_FREE_SPEEDS, DEMO_FREE_SPEED_DEFAULT_INDEX, ET_PLAYER, REWARD_BLOB_MS,
+    ViewBobInput, ViewLatchMode, DEMO_FREE_SPEEDS, DEMO_FREE_SPEED_DEFAULT_INDEX, ET_PLAYER, REWARD_BLOB_MS,
     REWARD_ICON_SIZE, REWARD_TIME_MS,
 };
 
@@ -334,6 +334,7 @@ impl GameSession {
         self.weapon_fx.reset_for_seek(0);
         self.player_presenter.reset_for_seek();
         self.fx_draws.clear();
+        self.fx_runner_draws.clear();
         self.gpu_commands = None;
         self.gpu_draw_indices.clear();
         self.gpu_pool = crate::fx::gpu_sparks::GpuSparkPool::default();
@@ -826,6 +827,7 @@ impl App {
 
     pub(in crate::app) fn apply_demo_camera(&mut self, sample: DemoCameraSample) {
         self.render_view_latch = ViewLatchMode::Disabled;
+        self.camera.clear_first_person_bob();
         let live_follow = sample.following
             && self
                 .game_session
@@ -965,6 +967,16 @@ impl App {
         self.camera.position = glam::Vec3::from_array(sample.eye_position);
         self.camera.yaw = sample.view_angles[1].to_radians();
         self.camera.pitch = -sample.view_angles[0].to_radians();
+        // CG_OffsetFirstPersonView: bob and velocity tilt affect only the
+        // presented camera, not the predicted viewangles or user commands.
+        self.camera.apply_first_person_bob(self.view_bob, ViewBobInput {
+            angles: sample.view_angles,
+            velocity: sample.velocity,
+            bob_cycle: sample.bob_cycle,
+            pm_flags: sample.pm_flags,
+            pm_type: sample.policy.pm_type,
+            health: sample.policy.health,
+        });
         if latch_input_available {
             self.render_view_latch = ViewLatchMode::Direct;
         }
@@ -976,6 +988,7 @@ impl App {
         fake: DemoFakeView,
     ) {
         self.render_view_latch = ViewLatchMode::Disabled;
+        self.camera.clear_first_person_bob();
         match self.spectator_camera.mode {
             SpectatorCameraMode::FirstPerson => {
                 self.camera.position = glam::Vec3::from_array(fake.eye_position);
@@ -1371,6 +1384,7 @@ impl App {
             playback.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             playback.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             playback.weapon_fx.set_fx_physics(self.video.fx_physics);
+            playback.weapon_fx.set_mark_count(self.video.mark_count as usize);
             playback.weapon_fx.set_fx_lod(
                 self.video.fx_lod,
                 self.video.fx_count_scale,
@@ -1385,6 +1399,7 @@ impl App {
             playback
                 .entity_presenter
                 .set_draw_map_models(self.video.draw_map_models);
+            playback.entity_presenter.set_entity_pvs_enabled(self.video.pvs_mode != crate::ui::PvsMode::Off);
             playback.entity_presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             playback.entity_presenter.set_md3_lod_settings(
                 ghoul2_view, self.video.lod_scale, self.video.ghoul2_lod_bias,
@@ -1481,10 +1496,9 @@ impl App {
                 debug: self.video.physics_debug_draw,
                 stats: self.video.physics_stats,
             });
-            let rt_rigid_casters_enabled = self.video.dynamic_shadows
-                == DynamicShadowsMode::RayTraced
+            let rt_rigid_casters_enabled = matches!(self.video.dynamic_shadows, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
                 || self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
-            let blob_shadows_enabled = self.video.dynamic_shadows == DynamicShadowsMode::Blob;
+            let blob_shadow_opacity = self.video.player_blob_shadow_opacity();
             playback
                 .weapon_fx
                 .set_rt_lighting(self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware);
@@ -1495,6 +1509,16 @@ impl App {
                     None
                 });
             }
+            // Body sliders are local profile settings, NOT camera/follow
+            // settings. Recorded demo players and spectated clients must not
+            // silently acquire the viewer's body deformation.
+            playback.player_presenter.set_local_body_owner(if playback.local {
+                Some(0)
+            } else if playback.live {
+                connection_client_num.map(usize::from)
+            } else {
+                None
+            });
             playback
                 .player_presenter
                 .set_local_cosmetics(if playback.local {
@@ -1541,7 +1565,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadows_enabled,
+                    blob_shadow_opacity,
                 )?
             } else if playback.live {
                 let Some(net) = self.net.as_ref() else {
@@ -1559,7 +1583,6 @@ impl App {
                 let session = net.session();
                 let provisional = self.live_provisional;
                 let entity_graph = self.entity_graph.as_deref();
-                let mut logged_failure = false;
                 let mut predict = |snap: &ProtocolSnapshot,
                                    next: Option<&ProtocolSnapshot>,
                                    entities: &[PresentedEntity]| {
@@ -1590,12 +1613,10 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| snap.player_state.clone());
                     if let Err(error) = predictor.predict(input) {
-                        if !logged_failure {
-                            eprintln!("PREDICTION FAILED (falling back to interpolation): {error}");
-                            logged_failure = true;
-                        }
+                        predictor.report_failure(&error);
                         return Ok(None);
                     }
+                    predictor.clear_failure();
                     let error = predictor.view_error(server_time, settings.error_decay);
                     let Some(display) = predictor.predicted().cloned() else {
                         return Ok(None);
@@ -1620,7 +1641,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadows_enabled,
+                    blob_shadow_opacity,
                     settings.no_predict,
                     Some(&mut predict),
                     Some(crate::app::PlayerPresentationInput::Remote {
@@ -1638,7 +1659,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadows_enabled,
+                    blob_shadow_opacity,
                 )?
             };
             (advance, sample, playback.take_event_debug_lines())
@@ -2088,7 +2109,7 @@ impl App {
                             // calculations on CPU; only the material key is
                             // needed to append an existing resident slot.
                             let draw = if is_ready {
-                                crate::fx::system::FxDraw::Sprite {
+                                crate::fx::system::FxDraw::Sprite { shader_time: 0.0,
                                     origin: [0.0; 3], radius: 0.0, rotation: 0.0,
                                     rgba: [0; 4], shader: spawn.shader.clone(),
                                 }
@@ -2135,6 +2156,7 @@ impl App {
                     playback.gpu_owned = next_owned;
                     if !accepted.is_empty() {
                         let accepted: std::collections::HashSet<_> = accepted.into_iter().collect();
+                        crate::fx::runner_cull::remove_promoted(&mut playback.fx_runner_draws, &accepted);
                         let mut index = 0;
                         playback.fx_draws.retain(|_| {
                             let keep = !accepted.contains(&index);
@@ -2150,25 +2172,53 @@ impl App {
                 playback.weapon_fx.set_gpu_owned(std::collections::HashSet::new());
                 playback.gpu_ready_modes.store(0, std::sync::atomic::Ordering::Release);
             }
-            let mut fx_surfaces = match self.video.fx_geometry {
-                FxGeometryMode::Cpu => {
-                    crate::fx::draw::tessellate(&playback.fx_draws, &view, &mut |shader| {
-                        entity_presenter.fx_material_stages(shader)
-                    })
+            let mut fx_surfaces = if self.video.fx_occlusion == 1 {
+                let mask = playback.fx_runner_cull.mask(
+                    &playback.fx_draws, &playback.fx_runner_draws, &view, self.video.occlusion_stats,
+                );
+                match self.video.fx_geometry {
+                    FxGeometryMode::Cpu => {
+                        crate::fx::draw::tessellate_masked(&playback.fx_draws, &view, &mut |shader| {
+                            entity_presenter.fx_material_stages(shader)
+                        }, mask)
+                    }
+                    FxGeometryMode::CpuWorkers => {
+                        crate::fx::draw::tessellate_workers_masked(&playback.fx_draws, &view, &mut |shader| {
+                            entity_presenter.fx_material_stages(shader)
+                        }, mask)
+                    }
+                    // Both raster and RT model preparation now consume FX instanced
+                    // surfaces (prepare_fx_surface + upload_prepared_fx_sprites).
+                    // Do not silently regress to CPU tessellation under RT lights.
+                    FxGeometryMode::Gpu => crate::fx::draw::tessellate_gpu_particles_masked(
+                        &playback.fx_draws,
+                        &view,
+                        &mut |shader| entity_presenter.fx_material_stages(shader),
+                        mask,
+                    ),
                 }
-                FxGeometryMode::CpuWorkers => {
-                    crate::fx::draw::tessellate_workers(&playback.fx_draws, &view, &mut |shader| {
-                        entity_presenter.fx_material_stages(shader)
-                    })
+            } else {
+                // OFF dispatches the unfiltered specialization; no runner bounds/mask work.
+                match self.video.fx_geometry {
+                    FxGeometryMode::Cpu => {
+                        crate::fx::draw::tessellate(&playback.fx_draws, &view, &mut |shader| {
+                            entity_presenter.fx_material_stages(shader)
+                        })
+                    }
+                    FxGeometryMode::CpuWorkers => {
+                        crate::fx::draw::tessellate_workers(&playback.fx_draws, &view, &mut |shader| {
+                            entity_presenter.fx_material_stages(shader)
+                        })
+                    }
+                    // Both raster and RT model preparation now consume FX instanced
+                    // surfaces (prepare_fx_surface + upload_prepared_fx_sprites).
+                    // Do not silently regress to CPU tessellation under RT lights.
+                    FxGeometryMode::Gpu => crate::fx::draw::tessellate_gpu_particles(
+                        &playback.fx_draws,
+                        &view,
+                        &mut |shader| entity_presenter.fx_material_stages(shader),
+                    ),
                 }
-                // Both raster and RT model preparation now consume FX instanced
-                // surfaces (prepare_fx_surface + upload_prepared_fx_sprites).
-                // Do not silently regress to CPU tessellation under RT lights.
-                FxGeometryMode::Gpu => crate::fx::draw::tessellate_gpu_particles(
-                    &playback.fx_draws,
-                    &view,
-                    &mut |shader| entity_presenter.fx_material_stages(shader),
-                ),
             };
             fx_surfaces.extend(resident_fx_surfaces);
             playback.client_perf.fx_render_surfaces =

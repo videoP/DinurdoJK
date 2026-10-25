@@ -1,7 +1,7 @@
 //! Creative EAGLE Environmental Audio Library (.eal) RIFF reader.
 //!
 //! EAXManager/EalMan-compatible authored map parsing. Audio DSP is implemented
-//! separately in `eal_openal` and remains optional at runtime.
+//! in the per-source `eal_native` scene and remains optional at runtime.
 //!
 //! Important: the EAGLE BSP is *not* the Quake 3 map BSP. Its split-plane
 //! tolerance is -1.0 JKA world unit, following EalMan's observed EaxMan rule.
@@ -61,6 +61,7 @@ pub struct EalSourceAcoustics {
 
 #[derive(Clone, Debug)]
 pub struct EalMap {
+    raw: std::sync::Arc<[u8]>,
     pub version: (u32, u32),
     pub default: EalPreset,
     pub environments: Vec<EalPreset>,
@@ -497,6 +498,7 @@ impl EalMap {
             return Err("EAL requires exactly one geometry set (same limitation as EalMan)".into());
         }
         Ok(Self {
+            raw: std::sync::Arc::from(data),
             version,
             default: EalPreset {
                 name: "Default".into(),
@@ -514,6 +516,26 @@ impl EalMap {
         })
     }
 
+    pub fn raw_data(&self) -> &[u8] { &self.raw }
+
+    /// Game-facing query. EAGLE stores X/right, Y/up, Z/depth; JKA is Z-up.
+    /// Keep the raw query separate for native EalMan/oracle comparisons.
+    pub fn environment_at_jka(&self, point: [f32; 3]) -> Option<EnvironmentAt<'_>> {
+        self.environment_at([point[0], point[2], point[1]])
+    }
+
+    pub fn source_acoustics_jka(
+        &self,
+        listener: [f32; 3],
+        source: [f32; 3],
+    ) -> Option<EalSourceAcoustics> {
+        self.source_acoustics(
+            [listener[0], listener[2], listener[1]],
+            [source[0], source[2], source[1]],
+        )
+    }
+
+    /// Raw EAGLE-space query, matching EalMan's public coordinate convention.
     pub fn environment_at(&self, point: [f32; 3]) -> Option<EnvironmentAt<'_>> {
         if point
             .iter()
@@ -558,7 +580,8 @@ impl EalMap {
     }
     /// EalMan GetSourceDynamicAttributes: room-to-room obstacle lookup.
     /// No diffraction is applied here; this is equivalent to
-    /// EMFLAG_NODIFFRACTION. The direct Steam Audio filter remains authoritative.
+    /// EMFLAG_NODIFFRACTION. The native scene uses EalMan with diffraction
+    /// enabled; this reader query is retained for validation and diagnostics.
     pub fn source_acoustics(
         &self,
         listener: [f32; 3],
@@ -660,6 +683,20 @@ mod tests {
         );
         assert_eq!(map.environment_at([-0.5, 0., 0.]).unwrap().id, 0);
         assert_eq!(map.environment_at([-2., 0., 0.]).unwrap().id, -1);
+    }
+    #[test]
+    fn jka_queries_use_height_for_eagle_y_on_both_sides_of_the_obstacle_matrix() {
+        let mut map = EalMap::decode(&fixture()).unwrap();
+        // A horizontal acoustic partition: game height, not game depth,
+        // determines the room. The matrix is deliberately asymmetric.
+        map.nodes[0].normal = [0.0, 1.0, 0.0];
+        map.matrix = vec![-2, -1, -2, -2];
+        let upstairs = [0.0, -20.0, 20.0];
+        let downstairs = [0.0, 20.0, -20.0];
+        assert_eq!(map.environment_at_jka(upstairs).unwrap().id, 0);
+        assert_eq!(map.environment_at_jka(downstairs).unwrap().id, -1);
+        assert_eq!(map.source_acoustics_jka(downstairs, upstairs).unwrap().index, -1);
+        assert_eq!(map.source_acoustics_jka(upstairs, downstairs).unwrap().index, -2);
     }
     #[test]
     fn invalid_child_reference_is_rejected() {

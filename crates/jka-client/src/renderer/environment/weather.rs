@@ -11,7 +11,7 @@ impl Renderer {
             &self.device,
             &self.shadow_receiver_layout,
             &self.shadow_resources._array_view,
-            if self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps {
+            if matches!(self.cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities) {
                 &self.shadow_resources.bevy_sampler
             } else {
                 &self.shadow_resources.legacy_sampler
@@ -295,7 +295,7 @@ impl Renderer {
                     continue;
                 }
                 boxes.push(crate::ocean::WaterVolume {
-                    minimum: [s.minimum[0], -65536.0, s.minimum[1]],
+                    minimum: [s.minimum[0], world.ocean_bottoms[slot], s.minimum[1]],
                     maximum: [s.maximum[0], s.plane_height, s.maximum[1]],
                     mask_slot: world.ocean_masks.is_masked(slot).then_some(slot as u8),
                 });
@@ -305,13 +305,12 @@ impl Renderer {
         // hollow of an island ring is inside the box but not in the water.
         let no_masks = crate::ocean::OceanMasks::default();
         let masks = self.world.as_ref().map_or(&no_masks, |world| &*world.ocean_masks);
-        // Under the animated surface = under `plane + offset`; the same test as
-        // against the flat plane once the eye is lowered by that offset.
+        // Waves move the top to `plane + offset`; the brush bottom stays fixed.
         let wave_offset = self.eye_wave_offset;
-        let eye_point = [eye.x, eye.y - wave_offset, eye.z];
+        let eye_point = eye.to_array();
         let mut surface = boxes
             .iter()
-            .filter(|volume| volume.contains(eye_point, masks))
+            .filter(|volume| volume.contains_displaced(eye_point, masks, wave_offset))
             .map(|volume| volume.maximum[1])
             .fold(NO_WATER_SURFACE, f32::max);
         // A camera beyond a sky-connected water edge is still inside the
@@ -324,6 +323,7 @@ impl Renderer {
                         continue;
                     };
                     if self.ocean_extension_active(slot)
+                        && eye.y >= world.ocean_bottoms[slot]
                         && eye.y - wave_offset <= ocean.plane_height && region.contains([eye.x, eye.z]) {
                         surface = surface.max(ocean.plane_height);
                     }

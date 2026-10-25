@@ -11,4 +11,4 @@ default = ["f32"]
 f32 = []
 f64 = []
 [dependencies]
-glam = "=0.33.9"
+glam.workspace = true

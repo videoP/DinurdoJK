@@ -89,6 +89,7 @@ $previousExecutable = "$executable.prev"
 
 # Restore upstream SMAA 0.21 with WGPU default backends disabled.
 . (Join-Path $PSScriptRoot 'scripts\ensure-smaa-vendor.ps1')
+. (Join-Path $PSScriptRoot 'scripts\ensure-openal-runtime.ps1')
 
 # Move the live executable aside (Windows allows renaming an exe that is running)
 # so a game that is already open keeps using the old image while the new
@@ -120,6 +121,16 @@ function Sync-RuntimeFile([string]$Source) {
 Push-Location $PSScriptRoot
 try {
     Ensure-PatchedSmaaVendor -WorkspaceRoot $PSScriptRoot
+    $openalRuntime = Ensure-OpenALRuntime -WorkspaceRoot $PSScriptRoot
+    New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+    Sync-RuntimeFile $openalRuntime
+    foreach ($name in @('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+        Sync-RuntimeFile (Join-Path $PSScriptRoot "target\fast\$name")
+    }
+    $runtimeLicenses = Join-Path $runtimeDirectory 'licenses'
+    New-Item -ItemType Directory -Force -Path $runtimeLicenses | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination $runtimeLicenses -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt') -Force
     # Refresh the dependency graph once when upgrading an older checkout.
     $lockfile = Join-Path $PSScriptRoot 'Cargo.lock'
     $lockText = if (Test-Path -LiteralPath $lockfile) { [System.IO.File]::ReadAllText($lockfile) } else { '' }
@@ -165,19 +176,14 @@ try {
         Get-ChildItem -LiteralPath $buildDirectory -Filter '*.dll' | ForEach-Object { Sync-RuntimeFile $_.FullName }
     }
     Set-Content -LiteralPath "$executable.mode" -Value "$buildMode $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
-    $rainGlassPackagePath = Join-Path $PSScriptRoot 'assets\dinurdo-assets.pk3'
-    if (-not (Test-Path -LiteralPath $rainGlassPackagePath)) {
-        throw "RainyGlass package is missing: $rainGlassPackagePath"
-    }
     $runtimeBase = Join-Path $runtimeDirectory 'base'
     New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
-    $runtimeRainGlassPackagePath = Join-Path $runtimeBase 'dinurdo-assets.pk3'
-    # As with runtime DLLs, an identical package needs no write (and may be
-    # held open by the running game or shared with other installs via hardlink).
-    if (-not (Test-Path -LiteralPath $runtimeRainGlassPackagePath) -or
-        (Get-FileHash -LiteralPath $rainGlassPackagePath).Hash -ne
-        (Get-FileHash -LiteralPath $runtimeRainGlassPackagePath).Hash) {
-        Copy-Item -LiteralPath $rainGlassPackagePath -Destination $runtimeRainGlassPackagePath -Force
+    $assetPackage = Join-Path $PSScriptRoot 'assets\dinurdo-assets.pk3'
+    $runtimeAssetPackage = Join-Path $runtimeBase 'dinurdo-assets.pk3'
+    if (-not (Test-Path -LiteralPath $runtimeAssetPackage) -or
+        (Get-FileHash -LiteralPath $assetPackage).Hash -ne
+        (Get-FileHash -LiteralPath $runtimeAssetPackage).Hash) {
+        Copy-Item -LiteralPath $assetPackage -Destination $runtimeAssetPackage -Force
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg') -Destination (Join-Path $runtimeBase 'shader_modes_ab.cfg') -Force
     Write-Host "`nBuilt ($buildMode): $executable"

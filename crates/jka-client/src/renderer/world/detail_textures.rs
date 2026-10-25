@@ -84,7 +84,7 @@ pub(in crate::renderer) fn auto_detail_candidates(material: u8) -> &'static [&'s
         28 => &["dt_plaster1.tga", "dt_plaster2.tga"],
         30 => &["dt_ssteel1.tga", "dt_metal2.tga", "dt_metal1.tga"],
         31 => &["dt_metal1.tga", "dt_smooth1.tga", "dt_ssteel1.tga"],
-        _ => &["dt_rough1.tga", "dt_smooth1.tga", "dt_conc.tga"],
+        _ => &["dt_smooth1.tga", "dt_smooth2.tga", "dt_conc.tga"],
     }
 }
 
@@ -96,7 +96,7 @@ pub(in crate::renderer) fn auto_detail_texture_index(name: &str) -> Option<u8> {
 }
 
 pub(in crate::renderer) fn auto_detail_fallback_index() -> u8 {
-    auto_detail_texture_index("dt_rough1.tga").unwrap_or(0)
+    auto_detail_texture_index("dt_smooth1.tga").unwrap_or(0)
 }
 
 pub(in crate::renderer) fn auto_detail_index_for_material(material: u8) -> u8 {
@@ -196,9 +196,9 @@ pub(in crate::renderer) fn detail_texture_for_source<'a>(
     let name = AUTO_DETAIL_TEXTURE_FILES
         .get(usize::from(selected))
         .copied()
-        .unwrap_or("dt_rough1.tga");
+        .unwrap_or("dt_smooth1.tga");
     auto_textures
         .get(name)
-        .or_else(|| auto_textures.get("dt_rough1.tga"))
+        .or_else(|| auto_textures.get("dt_smooth1.tga"))
         .unwrap_or(manual)
 }

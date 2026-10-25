@@ -174,7 +174,7 @@ pub(in crate::renderer) fn sample_view_rotation(
         ViewLatchMode::Disabled => unreachable!(),
         ViewLatchMode::Direct => {
             camera.yaw = sample.yaw;
-            camera.pitch = sample.pitch;
+            camera.pitch = camera.late_latched_pitch(sample.pitch);
             // The base position (already shaken by the frame setup) is untouched.
             camera.apply_shake_angles();
         }

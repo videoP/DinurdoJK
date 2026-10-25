@@ -20,6 +20,10 @@ impl App {
         // A focus regain, left click, or set_overlay(None) must not re-lock the
         // cursor while a map/download modal is open over live gameplay.
         let captured = captured
+            && !self.renderer_restart_suspended
+            && self.video_confirmation.is_none()
+            && self.pending_video_confirmation.is_none()
+            && !super::lifecycle::headless()
             && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && self.window_focused
             && !self.connection_modal_active();
@@ -75,6 +79,9 @@ impl App {
         self.profile_studio_started = Instant::now();
         self.profile_studio_last_frame = Instant::now();
         self.profile_studio_spin_velocity = 0.0;
+        self.profile_studio_camera = super::ProfileStudioCamera::default();
+        self.profile_preview_yaw = 180.0;
+        self.profile_preview_zoom = 1.0;
         self.profile_studio_head_look = [0.0; 2];
         self.profile_studio_world_anchors = [None; 7];
         self.profile_body_highlight = None;
@@ -115,12 +122,18 @@ impl App {
         self.render_command(RenderCommand::SetAssetPreviewMode(active));
         self.render_command(RenderCommand::SetAssetPreviewViewport(None));
         if !active {
+            self.set_studio_mouse_look(false);
+            self.render_studio.navigation.selected = false;
             self.profile_dynamic_models = Arc::new(Vec::new());
         }
     }
 
     pub(in crate::app) fn set_overlay(&mut self, overlay: OverlayMode) {
         let previous_overlay = self.overlay;
+        if previous_overlay != overlay {
+            self.set_studio_mouse_look(false);
+            self.render_studio.navigation.selected = false;
+        }
         let leaving_console =
             self.overlay == OverlayMode::Console && overlay != OverlayMode::Console;
         let toggling_console = self.overlay != overlay
@@ -140,7 +153,7 @@ impl App {
             self.sync_profile_preview_mode(
                 self.overlay == OverlayMode::Game
                     && if self.front_end {
-                        self.frontend_page == FrontendPage::Profile
+                        matches!(self.frontend_page, FrontendPage::Profile | FrontendPage::RenderStudio)
                     } else {
                         self.menu_selected == 2
                     },
@@ -264,6 +277,13 @@ impl App {
         }
         if self.frontend_page == FrontendPage::Profile {
             self.sync_profile_preview_mode(false);
+        } else if self.frontend_page == FrontendPage::RenderStudio {
+            self.set_studio_mouse_look(false);
+            self.render_studio.navigation.selected = false;
+            self.cancel_render_studio_export();
+            self.sync_profile_preview_mode(false);
+            self.render_command(RenderCommand::SetAssetPreviewBackground(None));
+            self.profile_background_requested = None;
         } else if self.frontend_page == FrontendPage::AssetViewer {
             self.render_command(RenderCommand::SetAssetPreviewMode(false));
             self.render_command(RenderCommand::SetAssetPreviewViewport(None));
@@ -281,7 +301,7 @@ impl App {
             FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => {
                 FrontendPage::Play
             }
-            FrontendPage::AssetViewer | FrontendPage::MapViewer => FrontendPage::DeveloperTools,
+            FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::RenderStudio => FrontendPage::DeveloperTools,
         };
         self.egui_repaint_requested = true;
         self.publish_ui();
@@ -290,6 +310,17 @@ impl App {
     pub(in crate::app) fn mark_config_dirty(&mut self) {
         self.config_dirty = true;
         self.last_config_write = Instant::now();
+        // Profile editor and console setters update VideoSettings directly,
+        // not NetworkSettings. Detect just this small quantized body snapshot
+        // so unrelated rendering changes do not spam userinfo sends.
+        let body = crate::profile_wire::BodyWire::from_tuning(self.current_profile_tuning());
+        if self.last_profile_wire.as_ref() != Some(&body) {
+            self.last_profile_wire = Some(body);
+            match self.sync_packed_body_cvar() {
+                Ok(()) => self.request_userinfo_send(),
+                Err(error) => self.push_console_error(error),
+            }
+        }
     }
 
     pub(in crate::app) fn refresh_bound_state(&mut self) {
@@ -582,6 +613,7 @@ impl App {
             self.overlay
         };
         self.emote_radial_category = None;
+        self.emote_radial_search = Default::default();
         self.dev_radial_offset = [0.0, -0.28];
         self.set_overlay(OverlayMode::EmoteRadial);
         self.set_capture(true);
@@ -589,7 +621,31 @@ impl App {
 
     pub(in crate::app) fn close_emote_radial(&mut self) {
         self.emote_radial_category = None;
+        self.emote_radial_search = Default::default();
         self.set_overlay(self.dev_radial_return_overlay);
+    }
+
+    /// Tab toggles between the nonmodal, mouse-captured wheel and a pinned,
+    /// text-focused browser. In search mode nothing typed goes to game binds.
+    pub(in crate::app) fn toggle_emote_radial_search(&mut self) {
+        if self.overlay != OverlayMode::EmoteRadial { return; }
+        if self.emote_radial_search.pinned {
+            self.emote_radial_search.pinned = false;
+            self.set_capture(true);
+        } else {
+            // Unlatch held +movement, attack and spectator inputs before
+            // switching to the text-input owner; never leave a ghost key held.
+            self.release_all_pressed_bindings();
+            self.keys.clear();
+            self.movement_keys.clear();
+            self.mouse_buttons_down.clear();
+            self.emote_radial_search.pinned = true;
+            self.emote_radial_search.request_focus = true;
+            self.emote_radial_search.selection = 0;
+            self.emote_radial_search.scroll_to_selection = true;
+            self.set_capture(false);
+        }
+        self.egui_repaint_requested = true;
     }
 
     pub(in crate::app) fn key_bound_to_emote(&self, code: KeyCode) -> bool {

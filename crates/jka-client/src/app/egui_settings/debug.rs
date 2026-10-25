@@ -146,21 +146,22 @@ impl App {
             self.video.draw_entities,
         );
 
-        const CULL: [(CullDebugMode, &str); 2] = [
+        const CULL: [(CullDebugMode, &str); 4] = [
             (CullDebugMode::Off, "Off"),
+            (CullDebugMode::Counters, "Counters only"),
+            (CullDebugMode::HiZOnly, "Hi-Z only"),
             (CullDebugMode::RejectionReasons, "Rejection reasons"),
         ];
         if let Some(target) = segmented_row(
             ui,
             "Cull rejection debug",
-            "Tints each batch by the reason it was culled, so over-aggressive \
-             culling can be traced back to a specific test.",
+            "Counters only keeps the scene unobstructed. Hi-Z only shows magenta dots for GPU wall occlusion; Rejection reasons also shows frustum, PVS and area rejections. Dots never accumulate into a solid fill.",
             theme::Reset::Video(ui::VIDEO_ROW_CULL_DEBUG),
             self.video.cull_debug,
             &CULL,
         ) {
-            let current = usize::from(self.video.cull_debug != CullDebugMode::Off);
-            let next = usize::from(target != CullDebugMode::Off);
+            let current = self.video.cull_debug.index();
+            let next = target.index();
             self.video_selected = ui::VIDEO_ROW_CULL_DEBUG;
             self.change_video_setting(next as i32 - current as i32);
         }
@@ -275,7 +276,7 @@ impl App {
             ui,
             "GPU timestamps",
             "Queries the GPU for real per-pass durations instead of estimating \
-             them from CPU submission time.",
+             them from CPU submission time. Session-only; starts off after restart.",
             ui::VIDEO_ROW_GPU_TIMINGS,
             self.video.gpu_timings,
         );

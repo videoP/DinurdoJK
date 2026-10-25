@@ -6,7 +6,6 @@ use crate::ghoul2::{GlaAnimation, GlmModel};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    io::{Cursor, Read},
     sync::{Arc, Mutex, OnceLock},
 };
 mod catalog;
@@ -30,9 +29,7 @@ pub fn apply_profile(
     } else {
         apply(glm, gla, BodyShapeParams::default(), details, native)?
     };
-    let pivots = super::procedural::apply(
-        glm, gla, params, detail_pivots.as_deref().or(native),
-    )?;
+    let pivots = super::procedural::apply(glm, gla, params, detail_pivots.as_deref().or(native))?;
     Ok(pivots.or(detail_pivots))
 }
 
@@ -171,15 +168,7 @@ struct Metadata {
     targets: Vec<Target>,
     controls: Vec<Local>,
     facial: Vec<Facial>,
-    #[cfg(test)]
-    oracle: Vec<Oracle>,
-}
-#[cfg(test)]
-#[derive(Deserialize)]
-struct Oracle {
-    params: [f32; 5],
-    details: String,
-    expected: [usize; 2],
+    fixed_params: [f32; 5],
 }
 struct Model {
     meta: Metadata,
@@ -207,27 +196,111 @@ fn mean(points: &[[f32; 3]], ids: &[usize]) -> [f32; 3] {
         add(v, mul(points[i], 1. / ids.len() as f32))
     })
 }
-fn model() -> &'static Model {
-    static MODEL: OnceLock<Model> = OnceLock::new();
-    MODEL.get_or_init(|| {
-        let mut zip = zip::ZipArchive::new(Cursor::new(include_bytes!("anny_targets.zip")))
-            .expect("bundled Anny archive");
-        let meta: Metadata = serde_json::from_reader(zip.by_name("model.json").unwrap())
-            .expect("bundled Anny metadata");
-        assert_eq!(meta.version, 1);
-        assert_eq!(meta.controls.len(), LOCAL_COUNT);
-        assert_eq!(meta.facial.len(), FACIAL_COUNT);
-        for (i, c) in meta.controls.iter().enumerate() {
-            assert_eq!(c.label, LOCAL_CONTROLS[i].0);
+/// Asset-pack paths of the lossless runtime deformation data.
+pub const RUNTIME_METADATA: &str = "customization/body/model.json";
+pub const RUNTIME_ARRAYS: &str = "customization/body/arrays.bin";
+static MODEL: OnceLock<Model> = OnceLock::new();
+static ASSETS: Mutex<Option<crate::pk3::AssetSearchPath>> = Mutex::new(None);
+
+/// Supply the presenter's VFS without decoding the donor until first use.
+/// The immutable donor and its derived mapping caches are shared by presenters.
+pub fn configure_assets(assets: &crate::pk3::AssetSearchPath) {
+    if MODEL.get().is_none() {
+        if let Ok(mut source) = ASSETS.lock() {
+            if source.is_none() {
+                *source = Some(assets.fork());
+            }
         }
-        for (i, c) in meta.facial.iter().enumerate() {
-            assert_eq!(c.label, FACIAL_CONTROLS[i]);
+    }
+}
+
+fn model() -> Result<&'static Model, String> {
+    if let Some(data) = MODEL.get() {
+        return Ok(data);
+    }
+    let mut source = ASSETS.lock().map_err(|_| "Anny asset reader poisoned")?;
+    if let Some(data) = MODEL.get() {
+        return Ok(data);
+    }
+    #[cfg(test)]
+    if source.is_none() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        *source = Some(crate::pk3::AssetSearchPath::open(&root).map_err(|e| e.to_string())?);
+    }
+    let assets = source
+        .as_mut()
+        .ok_or("Anny asset search path is not configured")?;
+    let mut read = |name, limit| {
+        assets
+            .read(name, limit)
+            .map_err(|e| format!("Anny asset: {e}"))?
+            .map(|asset| asset.bytes)
+            .ok_or_else(|| format!("Missing {name}; install dinurdo-assets.pk3 in base"))
+    };
+    let json = read(RUNTIME_METADATA, 2 * 1024 * 1024)?;
+    let bytes = read(RUNTIME_ARRAYS, 32 * 1024 * 1024)?;
+    let data = Model::parse(&json, bytes)?;
+    let _ = MODEL.set(data);
+    *source = None;
+    MODEL
+        .get()
+        .ok_or_else(|| "Anny initialization failed".into())
+}
+
+impl Model {
+    fn parse(json: &[u8], mut bytes: Vec<u8>) -> Result<Self, String> {
+        if json.len() > 2 * 1024 * 1024 {
+            return Err("Anny metadata exceeds limit".into());
         }
-        let mut bytes = Vec::new();
-        zip.by_name("arrays.bin")
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
+        let meta: Metadata = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+        if meta.version != 2
+            || meta.fixed_params != [0.5; 5]
+            || meta.controls.len() != LOCAL_COUNT
+            || meta.facial.len() != FACIAL_COUNT
+            || meta
+                .controls
+                .iter()
+                .zip(LOCAL_CONTROLS)
+                .any(|(c, expected)| c.label != expected.0)
+            || meta
+                .facial
+                .iter()
+                .zip(FACIAL_CONTROLS)
+                .any(|(c, expected)| c.label != expected)
+        {
+            return Err("Unsupported Anny runtime data/catalog".into());
+        }
+        if bytes.len() > 32 * 1024 * 1024 {
+            return Err("Anny arrays exceed limit".into());
+        }
+        let valid = |[offset, count]: [usize; 2]| {
+            offset
+                .checked_add(count.saturating_mul(4))
+                .is_some_and(|end| end <= bytes.len())
+        };
+        if meta.blocks.iter().any(|&spec| !valid(spec))
+            || !valid(meta.vertices)
+            || !valid(meta.faces)
+            || meta.vertices[1] == 0
+            || meta.vertices[1] % 3 != 0
+            || meta.faces[1] % 3 != 0
+        {
+            return Err("Invalid Anny array bounds".into());
+        }
+        for sparse in meta
+            .targets
+            .iter()
+            .map(|t| &t.sparse)
+            .chain(meta.controls.iter().flat_map(|c| c.sides.iter()))
+            .chain(meta.facial.iter().map(|f| &f.sparse))
+        {
+            if !valid(sparse.indices)
+                || !valid(sparse.delta)
+                || sparse.indices[1].checked_mul(3) != Some(sparse.delta[1])
+            {
+                return Err("Invalid Anny target bounds".into());
+            }
+        }
         for &[offset, count] in &meta.blocks {
             let shuffled = bytes[offset..offset + count * 4].to_vec();
             for i in 0..count {
@@ -255,6 +328,7 @@ fn model() -> &'static Model {
             heads: vec![],
             tails: vec![],
         };
+        out.validate()?;
         out.neutral = out.evaluate(BodyShapeParams::default(), Details::default());
         out.heads = out
             .meta
@@ -268,10 +342,66 @@ fn model() -> &'static Model {
             .iter()
             .map(|b| mean(&out.neutral, &b.tail))
             .collect();
-        out
-    })
+        Ok(out)
+    }
 }
 impl Model {
+    fn validate(&self) -> Result<(), String> {
+        let n = self.template.len();
+        let bones = self.meta.bones.len();
+        if bones == 0
+            || bones > 256
+            || self.meta.weights.len() != n
+            || self.template.iter().flatten().any(|x| !x.is_finite())
+            || self.faces.iter().flatten().any(|&i| i >= n)
+            || self.meta.bones.iter().any(|b| {
+                b.head.is_empty()
+                    || b.tail.is_empty()
+                    || b.head.iter().chain(&b.tail).any(|&i| i >= n)
+            })
+            || self
+                .meta
+                .weights
+                .iter()
+                .flatten()
+                .any(|&(i, w)| i >= bones || !w.is_finite())
+        {
+            return Err("Invalid Anny reference geometry/rig".into());
+        }
+        for t in &self.meta.targets {
+            for (axis, anchor) in &t.terms {
+                let count = match axis.as_str() {
+                    "race" | "cupsize" | "firmness" | "muscle" | "weight" => 3,
+                    "gender" | "height" | "proportions" => 2,
+                    "age" => 5,
+                    _ => return Err("Invalid Anny target axis".into()),
+                };
+                if *anchor >= count {
+                    return Err("Invalid Anny target anchor".into());
+                }
+            }
+        }
+        for s in self
+            .meta
+            .targets
+            .iter()
+            .map(|t| &t.sparse)
+            .chain(self.meta.controls.iter().flat_map(|c| c.sides.iter()))
+            .chain(self.meta.facial.iter().map(|f| &f.sparse))
+        {
+            for v in self.bytes[s.indices[0]..s.indices[0] + s.indices[1] * 4].chunks_exact(4) {
+                if u32::from_le_bytes(v.try_into().unwrap()) as usize >= n {
+                    return Err("Invalid Anny target vertex".into());
+                }
+            }
+            for v in self.bytes[s.delta[0]..s.delta[0] + s.delta[1] * 4].chunks_exact(4) {
+                if !f32::from_le_bytes(v.try_into().unwrap()).is_finite() {
+                    return Err("Invalid Anny target displacement".into());
+                }
+            }
+        }
+        Ok(())
+    }
     fn accumulate(&self, out: &mut [[f32; 3]], sparse: &Sparse, weight: f32) {
         if weight == 0. {
             return;

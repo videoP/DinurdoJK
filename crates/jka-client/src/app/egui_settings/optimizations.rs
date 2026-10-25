@@ -23,6 +23,8 @@ pub(in crate::app) const OPTIMIZATION_CVARS: &[(&str, &str, &str)] = &[
     ("r_inlineTransform", "gpu", "cpu"),
     ("r_ghoul2BatchDraws", "1", "0"),
     ("r_staticMd3Instances", "0", "0"),
+    ("r_staticMd3Bvh", "0", "0"),
+    ("r_fxOcclusion", "0", "0"),
     ("r_ghoul2EarlyCull", "1", "0"),
     ("r_fxGeometry", "gpu", "cpu"),
     ("r_fxZeroAlphaDiscard", "0", "0"),
@@ -493,6 +495,18 @@ impl App {
             },
         );
 
+        theme::row(
+            ui,
+            "Static MD3 BVH (A/B)",
+            "Conservative group-level PVS, frustum and distance candidate pruning before the original MD3 tests. 0 = reference scan; 1 = spatial hierarchy; unrelated to GPU Hi-Z. Compare via r_occlusionStats 1.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.static_md3_bvh) {
+                    let _ = self.set_console_cvar("r_staticMd3Bvh", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
         self.egui_toggle_row(
             ui,
             "Offscreen early cull",
@@ -529,6 +543,29 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_FX_GEOMETRY;
             self.change_video_setting(next as i32 - current as i32);
         }
+
+        theme::row(
+            ui,
+            "Map FX runner culling (A/B)",
+            "0 = original FX path; 1 = stationary map fx_runner groups, bounded by their current live particles, rejected only when entirely behind the camera. Simulation, lights and resident GPU particles continue. No wall occlusion.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.fx_occlusion == 1) {
+                    let _ = self.set_console_cvar("r_fxOcclusion", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "Occlusion A/B diagnostics",
+            "Print a representative MD3 and FX CPU broad-phase report each second (with r_occlusionStats 1). Disable while recording benchmark FPS/timing runs.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.occlusion_stats) {
+                    let _ = self.set_console_cvar("r_occlusionStats", if enabled { "1" } else { "0" });
+                }
+            },
+        );
 
         ui.add_enabled_ui(self.video.fx_geometry == FxGeometryMode::Gpu, |ui| {
             self.egui_toggle_row(

@@ -1,12 +1,17 @@
 //! Client-only swim orientation layered over OpenJK's normal player axis.
-//! There is no player waterlevel field in remote entityState; the authoritative
-//! swim legs animation is the reliable shared indicator for local/remote bodies.
+//! There is no player waterlevel field in remote entityState, so the water
+//! collision volume estimates surface proximity; the swim legs animation is
+//! the reliable shared gate for local and remote bodies.
 use jka_assets::animation::AnimationSet;
+use jka_movement::TraceWorld;
 
 const MAX_FORWARD_PITCH: f32 = 82.0;
 const MAX_BACKWARD_PITCH: f32 = 62.0;
 const MAX_STRAFE_ROLL: f32 = 22.0;
-const MAX_TURN_BANK: f32 = 45.0;
+const MAX_TURN_BANK: f32 = 60.0;
+const SURFACE_PITCH_LIFT: f32 = 12.0;
+const WATER_SURFACE_BLEND_DISTANCE: f32 = 48.0;
+const CONTENTS_WATER: i32 = 0x4;
 
 pub(super) fn swimming_legs(raw_anim: i32) -> bool {
     // The animation toggle bit is not part of the index (JKA 2048).
@@ -20,6 +25,7 @@ pub(super) fn swimming_legs(raw_anim: i32) -> bool {
 /// retain the stock upright tread animation; moving bodies transition flat.
 pub(super) fn swim_target_angles(
     legs_anim: i32, yaw_degrees: f32, velocity: [f32; 3], strength: f32,
+    surface_proximity: f32,
 ) -> [f32; 2] {
     if strength <= 0.0 || !swimming_legs(legs_anim) || !velocity.iter().all(|v| v.is_finite()) {
         return [0.0; 2];
@@ -38,8 +44,43 @@ pub(super) fn swim_target_angles(
     // Pitch slightly toward diving/ascending without making vertical tread
     // point the head straight down or flip the body upside-down.
     let vertical = velocity[2] / horizontal.hypot(velocity[2]).max(1.0);
-    let pitch = (base_pitch - 23.0 * vertical * forward.max(0.0)).clamp(-67.0, 102.0);
+    let surface_lift = SURFACE_PITCH_LIFT * surface_proximity.clamp(0.0, 1.0);
+    let pitch = (base_pitch - 23.0 * vertical * forward.max(0.0) - surface_lift)
+        .clamp(-67.0, 102.0);
     [pitch * motion * strength, -MAX_STRAFE_ROLL * sideways * motion * strength]
+}
+
+/// Estimate how close a swimmer is to the top of its water volume. Sample from
+/// torso height upward so the head-up pose eases in while the body approaches
+/// the surface. The swim animation remains the gate; this also works for
+/// remote players, whose network entity state does not include waterlevel.
+pub(super) fn swim_surface_proximity<W: TraceWorld>(
+    world: &mut W,
+    origin: [f32; 3],
+    pass_entity: i32,
+) -> f32 {
+    if !origin.iter().all(|value| value.is_finite()) {
+        return 0.0;
+    }
+    let torso = [origin[0], origin[1], origin[2] + 24.0];
+    let torso_wet = world.point_contents(torso, pass_entity) & CONTENTS_WATER != 0;
+    if !torso_wet {
+        return if world.point_contents(origin, pass_entity) & CONTENTS_WATER != 0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    for height in (8..=48).step_by(8) {
+        let sample = [torso[0], torso[1], torso[2] + height as f32];
+        if world.point_contents(sample, pass_entity) & CONTENTS_WATER == 0 {
+            let distance = height as f32 / WATER_SURFACE_BLEND_DISTANCE;
+            let smooth = distance * distance * (3.0 - 2.0 * distance);
+            return 1.0 - smooth;
+        }
+    }
+    0.0
 }
 
 /// Velocity-derived swim turn bank. Local axis 2 rotates the swimmer about
@@ -95,7 +136,7 @@ impl SwimTurnMotion {
                 let turn_fraction = ((turn_rate.abs() - 8.0) / 105.0).clamp(0.0, 1.0);
                 let motion = ((speed - 25.0) / 95.0).clamp(0.0, 1.0);
                 // Positive heading delta is a left curve, so negative bank;
-                // right/D curve is positive bank. At full rate -> ±45°.
+                // right/D curve is positive bank. At full rate -> ±60°.
                 self.target = -turn_rate.signum() * MAX_TURN_BANK * turn_fraction
                     * motion * tilt_strength * bank_strength;
             }
@@ -166,10 +207,10 @@ mod tests {
         let forward = animation_index("BOTH_SWIMFORWARD").unwrap() as i32;
         let backward = animation_index("BOTH_SWIMBACKWARD").unwrap() as i32;
         assert!(swimming_legs(forward | super::super::physics::ANIM_TOGGLEBIT));
-        assert!(swim_target_angles(forward, 0.0, [200.0, 0.0, 0.0], 1.0)[0] > 75.0);
-        assert!(swim_target_angles(backward, 0.0, [-200.0, 0.0, 0.0], 1.0)[0] < -50.0);
-        assert_eq!(swim_target_angles(forward, 0.0, [200.0, 0.0, 0.0], 0.0), [0.0; 2]);
-        assert_eq!(swim_target_angles(0, 0.0, [200.0, 0.0, 0.0], 1.0), [0.0; 2]);
+        assert!(swim_target_angles(forward, 0.0, [200.0, 0.0, 0.0], 1.0, 0.0)[0] > 75.0);
+        assert!(swim_target_angles(backward, 0.0, [-200.0, 0.0, 0.0], 1.0, 0.0)[0] < -50.0);
+        assert_eq!(swim_target_angles(forward, 0.0, [200.0, 0.0, 0.0], 0.0, 0.0), [0.0; 2]);
+        assert_eq!(swim_target_angles(0, 0.0, [200.0, 0.0, 0.0], 1.0, 0.0), [0.0; 2]);
     }
 
     #[test]

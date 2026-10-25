@@ -39,6 +39,8 @@ pub enum FxClass {
     #[default]
     General,
     SaberImpact,
+    /// Stable ET_FX source. Descendant/death/emitter effects inherit this class.
+    MapRunner(u16),
 }
 
 /// Effect ids a primitive refers to, resolved once at registration.
@@ -122,10 +124,29 @@ struct Primitive {
     angle_delta: [f32; 3],
 }
 
+/// An authored `Decal {}` request emitted once by the FX worker. Actual BSP
+/// clipping is performed by the presentation layer's R_MarkFragments port.
+/// Defer it rather than drawing a billboard: it must never float through a wall.
+#[derive(Clone, Debug)]
+pub struct FxDecalSpawn {
+    pub origin: [f32; 3],
+    pub normal: [f32; 3],
+    pub radius: f32,
+    pub rotation: f32,
+    pub shader: String,
+    pub rgba: [u8; 4],
+    pub life_ms: i32,
+    pub class: FxClass,
+    /// TaystJK FX_GHOUL2_DECALS: also project onto intersected skinned models.
+    pub ghoul2: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FxDraw {
     /// RT_SPRITE: view-facing quad of half-extent `radius`.
-    Sprite { origin: [f32; 3], radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    /// `shader_time` is refEntity_t::shaderTime in seconds: zero uses the
+    /// global shader clock, otherwise stages run from that time (setShaderTime).
+    Sprite { shader_time: f32, origin: [f32; 3], radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
     /// RT_SABER_GLOW: JKA's renderer-side chain of view-facing glow sprites.
     /// Keeping this as one primitive preserves the stock split between CGame's
     /// blade flicker and RB_SurfaceSaberGlow's own hilt pulse/randomness.
@@ -139,7 +160,7 @@ pub enum FxDraw {
         shader: String,
     },
     /// RT_ORIENTED_QUAD: quad in axis[1]/axis[2] of half-extent `radius`.
-    OrientedQuad { origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    OrientedQuad { shader_time: f32, origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
     /// Camera-facing (or velocity-aligned) quad with independent half extents
     /// and a texture sub-rectangle, for baked flipbook particles.
     /// `facing` places the quad in the plane perpendicular to it (custom facing).
@@ -161,7 +182,7 @@ pub enum FxDraw {
         indices: Vec<u32>,
         shader: String,
     },
-    /// Lit, alpha-blended relief mesh with real normals and no texture (vertex
+    /// Opaque, depth-writing relief mesh with real normals and no texture (vertex
     /// colour only). `lighting_origin` picks the BSP light-grid sample. Used by
     /// the enhanced saber melt so raised slag is shaded by the scene lights.
     LitMesh {
@@ -250,6 +271,12 @@ pub struct FxBlade {
 #[derive(Default, Debug)]
 pub struct FxFrame {
     pub draws: Vec<FxDraw>,
+    /// Only newly spawned author-written decal primitives, not persistent draws.
+    pub decals: Vec<FxDecalSpawn>,
+    /// Authored decals requesting Ghoul2 mesh projection, after world projection.
+    pub ghoul2_decals: Vec<FxDecalSpawn>,
+    /// Original draw indices for map-runner descendants; populated only in the opt-in path.
+    pub runner_draws: Vec<(usize, u16)>,
     /// Optional once-per-spawn GPU staging; the existing CPU draw path remains
     /// authoritative until renderer material-stage eligibility is connected.
     pub gpu_sparks: Option<super::gpu_sparks::GpuSparkCommands>,
@@ -400,6 +427,7 @@ pub struct FxSystem {
     gpu_offloaded_last_frame: usize,
     sounds: Vec<FxSound>,
     shakes: Vec<FxShake>,
+    decal_spawns: Vec<FxDecalSpawn>,
     /// FxRunner PlayEffect calls made while creating a primitive.
     runner_queue: Vec<(EffectId, [f32; 3], Axis, FxClass)>,
     time: i32,
@@ -445,6 +473,7 @@ impl FxSystem {
             gpu_offloaded_last_frame: 0,
             sounds: Vec::new(),
             shakes: Vec::new(),
+            decal_spawns: Vec::new(),
             runner_queue: Vec::new(),
             time: 0,
             old_time: 0,
@@ -547,6 +576,7 @@ impl FxSystem {
         self.active.clear();
         self.scheduled.clear();
         self.sounds.clear();
+        self.decal_spawns.clear();
     }
 
     /// Reset the scheduler clock and transient primitives at a demo seek boundary.
@@ -717,6 +747,15 @@ impl FxSystem {
     /// rendered output of saber-impact trees. The simulation is intentionally
     /// retained so a paused demo can toggle the same frozen population off/on.
     pub fn frame_with_visibility(&mut self, saber_impact_fx: bool) -> FxFrame {
+        self.frame_impl::<false>(saber_impact_fx)
+    }
+
+    pub fn frame_with_runner_tracking(&mut self, saber_impact_fx: bool) -> FxFrame {
+        self.frame_impl::<true>(saber_impact_fx)
+    }
+
+    // Separate monomorphizations: OFF does not inspect runner classes or record indices.
+    fn frame_impl<const TRACK_RUNNERS: bool>(&mut self, saber_impact_fx: bool) -> FxFrame {
         let now = self.time;
         let mut due = Vec::new();
         self.scheduled.retain(|scheduled| {
@@ -740,6 +779,7 @@ impl FxSystem {
         }
 
         let mut out = FxFrame {
+            decals: std::mem::take(&mut self.decal_spawns),
             sounds: std::mem::take(&mut self.sounds),
             shakes: std::mem::take(&mut self.shakes),
             ..FxFrame::default()
@@ -796,7 +836,14 @@ impl FxSystem {
             }
             let visible = saber_impact_fx || prim.class != FxClass::SaberImpact;
             let world = collision.as_deref_mut().map(|world| world as &mut dyn TraceWorld);
-            update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible, physics_mode, world)
+            let first_draw = if TRACK_RUNNERS { out.draws.len() } else { 0 };
+            let alive = update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible, physics_mode, world);
+            if TRACK_RUNNERS {
+                if let FxClass::MapRunner(id) = prim.class {
+                    out.runner_draws.extend((first_draw..out.draws.len()).map(|i| (i, id)));
+                }
+            }
+            alive
         });
         self.gpu_offloaded_last_frame = gpu_offloaded;
         for (id, origin, dir, class) in deaths {
@@ -977,15 +1024,46 @@ impl FxSystem {
                 });
                 return;
             }
-            PrimType::Decal | PrimType::ScreenFlash | PrimType::Electricity => {
-                // Electricity is drawn as a straight line until RT_ELECTRICITY
-                // (chaos/branching) is ported; the rest need systems that do
-                // not exist yet (marks, 2D flash).
-                if fx.kind != PrimType::Electricity {
-                    self.unsupported_spawns += 1;
-                    return;
+            PrimType::Decal => {
+                // CFxScheduler::CreateDecal: an authored decal is a one-shot
+                // projection, *not* an animated screen-facing FX particle.
+                // Keep its shader/radius/tint and project onto markable BSP
+                // surfaces on the presentation side when the worker flushes.
+                if let Some(shader) = shader {
+                    let size = fx.size_start.get(rng).max(0.0);
+                    if size > 0.0 {
+                        self.decal_spawns.push(FxDecalSpawn {
+                            origin: org,
+                            normal: normalize(ax[0]),
+                            radius: size,
+                            rotation: fx.rotation.get(rng),
+                            shader,
+                            rgba: [
+                                (rgb_start[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                (rgb_start[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                (rgb_start[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                // An authored mark is a persistent poly, not a
+                                // zero-alpha refEntity. Keep it visible even
+                                // when the primitive omits `useAlpha`.
+                                if flags & FX_USE_ALPHA != 0 {
+                                    (fx.alpha_start.get(rng).clamp(0.0, 1.0) * 255.0) as u8
+                                } else { 255 },
+                            ],
+                            // FxScheduler.cpp calls AddDecalToScene without
+                            // forwarding mLife; the renderer owns decal lifetime.
+                            life_ms: 10_000,
+                            class,
+                            ghoul2: fx.flags & FX_GHOUL2_DECALS != 0,
+                        });
+                    }
                 }
+                return;
             }
+            PrimType::ScreenFlash => {
+                self.unsupported_spawns += 1;
+                return;
+            }
+            PrimType::Electricity => {}
             _ => {}
         }
 
@@ -1195,6 +1273,9 @@ fn update_primitive(
                     });
                 }
             }
+            // CEffect::SetTimeStart: FX_SET_SHADER_TIME starts animMaps and
+            // waves at the primitive's own birth instead of the map clock.
+            let shader_time = if prim.flags & FX_SET_SHADER_TIME != 0 { prim.time_start as f32 * 0.001 } else { 0.0 };
             match prim.kind {
                 PrimType::Particle => {
                     rotate(prim, frame_time);
@@ -1202,7 +1283,7 @@ fn update_primitive(
                         if let Some(id) = prim.gpu_id {
                             out.gpu_sprite_draw_indices.push((out.draws.len(), id));
                         }
-                        out.draws.push(FxDraw::Sprite { origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
+                        out.draws.push(FxDraw::Sprite { shader_time, origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
                     }
                 }
                 PrimType::OrientedParticle => {
@@ -1210,6 +1291,7 @@ fn update_primitive(
                     if visible {
                         let (right, up) = make_normal_vectors(prim.normal);
                         out.draws.push(FxDraw::OrientedQuad {
+                            shader_time,
                             origin: prim.origin,
                             axis: [prim.normal, right, up],
                             radius,
@@ -1587,6 +1669,70 @@ mod tests {
     }
 
     const SHOT: &str = "Line\n{\n\torigin\t8 0 0\n\torigin2\t-80 0 0\n\tflags\tuseAlpha\n\twidth\n\t{\n\t\tstart\t1.5\n\t}\n\talpha\n\t{\n\t\tstart\t0.6\n\t}\n\tshader\n\t[\n\t\tgfx/effects/blaster_blob\n\t]\n}\nparticle\n{\n\torigin\t-5 0 0\n\tlife 100\n\tvelocity 100 0 0\n\tsize\n\t{\n\t\tstart\t2\n\t\tend 0\n\t\tflags linear\n\t}\n\tshader\n\t[\n\t\tgfx/effects/whiteGlow\n\t]\n}\n";
+
+    #[test]
+    fn authored_decals_flush_once_with_shader_and_size() {
+        const MARK: &str = "decal\n{\nlife 4000\nsize\n{\nstart 8\n}\nshader\n[\ngfx/damage/bullet_mrk\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/mark", &mut read_fixture(&[("effects/test/mark.efx", MARK)]));
+        assert_ne!(id, 0);
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.play_effect_dir(id, [12.0, 4.0, 8.0], [0.0, 0.0, 1.0]);
+        let first = fx.frame();
+        assert_eq!(first.decals.len(), 1, "decal is a one-shot projection request");
+        assert!(first.draws.is_empty(), "EFX decals must not become billboards");
+        let mark = &first.decals[0];
+        assert_eq!(mark.origin, [12.0, 4.0, 8.0]);
+        assert_eq!(mark.normal, [0.0, 0.0, 1.0]);
+        assert_eq!(mark.radius, 8.0);
+        assert_eq!(mark.life_ms, 10_000, "author life must not expire a persistent decal");
+        assert_eq!(mark.shader, "gfx/damage/bullet_mrk");
+        assert_eq!(mark.rgba[3], 255);
+        assert!(!mark.ghoul2);
+        fx.adjust_time(1032);
+        assert!(fx.frame().decals.is_empty(), "do not respawn the decal each frame");
+    }
+
+    #[test]
+    fn ghoul2decal_flag_is_carried_from_efx_template() {
+        const MARK: &str = "decal\n{\nflags ghoul2decals\nsize\n{\nstart 5\n}\nshader\n[\ngfx/damage/bodyburnmark1\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/g2", &mut read_fixture(&[("effects/test/g2.efx", MARK)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.play_effect_dir(id, [0.0; 3], [0.0, 0.0, 1.0]);
+        assert!(fx.frame().decals.iter().any(|decal| decal.ghoul2));
+    }
+
+    #[test]
+    fn runner_tracking_preserves_simulation_lights_sounds_and_nested_ownership() {
+        const ROOT: &str = "fxRunner\n{\nplayFx\n[\nblaster/shot\n]\n}\nlight\n{\nlife 1000\nsize\n{\nstart 64\n}\n}\nsound\n{\nshader\n[\nsound/test.wav\n]\n}\n";
+        fn system() -> FxSystem {
+            let mut fx = FxSystem::new();
+            let id = fx.register("root", &mut read_fixture(&[("effects/root.efx", ROOT), ("effects/blaster/shot.efx", SHOT)]));
+            assert_ne!(id, 0);
+            fx.adjust_time(1000); fx.adjust_time(1016);
+            fx.play_effect_dir_class(id, [-600.0,0.0,0.0], [1.0,0.0,0.0], FxClass::MapRunner(17));
+            fx
+        }
+        let mut baseline = system(); let mut tracked = system();
+        for time in [1016,1032,1080] {
+            baseline.adjust_time(time); tracked.adjust_time(time);
+            let a = baseline.frame_with_visibility(true);
+            let b = tracked.frame_with_runner_tracking(true);
+            assert_eq!(a.draws, b.draws);
+            assert_eq!(a.lights, b.lights);
+            assert_eq!(a.sounds, b.sounds);
+            assert_eq!(a.shakes, b.shakes);
+            assert!(a.runner_draws.is_empty());
+            assert_eq!(b.runner_draws.len(), b.draws.len());
+            assert!(b.runner_draws.iter().all(|(_, id)| *id == 17), "nested fxRunner must inherit its root entity");
+        }
+        let off = tracked.frame_with_visibility(true);
+        assert!(off.runner_draws.is_empty());
+        assert_eq!(baseline.stats().active, tracked.stats().active);
+    }
 
     #[test]
     fn electricity_shorter_than_one_step_draws_nothing() {

@@ -189,6 +189,7 @@ pub(in crate::scene) fn dynamic_light_from_values(
         color,
         radius,
         intensity,
+        shadow_power: 0.0,
         falloff: DynamicLightFalloff::Smooth,
         // Preserve the existing compiled-BSP enhancement path exactly. Source-map
         // lightJunior filtering is handled by map_dynamic_light below.
@@ -535,6 +536,7 @@ pub(in crate::scene) fn bsp_fx_runners(bsp: &Bsp, warnings: &mut Vec<String>) ->
             }
 
             Some(MapFxRunner {
+                bake_static: bsp_entity_value(entity, b"targetname").is_none(),
                 source_entity_index,
                 effect: effect.replace('\\', "/"),
                 origin,
@@ -675,6 +677,7 @@ pub(in crate::scene) fn map_dynamic_light(
         } else {
             DynamicLightFalloff::InverseSquare
         },
+        shadow_power: 0.0,
         surface_lighting: classname != "lightJunior",
         emitter_normal: [0.0; 3],
         emitter_two_sided: false,

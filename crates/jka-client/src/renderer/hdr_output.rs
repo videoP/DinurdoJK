@@ -107,6 +107,7 @@ pub(super) struct HdrOutput {
     output_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     capture_pipeline: wgpu::RenderPipeline,
+    capture_alpha_pipeline: wgpu::RenderPipeline,
     scene_group: wgpu::BindGroup,
     ui_group: wgpu::BindGroup,
     capture_group: wgpu::BindGroup,
@@ -274,6 +275,10 @@ impl HdrOutput {
             "fs_output",
             None,
         );
+        let capture_alpha_pipeline = pipeline(
+            device, &layout, &shader, wgpu::TextureFormat::Bgra8UnormSrgb,
+            "fs_capture_alpha", None,
+        );
         Self {
             selection,
             requested,
@@ -290,6 +295,7 @@ impl HdrOutput {
             output_pipeline,
             ui_pipeline,
             capture_pipeline,
+            capture_alpha_pipeline,
             scene_group,
             ui_group,
             capture_group,
@@ -374,11 +380,15 @@ impl HdrOutput {
         );
     }
     pub fn submit(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        surface: &wgpu::TextureView,
-        capture: bool,
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        surface: &wgpu::TextureView, capture: bool,
+    ) {
+        self.submit_with_alpha(device, queue, surface, capture, false);
+    }
+
+    pub fn submit_with_alpha(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        surface: &wgpu::TextureView, capture: bool, transparent: bool,
     ) {
         let mut encoder = device.create_command_encoder(&Default::default());
         Self::pass(
@@ -392,7 +402,7 @@ impl HdrOutput {
             Self::pass(
                 &mut encoder,
                 &self.capture_view,
-                &self.capture_pipeline,
+                if transparent { &self.capture_alpha_pipeline } else { &self.capture_pipeline },
                 &self.capture_group,
                 wgpu::LoadOp::Clear(wgpu::Color::BLACK),
             );

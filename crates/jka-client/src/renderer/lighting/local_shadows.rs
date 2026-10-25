@@ -2,7 +2,7 @@
 use crate::renderer::{
     hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
     GpuPointLight, LocalShadowCacheEntry, LocalShadowResources, Mat4, Renderer,
-    ShadowCasterUniform, Vec3, WorldGpu, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
+    ShadowCasterUniform, Vec3, WorldGpu, GpuPass, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
     LOCAL_SHADOW_HYSTERESIS, LOCAL_SHADOW_MAP_SIZE, LOCAL_SHADOW_NEAR,
     LOCAL_SHADOW_RESELECT_DISTANCE, MAX_LOCAL_SHADOW_LIGHTS,
 };
@@ -13,6 +13,21 @@ use crate::renderer::lighting::glass_transmission::{
 use wgpu::util::DeviceExt;
 
 impl Renderer {
+    pub(in crate::renderer) fn set_lamp_shadow_ab(&mut self, mode: u8) {
+        let mode = mode.min(4);
+        if self.lamp_shadow_ab == mode { return; }
+        self.lamp_shadow_ab = mode;
+        if let Some(world) = &mut self.world {
+            // Explicitly reset the GPU octant payload when returning to control.
+            world.local_shadows.moving_octant_masks.fill(0);
+        }
+        self.upload_light_buffer();
+        // A/B=4 also toggles the conservative pixel receiver early-out
+        // bit carried in LightingSettings, not just per-light octant masks.
+        self.update_lighting_settings();
+        rverbose!(1, "[LAMP SHADOW A/B] mode={} (0=control, 1=receiver octants, 2=caster prefilter, 3=combined, 4=conservative early-out)", mode);
+    }
+
     pub(in crate::renderer) fn ray_traced_local_shadows_active(&self) -> bool {
         self.world.as_ref().is_some_and(|world| {
             world.active_pipeline_variant.ray_traced_shadows
@@ -21,7 +36,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn hardware_rt_requested(&self) -> bool {
-        self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+        matches!(self.cascaded_shadow_mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
             || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
     }
 
@@ -31,18 +46,17 @@ impl Renderer {
             .is_some_and(|world| world.active_pipeline_variant.ray_traced_shadows)
     }
 
-    pub(in crate::renderer) fn update_local_shadow_selection(&mut self, camera: &Camera) {
-        // RT queries cover all existing clustered lights, including transient
-        // lights with no cubemap slot. Keep the raster cache intact for toggles.
-        if self.ray_traced_local_shadows_active() {
-            return;
-        }
+    pub(in crate::renderer) fn update_local_shadow_selection(&mut self, camera: &Camera, player_position: Option<Vec3>) {
+        // Static map lights keep their raster cache even when transient lights
+        // use RT; transient lights never consume cubemap slots.
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.any_area_lights_enabled();
-        if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows;
+        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows) {
             return;
         }
 
+        let focus=player_position.unwrap_or(camera.position);
+        let reselect_distance=if self.baked_local_shadows {32.0} else {LOCAL_SHADOW_RESELECT_DISTANCE};
         let should_reselect = self.world.as_ref().is_some_and(|world| {
             if world.light_count == 0 {
                 return false;
@@ -50,8 +64,8 @@ impl Renderer {
             let shadows = &world.local_shadows;
             let cluster_changed = shadows.selection_cluster != world.last_cluster;
             let moved = shadows.selection_position.is_none_or(|position| {
-                position.distance_squared(camera.position)
-                    >= LOCAL_SHADOW_RESELECT_DISTANCE * LOCAL_SHADOW_RESELECT_DISTANCE
+                position.distance_squared(focus)
+                    >= reselect_distance * reselect_distance
             });
             cluster_changed || moved
         });
@@ -65,11 +79,12 @@ impl Renderer {
             };
             select_relevant_shadow_lights(
                 world,
-                camera,
+                focus,
                 self.static_point_lighting_enabled(),
                 self.emissive_area_lights_enabled,
                 self.shader_light_promotion_enabled,
                 self.shader_light_promotion_mask,
+                if self.baked_local_shadows { self.baked_local_sources } else { 0 },
             )
         };
 
@@ -142,7 +157,7 @@ impl Renderer {
             shadows.active_light_indices = selected.clone();
             shadows.shadowed_light_count = u32::try_from(selected.len()).unwrap_or(0);
             shadows.selection_cluster = world.last_cluster;
-            shadows.selection_position = Some(camera.position);
+            shadows.selection_position = Some(focus);
 
             // Upload after this mutable world borrow ends so the transient,
             // explicitly-unshadowed tail is preserved as well.
@@ -165,12 +180,9 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn ensure_local_shadow_cache(&mut self) {
-        if self.ray_traced_local_shadows_active() {
-            return;
-        }
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.any_area_lights_enabled();
-        if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows;
+        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows) {
             return;
         }
         let pending_slots = self
@@ -178,6 +190,9 @@ impl Renderer {
             .as_ref()
             .map(|world| world.local_shadows.pending_slots.clone())
             .unwrap_or_default();
+        if let Some(world) = &mut self.world {
+            world.local_shadows.ab_last_static_rebuilds = pending_slots.len() as u32;
+        }
         if pending_slots.is_empty() {
             return;
         }
@@ -187,6 +202,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("JKA local-light shadow cache encoder"),
             });
+        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::LocalShadowStatic, false);
         if let Some(world) = &self.world {
             for &slot in &pending_slots {
                 let Some(light_index) = world.local_shadows.cache_entries[slot].light_index else {
@@ -248,7 +264,8 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
-                        if (batch.is_inline_entity && !self.draw_inline_models)
+                        if (self.baked_local_shadows && (batch.is_inline_entity || super::lightmap_sun::moving_static_material(&batch.source,crate::renderer::SunVisibilityMode::Filtered)))
+                            || (batch.is_inline_entity && !self.draw_inline_models)
                             || hidden_inline_batch(batch, &world.inline_models) {
                             continue;
                         }
@@ -297,6 +314,7 @@ impl Renderer {
                 }
             }
         }
+        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::LocalShadowStatic, true);
         self.queue.submit(Some(encoder.finish()));
         if let Some(world) = &mut self.world {
             world.local_shadows.pending_slots.clear();
@@ -417,6 +435,20 @@ pub(in crate::renderer) fn local_shadow_importance(
         return 0.0;
     }
 
+    if light.shadow_power > 0.0 {
+        let distance_sq=Vec3::from_array(light.position).distance_squared(camera_position);
+        let normal=Vec3::from_array(light.emitter_normal);
+        let toward_player=(camera_position-Vec3::from_array(light.position)).normalize_or_zero();
+        let emission=if normal.length_squared()>1e-6 {
+            let cosine=normal.normalize().dot(toward_player);
+            if light.emitter_two_sided {cosine.abs()} else {cosine.max(0.0)}
+        } else {1.0};
+        let reach=light.radius+128.0;
+        let window=(1.0-distance_sq/(reach*reach)).max(0.0);
+        return emission*light.shadow_power/(distance_sq+4096.0)*window*window
+            * if already_active {LOCAL_SHADOW_HYSTERESIS} else {1.0};
+    }
+
     let distance = Vec3::from_array(light.position)
         .distance(camera_position)
         .max(LOCAL_SHADOW_NEAR);
@@ -425,33 +457,34 @@ pub(in crate::renderer) fn local_shadow_importance(
     let projected_influence = (radius / distance.max(radius * 0.25)).clamp(0.0, 4.0);
     let proximity = 1.0 / (1.0 + outside_distance / radius);
     let energy = light.intensity.max(0.0).sqrt();
-    let emitter_normal = Vec3::from_array(light.emitter_normal);
-    let emitter_relevance = if emitter_normal.length_squared() > 1e-6 {
-        let to_camera = (camera_position - Vec3::from_array(light.position)).normalize_or_zero();
-        let facing = emitter_normal.normalize().dot(to_camera);
-        if light.emitter_two_sided {
-            facing.abs()
-        } else {
-            facing.max(0.0)
-        }
-    } else {
-        1.0
-    };
     let hysteresis = if already_active {
         LOCAL_SHADOW_HYSTERESIS
     } else {
         1.0
     };
-    energy * projected_influence * projected_influence * proximity * emitter_relevance * hysteresis
+    // Eye position is not a receiver: a third-person camera behind the lamp
+    // plane must not remove the light casting a shadow from the player.
+    energy * projected_influence * projected_influence * proximity * hysteresis
+}
+
+pub(in crate::renderer) fn inferred_lamp_in_player_pvs(
+    visibility: Option<&jka_assets::bsp::Visibility>,
+    light: scene::DynamicLight,
+    focus: Vec3,
+) -> bool {
+    let Some(vis)=visibility else {return true;};
+    let Some(lamp_cluster)=vis.cluster_at(scene::jka_position(light.position)) else {return true;};
+    vis.visible(vis.cluster_at(scene::jka_position(focus.to_array())), &[lamp_cluster])
 }
 
 pub(in crate::renderer) fn select_relevant_shadow_lights(
     world: &WorldGpu,
-    camera: &Camera,
+    focus: Vec3,
     include_point_lights: bool,
     include_authored_area_lights: bool,
     shader_promotion_enabled: bool,
     shader_promotion_mask: u32,
+    baked_sources: u32,
 ) -> Vec<usize> {
     let mut candidates = world
         .dynamic_lights
@@ -459,6 +492,9 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
         .copied()
         .enumerate()
         .filter_map(|(index, light)| {
+            let baked = world.static_bake_sources.iter().any(|(source,l)|*source==index && super::lightmap_local::source_enabled(l,baked_sources));
+            if baked && !inferred_lamp_in_player_pvs(world.visibility.as_ref(),light,focus) {return None;}
+            if index >= world.runtime_light_count && !baked { return None; }
             if !light.surface_lighting {
                 return None;
             }
@@ -474,27 +510,20 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
                 } else {
                     include_authored_area_lights
                 };
-                if !enabled {
+                if !enabled && !baked {
                     return None;
                 }
             }
-            if !is_area && !include_point_lights {
+            if !is_area && !include_point_lights && !baked {
                 return None;
             }
-            // A single cubemap sample cannot correctly shadow both hemispheres
-            // of a two-sided area emitter. One-sided q3map emitters are offset
-            // from their source plane and can use the normal local-shadow cache.
-            if light.emitter_two_sided
-                && light.emitter_normal.iter().any(|value| value.abs() > 1e-6)
-            {
-                return None;
-            }
+            // Cubemaps cover both hemispheres, including two-sided glow.
             if !local_light_is_pvs_relevant(world, light) {
                 return None;
             }
             let score = local_shadow_importance(
                 light,
-                camera.position,
+                focus,
                 world.local_shadows.active_light_indices.contains(&index),
             );
             (score > 0.0).then_some((index, score))
@@ -509,14 +538,40 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
     candidates.into_iter().map(|(index, _)| index).collect()
 }
 
+/// Octants intersected by an AABB as seen from a fixed world-space lamp.
+/// This is a conservative ray-direction test, not a depth or screen-space test.
+/// A blocker in another octant cannot shadow this receiver. Widen around axis
+/// planes to retain PCF samples that cross a sign boundary.
+pub(in crate::renderer) fn moving_caster_octants(
+    minimum: [f32; 3], maximum: [f32; 3], lamp: [f32; 3], radius: f32,
+) -> u32 {
+    let pad = (radius * 0.02).max(2.0);
+    let mut result = 0u32;
+    for octant in 0..8u32 {
+        if (0..3).all(|axis| {
+            if octant & (1u32 << axis) == 0 {
+                minimum[axis] <= lamp[axis] + pad
+            } else {
+                maximum[axis] >= lamp[axis] - pad
+            }
+        }) { result |= 1u32 << octant; }
+    }
+    result
+}
+
 pub(in crate::renderer) fn local_shadow_face_matrices(position: Vec3, radius: f32) -> [Mat4; 6] {
     let far_plane = radius.max(LOCAL_SHADOW_NEAR + 1.0);
-    let projection = Mat4::perspective_rh(
+    let mut projection = Mat4::perspective_rh(
         std::f32::consts::FRAC_PI_2,
         1.0,
         LOCAL_SHADOW_NEAR,
         far_plane,
     );
+    // Cube sampling defines its face V axis independently of render-target
+    // coordinates. Wgpu raster targets have Y down, unlike the GL cubemap
+    // camera convention below. Flip projection Y so captured casters and
+    // textureSampleCompareLevel address the same direction off the face centre.
+    projection.y_axis.y = -projection.y_axis.y;
     let faces = [
         (Vec3::X, -Vec3::Y),
         (-Vec3::X, -Vec3::Y),
@@ -528,11 +583,15 @@ pub(in crate::renderer) fn local_shadow_face_matrices(position: Vec3, radius: f3
     faces.map(|(direction, up)| projection * Mat4::look_to_rh(position, direction, up))
 }
 
+#[cfg(test)]
+#[path = "local_shadow_tests.rs"]
+mod tests;
+
 pub(in crate::renderer) fn create_local_shadow_resources(
     device: &wgpu::Device,
     caster_layout: &wgpu::BindGroupLayout,
 ) -> LocalShadowResources {
-    let layer_count = u32::try_from(LOCAL_SHADOW_CACHE_SLOTS * 6).unwrap_or(6);
+    let layer_count = u32::try_from(LOCAL_SHADOW_CACHE_SLOTS * 12).unwrap_or(6);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA local-light shadow cubemap cache"),
         size: wgpu::Extent3d {
@@ -576,7 +635,7 @@ pub(in crate::renderer) fn create_local_shadow_resources(
     let mut layer_views = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
     let mut caster_buffers = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
     let mut caster_bind_groups = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
-    for layer in 0..LOCAL_SHADOW_CACHE_SLOTS * 6 {
+    for layer in 0..LOCAL_SHADOW_CACHE_SLOTS * 12 {
         layer_views.push(texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("JKA local-light cached shadow face"),
             format: Some(DEPTH_FORMAT),
@@ -605,6 +664,14 @@ pub(in crate::renderer) fn create_local_shadow_resources(
     }
 
     LocalShadowResources {
+        moving_face_masks: vec![0; LOCAL_SHADOW_CACHE_SLOTS],
+        moving_octant_masks: vec![0; LOCAL_SHADOW_CACHE_SLOTS],
+        ab_last_cpu_ms: 0.0,
+        ab_last_dynamic_faces: 0,
+        ab_last_entity_face_pairs: 0,
+        ab_last_bsp_face_pairs: 0,
+        ab_last_static_rebuilds: 0,
+        moving_cameras: None,
         _texture: texture,
         cube_view,
         sampler,
@@ -773,4 +840,162 @@ pub(in crate::renderer) fn aabb_intersects_shadow_frustum(
     };
 
     !(outside_left || outside_right || outside_bottom || outside_top || beyond_cascade)
+}
+
+impl Renderer {
+    pub(in crate::renderer) fn baked_local_moving_casters(&self) -> bool {
+        self.baked_local_shadows &&
+            (self.dynamic_model_renderer.has_depth_casters() || self.world.as_ref().is_some_and(|w|w.coarse_batches.iter().any(|b|((self.draw_inline_models && b.is_inline_entity) || super::lightmap_sun::moving_static_material(&b.source,crate::renderer::SunVisibilityMode::Filtered)) && !hidden_inline_batch(b,&w.inline_models))))
+    }
+    pub(in crate::renderer) fn encode_baked_local_moving_shadows(&mut self, encoder: &mut wgpu::CommandEncoder, models: &[crate::renderer::DynamicModelSurface]) {
+        let moving=self.baked_local_moving_casters();
+        if self.baked_local_had_casters != moving { self.baked_local_had_casters=moving;self.update_lighting_settings(); }
+        // Original-lighting correction uses the moving cube independently of
+        // the renderer's optional RT path for added direct illumination.
+        if !moving {
+            if let Some(world) = &mut self.world {
+                world.local_shadows.ab_last_dynamic_faces = 0;
+                world.local_shadows.ab_last_entity_face_pairs = 0;
+                world.local_shadows.ab_last_bsp_face_pairs = 0;
+                world.local_shadows.ab_last_cpu_ms = 0.0;
+            }
+            return;
+        }
+        let cpu_started = std::time::Instant::now();
+        self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::LocalShadowMoving, false);
+        let unclipped=self.entity_shadow_unclipped_depth();
+        self.dynamic_model_renderer.ensure_entity_shadow_pipelines(&mut self.pipeline_jobs,&self.device,false,unclipped);
+        let mut bounds = std::collections::HashMap::<u16,(Vec3,Vec3)>::new();
+        for model in models.iter().filter(|m| m.raster_visible && matches!(m.alpha_mode,
+            crate::renderer::DynamicModelAlphaMode::Opaque | crate::renderer::DynamicModelAlphaMode::Mask)) {
+            let (min,max) = if let Some(skin) = model.ghoul2_gpu.as_ref() {
+                self.dynamic_model_renderer.shadow_skin_sphere(skin).map_or(
+                    (Vec3::splat(-1e20),Vec3::splat(1e20)),
+                    |(p,r)| (p-Vec3::splat(r),p+Vec3::splat(r)))
+            } else {
+                model.vertices.iter().fold((Vec3::splat(f32::INFINITY),Vec3::splat(f32::NEG_INFINITY)),
+                    |(min,max),v| { let p=Vec3::from_array(v.position);(min.min(p),max.max(p)) })
+            };
+            let entry = bounds.entry(model.entity_num).or_insert((min,max));
+            entry.0 = entry.0.min(min); entry.1 = entry.1.max(max);
+        }
+        let Some(world)=self.world.as_mut() else {return;};
+        let mut masks_changed=false;
+        let mut rendered_faces=0u32;
+        let mut entity_face_pairs=0u32;
+        let mut bsp_face_pairs=0u32;
+        let moving_batches: Vec<_> = world.coarse_batches.iter().filter(|batch|
+            (batch.is_inline_entity && self.draw_inline_models || super::lightmap_sun::moving_static_material(&batch.source,crate::renderer::SunVisibilityMode::Filtered))
+                && !hidden_inline_batch(batch,&world.inline_models)
+                && (batch.source.pipeline.class==DrawClass::Opaque || batch.source.alpha_cutoff!=0.0)).collect();
+        let cameras=world.local_shadows.moving_cameras.get_or_insert_with(||
+            crate::renderer::lighting::entity_shadows::EntityShadowState::with_count(&self.device,&self.camera_layout,LOCAL_SHADOW_CACHE_SLOTS*6));
+        for &light_index in &world.local_shadows.active_light_indices {
+            let Some(slot)=world.local_shadows.cache_entries.iter().position(|e|e.light_index==Some(light_index)) else {continue;};
+            let light=world.dynamic_lights[light_index];
+            let matrices=local_shadow_face_matrices(Vec3::from_array(light.position),light.radius);
+            let previous_mask=world.local_shadows.moving_face_masks[slot];
+            let previous_octants=world.local_shadows.moving_octant_masks[slot];
+            let caster_prefilter = (self.lamp_shadow_ab & 2) != 0;
+            // C variant: evaluate each model / mover's lamp sphere intersection
+            // once instead of six times. No temporal caching or reduced Hz.
+            let near_entities = caster_prefilter.then(|| bounds.iter().filter(|(_, (min, max))|
+                min.is_finite() && aabb_intersects_sphere(min.to_array(), max.to_array(), light.position, light.radius)
+            ).map(|(&id, &(min,max))| (id,min,max)).collect::<Vec<_>>());
+            let near_batches = caster_prefilter.then(|| moving_batches.iter().copied().filter(|batch|
+                aabb_intersects_sphere(batch.bounds_min,batch.bounds_max,light.position,light.radius)
+            ).collect::<Vec<_>>());
+            let mut octants=0u32;
+            if (self.lamp_shadow_ab & 1) != 0 || self.lamp_shadow_ab == 4 {
+                if let Some(ref entities) = near_entities {
+                    for &(_,min,max) in entities {octants |= moving_caster_octants(min.to_array(),max.to_array(),light.position,light.radius);}
+                } else {
+                    for (_, (min,max)) in &bounds {
+                        if min.is_finite() && aabb_intersects_sphere(min.to_array(),max.to_array(),light.position,light.radius) {
+                            octants |= moving_caster_octants(min.to_array(),max.to_array(),light.position,light.radius);
+                        }
+                    }
+                }
+                if let Some(ref batches) = near_batches {
+                    for batch in batches {octants |= moving_caster_octants(batch.bounds_min,batch.bounds_max,light.position,light.radius);}
+                } else {
+                    for batch in &moving_batches {
+                        if aabb_intersects_sphere(batch.bounds_min,batch.bounds_max,light.position,light.radius) {
+                            octants |= moving_caster_octants(batch.bounds_min,batch.bounds_max,light.position,light.radius);
+                        }
+                    }
+                }
+            }
+            // If every octant is occupied, the receiver mask cannot reject
+            // anything: encode zero to retain the legacy fast sampling path.
+            if octants == 0xff { octants = 0; }
+            let mut face_mask=0;
+            for (face,matrix) in matrices.into_iter().enumerate() {
+                let entities: std::collections::HashSet<_> = if let Some(ref near) = near_entities {
+                    near.iter().filter_map(|&(id,min,max)|
+                        aabb_intersects_clip_frustum(min.to_array(),max.to_array(),matrix).then_some(id)).collect()
+                } else {
+                    bounds.iter().filter_map(|(&id,(min,max))|
+                        (min.is_finite() && aabb_intersects_sphere(min.to_array(),max.to_array(),light.position,light.radius)
+                            && aabb_intersects_clip_frustum(min.to_array(),max.to_array(),matrix)).then_some(id)).collect()
+                };
+                let batches: Vec<_> = if let Some(ref near) = near_batches {
+                    near.iter().copied().filter(|batch|
+                        aabb_intersects_clip_frustum(batch.bounds_min,batch.bounds_max,matrix)).collect()
+                } else {
+                    moving_batches.iter().copied().filter(|batch|
+                        aabb_intersects_sphere(batch.bounds_min,batch.bounds_max,light.position,light.radius)
+                            && aabb_intersects_clip_frustum(batch.bounds_min,batch.bounds_max,matrix)).collect()
+                };
+                let has_casters = !entities.is_empty() || !batches.is_empty();
+                if has_casters { face_mask |= 1 << face; }
+                // Empty faces need clearing only when a previous caster leaves.
+                if !has_casters && previous_mask & (1 << face) == 0 {continue;}
+                rendered_faces += 1;
+                entity_face_pairs += entities.len() as u32;
+                bsp_face_pairs += batches.len() as u32;
+                let face_index=slot*6+face;
+                cameras.write_camera(&self.queue,face_index,matrix);
+                self.queue.write_buffer(&world.local_shadows.caster_buffers[face_index+LOCAL_SHADOW_CACHE_SLOTS*6],0,
+                    bytemuck::bytes_of(&ShadowCasterUniform { view_proj:matrix.to_cols_array_2d(),camera_pos_time:[0.0;4] }));
+                let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("baked local light moving casters"),color_attachments:&[],
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {
+                        view:&world.local_shadows.layer_views[face_index+LOCAL_SHADOW_CACHE_SLOTS*6],
+                        depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Clear(1.0),store:wgpu::StoreOp::Store}),stencil_ops:None,
+                    }),timestamp_writes:None,occlusion_query_set:None,multiview_mask:None,
+                });
+                if !batches.is_empty() {
+                    pass.set_pipeline(&self.shadow_resources.pipeline);
+                    pass.set_bind_group(0,&world.local_shadows.caster_bind_groups[face_index+LOCAL_SHADOW_CACHE_SLOTS*6],&[]);
+                    pass.set_vertex_buffer(0,world.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1,world.legacy_dlight_surface_id_buffer.slice(..));
+                    pass.set_index_buffer(world.index_buffer.slice(..),wgpu::IndexFormat::Uint32);
+                    for batch in batches {
+                        if batch.source.pipeline.class==DrawClass::Opaque && batch.source.alpha_cutoff==0.0 {
+                            pass.set_pipeline(&self.shadow_resources.pipeline);
+                        } else if batch.source.alpha_cutoff!=0.0 {
+                            pass.set_pipeline(&self.shadow_resources.mask_pipeline);pass.set_bind_group(1,&batch.bind_group,&[]);
+                        } else {continue;}
+                        crate::renderer::draw_world_batch_secondary(&mut pass,batch,0..1,None);
+                    }
+                }
+                if !entities.is_empty() { self.dynamic_model_renderer.draw_local_entity_shadow(&mut pass,&cameras.cameras[face_index].1,&entities); }
+            }
+            masks_changed |= previous_mask != face_mask || previous_octants != octants;
+            world.local_shadows.moving_face_masks[slot]=face_mask;
+            world.local_shadows.moving_octant_masks[slot]=octants;
+        }
+        world.local_shadows.ab_last_dynamic_faces = rendered_faces;
+        world.local_shadows.ab_last_entity_face_pairs = entity_face_pairs;
+        world.local_shadows.ab_last_bsp_face_pairs = bsp_face_pairs;
+        if masks_changed { self.upload_light_buffer(); }
+        self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::LocalShadowMoving, true);
+        // Times only the CPU encoding, not GPU execution. GPU timestamps are
+        // exported separately as local_shadow_moving in perfcapture.
+        let elapsed_ms = cpu_started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(world) = &mut self.world {
+            world.local_shadows.ab_last_cpu_ms = elapsed_ms;
+        }
+    }
 }

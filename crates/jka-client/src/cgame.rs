@@ -143,6 +143,12 @@ pub struct ClientInfo {
     /// TaystJK global cosmetic suffixes decoded from c1/c2 (non-jaPRO).
     pub global_hat: String,
     pub global_cape: String,
+    /// DinurdoJK v1 packed c1 cosmetics, independent of jaPRO's server c5.
+    pub packed_cosmetics: Option<crate::profile_wire::PackedCosmetics>,
+    /// Reversible, bounded and quantized Anny/mesh parameters from packed c2.
+    pub body_wire: Option<crate::profile_wire::BodyWire>,
+    /// Local viewer's settings are exact; remote wire settings are quantized.
+    pub local_body: bool,
 }
 
 impl ClientInfo {
@@ -170,6 +176,9 @@ impl ClientInfo {
             cosmetics: 0,
             global_hat: String::new(),
             global_cape: String::new(),
+            packed_cosmetics: None,
+            body_wire: None,
+            local_body: false,
         }
     }
 
@@ -833,12 +842,25 @@ pub struct ClientGameState {
     /// already stripped. Kept separate from ordinary server actions so the
     /// renderer compatibility path cannot consume Siege/UI events.
     pending_world_effect_commands: VecDeque<String>,
+    /// TaystJK cg.coldBreathEffects: latched by CG_ParseWeatherEffect when
+    /// server CS_EFFECTS supplies an eligible *world-effect command.
+    cold_breath_effects: bool,
     pending_server_actions: VecDeque<CgameServerAction>,
     pending_audio_actions: VecDeque<CgameServerAction>,
     team_info: Vec<TeamInfoEntry>,
     cosmetic_unlocks: Vec<CosmeticUnlock>,
     force_rank_change: Option<(i32, bool, i32)>,
     config_state: ConfigStringState,
+}
+
+/// Literal prefix exclusions from TaystJK CG_ParseWeatherEffect.
+/// Input is the CS_EFFECTS value after removing its leading `*`.
+fn breath_weather_command_enables_cold(command: &str) -> bool {
+    let command = command.trim();
+    !["die", "clear", "freeze", "zone", "acidrain", "spacedust", "sand",
+      "outsideshake", "outsidepain"]
+        .iter()
+        .any(|excluded| command.get(..excluded.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(excluded)))
 }
 
 impl Default for ClientGameState {
@@ -865,6 +887,7 @@ impl Default for ClientGameState {
             pending_event_traces: VecDeque::new(),
             pending_ghoul2_commands: VecDeque::new(),
             pending_world_effect_commands: VecDeque::new(),
+            cold_breath_effects: false,
             pending_server_actions: VecDeque::new(),
             pending_audio_actions: VecDeque::new(),
             team_info: Vec::new(),
@@ -883,6 +906,9 @@ impl ClientGameState {
     pub fn set_plugin_disable(&mut self, bits: i32) {
         self.plugin_disable = bits;
     }
+
+    /// Current local cp_pluginDisable bits used by TaystJK presentation.
+    pub fn plugin_disable(&self) -> i32 { self.plugin_disable }
 
     /// `cg_correctPredictedEvents`: run the OpenJK correction gate that Raven
     /// left commented out. See `transition_predicted_player_state`.
@@ -1107,8 +1133,10 @@ impl ClientGameState {
         // reset its compatibility state, then replay the initial CS_EFFECTS table
         // in protocol order exactly as CG_RegisterEffects does.
         self.pending_world_effect_commands.push_back("die".to_owned());
+        self.cold_breath_effects = false;
         for index in (CS_EFFECTS + 1)..(CS_EFFECTS + 64) {
             if let Some(command) = self.weather_effect_configstring(index) {
+                self.register_cold_breath_weather(&command);
                 self.pending_world_effect_commands.push_back(command);
             }
         }
@@ -1164,6 +1192,7 @@ impl ClientGameState {
                 // lazy assets in the existing effect path.
                 if emit_actions {
                     if let Some(command) = self.weather_effect_configstring(index) {
+                        self.register_cold_breath_weather(&command);
                         self.pending_world_effect_commands.push_back(command);
                     }
                 }
@@ -1180,6 +1209,20 @@ impl ClientGameState {
             // by their consumers. This is equivalent to TaystJK's assignment /
             // registration side effects without duplicating cache ownership.
             _ => {}
+        }
+    }
+
+    pub fn cold_breath_effects(&self) -> bool {
+        self.cold_breath_effects
+    }
+
+    fn register_cold_breath_weather(&mut self, command: &str) {
+        // TaystJK CG_ParseWeatherEffect (cg_main.c): not a thermometer or
+        // snowfall-only gate. Any command except the excluded prefixes latches
+        // this true for the map (including wind, rain and fog). Clearing clouds
+        // does NOT clear the flag; only CG_Init on the next map does.
+        if crate::cgame::breath_weather_command_enables_cold(command) {
+            self.cold_breath_effects = true;
         }
     }
 
@@ -1533,6 +1576,32 @@ impl ClientGameState {
             .is_some_and(crate::net::mod_support::supports_rgb_sabers)
     }
 
+    pub fn is_japlus(&self) -> bool {
+        self.configstring(CS_SERVERINFO).is_some_and(|info| {
+            crate::net::mod_support::ServerMod::detect(info) == crate::net::mod_support::ServerMod::Japlus
+        })
+    }
+
+    /// TaystJK JAPLUS_SERVER_HAS: read jp_cinfo only on JA+.
+    pub fn japlus_cinfo(&self) -> i32 {
+        self.configstring(CS_SERVERINFO)
+            .filter(|info| crate::net::mod_support::ServerMod::detect(info)
+                == crate::net::mod_support::ServerMod::Japlus)
+            .and_then(|info| info_value(info, b"jp_cinfo"))
+            .and_then(parse_i32_ascii)
+            .unwrap_or(0)
+    }
+
+    /// TaystJK jp_DuelAlpha, defaults to 0; sign controls non-opponent
+    /// *visibility* during JA+ duels, not per-entity alpha.
+    pub fn japlus_duel_alpha(&self) -> Option<i32> {
+        self.configstring(CS_SERVERINFO)
+            .filter(|info| crate::net::mod_support::ServerMod::detect(info)
+                == crate::net::mod_support::ServerMod::Japlus)
+            .and_then(|info| info_value(info, b"jp_duelalpha"))
+            .and_then(parse_i32_ascii)
+    }
+
     /// `cgs.jcinfo2`.
     pub fn japro_cinfo2(&self) -> i32 {
         self.configstring(CS_SERVERINFO)
@@ -1702,10 +1771,18 @@ impl ClientGameState {
             .unwrap_or_default();
         // jaPRO relays `cp_sbRGB1/2` as c3/c4; they only apply to SABER_RGB.
         let rgb_capable = self.rgb_sabers_supported();
-        let (color1_number, global_hat) = crate::global_cosmetics::decode_wire(
-            info_value(configstring, b"c1").unwrap_or(b"4"));
-        let (color2_number, global_cape) = crate::global_cosmetics::decode_wire(
-            info_value(configstring, b"c2").unwrap_or(b"4"));
+        let c1 = info_value(configstring, b"c1").unwrap_or(b"4");
+        let c2 = info_value(configstring, b"c2").unwrap_or(b"4");
+        // Detect our versioned values first, then faithfully fall back to the
+        // TaystJK numeric-prefix/hat/cape convention, then saber colors only.
+        let packed_cosmetics = crate::profile_wire::decode_cosmetics(c1);
+        let body_wire = crate::profile_wire::BodyWire::decode(c2);
+        let (color1_number, global_hat) = if let Some((color, _)) = packed_cosmetics {
+            (color, String::new())
+        } else { crate::global_cosmetics::decode_wire(c1) };
+        let (color2_number, global_cape) = if let Some((color, _)) = &body_wire {
+            (*color, String::new())
+        } else { crate::global_cosmetics::decode_wire(c2) };
         let mut saber_color = resolve_saber_color(
             color1_number,
             info_value(configstring, b"c3").and_then(parse_i32_ascii).unwrap_or(0),
@@ -1758,6 +1835,9 @@ impl ClientGameState {
                 .map_or(0, |bits| bits as u32),
             global_hat,
             global_cape,
+            packed_cosmetics: packed_cosmetics.map(|(_, value)| value),
+            body_wire: body_wire.map(|(_, value)| value),
+            local_body: false,
         })
     }
 
@@ -1855,6 +1935,9 @@ impl ClientGameState {
                 cosmetics: 0,
                 global_hat: String::new(),
                 global_cape: String::new(),
+                packed_cosmetics: None,
+                body_wire: None,
+                local_body: false,
             },
         })
     }
@@ -2028,6 +2111,13 @@ impl ClientGameState {
             // As in CG_AddCEntity, event-only entities have already served their transition/event
             // purpose and are not persistent scene geometry.
             if entity_type >= ET_EVENTS {
+                continue;
+            }
+            // Match the renderer's NaN-entity rejection before downstream
+            // model, effect and collision consumers see an invalid transform.
+            if !cent.lerp_origin.iter().chain(&cent.lerp_angles).all(|v| v.is_finite()) {
+                log::warn!("Skipping non-finite presented entity {}: origin={:?} angles={:?}",
+                    current_state.number, cent.lerp_origin, cent.lerp_angles);
                 continue;
             }
             presented.push(PresentedEntity {
@@ -4262,6 +4352,30 @@ mod tests {
         cg.set_next_snapshot(Some(&next)).unwrap();
         assert!(!cg.entities[4].interpolate);
     }
+
+    #[test]
+    fn non_finite_remote_entity_is_skipped_until_a_valid_snapshot_arrives() {
+        let bad = entity(4, &[("eType", ET_PLAYER as u32), ("pos.trBase[0]", f32::NAN.to_bits())]);
+        let good = entity(5, &[("eType", ET_PLAYER as u32)]);
+        let first = Snapshot {
+            server_time: 100, message_num: 1, delta_num: -1, snap_flags: 0, ping: 0,
+            server_command_num: 0, area_mask: [0; 32], player_state: PlayerState::default(),
+            vehicle_player_state: None, entities: vec![bad, good],
+        };
+        let mut game = ClientGameState::new();
+        game.set_initial_snapshot(&first).unwrap();
+        let presented = game.present_entities(100).unwrap();
+        assert_eq!(presented.iter().map(|entity| entity.number).collect::<Vec<_>>(), vec![5]);
+        assert!(game.current_snapshot().unwrap().entities[0].field_f32("pos.trBase[0]").unwrap().is_nan());
+        let next = Snapshot {
+            server_time: 133, message_num: 2,
+            entities: vec![entity(4, &[("eType", ET_PLAYER as u32), ("eFlags", EF_TELEPORT_BIT as u32)])],
+            ..first
+        };
+        game.set_next_snapshot(Some(&next)).unwrap();
+        game.transition_snapshot(133).unwrap();
+        assert_eq!(game.present_entities(133).unwrap()[0].number, 4);
+    }
 }
 
 #[cfg(test)]
@@ -4484,5 +4598,37 @@ mod client_info_tests {
             info.skin_qpath(),
             "models/players/jedi_hm/|head_a1|torso_a1|lower_a1"
         );
+    }
+}
+
+#[cfg(test)]
+mod breath_weather_port_tests {
+    use super::{breath_weather_command_enables_cold, ClientGameState, CS_EFFECTS};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn server_weather_latches_cold_breath_until_next_map() {
+        let mut game = ClientGameState::new();
+        assert!(!game.cold_breath_effects());
+        game.set_configstring(CS_EFFECTS + 1, b"*snow".to_vec());
+        assert!(game.cold_breath_effects());
+        game.set_configstring(CS_EFFECTS + 1, b"*clear".to_vec());
+        assert!(game.cold_breath_effects(), "CG_ParseWeatherEffect does not clear this latch");
+        game.reset_gamestate(&BTreeMap::new(), 0);
+        assert!(!game.cold_breath_effects());
+        game.set_configstring(CS_EFFECTS + 1, b"*acidrain".to_vec());
+        assert!(!game.cold_breath_effects());
+    }
+
+    #[test]
+    fn tayst_cold_breath_weather_prefixes() {
+        for command in ["die", "clear", "freeze", "zone ( 0 0 0 )", "acidrain",
+            "spacedust", "sand", "outsideshake", "outsidepain", "CLEAR"] {
+            assert!(!breath_weather_command_enables_cold(command), "{command}");
+        }
+        for command in ["snow", "heavyrain", "rain", "lightrain", "fog",
+            "wind", "constantwind ( 0 800 0 )", "gustingwind"] {
+            assert!(breath_weather_command_enables_cold(command), "{command}");
+        }
     }
 }

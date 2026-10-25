@@ -314,6 +314,16 @@ impl AssetSearchPath {
         }
     }
 
+    /// Physical loose file selected by ordinary asset lookup, when the winning
+    /// provider is editable on disk. Packaged assets return `None`.
+    pub fn loose_file_path(&self, name: &str) -> Option<PathBuf> {
+        validate_asset_name(name).ok()?;
+        match self.provider_for_ordinary_read(&normalize_asset_name(name))? {
+            Provider::Loose { path } => Some(path),
+            Provider::Archive { .. } => None,
+        }
+    }
+
     /// Control whether ordinary VFS reads may shadow qpaths present in the
     /// retail JKA `assets0.pk3` through `assets3.pk3` archives. This does not
     /// affect [`Self::read_from_source`], because an active material explicitly
@@ -353,6 +363,25 @@ impl AssetSearchPath {
             return Ok(None);
         };
         self.read_provider(name, limit, provider).map(Some)
+    }
+
+    /// Read only a file's prefix through the ordinary VFS provider policy.
+    /// Useful for catalog metadata: large animation payloads remain on disk.
+    pub fn read_prefix(&mut self,name:&str,limit:usize)->Result<Option<Asset>,Box<dyn Error>> {
+        validate_asset_name(name)?;
+        let Some(provider)=self.provider_for_ordinary_read(&normalize_asset_name(name)) else {return Ok(None);};
+        let (bytes,source)=match provider {
+            Provider::Archive {archive,entry}=>{
+                let source=self.shared.archive_paths[archive].clone();
+                let file=self.archive_handle(archive)?.by_index(entry)?;
+                if normalize_asset_name(file.name())!=normalize_asset_name(name) {return Err("archive entry changed since indexing".into());}
+                let mut bytes=Vec::new();file.take(limit as u64).read_to_end(&mut bytes)?;(bytes,source)
+            }
+            Provider::Loose {path}=>{
+                let mut bytes=Vec::new();File::open(&path)?.take(limit as u64).read_to_end(&mut bytes)?;(bytes,path)
+            }
+        };
+        Ok(Some(Asset {bytes,source}))
     }
 
     fn stock_provider(&self, key: &str) -> Option<Provider> {
@@ -981,6 +1010,28 @@ pub fn read_stock(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cinematic_metadata_prefix_reads_preserve_vfs_precedence_without_loading_payloads() {
+        let root=test_root("cinematic-prefix");let base=root.join("base");let game=root.join("game");
+        fs::create_dir_all(&base).unwrap();fs::create_dir_all(&game).unwrap();
+        let qpath="models/players/_humanoid_test/_humanoid_test.gla";
+        write_package(&base.join("assets1.pk3"),qpath,b"stock-header-large-payload");
+        write_package(&game.join("override.pk3"),qpath,b"mod-header-large-payload");
+        fs::write(game.join("loose.bin"),b"loose-header-large-payload").unwrap();
+        let mut assets=AssetSearchPath::open_game(&base,Some(&game)).unwrap();
+        assert!(assets.read(qpath,5).is_err());
+        assert_eq!(assets.read_prefix(qpath,5).unwrap().unwrap().bytes,b"mod-h");
+        assets.set_allow_asset_overrides(false);
+        assert_eq!(assets.read_prefix(qpath,5).unwrap().unwrap().bytes,b"stock");
+        assert_eq!(assets.fork().read_prefix(qpath,5).unwrap().unwrap().bytes,b"stock");
+        assert_eq!(assets.read_prefix("loose.bin",5).unwrap().unwrap().bytes,b"loose");
+        assert!(assets.read_prefix("missing.gla",100).unwrap().is_none());
+        drop(assets);
+        // Delete only the exact fixture files; no recursive workspace cleanup.
+        fs::remove_file(game.join("loose.bin")).unwrap();fs::remove_file(game.join("override.pk3")).unwrap();
+        fs::remove_file(base.join("assets1.pk3")).unwrap();fs::remove_dir(game).unwrap();fs::remove_dir(base).unwrap();fs::remove_dir(root).unwrap();
+    }
 
     fn write_package(path: &Path, name: &str, content: &[u8]) {
         write_package_entries(path, &[(name, content)]);

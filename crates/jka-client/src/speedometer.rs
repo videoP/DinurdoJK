@@ -156,6 +156,8 @@ pub struct Rect {
 /// unrelated places, so the HUD editor moves them independently.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Ui {
+    /// Ranges in the native draw lists belonging to each independently placed component.
+    pub components: Vec<(crate::ui::HudElementId, std::ops::Range<usize>, std::ops::Range<usize>)>,
     pub size: f32,
     /// The settings this frame was built with (the HUD editor sizes its outlines from them).
     pub settings: Settings,
@@ -167,9 +169,8 @@ pub struct Ui {
     pub jump_texts: Vec<Text>,
     /// The speed graph(s).
     pub graph_rects: Vec<Rect>,
-    /// The old speed graph's `gfx/2d/lag` frame and speed readout (`cg_lagometer` 1-3).
+    /// The old speed graph's `gfx/2d/lag` frame.
     pub graph_pics: Vec<crate::lagometer::Pic>,
-    pub graph_texts: Vec<crate::lagometer::Text>,
 }
 
 const WHITE: [f32; 4] = [1.0; 4];
@@ -256,50 +257,50 @@ impl Default for Speedometer {
     }
 }
 
-/// A static sample of every part of the readout for the HUD editor.
+/// A static sample of the selected components for geometry tests.
+#[cfg(test)]
 pub fn preview(settings: &Settings) -> Ui {
-    let mut ui = Ui { size: settings.size, settings: *settings, ..Ui::default() };
-    let y = settings.y;
-    let mut x = settings.x;
-    let text = |ui: &mut Ui, value: &str, x: f32, color: [f32; 4]| {
-        ui.texts.push(Text { text: value.to_owned(), x, y: y.trunc(), color });
-    };
-    text(&mut ui, "^2\u{b5}:", x, WHITE);
-    text(&mut ui, "   612", x, [1.0, 0.6, 0.6, 1.0]);
-    x += 52.0;
-    text(&mut ui, "704", x, [1.0, 0.7, 0.7, 1.0]);
-    x += 52.0;
-    ui.rects.push(Rect { x: x - 88.0 - 0.75, y: y - 10.75, w: 37.75, h: 13.75, color: [0.0, 0.0, 0.0, 1.0], outline: Some(0.5) });
-    ui.rects.push(Rect { x: x - 88.0 + 0.25, y: y - 9.9, w: 24.0, h: 12.0, color: [1.0, 0.0, 0.0, 1.0], outline: None });
-    text(&mut ui, "58.3", x, WHITE);
-    x += 42.0;
-    text(&mut ui, "214.6", x, WHITE);
-    x += 62.0;
-    text(&mut ui, "270", x, WHITE);
-    x += 42.0;
-    text(&mut ui, "210", x, WHITE);
-    for (index, value) in ["704", "761", "802"].into_iter().enumerate() {
-        ui.jump_texts.push(Text {
-            text: value.to_owned(),
-            x: settings.jumps_x + index as f32 * 52.0,
-            y: settings.jumps_y,
-            color: WHITE,
-        });
+    preview_with_context(settings, crate::lagometer::Settings::default(), 1.0)
+}
+
+pub fn preview_with_context(settings: &Settings, lagometer: crate::lagometer::Settings, width_ratio_coef: f32) -> Ui {
+    let mut meter = Speedometer::default();
+    meter.previous_speed = 612.0;
+    meter.previous_times.fill(0.75);
+    meter.last_ground_speed = 704.0;
+    meter.last_ground_time = 1000;
+    meter.last_jump_height = 58.3;
+    meter.last_jump_height_time = 1000;
+    meter.last_jump_distance = 214.6;
+    meter.last_jump_distance_time = 1000;
+    meter.first_time_in_air = true;
+    meter.jumps_counter = 3;
+    meter.last_ground_speeds[..3].copy_from_slice(&[704.0, 761.0, 802.0]);
+    for (i, value) in meter.graph.iter_mut().enumerate() { *value = 350.0 + 450.0 * (i as f32 * 0.04).sin().abs(); }
+    meter.old_graph.fill(612);
+    meter.old_graph_count = 256;
+    let input = Input { v:612.0, vxyz:669.0, vertical:270.0, wishspeed:250.0,
+        player_speed:250.0, cgaz_frametime:0.008, time_ms:1000, real_ms:1000,
+        frame_ms:8, view_yaw:45.0, width_ratio_coef, lagometer, ..Input::default() };
+    meter.update(settings, &input).unwrap_or_else(|| Ui { settings:*settings, size:settings.size, ..Ui::default() })
+}
+
+pub fn component_origin(id: crate::ui::HudElementId, settings: &Settings) -> [f32; 2] {
+    use crate::ui::HudElementId::*;
+    match id {
+        GroundSpeed => [240.0, 340.0],
+        AccelMeter => [300.0, 340.0],
+        JumpHeight => [220.0, 360.0], JumpDistance => [290.0, 360.0],
+        VerticalSpeed => [360.0, 360.0], YawSpeed => [430.0, 360.0],
+        _ => [settings.x, settings.y],
     }
-    let (gx, gy, gw, gh) = (245.0, 456.0, 150.0, 22.0);
-    for i in 1..GRAPH_SAMPLES {
-        let fraction = i as f32 / GRAPH_SAMPLES as f32;
-        let level = 0.35 + 0.65 * (fraction * std::f32::consts::TAU * 2.0).sin().abs();
-        ui.graph_rects.push(Rect {
-            x: gx + fraction * gw,
-            y: gy + (1.0 - level) * gh,
-            w: gw / GRAPH_SAMPLES as f32,
-            h: level * gh,
-            color: [fraction, 1.0 - fraction, 0.5, 0.8],
-            outline: None,
-        });
+}
+
+impl Ui {
+    fn mark(&mut self, id: crate::ui::HudElementId, start: (usize,usize)) {
+        self.components.push((id, start.0..self.texts.len(), start.1..self.rects.len()));
     }
-    ui
+    fn cursor(&self) -> (usize,usize) { (self.texts.len(), self.rects.len()) }
 }
 
 /// `AngleSubtract`.
@@ -328,13 +329,12 @@ impl Speedometer {
         self.old_graph_count = self.old_graph_count.wrapping_add(1);
 
         let flags = settings.flags;
-        if flags & flag::ENABLE == 0 && !input.strafehelper_accelmeter {
+        if flags & crate::ui::movement_components::NATIVE_READOUTS == 0 && !input.strafehelper_accelmeter {
             return None;
         }
 
         let mut ui = Ui { size: settings.size, settings: *settings, ..Ui::default() };
         let mut xpos = settings.x;
-        let mut jumps_xpos = settings.jumps_x;
 
         // DF_SetSpeedometer.
         let mut speed = if flags & flag::XYZ != 0 { input.vxyz } else { input.v };
@@ -346,29 +346,40 @@ impl Speedometer {
             speed = (speed + 0.5).floor();
         }
 
-        self.draw_speedometer(settings, input, speed, &mut xpos, &mut jumps_xpos, &mut ui);
-
-        if flags & flag::ACCELMETER != 0 || input.strafehelper_accelmeter {
-            self.draw_accel_meter(settings, input, xpos, &mut ui);
+        use crate::ui::HudElementId;
+        self.draw_speedometer(settings, input, speed, &mut xpos, &mut ui);
+        ui.mark(HudElementId::Speedometer, (0,0));
+        if flags & (flag::GROUNDSPEED | flag::JUMPS) != 0 {
+            let start = ui.cursor();
+            let [mut x,y] = component_origin(HudElementId::GroundSpeed, settings);
+            let part = Settings { y, ..*settings };
+            self.draw_ground_speeds(&part, input, speed, &mut x, &mut ui);
+            ui.mark(HudElementId::GroundSpeed, start);
         }
-        if flags & flag::JUMPHEIGHT != 0 {
-            self.draw_jump_height(settings, input, &mut xpos, &mut ui);
-        }
-        if flags & flag::JUMPDISTANCE != 0 {
-            self.draw_jump_distance(settings, input, &mut xpos, &mut ui);
-        }
-        if flags & flag::VERTICALSPEED != 0 {
-            draw_vertical_speed(settings, input, &mut xpos, &mut ui);
-        }
-        if flags & flag::YAWSPEED != 0 {
-            self.draw_yaw_speed(settings, input, &mut xpos, &mut ui);
+        for id in [HudElementId::AccelMeter, HudElementId::JumpHeight, HudElementId::JumpDistance,
+            HudElementId::VerticalSpeed, HudElementId::YawSpeed] {
+            let enabled = flags & crate::ui::movement_components::native_bit(id) != 0
+                || (id == HudElementId::AccelMeter && input.strafehelper_accelmeter);
+            if !enabled { continue; }
+            let start = ui.cursor();
+            let [mut x,y] = component_origin(id, settings);
+            let part = Settings { y, ..*settings };
+            match id {
+                HudElementId::AccelMeter => self.draw_accel_meter(&part, input, x + if flags & flag::GROUNDSPEED != 0 {88.0} else {52.0}, &mut ui),
+                HudElementId::JumpHeight => self.draw_jump_height(&part, input, &mut x, &mut ui),
+                HudElementId::JumpDistance => self.draw_jump_distance(&part, input, &mut x, &mut ui),
+                HudElementId::VerticalSpeed => draw_vertical_speed(&part, input, &mut x, &mut ui),
+                HudElementId::YawSpeed => self.draw_yaw_speed(&part, input, &mut x, &mut ui),
+                _ => unreachable!(),
+            }
+            ui.mark(id, start);
         }
         if flags & flag::SPEEDGRAPH != 0 {
             self.graph_add_speed(input.vxyz);
             self.draw_speed_graph(&mut ui);
         }
-        if flags & flag::SPEEDGRAPHOLD != 0 {
-            self.draw_speed_graph_old(&input.lagometer, input.width_ratio_coef, input.v, &mut ui);
+        if flags & flag::SPEEDGRAPHOLD != 0 && flags & flag::SPEEDGRAPH == 0 {
+            self.draw_speed_graph_old(&input.lagometer, input.width_ratio_coef, &mut ui);
         }
 
         // The end of the C HUD routine: `wasOnGround` and `cg.lastZSpeed`.
@@ -388,7 +399,6 @@ impl Speedometer {
         input: &Input,
         speed: f32,
         xpos: &mut f32,
-        jumps_xpos: &mut f32,
         ui: &mut Ui,
     ) {
         let flags = settings.flags;
@@ -423,6 +433,7 @@ impl Speedometer {
         } else {
             WHITE_CODE
         };
+        if flags & flag::ENABLE == 0 { return; }
         let number = format!("   {speed:.0}");
         let label = if flags & flag::KPH != 0 {
             "k:"
@@ -435,9 +446,6 @@ impl Speedometer {
         Self::text(ui, number, *xpos, settings.y, color_speed);
         *xpos += 52.0;
 
-        if flags & flag::GROUNDSPEED != 0 || (flags != 0 && flags & flag::JUMPS != 0) {
-            self.draw_ground_speeds(settings, input, speed, xpos, jumps_xpos, ui);
-        }
     }
 
     /// The pre-speed / jumps-array half of `DF_DrawSpeedometer`.
@@ -447,7 +455,6 @@ impl Speedometer {
         input: &Input,
         speed: f32,
         xpos: &mut f32,
-        jumps_xpos: &mut f32,
         ui: &mut Ui,
     ) {
         let flags = settings.flags;
@@ -508,8 +515,14 @@ impl Speedometer {
                         }
                     }
                     if text != "0" {
-                        ui.jump_texts.push(Text { text, x: *jumps_xpos, y: settings.jumps_y, color: color_ground_speeds });
-                        *jumps_xpos += 52.0;
+                        // Five values per row keep the history inside the screen
+                        // and inside its independently editable panel.
+                        let visible = ui.jump_texts.len();
+                        ui.jump_texts.push(Text {
+                            text, x: settings.jumps_x + (visible % 5) as f32 * 52.0,
+                            y: settings.jumps_y + 110.0 + (visible / 5) as f32 * 20.0,
+                            color: color_ground_speeds,
+                        });
                     }
                 }
             } else if settings.jumps != 0 && self.jumps_counter >= jumps_limit {
@@ -687,7 +700,7 @@ impl Speedometer {
 
     /// `DF_DrawSpeedGraph` with the rect/colours `CG_DrawSpeedometer`'s caller passes.
     fn draw_speed_graph(&self, ui: &mut Ui) {
-        let (gx, gy, gw, gh) = (640.0 * 0.5 - 150.0 / 2.0, 480.0 - 22.0 - 2.0, 150.0, 22.0);
+        let (gx, gy, gw, gh) = (640.0 * 0.5 - 150.0 / 2.0, 368.0, 150.0, 22.0);
         let fore_alpha = 0.8;
         let fast = [1.0_f32, 0.0, 0.0];
         let medium = [0.0_f32, 1.0, 0.0];
@@ -718,13 +731,12 @@ impl Speedometer {
     }
 
     /// `DF_DrawSpeedGraphOld`: shares `cg_lagometer`'s position and frame. Modes 1 and 2
-    /// draw it as a 48x48 graph in the `gfx/2d/lag` frame, 2 (and 3 while moving) adds the
-    /// speed; every other mode is the frameless 144 px tall graph, 96 higher.
+    /// draw it as a 48x48 graph in the `gfx/2d/lag` frame; every other mode is the
+    /// frameless 144 px tall graph, 96 higher. The numeric speed is a separate component.
     fn draw_speed_graph_old(
         &self,
         lagometer: &crate::lagometer::Settings,
         coef: f32,
-        speed: f32,
         ui: &mut Ui,
     ) {
         let (x, mut y) = crate::lagometer::speed_graph_origin(lagometer, coef);
@@ -736,14 +748,6 @@ impl Speedometer {
                 y,
                 w: 48.0 * coef,
                 h: 48.0,
-            });
-        }
-        if lagometer.mode == 2 || (lagometer.mode == 3 && speed != 0.0) {
-            ui.graph_texts.push(crate::lagometer::Text {
-                text: format!("{speed:.0}"),
-                x: x + 2.0 * coef,
-                y,
-                right: false,
             });
         }
         if !framed {
@@ -822,6 +826,31 @@ mod tests {
     }
 
     #[test]
+    fn movement_components_accel_only_never_draws_the_speed_number() {
+        let ui = preview(&settings(flag::ACCELMETER));
+        assert!(ui.texts.is_empty());
+        assert!(!ui.rects.is_empty());
+        assert!(ui.components.iter().filter(|(_,texts,rects)| !texts.is_empty() || !rects.is_empty())
+            .all(|(id,_,_)| *id == crate::ui::HudElementId::AccelMeter));
+        let off = preview(&settings(0));
+        assert!(off.texts.is_empty() && off.rects.is_empty() && off.graph_rects.is_empty() && off.jump_texts.is_empty());
+    }
+
+    #[test]
+    fn movement_components_preview_only_contains_selected_metrics() {
+        use crate::ui::{movement_components, HudElementId};
+        for id in [HudElementId::Speedometer, HudElementId::GroundSpeed, HudElementId::AccelMeter,
+            HudElementId::JumpHeight, HudElementId::JumpDistance, HudElementId::VerticalSpeed, HudElementId::YawSpeed] {
+            let ui = preview(&settings(movement_components::native_bit(id)));
+            for (emitted,texts,rects) in &ui.components {
+                if !texts.is_empty() || !rects.is_empty() { assert_eq!(*emitted,id); }
+            }
+            assert!(ui.components.iter().any(|(emitted,texts,rects)| *emitted == id && (!texts.is_empty() || !rects.is_empty())), "{id:?}");
+            assert!(ui.jump_texts.is_empty() && ui.graph_rects.is_empty());
+        }
+    }
+
+    #[test]
     fn plain_speedometer_shows_label_and_rounded_speed() {
         let mut speedo = Speedometer::default();
         let ui = speedo.update(&settings(flag::ENABLE), &input()).expect("enabled");
@@ -838,18 +867,45 @@ mod tests {
         let mut speedo = Speedometer::default();
         let config = settings(flag::ENABLE | flag::SPEEDGRAPHOLD);
 
-        // cg_lagometer 2: 48 px graph in the lag frame, with the speed written in it.
+        // cg_lagometer 2: a 48 px graph in the lag frame. Its speed number is
+        // exclusively owned by the speedometer component.
         let framed = Input { lagometer: crate::lagometer::Settings { mode: 2, ..Default::default() }, ..input() };
         let ui = speedo.update(&config, &framed).expect("enabled");
         assert_eq!(ui.graph_pics.len(), 1);
         assert_eq!((ui.graph_pics[0].x, ui.graph_pics[0].y), (592.0, 480.0 - 144.0 - 56.0 - 16.0));
-        assert_eq!(ui.graph_texts[0].text, "500");
         assert!((ui.graph_rects[0].h - 500.0 * 48.0 / 3000.0).abs() < 1e-3);
 
         // cg_lagometer 0: the frameless 144 px graph, 96 higher.
         let ui = speedo.update(&config, &input()).expect("enabled");
-        assert!(ui.graph_pics.is_empty() && ui.graph_texts.is_empty());
+        assert!(ui.graph_pics.is_empty());
         assert!((ui.graph_rects[0].h - 500.0 * 144.0 / 3000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn movement_components_classic_graph_has_no_bundled_speed_number() {
+        let ui = preview_with_context(&settings(flag::SPEEDGRAPHOLD),
+            crate::lagometer::Settings {mode:2, ..Default::default()}, 0.75);
+        assert!(!ui.graph_rects.is_empty() && !ui.graph_pics.is_empty());
+        assert!(ui.texts.is_empty() && ui.jump_texts.is_empty());
+    }
+
+    #[test]
+    fn movement_components_jump_history_wraps_without_enabling_pre_speed() {
+        let mut meter = Speedometer::default();
+        let config = settings(flag::JUMPS);
+        let mut last = Ui::default();
+        for jump in 0..8 {
+            let ground = Input {time_ms:1000+jump*100, real_ms:1000+i64::from(jump)*100, ..input()};
+            meter.update(&config, &ground);
+            last = meter.update(&config, &Input {
+                time_ms:ground.time_ms+8, real_ms:ground.real_ms+8,
+                on_ground:false, vertical:270.0, v:640.0+jump as f32, ..ground
+            }).unwrap();
+        }
+        assert!(last.texts.is_empty());
+        assert_eq!(last.jump_texts.len(), 8);
+        assert_eq!(last.jump_texts[0].x, last.jump_texts[5].x);
+        assert_eq!(last.jump_texts[5].y-last.jump_texts[0].y, 20.0);
     }
 
     #[test]
@@ -863,13 +919,14 @@ mod tests {
     #[test]
     fn pre_speed_is_captured_on_takeoff() {
         let mut speedo = Speedometer::default();
-        let config = settings(flag::ENABLE | flag::GROUNDSPEED);
+        let config = settings(flag::GROUNDSPEED);
         speedo.update(&config, &input());
         let airborne = Input { on_ground: false, vertical: 270.0, v: 640.0, time_ms: 1008, real_ms: 1008, ..input() };
         let ui = speedo.update(&config, &airborne).expect("enabled");
-        // Speed, then the pre-speed at 132 + 52.
-        let pre = ui.texts.iter().find(|text| text.x == 184.0).expect("pre-speed readout");
+        // Takeoff tracking works even when the primary speedometer is Off.
+        let pre = ui.texts.iter().find(|text| text.text == "640").expect("pre-speed readout");
         assert_eq!(pre.text, "640");
+        assert_eq!(ui.texts.len(), 1);
     }
 
     #[test]

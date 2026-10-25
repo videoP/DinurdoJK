@@ -6,11 +6,11 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_shadows(&mut self, ui: &mut egui::Ui) {
-        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 5] = [
+        const SHADOW_OPTIONS: [(DynamicShadowsMode, &str, &str); 6] = [
             (
                 DynamicShadowsMode::Off,
                 "Off",
-                "No dynamic shadows cast by players, NPCs or moveable objects.",
+                "No directional shadow maps. Player foot-contact blobs are controlled separately.",
             ),
             (
                 DynamicShadowsMode::Blob,
@@ -28,15 +28,20 @@ impl App {
                 "Bevy 0.19.1 directional-light CSM: four exponential cascades, stable texel snapping, reverse-Z and Bevy shadow filtering.",
             ),
             (
+                DynamicShadowsMode::HybridCsmRtEntities,
+                "Hybrid: CSM + RT entities",
+                "CSM renders static BSP sun blockers. Hardware ray queries handle moving inline BSPs, player/NPC meshes and eligible movable models. Falls back to CSM-only if hardware RT is unavailable; does not ray-trace static world blockers for the sun.",
+            ),
+            (
                 DynamicShadowsMode::RayTraced,
                 "Ray traced",
-                "Hardware ray-query sun visibility using the current wgpu BLAS/TLAS API. This first port traces opaque static BSP casters; alpha-tested/translucent surfaces and moving/skinned casters are deliberately excluded rather than approximated.",
+                "Hardware ray-query sunlight shadows from static BSP, moving BSP models, eligible rigid MD3s and skinned Ghoul2 casters. Requires hardware ray queries.",
             ),
         ];
         if let Some(target) = mode_row(
             ui,
-            "Dynamic shadows",
-            "Real-time shadow technique layered over the map's authored/baked lighting. Hardware ray tracing currently covers opaque static BSP sun occlusion.",
+            "Sun & entity shadow method",
+            "Shadowing for sunlight and legacy entity drop-shadows. These are shadow techniques, not additional static light sources. Hybrid combines static BSP CSM with ray-traced moving blockers.",
             theme::Reset::Video(ui::VIDEO_ROW_DYNAMIC_SHADOWS),
             self.video.dynamic_shadows,
             &SHADOW_OPTIONS,
@@ -44,6 +49,12 @@ impl App {
             let current = mode_index(&SHADOW_OPTIONS, self.video.dynamic_shadows);
             self.video_selected = ui::VIDEO_ROW_DYNAMIC_SHADOWS;
             self.change_video_setting(target as i32 - current as i32);
+        }
+        let mut contact = self.video.player_contact_shadows;
+        if ui.checkbox(&mut contact, "Player foot-contact blobs").on_hover_text(
+            "Subtle ground-contact darkening under players and NPCs, independent of CSM, RT and lamp shadows. Reuses the projected blob system, follows the floor, and fades with height. Classic Blob mode retains its full-size drop shadow."
+        ).changed() {
+            let _ = self.set_console_cvar("r_playerContactShadows", if contact { "1" } else { "0" });
         }
         ui.add_enabled_ui(self.video.dynamic_shadows == DynamicShadowsMode::EntityMap, |ui| {
             const ENTITY_SHADOW_LIGHT_OPTIONS: [(EntityShadowLight, &str); 2] = [
@@ -68,16 +79,16 @@ impl App {
                 self.change_video_setting(next as i32 - current as i32);
             }
         });
-        // Only Forward+ consults this toggle. Ray-traced lights always trace
-        // local visibility, and the lower tiers never shadow local lights.
-        let local_shadows_applies =
-            self.video.dynamic_lights == DynamicLightsMode::PerPixelForwardPlus;
+        // RT always shadows transient lights; this toggle still controls the
+        // cached raster shadows of static map lights in that mode.
+        let local_shadows_applies = matches!(self.video.dynamic_lights,
+            DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware);
         let local_shadows_note = match self.video.dynamic_lights {
             DynamicLightsMode::PerPixelForwardPlus => "",
             DynamicLightsMode::RayTracedHardware => {
                 "
 
-Not used: Ray traced dynamic lights always trace local-light visibility."
+In Ray traced mode, this controls static map-light cubemap shadows. Transient lights always use RT shadows."
             }
             _ => {
                 "
@@ -90,7 +101,7 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
                 ui,
                 "Local light shadows",
                 &format!(
-                    "Adds shadows to local lights. With RT Shadows, uses hard ray-traced shadows for clustered lights, including moving FX lights. Other shadow modes use cached shadow cubemaps. Hardware RT dynamic lighting always includes local visibility, independently of this toggle.{local_shadows_note}"
+                    "Enables cached cubemap shadows for static map lights. Transient lights use RT visibility when hardware RT is active; Ray traced dynamic lights always include their transient shadows.{local_shadows_note}"
                 ),
                 ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS,
                 self.video.local_light_shadows,
@@ -98,7 +109,7 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         });
         self.egui_toggle_row(
             ui,
-            "Contact shadows",
+            "Sun screen-space contact shadows",
             "Marches a short ray from each pixel toward the map's sun through the \
              depth buffer and darkens pixels where a nearby on-screen surface blocks \
              it, filling in the fine darkening where objects meet the ground. \
@@ -110,7 +121,7 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
 
         // Grey out (rather than hide) the RT tuning rows when nothing ray-traced
         // is active, matching the other dependent rows on this page.
-        let rt_sun = self.video.dynamic_shadows == DynamicShadowsMode::RayTraced;
+        let rt_sun = matches!(self.video.dynamic_shadows, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities);
         let rt_lights = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
         const RT_TRACE_RATE: [(u32, &str, &str); 3] = [
             (1, "Full", "Fresh sun and local-light shadow rays every frame."),
@@ -118,8 +129,8 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
             (4, "Quarter", "Refresh roughly one quarter of stable pixels each frame. More history reuse; changes may need extra rays."),
         ];
         ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
-            let note = if rt_sun || rt_lights { "" } else { "\n\nNeeds RT Shadows or Ray traced dynamic lights." };
-            if let Some(index) = mode_row(ui, "RT update rate", &format!("Fresh tracing rate for sun and local-light shadows at full output resolution. Newly exposed surfaces, changing lights and shadow edges refresh sooner. Colored-glass transmission uses full-rate direct rays. FPS gains depend on the scene.{note}"),
+            let note = if rt_sun || rt_lights { "" } else { "\n\nNeeds ray-traced sun/entity shadows or ray-traced local lights." };
+            if let Some(index) = mode_row(ui, "RT update rate", &format!("Fresh tracing rate for full sun RT and local-light shadows. Hybrid sun/entity rays run at full rate (no shared sun history); local-light tracing can still be reduced. FPS gains depend on the scene.{note}"),
                 theme::Reset::None, self.video.rt_trace_rate, &RT_TRACE_RATE) {
                 let _ = self.set_console_cvar("r_rtTraceRate", &RT_TRACE_RATE[index].0.to_string());
             }
@@ -152,7 +163,7 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
         });
 
         ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
-            let note = if rt_sun || rt_lights { "" } else { "\n\nNot used: needs RT Shadows or Ray traced dynamic lights." };
+            let note = if rt_sun || rt_lights { "" } else { "\n\nNot used: needs ray-traced sun/entity shadows or ray-traced local lights." };
             if let Some(index) = mode_row(ui, "RT samples", &format!("Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.{note}"),
                 theme::Reset::None, self.video.rt_samples, &RT_SAMPLES) {
                 let _ = self.set_console_cvar("r_rtSamples", &RT_SAMPLES[index].0.to_string());

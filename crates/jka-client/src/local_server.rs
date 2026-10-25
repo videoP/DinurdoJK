@@ -21,7 +21,7 @@ use jka_assets::saber::{SaberDefinition, SaberDefinitions};
 
 use crate::{
     camera::Camera,
-    cgame::{ambient_sets::CS_AMBIENT_SET, ClientInfo, CS_EFFECTS, CS_MODELS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
+    cgame::{ambient_sets::CS_AMBIENT_SET, ClientInfo, CS_EFFECTS, CS_MODELS, CS_MUSIC, CS_PLAYERS, CS_SERVERINFO, ET_FX},
     player::{LocalPlayer, MouseInputSettings},
     scene::{MapBrushEntity, MapFxRunner, MapWorldEffectRegistration, SpawnPoint},
     surface_deformation::SurfaceDeformationStamp,
@@ -66,6 +66,7 @@ pub struct LocalServer {
     player: LocalPlayer,
     map_name: String,
     client_name: String,
+    worldspawn_music: String,
     configstrings: BTreeMap<u16, Vec<u8>>,
     /// Reliable server commands emitted by the in-process game authority.
     /// They are fed through CGame's ordinary `CG_ServerCommand` queue rather
@@ -104,6 +105,7 @@ impl LocalServer {
         fx_runners: &[MapFxRunner],
         world_effect_registrations: &[MapWorldEffectRegistration],
         brush_entities: &[MapBrushEntity],
+        worldspawn_music: Option<&str>,
         areas: Option<jka_assets::bsp::AreaLocator>,
     ) -> Result<Self, String> {
         let mut player = LocalPlayer::new(movement, world, spawn)?;
@@ -133,6 +135,7 @@ impl LocalServer {
             player,
             map_name,
             client_name: clean_info_value(&client_info.name),
+            worldspawn_music: worldspawn_music.unwrap_or_default().to_owned(),
             configstrings: BTreeMap::new(),
             pending_server_commands: VecDeque::new(),
             server_command_sequence: 0,
@@ -228,6 +231,8 @@ impl LocalServer {
             CS_SYSTEMINFO,
             b"\\sv_serverid\\1\\sv_pure\\0".to_vec(),
         );
+        // TaystJK SP_worldspawn publishes even an empty music value.
+        self.configstrings.insert(CS_MUSIC, self.worldspawn_music.as_bytes().to_vec());
         for (slot, model) in self.map_models.iter().enumerate() {
             let Ok(slot) = u16::try_from(slot + 1) else { break };
             self.configstrings
@@ -778,6 +783,23 @@ mod tests {
     }
 
     #[test]
+    fn local_server_publishes_worldspawn_music_as_cs_music() {
+        let info = ClientInfo::solo_model("kyle/default");
+        let create = |music: Option<&str>| {
+            LocalServer::new(
+                "mp/ffa3", None, None, SpawnPoint::default(), &info,
+                [SaberMovementInfo::equipped_default(), SaberMovementInfo::default()],
+                &[], &[], &[], music, None,
+            ).expect("local spectator server")
+        };
+        assert_eq!(
+            create(Some("music/intro.mp3 music/loop.mp3")).configstrings().get(&CS_MUSIC),
+            Some(&b"music/intro.mp3 music/loop.mp3".to_vec()),
+        );
+        assert_eq!(create(None).configstrings().get(&CS_MUSIC), Some(&Vec::new()));
+    }
+
+    #[test]
     fn map_name_is_protocol_style() {
         assert_eq!(normalize_map_name("mp/ffa3.bsp"), "mp/ffa3");
         assert_eq!(normalize_map_name("mp\\ffa3"), "mp/ffa3");
@@ -841,6 +863,7 @@ mod tests {
     #[test]
     fn local_fx_runner_uses_effect_configstring_and_et_fx() {
         let runner = MapFxRunner {
+                bake_static: false,
             source_entity_index: 0,
             effect: "effects/test.efx".into(),
             origin: [1.0, 2.0, 3.0],
@@ -876,6 +899,7 @@ mod tests {
             effect: "*rain".to_owned(),
         }];
         let runner = MapFxRunner {
+                bake_static: false,
             source_entity_index: 1,
             effect: "*clear".into(),
             origin: [0.0; 3],
@@ -892,6 +916,7 @@ mod tests {
     #[test]
     fn star_fx_runner_registers_weather_but_does_not_spawn_et_fx() {
         let runner = MapFxRunner {
+                bake_static: false,
             source_entity_index: 0,
             effect: "*heavyrain".into(),
             origin: [1.0, 2.0, 3.0],
@@ -909,6 +934,7 @@ mod tests {
     fn startoff_and_oneshot_fx_runners_begin_off() {
         for spawnflags in [FX_RUNNER_STARTOFF, FX_RUNNER_ONESHOT] {
             let runner = MapFxRunner {
+                bake_static: false,
                 source_entity_index: 0,
                 effect: "test".into(),
                 origin: [0.0; 3],

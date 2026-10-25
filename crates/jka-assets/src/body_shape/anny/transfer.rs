@@ -32,7 +32,7 @@ fn frames(
     gla: &GlaAnimation,
     native: Option<&[[f32; 3]]>,
 ) -> Option<(Vec<Frame>, Vec<Option<usize>>)> {
-    let data = model();
+    let data = model().ok()?;
     if native.is_some_and(|v| v.len() != gla.skeleton.len()) {
         return None;
     }
@@ -163,7 +163,7 @@ fn fitted(
     gla: &GlaAnimation,
     native: Option<&[[f32; 3]]>,
 ) -> Option<(Vec<Frame>, Vec<Option<usize>>, SurfaceTree)> {
-    let data = model();
+    let data = model().ok()?;
     let (frames, ids) = frames(gla, native)?;
     let vertices = data
         .neutral
@@ -249,6 +249,8 @@ fn mapping(
     Ok(out)
 }
 
+/// Apply authored detail shapes at neutral whole-body parameters.
+/// Use `apply_profile` to combine details with the procedural whole-body sliders.
 pub fn apply(
     glm: &mut GlmModel,
     gla: &GlaAnimation,
@@ -259,10 +261,16 @@ pub fn apply(
     if params.is_neutral() && details.is_neutral() {
         return Ok(None);
     }
+    if !params.is_neutral() {
+        return Err(
+            "Anny runtime data fixes whole-body axes; use apply_profile for whole-body sliders"
+                .into(),
+        );
+    }
+    let data = model()?;
     if !supports(glm, gla, native) {
         return Err("Anny requires a mapped humanoid skeleton".into());
     }
-    let data = model();
     let map = mapping(glm, gla, native)?;
     let shaped = data.evaluate(params, details);
     let heads: Vec<_> = data
@@ -297,6 +305,7 @@ pub fn apply(
     // differently and a height change can turn a one-unit link into 27 units.
     let mut changes = vec![None; heads.len()];
     fn joint_change(
+        data: &Model,
         i: usize,
         parents: &[Option<usize>],
         owners: &[usize],
@@ -308,12 +317,12 @@ pub fn apply(
         if let Some(change) = changes[i] {
             return change;
         }
-        let data = model();
         let owner = owners[i];
         let change = if owner != i {
-            joint_change(owner, parents, owners, map, heads, original, changes)
+            joint_change(data, owner, parents, owners, map, heads, original, changes)
         } else if let Some(parent) = parents[i].map(|p| owners[p]) {
-            let inherited = joint_change(parent, parents, owners, map, heads, original, changes);
+            let inherited =
+                joint_change(data, parent, parents, owners, map, heads, original, changes);
             let before = sub(data.heads[i], data.heads[parent]);
             let after = sub(heads[i], heads[parent]);
             let target = sub(
@@ -333,7 +342,16 @@ pub fn apply(
         change
     }
     for i in 0..heads.len() {
-        joint_change(i, &parents, &owners, &map, &heads, &original, &mut changes);
+        joint_change(
+            data,
+            i,
+            &parents,
+            &owners,
+            &map,
+            &heads,
+            &original,
+            &mut changes,
+        );
     }
     let mut target_changes = vec![None; gla.skeleton.len()];
     for (i, &target) in map.bone_ids.iter().enumerate() {
@@ -416,10 +434,9 @@ pub fn apply(
 
 /// Classify by the authored local targets influencing the projected donor
 /// surface. No screen-space body rectangles or guessed body-height thresholds.
-fn region_labels() -> &'static [&'static str] {
+fn region_labels(data: &Model) -> &'static [&'static str] {
     static LABELS: OnceLock<Vec<&'static str>> = OnceLock::new();
     LABELS.get_or_init(|| {
-        let data = model();
         let mut groups: Vec<&str> = LOCAL_CONTROLS.iter().map(|c| c.1).collect();
         groups.sort();
         groups.dedup();
@@ -459,11 +476,11 @@ fn region_labels() -> &'static [&'static str] {
     })
 }
 
-fn projection_region(projection: Projection) -> &'static str {
+fn projection_region(data: &Model, projection: Projection) -> &'static str {
     let index = (0..3)
         .max_by(|&a, &b| projection.weights[a].total_cmp(&projection.weights[b]))
         .unwrap();
-    region_labels()[model().faces[projection.face][index]]
+    region_labels(data)[data.faces[projection.face][index]]
 }
 
 pub fn region(
@@ -472,8 +489,9 @@ pub fn region(
     native: Option<&[[f32; 3]]>,
     point: [f32; 3],
 ) -> Option<&'static str> {
+    let data = model().ok()?;
     let map = mapping(glm, gla, native).ok()?;
-    Some(projection_region(map.tree.project(point)))
+    Some(projection_region(data, map.tree.project(point)))
 }
 
 /// Batched counterpart used to cache selection masks for rendered triangles.
@@ -484,10 +502,11 @@ pub fn regions(
     native: Option<&[[f32; 3]]>,
     points: impl IntoIterator<Item = [f32; 3]>,
 ) -> Result<Vec<&'static str>, String> {
+    let data = model()?;
     let map = mapping(glm, gla, native)?;
     Ok(points
         .into_iter()
-        .map(|p| projection_region(map.tree.project(p)))
+        .map(|p| projection_region(data, map.tree.project(p)))
         .collect())
 }
 

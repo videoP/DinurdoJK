@@ -4,6 +4,7 @@ use crate::renderer::{
     ShadowCasterUniform, ShadowReceiverUniform, Vec3, WeatherSurfaceUniform,
     BEVY_CSM_OVERLAP_PROPORTION, BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS,
     DEPTH_FORMAT, FALLBACK_SUN_DIRECTION, SHADOW_CASCADES, SHADOW_MAP_SIZE, VERTEX_ATTRIBUTES,
+    SunVisibilityMode, DynamicShadowsMode, Camera,
 };
 use wgpu::util::DeviceExt;
 
@@ -15,10 +16,99 @@ pub(in crate::renderer) struct OriginalSunShadowCache {
     pub(in crate::renderer) texel_size: f32,
 }
 
+/// Static sun shadows are captured in light space and reused as long as the
+/// camera frustum still fits inside their padded projection. This is a GPU
+/// depth cache, not a baked lightmap, and never contains moving entity casters.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct CachedStaticCascade {
+    pub(in crate::renderer) matrix: Mat4,
+    pub(in crate::renderer) texel_size: f32,
+    pub(in crate::renderer) map_id: u64,
+    pub(in crate::renderer) sun_direction: [f32; 3],
+    pub(in crate::renderer) visibility: SunVisibilityMode,
+    pub(in crate::renderer) draw_inline_models: bool,
+    pub(in crate::renderer) draw_bsp_model_surfaces: bool,
+    pub(in crate::renderer) tinted_glass: bool,
+    pub(in crate::renderer) generation: u64,
+}
+
+/// Expand the initial light-space footprint so modest camera motion can reuse
+/// the same depth texture. Moving nearer an edge forces a fresh capture.
+pub(in crate::renderer) fn padded_static_shadow_matrix(matrix: Mat4) -> Mat4 {
+    Mat4::from_cols(
+        crate::renderer::Vec4::new(0.80, 0.0, 0.0, 0.0),
+        crate::renderer::Vec4::new(0.0, 0.80, 0.0, 0.0),
+        crate::renderer::Vec4::new(0.0, 0.0, 0.80, 0.0),
+        crate::renderer::Vec4::new(0.0, 0.0, 0.10, 1.0),
+    ) * matrix
+}
+
+pub(in crate::renderer) fn static_shadow_covers_camera(
+    cached: Mat4, camera: &Camera, width: u32, height: u32, cascade: usize,
+) -> bool {
+    // A margin remains between the new frustum and the cached depth border.
+    // The z check matters: a moving camera can otherwise reuse a projection
+    // which clips a blocker even though its XY coordinates still fit.
+    let bounds = bevy_cascade_bounds();
+    let near = if cascade == 0 { crate::renderer::BEVY_CSM_MINIMUM_DISTANCE }
+        else { (1.0 - BEVY_CSM_OVERLAP_PROPORTION) * bounds[cascade - 1] };
+    camera.frustum_corners(width, height, near, bounds[cascade]).iter().all(|&p| {
+        let q = cached.transform_point3(p);
+        q.is_finite() && q.x.abs() < 0.87 && q.y.abs() < 0.87
+            && q.z > 0.065 && q.z < 0.935
+    })
+}
+
+pub(in crate::renderer) struct StaticSkySnapshot {
+    pub(in crate::renderer) sky_depth: wgpu::Texture,
+    pub(in crate::renderer) sky_layer_views: Vec<wgpu::TextureView>,
+}
+
+impl StaticSkySnapshot {
+    fn new(device: &wgpu::Device) -> Self {
+    // Keep static sky admission separate from moving sky surfaces. Ordinary
+    // static caster depth lives directly in the receiver array; it is never
+    // copied each frame or overwritten by the moving-caster layers.
+    let static_sky_depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA static CSM cached sky admission"),
+        size: wgpu::Extent3d { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE,
+            depth_or_array_layers: SHADOW_CASCADES as u32 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let static_sky_layer_views = (0..SHADOW_CASCADES).map(|index| {
+        static_sky_depth.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("JKA static CSM cached sky layer"),
+            format: Some(DEPTH_FORMAT), dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0, mip_level_count: Some(1),
+            base_array_layer: index as u32, array_layer_count: Some(1),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        })
+    }).collect::<Vec<_>>();
+
+        Self { sky_depth: static_sky_depth, sky_layer_views: static_sky_layer_views }
+    }
+}
+
 pub(in crate::renderer) struct ShadowResources {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) _array_view: wgpu::TextureView,
     pub(in crate::renderer) layer_views: Vec<wgpu::TextureView>,
+    /// Static sky admission, restored only when moving sky surfaces affect it.
+    pub(in crate::renderer) sky_snapshot: Option<StaticSkySnapshot>,
+    pub(in crate::renderer) static_cascades: [Option<CachedStaticCascade>; SHADOW_CASCADES],
+    pub(in crate::renderer) rendered_generations: [u64; SHADOW_CASCADES],
+    pub(in crate::renderer) next_generation: u64,
+    pub(in crate::renderer) last_csm_mode: Option<DynamicShadowsMode>,
+    pub(in crate::renderer) dynamic_sky_layers: u32,
+    /// One-second diagnostic counters, enabled with JKA_CSM_CACHE_DEBUG=1.
+    pub(in crate::renderer) cache_debug_epoch: std::time::Instant,
+    pub(in crate::renderer) cache_debug_frames: u32,
+    pub(in crate::renderer) cache_debug_captures: u32,
+    pub(in crate::renderer) cache_debug_sky_copies: u32,
     /// Last array slice: original BSP sun, never sampled by runtime CSM.
     pub(in crate::renderer) original_sun_cache: Option<OriginalSunShadowCache>,
     pub(in crate::renderer) _sky_texture: wgpu::Texture,
@@ -45,6 +135,14 @@ pub(in crate::renderer) struct ShadowResources {
     pub(in crate::renderer) bevy_sky_pipeline: wgpu::RenderPipeline,
 }
 
+impl ShadowResources {
+    pub(in crate::renderer) fn ensure_sky_snapshot(&mut self, device: &wgpu::Device) {
+        if self.sky_snapshot.is_none() {
+            self.sky_snapshot = Some(StaticSkySnapshot::new(device));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(in crate::renderer) struct LocalShadowCacheEntry {
     pub(in crate::renderer) light_index: Option<usize>,
@@ -52,6 +150,15 @@ pub(in crate::renderer) struct LocalShadowCacheEntry {
 }
 
 pub(in crate::renderer) struct LocalShadowResources {
+    pub moving_face_masks: Vec<u32>,
+    /// Conservative 8 octants containing moving casters (bit 0 = -x,-y,-z).
+    pub moving_octant_masks: Vec<u32>,
+    pub ab_last_cpu_ms: f64,
+    pub ab_last_dynamic_faces: u32,
+    pub ab_last_entity_face_pairs: u32,
+    pub ab_last_bsp_face_pairs: u32,
+    pub ab_last_static_rebuilds: u32,
+    pub moving_cameras: Option<crate::renderer::lighting::entity_shadows::EntityShadowState>,
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) cube_view: wgpu::TextureView,
     pub(in crate::renderer) sampler: wgpu::Sampler,
@@ -302,13 +409,14 @@ pub(in crate::renderer) fn create_shadow_resources(
         size: wgpu::Extent3d {
             width: SHADOW_MAP_SIZE,
             height: SHADOW_MAP_SIZE,
-            depth_or_array_layers: (SHADOW_CASCADES + 1) as u32,
+            depth_or_array_layers: (SHADOW_CASCADES * 2 + 1) as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -318,11 +426,11 @@ pub(in crate::renderer) fn create_shadow_resources(
         base_mip_level: 0,
         mip_level_count: Some(1),
         base_array_layer: 0,
-        array_layer_count: Some((SHADOW_CASCADES + 1) as u32),
+        array_layer_count: Some((SHADOW_CASCADES * 2 + 1) as u32),
         aspect: wgpu::TextureAspect::DepthOnly,
         usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
     });
-    let layer_views = (0..=SHADOW_CASCADES)
+    let layer_views = (0..=(SHADOW_CASCADES * 2))
         .map(|cascade| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA cascaded sun shadow layer"),
@@ -348,7 +456,8 @@ pub(in crate::renderer) fn create_shadow_resources(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let sky_array_view = sky_texture.create_view(&wgpu::TextureViewDescriptor {
@@ -430,6 +539,7 @@ pub(in crate::renderer) fn create_shadow_resources(
         ..Default::default()
     });
     let receiver = ShadowReceiverUniform {
+        dynamic_regions: [[1.0,1.0,-1.0,-1.0]; SHADOW_CASCADES],
         view_proj: [Mat4::IDENTITY.to_cols_array_2d(); SHADOW_CASCADES],
         split_depths: bevy_cascade_bounds(),
         light_direction_enabled: [
@@ -534,6 +644,16 @@ pub(in crate::renderer) fn create_shadow_resources(
         _texture: texture,
         _array_view: array_view,
         layer_views,
+        sky_snapshot: None,
+        static_cascades: [None; SHADOW_CASCADES],
+        rendered_generations: [0; SHADOW_CASCADES],
+        next_generation: 0,
+        last_csm_mode: None,
+        dynamic_sky_layers: 0,
+        cache_debug_epoch: std::time::Instant::now(),
+        cache_debug_frames: 0,
+        cache_debug_captures: 0,
+        cache_debug_sky_copies: 0,
         original_sun_cache: None,
         _sky_texture: sky_texture,
         sky_array_view,

@@ -30,6 +30,7 @@ pub(super) enum FrontendPage {
     AssetViewer,
     Screenshots,
     MapViewer,
+    RenderStudio,
 }
 
 

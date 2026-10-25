@@ -25,6 +25,13 @@ pub fn taunt_should_cancel(torso_anim: i32, legs_anim: i32, buttons: i32, up_mov
     unsafe { ffi::jka_taunt_should_cancel(torso_anim & 0x7fff, legs_anim & 0x7fff, buttons, i32::from(up_move)) != 0 }
 }
 
+/// Native attack/Force cancellation buttons, independent of animation ownership.
+/// Cosmetic playback uses this while no accepted native taunt is available.
+pub fn taunt_action_should_cancel(buttons: i32) -> bool {
+    // SAFETY: the native input predicate has no shared mutable state.
+    unsafe { ffi::jka_taunt_action_should_cancel(buttons) != 0 }
+}
+
 /// One `bg_itemlist` entry from the pinned OpenJK tables (gitem_t subset).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemInfo {
@@ -268,6 +275,17 @@ pub struct TraceResult {
     pub all_solid: i32,
 }
 impl TraceResult {
+    /// Stop at a finite position when a caller supplies unusable coordinates.
+    pub(crate) fn blocked(start: [f32; 3]) -> Self {
+        let mut result = Self::clear(if start.iter().all(|v| v.is_finite()) { start } else { [0.0; 3] });
+        result.fraction = 0.0;
+        result.start_solid = 1;
+        result.all_solid = 1;
+        result.contents = 1; // CONTENTS_SOLID
+        result.entity = ENTITY_WORLD;
+        result
+    }
+
     pub fn clear(end: [f32; 3]) -> Self {
         Self {
             fraction: 1.0,
@@ -290,6 +308,12 @@ pub struct TraceQuery {
     pub end: [f32; 3],
     pub pass_entity: i32,
     pub mask: i32,
+}
+impl TraceQuery {
+    pub(crate) fn is_finite(&self) -> bool {
+        self.start.iter().chain(&self.end).chain(&self.mins).chain(&self.maxs)
+            .all(|v| v.is_finite())
+    }
 }
 pub trait TraceWorld {
     fn trace(&mut self, query: TraceQuery) -> TraceResult;
@@ -537,6 +561,16 @@ pub struct PlayerEntityView {
 }
 
 impl PlayerView {
+    fn validate_movement(&self) -> Result<(), String> {
+        if self.origin.iter().chain(&self.velocity).chain(&self.view_angles)
+            .chain(&self.mins).chain(&self.maxs).all(|v| v.is_finite()) {
+            Ok(())
+        } else {
+            Err(format!("Non-finite movement state at commandTime {}: origin={:?} velocity={:?} angles={:?} mins={:?} maxs={:?}",
+                self.command_time, self.origin, self.velocity, self.view_angles, self.mins, self.maxs))
+        }
+    }
+
     pub fn legs_animation_name(&self) -> String {
         let _guard = ffi::NativeGuard::new();
         unsafe {
@@ -660,8 +694,12 @@ pub struct PredictionEntity {
 unsafe impl Send for PlayerState {}
 impl PlayerState {
     pub fn set_prediction_entities(&mut self, entities: &[PredictionEntity]) -> Result<(), String> {
-        if entities.len() > 1024 || entities.iter().any(|e| !e.origin.iter().chain(&e.velocity).chain(&e.angular_velocity).all(|v| v.is_finite())) {
-            return Err("Invalid prediction entities".into());
+        if entities.len() > 1024 {
+            return Err(format!("Too many prediction entities: {}", entities.len()));
+        }
+        if let Some(e) = entities.iter().find(|e| !e.origin.iter().chain(&e.velocity).chain(&e.angular_velocity).all(|v| v.is_finite())) {
+            return Err(format!("Non-finite prediction entity {} (type {}): origin={:?} velocity={:?} angular_velocity={:?}",
+                e.number, e.entity_type, e.origin, e.velocity, e.angular_velocity));
         }
         let _guard = ffi::NativeGuard::new();
         if unsafe { ffi::jka_player_set_entities(self.raw.as_ptr(), entities.as_ptr(), entities.len() as i32) } == 0 {
@@ -970,6 +1008,7 @@ impl PmoveContext {
         let _guard = ffi::NativeGuard::new();
         self.activate()?;
         let before = state.view();
+        before.validate_movement()?;
         if cmd.weapon >= 19 || cmd.force_selection >= 18 {
             return Err("Invalid user command selection".into());
         }
@@ -996,7 +1035,9 @@ impl PmoveContext {
         if ok == 0 {
             return Err(native_error());
         }
-        Ok(state.view())
+        let view = state.view();
+        view.validate_movement()?;
+        Ok(view)
     }
 
     /// Advance one authored usercmd whose timestamp may be wider than a single
@@ -1017,6 +1058,7 @@ impl PmoveContext {
             return Err("Pmove command span must be 1..=1000 milliseconds".into());
         }
         let before = state.view();
+        before.validate_movement()?;
         if before.command_time.checked_add(command_msec) != Some(cmd.server_time) {
             return Err(format!(
                 "Pmove command must advance by exactly {command_msec} milliseconds"
@@ -1045,7 +1087,9 @@ impl PmoveContext {
         if ok == 0 {
             return Err(native_error());
         }
-        Ok(state.view())
+        let view = state.view();
+        view.validate_movement()?;
+        Ok(view)
     }
 }
 impl PmoveContext {
@@ -1070,6 +1114,7 @@ impl PmoveContext {
         }
         let _guard = ffi::NativeGuard::new();
         self.activate()?;
+        state.view().validate_movement().map_err(|e| format!("Pmove input: {e}"))?;
         let mut callbacks = ffi::Callbacks::new(world);
         let ok = unsafe {
             ffi::jka_player_predict(
@@ -1085,6 +1130,7 @@ impl PmoveContext {
         if ok == 0 {
             return Err(native_error());
         }
+        state.view().validate_movement().map_err(|e| format!("Pmove output: {e}"))?;
         Ok(())
     }
 }

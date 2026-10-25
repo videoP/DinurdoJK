@@ -562,7 +562,7 @@ impl Renderer {
         let clustered_lite_dlights = self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite;
         let point_lights = self.point_lighting_enabled_for(source_map);
         let map_light_simulation = self.map_light_simulation_active_for(source_map);
-        let shadowable_local_lights = point_lights || self.any_area_lights_enabled();
+        let shadowable_local_lights = point_lights || self.any_area_lights_enabled() || self.baked_local_shadows;
         WorldShaderVariantKey {
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
             pom: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
@@ -583,15 +583,15 @@ impl Renderer {
             area_lights: self.any_area_lights_enabled(),
             irradiance_volume: self.irradiance_volume_enabled,
             voxel_gi: self.voxel_probe_gi_enabled,
-            // A local-shadow shader path is useless without a direct local-light
-            // source. Normalize it out of the key so toggling shadows alone does
-            // not create a redundant pipeline permutation.
+            // Inferred lamps also need cube comparisons while leaving direct
+            // illumination disabled.
             local_shadows: (self.local_light_shadows_enabled
+                || self.baked_local_shadows
                 || self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware)
                 && shadowable_local_lights,
             cascaded_shadows: self.cascaded_shadows_enabled,
             ray_traced_shadows: self.hardware_rt_requested() && self.ray_tracing_supported,
-            ray_traced_sun: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+            ray_traced_sun: matches!(self.cascaded_shadow_mode, DynamicShadowsMode::RayTraced | DynamicShadowsMode::HybridCsmRtEntities)
                 && self.ray_tracing_supported,
             rt_receiver_glass: self.hardware_rt_requested() && self.ray_tracing_supported
                 && crate::renderer::lighting::rt_diagnostics::config().receiver.glass,
@@ -628,6 +628,9 @@ impl Renderer {
     /// Shared by frame routing and shader specialization: the fast renderer
     /// cannot apply these controls, even when every other effect is disabled.
     pub(in crate::renderer) fn baked_lighting_shader_needed(&self) -> bool {
+        // Worker readiness is a uniform/binding change, never a shader variant.
+        (self.baked_sun_cache && self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps)
+            || self.baked_local_lights || self.baked_local_shadows ||
         (self.baked_indirect_scale - 1.0).abs() > 0.0001
             || (self.baked_indirect_saturation - 1.0).abs() > 0.0001
             || (self.baked_indirect_power - 1.0).abs() > 0.0001
@@ -1019,6 +1022,8 @@ impl Renderer {
             return;
         }
         self.cull_debug_mode = mode;
+        // Filtered and all-reason overlays use different fragment entry points.
+        self.cull_debug_pipeline = None;
         if let Some(world) = &mut self.world {
             // Force the CPU PVS classification to be republished into the
             // debug-reason buffer when diagnostics are switched on.

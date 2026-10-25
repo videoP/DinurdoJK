@@ -7,6 +7,44 @@ use crate::app::{
 };
 
 impl App {
+    /// Editor handles follow configuration, including transient components
+    /// whose live data may currently be empty (for example jump measurements).
+    pub(in crate::app) fn hud_edit_element_enabled(&self, id: ui::HudElementId) -> bool {
+        use ui::HudElementId::*;
+        if !self.video.draw_2d || self.video.skip_ui { return false; }
+        if ui::movement_components::is_movement_component(id) {
+            let choice = ui::movement_components::selected(id, self.strafe_helper.flags, self.japro_cg.speedometer.flags);
+            return choice != 0 && !(id == StrafeGuide && choice == ui::SHELPER_CINEMATIC);
+        }
+        match id {
+            Health | Shield | Ammo | Force => self.video.draw_hud,
+            MovementKeys => self.movement_keys_hud.mode != 0,
+            Fps => self.video.draw_fps != 0,
+            CrosshairName => self.crosshair.names != 0.0,
+            RaceTimer => self.japro_cg.race_timer != 0,
+            RaceStart => self.japro_cg.race_start,
+            Lagometer => self.japro_cg.lagometer.mode != 0,
+            SurfaceInspector => false,
+            _ => true,
+        }
+    }
+
+    pub(in crate::app) fn current_lagometer_ui(&self) -> Option<crate::lagometer::Ui> {
+        if self.overlay != OverlayMode::HudEdit { return self.lagometer_ui.clone(); }
+        if !self.hud_edit_element_enabled(ui::HudElementId::Lagometer) { return None; }
+        let mut plot = crate::lagometer::Lagometer::default();
+        for i in 0..96 {
+            plot.add_frame_info(1000+i*20+8,1000+i*20);
+            plot.add_snapshot_info(&crate::lagometer::SnapshotInfo {
+                message_num:i, server_time:1000+i*20, command_time:1000+i*20-40,
+                ping:35+i%12, flags:0,
+            }, false, 50);
+        }
+        plot.draw(&self.japro_cg.lagometer, &crate::lagometer::DrawInput {
+            width_ratio_coef:self.width_ratio_coef(), ..Default::default()
+        })
+    }
+
     pub(in crate::app) fn ui_snapshot(&self) -> UiSnapshot {
         // Keep the retained UI snapshot bounded even after a very long console session.
         // Full-screen 4K needs far fewer than 384 atlas-text rows, so this leaves
@@ -151,6 +189,7 @@ impl App {
         };
         let prediction_debug = self.prediction_debug_ui();
         let force_select = self.force_select_ui(Instant::now());
+        let weapon_select = self.weapon_select_ui(Instant::now());
 
         let mut snapshot = UiSnapshot {
             frontend_main_scene: self.front_end && self.frontend_page == crate::app::FrontendPage::Main,
@@ -189,6 +228,7 @@ impl App {
             mini_scores: self.mini_scores_ui(),
             siege_hud: self.siege_hud_ui(),
             race_timer,
+            race_components: [self.japro_cg.race_timer != 0, self.japro_cg.race_start],
             vote_line,
             scoreboard,
             scoreboard_focus_client,
@@ -203,11 +243,15 @@ impl App {
             crosshair: self.crosshair,
             crosshair_target,
             force_select,
+            weapon_select,
+            icon_atlas_uvs: Vec::new(),
             movement_keys: self.movement_keys_hud,
             strafe_helper: self.strafe_helper,
             movement_hud: self.current_movement_hud_state(),
             speedometer,
-            lagometer: self.lagometer_ui.clone(),
+            speedometer_settings: self.japro_cg.speedometer,
+            lagometer: self.current_lagometer_ui(),
+            lagometer_settings: self.japro_cg.lagometer,
             video: self.video,
             perf: self.perf,
             threads: self.threads.clone(),
@@ -273,24 +317,30 @@ impl App {
         });
         follow_name.get_or_insert_with(|| "Followed Player".to_owned());
         vote_line.get_or_insert_with(|| "Vote (30): map ffa_bespin  Yes: 1  No: 0".to_owned());
-        if crosshair_target.name.is_none() {
+        if !self.hud_edit_element_enabled(ui::HudElementId::CrosshairName) {
+            crosshair_target.name = None;
+        } else if crosshair_target.name.is_none() {
             crosshair_target.name = Some(ui::UiCrosshairName {
                 text: "Target Player".to_owned(),
                 color: [1.0, 1.0, 1.0],
                 alpha: 1.0,
             });
         }
-        race_timer.get_or_insert_with(|| crate::japro_cg::RaceTimerUi {
-            timer_text: "0:12.3\nMax: 640\nAvg: 512".to_owned(),
+        *race_timer = (self.japro_cg.race_timer != 0 || self.japro_cg.race_start).then(|| crate::japro_cg::RaceTimerUi {
+            timer_text: if self.japro_cg.race_timer != 0 {"0:12.3\nMax: 640\nAvg: 512".to_owned()} else {String::new()},
             timer_x: self.japro_cg.race_timer_x,
             timer_y: self.japro_cg.race_timer_y,
             size: self.japro_cg.race_timer_size,
-            start_text: "Start: 420".to_owned(),
+            start_text: if self.japro_cg.race_start {"Start: 420".to_owned()} else {String::new()},
             start_x: self.japro_cg.race_start_x,
             start_y: self.japro_cg.race_start_y,
             start_color: [1.0; 3],
         });
-        speedometer.get_or_insert_with(|| crate::speedometer::preview(&self.japro_cg.speedometer));
+        let mut settings = self.japro_cg.speedometer;
+        let mut helper = self.strafe_helper.flags;
+        ui::movement_components::normalize(&mut helper, &mut settings.flags);
+        *speedometer = (settings.flags & ui::movement_components::NATIVE_READOUTS != 0)
+            .then(|| crate::speedometer::preview_with_context(&settings, self.japro_cg.lagometer, self.width_ratio_coef()));
     }
 
     pub(in crate::app) fn prediction_debug_ui(&self) -> Option<PredictionDebugUi> {

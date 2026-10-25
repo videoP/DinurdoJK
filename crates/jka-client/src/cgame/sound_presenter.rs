@@ -206,6 +206,8 @@ pub struct SoundPresenter {
     eal_map: Option<Arc<crate::eal::EalMap>>,
     eal_file: Option<String>,
     eal_enabled: bool,
+    eal_hrtf_enabled: bool,
+    eal_debug_mode: u8,
     /// Physical-device backend parked while deterministic demo export owns an
     /// offline software mixer. None during ordinary gameplay.
     offline_restore_backend: Option<AudioBackend>,
@@ -289,6 +291,8 @@ impl SoundPresenter {
             eal_map: None,
             eal_file: None,
             eal_enabled: false,
+            eal_hrtf_enabled: false,
+            eal_debug_mode: 0,
             offline_restore_backend: None,
             offline_capture_active: false,
             warnings: HashSet::new(),
@@ -455,7 +459,7 @@ impl SoundPresenter {
         if self.backend.is_none() { return; }
         let mut requests = Vec::new();
         let ambient = self.update_ambient(game, entities, followed_entity, listener_origin, server_time);
-        requests.extend(ambient.loops.into_iter().map(|looped| LoopRequest {
+        requests.extend(ambient.loops.into_iter().map(|looped| LoopRequest { emitter: looped.emitter,
             qpath: looped.qpath,
             origin: SoundOrigin::Fixed(looped.origin),
             volume: f32::from(looped.volume) / 255.0,
@@ -492,7 +496,7 @@ impl SoundPresenter {
                 }
                 if let Some(loops) = self.event_loops.get(&entity.number) {
                     let origin = SoundOrigin::Fixed(loop_origin(entity, &self.inline_model_midpoints));
-                    requests.extend(loops.iter().map(|qpath| LoopRequest { qpath: qpath.clone(), origin, volume: 1.0 }));
+                    requests.extend(loops.iter().map(|qpath| LoopRequest { emitter: (u64::from(entity.number) << 8) | 1, qpath: qpath.clone(), origin, volume: 1.0 }));
                 }
             }
             if entity.entity_type == ET_PLAYER {
@@ -982,6 +986,19 @@ impl SoundPresenter {
         }
     }
 
+    /// After a vid_restart, restore the audio scene retained by CGame without
+    /// reopening the physical sound device. AudioBackend::clear() dismantles
+    /// the native EAL wet bus in addition to voices, so it must be reattached.
+    pub fn resume_after_video_restart(&mut self, game: &ClientGameState) {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
+            backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
+            backend.set_eal_enabled(self.eal_enabled);
+            backend.set_eal_debug_mode(self.eal_debug_mode);
+        }
+        self.restart_map_music(game);
+    }
+
     pub fn set_rate(&mut self, rate: f32) { if let Some(b) = &mut self.backend { b.set_rate(rate); } }
     pub fn clear(&mut self) {
         self.event_loops.clear();
@@ -998,6 +1015,12 @@ impl SoundPresenter {
         if let Some(backend) = &mut self.backend {
             backend.update_variometer(sample, volume, style);
         }
+    }
+
+    /// TaystJK trap->S_GetVoiceVolume(entity) > 0, using the same OpenJK
+    /// channel test already used by our EV_JUMP suppression.
+    pub fn voice_active(&self, entity: u16) -> bool {
+        self.backend.as_ref().is_some_and(|backend| backend.voice_active(entity))
     }
 
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
@@ -1028,6 +1051,19 @@ impl SoundPresenter {
             backend.set_steam_audio_environmental_enabled(enabled);
         }
     }
+    pub fn set_eal_debug_mode(&mut self, mode: u8) {
+        self.eal_debug_mode = mode.min(9);
+        if let Some(backend) = &mut self.backend {
+            backend.set_eal_debug_mode(self.eal_debug_mode);
+        }
+    }
+
+    pub fn set_eal_hrtf_enabled(&mut self, enabled: bool) {
+        self.eal_hrtf_enabled = enabled;
+        if let Some(backend) = &mut self.backend {
+            backend.set_eal_hrtf_enabled(enabled);
+        }
+    }
     pub fn set_eal_enabled(&mut self, enabled: bool) {
         self.eal_enabled = enabled;
         if let Some(backend) = &mut self.backend {
@@ -1050,8 +1086,10 @@ impl SoundPresenter {
             Err(error) => eprintln!("EAL ZONES: {error}; disabled for this map"),
         }
         if let Some(backend) = &mut self.backend {
+            backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
             backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
             backend.set_eal_enabled(self.eal_enabled);
+            backend.set_eal_debug_mode(self.eal_debug_mode);
         }
     }
 
@@ -1102,8 +1140,10 @@ impl SoundPresenter {
         backend.set_music_level((music_volume * self.music_mult).clamp(0.0, 1.0));
         backend.set_rate(rate);
         backend.set_steam_audio_map(acoustic_mesh, bake);
+        backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
         backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
         backend.set_eal_enabled(self.eal_enabled);
+        backend.set_eal_debug_mode(self.eal_debug_mode);
         let info = backend.info();
         self.backend = Some(backend);
         self.music_base = music_volume;
@@ -2500,7 +2540,7 @@ fn entity_loop(
         if qpath.starts_with('*') { return None; } // custom player sounds never loop
         qpath
     };
-    Some(LoopRequest { qpath, origin: SoundOrigin::Fixed(loop_origin(entity, midpoints)), volume: 1.0 })
+    Some(LoopRequest { emitter: (u64::from(entity.number) << 8) | 2, qpath, origin: SoundOrigin::Fixed(loop_origin(entity, midpoints)), volume: 1.0 })
 }
 
 /// CG_Missile "add missile sound": the weapon's (alt) missile hum follows the missile.
@@ -2510,7 +2550,7 @@ fn missile_loop(entity: &PresentedEntity) -> Option<LoopRequest> {
     let sounds = tables::weapon_sounds(weapon);
     let alt = state.field_i32("eFlags").unwrap_or(0) & EF_ALT_FIRING != 0;
     let qpath = if alt { sounds.alt_missile } else { sounds.missile }?;
-    Some(LoopRequest { qpath: qpath.to_owned(), origin: SoundOrigin::Fixed(entity.origin), volume: 1.0 })
+    Some(LoopRequest { emitter: (u64::from(entity.number) << 8) | 3, qpath: qpath.to_owned(), origin: SoundOrigin::Fixed(entity.origin), volume: 1.0 })
 }
 
 /// TaystJK CG_Player jetpack loop sounds. The visual presenter owns the
@@ -2535,13 +2575,13 @@ fn jetpack_loops(
         SoundOrigin::Fixed(entity.origin)
     };
     if game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES != 0 {
-        out.push(LoopRequest {
+        out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 4,
             qpath: "sound/effects/thrust.wav".to_owned(),
             origin,
             volume: 1.0,
         });
     } else if e_flags & EF_JETPACK_FLAMING != 0 {
-        out.push(LoopRequest {
+        out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 5,
             qpath: "sound/effects/fire_lp".to_owned(),
             origin,
             volume: 1.0,
@@ -2549,7 +2589,7 @@ fn jetpack_loops(
     }
     // TaystJK adds JETHOVER for both the Boba and WTTRIBES branches while the
     // pack is active.
-    out.push(LoopRequest {
+    out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 6,
         qpath: "sound/boba/JETHOVER".to_owned(),
         origin,
         volume: 1.0,
@@ -2588,14 +2628,14 @@ fn saber_hum_loops(
     let mut first = None;
     if state.field_i32("saberInFlight").unwrap_or(0) == 0 {
         let qpath = sound_loop(&info.saber_name);
-        out.push(LoopRequest { qpath: qpath.clone(), origin, volume: 1.0 });
+        out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 7, qpath: qpath.clone(), origin, volume: 1.0 });
         first = Some(qpath);
     }
     // A dual saber's second blade is off at saberHolstered 1.
     if !info.saber2_name.is_empty() && !saber_name_is_removed(&info.saber2_name) && holstered == 0 {
         let qpath = sound_loop(&info.saber2_name);
         if first.as_deref() != Some(qpath.as_str()) {
-            out.push(LoopRequest { qpath, origin, volume: 1.0 });
+            out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 8, qpath, origin, volume: 1.0 });
         }
     }
 }

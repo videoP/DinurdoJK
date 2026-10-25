@@ -74,6 +74,11 @@ pub(crate) struct MenuStage {
     pub player_yaw: f32,
     /// `anims.h` name, e.g. `BOTH_STAND1`, or `BOTH_SIT1` for jaPRO's `/amsit`.
     pub player_anim: &'static str,
+    /// Stage the foreground player at all.
+    pub player: bool,
+    /// The slow idle drift of the camera. Off where the main page pins
+    /// screen-space elements to scene features (the ctf4 TV).
+    pub camera_sway: bool,
 }
 
 const DEFAULT_STAGE: MenuStage = MenuStage {
@@ -86,10 +91,34 @@ const DEFAULT_STAGE: MenuStage = MenuStage {
     player_feet: [-317.0, -406.0, 230.0],
     player_yaw: 0.0,
     player_anim: "BOTH_STAND1",
+    player: true,
+    camera_sway: true,
 };
 
+/// `mp/ctf4`: looking down the street at the wall screen on the right, which
+/// the main page covers with its CRT. Camera = `viewpos` (3789 -2177 -240) 325, pitch -5.
+const CTF4_STAGE: MenuStage = MenuStage {
+    camera: [3789.0, -2177.0, -240.0],
+    camera_yaw: 325.0,
+    camera_pitch: -5.0,
+    player_feet: [0.0; 3],
+    player_yaw: 0.0,
+    player_anim: "BOTH_STAND1",
+    player: false,
+    camera_sway: false,
+};
+
+fn map_key(map: &str) -> String {
+    let map = map.trim().replace('\\', "/").to_ascii_lowercase();
+    let map = map.strip_prefix("maps/").unwrap_or(&map);
+    map.strip_suffix(".bsp").unwrap_or(map).to_owned()
+}
+
 pub(crate) fn menu_stage(map: &str) -> Option<MenuStage> {
-    is_duel9(map).then_some(DEFAULT_STAGE)
+    if is_duel9(map) {
+        return Some(DEFAULT_STAGE);
+    }
+    (map_key(map) == "mp/ctf4").then_some(CTF4_STAGE)
 }
 
 const WATER_HEIGHT: f32 = 186.0;
@@ -346,6 +375,7 @@ fn scene_from_ent(
                 }
             });
             runners.push(MapFxRunner {
+                bake_static: false,
                 source_entity_index: usize::MAX,
                 effect: effect.replace('\\', "/"),
                 origin,
@@ -404,6 +434,7 @@ pub(in crate::scene) fn apply_scene(
     }
     if runners.is_empty() {
         fx_runners.extend(default_fx_placements().into_iter().map(|fx| MapFxRunner {
+                bake_static: false,
             source_entity_index: usize::MAX,
             effect: fx.effect.to_owned(),
             origin: fx.origin,

@@ -52,6 +52,8 @@ impl App {
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
         self.game_session = None;
+        self.weapon_select_until = None;
+        self.force_select_until = None;
         self.reset_world_effects();
         self.live_without_world = false;
         self.demo_without_world = false;
@@ -144,6 +146,8 @@ impl App {
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
         self.game_session = None;
+        self.weapon_select_until = None;
+        self.force_select_until = None;
         self.reset_world_effects();
         self.live_without_world = false;
         self.demo_without_world = false;

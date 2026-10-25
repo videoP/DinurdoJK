@@ -224,14 +224,15 @@ impl Renderer {
         let device_started = Instant::now();
         // Diagnostic A/B switch: compare allocator policies with the same binary
         // and settings, without keeping a second executable or build cache.
-        let memory_hints = if std::env::var("JKA_GPU_MEMORY_HINTS").as_deref() == Ok("performance") {
-            wgpu::MemoryHints::Performance
-        } else {
-            // Smaller blocks reduce stranded reservations after map changes.
-            // Resource sizes and rendering quality are unchanged.
+        let memory_hints = if std::env::var("JKA_GPU_MEMORY_HINTS").as_deref() == Ok("compact") {
+            // Smaller blocks reduce stranded reservations after map changes,
+            // but measured +260..330 ms of texture creation per map load on
+            // ffa3 (RTX 3060), so they are opt-in.
             wgpu::MemoryHints::Manual {
                 suballocated_device_memory_block_size: (4 << 20)..(16 << 20),
             }
+        } else {
+            wgpu::MemoryHints::Performance
         };
         println!("GPU memory allocator policy: {memory_hints:?}");
         let (device, queue) = adapter
@@ -534,6 +535,8 @@ impl Renderer {
                 sampler_entry(31),
                 uniform_entry(32, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 uniform_entry(33, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry { binding: 34, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             ],
         });
         // Exact descriptor layouts used by the known-fast renderer. Advanced
@@ -575,6 +578,8 @@ impl Renderer {
                     sampler_entry(31),
                     uniform_entry(32, wgpu::ShaderStages::VERTEX_FRAGMENT),
                     uniform_entry(33, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry { binding: 34, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
                             uniform_entry(
                         21,
                         wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -2514,6 +2519,7 @@ impl Renderer {
             asset_preview_viewport: None,
             asset_preview_background: None,
             menu_backdrop: None,
+            neon_menu: Default::default(),
             world: None,
             world_videos: Vec::new(),
             dynamic_model_renderer,
@@ -2723,6 +2729,11 @@ impl Renderer {
             dynamic_light_brightness: 1.0,
             emissive_area_lights_enabled: false,
             shader_light_promotion_enabled: false,
+            baked_local_lights: false,
+            baked_local_sources: crate::renderer::lighting::lightmap_local::DEFAULT_SOURCES,
+            baked_local_shadows: false,
+            baked_local_had_casters: false,
+            lamp_shadow_ab: 0,
             shader_light_promotion_mask: crate::materials::SHADER_LIGHT_ALL,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,

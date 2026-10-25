@@ -68,6 +68,7 @@ impl App {
             self.forced_player_models.clone(),
         );
         session.water_wake_mode = self.video.water_wake;
+        session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
         session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
         session
@@ -77,6 +78,7 @@ impl App {
             .weapon_fx
             .set_saber_impact_fx(self.video.saber_impact_fx);
         session.weapon_fx.set_saber_marks(self.video.saber_marks);
+        session.weapon_fx.set_mark_count(self.video.mark_count as usize);
         session
             .weapon_fx
             .set_collision_world(self.map_collision.clone());
@@ -87,6 +89,9 @@ impl App {
             .entity_presenter
             .set_static_models(Arc::clone(&self.map_static_models));
         session.entity_presenter.set_static_md3_instances(self.video.static_md3_instances);
+        session.entity_presenter.set_static_md3_bvh(self.video.static_md3_bvh);
+        session.entity_presenter.set_occlusion_stats(self.video.occlusion_stats);
+        session.weapon_fx.set_runner_culling(self.video.fx_occlusion == 1);
         session
             .player_presenter
             .set_collision_world(self.map_collision.clone());
@@ -131,7 +136,9 @@ impl App {
                     self.audio.steam_audio_environmental,
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
+                sound.set_eal_hrtf_enabled(self.audio.eal_hrtf);
                 sound.set_eal_enabled(self.audio.eal_enabled);
+                sound.set_eal_debug_mode(self.audio.eal_debug_mode);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
@@ -189,6 +196,12 @@ impl App {
         session.live = true;
         session.local = true;
         session.map_name = Some(server.map_name().to_owned());
+        // The generic session constructor runs before the local server's map
+        // name is available. Initialize authored acoustics now, rather than
+        // leaving a local game with an empty EAL state until the next map load.
+        if let Some(sound) = session.sound_presenter.as_mut() {
+            sound.set_eal_map(server.map_name());
+        }
         session
             .client_game
             .reset_gamestate(server.configstrings(), 0);
@@ -264,7 +277,9 @@ impl App {
                     self.audio.steam_audio_environmental,
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
+                sound.set_eal_hrtf_enabled(self.audio.eal_hrtf);
                 sound.set_eal_enabled(self.audio.eal_enabled);
+                sound.set_eal_debug_mode(self.audio.eal_debug_mode);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);

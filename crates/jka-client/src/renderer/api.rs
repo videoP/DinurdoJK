@@ -1149,6 +1149,8 @@ pub enum RenderCommand {
     },
     SetEmissiveAreaLights(bool),
     SetShaderLightPromotion { enabled: bool, mask: u32 },
+    SetBakedLocalLights { enabled: bool, sources: u32 },
+    SetLampShadowAB(u8),
     SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
     SetLocalLightShadows(bool),
@@ -1191,8 +1193,12 @@ pub enum RenderCommand {
     HybridWaveDump { path: PathBuf },
     /// One-shot scene-only readback, before egui/HUD layers.
     CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
-    CaptureVideoFrame { frame_index: u64, depth: bool },
+    CaptureVideoFrame { frame_index: u64, depth: bool, alpha: bool },
     SetUi(UiSnapshot),
+    /// The renderer-drawn main page; `None` when it is not showing.
+    SetNeonMenu(Option<crate::neon_menu::MenuFrame>),
+    /// Decoded scene still; uploaded on render thread and composited beneath neon.
+    SetNeonMenuCache(Option<egui::ColorImage>),
     /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
     SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>, crate::extensions::NativeHudMask, Vec<String>),
     SetTransientUi {
@@ -1203,6 +1209,7 @@ pub enum RenderCommand {
         prediction_debug: Option<ui::PredictionDebugUi>,
         crosshair_target: ui::UiCrosshairTarget,
         force_select: Option<ui::UiForceSelect>,
+        weapon_select: Option<ui::UiWeaponSelect>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
@@ -1247,6 +1254,8 @@ pub enum RenderCommand {
     SetAssetPreviewViewport(Option<[u32; 4]>),
     /// Decoded installed-map levelshot, uploaded once when selected.
     SetAssetPreviewBackground(Option<([u32;2],Vec<u8>)>),
+    /// Preview-only transparency indicator; excluded from clean captures.
+    SetAssetPreviewCheckerboard,
     UnloadMap,
     /// Grow private inline render slots from the prepared CPU cache while the
     /// current CGame/collision session continues unchanged.

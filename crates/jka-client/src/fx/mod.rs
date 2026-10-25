@@ -92,6 +92,7 @@ pub fn lod_density(px: f32) -> f32 {
     FLOOR + (1.0 - FLOOR) * t * t * (3.0 - 2.0 * t)
 }
 
+pub mod runner_cull;
 pub mod draw;
 pub mod gpu_sparks;
 pub mod gp2;

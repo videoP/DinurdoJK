@@ -48,7 +48,7 @@ impl Renderer {
     /// Whether the sky-extension ocean (mesh, analytic far plane, optics, fog,
     /// submerged classification) is active for `slot` from the current camera.
     pub(in crate::renderer) fn ocean_extension_active(&self, slot: usize) -> bool {
-        self.ocean_settings.backend != 3 && self.ocean_sky_extend && slot < 8 && self.ocean_extension_mask >> slot & 1 != 0
+        self.ocean_sky_extend && slot < 8 && self.ocean_extension_mask >> slot & 1 != 0
     }
 
     /// The extension only exists where the camera's PVS can see the pool's
@@ -287,6 +287,7 @@ impl Renderer {
         settings: crate::ocean::OceanSettings,
     ) {
         let mut settings = settings.sanitize().resolved_for_gpu();
+        let had_lake_planar = self.lake_planar_enabled();
         // Atmospheric wind is renderer-global. Ocean-specific settings may
         // arrive through their legacy API, but they cannot fork the wind field.
         settings.wind = self.weather_wind;
@@ -319,6 +320,11 @@ impl Renderer {
         }
         let descriptors = self.authored_ocean_definitions.clone();
         self.set_authored_oceans(descriptors);
+        if had_lake_planar != self.lake_planar_enabled() {
+            self.rebuild_planar_reflection_resources();
+            self.rebuild_frame_plan();
+            self.activate_world_pipeline_variant();
+        }
     }
 
     pub(in crate::renderer) fn set_authored_oceans(

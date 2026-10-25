@@ -251,6 +251,9 @@ impl Renderer {
                 );
             }
         }
+        if let Some(world) = &mut self.world {
+            crate::renderer::visibility::pvs::refresh_inline_pvs(world, self.pvs_mode, area_mask);
+        }
         if defer_camera_write {
             self.queue
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -308,7 +311,7 @@ impl Renderer {
         // A transmissive snapshot needs a sampleable scene attachment. The
         // swapchain view is renderable but is not guaranteed TEXTURE_BINDING.
         let use_gamma_post = self.frame_plan.use_post || glass_capture_needed;
-        let menu_backdrop_active = self.menu_backdrop_requested() && self.menu_backdrop.is_some();
+        let menu_backdrop_active = self.menu_backdrop_requested() && self.menu_backdrop_ready();
         let crt_active = self.crt_scope != ui::CrtScope::Off;
         if crt_active {
             self.ensure_crt_resources();
@@ -628,7 +631,7 @@ impl Renderer {
                     &self.ocean_inert_bind_group, None,
                 );
                 self.glass_world.as_ref().expect("glass pipeline").capture_geometry(
-                    &mut encoder, &self.ocean_optics, &self.camera_bind_group, world,
+                    &self.queue, &mut encoder, &self.ocean_optics, &self.camera_bind_group, world,
                     &active.batches, &active.indices, &deferred_transparent,
                     &self.dynamic_model_renderer, false,
                 );
@@ -729,7 +732,8 @@ impl Renderer {
                                 && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                                 && (!batch.is_inline_entity || self.draw_inline_models)
                                 && !hidden_inline_batch(batch, &world.inline_models)
-                                && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
+                                // Match the shaded pass for every replaced water stage.
+                                && !ocean_suppresses_batch(self.ocean_enabled, batch)
                                 && batch.source.pipeline.class != DrawClass::Sky
                                 && aabb_intersects_clip_frustum(
                                     batch.bounds_min,
@@ -1181,7 +1185,7 @@ impl Renderer {
             &frame_view
         };
         if menu_backdrop_active {
-            self.submit_menu_backdrop(ui_composite_target);
+            self.submit_menu_backdrop(ui_composite_target, false);
         }
         self.submit_egui(ui_composite_target);
         let late_native_ui = !native_ui_in_main

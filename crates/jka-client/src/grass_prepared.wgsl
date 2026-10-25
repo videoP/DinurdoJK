@@ -168,7 +168,7 @@ fn sample_cascade_shadow_bevy(world_position: vec3<f32>, normal: vec3<f32>, casc
     let ndc = clip.xyz / clip.w;
     if (any(ndc.xy < vec2<f32>(-1.0)) || ndc.z < 0.0 || any(ndc > vec3<f32>(1.0))) { return 1.0; }
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    return sample_shadow_map_bevy_castano(uv, ndc.z, cascade);
+    return min(sample_shadow_map_bevy_castano(uv, ndc.z, cascade), sample_shadow_map_bevy_castano(uv, ndc.z, cascade+5i));
 }
 
 fn shader_sun_sky_admission(world_position: vec3<f32>, cascade: i32) -> f32 {
@@ -457,18 +457,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         * smoothstep(0.66, 0.91, input.blade_random * 0.55 + detail.b * 0.45);
     albedo = mix(albedo, albedo * vec3<f32>(1.06, 1.01, 0.82), dry_tip * 0.07);
 
-    // At distance, converge the blade's *chromaticity* toward the average opaque
-    // base texture of the BSP material that emitted it. Baked lighting is applied
-    // later to both, so sparse far LOD grass visually dissolves into the ground
-    // instead of forming a differently colored layer.
+    // Rebase the complete blade material onto the ground's linear albedo.
+    // Multiplication keeps fibres, mottling, root/tip contrast and per-blade
+    // color/value variation; replacing albedo here would flatten that detail.
+    // Match the same ground target at every distance. Normalize against the
+    // material's average before detail, accounting for its existing distance
+    // flattening so that fading root/tip contrast does not shift average color.
     if (input.ground_tint.a > 0.5) {
-        let luma_weights = vec3<f32>(0.2126, 0.7152, 0.0722);
-        let albedo_luma = max(dot(albedo, luma_weights), 0.025);
-        let ground_luma = max(dot(input.ground_tint.rgb, luma_weights), 0.025);
-        let ground_chroma = input.ground_tint.rgb * (albedo_luma / ground_luma);
-        let normalized_ground = mix(ground_chroma, input.ground_tint.rgb, 0.30);
-        let ground_match = smoothstep(48.0, 155.0, input.camera_distance_m) * 0.88;
-        albedo = mix(albedo, normalized_ground, ground_match);
+        // Integral over blade height of mix(base, tip, h^4) * (0.1 + 0.9*h^2).
+        let near_reference = grass.base_color.rgb * 0.4
+            + (grass.tip_color.rgb - grass.base_color.rgb) * (0.1 / 5.0 + 0.9 / 7.0);
+        let far_reference = mix(grass.base_color.rgb, grass.tip_color.rgb, 0.5) * 0.5;
+        let reference_albedo = mix(far_reference, near_reference, fog_factor);
+        albedo *= input.ground_tint.rgb / max(reference_albedo, vec3<f32>(0.001));
     }
 
     let wetness = clamp(input.baked_light.a, 0.0, 1.0);

@@ -29,7 +29,7 @@ impl App {
         theme::page_title(
             ui,
             "AUDIO",
-            "OpenJK mixer levels, Steam Audio spatial acoustics and native output diagnostics.",
+            "Game audio levels, EAL/OpenAL map acoustics, Steam Audio and output diagnostics.",
         );
 
         egui::ScrollArea::vertical()
@@ -277,10 +277,93 @@ impl App {
             &[(0, "Off"), (1, "Set 1"), (2, "Set 2"), (3, "Set 3"), (4, "Set 4"), (5, "Saber plain"), (6, "Saber any")],
         );
 
+        theme::section(ui, "MAP ACOUSTICS · EAL / OPENAL SOFT", "Map-authored .eal environmental effects. Independent of Steam Audio; changes are saved.");
+        theme::row(
+            ui,
+            "EAL map audio",
+            "s_eal. Enable authored reverb, frequency filtering, diffraction and room directionality from the map's .eal data. Works independently of Steam Audio. Maps without EAL data keep their normal sound. No sound restart is required.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.audio.eal_enabled) {
+                    let _ = self.set_console_cvar("s_eal", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        theme::row(
+            ui,
+            "OpenAL headphone HRTF",
+            "s_ealHrtf. Headphone binaural positioning for EAL/OpenAL sources. Independent of s_steamAudio and s_steamAudioBinaural; only applies when EAL map acoustics are active. Changing it live reconfigures OpenAL Soft.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.audio.eal_hrtf) {
+                    let _ = self.set_console_cvar("s_ealHrtf", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+        let info = self
+            .game_session
+            .as_ref()
+            .and_then(|playback| playback.sound_presenter.as_ref())
+            .and_then(|sound| sound.info());
+        theme::row(
+            ui,
+            "EAL audio status",
+            "Shows whether the current map's authored acoustics is running, unavailable, or has no EAL data.",
+            theme::Reset::None,
+            |ui| {
+                let (state, color) = if !self.audio.eal_enabled {
+                    ("Off".to_owned(), theme::TEXT_FAINT)
+                } else if let Some(info) = &info {
+                    if let Some(error) = &info.eal_effects_error {
+                        (format!("Unavailable: {error}"), theme::WARNING)
+                    } else if let Some(path) = &info.eal_file {
+                        (format!("{}: {} | {}", if info.eal_effects_active { "Active" } else { "Inactive" },
+                            path, info.eal_environment.as_deref().unwrap_or("waiting for listener position")), theme::TEXT)
+                    } else {
+                        ("No EAL data loaded for this map".to_owned(), theme::TEXT_DIM)
+                    }
+                } else {
+                    ("Enabled: load a map to hear its acoustics".to_owned(), theme::TEXT_DIM)
+                };
+                theme::hint(ui, &state, color);
+            },
+        );
+
+        theme::row(
+            ui,
+            "OpenAL HRTF status",
+            "Actual EAL HRTF processing state as reported by the OpenAL effects worker.",
+            theme::Reset::None,
+            |ui| {
+                let (state, color) = if !self.audio.eal_enabled {
+                    ("EAL disabled", theme::TEXT_FAINT)
+                } else if let Some(info) = &info {
+                    if info.eal_effects_error.is_some() {
+                        ("Unavailable", theme::WARNING)
+                    } else if info.eal_hrtf {
+                        ("Active", theme::TEXT)
+                    } else if !self.audio.eal_hrtf {
+                        ("Off", theme::TEXT_DIM)
+                    } else if info.eal_effects_active {
+                        (match info.eal_hrtf_status { 2 => "Denied by device", 5 => "Unsupported output format", _ => "Requested; device HRTF is off" }, theme::WARNING)
+                    } else if info.eal_file.is_none() {
+                        ("No EAL map loaded", theme::TEXT_DIM)
+                    } else {
+                        ("Requested · awaiting worker", theme::TEXT_DIM)
+                    }
+                } else if !self.audio.eal_hrtf {
+                    ("Off", theme::TEXT_DIM)
+                } else {
+                    ("Waiting for map", theme::TEXT_DIM)
+                };
+                theme::hint(ui, state, color);
+            },
+        );
+
         theme::section(
             ui,
-            "SPATIAL AUDIO",
-            "Valve Steam Audio is optional. When disabled, DinurdoJK keeps the legacy OpenJK-compatible spatial mixer and skips acoustic BSP/bake preparation entirely.",
+            "STEAM AUDIO",
+            "Optional headphone spatialization, material occlusion and transmission for supported world sounds. When off, no Steam Audio acoustic geometry or bake work is prepared on subsequent map loads.",
         );
         theme::row(
             ui,
@@ -298,7 +381,7 @@ impl App {
         ui.add_enabled_ui(steam_audio_enabled, |ui| {
             theme::row(
                 ui,
-                "Binaural HRTF",
+                "Steam binaural HRTF",
                 "s_steamAudioBinaural. Uses Steam Audio HRTF rendering for positional sounds. This is a live setting and does not require a map reload.",
                 theme::Reset::None,
                 |ui| {
@@ -321,7 +404,7 @@ impl App {
         ui.add_enabled_ui(steam_audio_enabled, |ui| {
             theme::row(
                 ui,
-                "Environmental Acoustics",
+                "Occlusion / transmission",
                 "s_steamAudioEnvironmental. Live Steam Audio direct-path acoustics for positional world sounds: wall occlusion plus frequency-dependent material transmission. Simulation runs on a dedicated worker at a bounded rate; the audio callback only applies the latest result. No map reload or rebake is required once the map's Steam Audio scene is ready.",
                 theme::Reset::None,
                 |ui| {
@@ -337,14 +420,9 @@ impl App {
 
         theme::section(
             ui,
-            "OUTPUT",
-            "The active device opens with the CGame/demo sound presenter.",
+            "OUTPUT & DIAGNOSTICS",
+            "Output format and runtime state of the audio subsystems.",
         );
-        let info = self
-            .game_session
-            .as_ref()
-            .and_then(|playback| playback.sound_presenter.as_ref())
-            .and_then(|sound| sound.info());
         if let Some(info) = info {
             theme::row(
                 ui,
@@ -470,7 +548,7 @@ impl App {
             );
             theme::row(
                 ui,
-                "Binaural HRTF",
+                "Steam HRTF status",
                 "Live Steam Audio headphone positioning for positional sound sources.",
                 theme::Reset::None,
                 |ui| {

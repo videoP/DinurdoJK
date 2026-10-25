@@ -25,6 +25,9 @@ impl Renderer {
         let needs_key_atlas = !self.ui_keys_loaded && ui_state.movement_keys.mode != 0;
         // The app is not the owner of pipeline jobs; preserve the render-thread
         // status when a gameplay/menu UI snapshot arrives between samples.
+        // The app never owns GPU atlas placement. Do not overwrite the UV
+        // lookup after a scroll/HUD snapshot arrives on the render thread.
+        ui_state.icon_atlas_uvs.clone_from(&self.ui_state.icon_atlas_uvs);
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
         self.ui_state = ui_state;
@@ -147,7 +150,8 @@ impl Renderer {
     }
 
     /// Bind the icon atlas the first time a draw list wants it: the lagometer's
-    /// own frame / phone jack, the old speed graph's frame, or an image crosshair.
+    /// own frame / phone jack, the old speed graph's frame, an image crosshair,
+    /// or a weapon / Force selection strip.
     pub(in crate::renderer) fn load_ui_icons_if_needed(&mut self) {
         if self.ui_icons_loaded {
             return;
@@ -163,13 +167,21 @@ impl Renderer {
                 .as_ref()
                 .is_some_and(|ui| !ui.graph_pics.is_empty())
             || self.ui_state.crosshair.image != 0
-            || self.ui_state.force_select.is_some();
+            || self.ui_state.force_select.is_some()
+            || self.ui_state.weapon_select.is_some();
         if !wanted {
             return;
         }
         let started = Instant::now();
-        let data = load_ui_icon_atlas(&self.base, self.detail_texture_game.as_deref());
+        let (data, uvs) = load_ui_icon_atlas(
+            &self.base,
+            self.detail_texture_game.as_deref(),
+            self.device.limits().max_texture_dimension_2d,
+        );
         self._ui_icons = upload_texture(&self.device, &self.queue, &data);
+        // Keep UV metadata and the uploaded pixels in sync. Incoming app
+        // snapshots preserve this render-thread-owned lookup in set_ui().
+        self.ui_state.icon_atlas_uvs = uvs;
         self.ui_icons_loaded = true;
         self.rebuild_ui_bind_group();
         rverbose!(
@@ -533,6 +545,7 @@ impl Renderer {
         prediction_debug: Option<ui::PredictionDebugUi>,
         crosshair_target: ui::UiCrosshairTarget,
         force_select: Option<ui::UiForceSelect>,
+        weapon_select: Option<ui::UiWeaponSelect>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
@@ -551,6 +564,7 @@ impl Renderer {
         self.ui_state.prediction_debug = prediction_debug;
         self.ui_state.crosshair_target = crosshair_target;
         self.ui_state.force_select = force_select;
+        self.ui_state.weapon_select = weapon_select;
         self.ui_state.follow_name = follow_name;
         self.ui_state.game_timer = game_timer;
         self.ui_state.mini_scores = mini_scores;
@@ -673,12 +687,21 @@ impl Renderer {
     pub(in crate::renderer) fn menu_backdrop_requested(&self) -> bool {
         // The frontend Main scene is artwork, not a page that needs a blurred
         // and desaturated background. Avoid both the grading and its extra pass.
-        !self.ui_state.frontend_main_scene
-            && !self.ui_state.video.skip_ui
-            && self.ui_state.loading.is_none()
-            && (self.ui_state.mode == ui::OverlayMode::Game
-                || (self.ui_state.mode == ui::OverlayMode::Video
-                    && self.ui_state.setup_selected != 1))
+        // It does use the same lazily allocated scene capture as the source of
+        // the renderer-drawn main page (neon_menu.rs).
+        self.neon_menu_wanted()
+            || (!self.ui_state.frontend_main_scene
+                && !self.ui_state.video.skip_ui
+                && self.ui_state.loading.is_none()
+                && (self.ui_state.mode == ui::OverlayMode::Game
+                    || (self.ui_state.mode == ui::OverlayMode::Video
+                        && self.ui_state.setup_selected != 1)))
+    }
+
+    /// The scene may render into the backdrop source this frame. The main page
+    /// waits for its own pipelines too, rendering straight to the frame until then.
+    pub(in crate::renderer) fn menu_backdrop_ready(&self) -> bool {
+        self.menu_backdrop.is_some() && (!self.neon_menu_wanted() || self.neon_menu_ready())
     }
 
     pub(in crate::renderer) fn ensure_menu_backdrop_resources(&mut self) {
@@ -706,7 +729,12 @@ impl Renderer {
         });
     }
 
-    pub(in crate::renderer) fn submit_menu_backdrop(&self, frame_view: &wgpu::TextureView) {
+    /// `plain_scene`: the frame of a cached-scene capture, which must not
+    /// contain the main page's overlays.
+    pub(in crate::renderer) fn submit_menu_backdrop(&self, frame_view: &wgpu::TextureView, plain_scene: bool) {
+        if self.neon_menu_wanted() && self.submit_neon_menu(frame_view, plain_scene) {
+            return;
+        }
         let Some(backdrop) = &self.menu_backdrop else {
             return;
         };
@@ -1144,66 +1172,221 @@ impl Renderer {
     }
 }
 
-/// Packs the stock 2D images in `ui::ICON_NAMES` (the lagometer's graph frame and phone
-/// jack, then the `crosshaira..j` image crosshairs) into one row of `ui::ICON_CELL`
-/// squares. The retail images are 32x32, so they are resampled up to the cell; a missing
-/// image (`crosshairj` needs japro-assets.pk3) leaves its cell transparent.
-pub(in crate::renderer) fn load_ui_icon_atlas(base: &Path, game: Option<&Path>) -> TextureData {
-    let cell = ui::ICON_CELL;
-    let (width, height) = (ui::ICON_NAMES.len() as u32 * cell, cell);
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
+/// Place images on shelves, largest-first. Each icon gets a one-texel
+/// extruded border, which gives linear filtering the same edge clamp as a
+/// standalone GL texture. No fixed 64/256 cell or resampling is involved.
+fn pack_native_icon_shelves(
+    images: &[Option<image::RgbaImage>],
+    width: u32,
+    max_height: u32,
+) -> Option<(u32, Vec<(u32, u32)>)> {
+    let mut order: Vec<usize> = (0..images.len())
+        .filter(|&i| images[i].is_some())
+        .collect();
+    order.sort_unstable_by_key(|&i| {
+        let im = images[i].as_ref().unwrap();
+        (std::cmp::Reverse(im.height()), std::cmp::Reverse(im.width()), i)
+    });
+    let mut coords = vec![(0, 0); images.len()];
+    let mut x: u32 = 2;
+    let mut y: u32 = 2;
+    let mut row_height: u32 = 0;
+    for i in order {
+        let image = images[i].as_ref().unwrap();
+        let (rw, rh) = (image.width() + 2, image.height() + 2);
+        if rw + 4 > width || rh + 4 > max_height { return None; }
+        if x + rw + 2 > width {
+            y += row_height;
+            x = 2;
+            row_height = 0;
+        }
+        if y + rh + 2 > max_height { return None; }
+        coords[i] = (x + 1, y + 1);
+        x += rw;
+        row_height = row_height.max(rh);
+    }
+    Some(((y + row_height + 2).max(4), coords))
+}
 
+/// Keep every HUD icon at its decoded native width and height. Only shrink an
+/// exceptional oversized image when GPU texture-size or memory limits force it;
+/// unlike the old fixed-cell atlas, ordinary 32px, 128px, 512px and HD art
+/// are copied byte-for-byte into this texture. Returns both pixels and per-icon
+/// UVs so weapons, Force icons, crosshairs and the lagometer share one binding.
+fn assemble_native_icon_atlas(
+    mut images: Vec<Option<image::RgbaImage>>,
+    max_texture_size: u32,
+) -> (TextureData, Vec<([f32; 2], [f32; 2])>) {
+    // Cap to a broadly supported size and to 128MiB of uncompressed atlas
+    // memory. Individual images remain native unless packing cannot fit.
+    let limit = max_texture_size.min(8192).max(8);
+    const MAX_PIXELS: u64 = 32 * 1024 * 1024;
+    let mut reductions = 0;
+    for (i, opt) in images.iter_mut().enumerate() {
+        let Some(image) = opt.as_mut() else { continue; };
+        let (w, h) = image.dimensions();
+        if w + 6 <= limit && h + 6 <= limit { continue; }
+        let factor = ((limit - 6) as f64 / w as f64)
+            .min((limit - 6) as f64 / h as f64)
+            .min(1.0);
+        let (nw, nh) = (((w as f64 * factor).floor() as u32).max(1),
+                        ((h as f64 * factor).floor() as u32).max(1));
+        eprintln!("UI icon {}: {}x{} exceeds GPU atlas limit, shrinking to {}x{}", i, w, h, nw, nh);
+        *image = image::imageops::resize(&*image, nw, nh, image::imageops::FilterType::Lanczos3);
+        reductions += 1;
+    }
+    let (width, height, positions) = loop {
+        let image_area = images.iter().flatten().map(|im| {
+            u64::from(im.width() + 2) * u64::from(im.height() + 2)
+        }).sum::<u64>();
+        let widest = images.iter().flatten().map(|im| im.width() + 6).max().unwrap_or(4);
+        let desired = (image_area as f64).sqrt().ceil() as u32;
+        let mut width = desired.max(widest).max(4).next_power_of_two().min(limit);
+        let mut packed = None;
+        loop {
+            if let Some((height, positions)) = pack_native_icon_shelves(&images, width, limit) {
+                if u64::from(width) * u64::from(height) <= MAX_PIXELS {
+                    packed = Some((width, height, positions));
+                    break;
+                }
+            }
+            if width == limit { break; }
+            width = width.saturating_mul(2).min(limit);
+        }
+        if let Some(layout) = packed { break layout; }
+        // Real texture constraints, not an arbitrary icon-size target, are the
+        // only reason we ever resample. Reduce the largest icon first.
+        let Some((i, _)) = images.iter().enumerate().filter_map(|(i, im)| {
+            im.as_ref().map(|im| (i, u64::from(im.width()) * u64::from(im.height())))
+        }).filter(|&(_, area)| area > 1).max_by_key(|&(_, area)| area) else {
+            eprintln!("UI icon atlas: cannot pack icons within texture limits; using transparent placeholder");
+            break (4, 4, vec![(0, 0); images.len()]);
+        };
+        let im = images[i].as_ref().unwrap();
+        let (w, h) = im.dimensions();
+        let (nw, nh) = ((w * 3 / 4).max(1), (h * 3 / 4).max(1));
+        eprintln!("UI icon {}: atlas capacity exceeded, shrinking {}x{} to {}x{}", i, w, h, nw, nh);
+        images[i] = Some(image::imageops::resize(im, nw, nh, image::imageops::FilterType::Lanczos3));
+        reductions += 1;
+    };
+
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    let mut uvs = vec![([0.5 / width as f32, 0.5 / height as f32],
+                        [0.5 / width as f32, 0.5 / height as f32]); images.len()];
+    for (i, opt) in images.iter().enumerate() {
+        let Some(im) = opt.as_ref() else { continue; };
+        let (x, y) = positions[i];
+        if x == 0 || y == 0 { continue; }
+        let (w, h) = im.dimensions();
+        // Duplicate the outside texel into a one-pixel gutter on all four
+        // sides. Bilinear filtering can't bleed from neighbouring artwork.
+        for dy in 0..(h + 2) {
+            for dx in 0..(w + 2) {
+                let src_x = dx.saturating_sub(1).min(w - 1);
+                let src_y = dy.saturating_sub(1).min(h - 1);
+                let px = im.get_pixel(src_x, src_y);
+                let offset = (((y - 1 + dy) * width + (x - 1 + dx)) * 4) as usize;
+                rgba[offset..offset + 4].copy_from_slice(&px.0);
+            }
+        }
+        uvs[i] = ([x as f32 / width as f32, y as f32 / height as f32],
+                  [(x + w) as f32 / width as f32, (y + h) as f32 / height as f32]);
+    }
+    rverbose!(1, "UI icon atlas: {}x{}, {} native-size icons, {} GPU-limit reductions",
+        width, height, images.iter().flatten().count(), reductions);
+    (TextureData {
+        label: "JKA UI native-resolution icon atlas".into(),
+        source: None, width, height, rgba, rgba16f: None,
+        mip_level_count: 1, clamp: true, srgb: true,
+    }, uvs)
+}
+
+pub(in crate::renderer) fn load_ui_icon_atlas(
+    base: &Path,
+    game: Option<&Path>,
+    max_texture_size: u32,
+) -> (TextureData, Vec<([f32; 2], [f32; 2])>) {
+    let mut images = vec![None; ui::ICON_NAMES.len()];
     match AssetSearchPath::open_game(base, game) {
         Ok(mut assets) => {
             for (index, name) in ui::ICON_NAMES.iter().enumerate() {
-                let Some(image) = try_load_texture_asset_from_search_path(
-                    &mut assets,
-                    name,
-                    true,
-                    false,
-                    true,
-                    "UI icon",
-                ) else {
-                    eprintln!("UI icon {name}: not found");
-                    continue;
-                };
-                let (source_w, source_h) = (image.width, image.height);
-                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba)
-                else {
-                    eprintln!("UI icon {name}: unexpected pixel format");
-                    continue;
-                };
-                let cell_image = if source_w == cell && source_h == cell {
-                    source
+                if name.is_empty() { continue; }
+                let requested = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF).contains(&index) {
+                    format!("{name}_na")
                 } else {
-                    image::imageops::resize(
-                        &source,
-                        cell,
-                        cell,
-                        image::imageops::FilterType::Triangle,
-                    )
+                    (*name).to_owned()
                 };
-                let pixels = cell_image.as_raw();
-                let row_bytes = (cell * 4) as usize;
-                for y in 0..cell {
-                    let src = y as usize * row_bytes;
-                    let dst = (((y * width) + index as u32 * cell) * 4) as usize;
-                    rgba[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+                let mut image = try_load_texture_asset_from_search_path(
+                    &mut assets, &requested, true, false, true, "UI icon",
+                );
+                if image.is_none() && index >= ui::ICON_WEAPON_NO_AMMO_BASE {
+                    let fallback = if index >= ui::ICON_WEAPON_STAFF {
+                        "gfx/hud/w_icon_lightsaber"
+                    } else { name };
+                    image = try_load_texture_asset_from_search_path(
+                        &mut assets, fallback, true, false, true, "UI icon fallback",
+                    );
+                }
+                let Some(image) = image else {
+                    eprintln!("UI icon {requested}: not found");
+                    continue;
+                };
+                images[index] = image::RgbaImage::from_raw(image.width, image.height, image.rgba);
+                if images[index].is_none() {
+                    eprintln!("UI icon {requested}: unexpected pixel format");
                 }
             }
         }
         Err(error) => eprintln!("UI icon asset search: {error}"),
     }
-    TextureData {
-        label: "JKA UI icon atlas".into(),
-        source: None,
-        width,
-        height,
-        rgba,
-        rgba16f: None,
-        mip_level_count: 1,
-        clamp: true,
-        srgb: true,
+    assemble_native_icon_atlas(images, max_texture_size)
+}
+
+#[cfg(test)]
+mod native_icon_atlas_tests {
+    use super::*;
+
+    #[test]
+    fn different_resolution_icons_are_copied_exactly_without_resampling() {
+        let sizes = [(32, 16), (512, 256), (93, 71), (64, 64)];
+        let mut icons = vec![None; sizes.len() + 1];
+        for (i, (w, h)) in sizes.iter().copied().enumerate() {
+            icons[i] = Some(image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([i as u8 * 13 + (x % 37) as u8,
+                             (y % 251) as u8, (x % 253) as u8, 255])
+            }));
+        }
+        let (atlas, uvs) = assemble_native_icon_atlas(icons.clone(), 2048);
+        assert_eq!(uvs.len(), icons.len());
+        assert_eq!(atlas.mip_level_count, 1);
+        assert!(atlas.width <= 2048 && atlas.height <= 2048);
+        for (i, icon) in icons.iter().enumerate() {
+            let Some(im) = icon.as_ref() else { continue; };
+            let (uv0, uv1) = uvs[i];
+            let (x, y) = ((uv0[0] * atlas.width as f32).round() as u32,
+                          (uv0[1] * atlas.height as f32).round() as u32);
+            assert_eq!(((uv1[0] - uv0[0]) * atlas.width as f32).round() as u32, im.width());
+            assert_eq!(((uv1[1] - uv0[1]) * atlas.height as f32).round() as u32, im.height());
+            for yy in 0..im.height() {
+                for xx in 0..im.width() {
+                    let o = (((y + yy) * atlas.width + x + xx) * 4) as usize;
+                    assert_eq!(&atlas.rgba[o..o + 4], &im.get_pixel(xx, yy).0[..]);
+                }
+            }
+            // The extruded border is an exact copy of the first texel.
+            let gutter = (((y - 1) * atlas.width + x - 1) * 4) as usize;
+            assert_eq!(&atlas.rgba[gutter..gutter + 4], &im.get_pixel(0, 0).0[..]);
+        }
+        assert_eq!(uvs[icons.len() - 1].0, uvs[icons.len() - 1].1);
+    }
+
+    #[test]
+    fn scales_only_when_hardware_constraints_prevent_native_packing() {
+        let images = vec![Some(image::RgbaImage::new(256, 128))];
+        let (atlas, uvs) = assemble_native_icon_atlas(images, 128);
+        let size = ((uvs[0].1[0] - uvs[0].0[0]) * atlas.width as f32).round() as u32;
+        assert!(size < 256);
+        assert!(atlas.width <= 128 && atlas.height <= 128);
     }
 }
 

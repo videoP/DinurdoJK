@@ -13,6 +13,9 @@ override ENABLE_LEGACY_FOG: bool = false;
 // replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
 // rather than changing material classification or blend behavior.
 override FORCE_FOG_BLACK: bool = false;
+// Opaque and alpha-tested materials still cover the surface when their
+// texture's otherwise-unused alpha channel is less than one.
+override CAPTURE_OPAQUE_ALPHA: bool = false;
 // Only the spectator visible-player erase pipeline uses this. Move the depth
 // test toward the eye by this many JKA world units without changing the
 // rasterized silhouette (screen XY/W remain exactly as before).
@@ -160,11 +163,12 @@ fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
-    return fogged(
+    let color = fogged(
         model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
+    return vec4(color.rgb,select(color.a,1.0,CAPTURE_OPAQUE_ALPHA));
 }
 
 @fragment
@@ -173,11 +177,12 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
     if tex.a < 0.5 {
         discard;
     }
-    return fogged(
+    let color = fogged(
         model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
+    return vec4(color.rgb,select(color.a,1.0,CAPTURE_OPAQUE_ALPHA));
 }
 
 @fragment

@@ -352,7 +352,7 @@ impl App {
                 let (s, c) = (facing + view).to_radians().sin_cos();
                 let axis = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
                 let origin = [anchor.origin[0] + anchor.side[0] * i as f32 * SPACING, anchor.origin[1] + anchor.side[1] * i as f32 * SPACING, anchor.origin[2]];
-                let (mut surfaces, _) = presenter.present_profile_player_preview(&info, origin, axis, 0, "BOTH_STAND1", false, [1.0; 3], 0, [0.0; 2], false, preview.clone())?;
+                let (mut surfaces, _) = presenter.present_profile_player_preview(&info, origin, axis, 0, "BOTH_STAND1", false, [1.0; 3], 0, [0.0; 2], false, preview.clone(), None)?;
                 draws.append(&mut surfaces);
             }
             let _ = presenter.drain_fx_requests();

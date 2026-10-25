@@ -35,8 +35,10 @@ pub mod upstream_coast;
 pub mod gerstner_contact;
 mod gerstner_patterns;
 mod lakes;
+mod lake_wakes;
 pub use lakes::LakeSettings;
 pub mod sky_extend;
+pub mod volume;
 mod footprint_index;
 #[cfg(test)]
 #[path = "ocean/footprint_perf_tests.rs"]
@@ -1444,6 +1446,13 @@ impl WaterVolume {
         (0..3).all(|axis| p[axis] >= self.minimum[axis] && p[axis] <= self.maximum[axis])
             && self.mask_slot.map_or(true, |slot| masks.contains(usize::from(slot), [p[0], p[2]]))
     }
+
+    /// Waves displace only the upper surface. The authored floor stays fixed.
+    pub fn contains_displaced(&self, p: [f32; 3], masks: &OceanMasks, surface_offset: f32) -> bool {
+        let mut displaced = *self;
+        displaced.maximum[1] += surface_offset;
+        displaced.contains(p, masks)
+    }
 }
 
 pub use jka_assets::bsp::bathymetry::{
@@ -1786,6 +1795,19 @@ impl OceanSettings {
         }
     }
 
+    /// Use Hybrid's Godot submerged optics and ray-length fog. Cheapwater
+    /// shares the optics while retaining its own animated mesh and normals.
+    pub fn uses_godot_underwater(&self) -> bool {
+        (self.backend == 2 && self.blue_water_underwater_mode == 4)
+            || (self.backend == 3 && self.lake.shader == 1)
+    }
+
+    /// Only Hybrid substitutes the Godot material/mesh draw. Cheapwater shades
+    /// its existing animated clipmap below water, including its ripple normals.
+    pub fn uses_godot_submerged_mesh(&self) -> bool {
+        self.backend == 2 && self.uses_godot_underwater()
+    }
+
     /// Absorption-matched world/clipmap culling distance for the active water
     /// backend. Blue Water derives this from its native RGB extinction; Unified
     /// retains its own transparency-distance and user multiplier.
@@ -1814,7 +1836,8 @@ impl OceanSettings {
     /// fields at the render boundary. Pure Blue Water remains independent.
     pub fn resolved_for_gpu(mut self) -> Self {
         if self.backend == 3 {
-            // Flat lakes use host bounded underwater fog, without any ocean wave work.
+            // Lakes retain flat-plane classification; Cheapwater shares Hybrid's
+            // submerged material/fog while all lake simulation stays disabled.
             self.blue_water_caustics_mode = 2;
             self.blue_water_underwater_mode = 4;
             self.blue_water_adapter = false;
@@ -1827,7 +1850,7 @@ impl OceanSettings {
             self.interaction = false;
             self.optics.caustics = 0.0;
             self.optics.transparency = optics::Settings::default().transparency * self.lake.transparency;
-            self.optics.fog_color = if self.lake.salt { [0.18,0.35,0.34] } else { [0.16,0.25,0.12] };
+            self.optics.fog_color = self.lake.fog_color;
         } else if self.backend == 2 {
             if self.gerstner_water {
                 // Its waves have no FFT component and no crest limiter (`hybrid_swell_uniform`).
@@ -2105,6 +2128,7 @@ fn ocean_lod_deadline(next: &mut f32, now: f32, hz: f32) -> bool {
 pub struct OceanGpu {
     blue_water: Option<blue_water::BlueWaterOcean>,
     lakes: Option<lakes::LakeRenderer>,
+    lake_actors: std::sync::Arc<Vec<interaction::ActorSample>>,
     /// Lazily created: only Hybrid classification asks for the real eye-wave height.
     eye_wave: Option<eye_wave::EyeWaveProbe>,
     /// `r_oceanType 5`'s intersection-foam contact fields, once their worker has built them.
@@ -2570,7 +2594,7 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, lakes:None, eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, lakes:None, lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
@@ -3571,6 +3595,17 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         uniform.surface[2] = 0.0;
         uniform.surface[3] = 0.0;
     }
+    if settings.backend == 3 {
+        // The native adapter setup above must not restore FFT weights for a
+        // lake. Its Godot underside has no FFT, swell, foam or brush-derived tint.
+        for scale in &mut uniform.map_scales { scale[2] = 0.0; scale[3] = 0.0; }
+        uniform.swell = [0.0; 4];
+        uniform.swell_motion = [0.0; 4];
+        uniform.water_color = [settings.lake.water_color[0] * settings.lake.tint_color[0],
+            settings.lake.water_color[1] * settings.lake.tint_color[1],
+            settings.lake.water_color[2] * settings.lake.tint_color[2], 1.0];
+        uniform.appearance_b[0] = 1.0;
+    }
     uniform
 }
 
@@ -3675,6 +3710,43 @@ fn bg_buffer<'a>(binding:u32,buffer:&'a wgpu::Buffer)->wgpu::BindGroupEntry<'a> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cheapwater_underwater_shares_hybrid_optics_without_fft_or_saved_setting_changes() {
+        let mut settings = OceanSettings::default();
+        settings.backend = 3;
+        settings.lake.shader = 1;
+        settings.lake.water_color = [0.8, 0.4, 0.2];
+        settings.lake.tint_color = [0.5, 1.0, 1.0];
+        settings.lake.fog_color = [0.2, 0.3, 0.4];
+        settings.lake.transparency = 2.0;
+        let saved = settings;
+        let resolved = settings.resolved_for_gpu().sanitize();
+        assert!(resolved.uses_godot_underwater());
+        assert!(!resolved.uses_godot_submerged_mesh(), "Cheapwater must retain its animated mesh");
+        assert_eq!(resolved.optics.fog_color, settings.lake.fog_color);
+        assert_eq!(resolved.optics.transparency, optics::Settings::default().transparency * 2.0);
+        assert!(!resolved.blue_water_adapter && !resolved.interaction);
+        assert_eq!(resolved.optics.caustics, 0.0);
+        let uniform = make_render_uniform(true, &resolved);
+        assert!(uniform.map_scales.iter().all(|s| s[2] == 0.0 && s[3] == 0.0));
+        assert_eq!(uniform.swell, [0.0; 4]);
+        assert_eq!(uniform.swell_motion, [0.0; 4]);
+        assert_eq!(uniform.foam_color[3], 0.0);
+        assert_eq!(uniform.water_color, [0.4, 0.4, 0.2, 1.0]);
+        assert_eq!(uniform.appearance_b[0], 1.0);
+        assert_eq!(settings, saved);
+        settings.lake.shader = 0;
+        assert!(!settings.resolved_for_gpu().uses_godot_underwater());
+        settings.backend = 2;
+        settings.hybrid_underwater_mode = 4;
+        assert!(settings.resolved_for_gpu().uses_godot_underwater());
+        assert!(settings.resolved_for_gpu().uses_godot_submerged_mesh());
+        settings.hybrid_underwater_mode = 0;
+        assert!(!settings.resolved_for_gpu().uses_godot_underwater());
+        settings.backend = 1;
+        assert!(!settings.resolved_for_gpu().uses_godot_underwater());
+    }
 
     #[test]
     fn mask_tiles_follow_the_outline_not_single_triangles() {
@@ -4517,6 +4589,7 @@ mod ocean_fft_heading_tests {
                     let pool = PromotedOcean { index: 0, name: "pool".into(),
                         surface: OceanSurface { plane_height: 100.0, minimum: [0.0; 2], maximum: [4096.0; 2] },
                         heuristic: wave_heuristic(0.0, None), color: [0.1, 0.2, 0.3], roughness: None,
+                        source_deformation: None, source_alpha: None,
                         swell_direction: Some(swell) };
                     ocean.set_surfaces(&queue, &[pool.surface]);
                     ocean.set_promoted_surfaces(&device, &queue, &[pool], &[]);

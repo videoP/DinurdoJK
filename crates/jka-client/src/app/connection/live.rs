@@ -26,6 +26,15 @@ impl App {
         self.live_http_base = None;
         self.live_download = None;
         self.live_join_ui = None;
+        // Cvars are the source of truth, including at first connect.
+        // Preserve explicitly entered/archived packed cvars; only generate
+        // them when this profile has not yet authored a packed value.
+        if self.network.color1_packed.is_none() {
+            if let Err(error) = self.sync_packed_cosmetics_cvar() { self.push_console_error(error); }
+        }
+        if self.network.color2_packed.is_none() {
+            if let Err(error) = self.sync_packed_body_cvar() { self.push_console_error(error); }
+        }
         let userinfo = self.network.userinfo(&self.solo_client_info.model_cvar());
         match crate::net::NetClient::connect_preflight(target, userinfo, self.network.net_port) {
             Ok(net) => {
@@ -670,6 +679,7 @@ impl App {
             session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             session.weapon_fx.set_fx_physics(self.video.fx_physics);
+            session.weapon_fx.set_mark_count(self.video.mark_count as usize);
             session.weapon_fx.set_fx_lod(
                 self.video.fx_lod,
                 self.video.fx_count_scale,

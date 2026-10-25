@@ -779,19 +779,41 @@ commands! {
                     ));
                     if let Some(path) = &info.eal_file {
                         self.push_console_line(format!(
-                            "^3EAL ZONES:^7 {} | {} presets | listener: {} | EAX effects: {}",
+                            "^3EAL ZONES:^7 {} | {} presets | listener: {} | authored acoustics: {}",
                             path, info.eal_preset_count,
                             info.eal_environment.as_deref().unwrap_or("outside EAL geometry"),
                             if info.eal_effects_active { "active" } else { "inactive" }
+                        ));
+                    } else {
+                        self.push_console_line(format!(
+                            "^3EAL ZONES:^7 no .eal dataset loaded | s_eal {} | authored acoustics inactive",
+                            u8::from(info.eal_enabled)
                         ));
                     }
                     if let Some(error) = &info.eal_effects_error {
                         self.push_console_line(format!("^3EAL DSP:^7 {error}"));
                     }
-                    if info.eal_enabled {
+                    if info.eal_effects_active {
+                        self.push_console_line(format!("^3EAL SCENE:^7 {} sources | {} rooms | {} filtered | {} diffracted | {} directional rooms | {} merged fallback loops | HRTF {}",
+                            info.eal_sources, info.eal_rooms, info.eal_filtered_sources, info.eal_diffracted_sources,
+                            info.eal_directional_rooms, info.eal_fallback_loops, if info.eal_hrtf { "on" } else { "off" }));
                         self.push_console_line(format!(
-                            "^3EAL WORKER:^7 {:.1} ms wet latency | max render {} us | {} underruns | {} dropped blocks",
+                            "^3EAL WORKER:^7 {:.1} ms scene latency | max render {} us | {} underruns | {} queue/capacity drops",
                             info.eal_latency_ms, info.eal_max_render_us, info.eal_underruns, info.eal_overflows
+                        ));
+                        self.push_console_line(format!("^3EAL DEBUG:^7 mode {} (0 EAX callback (default), 1 PCM, 2 OpenAL dry, 3 cached EAX, 4 OpenAL 2D, 5 AL tone, 6 AL double-preroll, 7 EAX callback, 8 callback tone, 9 legacy EAX queue)", info.eal_debug_mode));
+                        self.push_console_line(format!(
+                            "^3EAL OPENAL:^7 {} empty queues | {} unexpected restarts | {} multi-buffer processed | {} queued-buffer reuses",
+                            info.eal_queue_starves, info.eal_restarts, info.eal_multi_processed, info.eal_buffer_reuse
+                        ));
+                        self.push_console_line(format!(
+                            "^3EAL TRANSPORT:^7 {} | callback underfeed {} samples | dropped {} samples | device HRTF status {}",
+                            match info.eal_transport { 1 => "callback", 2 => "legacy queue", _ => "raw PCM / initializing" },
+                            info.eal_callback_underfeed_samples, info.eal_callback_dropped_samples, info.eal_hrtf_status
+                        ));
+                        self.push_console_line(format!(
+                            "^3EAL EDGES:^7 maximum block-boundary jump (input {:.5}, OpenAL output {:.5}) | cumulative since mode switch",
+                            info.eal_input_edge_max, info.eal_output_edge_max
                         ));
                     }
                     if info.overload_samples > 0 {

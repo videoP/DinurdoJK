@@ -30,7 +30,7 @@ struct RainGlassUniform {
     wind_lens: [f32; 4],
 }
 
-pub(super) struct RainGlassResources {
+pub(crate) struct RainGlassResources {
     _droplet_texture: wgpu::Texture,
     _rivulet_texture: wgpu::Texture,
     droplet_view: wgpu::TextureView,
@@ -49,10 +49,13 @@ pub(super) struct RainGlassResources {
     height: u32,
     format: wgpu::TextureFormat,
     amount: f32,
+    /// Pipeline-job slot. Instances with different formats must not share
+    /// one: a request in the same family+slot evicts the other's job.
+    job_slot: u32,
 }
 
 impl RainGlassResources {
-    pub(super) fn new(
+    pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         width: u32,
@@ -167,10 +170,11 @@ impl RainGlassResources {
             height,
             format,
             amount: 0.0,
+            job_slot: 0,
         })
     }
 
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
@@ -220,7 +224,7 @@ impl RainGlassResources {
 
         let config = pipeline_hash(&self.format);
         if self.pipeline.is_none() {
-            let key = PipelineJobKey::new("rain-glass", 0, config);
+            let key = PipelineJobKey::new("rain-glass", self.job_slot, config);
             if let Some(pipeline) = jobs.take_ready(key) {
                 self.pipeline = Some(pipeline);
             } else {
@@ -235,15 +239,20 @@ impl RainGlassResources {
         }
     }
 
-    pub(super) fn active(&self) -> bool {
+    /// Use a separate pipeline-job slot (a second instance, e.g. the main menu's).
+    pub(crate) fn set_job_slot(&mut self, slot: u32) {
+        self.job_slot = slot;
+    }
+
+    pub(crate) fn active(&self) -> bool {
         self.amount > 0.001 && self.pipeline.is_some()
     }
 
-    pub(super) fn source_view(&self) -> &wgpu::TextureView {
+    pub(crate) fn source_view(&self) -> &wgpu::TextureView {
         &self.source_view
     }
 
-    pub(super) fn render(
+    pub(crate) fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,

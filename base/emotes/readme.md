@@ -44,6 +44,8 @@ chosen variations, and is never packaged.
   Full-body taunts stop on attack, alt-attack, Force action buttons, and
   jump/crouch input. Torso-only taunts allow independent leg movement,
   including crouching; an action that replaces the torso animation stops them.
+  When no native taunt is available (including the lightweight local game),
+  attack, alt-attack and Force action buttons still stop cosmetic playback.
 * **Console**: `djk_emote list`, `djk_emote 12`, `djk_emote EID_DanceMoves`,
   `djk_emote stop`, `djk_emote refresh` (rescan after installing).
   Numbers are permanent network IDs, including the exact variation, rather than

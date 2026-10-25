@@ -278,6 +278,12 @@ impl App {
                 }
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS => { self.video.baked_local_lights = defaults.baked_local_lights; self.sync_baked_local_lights(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources = (self.video.baked_local_sources & !1) | (defaults.baked_local_sources & 1); self.sync_baked_local_lights(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !2) | (defaults.baked_local_sources & 2); self.sync_baked_local_lights(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !4) | (defaults.baked_local_sources & 4); self.sync_baked_local_lights(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources = (self.video.baked_local_sources & !8) | (defaults.baked_local_sources & 8); self.sync_baked_local_lights(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources = (self.video.baked_local_sources & !16) | (defaults.baked_local_sources & 16); self.sync_baked_local_lights(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
                 self.video.promote_shader_lights = defaults.promote_shader_lights;
                 self.sync_shader_light_promotion();
@@ -392,7 +398,7 @@ impl App {
             ui::VIDEO_ROW_DYNAMIC_SHADOWS => {
                 self.video.dynamic_shadows = defaults.dynamic_shadows;
                 self.video.cascaded_shadows =
-                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                    matches!(self.video.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
             }
@@ -529,7 +535,6 @@ impl App {
             ui::VIDEO_ROW_GPU_TIMINGS => {
                 self.video.gpu_timings = defaults.gpu_timings;
                 self.render_command(RenderCommand::SetGpuTimings(self.video.gpu_timings));
-                self.mark_config_dirty();
             }
             ui::VIDEO_ROW_GHOUL2_SKINNING => {
                 self.video.ghoul2_skinning = defaults.ghoul2_skinning;

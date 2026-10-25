@@ -26,6 +26,62 @@ impl App {
         }
     }
 
+    /// The source for local geometric deformation cvars is VideoSettings.
+    /// They are presentation choices; do not change gameplay collision bounds.
+    pub(in crate::app) fn current_profile_tuning(&self) -> crate::cgame::jiggle::JiggleRemeshTuning {
+        crate::cgame::jiggle::JiggleRemeshTuning {
+            body_shape: self.video.body_shape_params(),
+            body_details: self.video.body_details,
+            breast_size: self.video.jiggle_breast_size,
+            glute_size: self.video.jiggle_glute_size,
+            breast_bottom_z: self.video.jiggle_breast_remesh_bottom_z,
+            breast_top_z: self.video.jiggle_breast_remesh_top_z,
+            glute_bottom_z: self.video.jiggle_glute_remesh_bottom_z,
+            glute_top_z: self.video.jiggle_glute_remesh_top_z,
+        }
+    }
+
+    /// Update the real color1 cvar. It then reaches the server through the
+    /// same NetworkSettings::userinfo() path as every other CVAR_USERINFO.
+    pub(in crate::app) fn sync_packed_cosmetics_cvar(&mut self) -> Result<(), String> {
+        let cosmetics = crate::profile_wire::PackedCosmetics {
+            mask: self.network.cosmetics,
+            hat: crate::profile_wire::cosmetic_id(&self.network.global_hat),
+            cape: crate::profile_wire::cosmetic_id(&self.network.global_cape),
+        };
+        let encoded = if cosmetics == crate::profile_wire::PackedCosmetics::default() {
+            crate::global_cosmetics::encode(self.network.color1, &self.network.global_hat)
+        } else {
+            crate::profile_wire::encode_cosmetics(self.network.color1, cosmetics)
+        };
+        if self.network.color1_value() != encoded {
+            self.network.set_cvar("color1", &encoded)
+                .ok_or_else(|| "color1 cvar is not registered".to_owned())??;
+        }
+        Ok(())
+    }
+
+    /// Body settings feed the actual color2 cvar. Never write outgoing
+    /// info strings here: they simply serialize the existing cvar value.
+    pub(in crate::app) fn sync_packed_body_cvar(&mut self) -> Result<(), String> {
+        let body = crate::profile_wire::BodyWire::from_tuning(self.current_profile_tuning());
+        let encoded = if body.is_neutral() {
+            crate::global_cosmetics::encode(self.network.color2, &self.network.global_cape)
+        } else if let Some(encoded) = body.encode(self.network.color2) {
+            encoded
+        } else {
+            // Do not transmit stale body data when the updated profile no
+            // longer fits. Fall back to saber color, never partial deformations.
+            self.push_console_error("color2: body profile exceeds the 220-character wire limit; sending saber color only".to_owned());
+            self.network.color2.to_string()
+        };
+        if self.network.color2_value() != encoded {
+            self.network.set_cvar("color2", &encoded)
+                .ok_or_else(|| "color2 cvar is not registered".to_owned())??;
+        }
+        Ok(())
+    }
+
     /// Queue CL_CheckUserinfo and report whether the reliable command really
     /// entered the stream. Callers that gate UI state on delivery must not
     /// silently clear their pending bit when the reliable ring is full.
@@ -41,9 +97,7 @@ impl App {
                     .to_vec()
             })
             .unwrap_or_default();
-        let info = self
-            .network
-            .userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info);
+        let info = self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info);
         let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
         let Some(net) = self.net.as_mut() else {
             return Err("network session disappeared while queuing userinfo".to_owned());
@@ -274,11 +328,22 @@ impl App {
                             } else {
                                 self.live_input.cycle_force(&ps, forward);
                                 self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                                self.weapon_select_until = None;
                                 self.publish_transient_ui();
                             }
                         }
                         GameCommand::Weapon => if let Some(slot) = words.get(1) { self.live_input.select_weapon_slot(&ps, slot); },
                         _ => unreachable!(),
+                    }
+                    if matches!(action, GameCommand::WeaponNext | GameCommand::WeaponPrev
+                        | GameCommand::WeaponLast | GameCommand::WeaponClean | GameCommand::Weapon)
+                        && ps.field_i32("pm_flags").unwrap_or(0) & 4096 == 0
+                        && ps.field_i32("pm_type").unwrap_or(0) != 4
+                        && ps.field_i32("emplacedIndex").unwrap_or(0) == 0
+                    {
+                        self.weapon_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                        self.force_select_until = None;
+                        self.publish_transient_ui();
                     }
                 }
                 return true;

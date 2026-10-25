@@ -23,12 +23,19 @@ mod initialize;
 mod input;
 mod inspector;
 mod lifecycle;
+mod update_runtime;
 mod local;
 mod map_loading;
 mod movement_hud;
 mod notices;
 mod performance;
 mod race_ghost_runtime;
+mod render_studio;
+mod render_studio_camera;
+mod render_studio_navigation;
+mod render_studio_cinematics;
+mod render_studio_spatial;
+mod render_studio_timeline;
 mod session;
 mod settings;
 mod siege;
@@ -61,7 +68,8 @@ use display::{
     ConsoleCvarSetResult, FrontendCinematic, MapLoadPurpose, PendingRendererRestart,
     VideoConfirmation,
 };
-use frontend_previews::{AssetPreviewFxState, MenuProps};
+use frontend_previews::{AssetPreviewFxState, MenuProps, ProfileStudioCamera};
+use render_studio::RenderStudio;
 use hud::generic_timer_bar;
 use map_loading::{
     prepared_map_has_ocean_surface, spawn_map_loader, MapLoadRequest, MapLoadingState, PerfSample,
@@ -119,6 +127,7 @@ use crate::{
     camera::{
         offset_third_person_view, Camera, SpectatorCameraMode, SpectatorCameraSettings,
         SpectatorCameraState, ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewInput,
+        ViewBobSettings, ViewBobInput,
         MAX_SPECTATOR_ORBIT_RANGE, MIN_SPECTATOR_ORBIT_RANGE,
     },
     cgame::{
@@ -226,6 +235,7 @@ struct AccountEditor {
 
 pub struct App {
     extensions: crate::extensions::Manager,
+    updater: crate::updater::State,
     base: PathBuf,
     /// Command-line/local game directory. Session fs_game is restored to this on disconnect.
     startup_game: Option<PathBuf>,
@@ -237,6 +247,8 @@ pub struct App {
     game_launch_screen: config::GameLaunchScreen,
     /// Non-main launches reveal navigation independently of background-scene readiness.
     frontend_skip_chrome_fade: bool,
+    /// Renderer-drawn frontend Main page: selection and what was last sent.
+    neon_menu: egui_menu::NeonMenuState,
     solo_maps: Vec<SoloMapEntry>,
     solo_map_selected: usize,
     solo_catalog_loaded: bool,
@@ -325,6 +337,8 @@ pub struct App {
     profile_studio_last_frame: Instant,
     /// Angular velocity (degrees/second). Decays naturally when drag releases.
     profile_studio_spin_velocity: f32,
+    /// Smoothed, selection-driven studio camera; never used by the live game.
+    profile_studio_camera: ProfileStudioCamera,
     /// Head-look control from cursor position on the Studio stage (-1..1).
     profile_studio_head_look: [f32; 2],
     /// Animated JKA-space anchors: head, face, back, hands, fitted breast/glute centers.
@@ -360,6 +374,8 @@ pub struct App {
     profile_defer_send: bool,
     /// A userinfo cvar was edited on the Profile page and not yet sent.
     profile_userinfo_pending: bool,
+    /// Quantized body appearance last observed by the config dirtiness hook.
+    last_profile_wire: Option<crate::profile_wire::BodyWire>,
     /// True while the console command buffer runs. Userinfo cvars set by one
     /// run (an `exec`'d cfg sets dozens) are collapsed into a single send in
     /// `console_userinfo_dirty`, instead of tripping the server's
@@ -376,6 +392,7 @@ pub struct App {
     profile_force_pending: bool,
     profile_dynamic_models: Arc<Vec<DynamicModelSurface>>,
     profile_preview_active: bool,
+    render_studio: RenderStudio,
     demo_entries: Vec<DemoEntry>,
     demo_catalog_pending: bool,
     demo_catalog_generation: u64,
@@ -611,6 +628,8 @@ pub struct App {
     crosshair_scan_at: Instant,
     /// `cg.forceSelectTime`: selector remains visible for OpenJK WEAPON_SELECT_TIME.
     force_select_until: Option<Instant>,
+    /// TaystJK cg.weaponSelectTime (WEAPON_SELECT_TIME = 1400 ms).
+    weapon_select_until: Option<Instant>,
     /// TaystJK cg_drawPlayerNames. Occlusion is sampled at 30 Hz; the render
     /// thread still projects accepted labels every frame for smooth late-latched motion.
     player_names: ui::PlayerNameSettings,
@@ -691,6 +710,7 @@ pub struct App {
     dev_radial_offset: [f32; 2],
     model_placement: egui_model_placement::ModelPlacementUi,
     emote_radial_category: Option<egui_emote_radial::EmoteCategory>,
+    emote_radial_search: egui_emote_radial::EmoteRadialSearch,
     console_input: String,
     /// UTF-8 byte offset of the editable console caret inside `console_input`.
     console_cursor: usize,
@@ -766,6 +786,8 @@ pub struct App {
     forced_player_models: Option<ForcedPlayerModels>,
     /// TaystJK cg_zoomFov and transient CG_ZoomDown/CG_ZoomUp state.
     japro_zoom_fov: f32,
+    /// Console-configured first-person view bobbing / velocity tilt.
+    view_bob: ViewBobSettings,
     japro_zoom_transition_at: Option<Instant>,
     /// TaystJK CG_DoAsync flipkick state/cvars.
     japro_fk_duration: i32,
@@ -972,6 +994,12 @@ pub struct App {
     static_ao_progress: Option<(u32, u32)>,
     preserve_game_state_on_next_map_upload: bool,
     renderer_restart_started: Option<Instant>,
+    /// The renderer restart spans several event-loop turns. Unlike TaystJK's
+    /// synchronous CL_Vid_Restart_f, those turns otherwise accept gameplay
+    /// inputs, run Pmove/CGame and keep audio playing behind a blank window.
+    /// Stay suspended until the replacement renderer has drawn its first frame;
+    /// the subsequent keep/revert video confirmation is NOT part of this barrier.
+    renderer_restart_suspended: bool,
     perf: PerfStats,
     threads: std::sync::Arc<[ThreadPerfStats]>,
     surface_inspector: Option<SurfaceInspectorInfo>,

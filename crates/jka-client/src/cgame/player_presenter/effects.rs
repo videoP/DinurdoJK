@@ -313,12 +313,17 @@ impl PlayerPresenter {
         {
             return;
         }
-        if !japro_server {
+        if !japro_server || info.packed_cosmetics.is_some() {
             use crate::global_cosmetics::Slot;
-            let hat = if own && info.global_hat.is_empty() {
+            let packed = info.packed_cosmetics;
+            let hat = if let Some(packed) = packed {
+                self.packed_cosmetic_name(Slot::Hat, packed.hat).unwrap_or_default()
+            } else if own && info.global_hat.is_empty() {
                 self.local_global_hat.clone()
             } else { info.global_hat.clone() };
-            let cape = if own && info.global_cape.is_empty() {
+            let cape = if let Some(packed) = packed {
+                self.packed_cosmetic_name(Slot::Cape, packed.cape).unwrap_or_default()
+            } else if own && info.global_cape.is_empty() {
                 self.local_global_cape.clone()
             } else { info.global_cape.clone() };
             for (slot, name) in [(Slot::Hat, hat), (Slot::Cape, cape)] {
@@ -334,10 +339,14 @@ impl PlayerPresenter {
             }
             // Keep the existing jaPRO bitmask-based cosmetic preview for
             // the offline solo shim. Never use cp_cosmetics for remote players.
-            if !own || self.local_cosmetics == 0 { return; }
+            if packed.is_none() && (!own || self.local_cosmetics == 0) { return; }
         }
         let mut mask = if japro_server {
+            // Always respect jaPRO's server-authoritative unlock/visibility mask,
+            // including when c5 is zero (no unlocks).
             info.cosmetics
+        } else if let Some(packed) = info.packed_cosmetics {
+            packed.mask
         } else {
             self.local_cosmetics
         };
@@ -386,7 +395,7 @@ impl PlayerPresenter {
         &mut self,
         entity: &PresentedEntity,
     ) {
-        if !self.blob_shadows_enabled {
+        if self.blob_shadow_opacity <= 0.0 {
             return;
         }
         let state = &entity.state;
@@ -407,7 +416,9 @@ impl PlayerPresenter {
             return;
         };
         let mut end = entity.origin;
-        end[2] -= BLOB_SHADOW_DISTANCE;
+        // Supplemental contact blobs stay close to the feet and fade quickly
+        // with height; the explicit classic Blob mode retains its long drop.
+        end[2] -= if self.blob_shadow_opacity < 1.0 { 96.0 } else { BLOB_SHADOW_DISTANCE };
         let trace = world.trace(TraceQuery {
             start: entity.origin,
             mins: BLOB_SHADOW_MINS,
@@ -431,9 +442,9 @@ impl PlayerPresenter {
         let radius = if npc_class == CLASS_REMOTE || npc_class == CLASS_SEEKER {
             BLOB_SHADOW_DROID_RADIUS
         } else {
-            BLOB_SHADOW_RADIUS
+            BLOB_SHADOW_RADIUS * if self.blob_shadow_opacity < 1.0 { 0.75 } else { 1.0 }
         };
-        let shade = (1.0 - trace.fraction).clamp(0.0, 1.0);
+        let shade = (1.0 - trace.fraction).clamp(0.0, 1.0) * self.blob_shadow_opacity;
         self.push_blob_shadow_request(entity.number, trace.end, trace.normal, yaw, radius, shade);
     }
 
@@ -495,6 +506,9 @@ impl PlayerPresenter {
 pub(in crate::cgame::player_presenter) fn viewer_style_from(
     ps: &jka_protocol::server::PlayerState,
     japro: bool,
+    japlus: bool,
+    japlus_duel_alpha: i32,
+    plugin_disable: i32,
     style_player: u32,
 ) -> crate::japro_cg::StyleViewer {
     const PMF_FOLLOW: i32 = 4096;
@@ -502,6 +516,9 @@ pub(in crate::cgame::player_presenter) fn viewer_style_from(
     let pm_flags = ps.field_i32("pm_flags").unwrap_or(0);
     crate::japro_cg::StyleViewer {
         japro,
+        japlus,
+        japlus_duel_alpha,
+        plugin_disable,
         style_player,
         client_num: ps.field_i32("clientNum").unwrap_or(-1),
         dueling: ps.field_i32("duelInProgress").unwrap_or(0) != 0,

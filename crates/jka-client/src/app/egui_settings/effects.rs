@@ -133,6 +133,15 @@ impl App {
         );
         });
 
+        theme::row(ui, "Wall mark count",
+            "r_markcount: maximum retained authored EFX wall marks, default 100. Zero disables them. BSP marks follow TaystJK's markable-surface rules.",
+            theme::Reset::None, |ui| {
+                let mut count = self.video.mark_count;
+                if ui.add(egui::DragValue::new(&mut count).range(0..=4096).speed(1.0)).changed() {
+                    let _ = self.set_console_cvar("r_markcount", &count.to_string());
+                }
+            });
+
         self.egui_toggle_row(
             ui,
             "Modern saber rendering",

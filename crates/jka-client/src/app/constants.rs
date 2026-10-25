@@ -17,12 +17,12 @@ pub(in crate::app) const DEMO_SCRUB_PREVIEW_INTERVAL: Duration = Duration::from_
 /// The frontend is a real rendered world, not a 2D levelshot. Keep the map
 /// fixed for now so menu art direction is deterministic; later this can become
 /// a cvar or an authored list of menu scenes without changing the load path.
-pub(in crate::app) const FRONTEND_BACKGROUND_MAP: &str = "mp/duel9";
+pub(in crate::app) const FRONTEND_BACKGROUND_MAP: &str = "mp/ctf4";
 
 /// Snapshot-cache identity of the staged menu scene. Bump the suffix whenever
 /// the menu look (`scene::menu_look`) changes, so a stale
 /// cached still of the previous look is not shown during the fade-in.
-pub(in crate::app) const FRONTEND_BACKGROUND_SCENE_ID: &str = "mp/duel9#menu-look-13";
+pub(in crate::app) const FRONTEND_BACKGROUND_SCENE_ID: &str = "mp/ctf4#menu-look-1";
 
 /// The menu is art-directed against this legacy horizontal 4:3 FOV, regardless
 /// of `cg_fov`, `cg_zoomFov`, or the current gameplay/spectator camera.

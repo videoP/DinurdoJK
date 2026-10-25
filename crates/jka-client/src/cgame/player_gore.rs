@@ -33,11 +33,25 @@ pub(crate) struct GoreSurface {
     pub indices: Arc<Vec<u32>>,
 }
 
+/// Event parameters kept until the corresponding player's GPU skinned mesh
+/// exists. Snapshot/event ordering must not decide whether a mark is rendered.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingGore {
+    pub entity: u16,
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub trace: bool,
+    pub size: f32,
+    pub shader: String,
+    pub time: i32,
+    pub sequence: u64,
+}
+
 pub(crate) struct Gore {
     pub entity: u16,
     pub start_time: i32,
     pub life_ms: i32,
-    pub shader: &'static str,
+    pub shader: String,
     pub surfaces: Vec<GoreSurface>,
 }
 

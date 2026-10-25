@@ -11,6 +11,12 @@ use fastnoise_lite::{CellularDistanceFunction, CellularReturnType, FastNoiseLite
 use std::sync::{Arc, OnceLock};
 
 const SEA_FOAM_PNG: &[u8] = include_bytes!("../../../../vendor/godot-water-shader/textures/sea_foam.png");
+
+pub(super) fn cheapwater_normal(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    let image = image::load_from_memory_with_format(include_bytes!("../../../../assets/cheapwater/water_normal.png"), image::ImageFormat::Png)
+        .expect("Cheapwater normal map decodes").to_rgba8();
+    blue_water_gpu::lakes::LakePipeline::normal_map(device, queue, image.as_raw(), image.width(), image.height())
+}
 /// NoiseTexture2D's default size and seamless blend skirt.
 const NOISE_SIZE: usize = 512;
 const BLEND_SKIRT: f32 = 0.1;
@@ -104,6 +110,26 @@ pub(super) fn patterns() -> Arc<Vec<u8>> {
         let baked = Arc::new(bake());
         rverbose!(1, "[GERSTNER] pattern texture baked in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
         baked
+    }))
+}
+
+/// The Gerstner material's smooth simplex source, reduced to a small height/gradient
+/// texture for lakes. Two octaves keep only broad relief that a cheap mesh resolves.
+pub(super) fn lake_noise() -> Arc<Vec<[f32; 4]>> {
+    static BAKED: OnceLock<Arc<Vec<[f32; 4]>>> = OnceLock::new();
+    Arc::clone(BAKED.get_or_init(|| {
+        let mut noise = godot_noise(NoiseType::OpenSimplex2S);
+        noise.set_fractal_octaves(Some(2));
+        const SIZE: usize = 128;
+        const REPEAT: f32 = 32.0;
+        let heights = resample(&seamless_noise(&noise), SIZE);
+        let at = |x: usize, y: usize| heights[(y % SIZE) * SIZE + x % SIZE] as f32 / 127.5 - 1.0;
+        Arc::new((0..SIZE * SIZE).map(|i| {
+            let (x, y) = (i % SIZE, i / SIZE);
+            let derivative = SIZE as f32 / (2.0 * REPEAT);
+            [at(x,y), (at(x+1,y)-at(x+SIZE-1,y))*derivative,
+                (at(x,y+1)-at(x,y+SIZE-1))*derivative, 0.0]
+        }).collect())
     }))
 }
 

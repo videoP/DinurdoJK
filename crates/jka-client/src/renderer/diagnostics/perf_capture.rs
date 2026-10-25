@@ -28,7 +28,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 217] = [
+const FIELDS: [&str; 225] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -145,6 +145,14 @@ const FIELDS: [&str; 217] = [
     "gpu_latest_ocean_surface_ms",
     "gpu_latest_ocean_optics_ms",
     "gpu_latest_blue_water_underwater_ms",
+    "lamp_shadow_ab_mode",
+    "gpu_latest_lamp_static_ms",
+    "gpu_latest_lamp_moving_ms",
+    "cpu_lamp_moving_encode_ms",
+    "lamp_dynamic_faces",
+    "lamp_entity_face_pairs",
+    "lamp_bsp_face_pairs",
+    "lamp_static_cache_rebuilds",
     "ocean_backend",
     "ocean_original_surfaces",
     "ocean_triangles",
@@ -437,6 +445,14 @@ impl PerfRow {
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::OceanSurface.index()]).unwrap_or(f64::NAN),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::OceanOptics.index()]).unwrap_or(f64::NAN),
                 gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::BlueWaterUnderwater.index()]).unwrap_or(f64::NAN),
+                f64::from(renderer.lamp_shadow_ab),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::LocalShadowStatic.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::LocalShadowMoving.index()]).unwrap_or(f64::NAN),
+                renderer.world.as_ref().map_or(f64::NAN, |world| world.local_shadows.ab_last_cpu_ms),
+                renderer.world.as_ref().map_or(f64::NAN, |world| f64::from(world.local_shadows.ab_last_dynamic_faces)),
+                renderer.world.as_ref().map_or(f64::NAN, |world| f64::from(world.local_shadows.ab_last_entity_face_pairs)),
+                renderer.world.as_ref().map_or(f64::NAN, |world| f64::from(world.local_shadows.ab_last_bsp_face_pairs)),
+                renderer.world.as_ref().map_or(f64::NAN, |world| f64::from(world.local_shadows.ab_last_static_rebuilds)),
                 f64::from(renderer.ocean_settings.backend),
                 f64::from(info.ocean.original_surfaces),
                 info.ocean.triangles as f64,

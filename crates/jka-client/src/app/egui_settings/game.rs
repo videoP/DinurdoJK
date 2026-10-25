@@ -34,6 +34,38 @@ impl App {
                     },
                 );
 
+                theme::section(ui, "UPDATES", "Check GitHub Releases on launch. Downloads are always manual.");
+                theme::row(ui, "Check for updates at launch",
+                    "Checks videop/DinurdoJK once at launch. Only announces a newer stable release; never downloads automatically.",
+                    theme::Reset::None, |ui| {
+                        if let Some(on) = theme::switch(ui, self.updater.auto_check) {
+                            if let Err(e) = self.updater.set_auto_check(on) {
+                                self.updater.error = Some(e);
+                            }
+                        }
+                    });
+                if ui.button("Check for Updates").clicked() { self.check_for_updates(true); }
+                if self.updater.checking { ui.label("Checking GitHub..."); }
+                if let Some(result) = &self.updater.manual_result { ui.label(result); }
+                if let Some(error) = &self.updater.error { ui.colored_label(theme::WARNING, error); }
+                if let Some(release) = self.updater.release.clone() {
+                    ui.label(format!("Available: {} (installed: {})", release.tag, env!("CARGO_PKG_VERSION")));
+                    if self.updater.downloading {
+                        let ratio = if self.updater.total == 0 { 0.0 } else { self.updater.downloaded as f32 / self.updater.total as f32 };
+                        ui.add(egui::ProgressBar::new(ratio.clamp(0.0, 1.0)).show_percentage());
+                    } else if let Some(stage) = self.updater.staged.clone() {
+                        ui.label("Verified. It will apply when you next start the game.");
+                        if ui.button("Restart & Apply Update").clicked() {
+                            match crate::updater::restart_with_update(&stage) {
+                                Ok(()) => self.request_quit(),
+                                Err(e) => self.updater.error = Some(e),
+                            }
+                        }
+                    } else if ui.button("Download & Install").clicked() {
+                        self.download_update();
+                    }
+                }
+
                 theme::section(ui, "WEAPONS", "Weapon selection helpers.");
                 if let Some(value) = segmented_row(
                     ui,
@@ -65,7 +97,7 @@ impl App {
                 theme::row(
                     ui,
                     "Directional swim tilt",
-                    "cg_swimTilt. Tilt the full player model toward the swim velocity while keeping the original swim animations. 0 = original JKA pose, 1 = near-horizontal forward swim. Camera, collisions and gameplay remain unchanged.",
+                    "cg_swimTilt. Tilt the full player model toward the swim velocity, with a gradual head-up lift near the water surface. Keeps the original swim animations. 0 = original JKA pose, 1 = near-horizontal forward swim. Camera, collisions and gameplay remain unchanged.",
                     theme::Reset::None,
                     |ui| {
                         let mut strength = self.swim_tilt;
@@ -78,7 +110,7 @@ impl App {
                 theme::row(
                     ui,
                     "Swim turn banking",
-                    "cg_swimTurnBank. Up to 45° of bank based on how quickly horizontal swim velocity changes direction. Active only while swimming and moving; 0 disables extra turning roll. cg_swimTilt 0 disables all swim tilting.",
+                    "cg_swimTurnBank. Up to 60° of bank based on how quickly horizontal swim velocity changes direction. Active only while swimming and moving; 0 disables extra turning roll. cg_swimTilt 0 disables all swim tilting.",
                     theme::Reset::None,
                     |ui| {
                         let mut strength = self.swim_turn_bank;

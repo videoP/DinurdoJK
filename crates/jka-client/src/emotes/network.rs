@@ -23,7 +23,8 @@ fn registry() -> &'static Registry {
         {
             let (id, key) = line.split_once('\t').expect("emote registry row");
             let id: u16 = id.parse().expect("emote registry ID");
-            assert!(id < STOP_ID && key.split('\t').count() == 2);
+            assert!(id < crate::emote_net_codec::MATCH_BASE_ID && key.split('\t').count() == 2,
+                "registry must not allocate reserved MATCH or STOP IDs");
             assert!(by_key.insert(key, id).is_none(), "duplicate emote identity");
             assert!(by_id.insert(id, key).is_none(), "duplicate emote wire ID");
         }
@@ -46,6 +47,10 @@ pub fn resolve(catalog: &[Emote], id: u16) -> Option<Emote> {
 
 struct Remote {
     generation: u64,
+    // Resolved identity and absolute timeline start. A MATCH captures these at
+    // reception; if the referenced dancer later leaves or stops, we continue.
+    wire_id: u16,
+    matched: bool,
     start: i32,
     flags: i32,
     taunt: taunt::Taunt,
@@ -203,47 +208,68 @@ fn update(
             rt.cancel(client);
         }
     }
+    // Invalidate every affected slot before resolving new starts, so a MATCH
+    // cannot silently capture an emote that was stopped in this snapshot.
     for start in starts {
-        let client = start.client_num;
-        if client >= MAX_CLIENTS || client as i32 == own_client {
-            continue;
+        if start.client_num < MAX_CLIENTS && start.client_num as i32 != own_client {
+            rt.cancel(start.client_num);
         }
-        rt.cancel(client);
-        if start.emote_id == STOP_ID {
-            continue;
-        }
-        let Some(emote) = resolve(catalog, start.emote_id) else {
-            continue;
-        };
-        rt.generation = rt.generation.wrapping_add(1);
-        let generation = rt.generation;
-        let Some(entity) = snapshot
-            .entities
-            .iter()
-            .find(|e| e.number as usize == client)
-        else { continue };
-        let Some(taunt) = taunt::Taunt::from_animations(
-            entity.field_i32("torsoAnim").unwrap_or(-1),
-            entity.field_i32("legsAnim").unwrap_or(-1),
-        ) else { continue };
-        let flags = entity.field_i32("eFlags").unwrap_or(0);
-        if rt
-            .jobs
-            .try_send(Job {
-                client,
-                generation,
-                emote,
-            })
-            .is_ok()
-        {
-            rt.slots[client] = Some(Remote {
-                generation,
-                start: start.server_time,
-                flags,
-                taunt,
-                state: PlaybackState::default(),
-            });
-        }
+    }
+    // Ordinary IDs before references, irrespective of entity iteration order.
+    // Resolve MATCH chains in further passes (up to the 32 possible clients).
+    let mut pending: Vec<_> = starts.iter()
+        .filter(|s| s.client_num < MAX_CLIENTS && s.client_num as i32 != own_client
+            && s.emote_id != STOP_ID)
+        .copied()
+        .collect();
+    for _ in 0..MAX_CLIENTS {
+        if pending.is_empty() { break; }
+        let mut progressed = false;
+        pending.retain(|start| {
+            let is_match = crate::emote_net_codec::match_source_client(start.emote_id).is_some();
+            let resolved = match crate::emote_net_codec::match_source_client(start.emote_id) {
+                None => Some((start.emote_id, start.server_time)),
+                Some(source) if source as usize == start.client_num => None,
+                Some(source) if i32::from(source) == own_client => {
+                    // The source's own client does not keep a Remote slot for
+                    // itself; read the live local playback to resolve that case.
+                    active_preview().and_then(|sample| {
+                        let wire_id = wire_id(&sample.emote)?;
+                        Some((wire_id, start.server_time.saturating_sub(sample.elapsed_ms)))
+                    })
+                }
+                Some(source) => rt.slots[usize::from(source)]
+                    .as_ref()
+                    .map(|remote| (remote.wire_id, remote.start)),
+            };
+            let Some((id, effective_start)) = resolved else { return true; };
+            let Some(emote) = resolve(catalog, id) else { return false; };
+            rt.generation = rt.generation.wrapping_add(1);
+            let generation = rt.generation;
+            let client = start.client_num;
+            let Some(entity) = snapshot.entities.iter().find(|e| e.number as usize == client) else {
+                return false;
+            };
+            let Some(taunt) = taunt::Taunt::from_animations(
+                entity.field_i32("torsoAnim").unwrap_or(-1),
+                entity.field_i32("legsAnim").unwrap_or(-1),
+            ) else { return false; };
+            let flags = entity.field_i32("eFlags").unwrap_or(0);
+            if rt.jobs.try_send(Job { client, generation, emote }).is_ok() {
+                rt.slots[client] = Some(Remote {
+                    generation,
+                    wire_id: id,
+                    matched: is_match,
+                    start: effective_start,
+                    flags,
+                    taunt,
+                    state: PlaybackState::default(),
+                });
+                progressed = true;
+            }
+            false
+        });
+        if !progressed { break; }
     }
 }
 
@@ -263,6 +289,18 @@ pub fn player_preview(entity: u16, viewer_client: i32, time: i32) -> Option<Prev
     if time < active.start {
         return None;
     }
+    preview_at(&mut active.state, time.saturating_sub(active.start))
+}
+
+/// The exact remote emote and timeline sample at the current presentation time.
+/// The target must already be playing a decoded, visible Fortnite emote.
+/// No animation is guessed from a normal JKA/JA+ taunt.
+pub fn match_target_preview(client: u16) -> Option<Preview> {
+    let mut rt = runtime().lock().ok()?;
+    if rt.own_client == Some(i32::from(client)) { return None; }
+    let time = rt.render_time;
+    let active = rt.slots.get_mut(client as usize)?.as_mut()?;
+    if time < active.start || active.state.playing.is_none() { return None; }
     preview_at(&mut active.state, time.saturating_sub(active.start))
 }
 
@@ -292,7 +330,14 @@ fn poll(
         match result {
             Ok((emote, decoded)) => {
                 audio.extend(decoded);
-                let next_audio_ms = emote.audio.iter().map(|c| c.at_ms).collect();
+                // A MATCH joins an already-running timeline, so never replay
+                // old cues at this player's start. Repeatable cues can fire
+                // again on their next loop if their timing supports it.
+                let next_audio_ms = if active.matched {
+                    audio_times_after(&emote, rt.render_time.saturating_sub(active.start).max(0) as u64)
+                } else {
+                    emote.audio.iter().map(|c| c.at_ms).collect()
+                };
                 active.state.playing = Some(Playing {
                     emote,
                     started: Instant::now(),
@@ -497,6 +542,95 @@ mod tests {
                 .any(|(c, cmd)| *c == 1 && matches!(cmd, AudioCommand::StopAll))
         );
         assert!(rt.slots[2].as_ref().unwrap().state.playing.is_some());
+    }
+
+    fn set_wire(es: &mut EntityState, id: u16) {
+        let mut angles = [0; 3];
+        assert!(crate::emote_net_codec::encode_cmd_angles(&mut angles, [0; 3], id));
+        for axis in 0..2 {
+            set(es, &format!("apos.trBase[{axis}]"),
+                ((angles[axis] as i16) as f32 * (360.0 / 65536.0)).to_bits());
+        }
+    }
+
+    fn set_taunt(es: &mut EntityState) {
+        set(es, "torsoAnim", jka_assets::animation::animation_index("BOTH_ENGAGETAUNT").unwrap() as u32);
+    }
+
+    #[test]
+    fn match_propagates_identity_variant_and_origin_and_survives_source_stop() {
+        // Client 1 begins the dance. Client 2 matches 1; then 3 matches 2.
+        // The third client inherits player 1's *original* timeline, not t=300.
+        let catalog = vec![dance()];
+        let id = wire_id(&catalog[0]).unwrap();
+        let (mut rt, _incoming, _completed) = fixture();
+        let mut receiver = crate::emote_net::Receiver::default();
+        receiver.on_snapshot(&snapshot(100, &[1, 2, 3], "BOTH_STAND1", None), 0);
+
+        let mut b = snapshot(150, &[1, 2, 3], "BOTH_STAND1", None);
+        set_taunt(&mut b.entities[0]);
+        set_wire(&mut b.entities[0], id);
+        let starts = receiver.on_snapshot(&b, 0);
+        assert_eq!(starts.len(), 1);
+        update(&mut rt, &b, 0, &starts, &catalog);
+        assert!(rt.slots[1].as_ref().unwrap().state.playing.is_none()); // still loading
+
+        let mut a = snapshot(250, &[1, 2, 3], "BOTH_STAND1", None);
+        set_taunt(&mut a.entities[0]);
+        set_taunt(&mut a.entities[1]);
+        set_wire(&mut a.entities[1], crate::emote_net_codec::match_reference_id(1).unwrap());
+        let starts = receiver.on_snapshot(&a, 0);
+        assert_eq!(starts.len(), 1);
+        update(&mut rt, &a, 0, &starts, &catalog);
+        let two = rt.slots[2].as_ref().unwrap();
+        assert_eq!((two.wire_id, two.start, two.matched), (id, 150, true));
+
+        let mut c = snapshot(300, &[1, 2, 3], "BOTH_STAND1", None);
+        for es in c.entities.iter_mut() { set_taunt(es); }
+        set_wire(&mut c.entities[2], crate::emote_net_codec::match_reference_id(2).unwrap());
+        let starts = receiver.on_snapshot(&c, 0);
+        assert_eq!(starts.len(), 1);
+        update(&mut rt, &c, 0, &starts, &catalog);
+        assert_eq!((rt.slots[3].as_ref().unwrap().wire_id, rt.slots[3].as_ref().unwrap().start), (id, 150));
+
+        let mut stop = c;
+        stop.server_time = 350;
+        set_wire(&mut stop.entities[0], STOP_ID);
+        let starts = receiver.on_snapshot(&stop, 0);
+        assert_eq!(starts.len(), 1);
+        update(&mut rt, &stop, 0, &starts, &catalog);
+        assert!(rt.slots[1].is_none());
+        assert_eq!(rt.slots[2].as_ref().unwrap().start, 150);
+        assert_eq!(rt.slots[3].as_ref().unwrap().start, 150);
+    }
+
+    #[test]
+    fn match_source_absent_is_ignored_instead_of_guessing_an_emote() {
+        let catalog = vec![dance()];
+        let (mut rt, _incoming, _completed) = fixture();
+        let snap = snapshot(250, &[2], "BOTH_ENGAGETAUNT", None);
+        update(&mut rt, &snap, 0, &[RemoteEmoteStart {
+            client_num: 2,
+            emote_id: crate::emote_net_codec::match_reference_id(1).unwrap(),
+            server_time: 250,
+        }], &catalog);
+        assert!(rt.slots[2].is_none());
+    }
+
+    #[test]
+    fn same_snapshot_reference_resolves_even_when_emitter_is_listed_first() {
+        let catalog = vec![dance()];
+        let id = wire_id(&catalog[0]).unwrap();
+        let (mut rt, _incoming, _completed) = fixture();
+        let snap = snapshot(250, &[1, 2], "BOTH_ENGAGETAUNT", None);
+        let starts = [
+            RemoteEmoteStart { client_num: 1,
+                emote_id: crate::emote_net_codec::match_reference_id(2).unwrap(), server_time: 250 },
+            RemoteEmoteStart { client_num: 2, emote_id: id, server_time: 250 },
+        ];
+        update(&mut rt, &snap, 0, &starts, &catalog);
+        assert_eq!(rt.slots[1].as_ref().unwrap().start, rt.slots[2].as_ref().unwrap().start);
+        assert_eq!(rt.slots[1].as_ref().unwrap().wire_id, id);
     }
 
     #[test]

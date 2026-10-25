@@ -1,7 +1,7 @@
 //! Live-editable client extensions (stage 2: read-only state + events).
 //!
 //! No code in this module touches wgpu, the prediction loop, or the renderer.
-//! File scanning, Rhai parsing and executing extension entrypoints all happen
+//! Asset lookup, Rhai parsing and executing extension entrypoints all happen
 //! on a dedicated worker. Later API bridges will send immutable snapshots and
 //! receive bounded HUD/world draw commands through this same worker.
 use std::{
@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use jka_assets::pk3::AssetSearchPath;
 use rhai::{CallFnOptions, Dynamic, Engine, Map, Scope, AST};
 use jka_protocol::{server::PlayerState, PLAYER_FIELDS, VEHICLE_ONLY_FIELDS};
 use crate::cgame::{ClientGameState, PresentationEvent};
@@ -423,6 +424,7 @@ pub struct ExtensionInfo {
     pub revision: u64,
     pub error: Option<String>,
     pub source: String,
+    pub editable: bool,
     /// Native HUD elements this extension replaces while it is running.
     pub hides: NativeHudMask,
 }
@@ -444,6 +446,7 @@ fn default_entry() -> String { "main.rhai".into() }
 #[derive(Debug)]
 enum Command {
     Refresh,
+    SetGame(Option<PathBuf>),
     Reload(String),
     SetEnabled(String, bool),
     SaveSource(String, String),
@@ -482,14 +485,14 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn spawn(root: PathBuf) -> Result<Self, String> {
+    pub fn spawn(base: PathBuf, game: Option<PathBuf>) -> Result<Self, String> {
+        let root = base.join("extensions");
         let (command_tx, command_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::sync_channel(2);
-        let worker_root = root.clone();
         thread::Builder::new()
             .name("rhai-extensions".into())
-            .spawn(move || Worker::new(worker_root, response_tx).run(command_rx, frame_rx))
+            .spawn(move || Worker::new(base, game, response_tx).run(command_rx, frame_rx))
             .map_err(|err| format!("Could not start extension worker: {err}"))?;
         let hud_layouts = fs::read_to_string(root.join("hud-layout.toml"))
             .ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default();
@@ -633,6 +636,8 @@ impl Manager {
         }
     }
 
+    pub fn set_game(&self, game: Option<PathBuf>) { let _ = self.tx.send(Command::SetGame(game)); }
+
     pub fn refresh(&self) { let _ = self.tx.send(Command::Refresh); }
     pub fn reload_selected(&self) {
         if let Some(id) = &self.selected { let _ = self.tx.send(Command::Reload(id.clone())); }
@@ -705,10 +710,13 @@ struct Slot {
     fingerprint: (String, String, bool),
     info: ExtensionInfo,
     active: Option<Active>,
+    source_path: Option<PathBuf>,
 }
 
 struct Worker {
     root: PathBuf,
+    base: PathBuf,
+    game: Option<PathBuf>,
     response: Sender<Response>,
     slots: BTreeMap<String, Slot>,
     revision: u64,
@@ -719,9 +727,9 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(root: PathBuf, response: Sender<Response>) -> Self {
+    fn new(base: PathBuf, game: Option<PathBuf>, response: Sender<Response>) -> Self {
         Self {
-            root, response, slots: BTreeMap::new(), revision: 0, force_reload: BTreeSet::new(),
+            root: base.join("extensions"), base, game, response, slots: BTreeMap::new(), revision: 0, force_reload: BTreeSet::new(),
             last_hud: Vec::new(), last_hidden: NativeHudMask::default(), last_preload: Vec::new(),
         }
     }
@@ -762,12 +770,23 @@ impl Worker {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Refresh => self.scan(false),
+            Command::SetGame(game) => {
+                if self.game == game { return; }
+                self.game = game;
+                self.slots.clear();
+                self.force_reload.clear();
+                self.send_snapshot();
+                self.send_hud();
+            }
             Command::Reload(id) => {
                 if !valid_id(&id) { return; }
                 self.force_reload.insert(id);
             }
             Command::SetEnabled(id, enabled) => {
-                if !valid_id(&id) || !self.root.join(&id).is_dir() { return; }
+                if !valid_id(&id) || !self.slots.contains_key(&id) { return; }
+                if let Err(err) = fs::create_dir_all(self.root.join(&id)) {
+                    self.log(format!("{id}: cannot update enabled state: {err}")); return;
+                }
                 let marker = self.root.join(&id).join(".disabled");
                 let result = if enabled {
                     match fs::remove_file(&marker) {
@@ -786,7 +805,9 @@ impl Worker {
                 let manifest_text = &slot.fingerprint.0;
                 let Ok(manifest) = toml::from_str::<Manifest>(manifest_text) else { return; };
                 if !valid_entry(&manifest.entry) { return; }
-                let path = self.root.join(&id).join(&manifest.entry);
+                let Some(path) = slot.source_path.as_ref() else {
+                    self.log(format!("{id}: packaged scripts are read-only; edit the source package")); return;
+                };
                 if path.is_symlink() { self.log(format!("{id}: script symlink refused")); return; }
                 match fs::write(path, source) {
                     Ok(()) => {
@@ -799,7 +820,8 @@ impl Worker {
             Command::SaveLayouts(layouts) => {
                 if let Ok(text) = toml::to_string(&layouts) {
                     // The worker owns all extension filesystem writes.
-                    if let Err(e) = fs::write(self.root.join("hud-layout.toml"), text) {
+                    if let Err(e) = fs::create_dir_all(&self.root)
+                        .and_then(|()| fs::write(self.root.join("hud-layout.toml"), text)) {
                         self.log(format!("HUD layout save failed: {e}"));
                     }
                 }
@@ -807,7 +829,7 @@ impl Worker {
             Command::Create(id) => {
                 if !valid_id(&id) { return; }
                 let path = self.root.join(&id);
-                if path.exists() { self.log(format!("{id}: extension already exists")); return; }
+                if path.exists() || self.slots.contains_key(&id) { self.log(format!("{id}: extension already exists")); return; }
                 if let Err(err) = fs::create_dir_all(&path) {
                     self.log(format!("{id}: cannot create extension: {err}"));
                     return;
@@ -825,38 +847,37 @@ impl Worker {
     }
 
     fn scan(&mut self, force: bool) {
-        if !self.root.is_dir() {
-            if !self.slots.is_empty() {
-                self.slots.clear();
-                self.send_snapshot();
-                self.send_hud();
-            }
-            return;
-        }
-        let Ok(entries) = fs::read_dir(&self.root) else { return; };
+        let mut assets = match AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+            Ok(assets) => assets,
+            Err(err) => { self.log(format!("Extension asset search: {err}")); return; }
+        };
+        let ids: BTreeSet<String> = assets.names().filter_map(|name| {
+            let id = name.strip_prefix("extensions/")?.strip_suffix("/extension.toml")?;
+            valid_id(id).then(|| id.to_owned())
+        }).take(MAX_EXTENSIONS).collect();
         let mut seen = BTreeSet::new();
         let mut changed = false;
-        for entry in entries.flatten() {
-            if seen.len() >= MAX_EXTENSIONS { break; }
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else { continue; };
-            if !valid_id(&id) || !entry.path().is_dir() || entry.path().is_symlink() { continue; }
+        for id in ids {
             seen.insert(id.clone());
-            let root = entry.path();
-            let manifest_str = read_limited(&root.join("extension.toml"), MAX_MANIFEST_BYTES)
+            let qroot = format!("extensions/{id}");
+            let manifest_str = read_asset_text(&mut assets, &format!("{qroot}/extension.toml"), MAX_MANIFEST_BYTES)
                 .unwrap_or_else(|err| format!("# Manifest read error: {err}"));
             let parsed = toml::from_str::<Manifest>(&manifest_str);
             let script_result = parsed.as_ref()
                 .map_err(|e| e.to_string())
                 .and_then(|m| {
                     if !valid_entry(&m.entry) { return Err("Invalid entry path (only a .rhai filename is allowed)".into()); }
-                    read_limited(&root.join(&m.entry), MAX_SOURCE_BYTES)
+                    read_asset_text(&mut assets, &format!("{qroot}/{}", m.entry), MAX_SOURCE_BYTES)
                 });
             let source = script_result.as_ref().cloned().unwrap_or_default();
-            let disabled = root.join(".disabled").exists();
+            // Enable state is a local preference, including for packaged extensions.
+            let disabled = self.root.join(&id).join(".disabled").exists();
+            let source_path = parsed.as_ref().ok().filter(|m| valid_entry(&m.entry))
+                .and_then(|m| assets.loose_file_path(&format!("{qroot}/{}", m.entry)));
             let fingerprint_source = script_result.as_ref().map_or_else(
                 |err| format!("<read error: {err}>"), Clone::clone);
             let fingerprint = (manifest_str, fingerprint_source, disabled);
-            if !force && !self.force_reload.remove(&id) && self.slots.get(&id).is_some_and(|slot| slot.fingerprint == fingerprint) {
+            if !force && !self.force_reload.remove(&id) && self.slots.get(&id).is_some_and(|slot| slot.fingerprint == fingerprint && slot.source_path == source_path) {
                 continue;
             }
             let hides = parsed.as_ref().map_err(|e| e.to_string())
@@ -867,7 +888,7 @@ impl Worker {
             let mut info = ExtensionInfo {
                 id: id.clone(), name: id.clone(), enabled: !disabled,
                 running: active.is_some(), revision: prior_revision,
-                error: None, source, hides: NativeHudMask::default(),
+                error: None, source, editable: source_path.is_some(), hides: NativeHudMask::default(),
             };
             let result = match parsed {
                 Ok(manifest) => {
@@ -903,7 +924,7 @@ impl Worker {
                 }
             }
             info.hides = active.as_ref().map_or_else(NativeHudMask::default, |a| a.hides);
-            self.slots.insert(id, Slot { fingerprint, info, active });
+            self.slots.insert(id, Slot { fingerprint, info, active, source_path });
             changed = true;
         }
         let old_len = self.slots.len();
@@ -1102,11 +1123,10 @@ impl Worker {
     }
 }
 
-fn read_limited(path: &Path, limit: usize) -> Result<String, String> {
-    if path.is_symlink() { return Err("symlinks are not permitted".into()); }
-    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if size > limit as u64 { return Err(format!("File exceeds {limit} bytes")); }
-    fs::read_to_string(path).map_err(|e| e.to_string())
+fn read_asset_text(assets: &mut AssetSearchPath, name: &str, limit: usize) -> Result<String, String> {
+    let asset = assets.read(name, limit).map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("Asset not found: {name}"))?;
+    String::from_utf8(asset.bytes).map_err(|err| err.to_string())
 }
 
 fn valid_id(s: &str) -> bool {
@@ -1124,6 +1144,100 @@ fn valid_entry(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct ExtensionFixture(PathBuf);
+
+    impl ExtensionFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("djk-extensions-{}-{}", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn loose(dir: &Path, name: &str, source: &str) {
+            let root = dir.join("extensions/test");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("extension.toml"), format!("api_version = 1\nname = '{name}'\n")).unwrap();
+            fs::write(root.join("main.rhai"), source).unwrap();
+        }
+
+        fn package(dir: &Path, name: &str, source: &str) {
+            use std::io::Write;
+            fs::create_dir_all(dir).unwrap();
+            let mut zip = zip::ZipWriter::new(fs::File::create(dir.join("extensions.pk3")).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("extensions/test/extension.toml", options).unwrap();
+            write!(zip, "api_version = 1\nname = '{name}'\n").unwrap();
+            zip.start_file("extensions/test/main.rhai", options).unwrap();
+            zip.write_all(source.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+    }
+
+    impl Drop for ExtensionFixture {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn discovery_uses_pk3_and_mod_precedence_and_local_enable_state() {
+        let fixture = ExtensionFixture::new();
+        let base = fixture.0.join("base");
+        let game = fixture.0.join("mod");
+        ExtensionFixture::loose(&base, "Base loose", "let base_loose = 1;");
+        ExtensionFixture::package(&base, "Base package", "let base_package = 1;");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(base.clone(), None, tx);
+        worker.scan(false);
+        assert_eq!(worker.slots.len(), 1);
+        assert_eq!(worker.slots["test"].info.name, "Base package");
+        assert!(worker.slots["test"].info.running);
+        assert!(!worker.slots["test"].info.editable);
+        worker.handle(Command::SaveSource("test".into(), "changed".into()));
+        assert_eq!(fs::read_to_string(base.join("extensions/test/main.rhai")).unwrap(), "let base_loose = 1;");
+        worker.handle(Command::SetEnabled("test".into(), false));
+        worker.scan(false);
+        assert!(!worker.slots["test"].info.enabled);
+        assert!(!worker.slots["test"].info.running);
+        worker.handle(Command::SetEnabled("test".into(), true));
+        worker.scan(false);
+        assert!(worker.slots["test"].info.running);
+
+        ExtensionFixture::loose(&game, "Mod loose", "let mod_loose = 1;");
+        worker.handle(Command::SetGame(Some(game.clone())));
+        worker.scan(false);
+        assert_eq!(worker.slots["test"].info.name, "Mod loose");
+        assert!(worker.slots["test"].info.editable);
+        worker.handle(Command::SaveSource("test".into(), "let edited = 2;".into()));
+        worker.scan(false);
+        assert_eq!(worker.slots["test"].info.source, "let edited = 2;");
+        assert_eq!(fs::read_to_string(game.join("extensions/test/main.rhai")).unwrap(), "let edited = 2;");
+
+        ExtensionFixture::package(&game, "Mod package", "let mod_package = 1;");
+        worker.scan(false);
+        assert_eq!(worker.slots["test"].info.name, "Mod package");
+        assert!(!worker.slots["test"].info.editable);
+        worker.handle(Command::SetGame(None));
+        worker.scan(false);
+        assert_eq!(worker.slots["test"].info.name, "Base package");
+    }
+
+    #[test]
+    fn packaged_extensions_work_without_a_loose_extensions_directory() {
+        let fixture = ExtensionFixture::new();
+        ExtensionFixture::package(&fixture.0, "Packaged", "let value = 1;");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(fixture.0.clone(), None, tx);
+        worker.scan(false);
+        assert!(worker.slots["test"].info.running);
+        assert!(!fixture.0.join("extensions").exists());
+        worker.handle(Command::SetEnabled("test".into(), false));
+        worker.scan(false);
+        assert!(!worker.slots["test"].info.running);
+        fs::remove_file(fixture.0.join("extensions.pk3")).unwrap();
+        worker.scan(false);
+        assert!(worker.slots.is_empty());
+    }
+
     #[test]
     fn safe_paths() {
         assert!(valid_id("speed-hud_1"));
@@ -1154,7 +1268,7 @@ mod tests {
     #[test]
     fn hud_registration_and_update_emit_bounded_draw_commands() {
         let (tx, _rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let script = r#"
             hud_register("speed", "Speed", 170.0, 45.0);
             fn on_update() {
@@ -1189,7 +1303,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn failed_update_hook_gives_native_elements_back() {
         let (tx, _rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let mut active = worker.compile("test", "fn on_update() { let x = 1 / 0; throw \"boom\"; }").unwrap();
         active.hides = NativeHudMask::from_names(&["ammo".to_owned()]).unwrap();
         assert!(active.effective_hides().contains(NativeHud::Ammo));
@@ -1200,7 +1314,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn top_level_variables_persist_between_callbacks() {
         let (tx, _rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let mut active = worker.compile("test", r#"
             hud_register("a", "A", 20.0, 20.0);
             let n = 0;
@@ -1217,7 +1331,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn bundled_ups_speedometer_runs_and_draws() {
         let (tx, _rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let manifest: Manifest = toml::from_str(include_str!("../extensions/ups-hud/extension.toml")).unwrap();
         assert!(NativeHudMask::from_names(&manifest.hides_native_hud).unwrap().contains(NativeHud::Speedometer));
         let mut active = worker.compile("ups-hud", include_str!("../extensions/ups-hud/main.rhai")).unwrap();
@@ -1262,7 +1376,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn bundled_jka_hud_draws_the_stock_tics_and_numbers() {
         let (tx, rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let manifest: Manifest = toml::from_str(include_str!("../extensions/jka-hud/extension.toml")).unwrap();
         let mask = NativeHudMask::from_names(&manifest.hides_native_hud).unwrap();
         assert!(mask.contains(NativeHud::Health) && mask.contains(NativeHud::Ammo) && !mask.contains(NativeHud::Speedometer));
@@ -1345,7 +1459,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn callbacks_do_not_rerun_script_top_level() {
         let (tx, rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         let mut active = worker.compile("test", "print(\"loaded\"); fn on_update() { } ").unwrap();
         assert!(rx.try_recv().is_ok());
         active.callback("on_update", None).unwrap();
@@ -1355,7 +1469,7 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn compiling_is_a_separate_stage_from_activation() {
         let (tx, _rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), tx);
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
         assert!(worker.compile("test", "let value = 42;").is_ok());
         assert!(worker.compile("test", "let value = ;").is_err());
         assert!(worker.compile("test", "while true { }").is_err());

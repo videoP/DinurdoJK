@@ -1078,7 +1078,7 @@ app_cvars! {
     APP_S_EAL {
         runtime: CvarDef::new(
                 "s_eal", "", "0..1",
-                "Use authored map .eal EAX reverb through optional OpenAL Soft, preserving Steam Audio direct sound.",
+                "Use authored map .eal filtering, diffraction, room routing and reverb through OpenAL Soft. EAL-owned sources use one acoustic renderer.",
                 CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
                 |app| CvarValue::String(App::cvar_get_s_eal(app)),
                 |app, value| App::cvar_set_s_eal(app, APP_S_EAL.entry.name, &value.to_string()),
@@ -1099,6 +1099,67 @@ app_cvars! {
                     if let Some(sound) = self.game_session.as_mut()
                         .and_then(|session| session.sound_presenter.as_mut()) {
                         sound.set_eal_enabled(enabled);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_S_EALDEBUG {
+        runtime: CvarDef::new(
+                "s_ealDebug", "0", "0..9",
+                "EAL transport: 0 normal EAX with callback PCM (legacy queue fallback if unsupported), 1 direct PCM (no OpenAL), 2 OpenAL dry, 3 cached EAX, 4 OpenAL non-spatial, 5 queue tone, 6 queue double preroll, 7 EAX callback, 8 callback tone, 9 original queue-based EAX (A/B only). Not archived.",
+                CvarType::Int { min: 0, max: 9 }, CvarFlags::NONE, LatchScope::None,
+                |app: &App| CvarValue::Int(i32::from(app.audio.eal_debug_mode)),
+                |app, value| App::cvar_set_s_ealdebug(app, APP_S_EALDEBUG.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_s_ealdebug, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_s_ealdebug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = Self::parse_cvar_finite(name, value)?;
+                    if mode.fract() != 0.0 || !(0.0..=9.0).contains(&mode) {
+                        return Err(format!("{name} must be an integer from 0 through 9"));
+                    }
+                    self.audio.eal_debug_mode = mode as u8;
+                    if let Some(sound) = self.game_session.as_mut()
+                        .and_then(|session| session.sound_presenter.as_mut()) {
+                        sound.set_eal_debug_mode(mode as u8);
+                    }
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_S_EALHRTF {
+        runtime: CvarDef::new(
+                "s_ealHrtf", "0", "0..1",
+                "OpenAL Soft headphone HRTF for map-authored EAL sources. Independent of Steam Audio HRTF; updates live.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_s_ealhrtf(app)),
+                |app, value| App::cvar_set_s_ealhrtf(app, APP_S_EALHRTF.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_s_ealhrtf, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| {
+                settings.eal_hrtf = parse_bool(value).unwrap_or(settings.eal_hrtf);
+            }),
+            archive: Some((431, |state| format!("{}", u8::from(state.audio.eal_hrtf)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_s_ealhrtf(&self) -> String { bool_value(self.audio.eal_hrtf) }
+                fn cvar_set_s_ealhrtf(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.audio.eal_hrtf = enabled;
+                    if let Some(sound) = self.game_session.as_mut()
+                        .and_then(|session| session.sound_presenter.as_mut()) {
+                        sound.set_eal_hrtf_enabled(enabled);
                     }
                     self.mark_config_dirty();
                     self.publish_ui();

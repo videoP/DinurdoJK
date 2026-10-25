@@ -1196,6 +1196,7 @@ fn hiz_occlusion_shaders_validate() {
         ("gpu_cull", include_str!("../../gpu_cull.wgsl")),
         ("hiz_build", include_str!("../../hiz_build.wgsl")),
         ("hiz_reduce", include_str!("../../hiz_reduce.wgsl")),
+        ("entity_hiz_probe", include_str!("../../entity_hiz_probe.wgsl")),
     ] {
         let module = wgpu::naga::front::wgsl::parse_str(source)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
@@ -1205,6 +1206,25 @@ fn hiz_occlusion_shaders_validate() {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+    }
+}
+
+#[test]
+fn lamp_receiver_culling_guard_resolves_for_raster_and_rt_shader_variants() {
+    // Regression: an undeclared RT-only override in the shared lamp WGSL
+    // used to crash Vulkan on startup while creating the raster BSP module.
+    for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
+        let raster = compose_world_shader(base);
+        assert!(raster.contains(
+            "fn lamp_raster_receiver_culling_safe() -> bool { return true; }"
+        ));
+        assert!(!raster.contains(
+            "fn lamp_raster_receiver_culling_safe() -> bool { return !ENABLE_RAY_TRACED_SHADOWS; }"
+        ));
+        let rt = compose_world_shader(&ray_traced_world_shader_source(base).unwrap());
+        assert!(rt.contains(
+            "fn lamp_raster_receiver_culling_safe() -> bool { return true; }"
+        ));
     }
 }
 
@@ -1254,6 +1274,7 @@ fn all_renderer_shaders_validate() {
         ("cull_debug", include_str!("../../cull_debug.wgsl")),
         ("hiz_build", include_str!("../../hiz_build.wgsl")),
         ("hiz_reduce", include_str!("../../hiz_reduce.wgsl")),
+        ("entity_hiz_probe", include_str!("../../entity_hiz_probe.wgsl")),
         ("cluster_lights", include_str!("../../cluster_lights.wgsl")),
         ("froxel_fog", include_str!("../../froxel_fog.wgsl")),
         ("ocean_windrow", include_str!("../../ocean_windrow.wgsl")),
@@ -1600,6 +1621,7 @@ fn blob_shadow_request_projects_onto_a_render_space_floor() {
     assert!(!indices.is_empty());
     for vertex in &vertices {
         assert!(vertex.position[0].abs() <= 24.01 && vertex.position[2].abs() <= 24.01);
+        assert_eq!(vertex.color[3], 0.5, "markShadow fades through vertex alpha");
         assert!(
             (vertex.position[1] - BLOB_MARK_SURFACE_LIFT).abs() < 1.0e-4,
             "lifted along render up"
@@ -1782,7 +1804,8 @@ fn promoted_water_gpu_views_and_spray_validate() {
         let pools: Vec<_> = (0..2).map(|i| PromotedOcean { index:i,name:format!("pool{i}"),
             surface:OceanSurface { plane_height:100.0+i as f32*200.0,
                 minimum:[0.0;2],maximum:[4096.0;2] },heuristic:wave_heuristic(i as f32,None),
-            color:[0.1,0.2,0.3],roughness:None,swell_direction:None }).collect();
+            color:[0.1,0.2,0.3],roughness:None,source_deformation: None, source_alpha: None,
+            swell_direction:None }).collect();
         let surfaces: Vec<_> = pools.iter().map(|p| p.surface).collect();
         ocean.set_enabled(&queue,true);
         ocean.set_surfaces(&queue,&surfaces);

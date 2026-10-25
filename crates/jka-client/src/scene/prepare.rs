@@ -430,9 +430,11 @@ pub(in crate::scene) fn prepare_internal(
                 })
         })
         .collect();
-    let mark_surfaces = (!options.visual_only).then(|| Arc::new(
-        jka_assets::bsp::MarkSurfaces::from_bsp(&bsp, &mesh, &mark_shader_flags),
-    ));
+    // Geometry/UV index can be prepared before image decode; attach its small
+    // material-color thumbnails below when the authored stages are resolved.
+    let mut mark_surfaces = (!options.visual_only).then(||
+        jka_assets::bsp::MarkSurfaces::from_bsp(&bsp, &mesh, &mark_shader_flags)
+    );
 
     let bsp_stats = BspMapStats {
         inline_model_midpoints: bsp
@@ -459,6 +461,16 @@ pub(in crate::scene) fn prepare_internal(
             .map_or(0, |visibility| visibility.clusters),
     };
     let distance_cull = bsp_worldspawn_distance_cull(&bsp, &mut warnings);
+    // TaystJK SP_worldspawn: G_SpawnString("music", "", &text) -> CS_MUSIC.
+    // Preserve the authored intro/loop pair verbatim; parsing belongs to CGame.
+    let worldspawn_music = bsp.entities.iter().find(|entity| {
+        entity.properties.iter().rev().any(|(key, value)| {
+            key.eq_ignore_ascii_case(b"classname") && value.eq_ignore_ascii_case(b"worldspawn")
+        })
+    }).and_then(|entity| {
+        entity.properties.iter().rev().find(|(key, _)| key.eq_ignore_ascii_case(b"music"))
+            .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+    });
     let sky_portal = bsp_sky_portal(&bsp);
     let global_fog_num = bsp_global_fog_num(&bsp);
     let global_fog = bsp_global_fog_params(&bsp, &library);
@@ -653,6 +665,26 @@ pub(in crate::scene) fn prepare_internal(
             )
         })
         .collect();
+    if let Some(marks) = mark_surfaces.as_mut() {
+        marks.set_color_textures(
+            surface_materials.iter().map(|material| {
+                // Only genuinely static base-UV diffuse stages: never sample
+                // scrolling/video/lightmap/additive/sky/environment maps as if
+                // they were a painted wall color.
+                let stage = material.stages.iter().find(|stage| {
+                    stage.blend.is_none()
+                        && stage.tc_mods.is_empty()
+                        && matches!(stage.tc_gen, jka_assets::shader::TcGen::Base)
+                        && stage.animation.is_none()
+                        && matches!(stage.texture, materials::StageTexture::Image(_))
+                })?;
+                let materials::StageTexture::Image(index) = stage.texture else { return None; };
+                let image = textures.images.get(index)?;
+                super::saber_color::mark_color_thumbnail(image, stage.color)
+            }).collect(),
+        );
+    }
+    let mark_surfaces = mark_surfaces.map(Arc::new);
     // Menu scene only: a stock water material for the synthesized water face,
     // described here so its textures join the map's texture set.
     let menu_scenery = (options.menu_look && super::menu_look::is_menu_map(name))
@@ -691,7 +723,7 @@ pub(in crate::scene) fn prepare_internal(
     let tints_ms = tints_started.elapsed().as_secs_f64() * 1000.0;
 
     let lights_started = Instant::now();
-    let (surface_lights, gi_surface_lights, surface_light_stats) =
+    let (surface_lights, gi_surface_lights, surface_light_stats, static_bake_lights) =
         bsp_surface_lights(&mesh, &surface_materials);
     let surface_lights_ms = lights_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1942,6 +1974,7 @@ pub(in crate::scene) fn prepare_internal(
         sub_bsp_names: Vec::new(),
         debug_volumes,
         authored_oceans,
+        water_brush_bounds: crate::ocean::volume::from_bsp(&bsp),
         movement,
         collision,
         mark_surfaces,
@@ -1976,6 +2009,7 @@ pub(in crate::scene) fn prepare_internal(
         steam_audio_bake_request,
         visibility,
         lights,
+        static_bake_lights,
         source_map_lighting: SourceMapLighting::default(),
         baked_sun_encoding,
         sun,
@@ -1993,6 +2027,7 @@ pub(in crate::scene) fn prepare_internal(
         world_effect_registrations,
         brush_entities,
         entity_graph,
+        worldspawn_music,
         distance_cull,
         sky_portal,
         triangles,

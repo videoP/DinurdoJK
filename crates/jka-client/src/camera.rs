@@ -650,11 +650,88 @@ impl ShakeRng {
     }
 }
 
+/// Exact five archived first-person view-motion cvars in TaystJK cg_xcvar.h.
+/// TaystJK defaults ALL five to zero (unlike stock OpenJK).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ViewBobSettings {
+    pub bob_up: f32,
+    pub bob_pitch: f32,
+    pub bob_roll: f32,
+    pub run_pitch: f32,
+    pub run_roll: f32,
+}
+
+/// The predicted playerState inputs consumed by TaystJK's
+/// CG_CalcViewValues / CG_OffsetFirstPersonView. Angles and velocity are in
+/// native JKA units. This state is presentation-only.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewBobInput {
+    pub angles: [f32; 3],
+    pub velocity: [f32; 3],
+    pub bob_cycle: i32,
+    pub pm_flags: i32,
+    pub pm_type: i32,
+    pub health: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ViewBobAngles {
+    pitch: f32,
+    roll: f32,
+    height: f32,
+}
+
+/// TaystJK cg_view.c: the 0..127 phase makes two identical positive half
+/// cycles, while bit 7 flips the lateral (roll) direction each step.
+fn tayst_view_bob(settings: ViewBobSettings, input: ViewBobInput) -> ViewBobAngles {
+    // PM_INTERMISSION bypasses CG_OffsetFirstPersonView. Dead views use the
+    // fixed dead camera instead of velocity/bob motion.
+    if input.pm_type == 7 || input.health <= 0 {
+        return ViewBobAngles::default();
+    }
+    let [pitch_deg, yaw_deg, _] = input.angles;
+    let pitch = pitch_deg.to_radians();
+    let yaw = yaw_deg.to_radians();
+    let (sp, cp) = pitch.sin_cos();
+    let (sy, cy) = yaw.sin_cos();
+    // OpenJK AngleVectors: viewaxis[0] = forward, viewaxis[1] = RIGHT,
+    // computed *before* run/bob pitch and roll are added.
+    let forward = [cp * cy, cp * sy, -sp];
+    let right = [sy, -cy, 0.0];
+    let dot = |axis: [f32; 3]| -> f32 {
+        input.velocity.iter().zip(axis).map(|(v, a)| *v * a).sum()
+    };
+    // CG_CalcViewValues caps xyspeed at 270, but the velocity-based tilts
+    // above intentionally use the full predicted velocity vector.
+    let xyspeed = input.velocity[0].hypot(input.velocity[1]).min(270.0);
+    let bobfracsin = (((input.bob_cycle & 127) as f32 / 127.0) * std::f32::consts::PI).sin().abs();
+    let duck_multiplier = if input.pm_flags & 1 != 0 { 3.0 } else { 1.0 }; // PMF_DUCKED
+    let speed = xyspeed.max(200.0);
+    let native_pitch = dot(forward) * settings.run_pitch
+        + bobfracsin * settings.bob_pitch * speed * duck_multiplier;
+    let alternate = if input.bob_cycle & 128 != 0 { -1.0 } else { 1.0 };
+    let native_roll = -dot(right) * settings.run_roll
+        + alternate * bobfracsin * settings.bob_roll * speed * duck_multiplier;
+    // Tayst clamps the positive bob height at six units, not symmetrically.
+    let height = (bobfracsin * xyspeed * settings.bob_up).min(6.0);
+    // JKA pitch is positive downward; our renderer pitch is positive upward.
+    // JKA roll maps to RH rotation around the forward axis in render space.
+    ViewBobAngles {
+        pitch: -native_pitch.to_radians(),
+        roll: native_roll.to_radians(),
+        height,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    /// Renderer-space roll in radians. Positive is right-hand rotation about forward.
+    pub roll: f32,
+    /// Pitch offset for late-latched first-person input. Already in renderer radians.
+    view_bob_pitch: f32,
     /// Pending CGame screen shake. Not part of the base view: it is re-applied
     /// after every late-latch overwrite of position/yaw/pitch.
     pub shake: CameraShakeOffset,
@@ -674,6 +751,8 @@ impl Camera {
             position: Vec3::from_array(position),
             yaw,
             pitch: 0.0,
+            roll: 0.0,
+            view_bob_pitch: 0.0,
             shake: CameraShakeOffset::default(),
             cg_fov: cg_fov.clamp(MIN_CG_FOV, MAX_CG_FOV),
             near: 1.0,
@@ -705,6 +784,30 @@ impl Camera {
     pub fn far_distance(&self) -> f32 { self.far }
 
     pub fn near_distance(&self) -> f32 { self.near }
+
+    /// Presentation-only TaystJK first-person movement view offsets.
+    /// Call once when establishing a new first-person base camera. The late
+    /// input mailbox reapplies *only* view_bob_pitch after replacing pitch;
+    /// it never double-applies the vertical offset.
+    pub fn apply_first_person_bob(&mut self, settings: ViewBobSettings, input: ViewBobInput) {
+        let offset = tayst_view_bob(settings, input);
+        self.position.y += offset.height;
+        self.pitch += offset.pitch;
+        self.roll = offset.roll;
+        self.view_bob_pitch = offset.pitch;
+    }
+
+    /// Clear first-person-only view motion when switching to a chase/free camera.
+    pub fn clear_first_person_bob(&mut self) {
+        self.view_bob_pitch = 0.0;
+        self.roll = 0.0;
+    }
+
+    /// Latest input angle samples contain unbobbed view pitch; retain the bob
+    /// during direct late latching without shifting the eye position twice.
+    pub fn late_latched_pitch(&self, unbobbed_pitch: f32) -> f32 {
+        unbobbed_pitch + self.view_bob_pitch
+    }
 
     /// Add the pending shake to a freshly assigned base view (position + angles).
     pub fn apply_shake(&mut self) {
@@ -754,6 +857,9 @@ impl Camera {
         let forward = self.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
+        let rotation = glam::Quat::from_axis_angle(forward, self.roll);
+        let right = rotation * right;
+        let up = rotation * up;
         let mut corners = [Vec3::ZERO; 8];
         for (plane, distance) in [near_distance.max(self.near), far_distance.min(self.far)]
             .into_iter()
@@ -805,7 +911,11 @@ impl Camera {
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
         let aspect = width / height;
-        let view = Mat4::look_to_rh(self.position, self.forward(), Vec3::Y);
+        let forward = self.forward();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let base_up = right.cross(forward).normalize_or_zero();
+        let up = glam::Quat::from_axis_angle(forward, self.roll) * base_up;
+        let view = Mat4::look_to_rh(self.position, forward, up);
         // Camera depth is permanently reversed-Z: near -> 1, far -> 0.
         // Shadow maps keep their own conventional depth convention.
         let projection = Mat4::perspective_rh(fov_y, aspect, self.far, self.near);
@@ -821,6 +931,92 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bob_input() -> ViewBobInput {
+        ViewBobInput {
+            angles: [0.0, 0.0, 0.0],
+            velocity: [300.0, 0.0, 0.0],
+            bob_cycle: 63,
+            pm_flags: 0,
+            pm_type: 0,
+            health: 100,
+        }
+    }
+
+    #[test]
+    fn tayst_view_motion_defaults_zero_and_off_during_intermission() {
+        assert_eq!(tayst_view_bob(ViewBobSettings::default(), bob_input()), ViewBobAngles::default());
+        let mut settings = ViewBobSettings::default();
+        settings.bob_up = 0.005;
+        let mut input = bob_input();
+        input.pm_type = 7;
+        assert_eq!(tayst_view_bob(settings, input), ViewBobAngles::default());
+        input.pm_type = 0;
+        input.health = 0;
+        assert_eq!(tayst_view_bob(settings, input), ViewBobAngles::default());
+    }
+
+    #[test]
+    fn tayst_bob_height_caps_speed_at_270_and_height_at_six() {
+        let input = bob_input();
+        let mut settings = ViewBobSettings::default();
+        settings.bob_up = 0.005;
+        let peak = (63.0f32 / 127.0 * std::f32::consts::PI).sin().abs();
+        let bob = tayst_view_bob(settings, input);
+        assert!((bob.height - peak * 270.0 * 0.005).abs() < 1e-5);
+        settings.bob_up = 1.0;
+        assert_eq!(tayst_view_bob(settings, input).height, 6.0);
+    }
+
+    #[test]
+    fn tayst_footstep_bob_roll_flips_and_ducking_triples_angles() {
+        let mut input = bob_input();
+        let settings = ViewBobSettings {
+            bob_pitch: 0.002, bob_roll: 0.002, ..ViewBobSettings::default()
+        };
+        let standing = tayst_view_bob(settings, input);
+        assert!(standing.pitch < 0.0 && standing.roll > 0.0);
+        input.bob_cycle = 63 | 128;
+        let other_foot = tayst_view_bob(settings, input);
+        assert!((standing.roll + other_foot.roll).abs() < 1e-6);
+        assert!((standing.pitch - other_foot.pitch).abs() < 1e-6);
+        input.pm_flags = 1; // PMF_DUCKED
+        let ducked = tayst_view_bob(settings, input);
+        assert!((ducked.pitch - 3.0 * other_foot.pitch).abs() < 1e-6);
+        assert!((ducked.roll - 3.0 * other_foot.roll).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tayst_run_pitch_and_roll_follow_camera_local_velocity() {
+        let input = bob_input();
+        let settings = ViewBobSettings {
+            run_pitch: 0.002, run_roll: 0.005, ..ViewBobSettings::default()
+        };
+        let forward = tayst_view_bob(settings, input);
+        assert!((forward.pitch - (-0.6f32).to_radians()).abs() < 1e-6);
+        assert_eq!(forward.roll, 0.0);
+        let mut side = input;
+        side.velocity = [0.0, -300.0, 0.0]; // native JKA right at yaw 0
+        let strafe = tayst_view_bob(settings, side);
+        assert!(strafe.pitch.abs() < 1e-6);
+        assert!((strafe.roll - (-1.5f32).to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn view_roll_affects_projection_and_latched_pitch_retains_bob() {
+        let mut camera = Camera::new([0.0, 0.0, 0.0], 0.0);
+        let no_roll = camera.view_projection(1280, 720);
+        camera.roll = 0.1;
+        assert_ne!(camera.view_projection(1280, 720), no_roll);
+        camera.apply_first_person_bob(ViewBobSettings {
+            bob_pitch: 0.002, ..ViewBobSettings::default()
+        }, bob_input());
+        let first = camera.pitch;
+        assert!((camera.late_latched_pitch(0.0) - first).abs() < 1e-6);
+        camera.clear_first_person_bob();
+        assert_eq!(camera.late_latched_pitch(0.0), 0.0);
+        assert_eq!(camera.roll, 0.0);
+    }
 
     fn third_person_input(view_angles: [f32; 3], velocity: [f32; 3], time: f64) -> ThirdPersonViewInput {
         ThirdPersonViewInput {

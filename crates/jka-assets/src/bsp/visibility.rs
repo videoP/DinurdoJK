@@ -268,6 +268,63 @@ impl Visibility {
         self.leaf_at(point)
             .and_then(|leaf| usize::try_from(self.leaf_areas[leaf]).ok())
     }
+    /// Conservative visibility of a world-space box. Test every non-solid
+    /// leaf it touches, rather than the origin (which can lie inside a wall).
+    /// Unknown bounds/view/leaf membership fail open. A set area-mask bit hides
+    /// that area, just as in a snapshot. No heap allocation on the frame path.
+    pub fn box_visible(
+        &self, from: Option<usize>, mins: [f32; 3], maxs: [f32; 3],
+        area_mask: Option<&[u8; 32]>,
+    ) -> bool {
+        let Some(from) = from.filter(|&c| c < self.clusters) else { return true };
+        if (0..3).any(|i| !mins[i].is_finite() || !maxs[i].is_finite() || mins[i] > maxs[i]) {
+            return true;
+        }
+        fn visit(vis: &Visibility, mut node: i32, from: usize, mins: [f32; 3], maxs: [f32; 3],
+                 mask: Option<&[u8; 32]>, depth: usize, budget: &mut usize) -> Option<bool> {
+            if depth >= 128 { return Some(true); }
+            loop {
+                if *budget == 0 { return Some(true); }
+                *budget -= 1;
+                if node < 0 {
+                    let leaf = -(node + 1) as usize;
+                    let cluster = usize::try_from(*vis.leaves.get(leaf)?).ok()?;
+                    let area_visible = mask.is_none_or(|mask| {
+                        usize::try_from(vis.leaf_areas[leaf]).ok()
+                            .filter(|&area| area < 256)
+                            .is_none_or(|area| mask[area / 8] & (1 << (area % 8)) == 0)
+                    });
+                    return Some(area_visible && vis.visible(Some(from), &[cluster]));
+                }
+                let record = &vis.nodes[node as usize];
+                let plane = vis.planes[record.plane];
+                let (mut near, mut far) = (0.0f32, 0.0f32);
+                for i in 0..3 {
+                    let (a, b) = (plane.normal[i] * mins[i], plane.normal[i] * maxs[i]);
+                    near += a.min(b);
+                    far += a.max(b);
+                }
+                // Include both leaves at a split plane; rounding must never
+                // hide geometry touching the visible side of a doorway.
+                if near > plane.distance + 0.01 {
+                    node = record.children[0];
+                } else if far < plane.distance - 0.01 {
+                    node = record.children[1];
+                } else {
+                    let front = visit(vis, record.children[0], from, mins, maxs, mask, depth + 1, budget);
+                    if front == Some(true) { return front; }
+                    let back = visit(vis, record.children[1], from, mins, maxs, mask, depth + 1, budget);
+                    return match (front, back) {
+                        (None, None) => None,
+                        (a, b) => Some(a.unwrap_or(false) || b.unwrap_or(false)),
+                    };
+                }
+            }
+        }
+        let mut budget = self.nodes.len().saturating_mul(2).saturating_add(8);
+        visit(self, 0, from, mins, maxs, area_mask, 0, &mut budget).unwrap_or(true)
+    }
+
     /// Missing/invalid source or unassigned surfaces conservatively remain visible.
     pub fn visible(&self, from: Option<usize>, targets: &[usize]) -> bool {
         let Some(from) = from.filter(|&v| v < self.clusters) else {
@@ -429,6 +486,36 @@ mod tests {
         assert_eq!(locator.box_areas([-8.0, 0.0, 0.0], [-1.0, 8.0, 8.0]), [Some(5), None]);
         assert_eq!(locator.box_areas([-4.0, 0.0, 0.0], [4.0, 8.0, 8.0]), [Some(3), Some(5)]);
     }
+    #[test]
+    fn box_pvs_keeps_straddling_models_and_handles_unknown_membership() {
+        let mut vis = fixture(-1).unwrap().unwrap();
+        assert!(vis.box_visible(Some(0), [1.0; 3], [8.0; 3], None));
+        assert!(!vis.box_visible(Some(0), [-8.0; 3], [-1.0; 3], None));
+        assert!(vis.box_visible(Some(0), [-8.0; 3], [1.0; 3], None));
+        assert!(vis.box_visible(Some(0), [-8.0; 3], [0.0; 3], None));
+        assert!(vis.box_visible(None, [-8.0; 3], [-1.0; 3], None));
+        assert!(vis.box_visible(Some(999), [-8.0; 3], [-1.0; 3], None));
+        assert!(vis.box_visible(Some(0), [f32::NAN; 3], [1.0; 3], None));
+        assert!(vis.box_visible(Some(0), [8.0; 3], [1.0; 3], None));
+        vis.leaves = vec![-1, -1];
+        assert!(vis.box_visible(Some(0), [-8.0; 3], [1.0; 3], None));
+    }
+
+    #[test]
+    fn box_pvs_and_area_mask_must_agree_on_a_touched_leaf() {
+        let mut vis = fixture(-1).unwrap().unwrap();
+        vis.leaf_areas = vec![0, 1];
+        let mut mask = [0; 32];
+        mask[0] = 1; // close front area
+        assert!(!vis.box_visible(Some(0), [-8.0; 3], [8.0; 3], Some(&mask)));
+        // The back leaf is in an open area but is outside the PVS.
+        vis.bits[0] = 3;
+        assert!(vis.box_visible(Some(0), [-8.0; 3], [8.0; 3], Some(&mask)));
+        mask[0] = 3;
+        assert!(!vis.box_visible(Some(0), [-8.0; 3], [8.0; 3], Some(&mask)));
+        assert!(vis.box_visible(None, [-8.0; 3], [8.0; 3], Some(&mask)));
+    }
+
     #[test]
     fn rejects_cycles_bad_children_and_truncated_bits() {
         assert!(fixture(0).is_err());

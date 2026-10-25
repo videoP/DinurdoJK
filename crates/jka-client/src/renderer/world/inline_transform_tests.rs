@@ -128,6 +128,9 @@ fn inline_transform_gpu_matches_cpu() {
         let models: Vec<_> = [5, 134]
             .into_iter()
             .map(|start| InlineModelGpu {
+                pvs_visible: None,
+                pvs_bounds_dirty: true,
+                pvs_area_rejected: false,
                 model: 1,
                 gpu_vertex_start: start,
                 base: base.clone(),

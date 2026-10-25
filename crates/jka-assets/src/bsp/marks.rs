@@ -41,6 +41,10 @@ struct MarkTriangle {
     normal: [f32; 3],
     /// The triangle is skipped unless `dot(normal, dir) <= -min_facing`.
     min_facing: f32,
+    /// Authored UV and BSP shader for *local* burn-color lookup; none for
+    /// synthetic/test geometry which has no material attached.
+    base_uv: Option<[[f32; 2]; 3]>,
+    shader: usize,
 }
 
 /// Immutable, cheap-to-clone (`Arc` it) markable-surface index of one map.
@@ -51,6 +55,9 @@ pub struct MarkSurfaces {
     cells: Vec<(u64, u32)>,
     /// Triangles too large for the cell grid; tested by bounds on every query.
     large: Vec<u32>,
+    /// Small immutable CPU-side linear-albedo thumbnails, indexed by BSP shader.
+    /// Built once during map preparation after material resolution. No GPU reads.
+    color_textures: Vec<Option<MarkColorTexture>>,
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -103,7 +110,7 @@ fn bounds_of(points: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
 impl MarkTriangle {
     fn new(points: [[f32; 3]; 3], normal: [f32; 3], min_facing: f32) -> Self {
         let (mins, maxs) = bounds_of(&points);
-        Self { points, mins, maxs, normal, min_facing }
+        Self { points, mins, maxs, normal, min_facing, base_uv: None, shader: usize::MAX }
     }
 }
 
@@ -138,7 +145,86 @@ impl MarkBuffer {
     }
 }
 
+/// Downsampled *linear* albedo for one shader's non-animated base stage.
+/// A small footprint blur is built into the thumbnail, preventing texel noise
+/// from imprinting onto the molten surface. No full-resolution image retained.
+#[derive(Debug, Clone)]
+pub struct MarkColorTexture {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<[f32; 3]>,
+    pub clamp: bool,
+}
+
+impl MarkColorTexture {
+    fn sample(&self, uv: [f32; 2]) -> Option<[f32; 3]> {
+        if self.width == 0 || self.height == 0 || self.pixels.len() != self.width * self.height
+            || !uv[0].is_finite() || !uv[1].is_finite()
+        { return None; }
+        // Filter across seams just like the authored repeating texture, rather
+        // than sampling the wrong end of the image at UV integers.
+        let wrap = |i: isize, size: usize| -> usize {
+            if self.clamp { i.clamp(0, size as isize - 1) as usize }
+            else { i.rem_euclid(size as isize) as usize }
+        };
+        let x = uv[0] * self.width as f32 - 0.5;
+        let y = uv[1] * self.height as f32 - 0.5;
+        let (ix, iy) = (x.floor() as isize, y.floor() as isize);
+        let (tx, ty) = (x - x.floor(), y - y.floor());
+        let get = |x, y| self.pixels[wrap(y, self.height) * self.width + wrap(x, self.width)];
+        let (a, b, c, d) = (get(ix, iy), get(ix + 1, iy), get(ix, iy + 1), get(ix + 1, iy + 1));
+        Some(std::array::from_fn(|channel| {
+            let top = a[channel] + (b[channel] - a[channel]) * tx;
+            let bottom = c[channel] + (d[channel] - c[channel]) * tx;
+            top + (bottom - top) * ty
+        }))
+    }
+}
+
 impl MarkSurfaces {
+    /// Add resolved *base* material colors to an existing markable triangle index.
+    /// Must be called before the index is published through Arc.
+    pub fn set_color_textures(&mut self, textures: Vec<Option<MarkColorTexture>>) {
+        self.color_textures = textures;
+    }
+
+    /// Sample the authored base stage in the region actually hit by the blade.
+    /// Work is confined to the static 128-unit cell containing the impact; this
+    /// is called at contact time, NOT per vertex or fragment during rendering.
+    pub fn sample_base_color(&self, point: [f32; 3], normal: [f32; 3]) -> Option<[f32; 3]> {
+        let n = normalize(normal);
+        if n == [0.0; 3] { return None; }
+        let key = cell_key(cell_coord(point[0]), cell_coord(point[1]), cell_coord(point[2]));
+        let start = self.cells.partition_point(|entry| entry.0 < key);
+        let mut best: Option<([f32; 3], f32)> = None;
+        let mut visit = |index: usize| {
+            let Some(t) = self.triangles.get(index) else { return; };
+            if dot(t.normal, n) < 0.95 { return; }
+            let (Some(uvs), Some(texture)) = (t.base_uv, self.color_textures.get(t.shader).and_then(Option::as_ref)) else { return; };
+            let e0 = sub(t.points[1], t.points[0]);
+            let e1 = sub(t.points[2], t.points[0]);
+            let d = sub(point, t.points[0]);
+            let (aa, ab, bb) = (dot(e0, e0), dot(e0, e1), dot(e1, e1));
+            let denom = aa * bb - ab * ab;
+            if denom <= 1.0e-6 { return; }
+            let (ad, bd) = (dot(e0, d), dot(e1, d));
+            let u = (ad * bb - bd * ab) / denom;
+            let v = (bd * aa - ad * ab) / denom;
+            if u < -0.015 || v < -0.015 || u + v > 1.015 { return; }
+            let distance = dot(d, t.normal).abs();
+            if distance > 1.6 || best.is_some_and(|(_, previous)| distance >= previous) { return; }
+            let uv = std::array::from_fn(|channel| {
+                uvs[0][channel] * (1.0 - u - v) + uvs[1][channel] * u + uvs[2][channel] * v
+            });
+            if let Some(rgb) = texture.sample(uv) { best = Some((rgb, distance)); }
+        };
+        for &(_, index) in self.cells[start..].iter().take_while(|entry| entry.0 == key) {
+            visit(index as usize);
+        }
+        for &index in &self.large { visit(index as usize); }
+        best.map(|(color, _)| color)
+    }
+
     /// Index of plain world triangles (each with its outward normal), treated
     /// like `SF_FACE`. Used when there is no BSP surface table to read flags
     /// from, such as a source-.map preview or a test.
@@ -196,13 +282,19 @@ impl MarkSurfaces {
                 let points = [a.position, b.position, c.position];
                 if planar {
                     // SF_FACE: `DotProduct(plane.normal, dir) > -0.5` is skipped.
-                    triangles.push(MarkTriangle::new(points, face_normal, 0.5));
+                    let mut triangle = MarkTriangle::new(points, face_normal, 0.5);
+                    triangle.base_uv = Some([a.texcoord, b.texcoord, c.texcoord]);
+                    triangle.shader = batch.shader;
+                    triangles.push(triangle);
                 } else {
                     // SF_GRID triangulates each quad as (v0, v[w], v1) then
                     // (v1, v[w], v[w+1]); the mesh keeps that winding and order.
                     // The engine tests the triangle's own normal, -0.1 then -0.05.
                     let normal = normalize(cross(sub(points[0], points[1]), sub(points[2], points[1])));
-                    triangles.push(MarkTriangle::new(points, normal, if n % 2 == 0 { 0.1 } else { 0.05 }));
+                    let mut triangle = MarkTriangle::new(points, normal, if n % 2 == 0 { 0.1 } else { 0.05 });
+                    triangle.base_uv = Some([a.texcoord, b.texcoord, c.texcoord]);
+                    triangle.shader = batch.shader;
+                    triangles.push(triangle);
                 }
             }
         }
@@ -231,7 +323,7 @@ impl MarkSurfaces {
             }
         }
         cells.sort_unstable();
-        Self { triangles, cells, large }
+        Self { triangles, cells, large, color_textures: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -424,6 +516,29 @@ mod tests {
             normal = normal.map(|v| -v);
         }
         (points, normal)
+    }
+
+    #[test]
+    fn local_texture_color_follows_triangle_uv_not_global_texture_mean() {
+        let points = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        let mut triangle = MarkTriangle::new(points, [0.0, 0.0, 1.0], 0.5);
+        triangle.base_uv = Some([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+        triangle.shader = 0;
+        let mut marks = MarkSurfaces::from_triangles(vec![triangle]);
+        let pixels = (0..32).flat_map(|_| (0..32).map(|x| [x as f32 / 31.0, 0.15, 0.2])).collect();
+        marks.set_color_textures(vec![Some(MarkColorTexture {
+            width: 32, height: 32, pixels, clamp: true,
+        })]);
+        let left = marks.sample_base_color([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        let right = marks.sample_base_color([7.0, 1.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        assert!(left[0] + 0.40 < right[0]);
+        assert!(marks.sample_base_color([7.0, 1.0, 4.0], [0.0, 0.0, 1.0]).is_none());
+        assert!(marks.sample_base_color([7.0, 1.0, 0.0], [0.0, 0.0, -1.0]).is_none());
+    }
+
+    #[test]
+    fn source_map_without_uvs_has_no_invented_color() {
+        assert!(floor().sample_base_color([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]).is_none());
     }
 
     fn floor() -> MarkSurfaces {

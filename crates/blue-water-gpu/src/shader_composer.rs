@@ -623,9 +623,9 @@ pub fn underwater_module(composer: &mut Composer, pass: &str) -> Result<wgpu::na
         "probe" => {
             let original = include_str!("../../../vendor/blue-water-sea-and-sky/ocean/shaders/underwater_probe.wgsl");
             let source = replace(original, "let depth = height_at(ray.start.xz) + wake_height(ray.start.xz) - ray.start.y;",
-                "let depth = select(-1.0, height_at(ray.start.xz) + wake_height(ray.start.xz) - ray.start.y, jka_water_contains(ray.start.xz));")
+                  "let depth = select(-1.0, height_at(ray.start.xz) + wake_height(ray.start.xz) - ray.start.y, jka_water_column_contains(ray.start));")
                 .replace("vec4<f32>(depth, height_at(eye.xz) - eye.y, 0.0, 1.0)",
-                    "vec4<f32>(depth, select(-1.0, height_at(eye.xz) - eye.y, jka_water_contains(eye.xz)), 0.0, 1.0)");
+                      "vec4<f32>(depth, select(-1.0, height_at(eye.xz) - eye.y, jka_water_column_contains(eye)), 0.0, 1.0)");
             (format!("{source}\n{}", include_str!("surface_boundary.wgsl")), "original underwater probe with JKA boundary")
         }
         "composite" => {
@@ -644,7 +644,7 @@ pub fn underwater_module(composer: &mut Composer, pass: &str) -> Result<wgpu::na
         "motes" => {
             let original = include_str!("../../../vendor/blue-water-sea-and-sky/ocean/shaders/underwater_motes.wgsl");
             let source = replace(original, "let shown = smoothstep(NEAR.x, NEAR.y, range)",
-                "let pixel = clamp(vec2<i32>(uv * camera.viewport.xy), vec2<i32>(0), vec2<i32>(camera.viewport.xy) - 1);\n    let bounded = select(0.0, step(range, textureLoad(jka_water_distance, pixel, 0).r), jka_water_contains(world.xz));\n    let shown = bounded * smoothstep(NEAR.x, NEAR.y, range)");
+                  "let pixel = clamp(vec2<i32>(uv * camera.viewport.xy), vec2<i32>(0), vec2<i32>(camera.viewport.xy) - 1);\n    let bounded = select(0.0, step(range, textureLoad(jka_water_distance, pixel, 0).r), jka_water_column_contains(world));\n    let shown = bounded * smoothstep(NEAR.x, NEAR.y, range)");
             (format!("{source}\n@group(1) @binding(4) var jka_water_distance: texture_2d<f32>;\n{}", include_str!("surface_boundary.wgsl")), "original underwater motes with JKA bounded path")
         }
         _ => panic!("unknown underwater pass {pass}"),

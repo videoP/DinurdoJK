@@ -30,8 +30,21 @@ app_cvars! {
         },
         implementations: []
     }
+    APP_R_LAKESOURCEHINTS {
+        runtime: CvarDef::new("r_lakeSourceHints", "1", "0|1",
+            "Use each promoted JKA water shader's source hue, alpha-blend clarity, authored deformation, roughness and tcMod scroll heading in Lake mode. 0 restores the global Lake material.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.lake.source_hints),
+            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() };
+                app.video.ocean_settings.lake.source_hints = v; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { settings.ocean_settings.lake.source_hints = value == "1"; }),
+            archive: Some((27377, |state| u8::from(state.video.ocean_settings.lake.source_hints).to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
     APP_R_LAKEWINDSPEED {
-        runtime: CvarDef::new("r_lakeWindSpeed", "4", "0..40", "Lake ripple wind speed in metres per second; independent of ocean spectrum.",
+        runtime: CvarDef::new("r_lakeWindSpeed", "0", "0..40", "Lake ripple wind speed in metres per second; independent of ocean spectrum.",
             CvarType::Float { min: 0.0, max: 40.0 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Float(app.video.ocean_settings.lake.wind_speed),
             |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
@@ -46,7 +59,7 @@ app_cvars! {
         implementations: []
     }
     APP_R_LAKEDIRECTION {
-        runtime: CvarDef::new("r_lakeDirection", "0", "-180..180", "Lake ripple direction in degrees from +X toward world +Z.",
+        runtime: CvarDef::new("r_lakeDirection", "52", "-180..180", "Lake ripple direction in degrees from +X toward world +Z.",
             CvarType::Float { min: -180.0, max: 180.0 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Float(app.video.ocean_settings.lake.direction),
             |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
@@ -61,7 +74,7 @@ app_cvars! {
         implementations: []
     }
     APP_R_LAKETRANSPARENCY {
-        runtime: CvarDef::new("r_lakeTransparency", "1", "0.1..10", "Lake optical clarity multiplier; 1 uses original freshwater/lagoon coefficients.",
+        runtime: CvarDef::new("r_lakeTransparency", "0.5", "0.1..10", "Lake optical clarity multiplier; higher values reveal more of the bed.",
             CvarType::Float { min: 0.1, max: 10.0 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Float(app.video.ocean_settings.lake.transparency),
             |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
@@ -75,18 +88,265 @@ app_cvars! {
         },
         implementations: []
     }
-    APP_R_LAKESALT {
-        runtime: CvarDef::new("r_lakeSalt", "0", "0|1", "Lake material: 0 freshwater, 1 lagoon/salt pond.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.lake.salt),
-            |app,value| { let CvarValue::Bool(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.salt=v;app.commit_ocean_settings();Ok(()) }),
+    APP_R_LAKEREFLECTIONS {
+        runtime: CvarDef::new("r_lakeReflections", "0.525", "0..1", "Lake world/sky reflection and sun glitter strength; 0 removes reflections.",
+            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.reflections),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.reflections=v;app.commit_ocean_settings();Ok(()) }),
         config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { settings.ocean_settings.lake.salt=value=="1"; }),
-            archive: Some((27343, |state| u8::from(state.video.ocean_settings.lake.salt).to_string())),
+            load_video: Some(|settings,_name,value,_context| {
+                if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.reflections=v.clamp(0.0,1.0); } }
+            }),
+            archive: Some((27363, |state| state.video.ocean_settings.lake.reflections.to_string())),
             ..CvarBinding::NONE
         },
         implementations: []
+    }
+    APP_R_LAKEAMPLITUDE {
+        runtime: CvarDef::new("r_lakeAmplitude", "6.65", "0..12", "Lake geometric amplitude in inches above/below the map plane; 0 is flat.",
+            CvarType::Float { min: 0.0, max: 12.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.amplitude),
+            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
+                app.video.ocean_settings.lake.amplitude=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| {
+                if let Ok(v)=value.parse::<f32>() {
+                    if v.is_finite() {settings.ocean_settings.lake.amplitude=v.clamp(0.0,12.0);}
+                }
+            }),
+            archive: Some((27360, |state| state.video.ocean_settings.lake.amplitude.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_LAKEWATERCOLOR {
+        runtime: CvarDef::new("r_lakeWaterColor", "0.41818184 0.9619174 1", "r g b (0..1)",
+            "Lake optical color for absorption and scattering; independent of surface tint and fog.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.lake.water_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_lake_water_color(app, APP_R_LAKEWATERCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_lake_water_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.water_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((27361, |state| { let c = state.video.ocean_settings.lake.water_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_lake_water_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.lake.water_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_LAKESPEED {
+        runtime: CvarDef::new("r_lakeSpeed", "1.45", "0..3", "Lake deformation animation speed; 0 freezes it, 1 is normal.",
+            CvarType::Float { min: 0.0, max: 3.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.speed),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.speed=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| {
+                if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.speed=v.clamp(0.0,3.0); } }
+            }),
+            archive: Some((27364, |state| state.video.ocean_settings.lake.speed.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKETRANSMISSION {
+        runtime: CvarDef::new("r_lakeTransmission", "1", "0..1.0", "Cheapwater transmission: 0 preserves opaque shading, 1 reveals the bed with depth absorption.",
+            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.cheap_transmission),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.cheap_transmission=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.cheap_transmission=v.clamp(0.0,1.0); } } }),
+            archive: Some((27369, |state| state.video.ocean_settings.lake.cheap_transmission.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKEREFRACTION {
+        runtime: CvarDef::new("r_lakeRefraction", "0.026", "0..0.05", "Cheapwater screen-space refraction strength; reuses its moving normal layers. Zero disables distortion.",
+            CvarType::Float { min: 0.0, max: 0.05 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.cheap_refraction),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.cheap_refraction=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.cheap_refraction=v.clamp(0.0,0.05); } } }),
+            archive: Some((27370, |state| state.video.ocean_settings.lake.cheap_refraction.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKEDEPTHCOLOR {
+        runtime: CvarDef::new("r_lakeDepthColor", "0.52", "0.0..1.0", "Cheapwater shallow/deep color blend. Zero preserves the base material.",
+            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.depth_color_strength),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.depth_color_strength=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.depth_color_strength=v.clamp(0.0,1.0); } } }),
+            archive: Some((27371, |state| state.video.ocean_settings.lake.depth_color_strength.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKECOLORDEPTH {
+        runtime: CvarDef::new("r_lakeColorDepth", "52", "0.1..100.0", "Vertical bed depth in metres at which Cheapwater reaches its deep color.",
+            CvarType::Float { min: 0.1, max: 100.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.color_depth),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.color_depth=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.color_depth=v.clamp(0.1,100.0); } } }),
+            archive: Some((27372, |state| state.video.ocean_settings.lake.color_depth.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKESHALLOWCOLOR {
+        runtime: CvarDef::new("r_lakeShallowColor", "0 0.043898553 0.025940072", "r g b (0..1)", "Cheapwater shallow color for depth coloring.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c=app.video.ocean_settings.lake.shallow_color; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },
+            |app,value| App::cvar_set_lake_shallow_color(app, APP_R_LAKESHALLOWCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_lake_shallow_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Some(c)=parse_vec3(value) { if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.shallow_color=c.map(|v| v.clamp(0.0,1.0)); } } }),
+            archive: Some((27373, |state| { let c=state.video.ocean_settings.lake.shallow_color; format!("{} {} {}",c[0],c[1],c[2]) })),
+            ..CvarBinding::NONE
+        }, implementations: [impl App {
+            fn cvar_set_lake_shallow_color(&mut self,name:&str,value:&str)->Result<(),String> {
+                self.video.ocean_settings.lake.shallow_color=Self::parse_cvar_floats(name,value)?.map(|v| v.clamp(0.0,1.0));
+                self.commit_ocean_settings();Ok(())
+            }
+        }]
+    }
+    APP_R_LAKEDEEPCOLOR {
+        runtime: CvarDef::new("r_lakeDeepColor", "0 0.08160421 0.061574105", "r g b (0..1)", "Cheapwater deep color for depth coloring.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c=app.video.ocean_settings.lake.deep_color; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },
+            |app,value| App::cvar_set_lake_deep_color(app, APP_R_LAKEDEEPCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_lake_deep_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Some(c)=parse_vec3(value) { if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.deep_color=c.map(|v| v.clamp(0.0,1.0)); } } }),
+            archive: Some((27374, |state| { let c=state.video.ocean_settings.lake.deep_color; format!("{} {} {}",c[0],c[1],c[2]) })),
+            ..CvarBinding::NONE
+        }, implementations: [impl App {
+            fn cvar_set_lake_deep_color(&mut self,name:&str,value:&str)->Result<(),String> {
+                self.video.ocean_settings.lake.deep_color=Self::parse_cvar_floats(name,value)?.map(|v| v.clamp(0.0,1.0));
+                self.commit_ocean_settings();Ok(())
+            }
+        }]
+    }
+    APP_R_LAKEOPAQUEDEPTH {
+        runtime: CvarDef::new("r_lakeOpaqueDepth", "8", "0.25..100 feet", "Cheapwater vertical bed depth in feet where nonlinear transparency reaches zero. 3-inch water remains almost fully clear at the default 8 feet.",
+            CvarType::Float { min: 0.25, max: 100.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.opaque_depth),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.opaque_depth=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.opaque_depth=v.clamp(0.25,100.0); } } }),
+            archive: Some((27375, |state| state.video.ocean_settings.lake.opaque_depth.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKEWAKE {
+        runtime: CvarDef::new("r_lakeWake", "10", "0..10", "Cheapwater player wake/ripple strength. Stronger ripples use the same rendering work. Independent of the ocean interaction solver. 0 disables.",
+            CvarType::Float { min: 0.0, max: 10.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.wake_strength),
+            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.wake_strength=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.wake_strength=v.clamp(0.0,10.0); } } }),
+            archive: Some((27376, |state| state.video.ocean_settings.lake.wake_strength.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKEPLANAR {
+        runtime: CvarDef::new("r_lakePlanar", "1", "0|1", "Compatibility alias: 1 selects lake Planar, 0 selects Sky. Use r_lakeReflectionMode for Sky/SSR/Planar comparisons.",
+            CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.lake.reflection_mode == 2),
+            |app,value| { let CvarValue::Bool(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.reflection_mode=if v {2} else {0};app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { settings.ocean_settings.lake.reflection_mode=if value=="1" {2} else {0}; }),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKESHADER {
+        runtime: CvarDef::new("r_lakeShader", "1", "0|1", "Lake material A/B: 0 original optical water, 1 Cheapwater material with neutral water reflections. Geometry and reflection selection are shared.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.lake.shader as i32),
+            |app,value| { let CvarValue::Int(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.shader=v as u8;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<u8>() {settings.ocean_settings.lake.shader=v.min(1);} }),
+            archive: Some((27367, |state| state.video.ocean_settings.lake.shader.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKEREFLECTIONMODE {
+        runtime: CvarDef::new("r_lakeReflectionMode", "2", "0..2", "Lake-local reflections: 0 Sky, 1 SSR, 2 Planar. Independent of global reflection mode and quality.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.lake.reflection_mode as i32),
+            |app,value| { let CvarValue::Int(v)=value else {unreachable!()};
+                app.video.ocean_settings.lake.reflection_mode=v as u8;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<u8>() {settings.ocean_settings.lake.reflection_mode=v.min(2);} }),
+            archive: Some((27368, |state| state.video.ocean_settings.lake.reflection_mode.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_LAKETINT {
+        runtime: CvarDef::new("r_lakeTint", "0.09994107 0.09994107 0.09994107", "r g b (0..1)",
+            "Lake surface tint, independent of optical color and fog; white is neutral.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.lake.tint_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_lake_tint(app, APP_R_LAKETINT.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_lake_tint, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.tint_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((27365, |state| { let c = state.video.ocean_settings.lake.tint_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        }, implementations: [impl App {
+            fn cvar_set_lake_tint(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.lake.tint_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
+                self.commit_ocean_settings(); Ok(())
+            }
+        }]
+    }
+    APP_R_LAKEFOGCOLOR {
+        runtime: CvarDef::new("r_lakeFogColor", "0 0.00003021201 0.01662098", "r g b (0..1)",
+            "Lake underwater fog color, independent of the surface color.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.lake.fog_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_lake_fog_color(app, APP_R_LAKEFOGCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_lake_fog_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.fog_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((27362, |state| { let c = state.video.ocean_settings.lake.fog_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_lake_fog_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.lake.fog_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
     }
     APP_R_HYBRIDGERSTNERAMPLITUDE {
         runtime: CvarDef::new("r_hybridGerstnerAmplitude", "128", "0.0..16384.0",
@@ -924,8 +1184,8 @@ app_cvars! {
         }]
     }
     APP_R_OCEANTYPE {
-        runtime: CvarDef::new("r_oceanType", "1", "0..5",
-            "Water promotion: 0 stock JKA, 1 Godot ocean, 2 native Blue Water ocean, 3 Hybrid ocean, 4 Blue Water lakes/ponds (flat, no FFT), 5 Gerstner ocean (Hybrid with godot-water-shader's waves, colour and foam, lit by Blue Water).",
+        runtime: CvarDef::new("r_oceanType", "4", "0..5",
+            "Water promotion: 0 stock JKA, 1 Godot ocean, 2 native Blue Water ocean, 3 Hybrid ocean, 4 Blue Water lakes/ponds (subtle relief, no FFT), 5 Gerstner ocean (Hybrid with godot-water-shader's waves, colour and foam, lit by Blue Water).",
             CvarType::Int { min: 0, max: 5 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(i32::from(app.ocean_type())),
             |app, value| {

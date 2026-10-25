@@ -84,7 +84,8 @@ impl Renderer {
     pub(in crate::renderer) fn set_dynamic_lighting(&mut self, mode: DynamicLightsMode) {
         self.dynamic_lights_mode = mode;
         // Direct RT lighting shares Forward+ light selection and radiometry;
-        // only visibility changes. Legacy/Vertex/Clustered Lite stay separate.
+        // only transient visibility changes. Static map lights retain raster
+        // shadows. Legacy/Vertex/Clustered Lite stay separate.
         self.clustered_lighting_enabled = matches!(
             mode,
             DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware
@@ -117,7 +118,7 @@ impl Renderer {
         } else if self.hardware_rt_active() && self.ray_traced_shadows.is_some() {
             rverbose!(
                 1,
-                "Hardware RT Lighting: ACTIVE; static={} transient={} total={} brightness={:.2} vertex_light={} (sun shadow mode independent)",
+                "Hardware RT Lighting: ACTIVE; static_raster={} transient_rt={} total={} brightness={:.2} vertex_light={} (sun shadow mode independent)",
                 self.active_static_light_count(),
                 self.active_transient_light_count(),
                 self.active_light_count(),

@@ -1,10 +1,23 @@
-The runtime data is exported from `D:/Code/anny-main`. It contains the original
-624 phenotype targets, 256 paired local controls, 52 facial actions, template,
-game-engine rig regressors, skin weights and MakeHuman body/eye/tongue triangles.
-The donor uses upstream's unedited MakeHuman topology and shorter-diagonal quad
-triangulation. Float32 targets are
-compressed losslessly; they are not replaced by procedural bulges or scaling
-curves. Anny and MakeHuman licenses are included inside `anny_targets.zip`.
+The runtime dataset lives directly at `customization/body/model.json` and
+`customization/body/arrays.bin` inside
+`assets/dinurdo-assets.pk3`, copied to the game's base directory by the build.
+The presenter supplies its VFS; the immutable donor loads on first use and
+reports missing or invalid data as an asset error. It is not embedded in the exe.
+
+The lossless 4.24 MB dataset contains 48 phenotype targets, all 256 paired local
+controls, all 52 facial actions, template geometry, game-engine rig regressors,
+skin weights and MakeHuman body/eye/tongue triangles. The original full export
+was 31.41 MB with 624 phenotype targets. `apply_profile` always evaluates Anny
+at neutral whole-body parameters before the original procedural whole-body
+sliders run. Targets with a zero coefficient at those fixed axes are omitted;
+all variable gender, ancestry, cup size, firmness, local and facial controls
+remain. The lower-level `apply` rejects nonneutral whole-body parameters so
+trimmed data cannot silently produce incomplete shapes.
+
+No targets are quantized. Original term order and float32 array values are
+preserved. Anny and MakeHuman licenses remain beside the data in `customization/body/`.
+Test-only Python reference vertices are stored separately in
+`tests/data/anny-neutral-oracle.bin` and are not shipped.
 
 Source references:
 
@@ -77,13 +90,20 @@ cargo test -p jka-assets --profile fast retail_models_keep_neutral_geometry_and_
 cargo check -p DinurdoJK --profile fast
 ```
 
-The Rust parity test compares every donor vertex in three mixed recipes with
-the independent existing Python evaluator, including positive/negative local
-targets. The Python validator checks all 512 local target sides bit for bit
-against the checkout. The retail test checks neutral identity, changed geometry,
+The Rust parity test compares every neutral donor vertex with the independent
+Python evaluator. The Python validator checks all 48 retained macro targets,
+512 local target sides and 52 facial shapes bit for bit against the checkout.
+The initial trim also compared all donor vertices for 35 mixed full-versus-trimmed
+recipes and found bit-identical results. Rust transfer tests cover detail-control
+changes on both game rigs and imported pivots. The retail test checks neutral identity, changed geometry,
 all LODs, unchanged topology/weights, and finite animated positions/normals on
 the three built-in Jedi body models, including height/age extremes in standing,
-walking and crouching poses. Segment-ratio regressions cover six global controls
-at four values on both humanoid rigs and a differently proportioned imported
-bind skeleton. A donor-surface test also checks retopology
+walking and crouching poses. Segment-ratio regressions cover gender, cup size, firmness, a local control
+and a facial action at four values on both humanoid rigs and a differently
+proportioned imported bind skeleton. A donor-surface test also checks retopology
 identity against a mixed authored recipe and distinguishes selected regions.
+
+The default exporter updates the runtime files in `assets/dinurdo-assets.pk3`
+and the test reference fixture. To produce the full dataset for offline Python
+validation, use `export_runtime.py D:/Code/anny-main --full --destination <dir>`.
+Full authoring archives are not runtime assets.

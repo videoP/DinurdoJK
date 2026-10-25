@@ -843,7 +843,11 @@ fn build_perf_contents(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32)
         );
         text(
             out,
-            "XRAY: FRUSTUM RED  HI-Z MAGENTA  PVS CYAN  AREA YELLOW",
+            match ui.video.cull_debug {
+                CullDebugMode::Counters => "CULL COUNTERS ONLY: NO XRAY OVERLAY",
+                CullDebugMode::HiZOnly => "DOTS: HI-Z MAGENTA | ALL REASONS COUNTED",
+                _ => "DOTS: FRUSTUM RED HI-Z MAGENTA PVS CYAN AREA YELLOW",
+            },
             x + 12.0,
             cy + 20.0,
             1.02,

@@ -191,6 +191,9 @@ struct PlaybackState {
     requested_mode: Option<AudioMode>,
     world_taunt: Option<taunt::Taunt>,
     playing: Option<Playing>,
+    // The logical animation start survives asynchronous bundle/audio loading.
+    // It may precede this client's play command when joining a remote dance.
+    requested_start: Option<Instant>,
     stop_pending: bool,
     generation: u64,
     prepared: Option<(u64, Emote, AudioMode, Vec<crate::audio::SoundDecodeResult>)>,
@@ -389,11 +392,19 @@ pub(crate) fn poll_prepared_audio() -> Vec<crate::audio::SoundDecodeResult> {
     if generation != state.generation {
         return Vec::new();
     }
-    let next_audio_ms = emote.audio.iter().map(|cue| cue.at_ms).collect();
+    let matched_start = state.requested_start.take();
+    let started = matched_start.unwrap_or_else(Instant::now);
+    // Preserve existing first-cue behavior for ordinary dances. Only a match
+    // skips past cues: replaying their music would double the target's beat.
+    let next_audio_ms = if matched_start.is_some() {
+        audio_times_after(&emote, started.elapsed().as_millis() as u64)
+    } else {
+        emote.audio.iter().map(|cue| cue.at_ms).collect()
+    };
     state.playing = Some(Playing {
         emote,
         mode,
-        started: Instant::now(),
+        started,
         next_audio_ms,
     });
     state.stop_pending = true;
@@ -406,13 +417,21 @@ fn playing() -> &'static Mutex<PlaybackState> {
 
 /// Profile-preview variant uses listener-local (1P) WAVs.
 pub fn play(emote: Emote) {
-    play_mode(emote, AudioMode::Preview);
+    play_mode(emote, AudioMode::Preview, 0);
 }
 /// Cosmetic world playback; App owns the associated game taunt transmission.
 pub fn play_world(emote: Emote) {
-    play_mode(emote, AudioMode::World);
+    play_mode(emote, AudioMode::World, 0);
 }
-fn play_mode(mut emote: Emote, mode: AudioMode) {
+/// Start this emote at the same point in its timeline as an existing player.
+/// `elapsed_ms` is taken from the remote player's *presented* server timeline,
+/// not from the time at which our bundle finishes asynchronously loading.
+pub fn play_world_matched(emote: Emote, elapsed_ms: i32) {
+    play_mode(emote, AudioMode::World, elapsed_ms.max(0) as u64);
+}
+fn play_mode(mut emote: Emote, mode: AudioMode, elapsed_ms: u64) {
+    let now = Instant::now();
+    let requested_start = now.checked_sub(std::time::Duration::from_millis(elapsed_ms)).unwrap_or(now);
     // Some exports include only one camera audience. This local client can use
     // that available PCM track for either camera rather than silently dropping it.
     for lane in [AudioLane::Music, AudioLane::Foley] {
@@ -438,6 +457,7 @@ fn play_mode(mut emote: Emote, mode: AudioMode) {
                 return;
             };
             state.requested_mode = Some(mode);
+            state.requested_start = (elapsed_ms > 0).then_some(requested_start);
             state.world_taunt = None;
             state.generation = state.generation.wrapping_add(1);
             state.playing = None;
@@ -450,13 +470,18 @@ fn play_mode(mut emote: Emote, mode: AudioMode) {
     }
     if let Ok(mut state) = playing().lock() {
         state.requested_mode = Some(mode);
+        state.requested_start = None;
         state.world_taunt = None;
         state.generation = state.generation.wrapping_add(1);
         state.prepared = None;
-        let next_audio_ms = emote.audio.iter().map(|cue| cue.at_ms).collect();
+        let next_audio_ms = if elapsed_ms > 0 {
+            audio_times_after(&emote, requested_start.elapsed().as_millis() as u64)
+        } else {
+            emote.audio.iter().map(|cue| cue.at_ms).collect()
+        };
         state.playing = Some(Playing {
             emote,
-            started: Instant::now(),
+            started: requested_start,
             mode,
             next_audio_ms,
         });
@@ -468,6 +493,7 @@ impl PlaybackState {
     fn stop(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.requested_mode = None;
+        self.requested_start = None;
         self.world_taunt = None;
         self.prepared = None;
         self.playing = None;
@@ -483,8 +509,14 @@ impl PlaybackState {
         if self.world_taunt.is_none() {
             self.world_taunt = taunt::Taunt::from_animations(torso, legs);
         }
-        if self.world_taunt.as_mut().is_some_and(|taunt|
-            taunt.interrupted(torso, legs) || taunt.cancel_input(buttons, up_move)) {
+        let cancel = match self.world_taunt.as_mut() {
+            Some(taunt) => taunt.interrupted(torso, legs) || taunt.cancel_input(buttons, up_move),
+            // The local shim does not execute native taunt commands. Also
+            // cover inputs arriving before a remote server accepts a taunt:
+            // absence of a binding must never disable attack/Force cancellation.
+            None => jka_movement::taunt_action_should_cancel(buttons),
+        };
+        if cancel {
             self.stop();
             return true;
         }
@@ -589,6 +621,24 @@ fn poll_state_audio(state: &mut PlaybackState, now: u64) -> Vec<AudioCommand> {
     }
     commands
 }
+/// Skip audio events already passed on the joined timeline. Otherwise a late
+/// join would restart the target's soundtrack from its beginning and produce
+/// a badly offset second beat. Repeating cues may play on their *next* loop.
+fn audio_times_after(emote: &Emote, elapsed_ms: u64) -> Vec<u64> {
+    let period = loop_period_ms(emote);
+    emote.audio.iter().map(|cue| {
+        if cue.at_ms >= elapsed_ms {
+            return cue.at_ms;
+        }
+        if !emote.looping || !cue.repeat_on_loop {
+            return u64::MAX;
+        }
+        let step = cue.repeat_period_ms.unwrap_or(period).max(1);
+        let missed = elapsed_ms.saturating_sub(cue.at_ms) / step + 1;
+        cue.at_ms.saturating_add(step.saturating_mul(missed))
+    }).collect()
+}
+
 fn clip_duration_ms(emote: &Emote) -> u64 {
     (((emote.end_frame - emote.first_frame) as f64 * 1000.0 / f64::from(emote.fps)).round() as u64)
         .max(1)
@@ -948,6 +998,26 @@ pub fn read_asset(qpath: &str, limit: usize) -> Result<Option<Vec<u8>>, String> 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn unbound_world_emote_cancels_pending_preparation_on_attack() {
+        use super::*;
+        let idle = jka_assets::animation::animation_index("BOTH_STAND1").unwrap() as i32;
+        let emote = jka_emotes::manifest::parse_manifest(&json!({"emotes":[{
+            "id":"pending", "name":"Pending", "gla":"test.gla", "first_frame":0, "end_frame":30, "fps":30
+        }]})).unwrap().remove(0);
+        let mut state = PlaybackState {
+            requested_mode: Some(AudioMode::World), generation: 7,
+            prepared: Some((7, emote, AudioMode::World, Vec::new())),
+            ..Default::default()
+        };
+        assert!(!state.cancel_world_taunt(idle, idle, 0, -127));
+        assert!(state.world_taunt.is_none());
+        assert!(state.cancel_world_taunt(idle, idle, jka_movement::BUTTON_ATTACK, 0));
+        assert_eq!(state.generation, 8);
+        assert!(state.prepared.is_none());
+        assert!(state.stop_pending);
+    }
+
+    #[test]
     fn native_taunt_cancellation_invalidates_world_preparation_but_keeps_preview() {
         use super::*;
         let dual = jka_assets::animation::animation_index("BOTH_DUAL_TAUNT").unwrap() as i32;
@@ -1016,6 +1086,31 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
+    #[test]
+    fn matched_dance_starts_at_remote_phase_and_never_replays_past_music() {
+        let emote = jka_emotes::manifest::parse_manifest(&json!({"emotes":[{
+            "id":"match_test", "name":"Match", "gla":"a.gla",
+            "first_frame":0, "end_frame":300, "fps":30, "loop":true,
+            "audio":[
+                {"at_ms":0, "lane":"music", "audience":"both", "wav":"music.wav"},
+                {"at_ms":6000, "lane":"foley", "audience":"both", "wav":"foot.wav"}
+            ]
+        }]})).unwrap().remove(0);
+        let times = audio_times_after(&emote, 5500);
+        // The target's music is already audible; don't double it at t=0.
+        assert_eq!(times[0], u64::MAX);
+        assert_eq!(times[1], 6000);
+        let mut state = PlaybackState::default();
+        state.playing = Some(Playing {
+            emote,
+            started: Instant::now(),
+            mode: AudioMode::World,
+            next_audio_ms: times,
+        });
+        assert_eq!(preview_at(&mut state, 5500).unwrap().elapsed_ms, 5500);
+        assert_eq!(preview_at(&mut state, 12000).unwrap().elapsed_ms, 2000);
+    }
+
     #[test]
     fn audio_diagnostics_distinguish_missing_assets_from_unmapped_variations() {
         let make = || json!({"id":"x","name":"X","gla":"a.gla","first_frame":0,"end_frame":30,"fps":30,"variants":[{"first_frame":30,"end_frame":60,"fps":30,"audio":[]}]});

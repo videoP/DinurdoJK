@@ -15,6 +15,9 @@ impl App {
 
     /// Debounced periodic save: never perform filesystem I/O on the tick path.
     pub(in crate::app) fn queue_config_save(&mut self) {
+        // Offline captures may override video/game settings for a comparison;
+        // never persist them over the interactive user's configuration.
+        if super::lifecycle::headless() { return; }
         if !self.config_dirty {
             return;
         }
@@ -106,6 +109,7 @@ impl App {
             swim_turn_bank: self.swim_turn_bank,
             move_lean: self.move_lean,
             zoom_fov: self.japro_zoom_fov,
+            view_bob: self.view_bob,
             fk_duration: self.japro_fk_duration,
             fk_first_jump_duration: self.japro_fk_first_jump_duration,
             fk_second_jump_delay: self.japro_fk_second_jump_delay,

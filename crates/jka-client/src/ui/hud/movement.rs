@@ -5,7 +5,7 @@ use crate::ui::{
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
     MovementKeysSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_IMAGE_NAMES, KEY_ART_SIZE, KEY_ATLAS_COLUMNS, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
-    SHELPER_CGAZ, SHELPER_ORIGINAL, SHELPER_UPDATED,
+    SHELPER_CGAZ, SHELPER_ORIGINAL, SHELPER_UPDATED, SHELPER_XONOTIC, SHELPER_Q3DF, SHELPER_WARSOW_HUD, SHELPER_COMPONENT_MASK,
 };
 
 /// jaPRO `DF_RaceTimer`: `CG_Text_Paint(x, y, size, ..)` at the configured
@@ -74,31 +74,49 @@ pub(in crate::ui) fn build_speedometer(
             None => rect(out, x, y, rw, rh, color, w, h),
         }
     };
-    draw_placed(out, ui, HudElementId::Speedometer, w, h, |out| {
-        for item in &speedo.rects {
-            fill(out, item);
-        }
-        for item in &speedo.texts {
-            paint(out, item);
-        }
-    });
+    for (id, texts, rects) in &speedo.components {
+        // Gate cached data using the current selection, never the flags that
+        // happened to build the previous frame's speedometer batch.
+        if crate::ui::movement_components::selected(*id, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 1 { continue; }
+        draw_placed(out, ui, *id, w, h, |out| {
+            let start = out.len();
+            for item in &speedo.rects[rects.clone()] { fill(out, item); }
+            for item in &speedo.texts[texts.clone()] { paint(out, item); }
+            if *id == HudElementId::Speedometer && out.len() > start {
+                // A component keeps its editor position when its provider is
+                // changed. Center the native font's actual bounds on the same
+                // stock anchor as the Q3DF number before applying saved layout.
+                let batch = &mut out[start..];
+                let min_x = batch.iter().map(|v| v.position[0]).fold(f32::INFINITY,f32::min);
+                let max_x = batch.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY,f32::max);
+                let min_y = batch.iter().map(|v| v.position[1]).fold(f32::INFINITY,f32::min);
+                let max_y = batch.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY,f32::max);
+                let target_y = 1.0-2.0*215.0/480.0;
+                for v in batch {
+                    v.position[0] = (v.position[0] - (min_x+max_x)*0.5) * 2.0 * sy / sx;
+                    v.position[1] = target_y + (v.position[1] - (min_y+max_y)*0.5) * 2.0;
+                }
+            }
+        });
+    }
+    if crate::ui::movement_components::selected(HudElementId::SpeedometerJumps, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 0 {
     draw_placed(out, ui, HudElementId::SpeedometerJumps, w, h, |out| {
         for item in &speedo.jump_texts {
             paint(out, item);
         }
     });
+    }
+    if crate::ui::movement_components::selected(HudElementId::SpeedGraph, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 0 {
     draw_placed(out, ui, HudElementId::SpeedGraph, w, h, |out| {
-        // The old speed graph's lag frame goes under its bars, its readout over them.
+        // The graph is independent of the numeric speedometer.
         for pic in &speedo.graph_pics {
-            lagometer_pic(out, pic, w, h);
+            lagometer_pic(out, pic, ui, w, h);
         }
         for item in &speedo.graph_rects {
             fill(out, item);
         }
-        for item in &speedo.graph_texts {
-            lagometer_text(out, item, small_font, w, h);
-        }
     });
+    }
 }
 
 /// Image names of the icon atlas (see `renderer::load_ui_icon_atlas`): the two
@@ -125,46 +143,75 @@ pub const FORCE_ICON_NAMES: [&str; 18] = [
     "gfx/mp/f_icon_saber_throw",
 ];
 
-pub const ICON_NAMES: [&str; 2 + CROSSHAIR_IMAGE_COUNT as usize + FORCE_ICON_NAMES.len()] = [
-    "gfx/2d/lag",
-    "gfx/2d/net",
-    CROSSHAIR_IMAGE_NAMES[0],
-    CROSSHAIR_IMAGE_NAMES[1],
-    CROSSHAIR_IMAGE_NAMES[2],
-    CROSSHAIR_IMAGE_NAMES[3],
-    CROSSHAIR_IMAGE_NAMES[4],
-    CROSSHAIR_IMAGE_NAMES[5],
-    CROSSHAIR_IMAGE_NAMES[6],
-    CROSSHAIR_IMAGE_NAMES[7],
-    CROSSHAIR_IMAGE_NAMES[8],
-    CROSSHAIR_IMAGE_NAMES[9],
-    FORCE_ICON_NAMES[0],
-    FORCE_ICON_NAMES[1],
-    FORCE_ICON_NAMES[2],
-    FORCE_ICON_NAMES[3],
-    FORCE_ICON_NAMES[4],
-    FORCE_ICON_NAMES[5],
-    FORCE_ICON_NAMES[6],
-    FORCE_ICON_NAMES[7],
-    FORCE_ICON_NAMES[8],
-    FORCE_ICON_NAMES[9],
-    FORCE_ICON_NAMES[10],
-    FORCE_ICON_NAMES[11],
-    FORCE_ICON_NAMES[12],
-    FORCE_ICON_NAMES[13],
-    FORCE_ICON_NAMES[14],
-    FORCE_ICON_NAMES[15],
-    FORCE_ICON_NAMES[16],
-    FORCE_ICON_NAMES[17],
+// TaystJK CG_Init (cg_main.c): BG_FindItemForWeapon(i)->icon in WP_* order.
+// The paths match the pinned OpenJK bg_itemlist and retain their original artwork.
+pub const WEAPON_ICON_NAMES: [&str; 17] = [
+    "", // WP_NONE (not a selectable weapon)
+    "gfx/hud/w_icon_stunbaton",
+    "gfx/hud/w_icon_melee",
+    "gfx/hud/w_icon_lightsaber",
+    "gfx/hud/w_icon_blaster_pistol",
+    "gfx/hud/w_icon_blaster",
+    "gfx/hud/w_icon_disruptor",
+    "gfx/hud/w_icon_bowcaster",
+    "gfx/hud/w_icon_repeater",
+    "gfx/hud/w_icon_demp2",
+    "gfx/hud/w_icon_flechette",
+    "gfx/hud/w_icon_merrsonn",
+    "gfx/hud/w_icon_thermal",
+    "gfx/hud/w_icon_tripmine",
+    "gfx/hud/w_icon_detpack",
+    "gfx/hud/w_icon_c_rifle",
+    "gfx/hud/w_icon_briar",
 ];
+
+pub(in crate::ui) const ICON_WEAPON_BASE: usize = ICON_FORCE_BASE + FORCE_ICON_NAMES.len();
+pub(crate) const ICON_WEAPON_NO_AMMO_BASE: usize = ICON_WEAPON_BASE + WEAPON_ICON_NAMES.len();
+pub(crate) const ICON_WEAPON_STAFF: usize = ICON_WEAPON_NO_AMMO_BASE + WEAPON_ICON_NAMES.len();
+pub(in crate::ui) const ICON_WEAPON_DUAL: usize = ICON_WEAPON_STAFF + 1;
+
+// Maintain the old atlas indices for crosshair/force icons, so existing HUD
+// paths don't change; NA cells use the corresponding qpath + "_na" at load time.
+pub const ICON_NAMES: [&str; ICON_WEAPON_DUAL + 1] = {
+    let mut names = [""; ICON_WEAPON_DUAL + 1];
+    names[0] = "gfx/2d/lag";
+    names[1] = "gfx/2d/net";
+    let mut i = 0;
+    while i < CROSSHAIR_IMAGE_NAMES.len() {
+        names[ICON_CROSSHAIR_BASE + i] = CROSSHAIR_IMAGE_NAMES[i];
+        i += 1;
+    }
+    i = 0;
+    while i < FORCE_ICON_NAMES.len() {
+        names[ICON_FORCE_BASE + i] = FORCE_ICON_NAMES[i];
+        i += 1;
+    }
+    i = 0;
+    while i < WEAPON_ICON_NAMES.len() {
+        names[ICON_WEAPON_BASE + i] = WEAPON_ICON_NAMES[i];
+        names[ICON_WEAPON_NO_AMMO_BASE + i] = WEAPON_ICON_NAMES[i];
+        i += 1;
+    }
+    names[ICON_WEAPON_STAFF] = "gfx/hud/w_icon_saberstaff";
+    names[ICON_WEAPON_DUAL] = "gfx/hud/w_icon_duallightsaber";
+    names
+};
 
 /// Atlas cell of the first image crosshair.
 pub(in crate::ui) const ICON_CROSSHAIR_BASE: usize = 2;
 
 pub(in crate::ui) const ICON_FORCE_BASE: usize = 2 + CROSSHAIR_IMAGE_COUNT as usize;
 
-/// Edge of one atlas cell in texels; the retail 32x32 images are resampled to it.
-pub const ICON_CELL: u32 = 64;
+/// Legacy fixed-grid UV fallback used only before the renderer has lazily
+/// loaded the native-resolution atlas (and by standalone HUD unit tests).
+/// Runtime icons use per-image UVs and retain their original pixel sizes.
+pub const ICON_CELL: u32 = 256;
+
+/// Pack icon cells in rows: a single row at 256px per icon would exceed the
+/// max 2D texture dimension on many GPUs. Both the CPU atlas writer and the
+/// UV calculation below must use the same column count.
+pub const ICON_COLUMNS: u32 = 8;
+pub const ICON_ROWS: u32 = (ICON_NAMES.len() as u32 + ICON_COLUMNS - 1) / ICON_COLUMNS;
 
 /// Texture source id of the icon atlas in `ui.wgsl`.
 pub(in crate::ui) const ICON_TEXTURE_SOURCE: f32 = 5.0;
@@ -179,18 +226,23 @@ pub(in crate::ui) const TEAM_ICON_TEXTURE_SOURCE: f32 = 6.0;
 /// The whole of atlas cell `index` as (uv0, uv1).
 pub(in crate::ui) fn icon_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
     let cell = ICON_CELL as f32;
-    let atlas_w = ICON_NAMES.len() as f32 * cell;
-    let index = index as f32;
-    // Half-texel inset keeps linear filtering inside this image's cell.
-    let u0 = (index * cell + 0.5) / atlas_w;
-    let u1 = ((index + 1.0) * cell - 0.5) / atlas_w;
-    ([u0, 0.5 / cell], [u1, (cell - 0.5) / cell])
+    let col = (index as u32 % ICON_COLUMNS) as f32;
+    let row = (index as u32 / ICON_COLUMNS) as f32;
+    let atlas_w = ICON_COLUMNS as f32 * cell;
+    let atlas_h = ICON_ROWS as f32 * cell;
+    // Half-texel inset prevents linear filtering across adjacent atlas cells.
+    let u0 = (col * cell + 0.5) / atlas_w;
+    let u1 = ((col + 1.0) * cell - 0.5) / atlas_w;
+    let v0 = (row * cell + 0.5) / atlas_h;
+    let v1 = ((row + 1.0) * cell - 0.5) / atlas_h;
+    ([u0, v0], [u1, v1])
 }
 
 /// `CG_DrawPic` of a lagometer image: the whole image, white, alpha blended.
 pub(in crate::ui) fn lagometer_pic(
     out: &mut Vec<UiVertex>,
     pic: &crate::lagometer::Pic,
+    ui: &UiSnapshot,
     w: u32,
     h: u32,
 ) {
@@ -198,7 +250,7 @@ pub(in crate::ui) fn lagometer_pic(
         crate::lagometer::Icon::Lag => 0,
         crate::lagometer::Icon::Net => 1,
     };
-    let (uv0, uv1) = icon_cell_uv(index);
+    let (uv0, uv1) = ui.icon_uv(index);
     let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
     textured_rect_with_source(
         out,
@@ -287,7 +339,7 @@ pub(in crate::ui) fn build_lagometer(
     // and map-change warnings stay screen-centered exactly like JKA.
     draw_placed(out, ui, HudElementId::Lagometer, w, h, |out| {
         for pic in &lag.pics[..lag.graph_pic_count.min(lag.pics.len())] {
-            lagometer_pic(out, pic, w, h);
+            lagometer_pic(out, pic, ui, w, h);
         }
         for bar in &lag.rects {
             rect(
@@ -322,7 +374,7 @@ pub(in crate::ui) fn build_lagometer(
     });
 
     for pic in &lag.pics[lag.graph_pic_count.min(lag.pics.len())..] {
-        lagometer_pic(out, pic, w, h);
+        lagometer_pic(out, pic, ui, w, h);
     }
     for item in &lag.big_texts[lag.graph_big_text_count.min(lag.big_texts.len())..] {
         fixed_charset_text(
@@ -375,6 +427,7 @@ pub(in crate::ui) fn build_race_timer(
             text(out, value, px, py, race.size * 1.4, color, w, h);
         }
     };
+    if ui.race_components[0] {
     draw_placed(out, ui, HudElementId::RaceTimer, w, h, |out| {
         paint(
             out,
@@ -384,7 +437,9 @@ pub(in crate::ui) fn build_race_timer(
             [1.0, 1.0, 1.0, 1.0],
         );
     });
+    }
     let [r, g, b] = race.start_color;
+    if ui.race_components[1] {
     draw_placed(out, ui, HudElementId::RaceStart, w, h, |out| {
         paint(
             out,
@@ -394,6 +449,7 @@ pub(in crate::ui) fn build_race_timer(
             [r, g, b, 1.0],
         );
     });
+    }
 }
 
 pub(crate) fn visible_jka_chars(value: &str) -> usize {
@@ -711,28 +767,213 @@ pub(in crate::ui) fn build_movement_keys(out: &mut Vec<UiVertex>, ui: &UiSnapsho
 }
 
 pub(in crate::ui) fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    use crate::ui::movement_components as components;
     let sh = ui.strafe_helper;
-    // Cinematic is submitted through the 3D FX path in app.rs; do not also
-    // spend time projecting/building an empty 2D strafehelper batch.
-    if sh.flags & (SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ) == 0 {
-        return;
-    }
+    let native = ui.speedometer_settings.flags;
+    let guide = components::selected(HudElementId::StrafeGuide, sh.flags, native);
     let aspect = w.max(1) as f32 / h.max(1) as f32;
-    let segments =
-        crate::strafehelper::strafe_lines(&sh, &ui.movement_hud, ui.video.fps_cap, aspect);
-    // cg_draw's 640x480 space maps straight onto the window on both axes.
-    let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
-    for segment in segments {
-        let [x0, y0] = [segment.from[0] * sx, segment.from[1] * sy];
-        let [x1, y1] = [segment.to[0] * sx, segment.to[1] * sy];
-        // DF_DrawLine stamps size x size squares (scaled per axis) along the
-        // segment; the swept shape is as thick as the square's extent across it.
-        let length = (x1 - x0).hypot(y1 - y0);
-        if length <= f32::EPSILON {
-            continue;
+    let mut state = ui.movement_hud;
+    if ui.mode == crate::ui::OverlayMode::HudEdit {
+        // Preview the selected style even while standing still or spectating.
+        state = crate::ui::MovementHudState { velocity:[755.0,0.0,0.0],
+            forward_move:127, right_move:-127, q3df_accel_bar_width:24.0,
+            fov_x:90.0, ..crate::ui::MovementHudState::default() };
+    }
+    for (id, flags) in [
+        (HudElementId::StrafeGuide, guide),
+        (HudElementId::Speedometer, if components::selected(HudElementId::Speedometer, sh.flags, native) == 2 {crate::ui::SHELPER_Q3DF_SPEED} else {0}),
+        (HudElementId::AccelMeter, if components::selected(HudElementId::AccelMeter, sh.flags, native) == 2 {crate::ui::SHELPER_Q3DF_ACCEL} else {0}),
+        (HudElementId::VelocityCompass, sh.flags & crate::ui::SHELPER_Q3DF_COMPASS),
+    ] {
+        if flags == 0 { continue; }
+        if id.native().is_some_and(|native| ui.native_replaced(native)) { continue; }
+        let part = crate::ui::StrafeHelperSettings { flags: flags | (sh.flags & (crate::ui::SHELPER_XONOTIC_VELOCITY | crate::ui::SHELPER_XONOTIC_PERSPECTIVE | crate::ui::SHELPER_XONOTIC_PANORAMIC)), ..sh };
+        if id == HudElementId::StrafeGuide && flags & (SHELPER_XONOTIC | SHELPER_Q3DF | SHELPER_WARSOW_HUD) == 0 {
+            let part = crate::ui::StrafeHelperSettings {flags: (sh.flags & !crate::ui::SHELPER_STYLE_MASK & !SHELPER_COMPONENT_MASK) | guide, ..sh};
+            let segments = crate::strafehelper::strafe_lines(&part, &state, ui.video.fps_cap, aspect);
+            draw_placed(out, ui, id, w, h, |out| {
+                let (sx,sy) = (w as f32/640.0,h as f32/480.0);
+                for segment in segments {
+                    let (x0,y0,x1,y1) = (segment.from[0]*sx,segment.from[1]*sy,segment.to[0]*sx,segment.to[1]*sy);
+                    let length = (x1-x0).hypot(y1-y0);
+                    if length <= f32::EPSILON {continue;}
+                    let (nx,ny) = (-(y1-y0)/length,(x1-x0)/length);
+                    hud_line(out,x0,y0,x1,y1,segment.size*(sx*nx.abs()+sy*ny.abs()),segment.color,w,h);
+                }
+            });
+        } else {
+            let hud = crate::strafehelper::extended_hud(&part, &state, aspect);
+            draw_placed(out, ui, id, w, h, |out| draw_extended(out, hud, w, h));
         }
-        let (nx, ny) = (-(y1 - y0) / length, (x1 - x0) / length);
-        let thickness = segment.size * (sx * nx.abs() + sy * ny.abs());
-        hud_line(out, x0, y0, x1, y1, thickness, segment.color, w, h);
+    }
+}
+
+fn draw_extended(out: &mut Vec<UiVertex>, hud: crate::strafehelper::ExtendedHud, w:u32, h:u32) {
+    let (sx,sy) = (w as f32/640.0,h as f32/480.0);
+    for triangle in hud.triangles {
+        for [x,y] in triangle.points { out.push(UiVertex { position:[2.0*x/640.0-1.0,1.0-2.0*y/480.0], uv:[0.0,0.0], color:triangle.color,textured:0.0 }); }
+    }
+    for fill in hud.fills { rect(out,fill.x*sx,fill.y*sy,fill.w*sx,fill.h*sy,fill.color,w,h); }
+    for label in hud.labels {
+        // Keep glyph aspect consistent at widescreen resolutions. Positions
+        // remain centered in the authored HUD space; text scales uniformly.
+        let x = w as f32*0.5 + (label.x-320.0)*sy;
+        fixed_charset_text(out,&label.text,x,label.y*sy,label.glyph_w*sy,label.glyph_h*sy,label.advance*sy,label.color,true,w,h);
+    }
+}
+
+#[cfg(test)]
+mod strafehelper_review {
+    use super::*;
+
+    #[test]
+    fn movement_components_off_suppresses_stale_cached_readouts() {
+        let mut ui = UiSnapshot::default();
+        let settings = crate::speedometer::Settings {flags:crate::speedometer::flag::ENABLE | crate::speedometer::flag::ACCELMETER, ..Default::default()};
+        ui.speedometer = Some(crate::speedometer::preview(&settings));
+        let mut vertices = Vec::new();
+        build_speedometer(&mut vertices,&ui,None,1280,800);
+        assert!(vertices.is_empty());
+        ui.strafe_helper.flags = crate::ui::SHELPER_Q3DF_SPEED;
+        ui.speedometer_settings = settings;
+        build_speedometer(&mut vertices,&ui,None,1280,800);
+        // The stale native speed number is suppressed; only native accel remains.
+        assert!(vertices.iter().all(|v| v.textured == 0.0));
+    }
+
+    #[test]
+    fn movement_components_each_extended_component_moves_independently() {
+        let mut ui = UiSnapshot::default();
+        ui.mode = crate::ui::OverlayMode::HudEdit;
+        ui.strafe_helper.flags = SHELPER_Q3DF | crate::ui::SHELPER_COMPONENT_MASK;
+        let mut original = Vec::new();
+        build_strafe_helper(&mut original,&ui,1280,800);
+        ui.hud_layout.speedometer.offset = [73.0,-41.0];
+        let mut moved = Vec::new();
+        build_strafe_helper(&mut moved,&ui,1280,800);
+        assert_eq!(original.len(),moved.len());
+        let mut changed = 0;
+        for (a,b) in original.iter().zip(&moved) {
+            if a.textured == 1.0 {
+                assert!((b.position[0]-a.position[0]-73.0*2.0/1280.0).abs()<1e-5);
+                assert!((b.position[1]-a.position[1]-41.0*2.0/800.0).abs()<1e-5);
+                changed += 1;
+            } else { assert_eq!(a.position,b.position); }
+        }
+        assert!(changed>0);
+    }
+
+    #[test]
+    fn strafehelper_readouts_do_not_suppress_legacy_lines() {
+        let mut ui = UiSnapshot::default();
+        ui.movement_hud.velocity = [700.0, 0.0, 0.0];
+        ui.movement_hud.forward_move = 127;
+        ui.movement_hud.right_move = -127;
+        ui.strafe_helper.flags |= SHELPER_UPDATED;
+        let mut lines = Vec::new();
+        build_strafe_helper(&mut lines, &ui, 1280, 720);
+        assert!(!lines.is_empty());
+        ui.strafe_helper.flags |= crate::ui::SHELPER_Q3DF_SPEED;
+        let mut combined = Vec::new();
+        build_strafe_helper(&mut combined, &ui, 1280, 720);
+        assert!(combined.len() > lines.len());
+        let guide = &combined[..lines.len()];
+        for (a, b) in guide.iter().zip(&lines) {
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.color, b.color);
+        }
+        ui.strafe_helper.flags = crate::ui::SHELPER_Q3DF_SPEED;
+        let mut readout = Vec::new();
+        build_strafe_helper(&mut readout, &ui, 1280, 720);
+        assert!(!readout.is_empty());
+        assert_eq!(readout.len()+lines.len(), combined.len());
+    }
+
+    /// Export the actual UI triangle batch, including charset UVs, for a
+    /// repeatable visual review without starting or modifying a game session.
+    #[test]
+    #[ignore = "writes visual-review artifacts; run explicitly"]
+    fn strafehelper_export_visual_review() {
+        let mut panels = Vec::new();
+        let extras = crate::ui::SHELPER_COMPONENT_MASK;
+        for (name, flags) in [
+            ("Q3DF", SHELPER_Q3DF | extras),
+            ("Xonotic", SHELPER_XONOTIC),
+            ("Warsow", SHELPER_WARSOW_HUD),
+            ("Warsow + independent Q3DF readouts", SHELPER_WARSOW_HUD | extras),
+        ] {
+            for yaw in [-30.0_f32, 0.0, 30.0] {
+                let mut ui = UiSnapshot::default();
+                ui.strafe_helper.flags = flags;
+                ui.movement_hud.velocity = [755.0, 0.0, 0.0];
+                ui.movement_hud.forward_move = 127;
+                ui.movement_hud.right_move = if yaw < 0.0 { 127 } else { -127 };
+                ui.movement_hud.view_yaw = yaw;
+                ui.movement_hud.q3df_accel_bar_width = 32.0;
+                let mut batch = Vec::new();
+                build_strafe_helper(&mut batch, &ui, 1280, 720);
+                let vertices: Vec<_> = batch.iter().map(|v| serde_json::json!({
+                    "position": v.position, "uv": v.uv, "color": v.color, "textured": v.textured,
+                })).collect();
+                panels.push(serde_json::json!({ "style": name, "yaw": yaw,
+                    "right": ui.movement_hud.right_move, "width": 1280, "height": 720,
+                    "vertices": vertices }));
+            }
+        }
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../artifacts/strafehelper-review");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("geometry.json"), serde_json::to_vec(&panels).unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod icon_atlas_quality_tests {
+    use super::*;
+
+    #[test]
+    fn every_icon_has_unique_uv_cell_in_two_dimensional_atlas() {
+        let mut previous = std::collections::HashSet::new();
+        assert!(ICON_NAMES.len() as u32 > ICON_COLUMNS);
+        for idx in 0..ICON_NAMES.len() {
+            let (min, max) = icon_cell_uv(idx);
+            assert!(min[0] >= 0.0 && min[1] >= 0.0);
+            assert!(max[0] <= 1.0 && max[1] <= 1.0);
+            assert!(min[0] < max[0] && min[1] < max[1]);
+            assert!(previous.insert((min[0].to_bits(), min[1].to_bits())));
+        }
+        assert!(ICON_COLUMNS * ICON_CELL <= 8192);
+        assert!(ICON_ROWS * ICON_CELL <= 8192);
+    }
+}
+
+#[cfg(test)]
+mod native_lagometer_icon_uv_tests {
+    use super::*;
+
+    #[test]
+    fn lagometer_uses_native_atlas_uvs() {
+        let mut ui = UiSnapshot::default();
+        ui.icon_atlas_uvs = vec![
+            ([0.125, 0.25], [0.375, 0.5]),
+            ([0.625, 0.125], [0.875, 0.375]),
+        ];
+        for (icon, index) in [
+            (crate::lagometer::Icon::Lag, 0usize),
+            (crate::lagometer::Icon::Net, 1),
+        ] {
+            let mut vertices = Vec::new();
+            let pic = crate::lagometer::Pic {
+                icon, x: 8.0, y: 16.0, w: 48.0, h: 48.0,
+            };
+            lagometer_pic(&mut vertices, &pic, &ui, 640, 480);
+            assert_eq!(vertices.len(), 6);
+            let (min, max) = ui.icon_atlas_uvs[index];
+            for vertex in &vertices {
+                assert!(vertex.uv[0] == min[0] || vertex.uv[0] == max[0]);
+                assert!(vertex.uv[1] == min[1] || vertex.uv[1] == max[1]);
+                assert_eq!(vertex.textured, ICON_TEXTURE_SOURCE);
+            }
+        }
     }
 }

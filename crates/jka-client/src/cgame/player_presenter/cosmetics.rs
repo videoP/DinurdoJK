@@ -33,6 +33,67 @@ pub(in crate::cgame::player_presenter) fn model_bolt_matrix_timed(
     result
 }
 
+/// Source/UE character hand-tag transfer currently leaves the secondary grip
+/// with its Y and Z axes inverted relative to native Ghoul2 tags. Comparing the
+/// same BOTH_WALK_DUAL pose showed ~169° difference on Y and ~163° on Z, while
+/// X (the wrist's long axis) differed by only ~19°. A half-turn *around the
+/// existing bolt's local X* corrects the hilt AND blade without changing the
+/// origin, skin pose, finger joints, or primary saber.
+///
+/// Apply this to the hilt attachment only: the rest of the player's hand bolts
+/// (weapon placement/cosmetics/etc.) keep their authored transforms. This is
+/// deliberately gated by import provenance, not the presence of native pivots:
+/// native GLMs with body-shape edits may also have those pivots.
+pub(in crate::cgame::player_presenter) fn saber_hand_bolt_matrix_timed(
+    perf: &mut Ghoul2PerfStats,
+    model: &PlayerModelAsset,
+    pose: &[Matrix3x4],
+    hand_name: &str,
+) -> Result<Option<Matrix3x4>, String> {
+    let Some(mut bolt) = model_bolt_matrix_timed(
+        perf, &model.glm, &model.gla, pose, hand_name,
+    )? else { return Ok(None); };
+    if model.source_imported && hand_name.eq_ignore_ascii_case("*l_hand") {
+        // Postmultiply the attachment frame by Rx(PI). The hand-tag origin and
+        // +X axis stay fixed; the +Y and +Z directions flip together.
+        for row in &mut bolt {
+            row[1] = -row[1];
+            row[2] = -row[2];
+        }
+    }
+    Ok(Some(bolt))
+}
+
+#[cfg(test)]
+mod imported_saber_hand_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_grip_roll_keeps_the_hilt_in_the_wrist() {
+        // Matrix from the actual faulty Source attachment diagnostic.
+        let mut bolt: Matrix3x4 = [
+            [0.10587881, -0.878925, 0.4650597, 101.64956],
+            [-0.6237606, 0.30552548, 0.71942824, -8.945267],
+            [-0.7744111, -0.3662581, -0.5158901, -14.922962],
+        ];
+        let original = bolt;
+        for row in &mut bolt { row[1] = -row[1]; row[2] = -row[2]; }
+        for r in 0..3 {
+            assert_eq!(bolt[r][0], original[r][0]);
+            assert_eq!(bolt[r][1], -original[r][1]);
+            assert_eq!(bolt[r][2], -original[r][2]);
+            assert_eq!(bolt[r][3], original[r][3]);
+        }
+        let source_blade_dir = [0.45652887_f32, 0.72276306, -0.51884013];
+        // Under a rigid hilt attachment the blade points along hand +Z;
+        // correcting the Y/Z roll turns that 163° mismatch into ~17°.
+        let corrected = source_blade_dir.map(|v| -v);
+        let native_blade_dir = [-0.55082864_f32, -0.48528558, 0.679033];
+        let dot: f32 = (0..3).map(|i| corrected[i] * native_blade_dir[i]).sum();
+        assert!(dot > 0.90, "corrected source blade must align with the native blade");
+    }
+}
+
 /// Profile is intentionally studio-lit rather than map-lightgrid-lit. Bake
 /// an ambient bounce + front key/fill + restrained back rim into preview-only
 /// vertex lighting. All terms multiply the *existing* material/tint color:
@@ -188,5 +249,34 @@ impl super::PlayerPresenter {
             .unwrap_or([0.0; 3]);
         self.global_cosmetic_offsets.insert(key, offset);
         offset
+    }
+}
+
+impl super::PlayerPresenter {
+    /// Build a stable local lookup once, not by relying on different clients'
+    /// package indexing or scanning PK3 contents for every player every frame.
+    pub(in crate::cgame::player_presenter) fn packed_cosmetic_name(
+        &mut self, slot: crate::global_cosmetics::Slot, hash: u32,
+    ) -> Option<String> {
+        if hash == 0 { return None; }
+        if self.packed_cosmetic_assets.is_none() {
+            let mut found: std::collections::HashMap<(u8, u32), Option<String>> = std::collections::HashMap::new();
+            for path in self.assets.names() {
+                for kind in [crate::global_cosmetics::Slot::Hat, crate::global_cosmetics::Slot::Cape] {
+                    let prefix = format!("{}/", kind.model_dir());
+                    let Some(name) = path.strip_prefix(&prefix).and_then(|p| p.strip_suffix(".md3")) else { continue; };
+                    if !crate::global_cosmetics::valid_name(name) { continue; }
+                    let key = (kind as u8, crate::profile_wire::cosmetic_id(name));
+                    match found.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(Some(name.to_owned())); }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if entry.get().as_deref() != Some(name) { entry.insert(None); }
+                        }
+                    }
+                }
+            }
+            self.packed_cosmetic_assets = Some(found);
+        }
+        self.packed_cosmetic_assets.as_ref()?.get(&(slot as u8, hash))?.clone()
     }
 }

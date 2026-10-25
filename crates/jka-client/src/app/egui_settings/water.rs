@@ -61,7 +61,7 @@ impl App {
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
         let current = self.ocean_type();
         theme::section(ui, "WATER PROMOTION", "Choose how map water is promoted. Off keeps stock JKA water.");
-        theme::row(ui, "Water renderer", "Lakes / ponds uses flat water with wind ripples and freshwater optics, without ocean FFT or an infinite horizon. Gerstner is Hybrid with godot-water-shader's waves, colour and persistent foam, lit by Blue Water. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
+        theme::row(ui, "Water renderer", "Lakes / ponds uses subtle noise relief, wind ripples and editable water colors, without ocean FFT or an infinite horizon. Gerstner is Hybrid with godot-water-shader's waves, colour and persistent foam, lit by Blue Water. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
             for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (5, "Gerstner"), (4, "Lakes / ponds")] {
                 if theme::chip(ui, label, mode == current).clicked() && mode != current {
                     self.set_ocean_type(mode);

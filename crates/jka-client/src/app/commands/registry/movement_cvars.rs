@@ -301,7 +301,7 @@ app_cvars! {
     }
 
     APP_CG_STRAFEHELPER {
-        runtime: CvarDef::new("cg_strafeHelper", "", "bitmask", "TaystJK Strafehelper style/direction bitmask, plus DinurdoJK Cinematic world-space style bit 2097152.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper(app)), |app, value| App::cvar_set_cg_strafehelper(app, APP_CG_STRAFEHELPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper, None),
+        runtime: CvarDef::new("cg_strafeHelper", "", "bitmask", "Strafehelper style/direction bitmask: TaystJK bits 0..21; Xonotic (1<<22), Q3 DeFRaG CGaz (1<<23); mode extras in 24..29; Warsow/Warfork triangular StrafeHUD bit 30.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper(app)), |app, value| App::cvar_set_cg_strafehelper(app, APP_CG_STRAFEHELPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     if let Ok(flags) = value.trim().parse::<u32>() {
@@ -325,6 +325,8 @@ app_cvars! {
                             .trim()
                             .parse::<u32>()
                             .map_err(|_| "cg_strafeHelper: expected a non-negative bitmask".to_owned())?;
+                        ui::movement_components::normalize(&mut self.strafe_helper.flags,
+                            &mut self.japro_cg.speedometer.flags);
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
@@ -335,7 +337,7 @@ app_cvars! {
     }
 
     APP_CG_STRAFEHELPER_FPS {
-        runtime: CvarDef::new("cg_strafeHelper_FPS", "", "0..1000", "Strafehelper physics FPS override; 0 follows com_maxfps, then falls back to 125 when uncapped.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper_fps(app)), |app, value| App::cvar_set_cg_strafehelper_fps(app, APP_CG_STRAFEHELPER_FPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper_fps, None),
+        runtime: CvarDef::new("cg_strafeHelper_FPS", "", "0..1000", "Strafehelper physics FPS override; 0 uses movement cadence/server fixed Pmove for Xonotic/Q3DF/Warsow, and com_maxfps (125 uncapped) for TaystJK styles.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper_fps(app)), |app, value| App::cvar_set_cg_strafehelper_fps(app, APP_CG_STRAFEHELPER_FPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper_fps, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     let finite = || {

@@ -251,7 +251,8 @@ pub struct Stage {
     pub image: String,
     pub animation: Option<ImageAnimation>,
     pub clamp: bool,
-    /// `videoMap`: `image` names a looping RoQ cinematic instead of a texture.
+    /// `videoMap`: `image` names a looping RoQ cinematic (optionally promoted
+    /// to a same-stem H.264 MP4 by the modern client) instead of a texture.
     pub video: bool,
     /// Rend2 material companion maps authored directly on this diffuse stage.
     pub normal_map: Option<String>,
@@ -669,16 +670,17 @@ fn parse_surface_sprite(args: &[String]) -> Result<SurfaceSprite, String> {
 }
 
 fn surface_sprite_value(args: &[String], name: &str) -> Result<f32, String> {
-    args.first()
-        .ok_or_else(|| format!("{name} expects one numeric parameter"))?
-        .parse::<f32>()
-        .map_err(|_| format!("invalid {name} value"))
-        .and_then(|value| {
-            value
-                .is_finite()
-                .then_some(value)
-                .ok_or_else(|| format!("invalid {name} value"))
-        })
+    let raw = args
+        .first()
+        .ok_or_else(|| format!("{name} expects one numeric parameter"))?;
+    // TaystJK's ParseSurfaceSpritesOptional calls C atof(), so trailing
+    // nonnumeric text is ignored: Chocobo v3 uses `ssWind 0.3s` (= 0.3).
+    // Reuse our existing legacy-shader numeric-prefix parser.
+    raw.parse::<f32>()
+        .ok()
+        .or_else(|| atof_prefix(raw))
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("invalid {name} value"))
 }
 
 /// Quake shader statements are line-oriented; braces delimit shaders and stages.
@@ -1094,6 +1096,11 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                         let value = surface_sprite_value(args, "ssWind")?;
                         if let Some(sprite) = &mut stage.surface_sprite {
                             sprite.wind = value.max(0.0);
+                            // TaystJK copies ssWind to ssWindIdle unless the
+                            // latter has already been set to a positive value.
+                            if sprite.wind_idle <= 0.0 {
+                                sprite.wind_idle = sprite.wind;
+                            }
                         }
                     }
                     "sswindidle" => {
@@ -1831,7 +1838,79 @@ clampanimmap 2 textures/test/a1 textures/test/a2
         assert_eq!(sprite.fade_scale, 1.0);
         assert_eq!(sprite.variance, [1.0, 2.0]);
         assert_eq!(sprite.wind, 0.5);
+        assert_eq!(sprite.wind_idle, 0.5); // TaystJK ssWind default
     }
+
+    #[test]
+    fn chocobo_swampsprite_keeps_both_stages_and_native_sprites() {
+        // The map's authored `ssWind 0.3s` must be parsed like TaystJK's atof.
+        let src = r#"
+textures/test/before { { map textures/test/a } }
+textures/chocobo_v3/chocobov3_swampsprite
+{
+    qer_trans 0.5
+    qer_editorimage textures/chocobo_v3/chocobov3_swampsprite
+    surfaceparm nomarks
+    surfaceparm trans
+    surfaceparm nonsolid
+    q3map_material ShortGrass
+    q3map_nolightmap
+    polygonOffset
+    {
+        map textures/chocobo_v3/chocobov3_void
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        alphaFunc LT128
+    }
+    {
+        map textures/chocobo_v3/chocobov3_swampgrass
+        surfaceSprites vertical 32 40 65 600
+        ssFademax 8000
+        ssFadescale 1
+        ssVariance 1 2
+        ssWind 0.3s
+        alphaFunc GE128
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        depthWrite
+        rgbGen vertex
+    }
+}
+textures/test/after { { map textures/test/b } }
+"#;
+        let (shaders, warnings) = parse_recovering(src).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(shaders.contains_key("textures/test/before"));
+        assert!(shaders.contains_key("textures/test/after"));
+        let material = &shaders["textures/chocobo_v3/chocobov3_swampsprite"];
+        assert!(material.polygon_offset);
+        assert_eq!(material.stages.len(), 2);
+        assert_eq!(material.stages[0].image, "textures/chocobo_v3/chocobov3_void");
+        assert_eq!(material.stages[0].alpha_test, "lt128");
+        assert_eq!(material.stages[1].image, "textures/chocobo_v3/chocobov3_swampgrass");
+        assert_eq!(material.stages[1].alpha_test, "ge128");
+        assert!(material.stages[1].depth_write);
+        assert_eq!(material.stages[1].rgb_gen, RgbGen::Vertex);
+        let sprite = material.stages[1].surface_sprite.expect("native grass emitter");
+        assert_eq!(sprite.kind, SurfaceSpriteType::Vertical);
+        assert_eq!((sprite.width, sprite.height, sprite.density), (32.0, 40.0, 65.0));
+        assert_eq!((sprite.fade_dist, sprite.fade_max, sprite.fade_scale), (600.0, 8000.0, 1.0));
+        assert_eq!(sprite.variance, [1.0, 2.0]);
+        assert_eq!((sprite.wind, sprite.wind_idle), (0.3, 0.3));
+    }
+
+    #[test]
+    fn surface_sprite_numbers_use_taystjk_numeric_prefixes() {
+        let value = |v: &str| surface_sprite_value(&[v.to_owned()], "ssWind");
+        assert_eq!(value("0.3s"), Ok(0.3));
+        assert_eq!(value("-.5seconds"), Ok(-0.5));
+        assert_eq!(value("1E"), Ok(1.0));
+        assert!(value("not-a-number").is_err());
+        assert!(value(".").is_err());
+
+        let shaders = parse("textures/test/wind {\n{\nsurfaceSprites vertical 32 40 65 600\nssWindIdle 0.6\nssWind 0.3\n}\n}\n").unwrap();
+        let sprite = shaders["textures/test/wind"].stages[0].surface_sprite.unwrap();
+        assert_eq!((sprite.wind, sprite.wind_idle), (0.3, 0.6));
+    }
+
     #[test]
     fn parses_jka_effect_surface_sprite_controls() {
         let shaders = parse(

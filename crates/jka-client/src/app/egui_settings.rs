@@ -16,6 +16,7 @@ mod glass;
 mod image;
 mod interface;
 mod lighting;
+mod materials;
 mod mod_options;
 mod models;
 mod optimizations;

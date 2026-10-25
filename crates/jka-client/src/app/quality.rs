@@ -79,6 +79,43 @@ impl QualityPreset {
             return settings;
         }
 
+        // High is Medium with the requested upgrades.
+        if self == Self::High {
+            let mut settings = Self::Medium.settings();
+            for (name, value) in &mut settings {
+                match *name {
+                    "r_ext_multisample" => *value = "4",
+                    "r_promoteFxLights" => *value = "2",
+                    "r_dynamicLights" => *value = "clustered_lite",
+                    "r_deluxeSpecular" => *value = "1",
+                    "r_dynamicShadows" => *value = "csm",
+                    "r_glassPromotion" => *value = "1",
+                    "r_hdr" => *value = "1",
+                    "r_ocean" => *value = "1",
+                    _ => {}
+                }
+            }
+            return settings;
+        }
+
+        // Ultra is High with ray-traced lights, hybrid CSM/RT shadows and TAA.
+        if self == Self::Ultra {
+            let mut settings = Self::High.settings();
+            for (name, value) in &mut settings {
+                match *name {
+                    // TAA intentionally disables MSAA; the preset must match that state.
+                    "r_ext_multisample" => *value = "0",
+                    "r_taa" => *value = "1",
+                    "r_dynamicLights" => *value = "ray_traced",
+                    "r_dynamicShadows" => *value = "hybrid_csm_rt_entities",
+                    "r_hdr" => *value = "1",
+                    _ => {}
+                }
+            }
+            settings.push(("r_rtSamples", "4"));
+            return settings;
+        }
+
         let table: &'static [(&'static str, &'static str)] = match self {
             Self::Minimal | Self::MinimalUnified => &[
                 // The cvar's canonical "off" value is 0; the setter maps both
@@ -86,9 +123,10 @@ impl QualityPreset {
                 // lets active_quality_preset() compare against the getter.
                 ("r_ext_multisample", "0"),
                 ("r_maxFrameLatency", "2"),
+                ("r_picmip", "3"),
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
-                ("r_texturemode", "GL_LINEAR_MIPMAP_NEAREST"),
+                ("r_texturemode", "GL_LINEAR_MIPMAP_LINEAR"),
                 ("r_detailTextures", "off"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
@@ -134,10 +172,12 @@ impl QualityPreset {
                 ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
+                ("r_glassPromotion", "0"),
             ],
             Self::Low => &[
                 ("r_ext_multisample", "2"),
                 ("r_maxFrameLatency", "2"),
+                ("r_picmip", "0"),
                 ("fx_physics", "2"),
                 ("r_promoteFxLights", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
@@ -188,128 +228,10 @@ impl QualityPreset {
                 ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
+                ("r_glassPromotion", "0"),
             ],
-            Self::High => &[
-                ("r_maxFrameLatency", "2"),
-                ("fx_physics", "3"),
-                ("r_promoteFxLights", "1"),
-                // SMAA is the preset AA mode. Post-process AA and MSAA are
-                // mutually exclusive in set_console_cvar(), so describe the
-                // normalized single-sample state instead of asking for both.
-                ("r_ext_multisample", "0"),
-                ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "1"),
-                ("r_hdr", "1"),
-                ("r_floatLightmap", "0"),
-                ("r_tonemap", "1"),
-                ("r_autoExposure", "1"),
-                ("r_glow", "combined"),
-                ("r_halation", "0"),
-                ("r_ssao", "1"),
-                ("r_staticBspAo", "0"),
-                ("r_staticBspAoSamples", "8"),
-                ("r_staticBspAoResolution", "1"),
-                ("r_fxaa", "0"),
-                ("r_smaa", "1"),
-                ("r_taa", "0"),
-                ("r_contactShadows", "0"),
-                ("r_drawfog", "2"),
-                ("r_sunVisibility", "sky"),
-                ("r_distanceCullScale", "0"),
-                ("r_clouds", "1"),
-                ("r_cloudQuality", "0.70"),
-                ("r_cloudRenderResolution", "half"),
-                ("r_cloudShadows", "1"),
-                ("r_cloudTemporal", "1"),
-                ("r_cloudTemporalDepthFix", "1"),
-                ("r_grass", "1"),
-                ("r_ocean", "0"),
-                ("r_oceanMapSize", "512"),
-                ("r_oceanMeshQuality", "1"),
-                ("r_oceanUpdates", "48"),
-                ("r_footprints", "3d"),
-                ("r_reflectionQuality", "medium"),
-                ("r_chromaticAberration", "0"),
-                ("r_vignette", "1"),
-                ("r_filmGrain", "0"),
-                ("r_motionBlur", "0"),
-                ("r_depthOfField", "0"),
-                ("r_dofQuality", "adaptive"),
-                ("r_colorLut", "fuji_velvia_50"),
-                ("r_colorLutStrength", "0.500"),
-                ("r_lodbias", "0"),
-                ("r_entityAmbientLighting", "bevy_irradiance_volume"),
-                ("r_dynamicLights", "forward_plus"),
-                ("r_pbr", "1"),
-                ("r_genNormalMaps", "1"),
-                ("r_deluxeMapping", "1"),
-                ("r_deluxeSpecular", "0"),
-                ("r_dynamicShadows", "csm"),
-                ("r_emissiveAreaLights", "0"),
-                ("r_voxelProbeGI", "0"),
-                ("r_localLightShadows", "0"),
-            ],
-            Self::Ultra => &[
-                ("r_maxFrameLatency", "2"),
-                ("fx_physics", "3"),
-                ("r_promoteFxLights", "1"),
-                // TAA is the preset AA mode; enabling it intentionally disables
-                // MSAA, so the preset must match that final state.
-                ("r_ext_multisample", "0"),
-                ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "1"),
-                ("r_hdr", "1"),
-                ("r_floatLightmap", "1"),
-                ("r_tonemap", "1"),
-                ("r_autoExposure", "1"),
-                ("r_glow", "combined"),
-                ("r_halation", "1"),
-                ("r_ssao", "1"),
-                ("r_staticBspAo", "0"),
-                ("r_staticBspAoSamples", "8"),
-                ("r_staticBspAoResolution", "1"),
-                ("r_fxaa", "0"),
-                ("r_smaa", "0"),
-                ("r_taa", "1"),
-                ("r_contactShadows", "1"),
-                ("r_drawfog", "3"),
-                ("r_sunVisibility", "filtered"),
-                ("r_distanceCullScale", "0"),
-                ("r_clouds", "1"),
-                ("r_cloudQuality", "1.0"),
-                ("r_cloudRenderResolution", "full"),
-                ("r_cloudShadows", "1"),
-                ("r_cloudTemporal", "1"),
-                ("r_cloudTemporalDepthFix", "1"),
-                ("r_grass", "1"),
-                ("r_ocean", "1"),
-                ("r_oceanMapSize", "1024"),
-                ("r_oceanMeshQuality", "1"),
-                ("r_oceanUpdates", "60"),
-                ("r_oceanSeaSpray", "1"),
-                ("r_oceanWindFoam", "1"),
-                ("r_footprints", "3d"),
-                ("r_reflectionQuality", "high"),
-                ("r_chromaticAberration", "0"),
-                ("r_vignette", "1"),
-                ("r_filmGrain", "0"),
-                ("r_motionBlur", "0"),
-                ("r_depthOfField", "0"),
-                ("r_dofQuality", "high"),
-                ("r_colorLut", "fuji_velvia_50"),
-                ("r_colorLutStrength", "0.500"),
-                ("r_lodbias", "0"),
-                ("r_entityAmbientLighting", "bevy_irradiance_volume"),
-                ("r_dynamicLights", "forward_plus"),
-                ("r_pbr", "1"),
-                ("r_genNormalMaps", "1"),
-                ("r_deluxeMapping", "1"),
-                ("r_deluxeSpecular", "1"),
-                ("r_dynamicShadows", "csm"),
-                ("r_emissiveAreaLights", "1"),
-                ("r_voxelProbeGI", "1"),
-                ("r_localLightShadows", "1"),
-            ],
+            Self::High => unreachable!("High derives from Medium above"),
+            Self::Ultra => unreachable!("Ultra derives from High above"),
             Self::Medium => unreachable!("Medium derives from Low above"),
         };
         let mut settings = table.to_vec();
@@ -318,8 +240,7 @@ impl QualityPreset {
         let (subdivisions, curve_error, model_scale) = match self {
             Self::Minimal | Self::MinimalUnified => ("12", "125", "5"),
             Self::Low => ("8", "125", "5"),
-            Self::High | Self::Ultra => ("1", "2500", "100"),
-            Self::Medium => unreachable!("Medium derives from Low above"),
+            Self::Medium | Self::High | Self::Ultra => unreachable!("derived presets return above"),
         };
         settings.extend([
             ("r_subdivisions", subdivisions),

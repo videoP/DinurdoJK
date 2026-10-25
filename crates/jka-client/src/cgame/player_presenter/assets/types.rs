@@ -167,6 +167,9 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     pub(in crate::cgame::player_presenter) retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
     /// Anatomical pivots for Source models or shaped native GLM players.
     pub(in crate::cgame::player_presenter) source_native_pivots: Option<Arc<Vec<[f32; 3]>>>,
+    /// Set only by the Source/UE import path, NOT by native body shaping.
+    /// Affects the secondary saber's attachment frame, never the player pose.
+    pub(in crate::cgame::player_presenter) source_imported: bool,
     /// Extra procedural bones appended after GLA matrices for Source players.
     pub(in crate::cgame::player_presenter) source_jiggles: Option<Arc<Vec<jka_assets::source1_rig::SourceJiggleBinding>>>,
     pub(in crate::cgame::player_presenter) source_jiggles_enabled: bool,

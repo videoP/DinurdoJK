@@ -9,7 +9,8 @@ impl App {
             "EXTENSIONS / RHAI",
             "Edit scripts directly in-game. Save & Reload recompiles on the extension worker; external file edits are detected automatically.",
         );
-        ui.label(format!("Directory: {}", self.extensions.root().display()));
+        ui.label(format!("Local extensions and preferences: {}", self.extensions.root().display()));
+        ui.label("Loads extensions/ from the active game and base, including PK3s, using normal asset precedence.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("RESCAN").clicked() { self.extensions.refresh(); }
@@ -77,14 +78,15 @@ impl App {
                     if self.extensions.editor_dirty {
                         ui.label("Unsaved editor changes");
                     }
+                    if !entry.editable { ui.label("Packaged script (read-only). Edit its source package to make changes."); }
                     let editor = egui::TextEdit::multiline(&mut self.extensions.editor)
                         .code_editor()
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                         .desired_rows(19);
-                    if ui.add(editor).changed() { self.extensions.editor_dirty = true; }
+                    if ui.add_enabled(entry.editable, editor).changed() { self.extensions.editor_dirty = true; }
                     ui.horizontal(|ui| {
-                        if ui.button("SAVE & RELOAD").clicked() {
+                        if ui.add_enabled(entry.editable, egui::Button::new("SAVE & RELOAD")).clicked() {
                             self.extensions.save_selected();
                         }
                         if ui.button("RELOAD FROM DISK").clicked() {

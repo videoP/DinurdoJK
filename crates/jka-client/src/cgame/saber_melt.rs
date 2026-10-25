@@ -18,9 +18,9 @@
 //! After the metal has sat cold for a while every chunk eases back to the
 //! original geometry and is dropped.
 //!
-//! Rendering is split in two: a lit alpha-blended relief skin (real raised
-//! geometry with proper normals, so grid/dynamic lights shade it) and an
-//! additive emissive layer. Nothing here touches gameplay or prediction.
+//! Rendering is split in two: an opaque, depth-writing lit relief skin (with
+//! geometry clipped to the burn footprint and sunk into the supporting BSP
+//! at its contour) and a separate additive emissive layer. Nothing here touches gameplay or prediction.
 
 use crate::fx::system::{FxDraw, FxLight, FxLightKind};
 use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE, ENTITY_WORLD};
@@ -45,7 +45,7 @@ const OFF_I: i32 = OFF as i32;
 const PAD: usize = CH + 2 * OFF + 1;
 const PP: usize = PAD * PAD;
 /// World-unit spacing of the collision probes that make the relief conform.
-const PROBE_STRIDE: usize = 4;
+const PROBE_STRIDE: usize = 2;
 const PROBES: usize = CH / PROBE_STRIDE + 1;
 const PROBE_REACH: f32 = 3.0;
 const PROBE_TOLERANCE: f32 = 1.6;
@@ -87,9 +87,9 @@ const STROKE_BREAK_MS: i32 = 140;
 const SURFACE_PLANE_TOLERANCE: f32 = 0.9;
 const SURFACE_NORMAL_DOT: f32 = 0.985;
 
-const MAX_SURFACES: usize = 16;
-const MAX_CHUNKS: usize = 200;
-const HARD_MAX_CHUNKS: usize = 320;
+const MAX_SURFACES: usize = 8;
+const MAX_CHUNKS: usize = 64;
+const HARD_MAX_CHUNKS: usize = 96;
 const MAX_BUBBLES_PER_CHUNK: usize = 14;
 const MAX_DROPLETS: usize = 24;
 const MAX_EVENTS_PER_UPDATE: usize = 6;
@@ -97,11 +97,21 @@ const MAX_EVENTS_PER_UPDATE: usize = 6;
 // ---- Look tuning ------------------------------------------------------------
 /// World units of relief per unit of frozen/molten mass.
 const LIP_HEIGHT: f32 = 3.4;
-/// Groove depth used for shading normals (the skin itself cannot dip below the
-/// wall, so the cavity is conveyed by lighting, darkening and the raised lips).
+/// Groove depth used for shading normals (true BSP cutting is not supported;
+/// the visible scorch/slag edge is embedded, with a normal-mapped cavity).
 const GROOVE_DEPTH: f32 = 1.9;
-const SKIN_BIAS: f32 = 0.22;
-const GLOW_LIFT: f32 = 0.05;
+/// Solid scorch is CLIPPED rather than alpha-blended. At the last contour
+/// vertex, push the mesh just behind the BSP surface so grazing angles have
+/// no hovering rim. Interior displacement stays positive.
+const SKIN_BIAS: f32 = 0.025;
+const EDGE_EMBED: f32 = 0.055;
+const SKIN_CONTOUR: f32 = 0.16;
+const GLOW_LIFT: f32 = 0.035;
+/// Only high-detail tessellate chunks close to the camera; this does not
+/// increase the cost of heat simulation or collision probes.
+const NEAR_MESH_DISTANCE: f32 = 480.0;
+/// Wall albedo controls the *pigment* of cooled char, never the emissive core.
+const WALL_COLOR_STRENGTH: f32 = 0.38;
 const EMIT_RANGE: f32 = 6000.0;
 const DROPLET_GRAVITY: f32 = 620.0;
 const DROPLET_LIFE_MS: i32 = 1200;
@@ -143,6 +153,18 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 fn lerp3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
     [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
+}
+
+/// Material albedo is expressed in linear RGB. Darken/desaturate it into
+/// char; normalize extreme luminances so white stone does not turn into white
+/// soot and dark metal does not become an invisible pure-black rim.
+fn burnt_material_color(wall: Vec3) -> Vec3 {
+    let luma = (wall[0] * 0.2126 + wall[1] * 0.7152 + wall[2] * 0.0722).clamp(0.0, 1.0);
+    let neutral = [luma; 3];
+    let muted = lerp3(neutral, wall, 0.48);
+    let brightness = 0.085 + 0.027 * luma.sqrt();
+    let denom = luma.max(0.045);
+    std::array::from_fn(|i| (brightness * (muted[i] / denom).clamp(0.45, 1.50)).clamp(0.035, 0.16))
 }
 
 fn hash2(i: i32, j: i32) -> f32 {
@@ -231,6 +253,8 @@ struct Chunk {
     touched_ms: i32,
     /// Over the chunk budget: skip the cold hold and revert quickly, then drop.
     evicting: bool,
+    /// Low-frequency local material albedo, sampled from BSP UVs at contact.
+    wall_color: Option<Vec3>,
 }
 
 impl Chunk {
@@ -245,6 +269,7 @@ impl Chunk {
             last_pop_ms: i32::MIN / 2,
             touched_ms: now,
             evicting: false,
+            wall_color: None,
         }
     }
 }
@@ -443,7 +468,21 @@ impl SaberMelt {
         position: Vec3,
         normal: Vec3,
         now: i32,
+        world: Option<&mut W>,
+    ) -> f32 {
+        self.contact_colored(stroke, position, normal, now, world, None)
+    }
+
+    /// Same melt physics, with a material-color sample from the struck BSP
+    /// base texture. `None` preserves the neutral appearance on test geometry.
+    pub fn contact_colored<W: TraceWorld>(
+        &mut self,
+        stroke: u32,
+        position: Vec3,
+        normal: Vec3,
+        now: i32,
         mut world: Option<&mut W>,
+        wall_color: Option<Vec3>,
     ) -> f32 {
         let normal = normalize(normal);
         let previous = self.strokes.get(&stroke).copied();
@@ -485,7 +524,7 @@ impl SaberMelt {
         };
         for k in 1..=substeps {
             let t = k as f32 / substeps as f32;
-            self.deposit(si, lerp(x0, x, t), lerp(y0, y, t), per_sub, sigma, now, world.as_deref_mut());
+            self.deposit(si, lerp(x0, x, t), lerp(y0, y, t), per_sub, sigma, now, world.as_deref_mut(), wall_color);
         }
         self.strokes.insert(stroke, StrokeState { surface: si, x, y, last_ms: now, born_ms });
         self.surfaces[si].touched_ms = now;
@@ -531,6 +570,7 @@ impl SaberMelt {
         sigma: f32,
         now: i32,
         mut world: Option<&mut W>,
+        wall_color: Option<Vec3>,
     ) {
         let reach = (3.0 * sigma).ceil() as i32;
         let (ci, cj) = (cx.round() as i32, cy.round() as i32);
@@ -544,6 +584,16 @@ impl SaberMelt {
         let two_sigma_sq = 2.0 * sigma * sigma;
         let max_d2 = (3.0 * sigma).powi(2);
         let surface = &mut self.surfaces[si];
+        if let Some(color) = wall_color {
+            // One filtered color per touched chunk. Keep it stable as the blade
+            // moves; a long stroke can still transition between different
+            // painted areas without storing a material texture per vertex.
+            for ky in lo_y..=hi_y { for kx in lo_x..=hi_x {
+                if let Some(chunk) = surface.chunks.get_mut(&(kx, ky)) {
+                    chunk.wall_color = Some(chunk.wall_color.map_or(color, |old| lerp3(old, color, 0.08)));
+                }
+            } }
+        }
         for gj in (cj - reach)..=(cj + reach) {
             for gi in (ci - reach)..=(ci + reach) {
                 let d2 = (gi as f32 - cx).powi(2) + (gj as f32 - cy).powi(2);
@@ -849,6 +899,14 @@ impl SaberMelt {
     pub fn emit(&self, now: i32, view: Vec3, draws: &mut Vec<FxDraw>, lights: &mut Vec<FxLight>) {
         let mut hot: Vec<(f32, Vec3)> = Vec::new();
         for surface in &self.surfaces {
+            // One detail level per continuous wall plane avoids T-junctions
+            // when neighbouring chunks share a seam at the LOD threshold.
+            let detail = if surface.chunks.keys().any(|&(kx, ky)| {
+                let c = surface.node_pos((kx * CH_I + CH_I / 2) as f32,
+                                         (ky * CH_I + CH_I / 2) as f32, 0.0);
+                let d = sub(c, view);
+                dot(d, d) < NEAR_MESH_DISTANCE * NEAR_MESH_DISTANCE
+            }) { 2 } else { 1 };
             for (&key, chunk) in &surface.chunks {
                 let centre = surface.node_pos(
                     (key.0 * CH_I) as f32 + CH as f32 * 0.5,
@@ -859,7 +917,7 @@ impl SaberMelt {
                 if dot(d, d) > EMIT_RANGE * EMIT_RANGE {
                     continue;
                 }
-                emit_chunk(surface, key, chunk, now, draws);
+                emit_chunk(surface, key, chunk, now, detail, draws);
                 if chunk.peak > 0.22 {
                     let (mut best, mut at) = (0.0_f32, 0usize);
                     for (i, &h) in chunk.f[F_HEAT].iter().enumerate() {
@@ -898,7 +956,7 @@ impl SaberMelt {
                 rgba: [255, 150, 40, 255],
                 shader: "gfx/effects/whiteGlow".to_owned(),
             });
-            draws.push(FxDraw::Sprite {
+            draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin: d.pos,
                 radius: 0.8,
                 rotation: 0.0,
@@ -1050,13 +1108,121 @@ fn step_chunk(surface: &Surface, key: (i32, i32), p: &Padded, decay: f32) -> Box
 
 // ---- Emission ---------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct Vertex {
     pos: Vec3,
+    /// The world-space BSP support point before any raised geometry.
+    wall_pos: Vec3,
     normal: Vec3,
     skin: [u8; 4],
     glow: [u8; 3],
-    skin_a: f32,
-    glow_a: f32,
+    /// Opaque polygon's signed contour value; never used as framebuffer alpha.
+    coverage: f32,
+    valid: bool,
+}
+
+/// Bilinear sampling of the existing coarse simulation onto the *render-only*
+/// grid. The padded grid includes neighbouring chunks, so seams stay stable.
+fn field_at(field: &[f32; PP], x: f32, y: f32) -> f32 {
+    let x = (x + OFF as f32).clamp(0.0, (PAD - 1) as f32);
+    let y = (y + OFF as f32).clamp(0.0, (PAD - 1) as f32);
+    let ix = (x.floor() as usize).min(PAD - 2);
+    let iy = (y.floor() as usize).min(PAD - 2);
+    let tx = x - ix as f32;
+    let ty = y - iy as f32;
+    let i = iy * PAD + ix;
+    lerp(lerp(field[i], field[i + 1], tx), lerp(field[i + PAD], field[i + PAD + 1], tx), ty)
+}
+
+/// Collision probes are shared by the simulation and the visual mesh. Never
+/// interpolate across a missing support sample: doing so was responsible for
+/// see-through wedges spilling over wall and door edges.
+fn supported_at(p: &Padded, x: f32, y: f32) -> bool {
+    let x = x + OFF as f32;
+    let y = y + OFF as f32;
+    let ix = x.floor() as usize;
+    let iy = y.floor() as usize;
+    if ix >= PAD - 1 || iy >= PAD - 1 { return false; }
+    let fx = x - ix as f32;
+    let fy = y - iy as f32;
+    let i = iy * PAD + ix;
+    p.valid[i]
+        && (fx <= 1.0e-5 || p.valid[i + 1])
+        && (fy <= 1.0e-5 || p.valid[i + PAD])
+        && (fx <= 1.0e-5 || fy <= 1.0e-5 || p.valid[i + PAD + 1])
+}
+
+fn edge_vertex(a: Vertex, b: Vertex, surface_normal: Vec3) -> Vertex {
+    let denominator = b.coverage - a.coverage;
+    let t = if denominator.abs() < 1.0e-7 {
+        0.5
+    } else {
+        ((SKIN_CONTOUR - a.coverage) / denominator).clamp(0.0, 1.0)
+    };
+    let wall_pos = lerp3(a.wall_pos, b.wall_pos, t);
+    let mut rgb = [0u8; 4];
+    let mut glow = [0u8; 3];
+    for j in 0..3 {
+        rgb[j] = lerp(a.skin[j] as f32, b.skin[j] as f32, t).round() as u8;
+        glow[j] = lerp(a.glow[j] as f32, b.glow[j] as f32, t).round() as u8;
+    }
+    rgb[3] = 255;
+    // Genuine contour, not a transparent vertex floating above the BSP.
+    Vertex {
+        pos: madd(wall_pos, surface_normal, -EDGE_EMBED),
+        wall_pos,
+        normal: surface_normal,
+        skin: rgb,
+        glow,
+        coverage: SKIN_CONTOUR,
+        valid: true,
+    }
+}
+
+/// Clip an indexed triangle to the opaque burn contour. Retain the original
+/// vertex indices and cache cut-edge intersections so adjacent triangles use
+/// *exactly* the same edge vertices (no cracks or duplicate seam geometry).
+fn clip_skin_triangle(
+    tri: [usize; 3], input: &[Vertex], output: &mut Vec<Vertex>,
+    input_remap: &mut [u32], cut_edges: &mut HashMap<(usize, usize), u32>,
+    indices: &mut Vec<u32>, normal: Vec3,
+) {
+    if tri.iter().any(|&i| !input[i].valid) { return; }
+    // A clipped triangle has at most four vertices. Stack storage avoids
+    // thousands of short heap allocations per frame in active melt fields.
+    let mut polygon = [0u32; 4];
+    let mut count = 0usize;
+    for j in 0..3 {
+        let a = tri[j];
+        let b = tri[(j + 1) % 3];
+        let inside_a = input[a].coverage >= SKIN_CONTOUR;
+        let inside_b = input[b].coverage >= SKIN_CONTOUR;
+        if inside_a {
+            let index = if input_remap[a] == u32::MAX {
+                let id = output.len() as u32;
+                input_remap[a] = id;
+                output.push(input[a]);
+                id
+            } else { input_remap[a] };
+            polygon[count] = index;
+            count += 1;
+        }
+        if inside_a != inside_b {
+            let edge = (a.min(b), a.max(b));
+            let index = *cut_edges.entry(edge).or_insert_with(|| {
+                let id = output.len() as u32;
+                output.push(edge_vertex(input[a], input[b], normal));
+                id
+            });
+            polygon[count] = index;
+            count += 1;
+        }
+    }
+    if count >= 3 {
+        for j in 1..count - 1 {
+            indices.extend_from_slice(&[polygon[0], polygon[j], polygon[j + 1]]);
+        }
+    }
 }
 
 /// Separable [1 2 1]/4 blur on the padded grid (edges keep their value).
@@ -1077,12 +1243,11 @@ fn blur3x3(f: &mut [f32; PP]) {
     }
 }
 
-fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, draws: &mut Vec<FxDraw>) {
+fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, detail: usize, draws: &mut Vec<FxDraw>) {
     let nh = Neighborhood::new(surface, key);
     let p = Padded::gather(&nh);
     let (kx, ky) = (key.0 * CH_I, key.1 * CH_I);
 
-    // Per-node presence (staggered revert), solid height, and total height.
     let mut amp = [0.0_f32; PP];
     let mut hs = [0.0_f32; PP];
     for py in 0..PAD {
@@ -1094,7 +1259,6 @@ fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, draws
             hs[i] = p.mass[i] * LIP_HEIGHT;
         }
     }
-    // Bubbles inflate then pop; they only exist in this chunk's interior.
     let mut bubble_glow = [0.0_f32; PP];
     for b in &chunk.bubbles {
         let tau = ((now - b.born) as f32 / b.life as f32).clamp(0.0, 1.0);
@@ -1103,14 +1267,10 @@ fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, draws
         for oy in -r..=r {
             for ox in -r..=r {
                 let (nx, ny) = (b.x.round() as i32 + ox, b.y.round() as i32 + oy);
-                if !(-OFF_I..=CH_I + OFF_I).contains(&nx) || !(-OFF_I..=CH_I + OFF_I).contains(&ny) {
-                    continue;
-                }
+                if !(-OFF_I..=CH_I + OFF_I).contains(&nx) || !(-OFF_I..=CH_I + OFF_I).contains(&ny) { continue; }
                 let d2 = (nx as f32 - b.x).powi(2) + (ny as f32 - b.y).powi(2);
                 let k = 1.0 - d2 / (b.radius * b.radius);
-                if k <= 0.0 {
-                    continue;
-                }
+                if k <= 0.0 { continue; }
                 let i = (ny + OFF_I) as usize * PAD + (nx + OFF_I) as usize;
                 let dome = b.amp * swell * k * k;
                 hs[i] += dome * amp[i];
@@ -1122,51 +1282,69 @@ fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, draws
     for i in 0..PP {
         ht[i] = hs[i] - p.carve[i] * GROOVE_DEPTH * amp[i];
     }
-    // The relief has to stay cheap, so instead of more geometry we blur the
-    // field: two binomial passes give a soft, rounded berm rather than a
-    // lumpy per-node one. Padding covers the stencil so chunk seams match.
     for _ in 0..2 {
         blur3x3(&mut hs);
         blur3x3(&mut ht);
     }
 
     let light_dir = normalize([0.35, 0.45, 0.82]);
-    let width = CH + 1;
+    let width = CH * detail + 1;
+    let step = 1.0 / detail as f32;
     let mut verts: Vec<Vertex> = Vec::with_capacity(width * width);
-    for y in 0..=CH {
-        for x in 0..=CH {
-            let i = (y + OFF) * PAD + (x + OFF);
-            let valid = p.valid[i];
-            let a = amp[i];
-            let heat = p.heat[i] * a;
-            let carve = p.carve[i];
-            let mass = p.mass[i];
+    for y in 0..width {
+        for x in 0..width {
+            let fx = x as f32 * step;
+            let fy = y as f32 * step;
+            let valid = supported_at(&p, fx, fy);
+            let a = field_at(&amp, fx, fy);
+            let heat = field_at(&p.heat, fx, fy) * a;
+            let carve = field_at(&p.carve, fx, fy);
+            let mass = field_at(&p.mass, fx, fy);
+            let soot = field_at(&p.soot, fx, fy);
+            let structure = (soot * 0.8).max(carve * 1.2).max((mass * 3.0).min(1.0));
+            let coverage = if valid { structure.clamp(0.0, 1.0) * a } else { 0.0 };
+            let gx = kx as f32 + fx;
+            let gy = ky as f32 + fy;
+            let wall_pos = surface.node_pos(gx, gy, field_at(&p.base, fx, fy));
+            let crest = smoothstep(0.10, 1.4, field_at(&hs, fx, fy));
+            let grain = value_noise(gx * 0.8, gy * 0.8);
+            // Fine relief is *render only* and stable in absolute chunk-space.
+            // Gate it by slag mass / coverage so it cannot lift the perimeter.
+            let detail_h = (grain - 0.5) * 0.26 * crest * smoothstep(SKIN_CONTOUR, 0.65, coverage);
+            let surface_h = field_at(&hs, fx, fy).max(0.0) + detail_h;
+            let boundary = !supported_at(&p, fx - step, fy)
+                || !supported_at(&p, fx + step, fy)
+                || !supported_at(&p, fx, fy - step)
+                || !supported_at(&p, fx, fy + step);
+            let tapered = if boundary { 0.0 } else { smoothstep(SKIN_CONTOUR, 0.64, coverage) };
+            let height = surface_h * tapered + SKIN_BIAS * tapered - EDGE_EMBED * (1.0 - tapered);
+            let pos = madd(wall_pos, surface.n, height);
 
-            let dx = (ht[i + 1] - ht[i - 1]) / (2.0 * CELL);
-            let dy = (ht[i + PAD] - ht[i - PAD]) / (2.0 * CELL);
+            // High-frequency shading now samples the doubled render grid rather
+            // than the 0.75-unit simulation grid. The groove normal remains a
+            // shading-only recess, while its polygonal outline is truly clipped.
+            let dx = (field_at(&ht, fx + step, fy) - field_at(&ht, fx - step, fy)) / (2.0 * CELL * step);
+            let dy = (field_at(&ht, fx, fy + step) - field_at(&ht, fx, fy - step)) / (2.0 * CELL * step);
             let nt = normalize([-dx, -dy, 1.0]);
-            let normal = normalize(add(add(scale(surface.u, nt[0]), scale(surface.v, nt[1])), scale(surface.n, nt[2])));
+            let relief_normal = normalize(add(add(scale(surface.u, nt[0]), scale(surface.v, nt[1])), scale(surface.n, nt[2])));
+            let normal = normalize(lerp3(surface.n, relief_normal, tapered));
 
-            let gx = (kx + x as i32) as f32;
-            let gy = (ky + y as i32) as f32;
-            let lift = hs[i].max(0.0);
-            let structure = (p.soot[i] * 0.8).max(carve * 1.2).max((mass * 3.0).min(1.0));
-            // The z-fight bias only applies where the skin is actually visible, so
-            // the berm meets the wall exactly at its outer edge and never appears
-            // to hover off it when seen from the side.
-            let bias = SKIN_BIAS * smoothstep(0.02, 0.35, structure * a);
-            let pos = surface.node_pos(gx, gy, p.base[i] + lift + bias);
-
-            let skin_a = if valid { (structure.clamp(0.0, 1.0) * a).min(1.0) } else { 0.0 };
-
-            // Cooled slag albedo: dark scorch, greyer on the raised crests.
-            let grain = value_noise(gx * 0.9, gy * 0.9);
-            let crest = smoothstep(0.1, 1.4, lift);
-            let mut albedo = lerp3([0.030, 0.026, 0.024], [0.085, 0.074, 0.066], (crest * 0.55 + grain * 0.25).min(1.0));
-            albedo = lerp3([0.014, 0.012, 0.011], albedo, smoothstep(0.08, 0.5, carve + mass));
-            let cavity = 1.0 - 0.35 * carve;
+            // Avoid the old almost-black outline: clipped boundary vertices
+            // used to inherit a 0.014 charcoal base and a 0.35x cavity shadow.
+            // The perimeter is recessed into the BSP; a narrow soot transition
+            // is enough without painting a thick black outline on the wall.
+            let relief_mix = (crest * 0.55 + grain * 0.25).clamp(0.0, 1.0);
+            let mut albedo = lerp3([0.082, 0.062, 0.050], [0.128, 0.099, 0.078], relief_mix);
+            let cooked = smoothstep(0.08, 0.5, carve + mass);
+            albedo = lerp3(scale(albedo, 0.85), albedo, cooked);
+            if let Some(wall) = chunk.wall_color {
+                albedo = lerp3(albedo, burnt_material_color(wall), WALL_COLOR_STRENGTH);
+            }
+            let rim = 1.0 - smoothstep(SKIN_CONTOUR, 0.50, coverage);
+            let cavity = 1.0 - 0.18 * carve;
             let relief = dot(sub(normal, surface.n), light_dir);
-            let shade = (1.0 + 3.0 * relief).clamp(0.35, 1.7) * cavity;
+            let shaped = (1.0 + 1.6 * relief).clamp(0.70, 1.5) * cavity;
+            let shade = lerp(shaped, 1.0, rim * 0.80);
             let ember = blackbody(heat);
             let warm = (heat * 1.2).clamp(0.0, 1.0);
             let rgb = lerp3(scale(albedo, shade), scale(ember, 0.55), warm);
@@ -1174,77 +1352,58 @@ fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, draws
                 (rgb[0] * 255.0).clamp(0.0, 255.0) as u8,
                 (rgb[1] * 255.0).clamp(0.0, 255.0) as u8,
                 (rgb[2] * 255.0).clamp(0.0, 255.0) as u8,
-                (skin_a * 255.0) as u8,
+                255, // No blended edges: contour clipping provides coverage.
             ];
 
-            // Emissive: heat plus a hotter bulge where molten mass and bubbles are.
             let gate = smoothstep(0.02, 0.30, heat);
             let fluid = smoothstep(FLUID_START, FLUID_FULL, heat);
-            let e = blackbody(heat + mass * 0.10 * fluid + bubble_glow[i] * 0.18 * fluid);
+            let e = blackbody(heat + mass * 0.10 * fluid + field_at(&bubble_glow, fx, fy) * 0.18 * fluid);
             let intensity = gate * (0.92 + 0.08 * (now as f32 * 0.02 + gx * 1.7 + gy * 1.3).sin());
             let glow = [
                 (e[0] * intensity * 255.0).clamp(0.0, 255.0) as u8,
                 (e[1] * intensity * 255.0).clamp(0.0, 255.0) as u8,
                 (e[2] * intensity * 255.0).clamp(0.0, 255.0) as u8,
             ];
-            let glow_a = if valid { intensity } else { 0.0 };
-            verts.push(Vertex { pos, normal, skin, glow, skin_a, glow_a });
+            verts.push(Vertex { pos, wall_pos, normal, skin, glow, coverage, valid });
         }
     }
 
-    let build = |use_glow: bool| -> (Vec<usize>, Vec<u32>) {
-        let mut remap = vec![u32::MAX; width * width];
-        let mut order: Vec<usize> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-        for b in 0..CH {
-            for a in 0..CH {
-                let ids = [b * width + a, b * width + a + 1, (b + 1) * width + a, (b + 1) * width + a + 1];
-                let visible = ids.iter().any(|&v| {
-                    if use_glow { verts[v].glow_a > 0.012 } else { verts[v].skin_a > 0.01 }
-                });
-                if !visible {
-                    continue;
-                }
-                let mut local = [0u32; 4];
-                for (slot, &v) in ids.iter().enumerate() {
-                    if remap[v] == u32::MAX {
-                        remap[v] = order.len() as u32;
-                        order.push(v);
-                    }
-                    local[slot] = remap[v];
-                }
-                let [v00, v10, v01, v11] = local;
-                // Both windings: the dynamic pipeline back-face culls.
-                let tris: [[u32; 3]; 2] = if (a + b) % 2 == 0 {
-                    [[v00, v10, v11], [v00, v11, v01]]
-                } else {
-                    [[v00, v10, v01], [v10, v11, v01]]
-                };
-                for t in tris {
-                    indices.extend_from_slice(&[t[0], t[1], t[2], t[0], t[2], t[1]]);
-                }
+    let mut remap = vec![u32::MAX; verts.len()];
+    let mut cut_edges = HashMap::new();
+    let mut skin_verts = Vec::with_capacity(width * width + width * 4);
+    let mut indices = Vec::with_capacity(6 * (width - 1) * (width - 1));
+    for b in 0..width - 1 {
+        for a in 0..width - 1 {
+            let v00 = b * width + a;
+            let v10 = v00 + 1;
+            let v01 = v00 + width;
+            let v11 = v01 + 1;
+            let tris = if (a + b) % 2 == 0 {
+                [[v00, v10, v11], [v00, v11, v01]]
+            } else {
+                [[v00, v10, v01], [v10, v11, v01]]
+            };
+            for tri in tris {
+                clip_skin_triangle(tri, &verts, &mut skin_verts, &mut remap, &mut cut_edges, &mut indices, surface.n);
             }
         }
-        (order, indices)
-    };
-
-    let (order, indices) = build(false);
-    if !indices.is_empty() {
-        let centre = surface.node_pos((kx + CH_I / 2) as f32, (ky + CH_I / 2) as f32, 3.0);
-        draws.push(FxDraw::LitMesh {
-            positions: order.iter().map(|&v| verts[v].pos).collect(),
-            normals: order.iter().map(|&v| verts[v].normal).collect(),
-            rgba: order.iter().map(|&v| verts[v].skin).collect(),
-            indices,
-            lighting_origin: centre,
-        });
     }
-    let (order, indices) = build(true);
-    if !indices.is_empty() {
+    if indices.is_empty() { return; }
+    let centre = surface.node_pos((kx + CH_I / 2) as f32, (ky + CH_I / 2) as f32, 3.0);
+    draws.push(FxDraw::LitMesh {
+        positions: skin_verts.iter().map(|v| v.pos).collect(),
+        normals: skin_verts.iter().map(|v| v.normal).collect(),
+        rgba: skin_verts.iter().map(|v| v.skin).collect(),
+        indices: indices.clone(),
+        lighting_origin: centre,
+    });
+    // Same clipped contour, different pass. Additive glow is allowed to fade,
+    // but cannot create independent see-through polygons beyond the solid mark.
+    if skin_verts.iter().any(|v| v.glow.iter().any(|&c| c > 4)) {
         draws.push(FxDraw::Mesh {
-            positions: order.iter().map(|&v| madd(verts[v].pos, surface.n, GLOW_LIFT)).collect(),
-            uvs: vec![[0.5, 0.5]; order.len()],
-            rgba: order.iter().map(|&v| [verts[v].glow[0], verts[v].glow[1], verts[v].glow[2], 255]).collect(),
+            positions: skin_verts.iter().map(|v| madd(v.pos, surface.n, GLOW_LIFT)).collect(),
+            uvs: vec![[0.5, 0.5]; skin_verts.len()],
+            rgba: skin_verts.iter().map(|v| [v.glow[0], v.glow[1], v.glow[2], 255]).collect(),
             indices,
             shader: "$melt_glow".to_owned(),
         });
@@ -1292,6 +1451,26 @@ mod tests {
             .flat_map(|s| s.chunks.values())
             .flat_map(|c| c.f[field].iter().copied())
             .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn colored_material_char_is_muted_and_never_black() {
+        let sandstone = burnt_material_color([0.55, 0.27, 0.08]);
+        let metal = burnt_material_color([0.10, 0.19, 0.40]);
+        assert!(sandstone[0] > sandstone[2]);
+        assert!(metal[2] > metal[0]);
+        assert!(sandstone.iter().all(|c| *c >= 0.035));
+    }
+
+    #[test]
+    fn caches_impact_albedo_without_affecting_heat_simulation() {
+        let mut melt = SaberMelt::new();
+        let mut wall = Wall;
+        let heat = melt.contact_colored(1, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            100, Some(&mut wall), Some([0.6, 0.3, 0.1]));
+        assert!(heat > 0.0);
+        assert!(melt.surfaces.iter().flat_map(|surface| surface.chunks.values())
+            .any(|chunk| chunk.wall_color.is_some()));
     }
 
     #[test]
@@ -1344,8 +1523,11 @@ mod tests {
                 assert_eq!(positions.len(), normals.len());
                 assert_eq!(positions.len(), rgba.len());
                 assert!(indices.iter().all(|&i| (i as usize) < positions.len()));
-                // The wall is the plane x = 0 and faces +X: the skin stays in front of it.
-                assert!(positions.iter().all(|p| p[0] > 0.0));
+                // At the footprint perimeter the mesh deliberately sinks
+                // slightly *into* the wall; its raised interior stays outside.
+                assert!(positions.iter().any(|p| p[0] > 0.10));
+                assert!(positions.iter().any(|p| p[0] < -0.01));
+                assert!(rgba.iter().all(|c| c[3] == 255));
             }
         }
     }
@@ -1376,12 +1558,48 @@ mod tests {
         melt.emit(2500, [200.0, 0.0, 50.0], &mut draws, &mut lights);
         for d in &draws {
             if let FxDraw::LitMesh { positions, rgba, .. } = d {
-                for (p, c) in positions.iter().zip(rgba) {
-                    if p[1] > 13.5 {
-                        assert_eq!(c[3], 0, "skin must be transparent beyond the ledge");
-                    }
-                }
+                assert!(positions.iter().all(|p| p[1] <= 13.5), "do not emit relief beyond the ledge");
+                assert!(rgba.iter().all(|c| c[3] == 255), "solid scorch cannot be see-through");
             }
         }
     }
+    #[test]
+    fn clipped_contour_is_opaque_and_embedded() {
+        let n = [1.0, 0.0, 0.0];
+        let make = |coverage: f32, x: f32, y: f32| Vertex {
+            pos: [1.5, x, y], wall_pos: [0.0, x, y], normal: n,
+            skin: [30, 25, 20, 255], glow: [12, 3, 0], coverage, valid: true,
+        };
+        let v = [make(1.0, 0.0, 0.0), make(0.0, 1.0, 0.0), make(0.0, 0.0, 1.0)];
+        let mut dst = Vec::new();
+        let mut remap = [u32::MAX; 3];
+        let mut cuts = HashMap::new();
+        let mut indices = Vec::new();
+        clip_skin_triangle([0, 1, 2], &v, &mut dst, &mut remap, &mut cuts, &mut indices, n);
+        assert_eq!(indices.len(), 3);
+        assert_eq!(cuts.len(), 2);
+        for vertex in &dst {
+            assert_eq!(vertex.skin[3], 255);
+        }
+        for &v in cuts.values() {
+            assert!((dst[v as usize].pos[0] + EDGE_EMBED).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn clipped_triangles_never_span_unsupported_collision_vertices() {
+        let n = [1.0, 0.0, 0.0];
+        let make = |valid: bool| Vertex {
+            pos: [0.0; 3], wall_pos: [0.0; 3], normal: n,
+            skin: [0, 0, 0, 255], glow: [0; 3], coverage: 1.0, valid,
+        };
+        let v = [make(true), make(true), make(false)];
+        let mut dst = Vec::new();
+        let mut remap = [u32::MAX; 3];
+        let mut cuts = HashMap::new();
+        let mut indices = Vec::new();
+        clip_skin_triangle([0, 1, 2], &v, &mut dst, &mut remap, &mut cuts, &mut indices, n);
+        assert!(indices.is_empty());
+    }
+
 }

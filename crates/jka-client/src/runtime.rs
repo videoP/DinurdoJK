@@ -161,6 +161,7 @@ pub enum ScreenshotOutput {
 }
 
 pub enum UserEvent {
+    Update(crate::updater::Event),
     BlueWaterThunder(f32),
     /// Credential Manager enumeration completes on a separate thread; the main
     /// window must not wait for it to show its first interactive frame.
@@ -187,6 +188,8 @@ pub enum UserEvent {
     /// The renderer presented a frame whose egui paint data carried this token.
     /// Sent once per distinct token; drives the menu stage fade clock.
     FrontendStagePresented(u64),
+    /// WGPU main-menu effects are compositing (egui can stop painting its fallback still).
+    NeonMenuCompositorReady,
     /// An asynchronously decoded placeholder (not the live 3D scene).
     FrontendSceneCacheReady { path: PathBuf, generation: u64, image: Option<egui::ColorImage> },
     /// Footsteps and landings the renderer found in standing water; the game

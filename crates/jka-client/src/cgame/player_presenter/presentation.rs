@@ -6,15 +6,17 @@ use crate::cgame::player_presenter::{
     ghoul2_render_origin, ghoul2_render_transform, model_bolt_matrix_timed,
     model_bolt_origin_timed, multiply_3x4, openjk_look_target_origin,
     openjk_player_entity_needs_reset, openjk_vectoangles, player_angle_entity, player_entity_rgb,
+    player_model_key,
     record_motion_pose_eval, record_pose_eval, presented_entity_velocity, reset_remote_player_saber_attachment,
     smooth_ghoul2_pose, smooth_head_look_yaw, source_dismember_surface_set, suppressed_during_intermission,
     transform_jka_model_point, update_weapon_attachment, viewer_style_from, weapon_world_model,
     swim_tilt, move_lean::MoveLeanState, Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
     DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator,
     Ghoul2PresentationView, HashMap, HashSet, Instant, ModelResolution, PlayerAngleState,
-    PlayerAnimationState, PlayerPresenter, PresentedEntity, RagdollMode, SaberBladeLengthKey,
+    PlayerAnimationState, PlayerPresenter, PresentedEntity, MindTrickFade, RagdollMode, SaberBladeLengthKey,
     SaberBladeLengthState, ViewerAnimDebug, BONE_ANGLES_POSTMULT, DEFAULT_SABER_BLADE_LENGTH_MAX,
     EF2_SHIP_DEATH, EF_DEAD, EF_JETPACK, EF_NODRAW, EF_RAG, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE,
+    entity_is_mind_tricked,
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER,
 };
 
@@ -24,6 +26,24 @@ use crate::cgame::player_presenter::{
 /// playerState entity: pilots in enclosed fighters are EF_NODRAW.
 pub(super) fn cg_player_hidden_by_server_flags(e_flags: i32, e_flags2: i32) -> bool {
     (e_flags & EF_NODRAW != 0) || (e_flags2 & EF2_SHIP_DEATH != 0)
+}
+
+/// Keep local profile deformation attached to the connection-owned ET_PLAYER
+/// only, not the spectated target, NPCs, corpses, or demo actors.
+pub(super) fn local_body_for_entity(
+    entity_type: i32,
+    entity_number: u16,
+    client_num: usize,
+    owner_override: Option<Option<usize>>,
+    viewer_client: i32,
+) -> bool {
+    entity_type == ET_PLAYER
+        && usize::from(entity_number) == client_num
+        && match owner_override {
+            Some(owner) => owner == Some(client_num),
+            None if viewer_client < 0 => client_num == 0, // standalone/offline fallback
+            None => usize::try_from(viewer_client).ok() == Some(client_num),
+        }
 }
 
 impl PlayerPresenter {
@@ -41,9 +61,20 @@ impl PlayerPresenter {
         self.stage_time_ms = current_time;
         crate::emotes::network::set_render_time(current_time);
         self.japro_cinfo2 = game.japro_cinfo2();
+        self.cold_breath_effects = game.cold_breath_effects();
+        self.breath_view_contents = match (view, self.collision_world.as_mut()) {
+            (Some(view), Some(world)) => {
+                use jka_movement::{TraceWorld, ENTITY_NONE};
+                world.point_contents(view.jka_position(), ENTITY_NONE)
+            }
+            _ => 0,
+        };
         self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
+        let japlus_cinfo = game.japlus_cinfo();
+        let mut viewer_alt_dim_eflags = 0;
         if let Some(snapshot) = game.current_snapshot() {
+            viewer_alt_dim_eflags = snapshot.player_state.field_i32("eFlags").unwrap_or(0);
             let viewer_client = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
             if viewer_client != self.viewer_client {
                 self.viewer_foot_bolts = None;
@@ -58,6 +89,9 @@ impl PlayerPresenter {
             self.viewer_style = viewer_style_from(
                 &snapshot.player_state,
                 game.is_japro(),
+                game.is_japlus(),
+                game.japlus_duel_alpha().unwrap_or(0),
+                game.plugin_disable(),
                 self.japro.style_player,
             );
         }
@@ -206,6 +240,19 @@ impl PlayerPresenter {
                     entity.state.field_i32("bolt1").unwrap_or(0),
                     entity_eflags & EF_DEAD != 0,
                 );
+                if self.look.ghost == crate::japro_cg::Ghost::None
+                    && crate::japro_cg::ja_plus_other_dimension(
+                        japlus_cinfo,
+                        self.viewer_client,
+                        viewer_alt_dim_eflags,
+                        i32::from(entity.number),
+                        entity_eflags,
+                    )
+                {
+                    // TaystJK RF_FORCE_ENT_ALPHA: apply cp_altDimAlpha only
+                    // when drawing the normal player skin, not custom ghosts.
+                    self.look.force_alpha = Some(self.japro.alt_dim_alpha.clamp(1, 255));
+                }
                 if !self.look.visible {
                     // CG_Player returns before animating, shadowing or adding
                     // sprites: dueling/racing bystanders simply do not exist.
@@ -217,6 +264,30 @@ impl PlayerPresenter {
             {
                 // CG_General hides corpses from a jaPRO duelist's view.
                 continue;
+            }
+            // TaystJK CG_Player checks the viewer's bit in the four
+            // `trickedentindex` masks before submitting the Ghoul2 body.
+            // JA+ can also send these masks; the old port only
+            // applied that check to sprites/cosmetics/shadows, leaving the
+            // entire player visible. This recorded JA+ demo has client 31 set
+            // in entity 8's trickedentindex2 and no EF_ALT_DIM capability bit.
+            let mut body_alpha = 1.0_f32;
+            if entity.entity_type == ET_PLAYER {
+                let tricked = entity_is_mind_tricked(entity, self.viewer_client);
+                let previous = self.mind_trick_fades.get(&entity.number).copied();
+                let fade = MindTrickFade::advance(previous, current_time, tricked);
+                if tricked || fade.alpha < 255.0 {
+                    self.mind_trick_fades.insert(entity.number, fade);
+                } else {
+                    self.mind_trick_fades.remove(&entity.number);
+                }
+                if tricked && fade.alpha <= 1.0 {
+                    self.report_player_status(entity.number,
+                        "submitted=0 reason=CG_IsMindTricked(viewer)".to_owned());
+                    // Do not draw an orphan saber or player effects either.
+                    continue;
+                }
+                body_alpha = fade.alpha / 255.0;
             }
             if entity.entity_type != ET_BODY {
                 self.queue_blob_shadow(entity);
@@ -309,7 +380,7 @@ impl PlayerPresenter {
                 &info,
                 npc_model_request.as_ref(),
                 current_time,
-                1.0,
+                body_alpha,
                 look_target_origin,
                 false,
                 hidden_first_person_entity != Some(entity.number),
@@ -337,7 +408,7 @@ impl PlayerPresenter {
                     entities,
                     game,
                     current_time,
-                    1.0,
+                    body_alpha,
                 ) {
                     Ok(mut saber_draws) => draws.append(&mut saber_draws),
                     Err(error) => self.report_saber_warning_once(entity.number, &error),
@@ -372,6 +443,8 @@ impl PlayerPresenter {
         live_ragdolls.extend(self.active_impulse_ragdolls.keys().copied());
         self.entities
             .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.breath_puff_times
+            .retain(|entity_num, _| live_entities.contains(entity_num));
         self.vehicle_animations
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.vehicle_snaps
@@ -391,6 +464,8 @@ impl PlayerPresenter {
         self.thrown_sabers
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.player_diagnostics
+            .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.mind_trick_fades
             .retain(|entity_num, _| live_entities.contains(entity_num));
         if !self.logged_first_draw && !draws.is_empty() {
             devprintln!(
@@ -597,6 +672,17 @@ impl PlayerPresenter {
         } else {
             team_info.team_color_override = None;
         }
+        // EntityState.clientNum and the current camera/viewed client are not
+        // proof of local ownership. In particular, following someone while
+        // spectating must not attach this client's sliders to their body.
+        team_info.local_body = npc_model_request.is_none()
+            && local_body_for_entity(
+                entity.entity_type,
+                entity.number,
+                team_info.client_num,
+                self.local_body_owner,
+                self.viewer_client,
+            );
         let info = &team_info;
 
         let requested_model_name = npc_model_request
@@ -610,6 +696,7 @@ impl PlayerPresenter {
             .get(&entity.number)
             .filter(|runtime| {
                 runtime.model_settled
+                    && (npc_model_request.is_some() || runtime.model_key == player_model_key(info))
                     && runtime
                         .requested_model_name
                         .eq_ignore_ascii_case(requested_model_name)
@@ -1143,8 +1230,21 @@ impl PlayerPresenter {
                 let yaw = entity.angles[1];
                 let velocity = presented_entity_velocity(entity);
                 let dt = current_time.saturating_sub(runtime.swim_angle_time);
+                let surface_proximity = if swim_tilt_strength > 0.0
+                    && swim_tilt::swimming_legs(legs_anim)
+                {
+                    self.collision_world.as_mut().map_or(0.0, |world| {
+                        swim_tilt::swim_surface_proximity(
+                            world,
+                            entity.origin,
+                            i32::from(entity.number),
+                        )
+                    })
+                } else {
+                    0.0
+                };
                 let target = swim_tilt::swim_target_angles(
-                    legs_anim, yaw, velocity, swim_tilt_strength,
+                    legs_anim, yaw, velocity, swim_tilt_strength, surface_proximity,
                 );
                 // The stock strafe roll stays at its full original strength.
                 // Turn banking is a separate local head-to-feet (axis 2)
@@ -1528,6 +1628,17 @@ impl PlayerPresenter {
                 },
             );
         }
+        // TaystJK CG_BreathPuffs: one mouth-attached EFX emission at the
+        // per-entity breath interval, not a continuously drawn smoke quad.
+        self.queue_breath_puff(
+            entity,
+            &model,
+            &pose,
+            render_axis,
+            render_origin,
+            current_time,
+            submit_geometry,
+        )?;
         self.queue_force_fx(
             entity,
             &model,
@@ -1580,11 +1691,14 @@ impl PlayerPresenter {
                     // Bystanders of your duel are drawn at a fifth of the light.
                     rgb = rgb.map(|channel| channel / 5.0);
                 }
-                ([1.0, 1.0, 1.0, entity_alpha], rgb, None)
+                // RF_FORCE_ENT_ALPHA replaces ordinary alpha instead of
+                // multiplying a distance/third-person fade.
+                let alpha = look.force_alpha.map_or(entity_alpha, |v| f32::from(v) / 255.0);
+                ([1.0, 1.0, 1.0, alpha], rgb, None)
             }
             ghost => {
-                let mut rgba = crate::japro_cg::ghost_color(ghost);
-                rgba[3] = entity_alpha;
+                // 50/255 race and 100/255 duel customShader alpha from TaystJK.
+                let rgba = crate::japro_cg::ghost_color(ghost);
                 (rgba, [1.0; 3], Some(self.ghost_material(ghost)))
             }
         };
@@ -1802,5 +1916,32 @@ impl PlayerPresenter {
             }
         }
         Ok(draws)
+    }
+}
+
+#[cfg(test)]
+mod mindtrick_fade_tests {
+    use super::MindTrickFade;
+
+    #[test]
+    fn ja_plus_demo_viewer_31_is_masked_for_player_8() {
+        // altdim.dm_26 (JA+ 2.5 B0): entity 8 trickedentindex2=43989.
+        // CG_IsMindTricked maps viewer 31 -> mask #2, bit 15.
+        assert_ne!(43989_i32 & (1 << (31 - 16)), 0);
+        assert_eq!(118227_i32 & (1 << 17), 0);
+    }
+
+    #[test]
+    fn tricked_players_hide_and_fade_back_at_taystjk_rates() {
+        let newly_tricked = MindTrickFade::advance(None, 1000, true);
+        assert_eq!(newly_tricked.alpha, 1.0);
+        // While previously visible, fade by half a byte per millisecond.
+        let shown = MindTrickFade::advance(None, 1000, false);
+        assert_eq!(MindTrickFade::advance(Some(shown), 1100, true).alpha, 205.0);
+        let back = MindTrickFade::advance(Some(newly_tricked), 1100, false);
+        assert_eq!(back.alpha, 101.0);
+        assert_eq!(MindTrickFade::advance(Some(back), 1300, false).alpha, 255.0);
+        // Demo seek backwards must reset time-dependent alpha.
+        assert_eq!(MindTrickFade::advance(Some(shown), 500, true).alpha, 1.0);
     }
 }

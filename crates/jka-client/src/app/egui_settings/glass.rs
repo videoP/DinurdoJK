@@ -296,7 +296,7 @@ impl App {
     pub(in crate::app::egui_settings) fn reset_glass_control(&mut self, name: &'static str) {
         let defaults = Settings::preset(crate::glass::settings().style);
         let value = match name {
-            "r_glassPromotion" => "1".to_owned(),
+            "r_glassPromotion" => "0".to_owned(),
             "r_glassStyle" => "liquid".to_owned(),
             "r_glassTint" => format!(
                 "{} {} {}",

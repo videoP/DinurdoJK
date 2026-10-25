@@ -199,6 +199,10 @@ fn glass_controls_gpu_preserve_pane_edges_and_exclude_foreground_halos() {
                     binding: 5,
                     resource: blur_settings.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: resources.bounds().as_entire_binding(),
+                },
             ],
         });
         let shader_source = format!(
@@ -279,6 +283,8 @@ fn glass_controls_gpu_preserve_pane_edges_and_exclude_foreground_halos() {
             mapped_at_creation: false,
         });
         let mut encoder = device.create_command_encoder(&Default::default());
+        let reach = Reach { edge: edge_pad(64), blur: recovery_settings.blur_reach(1) };
+        resources.locate(&queue, &mut encoder, reach, true);
         resources.resolve(&mut encoder, 64);
         encoder.copy_texture_to_buffer(
             resources.textures[0].as_image_copy(),
@@ -312,7 +318,7 @@ fn glass_controls_gpu_preserve_pane_edges_and_exclude_foreground_halos() {
             });
             pass.set_pipeline(&blur_pipeline);
             pass.set_bind_group(0, &blur_group, &[]);
-            pass.draw(0..3, 0..1);
+            pass.draw(0..6, 1..2);
         }
         for case in 0..7 {
             let mut settings = crate::glass::Settings::preset(crate::glass::Style::Bevy);
@@ -507,5 +513,83 @@ fn glass_controls_gpu_preserve_pane_edges_and_exclude_foreground_halos() {
             behind[0] > 0.99 && behind[1] < 0.001,
             "a model behind the pane must remain in the refracted scene"
         );
+    });
+}
+
+#[test]
+#[ignore = "requires a GPU adapter; run explicitly"]
+fn glass_bounds_gpu_pad_visible_panes_and_skip_hidden_ones() {
+    futures_lite::future::block_on(async {
+        let adapter = wgpu::Instance::default()
+            .request_adapter(&Default::default())
+            .await
+            .expect("GPU adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let extent = wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 };
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&Default::default());
+        let resources = Resources::new(&device, 64, 64, 1, &depth_view);
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 3 * 64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        // Case 0: a 4x2 pane at depth 10 in front of the world (20).
+        // Case 1: the same pane behind an opaque wall (5): nothing to run.
+        // Case 2: the hidden pane without the depth test: still padded.
+        for (case, (wall, use_depth)) in [(20.0f32, true), (5.0, true), (5.0, false)].into_iter().enumerate() {
+            let mut coverage = vec![0u16; 64 * 64 * 4];
+            for y in 30..32 {
+                for x in 20..24 {
+                    coverage[(y * 64 + x) * 4 + 2] = 0x4900; // z = 10
+                    coverage[(y * 64 + x) * 4 + 3] = 0x3c00; // w = 1
+                }
+            }
+            let write = |texture: &wgpu::Texture, bytes: &[u8], stride| {
+                queue.write_texture(
+                    texture.as_image_copy(),
+                    bytes,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: Some(64) },
+                    extent,
+                )
+            };
+            write(&resources._mask_texture, bytemuck::cast_slice(&coverage), 512);
+            write(&depth, bytemuck::cast_slice(&vec![wall; 64 * 64]), 256);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            resources.locate(&queue, &mut encoder, Reach { edge: 6, blur: 3 }, use_depth);
+            encoder.copy_buffer_to_buffer(resources.bounds(), 0, &read, case as u64 * 64, 64);
+            queue.submit([encoder.finish()]);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        read.slice(..).map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(30)) })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        assert!(scope.pop().await.is_none(), "glass bounds must validate");
+        let data = read.slice(..).get_mapped_range().unwrap();
+        let words: &[u32] = bytemuck::cast_slice(&data);
+        let case = |index: usize| &words[index * 16..index * 16 + 16];
+        // Full-res [14, 30) x [24, 38) halves to [7, 15) x [12, 19): 1 x 1 groups.
+        assert_eq!(case(0), &[1, 1, 1, 0, 7, 12, 15, 19, 17, 27, 27, 35, 64, 64, 0, 0]);
+        assert_eq!(case(1), &[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 64, 0, 0]);
+        assert_eq!(case(2), case(0), "without the depth test hidden glass still counts");
     });
 }

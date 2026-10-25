@@ -219,6 +219,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetClassicWorldLighting { .. } => "SetClassicWorldLighting",
         RenderCommand::SetEmissiveAreaLights(..) => "SetEmissiveAreaLights",
         RenderCommand::SetShaderLightPromotion { .. } => "SetShaderLightPromotion",
+        RenderCommand::SetBakedLocalLights { .. } => "SetBakedLocalLights",
         RenderCommand::SetEntityAmbientLighting(..) => "SetEntityAmbientLighting",
         RenderCommand::SetVoxelProbeGi(..) => "SetVoxelProbeGi",
         RenderCommand::SetLocalLightShadows(..) => "SetLocalLightShadows",
@@ -243,6 +244,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
         RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
         RenderCommand::SetUi(..) => "SetUi",
+        RenderCommand::SetNeonMenu(..) => "SetNeonMenu",
+        RenderCommand::SetNeonMenuCache(..) => "SetNeonMenuCache",
         RenderCommand::SetExtensionHud(..) => "SetExtensionHud",
         RenderCommand::SetTransientUi { .. } => "SetTransientUi",
         RenderCommand::SetUiTelemetry { .. } => "SetUiTelemetry",
@@ -852,6 +855,8 @@ pub(in crate::renderer) fn render_thread_main(
         initial_ui.video.promote_shader_lights,
         shader_light_mask,
     );
+    renderer.set_baked_local_lights(initial_ui.video.baked_local_lights, initial_ui.video.baked_local_sources);
+    renderer.set_lamp_shadow_ab(initial_ui.video.lamp_shadow_ab);
     renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
     renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
     renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
@@ -993,6 +998,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut gamma_preparation = None;
     let mut first_frame_notified = false;
     let mut first_menu_frame_notified = false;
+    let mut neon_compositor_ready_notified = false;
     let mut last_stage_token: Option<u64> = None;
     let mut batch_timing: Option<RenderBatchTiming> = None;
 
@@ -1518,6 +1524,12 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetEmissiveAreaLights(enabled)) => {
                         renderer.set_emissive_area_lights(enabled);
                     }
+                    Ok(RenderCommand::SetBakedLocalLights { enabled, sources }) => {
+                        renderer.set_baked_local_lights(enabled, sources);
+                    }
+                    Ok(RenderCommand::SetLampShadowAB(mode)) => {
+                        renderer.set_lamp_shadow_ab(mode);
+                    }
                     Ok(RenderCommand::SetShaderLightPromotion { enabled, mask }) => {
                         renderer.set_shader_light_promotion(enabled, mask);
                     }
@@ -1657,8 +1669,10 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
                     Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
-                    Ok(RenderCommand::CaptureVideoFrame { frame_index, depth }) => renderer.request_video_frame_capture(frame_index, depth),
+                    Ok(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha }) => renderer.request_video_frame_capture(frame_index, depth, alpha),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::SetNeonMenu(frame)) => renderer.set_neon_menu(frame),
+                    Ok(RenderCommand::SetNeonMenuCache(image)) => renderer.set_neon_menu_cache(image),
                     Ok(RenderCommand::SetExtensionHud(widgets, hidden, images)) => renderer.set_extension_hud(widgets, hidden, images),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
@@ -1668,6 +1682,7 @@ pub(in crate::renderer) fn render_thread_main(
                         prediction_debug,
                         crosshair_target,
                         force_select,
+                        weapon_select,
                         follow_name,
                         game_timer,
                         mini_scores,
@@ -1687,6 +1702,7 @@ pub(in crate::renderer) fn render_thread_main(
                             prediction_debug,
                             crosshair_target,
                             force_select,
+                            weapon_select,
                             follow_name,
                             game_timer,
                             mini_scores,
@@ -1753,6 +1769,10 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetAssetPreviewViewport(viewport)) => {
                         renderer.asset_preview_viewport = viewport;
+                    }
+                    Ok(RenderCommand::SetAssetPreviewCheckerboard)=>{
+                        renderer.asset_preview_background=super::frame::preview_background::PreviewBackground::checkerboard(
+                            &renderer.device,&renderer.queue,renderer.config.format,renderer.msaa_samples).ok();
                     }
                     Ok(RenderCommand::SetAssetPreviewBackground(image))=>{
                         renderer.asset_preview_background=image.and_then(|(size,rgba)|
@@ -2009,6 +2029,9 @@ pub(in crate::renderer) fn render_thread_main(
             }
             renderer.model_frame_log.set_source(model_source);
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
+            if let Some(ocean) = renderer.ocean.as_mut() {
+                ocean.set_lake_actors(&snapshot.ocean_actors);
+            }
             renderer.dynamic_model_renderer.entity_water = Arc::clone(&snapshot.player_water);
             if let Some(probe) = tile_probe.as_mut() {
                 probe.begin_frame(&mut renderer);
@@ -2174,6 +2197,10 @@ pub(in crate::renderer) fn render_thread_main(
                 if !first_menu_frame_notified && renderer.egui_active {
                     first_menu_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstMenuFrame);
+                }
+                if !neon_compositor_ready_notified && renderer.neon_menu_wanted() && renderer.neon_menu_ready() {
+                    neon_compositor_ready_notified = true;
+                    let _ = proxy.send_event(UserEvent::NeonMenuCompositorReady);
                 }
                 if let Some(token) = renderer.egui_present_token.filter(|_| renderer.egui_active) {
                     if last_stage_token != Some(token) {

@@ -24,6 +24,14 @@ pub enum HudElementId {
     Speedometer,
     SpeedometerJumps,
     SpeedGraph,
+    StrafeGuide,
+    AccelMeter,
+    VelocityCompass,
+    GroundSpeed,
+    JumpHeight,
+    JumpDistance,
+    VerticalSpeed,
+    YawSpeed,
 }
 
 impl HudElementId {
@@ -31,7 +39,7 @@ impl HudElementId {
     // position is now the clickable `OverlayMode::Trace` egui menu, which
     // isn't a draggable HUD element. The variant, its cvar prefix and its
     // offset field stay (see `element`/`element_mut`) so old configs still load.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 25] = [
         Self::Health,
         Self::Shield,
         Self::Ammo,
@@ -49,6 +57,14 @@ impl HudElementId {
         Self::Speedometer,
         Self::SpeedometerJumps,
         Self::SpeedGraph,
+        Self::StrafeGuide,
+        Self::AccelMeter,
+        Self::VelocityCompass,
+        Self::GroundSpeed,
+        Self::JumpHeight,
+        Self::JumpDistance,
+        Self::VerticalSpeed,
+        Self::YawSpeed,
     ];
 
     pub fn label(self) -> &'static str {
@@ -71,6 +87,15 @@ impl HudElementId {
             Self::Speedometer => "SPEEDOMETER",
             Self::SpeedometerJumps => "SPEEDOMETER JUMPS",
             Self::SpeedGraph => "SPEED GRAPH",
+            Self::StrafeGuide => "STRAFE GUIDE",
+            Self::AccelMeter => "ACCELERATION METER",
+            Self::VelocityCompass => "VELOCITY COMPASS",
+            Self::GroundSpeed => "PRE-SPEED",
+            Self::JumpHeight => "JUMP HEIGHT",
+            Self::JumpDistance => "JUMP DISTANCE",
+            Self::VerticalSpeed => "VERTICAL SPEED",
+            Self::YawSpeed => "YAW SPEED",
+
         }
     }
 
@@ -94,6 +119,15 @@ impl HudElementId {
             Self::Speedometer => "cg_hudSpeedometer",
             Self::SpeedometerJumps => "cg_hudSpeedometerJumps",
             Self::SpeedGraph => "cg_hudSpeedGraph",
+            Self::StrafeGuide => "cg_hudStrafeGuide",
+            Self::AccelMeter => "cg_hudAccelMeter",
+            Self::VelocityCompass => "cg_hudVelocityCompass",
+            Self::GroundSpeed => "cg_hudGroundSpeed",
+            Self::JumpHeight => "cg_hudJumpHeight",
+            Self::JumpDistance => "cg_hudJumpDistance",
+            Self::VerticalSpeed => "cg_hudVerticalSpeed",
+            Self::YawSpeed => "cg_hudYawSpeed",
+
         }
     }
 
@@ -254,6 +288,15 @@ pub struct HudLayout {
     pub speedometer: HudElementLayout,
     pub speedometer_jumps: HudElementLayout,
     pub speed_graph: HudElementLayout,
+    pub strafe_guide: HudElementLayout,
+    pub accel_meter: HudElementLayout,
+    pub velocity_compass: HudElementLayout,
+    pub ground_speed: HudElementLayout,
+    pub jump_height: HudElementLayout,
+    pub jump_distance: HudElementLayout,
+    pub vertical_speed: HudElementLayout,
+    pub yaw_speed: HudElementLayout,
+
     pub snap_to_grid: bool,
     pub grid_size: f32,
 }
@@ -283,6 +326,15 @@ impl Default for HudLayout {
             speedometer: HUD_UNMOVED,
             speedometer_jumps: HUD_UNMOVED,
             speed_graph: HUD_UNMOVED,
+            strafe_guide: HUD_UNMOVED,
+            accel_meter: HUD_UNMOVED,
+            velocity_compass: HUD_UNMOVED,
+            ground_speed: HUD_UNMOVED,
+            jump_height: HUD_UNMOVED,
+            jump_distance: HUD_UNMOVED,
+            vertical_speed: HUD_UNMOVED,
+            yaw_speed: HUD_UNMOVED,
+
             // These resolve to the exact pre-editor positions at scale 1.0.
             health: HudElementLayout {
                 anchor: HudAnchor::BottomLeft,
@@ -335,6 +387,15 @@ impl HudLayout {
             HudElementId::Speedometer => self.speedometer,
             HudElementId::SpeedometerJumps => self.speedometer_jumps,
             HudElementId::SpeedGraph => self.speed_graph,
+            HudElementId::StrafeGuide => self.strafe_guide,
+            HudElementId::AccelMeter => self.accel_meter,
+            HudElementId::VelocityCompass => self.velocity_compass,
+            HudElementId::GroundSpeed => self.ground_speed,
+            HudElementId::JumpHeight => self.jump_height,
+            HudElementId::JumpDistance => self.jump_distance,
+            HudElementId::VerticalSpeed => self.vertical_speed,
+            HudElementId::YawSpeed => self.yaw_speed,
+
         }
     }
 
@@ -358,6 +419,15 @@ impl HudLayout {
             HudElementId::Speedometer => &mut self.speedometer,
             HudElementId::SpeedometerJumps => &mut self.speedometer_jumps,
             HudElementId::SpeedGraph => &mut self.speed_graph,
+            HudElementId::StrafeGuide => &mut self.strafe_guide,
+            HudElementId::AccelMeter => &mut self.accel_meter,
+            HudElementId::VelocityCompass => &mut self.velocity_compass,
+            HudElementId::GroundSpeed => &mut self.ground_speed,
+            HudElementId::JumpHeight => &mut self.jump_height,
+            HudElementId::JumpDistance => &mut self.jump_distance,
+            HudElementId::VerticalSpeed => &mut self.vertical_speed,
+            HudElementId::YawSpeed => &mut self.yaw_speed,
+
         }
     }
 
@@ -389,6 +459,7 @@ pub struct HudRectContext {
     pub race_start: [f32; 2],
     pub lagometer: crate::lagometer::Settings,
     pub speedometer: crate::speedometer::Settings,
+    pub strafe_helper: crate::ui::StrafeHelperSettings,
 }
 
 impl HudRectContext {
@@ -398,6 +469,7 @@ impl HudRectContext {
         perf: &PerfStats,
         thread_count: usize,
         race: &crate::japro_cg::JaproCgame,
+        strafe_helper: crate::ui::StrafeHelperSettings,
     ) -> Self {
         Self {
             movement_keys,
@@ -409,6 +481,7 @@ impl HudRectContext {
             race_start: [race.race_start_x, race.race_start_y],
             lagometer: race.lagometer,
             speedometer: race.speedometer,
+            strafe_helper,
         }
     }
 
@@ -421,18 +494,15 @@ impl HudRectContext {
             race.race_start_x = live.start_x;
             race.race_start_y = live.start_y;
         }
-        if let Some(speedometer) = ui.speedometer.as_ref() {
-            race.speedometer = speedometer.settings;
-        }
-        if let Some(lagometer) = ui.lagometer.as_ref() {
-            race.lagometer = lagometer.settings;
-        }
+        race.speedometer = ui.speedometer_settings;
+        race.lagometer = ui.lagometer_settings;
         Self::new(
             ui.movement_keys,
             &ui.video,
             &ui.perf,
             ui.threads.len(),
             &race,
+            ui.strafe_helper,
         )
     }
 }
@@ -515,21 +585,38 @@ pub(in crate::ui) fn hud_stock_rect(
             virtual_rect(x - coef, y, 49.0 * coef, height)
         }
         HudElementId::Speedometer => {
-            let s = &ctx.speedometer;
-            virtual_rect(s.x - 2.0, s.y - 14.0, 212.0, 20.0)
+            HudRect { x:320.0*sx-62.0*sy, y:200.0*sy, width:124.0*sy, height:30.0*sy }
         }
         HudElementId::SpeedometerJumps => {
             let s = &ctx.speedometer;
-            virtual_rect(s.jumps_x, s.jumps_y - 14.0, 260.0, 20.0)
+            let rows = ((s.jumps.clamp(1, 511) + 4) / 5) as f32;
+            virtual_rect(s.jumps_x, s.jumps_y + 96.0, 260.0, 20.0 * rows)
         }
         HudElementId::SpeedGraph => {
             use crate::speedometer::flag;
             let flags = ctx.speedometer.flags;
             if flags & flag::SPEEDGRAPHOLD != 0 && flags & flag::SPEEDGRAPH == 0 {
-                virtual_rect(544.0, 168.0, 48.0, 144.0)
+                let coef = crate::lagometer::width_ratio_coef(w, h);
+                let (x, y) = crate::lagometer::speed_graph_origin(&ctx.lagometer, coef);
+                let framed = matches!(ctx.lagometer.mode, 1 | 2);
+                virtual_rect(x - coef, if framed {y} else {y-96.0}, 49.0*coef, if framed {48.0} else {144.0})
             } else {
-                virtual_rect(245.0, 456.0, 150.0, 22.0)
+                virtual_rect(245.0, 368.0, 150.0, 22.0)
             }
+        }
+        HudElementId::StrafeGuide => {
+            let flags = ctx.strafe_helper.flags;
+            if flags & crate::ui::SHELPER_WARSOW_HUD != 0 { virtual_rect(80.0, 168.0, 480.0, 20.0) }
+            else if flags & crate::ui::SHELPER_XONOTIC != 0 { virtual_rect(192.0, 260.0, 256.0, 26.0) }
+            else if flags & crate::ui::SHELPER_Q3DF != 0 { virtual_rect(0.0, 268.0, 640.0, 12.0) }
+            else { virtual_rect(0.0, 240.0, 640.0, 240.0) }
+        }
+        HudElementId::VelocityCompass => virtual_rect(0.0, 288.0, 640.0, 32.0),
+        HudElementId::AccelMeter if ctx.strafe_helper.flags & crate::ui::SHELPER_Q3DF_ACCEL != 0 => virtual_rect(210.0, 232.0, 220.0, 16.0),
+        HudElementId::AccelMeter | HudElementId::GroundSpeed | HudElementId::JumpHeight
+        | HudElementId::JumpDistance | HudElementId::VerticalSpeed | HudElementId::YawSpeed => {
+            let [x,y] = crate::speedometer::component_origin(id, &ctx.speedometer);
+            virtual_rect(x-2.0, y-14.0, if id == HudElementId::AccelMeter {42.0} else {70.0}, 20.0)
         }
         HudElementId::SurfaceInspector => {
             let (x, y, width) = surface_inspector_frame(w);

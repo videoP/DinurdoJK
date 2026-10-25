@@ -6,6 +6,7 @@ fn lamp(position: [f32; 3], intensity: f32) -> scene::DynamicLight {
         color: [1.0; 3],
         radius: 300.0,
         intensity,
+        shadow_power: 0.0,
         falloff: scene::DynamicLightFalloff::InverseSquare,
         surface_lighting: true,
         emitter_normal: [0.0; 3],

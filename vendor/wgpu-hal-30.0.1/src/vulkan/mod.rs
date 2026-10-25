@@ -31,6 +31,7 @@ mod descriptor;
 mod device;
 mod drm;
 mod instance;
+mod pipeline_disk_cache;
 mod sampler;
 mod semaphore_list;
 mod swapchain;
@@ -1145,7 +1146,8 @@ impl crate::DynCommandBuffer for CommandBuffer {}
 
 #[derive(Debug)]
 pub enum ShaderModule {
-    Raw(vk::ShaderModule),
+    /// DinurdoJK patch: the hash of its SPIR-V, for `pipeline_disk_cache`.
+    Raw(vk::ShaderModule, u64),
     Intermediate {
         naga_shader: crate::NagaShader,
         runtime_checks: wgt::ShaderRuntimeChecks,

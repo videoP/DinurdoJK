@@ -105,6 +105,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         masks = vec4<u32>(0u);
         for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {
             let light = dynamic_lights[cluster.indices[i]];
+            // Static map emitters use raster shadows at the receiver. Their
+            // cache bits are unused; never trace them in this compute pass.
+            if (light.shadow.w < 0.5) { continue; }
             let count = rt_local_sample_count(light);
             for (var s = 0u; s < count; s += 1u) {
                 let sampled = rt_sample_local_emitter_seed(light, input, cluster.indices[i], s, count, seed);

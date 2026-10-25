@@ -4,6 +4,16 @@ use jka_movement::{taunt_should_cancel, BUTTON_ALT_ATTACK, BUTTON_ATTACK, BUTTON
 mod support;
 
 #[test]
+fn native_action_cancel_buttons_work_without_an_animation_binding() {
+    use jka_movement::taunt_action_should_cancel;
+    assert!(!taunt_action_should_cancel(0));
+    assert!(!taunt_action_should_cancel(BUTTON_WALKING));
+    for button in [BUTTON_ATTACK, BUTTON_ALT_ATTACK, 64, 512, 1024, 2048] {
+        assert!(taunt_action_should_cancel(button));
+    }
+}
+
+#[test]
 fn native_taunt_input_cancels_attacks_and_vertical_movement() {
     for name in ["BOTH_GESTURE1", "BOTH_DUAL_TAUNT", "BOTH_STAFF_TAUNT"] {
         let anim = animation_index(name).unwrap() as i32;

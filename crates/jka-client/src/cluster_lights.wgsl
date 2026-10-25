@@ -132,6 +132,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             iteration >= light_count - transient_start
         );
         let light = lights[light_index];
+        if light.shape.w < -0.5 {continue;}
         let is_area = light.emitter.w > 0.5 && light.emitter.w < 2.5;
         if (is_area) {
             if (settings.feature_flags.x == 0u) {

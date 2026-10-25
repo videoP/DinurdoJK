@@ -4,10 +4,129 @@ use crate::app::{
     scene, ui_catalog, App, Arc, AssetDetail, AssetKind, Camera, ClientInfo, Duration,
     DynamicModelSurface, EntityPresenter, FrontendPage, Ghoul2SkinningMode, Instant, JoinMode,
     PlayerFxRequest, PlayerPresenter, PlayerViewPolicyState, ProfileModelEntry, ProfileSaberEntry,
-    RenderCommand, ThirdPersonViewInput, ViewLatchMode, ET_PLAYER, FRONTEND_CAMERA_EYE_HEIGHT,
+    RenderCommand, ThirdPersonViewInput, ViewBobInput, ViewLatchMode, ET_PLAYER, FRONTEND_CAMERA_EYE_HEIGHT,
     FRONTEND_FOREGROUND_MODEL, FRONTEND_FOREGROUND_MODEL_DISTANCE,
     FRONTEND_FOREGROUND_MODEL_HEAD_HEIGHT, FRONTEND_FOREGROUND_MODEL_SIDE_OFFSET,
 };
+
+/// Camera focus targets are expressed in the real isolated Studio viewport.
+/// Moving the eye instead of moving the player keeps Ghoul2 body picking,
+/// bolt callouts, saber FX and all renderer-side projections consistent.
+#[derive(Clone, Copy)]
+pub(in crate::app) struct ProfileStudioCamera {
+    pub height: f32,
+    pub lateral: f32,
+    pub pitch: f32,
+    target_height: f32,
+    target_lateral: f32,
+    target_pitch: f32,
+    pub target_yaw: f32,
+    pub target_zoom: f32,
+}
+
+impl Default for ProfileStudioCamera {
+    fn default() -> Self {
+        Self {
+            height: -11.0, lateral: 0.0, pitch: 5.0,
+            target_height: -11.0, target_lateral: 0.0, target_pitch: 5.0,
+            target_yaw: 180.0, target_zoom: 1.0,
+        }
+    }
+}
+
+impl ProfileStudioCamera {
+    /// Frame-rate-independent exponential ease with no
+    /// per-frame pixel lerp or 30/60-Hz assumptions. Yaw takes the short arc.
+    fn tick(&mut self, dt: f32, yaw: &mut f32, zoom: &mut f32) -> bool {
+        let gain = 1.0 - (-6.5 * dt).exp();
+        let mut changed = false;
+        for (current, goal) in [
+            (&mut self.height, self.target_height),
+            (&mut self.lateral, self.target_lateral),
+            (&mut self.pitch, self.target_pitch),
+        ] {
+            let delta = goal - *current;
+            if delta.abs() > 0.002 {
+                *current += delta * gain;
+                changed = true;
+            } else {
+                *current = goal;
+            }
+        }
+        let delta_yaw = (self.target_yaw - *yaw + 180.0).rem_euclid(360.0) - 180.0;
+        if delta_yaw.abs() > 0.01 {
+            *yaw = (*yaw + delta_yaw * gain).rem_euclid(360.0);
+            changed = true;
+        } else {
+            *yaw = self.target_yaw;
+        }
+        let delta_zoom = self.target_zoom - *zoom;
+        if delta_zoom.abs() > 0.0001 {
+            *zoom = (*zoom + delta_zoom * gain).clamp(0.45, 2.5);
+            changed = true;
+        } else {
+            *zoom = self.target_zoom;
+        }
+        changed
+    }
+}
+
+/// One configuration for the anatomical *region*, not one for each Anny
+/// slider. Actual animated Ghoul2 anchors override these height fallbacks.
+/// The back-facing presets are deliberate (capes, glutes); eyes/ears obtain
+/// a closer frontal or three-quarter view.
+fn studio_focus_preset(region: &str) -> (f32, f32, f32, Option<usize>, f32) {
+    match region {
+        "cosmetic:head" | "head" => (165.0, 0.60, 37.0, Some(0), 0.0),
+        "cosmetic:face" | "eyes" | "eyebrows" | "nose" | "mouth" | "chin"
+        | "forehead" | "cheek" | "facial actions" => (180.0, 0.52, 35.0, Some(1), 0.0),
+        "ears" => (130.0, 0.53, 34.0, Some(1), 0.0),
+        "neck" => (170.0, 0.68, 31.0, Some(0), -10.0),
+        "breast" => (175.0, 0.68, 19.0, Some(5), 0.0),
+        "torso" => (172.0, 0.78, 15.0, Some(5), -5.0),
+        "stomach" => (175.0, 0.76, 8.0, Some(5), -13.0),
+        "arms" => (155.0, 0.80, 16.0, Some(3), 9.0),
+        "hands" | "saber:right" => (163.0, 0.68, 5.0, Some(3), 0.0),
+        "saber:left" => (197.0, 0.68, 5.0, Some(4), 0.0),
+        "saber:both" => (180.0, 0.87, 8.0, Some(3), 9.0),
+        "hip" | "pelvis" => (170.0, 0.78, 7.0, Some(6), 3.0),
+        "buttocks" => (0.0, 0.70, 7.0, Some(6), 0.0),
+        "cosmetic:back" => (0.0, 0.82, 22.0, Some(2), -14.0),
+        "legs" => (168.0, 0.85, -3.0, None, 0.0),
+        "feet" => (165.0, 0.65, -18.0, None, 0.0),
+        _ => (180.0, 1.0, -11.0, None, 0.0),
+    }
+}
+
+#[cfg(test)]
+mod profile_studio_camera_tests {
+    use super::{studio_focus_preset, ProfileStudioCamera};
+
+    #[test]
+    fn body_and_cosmetic_views_select_the_expected_side() {
+        assert_eq!(studio_focus_preset("buttocks").0, 0.0);
+        assert_eq!(studio_focus_preset("cosmetic:back").0, 0.0);
+        assert!(studio_focus_preset("cosmetic:face").1 < studio_focus_preset("torso").1);
+        assert_eq!(studio_focus_preset("feet").3, None);
+    }
+
+    #[test]
+    fn orbit_uses_the_short_arc_and_zoom_remains_bounded() {
+        let mut focus = ProfileStudioCamera::default();
+        let mut yaw = 350.0;
+        let mut zoom = 1.0;
+        focus.target_yaw = 10.0;
+        focus.target_zoom = 0.52;
+        focus.tick(0.05, &mut yaw, &mut zoom);
+        assert!(yaw > 350.0 || yaw < 10.0);
+        assert!((0.52..1.0).contains(&zoom));
+        for _ in 0..90 {
+            focus.tick(0.016, &mut yaw, &mut zoom);
+        }
+        assert!((yaw - 10.0).abs() < 0.1);
+        assert!((zoom - 0.52).abs() < 0.001);
+    }
+}
 
 /// Dedicated, silent FX scheduler used only by Developer Tools. Keeping this
 /// separate from CGame's weapon/map FX means previewing an .efx file can never
@@ -102,16 +221,69 @@ impl App {
         if let Some(camera) = self.emote_gallery_camera() {
             return camera;
         }
+        if self.profile_preview_active && self.frontend_page == FrontendPage::RenderStudio {
+            if self.render_studio.export.is_none() && self.render_studio.still.is_none() {
+                if let Some(preview)=self.render_studio.cinematic_preview.as_ref() {
+                    return super::render_studio_spatial::camera_from_key(preview.camera);
+                }
+                if let Some(key)=self.render_studio.spatial.scene_camera {
+                    return super::render_studio_spatial::camera_from_key(key);
+                }
+            }
+            return self.studio_shot_camera();
+        }
         if self.profile_preview_active {
-            // Lower the studio camera and give it a slight upward pitch. The
-            // old origin-level camera made the portrait read as if it were
-            // looking down from above the character's chest/head line.
-            let mut camera =
-                Camera::new_with_fov([0.0, -11.0, 0.0], 0.0, 58.0);
-            camera.pitch = 5.0_f32.to_radians();
+            let studio = &self.profile_studio_camera;
+            let mut camera = Camera::new_with_fov(
+                [0.0, studio.height, studio.lateral], 0.0, 58.0);
+            camera.pitch = studio.pitch.to_radians();
             camera
         } else {
             Camera::new_with_fov([0.0, 0.0, 0.0], 0.0, 65.0)
+        }
+    }
+
+    pub(in crate::app) fn studio_shot_camera(&self)->Camera {
+        let key=self.render_studio.camera_rig_runtime.camera.filter(|_|self.render_studio.timeline.camera_rig.active())
+            .unwrap_or_else(||self.render_studio.timeline.camera_at(self.render_studio.timeline_time()));
+        super::render_studio_spatial::camera_from_key(key)
+    }
+
+    /// Called only on an explicit part/cosmetic/saber selection. Normal
+    /// scrolling and mouse orbit never reissue these targets, so a user can
+    /// explore manually without automatic framing fighting their input.
+    pub(in crate::app) fn focus_profile_studio_camera(&mut self, region: &str) {
+        let (yaw, zoom, fallback_y, anchor_index, vertical_adjust) = studio_focus_preset(region);
+        let anchor = anchor_index.and_then(|idx|
+            self.profile_studio_world_anchors.get(idx).copied().flatten());
+        let (height, lateral) = if region.is_empty() || region == "all" || region == "global" {
+            (-11.0, 0.0)
+        } else {
+            // Anchors are JKA-space world points, already placed and skinned.
+            // Camera space uses (x,z,-y). We follow the part but do not chase
+            // every step of its walking animation (which would bob the eye).
+            let y = anchor.map_or(fallback_y, |point| point[2] + vertical_adjust);
+            let z = anchor.map_or(0.0, |point| -point[1]);
+            // Body-shape sliders float on the right, cosmetic popovers on the
+            // left. Frame the character toward the *opposite* side so the
+            // active editor does not obscure the area being inspected.
+            let side = if region.starts_with("cosmetic:") { -6.0 } else { 4.0 };
+            (y, z + side)
+        };
+        let camera = &mut self.profile_studio_camera;
+        camera.target_height = height;
+        camera.target_lateral = lateral;
+        camera.target_pitch = if region.is_empty() || region == "all" || region == "global" { 5.0 } else { 0.0 };
+        camera.target_yaw = yaw;
+        camera.target_zoom = zoom;
+        self.profile_studio_spin_velocity = 0.0;
+        self.profile_preview_key = None;
+    }
+
+    pub(in crate::app) fn tick_profile_studio_camera(&mut self, dt: f32) {
+        if self.profile_studio_camera.tick(dt, &mut self.profile_preview_yaw,
+            &mut self.profile_preview_zoom) {
+            self.profile_preview_key = None;
         }
     }
 
@@ -176,6 +348,17 @@ impl App {
     }
 
     pub(in crate::app) fn update_profile_preview(&mut self) {
+        // Bone damping can evaluate historical poses. Keep the displayed actor
+        // and camera on the same instant even if that first evaluation is slow.
+        let previous=self.render_studio.preview_sample_time;
+        if self.frontend_page==FrontendPage::RenderStudio {
+            self.render_studio.preview_sample_time=Some(self.render_studio.timeline_time());
+        }
+        self.update_profile_preview_at_time();
+        self.render_studio.preview_sample_time=previous;
+    }
+
+    fn update_profile_preview_at_time(&mut self) {
         if self.game_session.is_none() {
             let (effects,voice,separation) = self.effective_audio_mix();
             let emote_music=self.effective_emote_music_volume();
@@ -191,9 +374,15 @@ impl App {
             return;
         }
 
+        self.update_studio_camera_rig();
+
         let force_page = self.profile_selected_section == 2;
         // Show blades is presentation-only: no network or config changes.
-        let studio_saber = self.profile_studio_show_saber;
+        let studio_saber = if self.frontend_page == FrontendPage::RenderStudio {
+            self.render_studio.with_sabers
+        } else {
+            self.profile_studio_show_saber
+        };
         if !force_page {
             self.profile_force_preview_pending = None;
             self.profile_force_preview_active = None;
@@ -265,9 +454,17 @@ impl App {
         };
         // Force demonstrations temporarily override walking, then return to
         // the normal looping walk without changing gameplay animations.
-        let animation_name = force_animation.unwrap_or(walk_animation);
+        // Own the Studio animation name: presenter creation below requires
+        // &mut App and must not overlap a borrowed field of RenderStudio.
+        let studio_eval = (self.frontend_page == FrontendPage::RenderStudio)
+            .then(|| self.render_studio.active_animation());
+        let animation_name = if let Some((name, _, _, _)) = studio_eval.as_ref() {
+            name.as_str()
+        } else {
+            force_animation.unwrap_or(walk_animation)
+        };
         let with_sabers = (studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17)))
-            && crate::emotes::active_preview().is_none();
+            && (self.frontend_page == FrontendPage::RenderStudio || crate::emotes::active_preview().is_none());
 
         // The Ghoul2 evaluator already interpolates between authored GLA frames.
         // Feed it continuous millisecond time: rounding the preview clock to
@@ -280,16 +477,38 @@ impl App {
         };
         // Preview the staged skin without mutating the live model cvar or
         // sending any userinfo until Profile actually closes.
-        let preview_model = self.profile_model_staged.as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.solo_client_info.model_cvar());
+        let preview_model = if self.frontend_page == FrontendPage::RenderStudio {
+            self.render_studio.actor_model(self.render_studio.cinematic_preview.as_ref().map_or(0,|p|p.lane)).to_owned()
+        } else {
+            self.profile_model_staged.as_deref().map(str::to_owned)
+                .unwrap_or_else(|| self.solo_client_info.model_cvar())
+        };
         // Clamp only at i32::MAX to match the Ghoul2 millisecond API; never
         // quantize to animation.cfg frameLerp (Ghoul2 performs that lerp).
-        let current_time = profile_preview_time_ms(animation_elapsed);
+        let current_time = if self.frontend_page == FrontendPage::RenderStudio {
+            studio_eval.as_ref().map_or(0, |eval| eval.3)
+        } else {
+            profile_preview_time_ms(animation_elapsed)
+        };
+        let studio_emote = studio_eval.as_ref().and_then(|eval| eval.1.clone());
+        let studio_range = studio_eval.as_ref().and_then(|eval| eval.2);
+        // Include all actor-lane animation clocks in the preview cache key.
+        // Otherwise a secondary character can freeze while the lead stands idle.
+        let actors_tag = if self.frontend_page == FrontendPage::RenderStudio {
+            let time=self.render_studio.timeline_time();
+            format!("{:?}:{:?}",self.render_studio.timeline.active_actors(time).iter().map(|clip|
+                (clip.lane,clip.name.as_str(),clip.pose_time_ms(time),
+                    clip.first_frame,clip.end_frame,clip.tail_frames,clip.playback,
+                    self.render_studio.timeline.lane_models.get(clip.lane),
+                    clip.motion_at(time,self.render_studio.timeline.interpolation !=
+                        super::render_studio_timeline::StudioInterpolation::Linear)))
+                    .collect::<Vec<_>>(),self.render_studio.camera_rig_runtime.camera
+                        .map(|k|(k.position,k.yaw,k.pitch,k.fov)))
+        } else { String::new() };
         let key = (
             format!(
                 "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}:{:.2}:{:.2}:{:?}",
-                format!("{animation_name}:{:?}:{:?}", crate::emotes::active_preview().map(|p| p.emote.id), self.profile_body_highlight),
+                format!("{animation_name}:{:?}:{:?}:{studio_range:?}", studio_emote.as_ref().map(|p| p.emote.id.as_str()).or_else(|| crate::emotes::active_preview().map(|_| "profile emote")), self.profile_body_highlight),
                 preview_model,
                 self.network.saber1,
                 self.network.saber2,
@@ -305,7 +524,7 @@ impl App {
                 self.video.jiggle_breast_size,
                 self.video.jiggle_glute_size,
                 (self.video.body_shape_params(), jka_assets::body_shape::anny::fingerprint(self.video.body_shape_params(), self.video.body_details)),
-            ),
+            ) + actors_tag.as_str(),
             (self.profile_preview_yaw * 10.0).round() as i32,
             (self.profile_preview_zoom * 1000.0).round() as i32,
             current_time,
@@ -314,12 +533,22 @@ impl App {
             return;
         }
 
-        let yaw = self.profile_preview_yaw.to_radians();
+        // Only Render Studio applies authored character motion. Normal Profile
+        // previews remain unchanged and continue to use the global model turntable.
+        let studio_motion = (self.frontend_page == FrontendPage::RenderStudio && self.render_studio.cinematic_preview.is_none())
+            .then(|| self.render_studio.timeline.clip_at_lane(self.render_studio.timeline_time(),0)
+                .map(|clip| clip.motion_at(self.render_studio.timeline_time(),
+                    self.render_studio.timeline.interpolation !=
+                        super::render_studio_timeline::StudioInterpolation::Linear)))
+            .flatten().unwrap_or_default();
+        let yaw = (self.profile_preview_yaw + studio_motion.yaw).to_radians();
         let (s, c) = yaw.sin_cos();
         let axis = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
         let zoom = self.profile_preview_zoom.clamp(0.45, 2.5);
         let mut info = self.solo_client_info.clone();
-        if let Some(model) = self.profile_model_staged.as_deref() {
+        if let Some(model) = (self.frontend_page == FrontendPage::RenderStudio)
+            .then_some(preview_model.as_str())
+            .or(self.profile_model_staged.as_deref()) {
             let staged = ClientInfo::solo_model(model);
             info.model_name = staged.model_name;
             info.skin_name = staged.skin_name;
@@ -347,7 +576,8 @@ impl App {
             if with_sabers || cosmetics != 0 {
                 self.ensure_asset_preview_entity_presenter()?;
             }
-            let origin = [88.0 * zoom, 0.0, -22.0];
+            let origin = [88.0 * zoom + studio_motion.position[0],
+                studio_motion.position[1], -22.0 + studio_motion.position[2]];
             let (mut draws, fx_requests) = {
                 let presenter = self
                     .asset_preview_player_presenter
@@ -357,10 +587,10 @@ impl App {
                 presenter.set_early_frustum_cull(false);
                 presenter.set_lod_bias(self.video.ghoul2_lod_bias);
                 presenter.set_lod_scale(self.video.lod_scale);
-                presenter.set_ghoul2_anim_smooth(self.video.ghoul2_anim_smooth);
-                // Profile has its own presenter, but uses the same jiggle solver
-                // and tuning as gameplay. Keep it disabled when physics/jiggle
-                // is disabled globally; never advance the live player's state.
+                presenter.set_ghoul2_anim_smooth(if self.frontend_page == FrontendPage::RenderStudio { 0.0 } else { self.video.ghoul2_anim_smooth });
+                // Profile and Render Studio have their own presenter, but use
+                // the same jiggle enablement, sex filter and tuning as gameplay.
+                // Their animation clocks never advance the live player's state.
                 presenter.set_jiggle_config(
                     self.video.client_physics && self.video.jiggle_physics != 0,
                     self.video.jiggle_physics,
@@ -422,7 +652,12 @@ impl App {
                     cosmetics,
                     self.profile_studio_head_look,
                     true,
-                    crate::emotes::active_preview(),
+                    if self.frontend_page == FrontendPage::RenderStudio {
+                        studio_emote.clone()
+                    } else {
+                        crate::emotes::active_preview()
+                    },
+                    studio_range,
                 )?;
                 let requests = presenter.drain_fx_requests();
                 self.profile_studio_world_anchors = anchors;
@@ -567,6 +802,80 @@ impl App {
                             presenter.fx_material_stages(shader)
                         });
                     draws.append(&mut blade_surfaces);
+                }
+            }
+            if self.frontend_page == FrontendPage::RenderStudio {
+                let t=self.render_studio.timeline_time();
+                let has_primary=self.render_studio.cinematic_preview.is_some() || self.render_studio.timeline.clip_at_lane(t,0).is_some();
+                if !has_primary {draws.clear();}
+                // Each occupied layer is a separate Ghoul2 actor. The existing
+                // presenter is reused sequentially: each call returns owned
+                // skinned surfaces, then the surfaces are composited in one pass.
+                // Separate Y offsets make two actors visible by default; motion
+                // keys still control each actor's local XYZ/yaw independently.
+                let actors:Vec<_>=self.render_studio.timeline.active_actors(t).into_iter()
+                    .filter(|c|c.lane>0 && self.render_studio.cinematic_preview.is_none()).map(|c|{
+                        let motion=c.motion_at(t,self.render_studio.timeline.interpolation !=
+                            super::render_studio_timeline::StudioInterpolation::Linear);
+                        let model=self.render_studio.actor_model(c.lane).to_owned();
+                        (c.lane,c.name.clone(),c.pose_time_ms(t),c.preview(t),
+                            (c.first_frame,c.end_frame),motion,model)
+                    }).collect();
+                for (lane,name,time_ms,emote,frame_range,motion,model) in actors {
+                    // Keep each character independent. A missing skin, unsupported
+                    // external pose, or bad emote must not discard the successful
+                    // draw surfaces of the other characters in this frame.
+                    let actor_result = (|| -> Result<Vec<DynamicModelSurface>, String> {
+                        let mut actor_info=info.clone();
+                        let staged=ClientInfo::solo_model(&model);
+                        actor_info.model_name=staged.model_name;
+                        actor_info.skin_name=staged.skin_name;
+                        let yaw=(self.profile_preview_yaw+motion.yaw).to_radians();
+                        let (sn,cs)=yaw.sin_cos();
+                        let actor_axis=[[cs,sn,0.0],[-sn,cs,0.0],[0.0,0.0,1.0]];
+                        // The renderer's preview stage uses Y-up and Z-sideways.
+                        // Stagger characters horizontally, not vertically.
+                        let actor_origin=[88.0*zoom+motion.position[0],
+                            motion.position[1],-22.0+lane as f32*26.0+motion.position[2]];
+                        let presenter=self.asset_preview_player_presenter.as_mut()
+                            .ok_or("Studio player presenter unavailable")?;
+                        let (mut actor_draws,_) = presenter.present_profile_player_preview(
+                            &actor_info,actor_origin,actor_axis,time_ms,&name,
+                            with_sabers,self.network.char_color.map(|channel|f32::from(channel)/255.0),
+                            0,self.profile_studio_head_look,true,emote,Some(frame_range))?;
+                        // Additional actors use the same attachment presenter as
+                        // the primary; no network or game session entities needed.
+                        let _=presenter.drain_fx_requests();
+                        let worn=presenter.drain_cosmetic_draws();
+                        let _=presenter.drain_emote_fx();
+                        if !worn.is_empty() {
+                            self.ensure_asset_preview_entity_presenter()?;
+                            let mut attachments=self.asset_preview_entity_presenter.as_mut()
+                                .ok_or("Studio attachment presenter unavailable")?.present_cosmetics(worn);
+                            actor_draws.append(&mut attachments);
+                        }
+                        Ok(actor_draws)
+                    })();
+                    match actor_result {
+                        Ok(mut actor_draws) => draws.append(&mut actor_draws),
+                        Err(error) => {
+                            // Errors partway through presentation may leave staged
+                            // props/FX in the shared presenter. Do not leak them
+                            // into the next actor's draw or the following frame.
+                            if let Some(presenter) = self.asset_preview_player_presenter.as_mut() {
+                                let _=presenter.drain_fx_requests();
+                                let _=presenter.drain_cosmetic_draws();
+                                let _=presenter.drain_emote_fx();
+                            }
+                            let message=format!(
+                                "RENDER STUDIO ACTOR {} ({model}, {name}): {error}",lane+1);
+                            if self.console_status != message {
+                                self.console_status=message.clone();
+                                self.push_console_line(format!("^1{message}"));
+                            }
+                            self.render_studio.status=message;
+                        }
+                    }
                 }
             }
             Ok(draws)
@@ -990,6 +1299,7 @@ impl App {
             };
             presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             presenter.set_static_md3_instances(self.video.static_md3_instances);
+            presenter.set_static_md3_bvh(self.video.static_md3_bvh);
             presenter.set_static_models(Arc::clone(&statics));
 
             let mut fx_assets =
@@ -1089,6 +1399,12 @@ impl App {
         }
 
         let stage = scene::menu_stage(super::constants::FRONTEND_BACKGROUND_MAP);
+        if stage.is_some_and(|stage| !stage.player) {
+            // An empty stage: nothing to wait for before the handoff.
+            self.solo_dynamic_models = Arc::new(self.menu_scene_props());
+            self.advance_frontend_scene_readiness(true, 0);
+            return;
+        }
         let Some(idle_anim) = jka_assets::animation::animation_index(
             stage.map_or("BOTH_STAND1", |stage| stage.player_anim),
         )
@@ -1197,6 +1513,7 @@ impl App {
 
     pub(in crate::app) fn update_solo_player_view_and_presentation(&mut self) {
         self.render_view_latch = ViewLatchMode::Disabled;
+        self.camera.clear_first_person_bob();
         if self
             .game_session
             .as_ref()
@@ -1210,6 +1527,7 @@ impl App {
             return;
         }
         let mut first_person_camera = self.camera;
+        first_person_camera.clear_first_person_bob();
         let Some((
             mode,
             player_view,
@@ -1284,6 +1602,14 @@ impl App {
             }
         } else {
             self.camera = first_person_camera;
+            self.camera.apply_first_person_bob(self.view_bob, ViewBobInput {
+                angles: view_angles,
+                velocity: player_view.velocity,
+                bob_cycle: player_view.bob_cycle,
+                pm_flags: player_view.pm_flags,
+                pm_type: player_view.pm_type,
+                health: entity_view.health,
+            });
             if latch_input_available {
                 self.render_view_latch = ViewLatchMode::Direct;
             }

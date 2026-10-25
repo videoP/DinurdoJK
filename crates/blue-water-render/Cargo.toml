@@ -7,6 +7,6 @@ license = "MIT"
 
 [dependencies]
 bytemuck = { version = "=1.25.2", features = ["derive"] }
-glam = "=0.33.9"
+glam.workspace = true
 naga_oil = { version = "0.23.0", default-features = false }
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "naga-ir", "dx12", "vulkan"] }

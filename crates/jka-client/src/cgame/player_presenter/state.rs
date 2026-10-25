@@ -55,17 +55,34 @@ pub(in crate::cgame::player_presenter) fn resolve_vehicle_model_request(
 }
 
 impl PlayerPresenter {
+    /// Connection ownership is independent of snapshot/playerState view ownership
+    /// (a spectator can be following another player). Demo playback has no
+    /// connection-owned body; explicit Profile previews set local_body themselves.
+    pub(crate) fn set_local_body_owner(&mut self, owner: Option<usize>) {
+        self.local_body_owner = Some(owner);
+    }
+
+    /// SoundPresenter -> S_GetVoiceVolume, sampled before CG_Player each frame.
+    pub fn set_breath_talking(&mut self, entities: impl IntoIterator<Item = u16>) {
+        self.breath_talking.clear();
+        self.breath_talking.extend(entities);
+    }
+
     /// Reset only per-entity/time-dependent presentation state for demo seeking.
     /// Asset/model caches stay hot so scrubbing does not turn into a reload path.
     pub fn reset_for_seek(&mut self) {
         self.fx_requests.clear();
+        self.breath_puff_times.clear();
+        self.breath_talking.clear();
         self.footsteps.clear();
         self.entities.clear();
         self.jiggle.clear();
         self.preview_source_jiggles.clear();
         self.team_power.clear();
         self.body_fade.clear();
+        self.mind_trick_fades.clear();
         self.gore.clear();
+        self.pending_gore.clear();
         self.last_gpu.clear();
         self.vehicle_snaps.clear();
         self.vehicle_animations.clear();
@@ -129,6 +146,7 @@ impl PlayerPresenter {
     }
 
     pub fn new(mut assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
+        jka_assets::body_shape::anny::configure_assets(&assets);
         let animations = load_humanoid_animations(&mut assets)?;
         let anim_events =
             jka_assets::animevents::load_humanoid_animation_events(&mut assets, &animations)
@@ -190,6 +208,10 @@ impl PlayerPresenter {
             load_shared,
             async_loading: true,
             fx_requests: Vec::new(),
+            breath_puff_times: HashMap::new(),
+            breath_talking: HashSet::new(),
+            cold_breath_effects: false,
+            breath_view_contents: 0,
             anim_events,
             footstep_stages: FootstepStages::from_level(footsteps::FOOTSTEPS_MARKS),
             footsteps: Vec::new(),
@@ -203,6 +225,7 @@ impl PlayerPresenter {
             viewer_dueling: false,
             japro: crate::japro_cg::JaproCgame::default(),
             viewer_style: crate::japro_cg::StyleViewer::default(),
+            mind_trick_fades: HashMap::new(),
             look: crate::japro_cg::Appearance::NORMAL,
             japro_cinfo2: 0,
             head_look_mode: 1,
@@ -218,18 +241,21 @@ impl PlayerPresenter {
             local_global_hat: String::new(),
             local_global_cape: String::new(),
             global_cosmetic_offsets: HashMap::new(),
+            packed_cosmetic_assets: None,
             sent_cosmetics: 0,
             cosmetic_mismatch_logged: None,
             team_power: HashMap::new(),
             body_fade: HashMap::new(),
             gore_limit: 0,
             gore: Vec::new(),
+            pending_gore: Vec::new(),
             gore_next_id: 1,
             last_gpu: HashMap::new(),
             vehicle_snaps: HashMap::new(),
             vehicle_animations: HashMap::new(),
             entities: HashMap::new(),
             external_live_entities: HashSet::new(),
+            local_body_owner: None,
             jiggle: super::AsyncJiggleSystem::default(),
             preview_source_jiggles: HashMap::new(),
             jiggle_sex_filter: 0,
@@ -265,7 +291,7 @@ impl PlayerPresenter {
             early_frustum_cull: true,
             rt_shadow_casters_enabled: false,
             collision_world: None,
-            blob_shadows_enabled: false,
+            blob_shadow_opacity: 0.0,
             blob_shadow_instances: Vec::new(),
             blob_shadow_texture: None,
             blob_shadow_alpha_mode: DynamicModelAlphaMode::BlendUnlit,

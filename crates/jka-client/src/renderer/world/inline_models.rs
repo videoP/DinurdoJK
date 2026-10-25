@@ -111,9 +111,11 @@ impl Renderer {
             // current per-instance flag, but avoid a needless vertex upload or
             // shadow invalidation when only isPortalEnt changed.
             if same_inline_geometry(model.uploaded, target) {
+                if model.uploaded != Some(target) { model.pvs_bounds_dirty = true; }
                 model.uploaded = Some(target);
                 continue;
             }
+            model.pvs_bounds_dirty = true;
             let was_hidden = matches!(model.uploaded, Some(None));
             model.uploaded = Some(target);
             glass_poses_changed |= model.rt_mask_sources.iter().any(|source| source.material.glass);

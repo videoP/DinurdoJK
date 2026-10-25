@@ -214,6 +214,9 @@ impl App {
     /// OpenJK Cbuf_Execute semantics: commands execute in order until the
     /// buffer empties or `wait` asks us to leave the remainder for later.
     pub(in crate::app) fn process_console_command_buffer(&mut self) -> bool {
+        if self.renderer_restart_suspended {
+            return false;
+        }
         let mut executed = 0usize;
         self.console_buffer_running = true;
         loop {
@@ -237,6 +240,12 @@ impl App {
             };
             self.execute_command_line(&command);
             executed += 1;
+            // The renderer restart is asynchronous in Rust. TaystJK's
+            // synchronous CL_Vid_Restart_f prevents the rest of this command
+            // buffer (including binds like +attack) from running meanwhile.
+            if self.renderer_restart_suspended {
+                break;
+            }
             // OpenJK has a fixed 128 KiB byte buffer but a self-reinserting
             // vstr/exec can otherwise spin forever in one host frame. Keep the
             // same ordering while yielding pathological scripts safely.

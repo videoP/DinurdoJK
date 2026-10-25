@@ -5,7 +5,7 @@ use crate::app::{
     BrowserUiState, Camera, ChatLogRangeFilter, ChatMode, ClientInfo, ConsoleSize,
     DemoConsoleFilter, DemoViewMode, EntityGraphUi, ShaderRemapUi, EventLoopProxy, ForcedPlayerModels,
     FrontendPage, HashMap, HashSet, Instant, KeyCode, MapLoadingState, ModifiersState, OverlayMode,
-    PathBuf, PerfStats, PhysicsMapMesh, SpectatorCameraState, ThirdPersonCameraState,
+    PathBuf, PerfStats, PhysicsMapMesh, ProfileStudioCamera, SpectatorCameraState, ThirdPersonCameraState,
     UserEvent, VecDeque, VideoSection, VideoSettings, ViewLatchMode,
     DEMO_EXPORT_DEFAULT_FPS, DEMO_FREE_SPEED_DEFAULT_INDEX, DemoVideoPreset,
 };
@@ -21,7 +21,7 @@ impl App {
         let loader_tx = spawn_map_loader(base.clone(), proxy.clone())?;
         let log_rx = crate::logging::subscribe();
         let settings_dir = jka_assets::pk3::active_game_directory(&base, game.as_deref());
-        let extensions = crate::extensions::Manager::spawn(base.join("extensions"))?;
+        let extensions = crate::extensions::Manager::spawn(base.clone(), game.clone())?;
         // External LUTs must be listed before the saved r_colorLut is parsed.
         crate::color_lut::scan_external(&base, game.as_deref());
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::LutScanReady);
@@ -32,6 +32,8 @@ impl App {
         let audio = config::load_audio_settings(&config_path);
         let mut presentation =
             config::load_client_presentation_settings(&config_path);
+        ui::movement_components::normalize(&mut presentation.strafe_helper.flags,
+            &mut presentation.japro.speedometer.flags);
         // OpenJK/TaystJK mirror cg_drawTeamOverlay into the read-only CVAR_USERINFO
         // key `teamoverlay`; the server uses it to decide whether to send tinfo.
         presentation.network.team_overlay = presentation.team_overlay.mode > 0;
@@ -125,9 +127,26 @@ impl App {
         let saved_accounts = Vec::new();
         let account_credential_error = None;
         crate::emotes::start_catalog(&base);
+        // Main-menu sign lettering (Star Jedi outlines). Rare work: one thread.
+        {
+            let (base, game) = (base.clone(), game.clone());
+            let _ = std::thread::Builder::new().name("neon-font".into()).spawn(move || {
+                let Ok(mut assets) = jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref()) else { return };
+                for path in crate::neon_menu::font::OUTLINE_FONT_PATHS {
+                    if let Ok(Some(asset)) = assets.read(path, 8 << 20) {
+                        match crate::neon_menu::font::install_outline_font(&asset.bytes) {
+                            Ok(()) => println!("Neon menu lettering: {path}"),
+                            Err(error) => eprintln!("Neon menu lettering {path}: {error}"),
+                        }
+                        return;
+                    }
+                }
+            });
+        }
         let emote_wheel = super::emote_wheel::EmoteWheel::load(&base);
         let mut app = Self {
             extensions,
+            updater: crate::updater::State::load(&settings_dir),
             base,
             startup_game: game.clone(),
             game,
@@ -147,6 +166,7 @@ impl App {
             frontend_page: FrontendPage::Main,
             game_launch_screen: presentation.game_launch_screen,
             frontend_skip_chrome_fade: presentation.game_launch_screen != config::GameLaunchScreen::Main,
+            neon_menu: Default::default(),
             solo_maps: Vec::new(),
             solo_map_selected: 0,
             solo_catalog_loaded: false,
@@ -224,6 +244,7 @@ impl App {
             profile_studio_started: Instant::now(),
             profile_studio_last_frame: Instant::now(),
             profile_studio_spin_velocity: 0.0,
+            profile_studio_camera: ProfileStudioCamera::default(),
             profile_studio_head_look: [0.0, 0.0],
             profile_studio_world_anchors: [None; 7],
             profile_body_highlight: None,
@@ -244,6 +265,7 @@ impl App {
             profile_preview_key: None,
             profile_defer_send: false,
             profile_userinfo_pending: false,
+            last_profile_wire: None,
             console_buffer_running: false,
             console_userinfo_dirty: false,
             japro_userinfo_update_debounce: 0,
@@ -254,6 +276,7 @@ impl App {
             profile_force_pending: false,
             profile_dynamic_models: Arc::new(Vec::new()),
             profile_preview_active: false,
+            render_studio: Default::default(),
             demo_entries: Vec::new(),
             demo_catalog_pending: false,
             demo_catalog_generation: 0,
@@ -417,6 +440,7 @@ impl App {
             crosshair_seen: None,
             crosshair_scan_at: Instant::now(),
             force_select_until: None,
+            weapon_select_until: None,
             player_names: presentation.player_names,
             player_name_visible: [false; 32],
             race_ghost_label_visible: [false; 128],
@@ -481,6 +505,7 @@ impl App {
             dev_radial_offset: [0.0; 2],
             model_placement: Default::default(),
             emote_radial_category: None,
+            emote_radial_search: Default::default(),
             console_input: String::new(),
             console_cursor: 0,
             console_status: if front_end {
@@ -527,6 +552,7 @@ impl App {
             force_model: presentation.force_model.clone(),
             forced_player_models,
             japro_zoom_fov: presentation.zoom_fov,
+            view_bob: presentation.view_bob,
             japro_zoom_transition_at: None,
             japro_fk_duration: presentation.fk_duration,
             japro_fk_first_jump_duration: presentation.fk_first_jump_duration,
@@ -670,6 +696,7 @@ impl App {
             static_ao_progress: None,
             preserve_game_state_on_next_map_upload: false,
             renderer_restart_started: None,
+            renderer_restart_suspended: false,
             perf: PerfStats::default(),
             threads: Arc::from([]),
             surface_inspector: None,

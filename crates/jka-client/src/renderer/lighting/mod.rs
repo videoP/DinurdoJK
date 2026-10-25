@@ -10,6 +10,8 @@ pub(in crate::renderer) mod sun_bake;
 mod sun_bake_cache;
 mod sun_bake_upload;
 pub(in crate::renderer) mod baked_sun_cache;
+pub(in crate::renderer) mod lightmap_sun;
+pub(crate) mod lightmap_local;
 pub(in crate::renderer) mod ray_tracing;
 pub(in crate::renderer) mod rt_diagnostics;
 pub(in crate::renderer) mod settings;

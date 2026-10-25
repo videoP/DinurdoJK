@@ -157,6 +157,12 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn apply_mark_count(&mut self) {
+        if let Some(session) = self.game_session.as_mut() {
+            session.weapon_fx.set_mark_count(self.video.mark_count as usize);
+        }
+    }
+
     /// Push `fx_lod` / `fx_countScale` into the live session's FX worker.
     pub(in crate::app) fn apply_fx_lod(&mut self) {
         if let Some(session) = self.game_session.as_mut() {

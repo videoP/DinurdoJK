@@ -15,7 +15,7 @@ use visibility::face_plane::{
 use overlay::ScreenFxBatch;
 use frametime_graph::FrameTimeGraph;
 use world::deferred_bundles::{DeferredCommand, DeferredResources, DeferredWorldBundles};
-use world::videos::{WorldVideoPlayer, WORLD_VIDEO_MAX_CATCH_UP};
+use world::videos::{Mp4Video, RoqWorker, VideoDecoder, WorldVideoPlayer};
 mod api;
 mod bindings;
 mod capture;
@@ -37,6 +37,7 @@ pub(crate) fn input_diag_win32_message(message: *const std::ffi::c_void) {
 
 mod lighting;
 mod models;
+mod neon_menu;
 mod overlay;
 mod portal_depth;
 mod post;
@@ -825,6 +826,8 @@ struct Renderer {
     // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
     // compile or allocate this pass.
     menu_backdrop: Option<MenuBackdropResources>,
+    /// Renderer-drawn frontend main page (rainy café window).
+    neon_menu: neon_menu::NeonMenu,
     world: Option<WorldGpu>,
     /// `videoMap` cinematics of the current world, streamed into `world.textures`.
     world_videos: Vec<WorldVideoPlayer>,
@@ -1079,6 +1082,12 @@ struct Renderer {
     dynamic_light_brightness: f32,
     emissive_area_lights_enabled: bool,
     shader_light_promotion_enabled: bool,
+    baked_local_lights: bool,
+    baked_local_sources: u32,
+    baked_local_shadows: bool,
+    baked_local_had_casters: bool,
+    /// Session-only lamp-shadow experiment: 0 baseline, 1 receiver octants, 2 caster prefilter, 3 both.
+    lamp_shadow_ab: u8,
     shader_light_promotion_mask: u32,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,

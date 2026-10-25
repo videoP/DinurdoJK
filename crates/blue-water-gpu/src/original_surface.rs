@@ -818,6 +818,8 @@ pub struct SurfaceCamera {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SurfaceBoundary {
     pub bounds: [f32; 4],
+    /// Bottom relative to the water plane in metres; y enables floor clipping.
+    pub depth: [f32; 4],
     pub counts: [u32; 4],
     pub scale: [f32; 4],
     pub tiles: [u32; 4],

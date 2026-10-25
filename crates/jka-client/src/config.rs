@@ -1,5 +1,5 @@
 pub(crate) mod cvars;
-use crate::camera::{SpectatorCameraSettings, ThirdPersonSettings, DEFAULT_CG_FOV};
+use crate::camera::{SpectatorCameraSettings, ThirdPersonSettings, ViewBobSettings, DEFAULT_CG_FOV};
 use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::player::MouseInputSettings;
 use crate::ui::{CrosshairSettings, HudLayout, MovementKeysSettings, PlayerNameSettings, StrafeHelperSettings, PvsMode, TextureFilter, DynamicShadowsMode, VideoSettings};
@@ -91,6 +91,8 @@ pub struct ClientPresentationSettings {
     pub fov: f32,
     /// TaystJK cg_zoomFov: target FOV for the held +zoom bind.
     pub zoom_fov: f32,
+    /// TaystJK cg_bobUp/Pitch/Roll + cg_runPitch/Roll (all default 0).
+    pub view_bob: ViewBobSettings,
     /// TaystJK flipkick bind timing, counted in CGame frames.
     pub fk_duration: i32,
     pub fk_first_jump_duration: i32,
@@ -253,6 +255,10 @@ pub struct AudioSettings {
     pub steam_audio: bool,
     /// Opt-in authored EAGLE/EAX reverb on maps with valid .eal.
     pub eal_enabled: bool,
+    /// Independent OpenAL Soft HRTF preference for EAL-owned sources.
+    pub eal_hrtf: bool,
+    /// Ephemeral EAL troubleshooting mode (not saved in the user config).
+    pub eal_debug_mode: u8,
     /// Live Steam Audio HRTF rendering for positional sounds.
     pub steam_audio_binaural: bool,
     /// Steam Audio HRTF direction interpolation: 0 = nearest, 1 = bilinear.
@@ -280,6 +286,8 @@ impl Default for AudioSettings {
             mute_when_unfocused: true,
             steam_audio: false,
             eal_enabled: false,
+            eal_hrtf: false,
+            eal_debug_mode: 0,
             steam_audio_binaural: true,
             steam_audio_hrtf_interpolation: 0,
             steam_audio_environmental: true,
@@ -351,6 +359,7 @@ impl Default for ClientPresentationSettings {
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
             zoom_fov: 30.0,
+            view_bob: ViewBobSettings::default(),
             fk_duration: 50,
             fk_first_jump_duration: 0,
             fk_second_jump_delay: 0,
@@ -430,6 +439,8 @@ pub fn load_client_presentation_settings(
 
         if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_presentation) { load(&mut settings, name, value); }
     }
+    crate::ui::movement_components::normalize(&mut settings.strafe_helper.flags,
+        &mut settings.japro.speedometer.flags);
     settings
 }
 
@@ -471,7 +482,7 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     // r_dynamicLights is the source of truth for all runtime-light techniques.
     if context.dynamic_shadows_mode_seen {
         settings.cascaded_shadows =
-            settings.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+            matches!(settings.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::HybridCsmRtEntities);
     } else {
         settings.dynamic_shadows = if settings.cascaded_shadows {
             DynamicShadowsMode::CascadedShadowMaps
@@ -1255,6 +1266,7 @@ mod tests {
             separation: 0.75,
             mute_when_unfocused: false,
             steam_audio: true,
+            eal_hrtf: true,
             game: GameOptions {
                 jump: 3,
                 roll: 2,
@@ -1289,6 +1301,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(loaded, audio);
+        assert!(text.contains("seta s_ealHrtf \"1\""));
         assert!(text.contains("seta s_volume \"0.375\""));
         assert!(text.contains("seta s_variometer \"1\""));
         assert!(text.contains("seta s_variometerStyle \"1\""));

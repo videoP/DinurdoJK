@@ -1,35 +1,17 @@
 use super::*;
+use std::io::Read;
 
 #[test]
 fn port_matches_independent_python_evaluator() {
-    let data = model();
-    for oracle in &data.meta.oracle {
-        let [muscle, weight, proportions, height, age] = oracle.params;
-        let vertices = data.evaluate(
-            BodyShapeParams {
-                muscle,
-                weight,
-                proportions,
-                height,
-                age,
-            },
-            Details::parse(&oracle.details).unwrap(),
-        );
-        let mut worst = 0.0f32;
-        assert_eq!(oracle.expected[1], vertices.len() * 3);
-        for (i, v) in vertices.iter().enumerate() {
-            for k in 0..3 {
-                let at = oracle.expected[0] + (i * 3 + k) * 4;
-                let expected = f32::from_le_bytes(data.bytes[at..at + 4].try_into().unwrap());
-                worst = worst.max((v[k] - expected).abs());
-            }
-        }
-        assert!(
-            worst < 5e-6,
-            "Anny source parity: {worst} for {:?}",
-            oracle.params
-        );
+    let data = model().unwrap();
+    let vertices = data.evaluate(BodyShapeParams::default(), Details::default());
+    let expected = include_bytes!("../../../tests/data/anny-neutral-oracle.bin");
+    assert_eq!(expected.len(), vertices.len() * 12);
+    let mut worst = 0.0f32;
+    for (actual, raw) in vertices.iter().flatten().zip(expected.chunks_exact(4)) {
+        worst = worst.max((actual - f32::from_le_bytes(raw.try_into().unwrap())).abs());
     }
+    assert!(worst < 5e-6, "Anny source parity: {worst}");
 }
 
 #[test]
@@ -68,7 +50,7 @@ fn retopology_preserves_authored_shapes_on_the_donor_surface() {
         ghoul2::*,
         skeleton::{humanoid_reference, HumanoidRig},
     };
-    let data = model();
+    let data = model().unwrap();
     let gla = humanoid_reference(HumanoidRig::Jka53);
     let mut native: Vec<_> = gla
         .skeleton
@@ -103,13 +85,7 @@ fn retopology_preserves_authored_shapes_on_the_donor_surface() {
             }],
         }],
     };
-    let params = BodyShapeParams {
-        muscle: 0.73,
-        weight: 0.23,
-        height: 0.9,
-        proportions: 0.66,
-        age: 0.2,
-    };
+    let params = BodyShapeParams::default();
     let details =
         Details::parse("gender=0.8,cupsize=0.7,buttocks-volume-incr=-0.6,jawOpen=0.5").unwrap();
     let expected = data.evaluate(params, details);
@@ -165,7 +141,7 @@ fn macro_changes_preserve_authored_segment_ratios_on_game_rigs() {
         ghoul2::*,
         skeleton::{humanoid_reference, HumanoidRig},
     };
-    let data = model();
+    let data = model().unwrap();
     for rig in [HumanoidRig::Jka53, HumanoidRig::Jk2_72] {
         let gla = humanoid_reference(rig);
         let ids: Vec<_> = data
@@ -187,19 +163,18 @@ fn macro_changes_preserve_authored_segment_ratios_on_game_rigs() {
             .collect();
         for original in [None, Some(native.as_slice())] {
             let rest = original.unwrap_or(&stock);
-            for axis in ["height", "age", "proportions", "gender", "muscle", "weight"] {
+            for axis in [
+                "gender",
+                "cupsize",
+                "firmness",
+                "buttocks-volume-incr",
+                "jawOpen",
+            ] {
                 for value in [0.0, 0.25, 0.75, 1.0] {
-                    let mut params = BodyShapeParams::default();
-                    let mut details = Details::default();
-                    match axis {
-                        "height" => params.height = value,
-                        "age" => params.age = value,
-                        "proportions" => params.proportions = value,
-                        "gender" => details.0[0] = value,
-                        "muscle" => params.muscle = value,
-                        "weight" => params.weight = value,
-                        _ => unreachable!(),
-                    }
+                    let params = BodyShapeParams::default();
+                    let mut details = Details::parse(&format!("{axis}={value}")).unwrap();
+                    // Nonneutral details exercise transfer even at a control's neutral anchor.
+                    details.0[0] = if axis == "gender" { value } else { 0.7 };
                     let expected = data.evaluate(params, details);
                     let heads: Vec<_> = data
                         .meta
@@ -320,6 +295,22 @@ fn retail_models_keep_neutral_geometry_and_animate_authored_local_targets() {
             ),
             (BodyShapeParams { age: 0., ..neutral }, ""),
             (BodyShapeParams { age: 1., ..neutral }, ""),
+            (
+                BodyShapeParams {
+                    height: 0.,
+                    age: 0.,
+                    ..neutral
+                },
+                "gender=0.8,cupsize=0.2,buttocks-volume-incr=-0.6,jawOpen=0.5",
+            ),
+            (
+                BodyShapeParams {
+                    height: 1.,
+                    age: 1.,
+                    ..neutral
+                },
+                "gender=0.2,firmness=0.8,l-upperarm-fat-incr=0.6",
+            ),
         ] {
             let mut shaped = original.clone();
             let pivots = apply_profile(
@@ -333,10 +324,19 @@ fn retail_models_keep_neutral_geometry_and_animate_authored_local_targets() {
             .unwrap();
             if recipe.is_empty() {
                 let mut previous = original.clone();
-                let previous_pivots = super::super::procedural::apply(&mut previous, &gla, params, None).unwrap().unwrap();
-                assert_eq!(pivots, previous_pivots, "restore previous pivots: {name} {params:?}");
-                assert_eq!(super::super::binding_fingerprint(&shaped), super::super::binding_fingerprint(&previous),
-                    "restore previous mesh: {name} {params:?}");
+                let previous_pivots =
+                    super::super::procedural::apply(&mut previous, &gla, params, None)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    pivots, previous_pivots,
+                    "restore previous pivots: {name} {params:?}"
+                );
+                assert_eq!(
+                    super::super::binding_fingerprint(&shaped),
+                    super::super::binding_fingerprint(&previous),
+                    "restore previous mesh: {name} {params:?}"
+                );
             }
             let binding = super::super::BodyShapeBinding::new(&gla, None, &pivots).unwrap();
             let poses: Vec<_> = [14651., 20447., 2947.]
@@ -383,4 +383,70 @@ fn retail_models_keep_neutral_geometry_and_animate_authored_local_targets() {
             assert!(changed > 0., "{name}: {recipe} has no influence");
         }
     }
+}
+
+#[test]
+fn runtime_data_is_trimmed_and_keeps_all_detail_controls() {
+    let data = model().unwrap();
+    assert_eq!(data.meta.targets.len(), 48);
+    assert_eq!(data.meta.controls.len(), 256);
+    assert_eq!(data.meta.facial.len(), 52);
+    assert!(data.bytes.len() < 20 * 1024 * 1024);
+    for i in 0..DETAIL_COUNT {
+        for value in [-1.0, 1.0] {
+            let mut details = Details::default();
+            details.0[i] = value;
+            let vertices = data.evaluate(BodyShapeParams::default(), details);
+            assert!(
+                vertices.iter().flatten().all(|x| x.is_finite()),
+                "{}={value}",
+                Details::name(i)
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_runtime_data_returns_an_error() {
+    assert!(Model::parse(b"not JSON", Vec::new()).is_err());
+    assert!(Model::parse(b"{}", Vec::new()).is_err());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+    let mut assets = crate::pk3::AssetSearchPath::open(&root).unwrap();
+    let json = assets
+        .read(RUNTIME_METADATA, 2 * 1024 * 1024)
+        .unwrap()
+        .unwrap()
+        .bytes;
+    assert!(
+        Model::parse(&json, Vec::new()).is_err(),
+        "missing array payload must be rejected"
+    );
+}
+
+#[test]
+fn detail_api_rejects_unavailable_whole_body_axes() {
+    use crate::{
+        ghoul2::*,
+        skeleton::{humanoid_reference, HumanoidRig},
+    };
+    let gla = humanoid_reference(HumanoidRig::Jka53);
+    let mut glm = GlmModel {
+        name: "runtime contract".into(),
+        anim_name: String::new(),
+        num_bones: gla.skeleton.len(),
+        hierarchy: vec![],
+        lods: vec![],
+    };
+    let error = apply(
+        &mut glm,
+        &gla,
+        BodyShapeParams {
+            height: 1.,
+            ..Default::default()
+        },
+        Details::default(),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("apply_profile"));
 }

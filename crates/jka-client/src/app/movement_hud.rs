@@ -7,7 +7,7 @@ use crate::app::{
 impl App {
     /// `cg_speedometer & SPEEDOMETER_ENABLE` or `cg_strafeHelper & SHELPER_ACCELMETER`.
     pub(in crate::app) fn speedometer_active(&self) -> bool {
-        self.japro_cg.speedometer.flags & crate::speedometer::flag::ENABLE != 0
+        self.japro_cg.speedometer.flags & ui::movement_components::NATIVE_READOUTS != 0
             || self.strafe_helper.flags & ui::SHELPER_ACCELMETER != 0
     }
 
@@ -114,7 +114,9 @@ impl App {
             lagometer: self.japro_cg.lagometer,
             width_ratio_coef: self.width_ratio_coef(),
         };
-        let settings = self.japro_cg.speedometer;
+        let mut settings = self.japro_cg.speedometer;
+        let mut helper = self.strafe_helper.flags;
+        ui::movement_components::normalize(&mut helper, &mut settings.flags);
         self.speedometer_ui = self.speedometer.update(&settings, &input);
     }
 
@@ -216,7 +218,7 @@ impl App {
     pub(in crate::app) fn current_movement_state(&self, require_physics: bool) -> ui::MovementHudState {
         let movement_keys_active = self.movement_keys_hud.mode != 0;
         let strafe_helper_active =
-            require_physics || self.strafe_helper.flags & ui::SHELPER_STYLE_MASK != 0 || self.speedometer_active();
+            require_physics || self.strafe_helper.flags & (ui::SHELPER_STYLE_MASK | ui::SHELPER_COMPONENT_MASK) != 0 || self.speedometer_active();
         if !movement_keys_active && !strafe_helper_active {
             // Keep the mailbox value completely stable when neither feature is
             // visible. In particular, do not let view yaw/velocity turn into a
@@ -384,8 +386,53 @@ impl App {
         state.view_yaw = angles[1];
         state.view_roll = angles[2];
         state.fov_x = self.japro_effective_fov(Instant::now());
+        state.crosshair_size = self.crosshair.size;
+        state.physics_frame_time = 1.0 / self.network.command_rate.clamp(15, 1000) as f32;
+        if let Some(session) = self.game_session.as_ref() {
+            // Another player's variable command cadence is not replicated.
+            // Keep a stable 125 Hz estimate for demos/follow unless the server
+            // supplies a fixed Pmove interval. Manual Physics FPS can override.
+            if following || (!session.live && !session.local) { state.physics_frame_time = 0.008; }
+            let system = session.decoder.configstrings.get(&1).map(Vec::as_slice).unwrap_or_default();
+            let int = |key: &[u8], default| jka_protocol::commands::info_value(system, key)
+                .map_or(default, jka_protocol::commands::atoi);
+            if int(b"pmove_fixed", 0) != 0 {
+                let msec = int(b"pmove_msec", 8);
+                let msec = if self.active_server_mod() == crate::net::mod_support::ServerMod::Japro {
+                    msec.clamp(1, 66)
+                } else { msec.clamp(8, 33) };
+                state.physics_frame_time = msec as f32 * 0.001;
+            }
+        }
 
         let mut ground = self.strafe_ground.get();
+        // The presented playerstate can contain an unsent subframe command.
+        // Its commandTime advances at presentation rate, so it cannot own the
+        // acceleration history. Use committed commands for our player and
+        // authoritative snapshots when prediction is disabled or following.
+        let accel_sample = if local_session || ps.is_none() {
+            self.local_server.as_ref().map(|player| {
+                let view = player.view();
+                (view.command_time, view.velocity[0].hypot(view.velocity[1]), view.ground_entity != 1023)
+            })
+        } else {
+            self.game_session.as_ref().and_then(|session| {
+                let sample = if session.live && !following && !self.network.no_predict
+                    && !session.client_game.synchronous_clients() {
+                    self.predictor.committed()
+                } else {
+                    session.next_snapshot.as_ref().or(session.current_snapshot.as_ref())
+                        .map(|snapshot| &snapshot.player_state)
+                }?;
+                let velocity = playerstate_vec3(sample, "velocity").unwrap_or_default();
+                Some((sample.field_i32("commandTime").unwrap_or(0), velocity[0].hypot(velocity[1]),
+                    sample.field_i32("groundEntityNum").is_some_and(|entity| entity != 1023)))
+            })
+        };
+        let (accel_time, accel_speed, accel_grounded) = accel_sample.unwrap_or((
+            command_time, state.velocity[0].hypot(state.velocity[1]), state.grounded,
+        ));
+        state.q3df_accel_bar_width = ground.q3df_accel_width(accel_time, accel_speed, accel_grounded);
         state.was_grounded = ground.update(command_time, state.grounded);
         self.strafe_ground.set(ground);
 

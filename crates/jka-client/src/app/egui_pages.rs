@@ -2,7 +2,6 @@
 //! its in-game editor, Network and Vote pages, plus visibility and race HUD controls.
 
 use super::egui_menu::jka_colored_text;
-use super::egui_settings::segmented_row;
 use super::egui_theme as theme;
 use super::session_tools::FlagCarrier;
 use super::*;
@@ -658,28 +657,16 @@ impl App {
 
     /// jaPRO HUD controls live with the rest of Setup -> Interface / HUD.
     pub(super) fn egui_japro_hud_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "RACE HUD", "The timer jaPRO shows while you are in race mode.");
-        if let Some(value) = segmented_row(
-            ui,
-            "Race timer",
-            "cg_raceTimer. Off; the time; the time plus max, average and start speed; or the same with millisecond precision.",
-            theme::Reset::None,
-            self.japro_cg.race_timer,
-            &[(0, "Off"), (1, "Time"), (2, "Time + speeds"), (3, "Milliseconds")],
-        ) {
-            let _ = self.set_console_cvar("cg_raceTimer", &value.to_string());
+        theme::section(ui, "RACE FORMATTING", "Component selection is above. These options change the selected readout's format.");
+        if self.japro_cg.race_timer != 0 {
+            theme::row(ui, "Timer format", "cg_raceTimer format for the enabled timer.", theme::Reset::None, |ui| {
+                let mut value = self.japro_cg.race_timer;
+                let choices = [(1,"Time"),(2,"Time + speeds"),(3,"Milliseconds")];
+                egui::ComboBox::from_id_salt("race_timer_format").selected_text(choices.iter().find(|(id,_)| *id == value).map(|(_,label)| *label).unwrap_or("Time"))
+                    .show_ui(ui, |ui| { for (id,label) in choices { ui.selectable_value(&mut value,id,label); } });
+                if value != self.japro_cg.race_timer { let _ = self.set_console_cvar("cg_raceTimer", &value.to_string()); }
+            });
         }
-        theme::row(
-            ui,
-            "Start speed readout",
-            "cg_raceStart. A separate readout of the speed you crossed the start line with.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.race_start) {
-                    let _ = self.set_console_cvar("cg_raceStart", if on { "1" } else { "0" });
-                }
-            },
-        );
         macro_rules! race_number {
             ($label:literal, $tip:literal, $field:ident, $cvar:literal, $range:expr, $speed:expr) => {
                 theme::row(ui, $label, $tip, theme::Reset::None, |ui| {
@@ -697,10 +684,11 @@ impl App {
 
         theme::section(
             ui,
-            "SPEEDOMETER",
-            "The jaPRO speedometer (cg_speedometer, also /speedometer <num>). Move any part of it with HUD Edit.",
+            "NATIVE READOUT FORMATTING",
+            "Formatting for jaPRO readouts. Enable each component with its dropdown above; position and scale it with HUD Edit.",
         );
         for (index, label) in crate::speedometer::TOGGLE_LABELS.iter().enumerate() {
+            if ![8,9,11,12,13,15].contains(&index) { continue; }
             theme::row(
                 ui,
                 label,
@@ -737,16 +725,13 @@ impl App {
             "LAGOMETER",
             "The jaPRO network graph (cg_lagometer): snapshot ping and drops below, interpolation above. Not shown against the local server.",
         );
-        if let Some(value) = segmented_row(
-            ui,
-            "Lagometer",
-            "cg_lagometer. Off; the graph in the lag frame; the graph with average ping and interpolation numbers; the numbers over a frameless graph; or those numbers plus packet loss and peak ping underneath (4, an addition of this client). The connection-interrupted warning shows regardless.",
-            theme::Reset::None,
-            self.japro_cg.lagometer.mode,
-            &[(0, "Off"), (1, "Graph"), (2, "Graph + numbers"), (3, "Numbers"), (4, "Numbers + loss")],
-        ) {
-            let _ = self.set_console_cvar("cg_lagometer", &value.to_string());
-        }
+        theme::row(ui, "Lagometer", "Select one network graph style, or Off. An enabled graph is independently editable in HUD Edit Mode.", theme::Reset::None, |ui| {
+            let mut value = self.japro_cg.lagometer.mode;
+            let choices = [(0,"Off"),(1,"Graph"),(2,"Graph + numbers"),(3,"Numbers"),(4,"Numbers + loss")];
+            egui::ComboBox::from_id_salt("lagometer_component").selected_text(choices.iter().find(|(id,_)| *id == value).map(|(_,label)| *label).unwrap_or("Off"))
+                .show_ui(ui, |ui| { for (id,label) in choices { ui.selectable_value(&mut value,id,label); } });
+            if value != self.japro_cg.lagometer.mode { let _ = self.set_console_cvar("cg_lagometer", &value.to_string()); }
+        });
         theme::row(
             ui,
             "Warning delay (commands)",

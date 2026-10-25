@@ -3,6 +3,8 @@ use crate::renderer::{
     mpsc, Duration, Instant, PathBuf, Renderer, ScreenshotFormat, ScreenshotOutput,
 };
 use image::ImageEncoder;
+#[path = "capture_alpha.rs"]
+pub(in crate::renderer) mod alpha;
 
 pub(in crate::renderer) struct ScreenshotReadbackBuffer {
     pub(in crate::renderer) buffer: wgpu::Buffer,
@@ -17,7 +19,9 @@ pub(in crate::renderer) enum ScreenshotDestination {
     },
     Clipboard,
     FrontendScene { path: PathBuf, neutral_gamma: f32, captured_gamma: f32, is_neutral: bool, surface_is_srgb: bool },
-    VideoFrame { frame_index: u64, depth: bool },
+    // None: HDR compositor already resolved straight sRGB. Some: resolve on
+    // readback, with the bool indicating whether the source surface is sRGB.
+    VideoFrame { frame_index: u64, depth: bool, alpha: bool, sdr_unpremultiply: Option<bool> },
 }
 
 pub(in crate::renderer) struct ScreenshotReadback {
@@ -355,7 +359,7 @@ pub(in crate::renderer) fn encode_screenshot_job(
             std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
             Ok(ScreenshotOutput::FrontendSceneSaved(path))
         }
-        ScreenshotDestination::VideoFrame { frame_index, depth: _ } => {
+        ScreenshotDestination::VideoFrame { frame_index, alpha, sdr_unpremultiply, .. } => {
             let row_bytes = job.width as usize * 4;
             let padded = job.padded_bytes_per_row as usize;
             let mut bgra = Vec::with_capacity(row_bytes * job.height as usize);
@@ -369,6 +373,9 @@ pub(in crate::renderer) fn encode_screenshot_job(
                         }
                     }
                 }
+            }
+            if alpha {
+                if let Some(srgb_surface)=sdr_unpremultiply {alpha::resolve_bgra(&mut bgra,srgb_surface);}
             }
             let depth_f32le = job.depth_pixels.map(|pixels| {
                 let mut depth = Vec::with_capacity(row_bytes * job.height as usize);
@@ -478,8 +485,11 @@ impl Renderer {
         self.request_screenshot_capture(ScreenshotDestination::Clipboard);
     }
 
-    pub(in crate::renderer) fn request_video_frame_capture(&mut self, frame_index: u64, depth: bool) {
-        self.request_screenshot_capture(ScreenshotDestination::VideoFrame { frame_index, depth });
+    pub(in crate::renderer) fn request_video_frame_capture(&mut self, frame_index: u64, depth: bool, alpha: bool) {
+        let sdr_unpremultiply = self.hdr_output.is_none().then_some(self.config.format.is_srgb());
+        self.request_screenshot_capture(ScreenshotDestination::VideoFrame {
+            frame_index, depth, alpha, sdr_unpremultiply,
+        });
     }
 
     pub(in crate::renderer) fn video_depth_capture_requested(&self) -> bool {

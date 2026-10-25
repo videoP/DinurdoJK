@@ -265,9 +265,15 @@ pub enum CullDebugMode {
     #[default]
     Off,
     RejectionReasons,
+    HiZOnly,
+    Counters,
 }
 
-impl CullDebugMode {}
+impl CullDebugMode {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Counters, Self::HiZOnly, Self::RejectionReasons];
+    pub fn index(self) -> usize { Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0) }
+    pub fn draws_overlay(self) -> bool { matches!(self, Self::RejectionReasons | Self::HiZOnly) }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PlanarReflectionDebugMode {
@@ -518,15 +524,18 @@ pub enum DynamicShadowsMode {
     EntityMap,
     /// Bevy-style directional-light cascades (the only CSM implementation).
     CascadedShadowMaps,
+    /// Static BSP CSM casters plus moving-entity sun occlusion via ray query.
+    HybridCsmRtEntities,
     RayTraced,
 }
 
 impl DynamicShadowsMode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Off,
         Self::Blob,
         Self::EntityMap,
         Self::CascadedShadowMaps,
+        Self::HybridCsmRtEntities,
         Self::RayTraced,
     ];
 
@@ -536,6 +545,7 @@ impl DynamicShadowsMode {
             Self::Blob => "blob",
             Self::EntityMap => "entity",
             Self::CascadedShadowMaps => "csm",
+            Self::HybridCsmRtEntities => "hybrid_csm_rt_entities",
             Self::RayTraced => "ray_traced",
         }
     }
@@ -559,6 +569,7 @@ impl DynamicShadowsMode {
             | "csm_bevy"
             | "bevy_csm"
             | "cascaded_shadow_maps_bevy" => Some(Self::CascadedShadowMaps),
+            "hybrid_csm_rt_entities" | "hybrid" | "csm_rt_entities" | "5" => Some(Self::HybridCsmRtEntities),
             "ray_traced" | "raytraced" | "3" | "4" => Some(Self::RayTraced),
             _ => None,
         }
@@ -1298,3 +1309,11 @@ impl FullscreenMode {
         matches!(self, Self::Windowed)
     }
 }
+
+pub const VIDEO_ROW_BAKED_LOCAL_LIGHTS: usize = 112;
+pub const VIDEO_ROW_BAKED_LOCAL_SHADOWS: usize = 113;
+pub const VIDEO_ROW_BAKED_LOCAL_GLOW: usize = 114;
+pub const VIDEO_ROW_BAKED_LOCAL_ADDITIVE: usize = 115;
+pub const VIDEO_ROW_BAKED_LOCAL_EMISSIVE: usize = 116;
+pub const VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT: usize = 117;
+pub const VIDEO_ROW_BAKED_LOCAL_FX: usize = 118;

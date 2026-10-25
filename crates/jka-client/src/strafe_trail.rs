@@ -675,7 +675,7 @@ fn append_time_marker(draws: &mut Vec<FxDraw>, marker: TimeMarker, camera: [f32;
     for (index, byte) in text.bytes().enumerate() {
         let Some(digit) = byte.checked_sub(b'0').filter(|digit| *digit <= 9) else { continue };
         let offset = (count * 0.5 - index as f32) * PLUM_NUMBER_SIZE;
-        draws.push(FxDraw::Sprite {
+        draws.push(FxDraw::Sprite { shader_time: 0.0,
             origin: [base[0] + side[0] * offset, base[1] + side[1] * offset, base[2]],
             radius: PLUM_NUMBER_SIZE * 0.5,
             rotation: 0.0,

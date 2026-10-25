@@ -1,7 +1,33 @@
 //! Effects cvars: declarative runtime and config bindings.
 use super::cvar_prelude::*;
 
+// Fix the CvarDef state type before the getter/setter closures are inferred.
+// This mirrors the renderer_cvars registry.
+type CvarDef = crate::console::cvars::CvarDef<App>;
+
 app_cvars! {
+    APP_R_MARKCOUNT {
+        runtime: CvarDef::new("r_markcount", "", "0..4096", "TaystJK wall mark count (default 100). Zero disables authored EFX decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.mark_count.to_string()), |app, value| App::cvar_set_r_markcount(app, APP_R_MARKCOUNT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_markcount, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(n) = value.trim().parse::<u32>() { settings.mark_count = n.min(4096); }
+            }),
+            archive: Some((174, |state| state.video.mark_count.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_markcount(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let n: u32 = value.trim().parse().map_err(|_| "r_markcount expects 0..4096".to_owned())?;
+                    self.video.mark_count = n.min(4096);
+                    self.apply_mark_count();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
     APP_R_FXAA {
         runtime: CvarDef::new(
                 "r_fxaa",
@@ -398,6 +424,29 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_R_FXOCCLUSION {
+        runtime: CvarDef::new("r_fxOcclusion", "", "0..1 (2 reserved)", "FX raster A/B: 0 original tessellation, 1 stationary map fx_runner groups with live descendant bounds, rear-plane rejection only. GPU Hi-Z wall-occlusion mode 2 is NOT implemented and is rejected. Defaults 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.fx_occlusion.to_string()),
+            |app, value| App::cvar_set_r_fxocclusion(app, APP_R_FXOCCLUSION.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_fxocclusion, None),
+        config: CvarBinding { default: Some(|state| state.video.fx_occlusion.to_string()), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_fxocclusion(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().map_err(|_| "r_fxOcclusion expects 0 or 1".to_owned())?;
+                if mode > 1 {
+                    return Err("r_fxOcclusion 2 (GPU Hi-Z) unavailable: raster query/draw integration is not implemented yet".to_owned());
+                }
+                self.video.fx_occlusion = mode;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_runner_culling(mode == 1);
+                }
+                self.publish_ui();
+                self.console_status = format!("FX CPU OCCLUSION A/B: {}", if mode == 0 {"ORIGINAL"} else {"MAP RUNNERS (rear-plane only)"});
+                Ok(())
+            }
+        }]
     }
 
     APP_R_FXZEROALPHADISCARD {

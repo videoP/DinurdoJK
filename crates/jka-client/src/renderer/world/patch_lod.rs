@@ -46,6 +46,10 @@ struct Geometry {
     grids: Vec<usize>,
     versions: Vec<u64>,
     active: Range<u32>,
+    /// Grid versions currently written into `reserved`, which keeps every part
+    /// at its FULL offset (patches padded with degenerate triangles), so a LOD
+    /// change rewrites only that patch. `None` until `reserved` is filled.
+    reserved_versions: Option<Vec<u64>>,
     /// Legacy dlight surface runs in FULL-detail index space (`original`).
     original_runs: Vec<crate::renderer::LegacyDlightRun>,
     targets: Vec<(u8, usize)>,
@@ -257,6 +261,7 @@ impl WorldPatchLod {
                     versions: vec![0; grids.len()],
                     grids,
                     active: original,
+                    reserved_versions: None,
                     original_runs,
                     targets: Vec::new(),
                 });
@@ -383,24 +388,74 @@ impl WorldPatchLod {
         let range = if full {
             g.original.clone()
         } else {
-            let start = g.reserved.start;
+            // Every part keeps its FULL offset inside `reserved`, so only the
+            // patches whose LOD changed since `reserved` was written are
+            // uploaded: a few KB, not the whole batch (9.5 MB per mouse
+            // movement on costadelsol's terrain).
             let mut indices = std::mem::take(&mut self.scratch);
-            indices.clear();
-            self.geometry_indices(geometry, &mut indices);
-            let range = start..start + indices.len() as u32;
-            if !indices.is_empty() {
-                queue.write_buffer(buffer, u64::from(start) * 4, bytemuck::cast_slice(&indices));
-                bytes = indices.len() as u64 * 4;
+            let mut offset = g.reserved.start;
+            let mut slot = 0;
+            for part in &g.parts {
+                match part {
+                    Part::Static(range) => {
+                        if g.reserved_versions.is_none() {
+                            queue.write_buffer(
+                                buffer,
+                                u64::from(offset) * 4,
+                                bytemuck::cast_slice(
+                                    &self.source.as_ref().expect("patch indices installed")
+                                        [range.start as usize..range.end as usize],
+                                ),
+                            );
+                            bytes += u64::from(range.end - range.start) * 4;
+                        }
+                        offset += range.end - range.start;
+                    }
+                    Part::Patch(id) => {
+                        let grid = &self.grids[*id];
+                        let capacity = grid.source_range.end - grid.source_range.start;
+                        if g.reserved_versions.as_ref().is_none_or(|v| v[slot] != grid.version) {
+                            indices.clear();
+                            self.padded_patch_indices(*id, &mut indices);
+                            queue.write_buffer(buffer, u64::from(offset) * 4, bytemuck::cast_slice(&indices));
+                            bytes += indices.len() as u64 * 4;
+                        }
+                        offset += capacity;
+                        slot += 1;
+                    }
+                }
             }
             self.scratch = indices;
-            range
+            debug_assert_eq!(offset - g.reserved.start, g.original.end - g.original.start);
+            g.reserved.start..offset
         };
         let g = &mut self.geometries[geometry];
         g.active = range.clone();
         for (version, &id) in g.versions.iter_mut().zip(&g.grids) {
             *version = self.grids[id].version;
         }
+        if !full {
+            g.reserved_versions = Some(g.versions.clone());
+        }
         Some((range, bytes))
+    }
+
+    /// One patch's selected indices padded with degenerate triangles to its
+    /// FULL index count (zero-area triangles are discarded before raster).
+    fn padded_patch_indices(&self, id: usize, out: &mut Vec<u32>) {
+        let grid = &self.grids[id];
+        let capacity = (grid.source_range.end - grid.source_range.start) as usize;
+        let start = out.len();
+        if !grid.suppressed {
+            if let Some(original) = &grid.original_indices {
+                out.extend_from_slice(original);
+            } else {
+                grid.lod.append_indices(grid.masks, &grid.vertices, out);
+            }
+        }
+        debug_assert!(out.len() - start <= capacity);
+        let pad = grid.vertices.iter().copied().find(|&v| v != u32::MAX).unwrap_or(0);
+        out.resize(start + capacity, pad);
     }
 
     fn needs_rebuild(&self, geometry: usize) -> bool {
@@ -432,11 +487,66 @@ impl WorldPatchLod {
         }
     }
 
+    /// `geometry_indices` with every patch padded to its FULL slot, so each
+    /// part sits at its FULL offset (see `padded_patch_indices`).
+    fn padded_geometry_indices(&self, geometry: usize, out: &mut Vec<u32>) {
+        for part in &self.geometries[geometry].parts {
+            match part {
+                Part::Static(range) => out.extend_from_slice(
+                    &self.source.as_ref().expect("patch indices installed")
+                        [range.start as usize..range.end as usize],
+                ),
+                Part::Patch(id) => self.padded_patch_indices(*id, out),
+            }
+        }
+    }
+
+    /// Rewrite only the patch spans of a resident recipe whose grid version
+    /// differs from `written` (its last `recipe_signature`). Recipes use the
+    /// padded layout, so every span sits at a fixed offset. Returns bytes.
+    fn rewrite_recipe_patches(
+        &mut self,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        members: &[usize],
+        full: &[WorldBatch],
+        start: u32,
+        written: &[u64],
+    ) -> u64 {
+        let mut indices = std::mem::take(&mut self.scratch);
+        let (mut offset, mut slot, mut bytes) = (start, 0, 0);
+        for &member in members {
+            let batch = &full[member];
+            let Some(geometry) = batch.patch_geometry else {
+                offset += batch.full_indexed_range.end - batch.full_indexed_range.start;
+                continue;
+            };
+            for part in &self.geometries[geometry].parts {
+                match part {
+                    Part::Static(range) => offset += range.end - range.start,
+                    Part::Patch(id) => {
+                        let grid = &self.grids[*id];
+                        if written.get(slot) != Some(&grid.version) {
+                            indices.clear();
+                            self.padded_patch_indices(*id, &mut indices);
+                            queue.write_buffer(buffer, u64::from(offset) * 4, bytemuck::cast_slice(&indices));
+                            bytes += indices.len() as u64 * 4;
+                        }
+                        offset += grid.source_range.end - grid.source_range.start;
+                        slot += 1;
+                    }
+                }
+            }
+        }
+        self.scratch = indices;
+        bytes
+    }
+
     fn recipe_indices(&self, members: &[usize], full: &[WorldBatch], out: &mut Vec<u32>) {
         for &member in members {
             let batch = &full[member];
             if let Some(geometry) = batch.patch_geometry {
-                self.geometry_indices(geometry, out);
+                self.padded_geometry_indices(geometry, out);
             } else {
                 let range = &batch.full_indexed_range;
                 out.extend_from_slice(
@@ -694,15 +804,35 @@ pub(in crate::renderer) fn update(
                 .model
                 .and_then(|m| world.inline_models[m].uploaded.flatten())
                 .map_or(origin, |pose| pose.transform_point(origin));
+            // Straight-line distance, not JKA's depth along the view axis
+            // (LodErrorForVolume): turning in place then never changes a
+            // curve's detail. Screen-edge curves get slightly less detail
+            // than JKA would give them.
             let depth = (0..3)
-                .map(|i| (origin[i] - view[i]) * forward[i])
+                .map(|i| (origin[i] - view[i]).powi(2))
                 .sum::<f32>()
-                .abs();
+                .sqrt();
             let threshold = if curve_error < 0.0 {
                 0.0
             } else {
                 curve_error / (depth - grid.lod.lod_radius).max(1.0)
             };
+            // Hysteresis: keep the current detail until the allowed error has
+            // moved more than LOD_HYSTERESIS from the one it was picked with.
+            // Small mouse circles otherwise flip curves near a level boundary
+            // back and forth, re-uploading them every frame. (JKA re-picks
+            // exactly each frame; a 5% error band is not visible.)
+            const LOD_HYSTERESIS: f32 = 0.05;
+            if no_curves == grid.suppressed
+                && grid.threshold.is_finite()
+                && (threshold - grid.threshold).abs() <= grid.threshold * LOD_HYSTERESIS
+            {
+                if !grid.suppressed {
+                    stats.selected_triangles += (grid.masks[0].count_ones() as u64 - 1)
+                        * (grid.masks[1].count_ones() as u64 - 1) * 2;
+                }
+                continue;
+            }
             grid.threshold = threshold;
             let masks = grid.lod.selection(if grid.simplifiable {
                 threshold
@@ -738,6 +868,11 @@ pub(in crate::renderer) fn update(
                     _ => &mut world.auto4_batches,
                 };
                 let batch = &mut batches[index];
+                // The padded layout keeps a partial LOD's range fixed; only a
+                // switch to or from FULL detail moves it.
+                if batch.indexed_range == range && batch.patch_suppressed == no_curves {
+                    continue;
+                }
                 batch.indexed_range = range.clone();
                 batch.patch_suppressed = no_curves;
                 upload_batch_range(
@@ -767,9 +902,18 @@ pub(in crate::renderer) fn update(
         };
         let range = range.clone();
         let signature = lod.recipe_signature(recipe);
-        if lod.recipe_reserved[recipe].as_ref() == Some(&range)
-            && lod.recipe_versions[recipe] == signature
-        {
+        if lod.recipe_reserved[recipe].as_ref() == Some(&range) {
+            if lod.recipe_versions[recipe] == signature {
+                continue;
+            }
+            // Same slot, padded layout: rewrite just the patches that changed.
+            // The recipe's draw range is unchanged.
+            let written = std::mem::take(&mut lod.recipe_versions[recipe]);
+            stats.index_upload_bytes += lod.rewrite_recipe_patches(
+                queue, &world.index_buffer, &world.auto4_geometry_members[recipe],
+                &world.full_batches, range.start, &written,
+            );
+            lod.recipe_versions[recipe] = signature;
             continue;
         }
         let mut indices = std::mem::take(&mut lod.scratch);
@@ -976,8 +1120,9 @@ mod tests {
                 grid.version += 1;
             }
             let (range, bytes) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
-            assert_eq!(range.end - range.start, 15);
-            assert_eq!(bytes, 60);
+            // FULL-size layout: every part keeps its offset, patches padded.
+            assert_eq!(range.end - range.start, original.end - original.start);
+            assert_eq!(bytes, u64::from(range.end - range.start) * 4, "first upload fills the range");
             assert!(
                 lod.upload_geometry(&queue, &buffer, 0).is_none(),
                 "unchanged LOD must issue no upload"
@@ -1014,9 +1159,25 @@ mod tests {
             assert_eq!(&indices[..full.len()], full);
             let mut selected = Vec::new();
             lod.geometry_indices(0, &mut selected);
-            assert_eq!(&indices[full.len()..], selected);
+            // Dropping the zero-area padding leaves exactly the compact selection.
+            let drawn: Vec<u32> = indices[full.len()..]
+                .chunks_exact(3)
+                .filter(|t| !(t[0] == t[1] && t[1] == t[2]))
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(drawn, selected);
             drop(mapped);
             readback.unmap();
+            // A later LOD change rewrites only patch spans, never static parts.
+            let patch_capacity: u64 = lod.grids.iter()
+                .map(|g| u64::from(g.source_range.end - g.source_range.start) * 4).sum();
+            for grid in &mut lod.grids {
+                grid.version += 1;
+            }
+            let (again, bytes) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
+            assert_eq!(again, range);
+            assert!(bytes <= patch_capacity, "{bytes} > {patch_capacity}");
             for grid in &mut lod.grids {
                 grid.masks = grid.lod.selection(f32::INFINITY);
                 grid.version += 1;

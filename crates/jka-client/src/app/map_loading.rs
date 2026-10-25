@@ -1244,6 +1244,8 @@ pub(in crate::app) fn spawn_map_loader(
                             )
                         };
 
+                        map.static_bake_lights.extend(fx_light_promotion.static_runner_lights(&map.fx_runners));
+
                         // A cache hit is already attached to `map`. A cache miss
                         // becomes a detached map-worker job only after the prepared
                         // world has been delivered, so first-time offline baking can

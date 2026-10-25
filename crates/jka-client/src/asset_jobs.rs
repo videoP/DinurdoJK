@@ -151,6 +151,14 @@ impl AssetWorkerPool {
         self.workers
     }
 
+    /// Queue CPU-only background work that recurs during play (ocean prune,
+    /// patch LOD) on these persistent threads instead of spawning one per
+    /// job. The owner applies the result. Returns false when the queue is
+    /// full, which drops `run`.
+    pub fn submit_task(&self, priority: AssetPriority, run: impl FnOnce() + Send + 'static) -> bool {
+        self.submit(priority, Box::new(run))
+    }
+
     fn submit(&self, priority: AssetPriority, run: Box<dyn FnOnce() + Send + 'static>) -> bool {
         let seq = self.shared.next_seq.fetch_add(1, AtomicOrdering::Relaxed);
         {

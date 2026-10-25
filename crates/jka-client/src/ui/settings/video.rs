@@ -69,6 +69,8 @@ pub struct VideoSettings {
     pub fx_count_scale: f32,
     /// `r_fxLodScale`: multiplies authored EFX cullRange (default 5, like r_lodscale).
     pub fx_lod_scale: f32,
+    /// TaystJK r_markcount: maximum live authored EFX decals (100 default).
+    pub mark_count: u32,
     /// `r_lodScale`: Ghoul2 and MD3 projected-size LOD scale (OpenJK default 5).
     pub lod_scale: f32,
     /// View-dependent EFX geometry expansion path. FX simulation itself already
@@ -134,6 +136,7 @@ pub struct VideoSettings {
     pub force_unified_world: bool,
     /// Session-only: parallax occlusion on top of `r_pbr` (`r_pom`, default on).
     pub pom: bool,
+    /// Session-only GPU profiler switch; always starts disabled.
     pub gpu_timings: bool,
     pub ghoul2_skinning: Ghoul2SkinningMode,
     pub ghoul2_early_cull: bool,
@@ -148,6 +151,15 @@ pub struct VideoSettings {
     pub md3_geometry_cache: bool,
     /// A/B GPU-resident instancing for repeated client-only static MD3 props.
     pub static_md3_instances: bool,
+    /// Live, session-only A/B: 0 original static MD3 scan; 1 conservative BVH broad phase.
+    pub static_md3_bvh: bool,
+    /// Live, session-only A/B: 0 ordinary FX raster; 1 stationary map-runner rear-plane culling.
+    /// GPU Hi-Z mode 2 is not available until the renderer dispatches queries.
+    pub fx_occlusion: u8,
+    /// Reserved for future *real* GPU MD3 Hi-Z. Remains zero until integrated.
+    pub md3_occlusion: u8,
+    /// Print representative per-frame CPU MD3/FX candidate stats once per second.
+    pub occlusion_stats: bool,
     /// Resident GPU instances for native vegetation surfaceSprites; false is
     /// the original per-frame CPU generation.
     pub surface_sprites_gpu: bool,
@@ -464,6 +476,11 @@ pub struct VideoSettings {
     /// Master for BSP shader-driven area-light promotion. q3map_surfacelight is
     /// intentionally separate and remains controlled by emissive_area_lights.
     pub promote_shader_lights: bool,
+    pub baked_local_lights: bool,
+    pub baked_local_sources: u32,
+    /// Session-only experiment: 0 baseline, 1 octant receiver, 2 caster prefilter,
+    /// 3 combined, 4 conservative receiver early-rejection (all work at frame rate).
+    pub lamp_shadow_ab: u8,
     pub promote_shader_glow: bool,
     pub promote_shader_additive: bool,
     pub promote_shader_emissive: bool,
@@ -515,6 +532,8 @@ pub struct VideoSettings {
     pub emissive_area_lights: bool,
     pub voxel_probe_gi: bool,
     pub dynamic_shadows: DynamicShadowsMode,
+    /// Ground-contact approximation, independent of directional/lamp shadows.
+    pub player_contact_shadows: bool,
     pub entity_shadow_light: EntityShadowLight,
     pub local_light_shadows: bool,
     /// Experimental RGB glass throughput for hardware RT local lights. Default OFF.
@@ -661,6 +680,7 @@ impl Default for VideoSettings {
             fx_lod: crate::fx::FX_LOD_DEFAULT,
             fx_count_scale: 1.0,
             fx_lod_scale: crate::fx::LOD_SCALE_DEFAULT,
+            mark_count: 100,
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             fx_geometry: FxGeometryMode::Gpu,
             fx_particle_simulation: true,
@@ -700,6 +720,10 @@ impl Default for VideoSettings {
             model_prepare_threads: 0,
             md3_geometry_cache: true,
             static_md3_instances: false,
+            static_md3_bvh: false,
+            fx_occlusion: 0,
+            md3_occlusion: 0,
+            occlusion_stats: false,
             surface_sprites_gpu: true,
             surface_sprites: true,
             md3_auto_lod: true,
@@ -878,9 +902,15 @@ impl Default for VideoSettings {
             grass_front_to_back: true,
             contact_shadow_debug: 0,
             ssr_debug: 0,
-            ocean: false,
+            ocean: true,
             water_wake: 1,
-            ocean_settings: crate::ocean::OceanSettings::default(),
+            ocean_settings: crate::ocean::OceanSettings {
+                // New promoted water uses Cheapwater; keep the unused FFT
+                // allocations at the saved preset's minimum size.
+                backend: 3,
+                map_size: 128,
+                ..crate::ocean::OceanSettings::default()
+            },
             cloud_render_resolution: CloudRenderResolution::Full,
             cloud_temporal: true,
             cloud_temporal_depth_fix: true,
@@ -927,6 +957,10 @@ impl Default for VideoSettings {
             dynamic_light_debug: false,
             promote_fx_lights: 0,
             promote_shader_lights: false,
+            baked_local_lights: false,
+            // No inferred lamp shadows until a source is explicitly selected.
+            baked_local_sources: 0,
+            lamp_shadow_ab: 0,
             promote_shader_glow: true,
             promote_shader_additive: true,
             promote_shader_emissive: true,
@@ -953,6 +987,7 @@ impl Default for VideoSettings {
             emissive_area_lights: false,
             voxel_probe_gi: false,
             dynamic_shadows: DynamicShadowsMode::Off,
+            player_contact_shadows: true,
             entity_shadow_light: EntityShadowLight::Lightgrid,
             local_light_shadows: false,
             tinted_glass: false,
@@ -1003,5 +1038,15 @@ mod hdr_mode_tests {
         settings.set_hdr_mode(0);
         assert!(!settings.hdr);
         assert_eq!(settings.hdr_output, 0);
+    }
+}
+
+impl VideoSettings {
+    /// Reuse the classic mark projector for a smaller, weaker ambient-contact
+    /// approximation. No sun or inferred lamp is needed for this contribution.
+    pub fn player_blob_shadow_opacity(&self) -> f32 {
+        if self.dynamic_shadows == DynamicShadowsMode::Blob { 1.0 }
+        else if self.player_contact_shadows { 0.5 }
+        else { 0.0 }
     }
 }

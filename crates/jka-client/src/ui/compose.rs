@@ -3,7 +3,7 @@ use crate::ui::{
     build_background_progress, build_shader_compile_progress, build_center_print, build_chat_history, build_chat_input,
     build_console, build_console_notify, build_crosshair_name, build_crosshair_vertices,
     build_demo_timeline,
-    build_follow_indicator, build_force_select, build_fps_simple, build_game_timer, build_hud,
+    build_follow_indicator, build_force_select, build_weapon_select, build_fps_simple, build_game_timer, build_hud,
     build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
     build_siege_hud,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
@@ -170,6 +170,7 @@ pub fn build_transient_vertices(
             build_crosshair_name(out, ui, small_font, width, height);
         });
         build_force_select(out, ui, small_font, width, height);
+        build_weapon_select(out, ui, small_font, width, height);
     }
     if gameplay_overlay {
         // Follows the snapshot's client every frame (CG_DrawFollow), so it lives

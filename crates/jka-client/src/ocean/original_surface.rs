@@ -747,7 +747,7 @@ impl OceanGpu {
     /// Godot's visible_tiles distinguishes unavailable mask data (None, keep
     /// conservative) from known water with zero tiles in this cluster (reject).
     /// Sky continuation is admitted separately by Godot's per-frame gate.
-    fn native_pool_visible(pvs: Option<OceanPvsTileMask>, sky_extension: bool) -> bool {
+    pub(super) fn native_pool_visible(pvs: Option<OceanPvsTileMask>, sky_extension: bool) -> bool {
         sky_extension || pvs.is_none_or(|tiles| tiles.iter().any(|word| *word != 0))
     }
 
@@ -779,10 +779,14 @@ impl OceanGpu {
         rain: f32,
         mesh_perf: &mut super::NativeMeshCpuStats,
         profile_cpu: bool,
+        seconds: f32,
+        lake_planar: Option<(&wgpu::TextureView, &wgpu::Sampler, &[Option<[f32; 4]>; 4])>,
+        lake_submerged: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
     ) {
         if self.settings.backend == 3 {
-            self.prepare_lakes(device, queue, encoder, camera, key, jitter, dt, frame, pvs,
-                sky_faces, sky_environment, aerial, cloud);
+            self.prepare_lakes(device, queue, encoder, camera, key, jitter, dt, frame, pvs, sky_pvs_mask,
+                sky_faces, sky_environment, aerial, cloud, seconds, lake_planar,
+                lake_submerged, volumes, camera_water_surface);
             return;
         }
         let Some(blue) = self.blue_water.as_mut() else {
@@ -1102,6 +1106,8 @@ impl OceanGpu {
                     self.settings.pixel_detail_distance.max(1.0)
                 },
             ];
+            let water_bottom = volumes.surface_bottom(source);
+            boundary.depth = [(water_bottom - source.plane_height) / OCEAN_UNITS_PER_METER, 1.0, 0.0, 0.0];
             let first = self.masks.ranges[index][0] as usize * 2;
             let count = self.masks.ranges[index][1] as usize;
             assert!(count <= 256 && first + count * 2 <= self.masks.triangles.len());
@@ -1181,7 +1187,8 @@ impl OceanGpu {
                 None => (surface_view.inverse_view_projection, source.plane_height, trough),
                 Some((matrix, plane, lowest)) => (matrix, plane, lowest.min(trough)),
             });
-            let near_surface = surface_view.position_time[1]
+            let near_surface = camera.position.y + near_reach >= water_bottom
+                && surface_view.position_time[1]
                 <= crest_bound + near_reach / OCEAN_UNITS_PER_METER
                 && (horizontal <= near_reach || extension.is_some_and(|sky| sky.contains(point)));
             slot.probe_due = new_slot || near_surface || slot.probe_active;
@@ -1431,13 +1438,18 @@ impl OceanGpu {
                     }
                     geometry.prune_cache = Some(result.cache);
                 } else {
+                    // The persistent asset worker threads; a full queue drops the job, whose
+                    // closed channel retries next frame with a fresh cache.
                     let (sender, receiver) = std::sync::mpsc::channel();
-                    let spawned = std::thread::Builder::new()
-                        .name("ocean-prune".into())
-                        .spawn(move || { let _ = sender.send(job.run(cache)); });
-                    match spawned {
-                        Ok(_) => geometry.prune_job = Some(receiver),
-                        Err(_) => geometry.prune_cache = Some(PruneSegmentCache::default()),
+                    if let Some(pool) = crate::asset_jobs::pool() {
+                        pool.submit_task(crate::asset_jobs::AssetPriority::High, move || {
+                            let _ = sender.send(job.run(cache));
+                        });
+                        geometry.prune_job = Some(receiver);
+                    } else {
+                        let result = job.run(cache);
+                        geometry.apply_pruned(queue, &result.indices, result.far_start, result.key);
+                        geometry.prune_cache = Some(result.cache);
                     }
                 }
             }
@@ -1870,7 +1882,11 @@ impl OceanGpu {
         depth: &wgpu::TextureView,
     ) {
         if let Some(lakes) = &self.lakes {
-            lakes.scene.capture(device, encoder, color, depth);
+            if self.settings.lake.needs_scene_color() {
+                lakes.scene.capture(device, encoder, color, depth);
+            } else {
+                lakes.scene.capture_depth(device, encoder, color, depth);
+            }
             return;
         }
         if let Some(renderer) = self
@@ -2038,6 +2054,10 @@ impl OceanGpu {
     /// r_showtris OCEAN: draw the REAL Blue Water clipmap, not the host's
     /// Godot mesh. Uses the same admitted surfaces and selected first/outer LOD.
     pub fn draw_original_wireframe<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, admitted: u8) {
+        if self.settings.backend == 3 {
+            if let Some(lakes) = &self.lakes { lakes.draw_wireframe(pass, admitted); }
+            return;
+        }
         let Some(blue) = self.blue_water.as_ref() else { return; };
         let Some(renderer) = blue.original_surface.as_ref() else { return; };
         let Some(pipeline) = renderer.pipeline.wireframe.as_ref() else { return; };

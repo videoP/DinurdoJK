@@ -16,6 +16,9 @@ int jka_full_body_taunt(int torso_anim, int legs_anim) {
 int jka_taunt_should_cancel(int torso_anim, int legs_anim, int buttons, int upmove) {
     return jka_full_body_taunt(torso_anim, legs_anim) && jka_taunt_cancel_input(buttons, upmove);
 }
+int jka_taunt_action_should_cancel(int buttons) {
+    return jka_taunt_cancel_input(buttons, 0);
+}
 #endif
 
 cgs_t cgs;

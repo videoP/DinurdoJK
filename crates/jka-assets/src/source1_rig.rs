@@ -882,6 +882,38 @@ fn joint_owners(gla_for_bone: &[Option<usize>]) -> BTreeMap<usize, usize> {
     owners
 }
 
+/// Locate an actual finger knuckle below a Source/UE hand. Many UE rigs
+/// insert `index_metacarpal_l` / `pinky_metacarpal_l` (or twist helpers)
+/// between `hand_l` and `index_01_l` / `pinky_01_l`. Requiring the finger to
+/// be an *immediate* child silently disables wrist/palm roll correction on
+/// those rigs. Work from rest-world transforms relative to the hand so an
+/// arbitrary number of intermediary joints does not change the landmark.
+fn source_hand_knuckle(
+    skeleton: &SourceSkeleton,
+    names: &[String],
+    rest_world: &[Matrix3x4],
+    hand_index: usize,
+    posed_hand: &Matrix3x4,
+    digit: u8,
+) -> Option<[f32; 3]> {
+    let side = names.get(hand_index)?.chars().next()?;
+    if !matches!(side, 'l' | 'r') { return None; }
+    let finger_name = format!("{side}finger{digit}");
+    let finger_index = skeleton.bones.iter().enumerate().find_map(|(candidate, bone)| {
+        if names.get(candidate)?.as_str() != finger_name { return None; }
+        let mut parent = bone.parent;
+        while let Some(ancestor) = parent {
+            if ancestor == hand_index { return Some(candidate); }
+            parent = skeleton.bones.get(ancestor)?.parent;
+        }
+        None
+    })?;
+    let hand_rest = rest_world.get(hand_index)?;
+    let finger_rest = rest_world.get(finger_index)?;
+    let finger_local = mul(&rigid_inverse(hand_rest), finger_rest);
+    Some(transform(posed_hand, origin(&finger_local)))
+}
+
 /// Pose the complete Source bind hierarchy into JKA's anatomical limb
 /// directions WITHOUT independently translating bones to GLA joint positions.
 ///
@@ -922,13 +954,7 @@ fn source_fk_rebinds(
         if names[index] == "lhand" || names[index] == "rhand" {
             let side = &names[index][..1];
             let source_knuckle = |digit: u8| {
-                let name = format!("{side}finger{digit}");
-                skeleton.bones.iter().enumerate()
-                    .find(|(child, bone)| bone.parent == Some(index) && names[*child] == name)
-                    .map(|(child, _)| {
-                        let local = mul(&rigid_inverse(&rest_world[index]), &rest_world[child]);
-                        transform(&current, origin(&local))
-                    })
+                source_hand_knuckle(skeleton, &names, rest_world, index, &current, digit)
             };
             let target_knuckle = |digit: u8| {
                 let name = format!("{side}_d{digit}_j1");
@@ -2136,6 +2162,64 @@ mod tests {
         assert_eq!(source_digit("rfinger11"), Some(('r', 1, 1)));
         assert_eq!(source_digit("lfinger12"), None);
         assert_eq!(source_digit("lforearm"), None);
+    }
+
+    #[test]
+    fn ue_metacarpals_do_not_disable_palm_orientation_retargeting() {
+        // UE hands commonly have hand -> metacarpal -> index/pinky, while
+        // ValveBiped commonly has hand -> index/pinky directly. Both must
+        // produce the SAME hand-frame correction for otherwise identical
+        // joint coordinates. A direct-parent-only lookup fails this fixture.
+        use crate::source1::{SourceBone, SourceSkeleton};
+        use crate::skeleton::{humanoid_reference, HumanoidRig};
+        let gla = humanoid_reference(HumanoidRig::Jk2_72);
+        let hand_idx = gla_bone_index(&gla, "lhand").unwrap();
+        let index_idx = gla_bone_index(&gla, "l_d2_j1").unwrap();
+        let pinky_idx = gla_bone_index(&gla, "l_d5_j1").unwrap();
+        let source_positions = [
+            [10., 2., 40.], // hand
+            [10.5, 2.2, 40.], // index metacarpal
+            [13., 1., 40.], // index knuckle
+            [10.5, 3., 40.], // pinky metacarpal
+            [13., 4., 40.], // pinky knuckle
+        ];
+        let names = ["lhand", "index_metacarpal_l", "lfinger1", "pinky_metacarpal_l", "lfinger4"];
+        let parents = [None, Some(0), Some(1), Some(0), Some(3)];
+        let skeleton = SourceSkeleton {
+            model_name: "synthetic_ue_metacarpals".into(),
+            bones: names.iter().zip(parents).map(|(name, parent)| SourceBone {
+                name: (*name).into(), parent,
+                bind_position: [0.; 3], bind_quaternion: [0., 0., 0., 1.],
+                pose_to_bone: identity(), jiggle: None,
+            }).collect(),
+        };
+        let rest: Vec<Matrix3x4> = source_positions.iter()
+            .map(|&pos| rigid(0., pos)).collect();
+        let normalized_names: Vec<String> = names.iter().map(|name| (*name).into()).collect();
+        let index = source_hand_knuckle(&skeleton, &normalized_names, &rest, 0, &rest[0], 1)
+            .expect("index knuckle behind an intermediary metacarpal");
+        let pinky = source_hand_knuckle(&skeleton, &normalized_names, &rest, 0, &rest[0], 4)
+            .expect("pinky knuckle behind an intermediary metacarpal");
+        assert!(distance(index, source_positions[2]) < 1e-4);
+        assert!(distance(pinky, source_positions[4]) < 1e-4);
+        let targets = [Some(hand_idx), Some(hand_idx), Some(index_idx), Some(hand_idx), Some(pinky_idx)];
+        let (bake, corrected) = source_fk_rebinds(
+            &skeleton, &rest, &gla, &targets, &identity(),
+        );
+        assert!(corrected > 0, "UE hand with metacarpals did not receive palm rotation");
+        let wrist = transform(&bake[0], source_positions[0]);
+        let index = transform(&bake[2], source_positions[2]);
+        let pinky = transform(&bake[4], source_positions[4]);
+        let actual = palm_frame(wrist, index, pinky).unwrap();
+        let target = palm_frame(
+            origin(&gla.skeleton[hand_idx].base_pose),
+            origin(&gla.skeleton[index_idx].base_pose),
+            origin(&gla.skeleton[pinky_idx].base_pose),
+        ).unwrap();
+        for k in 0..3 {
+            let dot = (0..3).map(|j| actual[k][j] * target[k][j]).sum::<f32>();
+            assert!(dot > 0.999, "palm frame axis {k} misaligned: dot={dot}");
+        }
     }
 
     #[test]

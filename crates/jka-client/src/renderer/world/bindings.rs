@@ -16,6 +16,7 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
     sky_sampler: &wgpu::Sampler,
     textures: &[GpuImage],
     lightmaps: &[GpuImage],
+    local_lightmaps: &[GpuImage],
     texture_clamp: &[bool],
     fallback_skybox: Option<[usize; 6]>,
     footprint_marks: &[&GpuImage; 2],
@@ -26,6 +27,8 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
+    let fallback_local = white._texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+    let local_view = source.lightmap.and_then(|i| local_lightmaps.get(i)).map_or(&fallback_local, |i| &i.view);
     let explicit_lightmap = source
         .lightmap
         .and_then(|index| lightmaps.get(index))
@@ -78,6 +81,10 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
         label: Some("JKA fast BSP surface bind group"),
         layout: surface_layout,
         entries: &[
+            wgpu::BindGroupEntry {
+                binding: 34,
+                resource: wgpu::BindingResource::TextureView(local_view),
+            },
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&base.view),
@@ -186,6 +193,7 @@ pub(in crate::renderer) fn create_world_bind_group(
     detail_texture: &GpuImage,
     textures: &[GpuImage],
     lightmaps: &[GpuImage],
+    local_lightmaps: &[GpuImage],
     deluxemaps: &[GpuImage],
     texture_clamp: &[bool],
     fallback_skybox: Option<[usize; 6]>,
@@ -199,6 +207,8 @@ pub(in crate::renderer) fn create_world_bind_group(
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
+    let fallback_local = white._texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+    let local_view = source.lightmap.and_then(|i| local_lightmaps.get(i)).map_or(&fallback_local, |i| &i.view);
     let explicit_lightmap = source
         .lightmap
         .and_then(|index| lightmaps.get(index))
@@ -305,6 +315,10 @@ pub(in crate::renderer) fn create_world_bind_group(
         label: Some("BSP surface bind group"),
         layout: surface_layout,
         entries: &[
+            wgpu::BindGroupEntry {
+                binding: 34,
+                resource: wgpu::BindingResource::TextureView(local_view),
+            },
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&base.view),
@@ -501,6 +515,8 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
         full_batches,
         textures,
         lightmaps,
+        baked_sun_cache,
+        static_sun,
         deluxemaps,
         texture_clamp,
         detail_texture_by_base,
@@ -509,12 +525,15 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
         footprint_mark_textures,
         ..
     } = world;
+    let original_lightmaps=baked_sun_cache.as_ref().filter(|c|c.active).map(|c|c.original.as_slice());
     let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
         footprint_mark_textures[slot]
             .and_then(|index| textures.get(index))
             .unwrap_or(white)
     });
     for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
+        let local_lightmaps = if !batch.is_inline_entity && baked_sun_cache.as_ref().is_some_and(|c| c.active) && static_sun.local_ready() { static_sun.local_flux.as_slice() } else { &[] };
+        let lightmaps = if batch.is_inline_entity { original_lightmaps.unwrap_or(lightmaps.as_slice()) } else { lightmaps.as_slice() };
         let selected_detail_texture = detail_texture_for_source(
             &batch.source,
             detail_texture,
@@ -536,7 +555,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             sky_sampler,
             selected_detail_texture,
             textures,
-            lightmaps,
+            lightmaps, local_lightmaps,
             deluxemaps,
             texture_clamp,
             *primary_skybox,
@@ -560,7 +579,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             lightmap_sampler,
             sky_sampler,
             textures,
-            lightmaps,
+            lightmaps, local_lightmaps,
             texture_clamp,
             *primary_skybox,
             &footprint_marks,
@@ -576,7 +595,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                 device, surface_layout, white, missing, flat_normal,
                 repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                 lightmap_sampler, sky_sampler, selected_detail_texture,
-                textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                textures, lightmaps, local_lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                 &footprint_marks, reflection_probes, &batch.source,
                 &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                 deformation_field_views, deformation_field_sampler,
@@ -590,14 +609,14 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                     device, surface_layout, white, missing, flat_normal,
                     repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                     lightmap_sampler, sky_sampler, selected_detail_texture,
-                    textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                    textures, lightmaps, local_lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                     &footprint_marks, reflection_probes, alternate,
                     &batch._material_buffer, &batch.additive_uniforms, &batch._fog_buffer, surface_deformation_buffer,
                     deformation_field_views, deformation_field_sampler,
                 ),
                 fast: create_fast_world_bind_group(
                     device, fast_surface_layout, white, missing, repeat_sampler, clamp_sampler,
-                    lightmap_sampler, sky_sampler, textures, lightmaps, texture_clamp,
+                    lightmap_sampler, sky_sampler, textures, lightmaps, local_lightmaps, texture_clamp,
                     *primary_skybox, &footprint_marks, alternate, &batch._material_buffer,
             &batch.additive_uniforms,
                     surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
@@ -607,7 +626,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                         device, surface_layout, white, missing, flat_normal,
                         repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                         lightmap_sampler, sky_sampler, selected_detail_texture,
-                        textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                        textures, lightmaps, local_lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                         &footprint_marks, reflection_probes, alternate,
                         &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                         deformation_field_views, deformation_field_sampler,

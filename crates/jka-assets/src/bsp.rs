@@ -8,7 +8,7 @@ mod marks;
 mod visibility;
 pub mod patch;
 pub use collision::{CollisionLeaf, CollisionNode, CollisionTree};
-pub use marks::{MarkBuffer, MarkFragment, MarkSurfaces, CONTENTS_FOG, SURF_NOIMPACT, SURF_NOMARKS};
+pub use marks::{MarkBuffer, MarkColorTexture, MarkFragment, MarkSurfaces, CONTENTS_FOG, SURF_NOIMPACT, SURF_NOMARKS};
 pub use visibility::{AreaLocator, Visibility};
 
 /// Maximum accepted RBSP size. Large community maps can legitimately exceed 128 MiB
@@ -204,7 +204,7 @@ pub struct StaticModel {
 #[derive(Debug, Clone, Default)]
 pub struct StaticModels {
     pub placements: Vec<StaticModel>,
-    /// Only kept when there are placements to test.
+    /// Also used by registered entity MD3s, even without static placements.
     pub visibility: Option<Visibility>,
 }
 
@@ -641,7 +641,7 @@ impl Bsp {
                 })
             })
             .collect();
-        let visibility = if placements.is_empty() { None } else { self.visibility.clone() };
+        let visibility = self.visibility.clone();
         StaticModels { placements, visibility }
     }
 

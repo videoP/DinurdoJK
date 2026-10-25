@@ -285,6 +285,12 @@ impl App {
                 CatalogPayload::ProfileBackgroundMaps(maps)=>{
                     self.profile_background_maps=Some(maps);
                 }
+                CatalogPayload::StudioCinematics {token,catalog}=>{
+                    if token==self.render_studio.cinematics.token {
+                        self.render_studio.cinematics.pending=false;
+                        self.render_studio.cinematics.catalog=Some(catalog.map(std::sync::Arc::new));
+                    }
+                }
                 CatalogPayload::ProfileBackground {map_name,image}=>{
                     if self.profile_background_requested.as_deref()==Some(map_name.as_str()){
                         self.profile_background_available=image.is_some();

@@ -1,5 +1,9 @@
 //! On-disk GPU pipeline cache (`base/cache/pipeline_cache_*.bin`).
 //!
+//! Superseded on Vulkan by the per-pipeline files of the patched wgpu-hal
+//! (`vulkan/pipeline_disk_cache.rs`, see `install`); this blob remains the
+//! `JKA_PIPELINE_CACHE_BLOB=1` fallback.
+//!
 //! Vulkan only: wgpu's DX12/GL backends have no pipeline cache, and every
 //! `cache:` field then stays `None`. The cache object lives in a process-wide
 //! slot so the ~100 pipeline builders (many of them free functions running on
@@ -58,6 +62,22 @@ pub(crate) fn install(device: &wgpu::Device, info: &wgpu::AdapterInfo, base: &Pa
         return;
     }
     let Some(key) = wgpu::util::pipeline_cache_key(info) else { return; };
+    // Default: the patched wgpu-hal keeps one small cache file per pipeline in
+    // base/cache/vk_pipelines/<adapter> and deletes the least recently used
+    // ones past its size cap, instead of this single blob, which could only be
+    // deleted whole (every pipeline then compiled cold, seconds each with RT).
+    // Pipelines get `cache: None` (the slot stays empty) and the HAL picks the
+    // file. Must run before the first pipeline: the HAL reads the variable once.
+    // `JKA_PIPELINE_CACHE_BLOB=1` restores the single blob for A/B.
+    if info.backend == wgpu::Backend::Vulkan
+        && std::env::var("JKA_PIPELINE_CACHE_BLOB").map_or(true, |value| value.trim() != "1")
+    {
+        let dir = base.join("cache").join("vk_pipelines").join(&key);
+        rverbose!(1, "[PIPELINE CACHE] per-pipeline files in {}", dir.display());
+        std::env::set_var("DINURDOJK_VK_PIPELINE_CACHE", dir);
+        *SLOT.write().unwrap_or_else(|e| e.into_inner()) = None;
+        return;
+    }
     let path = base.join("cache").join(format!("{key}.bin"));
     let started = std::time::Instant::now();
     let mut loaded = read_blob(&path);

@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 44;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 46;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -93,6 +93,9 @@ pub(in crate::renderer) enum GpuPass {
     PostFinal = 42,
     // Independent pre-world compute, before every mover geometry consumer.
     InlineTransform = 43,
+    // Independent static-cache preparation; dynamic shadows are encoded pre-world.
+    LocalShadowStatic = 44,
+    LocalShadowMoving = 45,
 }
 
 impl GpuPass {
@@ -147,6 +150,8 @@ impl GpuPass {
         Self::PostBloom,
         Self::PostFinal,
         Self::InlineTransform,
+        Self::LocalShadowStatic,
+        Self::LocalShadowMoving,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -195,6 +200,8 @@ impl GpuPass {
             Self::PostBloom => "post_bloom",
             Self::PostFinal => "post_final",
             Self::InlineTransform => "inline_transform",
+            Self::LocalShadowStatic => "local_shadow_static",
+            Self::LocalShadowMoving => "local_shadow_moving",
         }
     }
 }
@@ -248,6 +255,11 @@ impl GpuTiming {
             GpuPass::CoastalSim,
             GpuPass::RtBuild,
             GpuPass::RtVisibility,
+            // Moving cubemap depth passes run before the world, independently
+            // of the depth/world intervals. Static cache builds submit in an
+            // earlier command encoder; they are sporadic rather than per-frame.
+            GpuPass::LocalShadowMoving,
+            GpuPass::LocalShadowStatic,
             GpuPass::World,
             GpuPass::Clouds,
             GpuPass::Post,

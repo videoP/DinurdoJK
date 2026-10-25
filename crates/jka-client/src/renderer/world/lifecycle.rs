@@ -1,10 +1,10 @@
 //! World lifecycle.
-use crate::renderer::{
+use crate::{materials::VideoSourceData, renderer::{
     build_auto_detail_by_base_texture, build_world, create_gpu_cull_bind_group,
     create_world_froxel_bind_group, Arc, DrawClass, EntityLegacyFog, GrassMapGpu, Instant,
     Mat4, PreparedMap, MATERIAL_SNOW, Renderer, WorldShaderFamily, WorldUploadTimings, WorldVideoPlayer,
-    PBR_PROFILE_COMPANION_COMPRESSION, WORLD_VIDEO_MAX_CATCH_UP,
-};
+    PBR_PROFILE_COMPANION_COMPRESSION, VideoDecoder, Mp4Video, RoqWorker,
+}};
 
 impl Renderer {
     pub(in crate::renderer) fn load_map(&mut self, map: PreparedMap) -> WorldUploadTimings {
@@ -223,6 +223,11 @@ impl Renderer {
         ));
         upload_timings.post_bind_groups_ms = post_bind_started.elapsed().as_secs_f64() * 1000.0;
         let post_misc_started = Instant::now();
+        // A map reload can reuse the same content hash but replace the GPU
+        // geometry/material bindings. Never sample a prior map's static depth.
+        self.shadow_resources.static_cascades = [None; crate::renderer::SHADOW_CASCADES];
+        self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
+        self.shadow_resources.last_csm_mode = None;
         self.world = Some(world);
         // A map replaced while the A/B diagnostic was enabled must receive
         // the same forced-alpha upload as a live toggle.
@@ -245,22 +250,34 @@ impl Renderer {
                 );
             }
         }
-        self.world_videos = videos
-            .iter()
-            .filter_map(
-                |source| match jka_assets::roq::RoqVideo::open(Arc::clone(&source.data)) {
-                    Ok(video) => Some(WorldVideoPlayer {
-                        texture: source.texture,
-                        video,
-                        next_frame_at: 0.0,
-                    }),
-                    Err(error) => {
-                        eprintln!("[JKA] video {}: {error}", source.name);
-                        None
+        self.world_videos = videos.into_iter().filter_map(|source| {
+            let decoder = match source.data {
+                VideoSourceData::Roq(bytes) => {
+                    RoqWorker::open(bytes).map(VideoDecoder::Roq)
+                }
+                VideoSourceData::Mp4 { bytes, info, fallback_roq } => {
+                    match Mp4Video::open(bytes, info) {
+                        Ok(video) => Ok(VideoDecoder::Mp4 { video, fallback_roq }),
+                        Err(error) => {
+                            eprintln!("[JKA] video {}: MP4 failed ({error}); trying RoQ", source.name);
+                            fallback_roq
+                                .ok_or_else(|| "no RoQ fallback".to_string())
+                                .and_then(RoqWorker::open)
+                                .map(VideoDecoder::Roq)
+                        }
                     }
-                },
-            )
-            .collect();
+                }
+            };
+            match decoder {
+                Ok(decoder) => Some(WorldVideoPlayer {
+                    texture: source.texture, decoder,
+                }),
+                Err(error) => {
+                    eprintln!("[JKA] video {}: {error}", source.name);
+                    None
+                }
+            }
+        }).collect();
         self.sync_baked_brightness_assets();
         if self.hardware_rt_requested() {
             self.ensure_ray_traced_shadow_resources();
@@ -350,40 +367,49 @@ impl Renderer {
         );
     }
 
-    /// Advance every `videoMap` cinematic to the wall clock and upload its newest frame.
+    /// Poll video worker mailboxes without performing any video decoding in
+    /// the renderer. Both RoQ and H.264 are advanced off the render thread.
     pub(in crate::renderer) fn update_world_videos(&mut self) {
-        let Some(world) = self.world.as_ref() else {
-            return;
-        };
-        let now = self.started.elapsed().as_secs_f64();
+        let Some(world) = self.world.as_ref() else { return };
         for player in &mut self.world_videos {
-            if now < player.next_frame_at {
+            let mut promote_failed = None;
+            let frame = match &mut player.decoder {
+                VideoDecoder::Failed => continue,
+                VideoDecoder::Roq(worker) => worker.poll(),
+                VideoDecoder::Mp4 { video, .. } => match video.poll() {
+                    Ok(frame) => frame,
+                    Err(error) => { promote_failed = Some(error); None },
+                },
+            };
+            if let Some(error) = promote_failed {
+                eprintln!("[JKA] MP4 video failed ({error}); restoring RoQ fallback");
+                let fallback = match &mut player.decoder {
+                    VideoDecoder::Mp4 { fallback_roq, .. } => fallback_roq.take(),
+                    _ => None,
+                };
+                let restored = fallback.and_then(|bytes| RoqWorker::open(bytes).ok());
+                player.decoder = match restored {
+                    Some(worker) => VideoDecoder::Roq(worker),
+                    None => VideoDecoder::Failed,
+                };
                 continue;
             }
-            let period = 1.0 / f64::from(player.video.fps().max(1));
-            let mut decoded = false;
-            let mut steps = 0;
-            while player.next_frame_at <= now && steps < WORLD_VIDEO_MAX_CATCH_UP {
-                if player.video.next_frame().is_none() {
-                    player.video.rewind();
-                    if player.video.next_frame().is_none() {
-                        break;
-                    }
-                }
-                decoded = true;
-                player.next_frame_at += period;
-                steps += 1;
-            }
-            if player.next_frame_at <= now {
-                player.next_frame_at = now + period;
-            }
-            let (Some(image), true) = (world.textures.get(player.texture), decoded) else {
+            let (Some(image), Some(frame)) = (world.textures.get(player.texture), frame) else {
                 continue;
             };
-            let (width, height) = (player.video.width(), player.video.height());
-            // The decoder keeps its newest frame until the next call, so the
-            // upload source is the frame decoded last above.
-            let frame = player.video.current_frame();
+            let size = image._texture.size();
+            let (source_width, source_height) = match &player.decoder {
+                VideoDecoder::Failed => continue,
+                VideoDecoder::Roq(worker) => worker.size(),
+                VideoDecoder::Mp4 { .. } => (size.width, size.height),
+            };
+            // The MP4 may be HD while the retained RoQ is SD. The texture
+            // dimensions are fixed at map upload; adapt only during fallback.
+            let frame = if source_width != size.width || source_height != size.height {
+                crate::media_mp4::resize_rgba_nearest(
+                    &frame, source_width, source_height, size.width, size.height,
+                )
+            } else { frame };
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &image._texture,
@@ -391,15 +417,15 @@ impl Renderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                frame,
+                &frame,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
+                    bytes_per_row: Some(size.width * 4),
+                    rows_per_image: Some(size.height),
                 },
                 wgpu::Extent3d {
-                    width,
-                    height,
+                    width: size.width,
+                    height: size.height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -412,6 +438,10 @@ impl Renderer {
         // Returning to the front end is a real world teardown, not just another
         // overlay over the last gameplay frame. Drop all map-owned GPU state so
         // the renderer returns to the same world-less state used at startup.
+        self.shadow_resources.static_cascades = [None; crate::renderer::SHADOW_CASCADES];
+        self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
+        self.shadow_resources.last_csm_mode = None;
+        self.shadow_resources.sky_snapshot = None;
         self.world = None;
         self.coastal_atlas = None;
         self.world_flares.load(&[]);

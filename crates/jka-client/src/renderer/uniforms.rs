@@ -465,9 +465,11 @@ pub(in crate::renderer) struct GpuPointLight {
     // xyz: area/spot direction, or RT segment half-vector when w=-1.
     // w: -1=segment, 0=point, 1=one-sided area, 2=two-sided area, 3=spot.
     pub(in crate::renderer) emitter: [f32; 4],
-    // x/y: spot inner/outer cone cosine for emitter.w=3.
+    // x/y: spot inner/outer cone cosine for emitter.w=3. Static lamp shadows
+    // use x=-(moving-face-mask | (moving-octant-mask << 6) + 1),
+    // where octants are optional conservative receiver tests. y=inferred luminance.
     // z: static shader-promotion evidence mask (0 for authored/runtime lights).
-    // w: reserved.
+    // w: positive=baked local irradiance layer+1, negative=shadow-only metadata.
     pub(in crate::renderer) shape: [f32; 4],
     // x: cubemap slot + 1; y: q3map falloff metadata;
     // z: q3map extra_distance for static map lights OR source radius for
@@ -593,6 +595,7 @@ pub(in crate::renderer) struct ShadowReceiverUniform {
     pub(in crate::renderer) camera_forward: [f32; 4],
     pub(in crate::renderer) cascade_texel_sizes: [f32; 4],
     pub(in crate::renderer) bevy_params: [f32; 4], // depth bias, normal bias, overlap proportion, cascade count
+    pub(in crate::renderer) dynamic_regions: [[f32; 4]; SHADOW_CASCADES], // light XY min/max; empty is min > max
 }
 
 #[repr(C)]

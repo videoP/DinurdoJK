@@ -10,7 +10,9 @@ impl HudElementId {
             Self::Shield => Some(NativeHud::Shield),
             Self::Ammo => Some(NativeHud::Ammo),
             Self::Force => Some(NativeHud::Force),
-            Self::Speedometer | Self::SpeedometerJumps | Self::SpeedGraph => Some(NativeHud::Speedometer),
+            Self::Speedometer | Self::SpeedometerJumps | Self::SpeedGraph
+            | Self::AccelMeter | Self::GroundSpeed | Self::JumpHeight | Self::JumpDistance
+            | Self::VerticalSpeed | Self::YawSpeed => Some(NativeHud::Speedometer),
             _ => None,
         }
     }

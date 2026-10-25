@@ -70,6 +70,7 @@ struct TestRay { origin: vec4<f32>, direction: vec4<f32> };
         "rt_alpha_generated_uv",
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",
+        "rt_trace_shadow_query_mask",
         "rt_trace_shadow_query",
         "rt_trace_shadow_visibility",
         "rt_trace_shadow_throughput",
@@ -467,7 +468,7 @@ fn raster_glass_gpu_transmission_acceptance() {
         source.push_str(
             r#"
 const ENABLE_LOCAL_SHADOWS: bool = true;
-struct TestLighting { feature_flags: vec4<u32>, local_shadows: vec4<u32> };
+struct TestLighting { feature_flags: vec4<u32>, local_shadows: vec4<u32>, baked_sun_debug_mode: vec4<u32> };
 @group(0) @binding(0) var<storage, read_write> results: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> lighting_settings: TestLighting;
 @group(0) @binding(2) var local_shadow_texture: texture_depth_cube_array;
@@ -476,6 +477,8 @@ struct TestLighting { feature_flags: vec4<u32>, local_shadows: vec4<u32> };
 "#,
         );
         for name in [
+            "sample_local_shadow_visibility",
+            "baked_local_moving_visibility",
             "local_light_shadow_visibility",
             "raster_glass_throughput",
             "local_light_shadow_rgb",
@@ -547,7 +550,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         });
         let settings = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&[0u32, 0, 512, 0, 1, 8, 16, 0]),
+            contents: bytemuck::cast_slice(&[0u32, 0, 512, 0, 1, 8, 16, 0, 0, 0, 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let cubes = device.create_texture(&wgpu::TextureDescriptor {

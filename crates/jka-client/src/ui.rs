@@ -22,6 +22,7 @@ pub(crate) use tile_cost::{build_tile_cost_vertices, TileCostView};
 mod diagnostics;
 mod geometry;
 mod hud;
+pub(crate) mod movement_components;
 mod inspector;
 mod loading;
 mod scoreboard;
@@ -48,6 +49,7 @@ use geometry::{disc, glyph_quad, glyph_quad_sized, rect, rect_outline, textured_
 use hud::crosshair::build_crosshair;
 pub use hud::crosshair::build_crosshair_vertices;
 use hud::crosshair::{build_crosshair_name, build_force_select, hud_line};
+use hud::weapons::build_weapon_select;
 use hud::draw::{
     build_hud, lighten, CHATBOX_CUTOFF, CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
@@ -64,7 +66,8 @@ use hud::movement::{
     center_print_lines, icon_cell_uv, movement_keys_origin, ICON_CROSSHAIR_BASE, ICON_FORCE_BASE,
     ICON_TEXTURE_SOURCE, TEAM_ICON_TEXTURE_SOURCE,
 };
-pub use hud::movement::{ICON_CELL, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub use hud::movement::{ICON_CELL, ICON_COLUMNS, ICON_ROWS, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
 use hud::scores::{build_game_timer, build_mini_scores};
 use hud::siege::build_siege_hud;
@@ -118,6 +121,7 @@ pub use settings::rendering::{
     VIDEO_ROW_EMISSIVE_AREA_LIGHTS, VIDEO_ROW_PROMOTE_FX_LIGHTS,
     VIDEO_ROW_PROMOTE_SHADER_ADDITIVE, VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
     VIDEO_ROW_PROMOTE_SHADER_GLOW, VIDEO_ROW_PROMOTE_SHADER_LIGHTS,
+    VIDEO_ROW_BAKED_LOCAL_LIGHTS, VIDEO_ROW_BAKED_LOCAL_SHADOWS, VIDEO_ROW_BAKED_LOCAL_GLOW, VIDEO_ROW_BAKED_LOCAL_ADDITIVE, VIDEO_ROW_BAKED_LOCAL_EMISSIVE, VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, VIDEO_ROW_BAKED_LOCAL_FX,
     VIDEO_ROW_ENTITY_AMBIENT_LIGHTING, VIDEO_ROW_ENTITY_SHADOW_LIGHT, VIDEO_ROW_FLARES,
     VIDEO_ROW_FLOAT_LIGHTMAP, VIDEO_ROW_FPS_CAP, VIDEO_ROW_FULLSCREEN, VIDEO_ROW_FX_FPS,
     VIDEO_ROW_FX_FPS_SCOPE, VIDEO_ROW_FX_GEOMETRY, VIDEO_ROW_FX_LOD, VIDEO_ROW_FX_PHYSICS,
@@ -612,6 +616,21 @@ pub const SHELPER_CGAZ: u32 = 1 << 2;
 /// DinurdoJK-only world-space presentation. TaystJK currently occupies
 /// bits 0..=20 (`SHELPER_ACCELZONES` is bit 20), so keep this extension next.
 pub const SHELPER_CINEMATIC: u32 = 1 << 21;
+/// Xonotic StrafeHUD and Q3 DeFRaG 1.91.26 CGaz are independent 2D modes.
+/// Bits below 21 retain their original TaystJK meaning.
+pub const SHELPER_XONOTIC: u32 = 1 << 22;
+pub const SHELPER_Q3DF: u32 = 1 << 23;
+/// Extras persisted in the same cg_strafeHelper bitmask, not another config.
+pub const SHELPER_XONOTIC_VELOCITY: u32 = 1 << 24;
+pub const SHELPER_XONOTIC_PERSPECTIVE: u32 = 1 << 25;
+pub const SHELPER_XONOTIC_PANORAMIC: u32 = 1 << 26;
+pub const SHELPER_Q3DF_SPEED: u32 = 1 << 27;
+pub const SHELPER_Q3DF_COMPASS: u32 = 1 << 28;
+pub const SHELPER_Q3DF_ACCEL: u32 = 1 << 29;
+/// Warsow / Warfork cg_strafeHUD-style *triangular* strafe zones. Do not
+/// confuse this with TaystJK's old Warsow-style red error bar (bit 3).
+/// Bit 30 leaves all previous saved strafehelper bitmasks unchanged.
+pub const SHELPER_WARSOW_HUD: u32 = 1 << 30;
 pub const SHELPER_W: u32 = 1 << 5;
 pub const SHELPER_WA: u32 = 1 << 6;
 pub const SHELPER_WD: u32 = 1 << 7;
@@ -628,7 +647,11 @@ pub const SHELPER_TINY: u32 = 1 << 18;
 pub const SHELPER_ACCELMETER: u32 = 1 << 12;
 pub const SHELPER_MAX: u32 = 1 << 19;
 pub const SHELPER_STYLE_MASK: u32 =
-    SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ | SHELPER_CINEMATIC;
+    SHELPER_ORIGINAL | SHELPER_UPDATED | SHELPER_CGAZ | SHELPER_CINEMATIC | SHELPER_XONOTIC | SHELPER_Q3DF | SHELPER_WARSOW_HUD;
+/// Independent readouts, usable with any guide or with the guide switched off.
+/// Reuse the archived bits so existing configurations keep their selections.
+pub const SHELPER_COMPONENT_MASK: u32 =
+    SHELPER_Q3DF_SPEED | SHELPER_Q3DF_COMPASS | SHELPER_Q3DF_ACCEL;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrafeHelperSettings {
@@ -678,6 +701,13 @@ pub struct MovementHudState {
     /// On the ground now, and on the previous pmove step (friction needs both).
     pub grounded: bool,
     pub was_grounded: bool,
+    /// Q3 DeFRaG acceleration bar samples commandTime, not render frames.
+    pub q3df_accel_bar_width: f32,
+    /// Movement interval for the new HUDs, independent of presentation FPS.
+    /// Fixed-Pmove servers supply pmove_msec; otherwise use command cadence.
+    pub physics_frame_time: f32,
+    /// Crosshair clearance for the independently selected Q3DF accel bar.
+    pub crosshair_size: f32,
     pub fov_x: f32,
     /// jaPRO `STAT_MOVEMENTSTYLE` (`MV_JKA` off jaPRO servers).
     pub move_style: i32,
@@ -711,6 +741,9 @@ impl Default for MovementHudState {
             player_speed: 250.0,
             grounded: false,
             was_grounded: false,
+            q3df_accel_bar_width: 0.0,
+            physics_frame_time: 0.008,
+            crosshair_size: 24.0,
             fov_x: 90.0,
             move_style: crate::strafehelper::mv::JKA,
             knockback: false,
@@ -917,6 +950,20 @@ pub struct UiForceSelect {
     pub known_bits: u32,
 }
 
+/// Temporary TaystJK `CG_DrawWeaponSelect` HUD. This is client-local input
+/// state plus the predicted inventory, not the server's equipped weapon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiWeaponSelect {
+    pub selected: u8,
+    pub owned_bits: u32,
+    /// `CG_WeaponSelectable`: used to omit depleted thermals and trip mines.
+    pub selectable_bits: u32,
+    /// `CG_WeaponCheck`: distinct from selectable for planted detpacks.
+    pub ammo_available_bits: u32,
+    /// `fd.saberDrawAnimLevel`: 6 = dual, 7 = staff.
+    pub saber_style: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiDuelMiniScore {
     pub name: String,
@@ -1005,6 +1052,7 @@ pub struct UiSnapshot {
     pub siege_hud: Option<UiSiegeHud>,
     /// jaPRO `cg_raceTimer` / `cg_raceStart` readout (updates every frame of a run).
     pub race_timer: Option<crate::japro_cg::RaceTimerUi>,
+    pub race_components: [bool; 2],
     /// `CG_DrawVote`: the open vote's summary line (colour codes included).
     pub vote_line: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
@@ -1027,13 +1075,19 @@ pub struct UiSnapshot {
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
     pub force_select: Option<UiForceSelect>,
+    pub weapon_select: Option<UiWeaponSelect>,
+    /// Render-thread-owned UV coordinates for native-resolution icons. Kept
+    /// across incoming app snapshots; empty until the atlas is lazily loaded.
+    pub(crate) icon_atlas_uvs: Vec<([f32; 2], [f32; 2])>,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub movement_hud: MovementHudState,
     /// jaPRO `cg_speedometer` draw list for this frame.
     pub speedometer: Option<crate::speedometer::Ui>,
+    pub speedometer_settings: crate::speedometer::Settings,
     /// jaPRO `CG_DrawLagometer` draw list for this frame (graph and connection warning).
     pub lagometer: Option<crate::lagometer::Ui>,
+    pub lagometer_settings: crate::lagometer::Settings,
     pub video: VideoSettings,
     pub perf: PerfStats,
     pub threads: std::sync::Arc<[ThreadPerfStats]>,
@@ -1092,6 +1146,7 @@ impl Default for UiSnapshot {
             mini_scores: None,
             siege_hud: None,
             race_timer: None,
+            race_components: [false; 2],
             vote_line: None,
             scoreboard: None,
             scoreboard_focus_client: None,
@@ -1106,11 +1161,15 @@ impl Default for UiSnapshot {
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,
+            weapon_select: None,
+            icon_atlas_uvs: Vec::new(),
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             movement_hud: MovementHudState::default(),
             speedometer: None,
+            speedometer_settings: crate::speedometer::Settings::default(),
             lagometer: None,
+            lagometer_settings: crate::lagometer::Settings::default(),
             video: VideoSettings::default(),
             perf: PerfStats::default(),
             threads: std::sync::Arc::from([]),
@@ -1136,3 +1195,12 @@ mod shadow_mode_tests;
 #[cfg(test)]
 #[path = "ui/tests/siege_tests.rs"]
 mod siege_tests;
+
+impl UiSnapshot {
+    /// Resolve atlas UVs from the renderer's packing result. The legacy
+    /// fixed-grid fallback supports builds/tests before the lazy atlas loads.
+    pub(in crate::ui) fn icon_uv(&self, index: usize) -> ([f32; 2], [f32; 2]) {
+        self.icon_atlas_uvs.get(index).copied()
+            .unwrap_or_else(|| hud::movement::icon_cell_uv(index))
+    }
+}
