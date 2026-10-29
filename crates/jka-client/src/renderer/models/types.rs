@@ -8,6 +8,7 @@ use crate::renderer::{
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
+    // xyz: model axis, w: stable foliage variation tag (also for rigid MD3 instances).
     pub(in crate::renderer) axis0: [f32; 4],
     pub(in crate::renderer) axis1: [f32; 4],
     pub(in crate::renderer) axis2: [f32; 4],
@@ -307,6 +308,10 @@ pub(in crate::renderer) struct DynamicEntityLightingUniform {
     // bindings of their own, so the few values they need ride here, in the uniform
     // every model draw already binds.
     pub(in crate::renderer) weather: EntityWeather,
+    pub(in crate::renderer) studio_lights: [[f32;4];128],
+    pub(in crate::renderer) studio_ambient: [f32;4],
+    pub(in crate::renderer) studio_sun: [f32;4],
+    pub(in crate::renderer) studio_sun_direction: [f32;4],
 }
 
 /// Wet weather applied to entities. Zeroed (wetness 0) disables it.
@@ -350,6 +355,8 @@ impl DynamicEntityLightingUniform {
             legacy_fog,
             cloud_shadow_sun,
             weather,
+            studio_lights: [[0.0;4];128],
+            studio_ambient:[0.0;4], studio_sun:[0.0;4], studio_sun_direction:[0.0;4],
         }
     }
 }
@@ -398,6 +405,9 @@ pub(in crate::renderer) struct DynamicPreparedDraw {
 /// cached here and upload only final CPU-evaluated bones plus per-draw transforms.
 /// The renderer still knows nothing about demo/network provenance or JKA state.
 pub(in crate::renderer) struct DynamicModelRenderer {
+    pub(in crate::renderer) legacy_blend: Option<super::legacy_blend::LegacyModelBlend>,
+    pub(in crate::renderer) legacy_model_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) legacy_skin_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) rt_raw_color_buffer: Option<wgpu::Buffer>,
     pub(in crate::renderer) scratch_raw_colors: Vec<[f32; 4]>,
     pub(in crate::renderer) texture_layout: wgpu::BindGroupLayout,
@@ -410,9 +420,12 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Runtime dynamic lights folded into classic entity lighting, set by the
     /// renderer each frame before `prepare`. Empty while dynamic lights are off.
     pub(in crate::renderer) entity_dlights: Vec<EntityDlight>,
+    pub(in crate::renderer) studio_lights: Vec<crate::renderer::TransientLight>,
+    pub(in crate::renderer) studio_environment: Option<crate::renderer::StudioSceneLighting>,
     /// The RT model receivers light this frame's RT-prepared models per pixel,
     /// so `prepare_rt_skinned` leaves `entity_dlights` out rather than add them twice.
     pub(in crate::renderer) entity_dlights_rt_per_pixel: bool,
+    pub(in crate::renderer) fixture_lighting: Option<super::fixture_lighting::FixtureLighting>,
     pub(in crate::renderer) model_brightness: f32,
     pub(in crate::renderer) entity_legacy_fog: EntityLegacyFog,
     pub(in crate::renderer) entity_weather: EntityWeather,

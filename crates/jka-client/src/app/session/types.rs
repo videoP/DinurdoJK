@@ -69,7 +69,7 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) source: String,
     pub(in crate::app) reader: DemoReader<Cursor<Arc<[u8]>>>,
     pub(in crate::app) demo_bytes: Arc<[u8]>,
-    pub(in crate::app) demo_index: Option<DemoIndex>,
+    pub(in crate::app) demo_index: Option<Arc<DemoIndex>>,
     pub(in crate::app) decoder: ServerMessageDecoder,
     pub(in crate::app) messages: usize,
     pub(in crate::app) snapshots: usize,
@@ -165,6 +165,11 @@ pub(in crate::app) struct GameSession {
     /// Visual-only recorded race references. Kept as a Vec from day one so
     /// multi-ghost presentation does not require changing session ownership.
     pub(in crate::app) race_ghosts: Vec<race_ghost::RaceGhost>,
+    /// Render Studio's local composite actors must survive the presenter's
+    /// live-entity cleanup, but do not belong to gameplay's ghost collection.
+    pub(in crate::app) studio_external_player_entities: Vec<u16>,
+    /// Render Studio "Hide other players": only these clients are presented.
+    pub(in crate::app) studio_visible_players: Option<Vec<u16>>,
     pub(in crate::app) race_ghost_alpha: f32,
     /// Exact predicted/followed sample used to compare the live racer against
     /// the synchronized ghost labels on this frame.

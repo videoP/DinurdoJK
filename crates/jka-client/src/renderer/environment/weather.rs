@@ -2,7 +2,7 @@
 use crate::renderer::{
     create_rt_receiver_bind_group, create_shadow_receiver_bind_group,
     create_world_froxel_bind_group, scene, weather, Camera, DynamicModelSurface,
-    DynamicShadowsMode, DynamicWireframeClass, EntityWeather, Renderer, Vec3, NO_WATER_SURFACE,
+    DynamicWireframeClass, EntityWeather, Renderer, Vec3, NO_WATER_SURFACE,
 };
 
 impl Renderer {
@@ -11,7 +11,7 @@ impl Renderer {
             &self.device,
             &self.shadow_receiver_layout,
             &self.shadow_resources._array_view,
-            if matches!(self.cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps) {
+            if self.cascaded_shadow_mode.is_csm() {
                 &self.shadow_resources.bevy_sampler
             } else {
                 &self.shadow_resources.legacy_sampler
@@ -140,6 +140,16 @@ impl Renderer {
         self.weather.rain.update_wake(camera.position, people);
     }
 
+    /// Idle Studio scenes release their cascaded shadow arrays; a drawn scene
+    /// restores them. Everything that samples the arrays is rebound.
+    pub(in crate::renderer) fn set_shadow_arrays_parked(&mut self, parked: bool) {
+        if !self.shadow_resources.set_parked(&self.device, parked) {
+            return;
+        }
+        self.rebuild_weather_surface_receiver_bind_group();
+        self.rebuild_world_froxel_bind_group();
+    }
+
     pub(in crate::renderer) fn ensure_weather_occlusion(&mut self) {
         let Some(weather_height_view) = self
             .weather
@@ -167,6 +177,10 @@ impl Renderer {
         self.rebuild_weather_surface_receiver_bind_group();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
+        self.rebuild_world_froxel_bind_group();
+    }
+
+    pub(in crate::renderer) fn rebuild_world_froxel_bind_group(&mut self) {
         if let Some(world) = self.world.as_mut() {
             world.froxel_bind_group = Some(create_world_froxel_bind_group(
                 &self.device,

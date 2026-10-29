@@ -139,8 +139,8 @@ impl MaterialFragmentKey {
         Self {
             flags: header[2] & !MATERIAL_FLAGS_UNREAD,
             flags_mask: !MATERIAL_FLAGS_UNREAD,
-            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS),
-            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS,
+            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | crate::foliage::MATERIAL_FLAG),
+            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | crate::foliage::MATERIAL_FLAG,
             tc_gen: header[0],
             alpha_func: if alpha_cutoff > 0.0 {
                 2
@@ -200,7 +200,7 @@ impl MaterialFragmentKey {
             | MATERIAL_FLAGS_VERTEX_COLOR
             | MATERIAL_FLAGS_WAVES
             | MATERIAL_FLAG_LEGACY_SRGB;
-        let mut keep_w = 0;
+        let mut keep_w = crate::foliage::MATERIAL_FLAG;
         let mut fix_tc_gen = false;
         if alpha_test {
             keep |= MATERIAL_FLAG_MASK_TEXTURE_ALPHA;

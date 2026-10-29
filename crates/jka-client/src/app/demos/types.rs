@@ -74,6 +74,7 @@ pub(in crate::app) struct DemoFakeView {
     pub(in crate::app) view_angles: [f32; 3],
     pub(in crate::app) velocity: [f32; 3],
     pub(in crate::app) health: i32,
+    pub(in crate::app) legs_anim: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +91,7 @@ impl DemoConsoleFilter {
             || matches!(
                 (self, *kind),
                 (Self::Print, DemoConsoleKind::Print)
-                    | (Self::Chat, DemoConsoleKind::Chat)
+                    | (Self::Chat, DemoConsoleKind::Chat | DemoConsoleKind::TeamChat)
                     | (Self::Event, DemoConsoleKind::Event)
             )
     }

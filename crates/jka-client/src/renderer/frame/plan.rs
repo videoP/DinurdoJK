@@ -158,7 +158,8 @@ impl Renderer {
         let rain_lens_copy = self.weather.rain.enabled
             && self.weather.rain.glass_enabled
             && self.weather.rain.fast_post;
-        let other_full_post_effects = self.ocean_enabled
+        let other_full_post_effects = self.thermal_vision != 0
+            || self.ocean_enabled
             || (self.sky_backend == 1 && self.blue_water_environment.filmic)
             || self.tone_mapping_enabled
             || self.glow_mode.enabled()
@@ -260,7 +261,8 @@ impl Renderer {
         // Hi-Z reads the camera depth buffer, so it no longer forces the full
         // linear-depth prepass: with no other consumer it runs a cheaper
         // depth-only early pass instead (see `FramePlan::hiz_early`).
-        let other_linear_depth = self.ssao_enabled
+        let other_linear_depth = self.thermal_vision != 0
+            || self.ssao_enabled
             || self.rt_local_cache_wanted()
             || self.temporal_resolve_active()
             || self.contact_shadows_enabled
@@ -333,6 +335,7 @@ impl Renderer {
             (plan.use_post && !plan.gamma_only_post && !plan.rain_only_post) || dof_may_need_post,
         );
         self.ensure_rain_post_pipeline(plan.rain_only_post);
+        if self.thermal_vision != 0 { self.ensure_thermal_post_pipeline(); }
         self.ensure_cloud_shadow_opaque_pipeline();
     }
 }

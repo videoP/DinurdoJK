@@ -77,6 +77,8 @@ pub(in crate::app) struct PendingVideoChange {
 pub(in crate::app) enum MapLoadPurpose {
     Gameplay,
     LivePrefetch,
+    /// Native demo BSP whose loading/progress UI belongs to Render Studio.
+    StudioDemo,
     FrontendBackground,
 }
 

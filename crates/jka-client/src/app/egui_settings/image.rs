@@ -1,6 +1,6 @@
 //! Image.
 use crate::app::egui_settings::{
-    index_of, quality_row, quality_table_row, segmented_row, theme, ui, App, PvsMode,
+    index_of, quality_row, quality_table_row, segmented_row, theme, ui, App,
     RenderCommand, TextureFilter,
 };
 

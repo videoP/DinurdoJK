@@ -18,7 +18,7 @@ pub(in crate::renderer) struct EncodedTexture {
     width: u32,
     height: u32,
     mip_level_count: u32,
-    bytes: Vec<u8>,
+    bytes: crate::materials::SharedPixels<u8>,
 }
 
 /// Which BC format `data` would use, or None when it must stay RGBA8.
@@ -77,7 +77,7 @@ pub(in crate::renderer) fn encode_texture(data: &TextureData, picmip: u32) -> Op
         width: base_width,
         height: base_height,
         mip_level_count,
-        bytes,
+        bytes: bytes.into(),
     })
 }
 
@@ -111,7 +111,7 @@ fn encode_companion_texture(data: &TextureData, picmip: u32) -> Option<EncodedTe
             source: data.source.clone(),
             width: aligned_width,
             height: aligned_height,
-            rgba: Vec::new(),
+            rgba: (Vec::new()).into(),
             rgba16f: None,
             mip_level_count,
             clamp: data.clamp,
@@ -144,7 +144,7 @@ fn encode_companion_texture(data: &TextureData, picmip: u32) -> Option<EncodedTe
         width: aligned_width,
         height: aligned_height,
         mip_level_count,
-        bytes,
+        bytes: bytes.into(),
     })
 }
 
@@ -196,6 +196,16 @@ pub(in crate::renderer) fn encode_world_textures_skipping(
     }).collect()
 }
 
+pub(in crate::renderer) fn upload_cached_encoded_texture(
+    device: &wgpu::Device, queue: &wgpu::Queue, label: &str, encoded: &EncodedTexture,
+) -> GpuImage {
+    super::image_cache::get_or_upload(device, super::image_cache::ImageSpec {
+        width: encoded.width, height: encoded.height, mips: encoded.mip_level_count,
+        format: encoded.format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    }, super::image_cache::Pixels::U8(encoded.bytes.clone(), 0),
+        || upload_encoded_texture(device, queue, label, encoded))
+}
+
 pub(in crate::renderer) fn upload_encoded_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -222,10 +232,7 @@ pub(in crate::renderer) fn upload_encoded_texture(
         &encoded.bytes,
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    GpuImage {
-        _texture: texture,
-        view,
-    }
+    GpuImage::new(texture, view)
 }
 
 fn squared_error(a: [u8; 4], b: [u8; 3]) -> u32 {
@@ -441,7 +448,7 @@ mod tests {
             width: 8,
             height: 8,
             // 8x8 + 4x4 + 2x2 + 1x1 RGBA8 mip chain, opaque.
-            rgba: [200, 200, 200, 255].repeat(64 + 16 + 4 + 1),
+            rgba: [200, 200, 200, 255].repeat(64 + 16 + 4 + 1).into(),
             rgba16f: None,
             mip_level_count: 4,
             clamp: false,
@@ -465,7 +472,7 @@ mod tests {
             source: None,
             width: 6,
             height: 4,
-            rgba: vec![255; 6 * 4 * 4],
+            rgba: (vec![255; 6 * 4 * 4]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -481,7 +488,7 @@ mod tests {
             source: None,
             width: 8,
             height: 8,
-            rgba: [180, 90, 70, 255].repeat(64 + 16),
+            rgba: ([180, 90, 70, 255].repeat(64 + 16)).into(),
             rgba16f: None,
             mip_level_count: 2,
             clamp: false,
@@ -503,7 +510,7 @@ mod tests {
             source: None,
             width: 8,
             height: 8,
-            rgba: vec![255; 8 * 8 * 4],
+            rgba: (vec![255; 8 * 8 * 4]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -523,7 +530,7 @@ mod tests {
             source: None,
             width: 8,
             height: 8,
-            rgba: [40, 127, 200, 255].repeat(64),
+            rgba: ([40, 127, 200, 255].repeat(64)).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -558,7 +565,7 @@ mod tests {
                 source: None,
                 width,
                 height,
-                rgba,
+                rgba: (rgba).into(),
                 rgba16f: None,
                 mip_level_count: 3,
                 clamp: false,
@@ -587,7 +594,7 @@ mod tests {
             source: None,
             width: 18,
             height: 16,
-            rgba: [127, 127, 255, 255].repeat(18 * 16 + 9 * 8 + 4 * 4),
+            rgba: ([127, 127, 255, 255].repeat(18 * 16 + 9 * 8 + 4 * 4)).into(),
             rgba16f: None,
             mip_level_count: 3,
             clamp: false,
@@ -597,7 +604,7 @@ mod tests {
         let actual = encoded[0].as_ref().expect("selected 4x4 mip is BC3-eligible");
         assert_eq!((actual.width, actual.height), (4, 4));
         assert_eq!(actual.bytes, crate::renderer::textures::encode_bc3_mip_chain(&image, 2));
-        image.rgba16f = Some(vec![0; image.rgba.len()]);
+        image.rgba16f = Some(vec![0; image.rgba.len()].into());
         assert!(encode_world_textures(&[image], &[1], 2, false, true)[0].is_none());
     }
 
@@ -609,7 +616,7 @@ mod tests {
             source: None,
             width: 6,
             height: 5,
-            rgba: [pixels[0].repeat(30), pixels[1].repeat(6), pixels[2].repeat(1)].concat(),
+            rgba: ([pixels[0].repeat(30), pixels[1].repeat(6), pixels[2].repeat(1)].concat()).into(),
             rgba16f: None,
             mip_level_count: 3,
             clamp: false,

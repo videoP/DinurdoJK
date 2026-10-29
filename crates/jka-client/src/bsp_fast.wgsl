@@ -21,6 +21,10 @@ struct Camera {
     clip_plane: vec4<f32>,
     render_flags: vec4<u32>,
     camera_forward: vec4<f32>,
+    unjittered_view_proj: mat4x4<f32>,
+    previous_unjittered_view_proj: mat4x4<f32>,
+    jump_shade: vec4<f32>,
+    foliage_wind: vec4<f32>,
 };
 struct Material {
     header: vec4<u32>,
@@ -253,7 +257,7 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
         instance_index,
         true
     );
-    let world_position = deformation.xyz;
+    let world_position = foliage_wind_position(deformation.xyz, material.header.w, camera.foliage_wind);
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     output.uv = generated_uv(input);
     output.lightmap_uv = input.lightmap_uv;

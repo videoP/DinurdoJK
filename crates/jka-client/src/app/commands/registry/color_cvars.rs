@@ -1041,7 +1041,7 @@ app_cvars! {
     }
 
     APP_R_GAMMAMETHOD {
-        runtime: CvarDef::new("r_gammaMethod", "", "shader | baked | hardware", "Brightness method: shader corrects the final image; baked changes textures; hardware uses the display ramp with crash restoration (Windows SDR). Also accepts 0, 1, 2.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_gammamethod(app)), |app, value| App::cvar_set_r_gammamethod(app, APP_R_GAMMAMETHOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_gammamethod, None),
+        runtime: CvarDef::new("r_gammaMethod", "", "shader | baked | hardware | hardware_scene", "Brightness strategy: shader post, baked textures, Windows SDR display ramp, or hardware ramp with UI counter-compensation. Also accepts 0, 1, 2, 3.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_gammamethod(app)), |app, value| App::cvar_set_r_gammamethod(app, APP_R_GAMMAMETHOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_gammamethod, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     if let Some(method) = crate::gamma::GammaMethod::parse(value) {
@@ -1062,7 +1062,7 @@ app_cvars! {
                 fn cvar_set_r_gammamethod(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         let method = crate::gamma::GammaMethod::parse(value).ok_or_else(|| {
-                            format!("{name}: expected shader, baked, hardware (or 0, 1, 2)")
+                            format!("{name}: expected shader, baked, hardware, hardware_scene (or 0, 1, 2, 3)")
                         })?;
                         self.set_gamma_method(method);
                     }

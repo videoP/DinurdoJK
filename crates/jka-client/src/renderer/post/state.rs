@@ -120,6 +120,77 @@ impl Renderer {
         });
     }
 
+    /// No thermal-specific PSO is requested or polled while r_thermalVision=0.
+    /// Both pipelines are cached across toggles. RT-TAA's alternative renderer
+    /// is bypassed while thermal is active so there is always a thermal output.
+    pub(in crate::renderer) fn ensure_thermal_post_pipeline(&mut self) {
+        if self.thermal_vision == 0 { return; }
+        let device = self.device.clone();
+        let layout = self.post_pipeline_layout.clone();
+        let shader = self.post_shader.clone();
+        let output_format = self.config.format;
+        // Only active thermal frames allocate these PSOs.  Encode BSP material
+        // thermal class into the *existing* policy.b channel, no new MRT.
+        for masked in [false, true] {
+            let ready = if masked { self.thermal_depth_mask_pipeline.is_some() }
+                        else { self.thermal_depth_pipeline.is_some() };
+            if ready { continue; }
+            let key = PipelineJobKey::new(if masked { "thermal-depth-mask" } else { "thermal-depth" }, 0, 0);
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                if masked { self.thermal_depth_mask_pipeline = Some(pipeline); }
+                else { self.thermal_depth_pipeline = Some(pipeline); }
+                continue;
+            }
+            let device = self.device.clone();
+            let cam = self.camera_layout.clone();
+            let surf = self.surface_layout.clone();
+            let planar = self.planar_reflection_layout.clone();
+            self.pipeline_jobs.request(key, if masked { "thermal masked world prepass" } else { "thermal world prepass" }, move || {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("JKA lazy thermal world classifier"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../../depth_prepass.wgsl").into()),
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("JKA lazy thermal world prepass layout"),
+                    bind_group_layouts: &[Some(&cam), Some(&surf), Some(&planar)],
+                    immediate_size: 0,
+                });
+                if masked {
+                    crate::renderer::create_depth_prepass_mask_pipeline(&device, &layout, &module, true)
+                } else {
+                    crate::renderer::create_depth_prepass_pipeline(&device, &layout, &module, true)
+                }
+            });
+        }
+        if self.thermal_post_pipeline.is_none() {
+            let key = PipelineJobKey::new("thermal-post", 0, pipeline_hash(&(output_format,)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.thermal_post_pipeline = Some(pipeline);
+            } else {
+                let d = device.clone();
+                let l = layout.clone();
+                let s = shader.clone();
+                self.pipeline_jobs.request(key, "thermal post", move || {
+                    super::pipelines::create_post_pipeline_with_entry(
+                        &d, &l, &s, output_format, None, "fs_main_thermal")
+                });
+            }
+        }
+        if self.taa_enabled && self.thermal_taa_pipeline.is_none() {
+            let scene_format = self.scene_format();
+            let key = PipelineJobKey::new("thermal-taa", 0,
+                pipeline_hash(&(output_format, scene_format)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.thermal_taa_pipeline = Some(pipeline);
+            } else {
+                self.pipeline_jobs.request(key, "thermal TAA post", move || {
+                    super::pipelines::create_taa_post_pipeline_with_entry(
+                        &device, &layout, &shader, output_format, scene_format, "fs_main_taa_thermal")
+                });
+            }
+        }
+    }
+
     /// Specialized opaque-only cloud shadow pass, queued on the normal shader
     /// worker. No compile, PSO, or draw overhead with cloud shadows disabled.
     pub(in crate::renderer) fn ensure_cloud_shadow_opaque_pipeline(&mut self) {
@@ -324,11 +395,21 @@ impl Renderer {
             grain: PostGrainSettings {
                 strength: self.film_grain_strength,
                 grain_size: 1.35,
-                time: self.started.elapsed().as_secs_f32(),
+                time: self.frame_time(),
                 exposure: self.color_grade.exposure_ev,
             },
             exposure_controls: [self.effective_auto_exposure_strength(),
-                if self.native_display_mapping_active() { 1.0 } else { 0.0 }, 0.0, 0.0],
+                if self.native_display_mapping_active() { 1.0 } else { 0.0 }, f32::from(self.thermal_vision),
+                if self.thermal_vision == 0 { 0.0 } else {
+                    let eye = crate::scene::jka_position([camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]]);
+                    let contents = self.world.as_ref().map_or(0, |world| {
+                        world.thermal_liquids.iter().filter(|liquid| liquid.contains(eye))
+                            .map(|liquid| liquid.kind).max().unwrap_or(0)
+                    });
+                    if contents == 0 && self.ocean_render_ready()
+                        && self.camera_water_surface > NO_WATER_SURFACE { 1.0 }
+                    else { f32::from(contents) }
+                }],
             camera_fx: PostCameraFxSettings {
                 motion_blur_scale,
                 depth_of_field: if dof_frame_active { self.depth_of_field_strength } else { 0.0 },

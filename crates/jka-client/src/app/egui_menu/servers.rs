@@ -194,6 +194,20 @@ impl App {
         self.egui_repaint_requested = true;
     }
 
+    // Avoid trusting a placeholder or a non-JKA server result as a map hint.
+    // A cached entry can be stale, so the caller must still verify it with the
+    // actual server's infoResponse and gamestate.
+    pub(in crate::app) fn browser_map_hint(
+        &self,
+        address: std::net::SocketAddr,
+    ) -> Option<(String, String)> {
+        self.server_browser
+            .servers
+            .get(&address)
+            .filter(|server| server.protocol == 26 && !server.map.trim().is_empty())
+            .map(|server| (server.map.clone(), server.game.clone()))
+    }
+
     pub(in crate::app::egui_menu) fn connect_browser_server(
         &mut self,
         address: std::net::SocketAddr,
@@ -211,7 +225,14 @@ impl App {
             );
             return;
         }
-        self.connect_to_server(&address.to_string());
+        // Browser refresh already resolved the map and mod for this endpoint.
+        // Treat them as hints, never as server admission: a fresh infoResponse
+        // (and later gamestate) will reconcile them with authoritative state.
+        let hint = self.browser_map_hint(address);
+        self.connect_to_server_with_hint(
+            &address.to_string(),
+            hint.as_ref().map(|(map, game)| (map.as_str(), game.as_str())),
+        );
     }
 
     pub(in crate::app::egui_menu) fn server_browser_sort_header(

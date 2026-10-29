@@ -413,6 +413,7 @@ impl HdrOutput {
 
 impl Renderer {
     pub(super) fn configure_surface(&self) {
+        if self.offscreen_output.is_some() { return; }
         let mut config =
             super::context::presentation_config(&self.config, self.surface_linear_present);
         if let Some(hdr) = &self.hdr_output {

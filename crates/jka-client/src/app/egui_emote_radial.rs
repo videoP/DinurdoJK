@@ -27,10 +27,14 @@ const MAX_BROWSE_SECTIONS: usize = 12;
 pub(in crate::app) struct EmoteRadialSearch {
     pub(in crate::app) pinned: bool,
     pub(in crate::app) query: String,
+    pub(in crate::app) category: String,
+    pub(in crate::app) favorites_only: bool,
     pub(in crate::app) selection: usize,
     pub(in crate::app) request_focus: bool,
     pub(in crate::app) scroll_to_selection: bool,
     cached_query: String,
+    cached_category: String,
+    cached_favorites_only: bool,
     cached_catalog_ptr: usize,
     cached_hits: std::sync::Arc<Vec<SearchHit>>,
 }
@@ -38,6 +42,7 @@ pub(in crate::app) struct EmoteRadialSearch {
 #[derive(Clone, Debug)]
 struct SearchHit {
     id: String,
+    wire_id: Option<u16>,
     title: String,
     category: String,
     favorite: bool,
@@ -340,6 +345,36 @@ fn emote_font_size(painter: &egui::Painter, label: &str, radial_space: f32) -> f
     size
 }
 
+/// The same user-authored category tabs are shown over both Fortnite lists.
+/// Selecting a tab switches the filter instead of stacking hidden checkboxes.
+pub(in crate::app) fn emote_category_tabs(
+    ui: &mut egui::Ui,
+    categories: &[crate::app::emote_wheel::Category],
+    category: &mut String,
+    favorites_only: &mut bool,
+) -> bool {
+    let previous = (category.clone(), *favorites_only);
+    egui::ScrollArea::horizontal().id_salt(ui.id().with("fortnite_category_tabs"))
+        .auto_shrink([false, true]).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if ui.add(egui::Button::new("All").selected(category.is_empty() && !*favorites_only)).clicked() {
+                category.clear(); *favorites_only = false;
+            }
+            if ui.add(egui::Button::new("★ Favorites").selected(*favorites_only)).clicked() {
+                category.clear(); *favorites_only = true;
+            }
+            for c in categories {
+                if ui.add(egui::Button::new(c.name.as_str()).selected(category.as_str() == c.id.as_str() && !*favorites_only))
+                    .on_hover_text(format!("Only {} emotes", c.name)).clicked() {
+                    *category = c.id.clone(); *favorites_only = false;
+                }
+            }
+        });
+    });
+    previous.0.as_str() != category.as_str() || previous.1 != *favorites_only
+}
+
 impl App {
     /// Every installed Fortnite emote is searchable, not just favorites or
     /// the current radial category. Keep only lightweight labels/IDs per hit.
@@ -351,6 +386,8 @@ impl App {
         let ptr = std::sync::Arc::as_ptr(&catalog) as usize;
         if self.emote_radial_search.cached_catalog_ptr == ptr
             && self.emote_radial_search.cached_query == self.emote_radial_search.query
+            && self.emote_radial_search.cached_category == self.emote_radial_search.category
+            && self.emote_radial_search.cached_favorites_only == self.emote_radial_search.favorites_only
         {
             return self.emote_radial_search.cached_hits.clone();
         }
@@ -369,15 +406,20 @@ impl App {
             let favorite = std::iter::once(&root.id).chain(root.catalog_aliases.iter())
                 .chain(root.variants.iter().map(|v| &v.id))
                 .any(|id| self.emote_wheel.favorites.contains(id));
+            if (self.emote_radial_search.favorites_only && !favorite)
+                || (!self.emote_radial_search.category.is_empty()
+                    && self.emote_radial_search.category != category_id) { return None; }
             Some(SearchHit {
-                id: selected.id.clone(), title: title.to_owned(), category,
-                favorite, rank,
+                id: selected.id.clone(), wire_id: crate::emotes::network::wire_id(selected),
+                title: title.to_owned(), category, favorite, rank,
             })
         }).collect();
         hits.sort_by(|a, b| a.rank.cmp(&b.rank)
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
             .then_with(|| a.id.cmp(&b.id)));
         self.emote_radial_search.cached_query = self.emote_radial_search.query.clone();
+        self.emote_radial_search.cached_category = self.emote_radial_search.category.clone();
+        self.emote_radial_search.cached_favorites_only = self.emote_radial_search.favorites_only;
         self.emote_radial_search.cached_catalog_ptr = ptr;
         self.emote_radial_search.cached_hits = std::sync::Arc::new(hits);
         self.emote_radial_search.cached_hits.clone()
@@ -407,98 +449,92 @@ impl App {
     /// pointer. Virtualized results keep a 1,800+ item catalog responsive.
     fn egui_pinned_emote_search(&mut self, root: &mut egui::Ui) {
         let rect = root.max_rect();
-        root.painter().rect_filled(rect, egui::CornerRadius::ZERO,
-            egui::Color32::from_black_alpha(185));
-        let hits = self.emote_radial_search_hits();
-        if self.emote_radial_search.selection >= hits.len() {
-            self.emote_radial_search.selection = hits.len().saturating_sub(1);
-        }
-        let width = (rect.width() - 48.0).clamp(260.0, 720.0);
         let mut selected_id = None;
-        let scroll_to_selection = std::mem::take(&mut self.emote_radial_search.scroll_to_selection);
-        let selected_index = self.emote_radial_search.selection;
         let mut unpin = false;
         let mut close = false;
-        root.vertical_centered(|ui| {
-            ui.add_space((rect.height() * 0.065).min(55.0));
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(16, 23, 33))
-                .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
-                .corner_radius(egui::CornerRadius::same(12))
-                .inner_margin(18.0)
-                .show(ui, |ui| {
-                    ui.set_width(width);
-                    ui.horizontal(|ui| {
-                        ui.heading("FORTNITE EMOTES");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕ Close").clicked() { close = true; }
-                            if ui.button("Unpin / Wheel").clicked() { unpin = true; }
+        // Non-modal right rail: no full-screen scrim and no center overlay.
+        // Leave the world and player's dance visible while clicking emotes.
+        let margin = 12.0;
+        let width = (rect.width() * 0.30).clamp(255.0, 385.0).min(rect.width() - margin * 2.0);
+        let available_h = (rect.height() - margin * 2.0).max(100.0);
+        let mut category = self.emote_radial_search.category.clone();
+        let mut favorites_only = self.emote_radial_search.favorites_only;
+        egui::Area::new(egui::Id::new("pinned_emote_right_rail"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-margin, margin))
+            .order(egui::Order::Foreground)
+            .show(root.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 33, 238))
+                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .corner_radius(egui::CornerRadius::same(9))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_width(width - 20.0);
+                        ui.set_max_width(width - 20.0);
+                        ui.horizontal(|ui| {
+                            ui.strong("FORTNITE EMOTES");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("×").on_hover_text("Close").clicked() { close = true; }
+                                if ui.small_button("Wheel").on_hover_text("Unpin / return to wheel").clicked() { unpin = true; }
+                            });
                         });
-                    });
-                    ui.label(egui::RichText::new("PINNED SEARCH  ·  Type an emote name or ID")
-                        .color(theme::TEXT_DIM).size(11.0));
-                    ui.add_space(8.0);
-                    let search = ui.add(egui::TextEdit::singleline(&mut self.emote_radial_search.query)
-                        .hint_text("Search any installed emote (e.g. Floss, EID_...)")
-                        .desired_width(f32::INFINITY));
-                    if self.emote_radial_search.request_focus {
-                        search.request_focus();
-                        self.emote_radial_search.request_focus = false;
-                    }
-                    if search.changed() {
-                        self.emote_radial_search.selection = 0;
-                        self.emote_radial_search.scroll_to_selection = true;
-                        self.egui_repaint_requested = true;
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} matches", hits.len()));
-                        ui.label(egui::RichText::new("↑↓ navigate   ·   Enter play   ·   Tab wheel   ·   Esc close")
-                            .color(theme::TEXT_DIM).size(10.0));
-                    });
-                    ui.separator();
-                    if hits.is_empty() {
-                        ui.add_space(20.0);
-                        ui.label(if self.emote_radial_search.query.trim().is_empty() {
-                            "No installed Fortnite emotes are loaded."
-                        } else { "No matching installed emotes." });
-                    } else {
-                        // Fixed-height rows let egui skip drawing thousands
-                        // of offscreen results while preserving full scroll.
-                        let mut area = egui::ScrollArea::vertical()
-                            .id_salt("pinned_emote_results")
-                            .max_height((rect.height() - 240.0).clamp(120.0, 580.0));
-                        if scroll_to_selection {
-                            area = area.vertical_scroll_offset(selected_index as f32 * 35.0);
+                        let search = ui.add(egui::TextEdit::singleline(&mut self.emote_radial_search.query)
+                            .hint_text("Search emotes or EID…")
+                            .desired_width(f32::INFINITY));
+                        if self.emote_radial_search.request_focus {
+                            search.request_focus();
+                            self.emote_radial_search.request_focus = false;
                         }
-                        area.show_rows(ui, 31.0, hits.len(), |ui, range| {
-                                ui.spacing_mut().item_spacing.y = 4.0;
+                        if search.changed() {
+                            self.emote_radial_search.selection = 0;
+                            self.emote_radial_search.scroll_to_selection = true;
+                        }
+                        ui.add_space(4.0);
+                        let changed = emote_category_tabs(ui, &self.emote_wheel.categories, &mut category, &mut favorites_only);
+                        if changed {
+                            self.emote_radial_search.category = category.clone();
+                            self.emote_radial_search.favorites_only = favorites_only;
+                            self.emote_radial_search.selection = 0;
+                            self.emote_radial_search.scroll_to_selection = true;
+                        }
+                        let hits = self.emote_radial_search_hits();
+                        self.emote_radial_search.selection = self.emote_radial_search.selection.min(hits.len().saturating_sub(1));
+                        ui.small(format!("{} matches · ↑↓ select · Enter play · Tab wheel", hits.len()));
+                        ui.separator();
+                        if hits.is_empty() {
+                            ui.label("No matching emotes in this category.");
+                        } else {
+                            let scroll_to_selection = std::mem::take(&mut self.emote_radial_search.scroll_to_selection);
+                            let mut area = egui::ScrollArea::vertical().id_salt("pinned_emote_results")
+                                .auto_shrink([false, false])
+                                .max_height((available_h - 150.0).max(110.0));
+                            if scroll_to_selection {
+                                area = area.vertical_scroll_offset(self.emote_radial_search.selection as f32 * 34.0);
+                            }
+                            area.show_rows(ui, 30.0, hits.len(), |ui, range| {
                                 for index in range {
                                     let hit = &hits[index];
-                                    let text = format!("{}{}    ·    {}", if hit.favorite { "★ " } else { "" },
-                                        hit.title, hit.category);
-                                    let row = ui.add_sized(
-                                        [ui.available_width(), 31.0],
-                                        egui::Button::new(text)
-                                            .selected(self.emote_radial_search.selection == index),
-                                    );
+                                    let id_label = hit.wire_id.map_or_else(
+                                        || "LOCAL".to_owned(), |id| format!("#{id}"));
+                                    let text = format!("{}  {}{}", id_label,
+                                        if hit.favorite { "★ " } else { "" }, hit.title);
+                                    let row = ui.add_sized([ui.available_width(), 30.0],
+                                        egui::Button::new(text).selected(self.emote_radial_search.selection == index));
                                     if row.clicked() {
                                         self.emote_radial_search.selection = index;
-                                        self.emote_radial_search.request_focus = true;
                                         selected_id = Some(hit.id.clone());
                                     }
-                                    if row.hovered() {
-                                        row.on_hover_text(hit.id.as_str());
-                                    }
+                                    let command = hit.wire_id.map_or_else(
+                                        || format!("djk_emote {}", hit.id),
+                                        |id| format!("djk_emote {id}"));
+                                    row.on_hover_text(format!("{} · {}\n{}", hit.category, hit.id, command));
                                 }
                             });
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new(
-                        "Click a result or press Enter to play. The browser remains open until closed."
-                    ).color(theme::TEXT_DIM).size(11.0));
-                });
-        });
+                        }
+                        ui.separator();
+                        ui.small("Click to dance; panel stays open · Esc closes");
+                    });
+            });
         if close { self.close_emote_radial(); }
         else if unpin { self.toggle_emote_radial_search(); }
         else if let Some(id) = selected_id { self.play_wheel_emote(&id); }

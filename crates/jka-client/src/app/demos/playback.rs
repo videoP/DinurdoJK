@@ -3,7 +3,7 @@ use crate::app::{
     charset_glyph_uv, generic_timer_bar, offset_third_person_view, playerstate_vec3,
     probe_demo_gamestate, rendering_third_person, scene, ui, ActiveReward, App, ApplyLatchedScope,
     Arc, ClientGameState, ClothConfig, Cursor, DemoAdvance, DemoCameraSample, DemoFakeView,
-    DemoIndex, DemoReader, DemoViewMode, Duration, DynamicLightsMode,
+    DemoReader, DemoViewMode, Duration, DynamicLightsMode,
     EntityEvent, FrontendPage, FxGeometryMode, GameSession, Ghoul2PresentationView, Instant,
     KeyCode, LivePredictionFrame, MapLoadingState, MissingMapPrompt, OverlayMode, Path,
     PresentationViewer, PresentedEntity, ProtocolSnapshot, RagdollConfig, ServerMessageDecoder,
@@ -114,7 +114,7 @@ impl GameSession {
     }
 
     pub(in crate::app) fn demo_duration_ms(&self) -> Option<i32> {
-        self.demo_index.as_ref().map(DemoIndex::duration_ms)
+        self.demo_index.as_ref().map(|index| index.duration_ms())
     }
 
     pub(in crate::app) fn demo_elapsed_ms(&self, now: Instant) -> Option<f64> {
@@ -246,6 +246,17 @@ impl GameSession {
             .and_then(|snapshot| snapshot.player_state.field_i32("clientNum"))
     }
 
+    /// Every connected player of the recording right now (client info
+    /// configstrings), flagged when visible in this snapshot.
+    pub(in crate::app) fn demo_all_players(&self) -> Vec<(i32, String, bool)> {
+        let visible = self.demo_visible_players();
+        (0..32usize).filter_map(|c| {
+            let name = self.client_game.client_name(c).filter(|n| !n.trim().is_empty())?;
+            let client = c as i32;
+            Some((client, name, visible.iter().any(|v| v.0 == client)))
+        }).collect()
+    }
+
     pub(in crate::app) fn demo_visible_players(&self) -> Vec<(i32, String)> {
         let authoritative = self.demo_followed_client();
         let mut out = Vec::<(i32, String)>::new();
@@ -290,6 +301,7 @@ impl GameSession {
                 entity.state.field_f32("pos.trDelta[2]").unwrap_or(0.0),
             ],
             health: entity.state.field_i32("health").unwrap_or(100),
+            legs_anim: entity.state.field_i32("legsAnim").unwrap_or(0),
         })
     }
 
@@ -354,11 +366,17 @@ impl GameSession {
         now: Instant,
         elapsed_ms: i32,
     ) -> Result<DemoCameraSample, String> {
+        self.seek_demo_reporting(now, elapsed_ms, |_, _| {})
+    }
+
+    pub(in crate::app) fn seek_demo_reporting(
+        &mut self, now: Instant, elapsed_ms: i32, progress: impl FnMut(u64, u64),
+    ) -> Result<DemoCameraSample, String> {
         if self.live {
             return Err("DEMO SEEK IS NOT AVAILABLE FOR LIVE SESSIONS".into());
         }
         self.seeking_demo = true;
-        let result = self.seek_demo_inner(now, elapsed_ms);
+        let result = self.seek_demo_inner_reporting(now, elapsed_ms, progress);
         self.seeking_demo = false;
         result
     }
@@ -367,6 +385,12 @@ impl GameSession {
         &mut self,
         now: Instant,
         elapsed_ms: i32,
+    ) -> Result<DemoCameraSample, String> {
+        self.seek_demo_inner_reporting(now, elapsed_ms, |_, _| {})
+    }
+
+    fn seek_demo_inner_reporting(
+        &mut self, now: Instant, elapsed_ms: i32, mut progress: impl FnMut(u64, u64),
     ) -> Result<DemoCameraSample, String> {
         let (first, duration) = {
             let index = self
@@ -380,6 +404,8 @@ impl GameSession {
         };
         let elapsed_ms = elapsed_ms.clamp(0, duration);
         let target = first.saturating_add(elapsed_ms);
+        let total = elapsed_ms.max(1) as u64;
+        progress(0, total);
         let (rate, resume_rate) = self
             .timeline
             .map(|timeline| (timeline.rate, timeline.resume_rate))
@@ -389,6 +415,7 @@ impl GameSession {
         let _map = self.read_until_map()?;
         let _ = self.begin_after_map_load(now)?;
 
+        let mut sampled = 0_u32;
         while self
             .next_snapshot
             .as_ref()
@@ -399,7 +426,13 @@ impl GameSession {
             self.next_snapshot = self.read_next_snapshot()?;
             self.client_game
                 .set_next_snapshot(self.next_snapshot.as_ref())?;
+            sampled += 1;
+            if sampled % 32 == 0 {
+                let done = self.current_snapshot.as_ref().map_or(0, |s| s.server_time.saturating_sub(first).max(0)) as u64;
+                progress(done.min(total), total);
+            }
         }
+        progress(total, total);
 
         // Seeking reconstructs authoritative CGame state, but transient effects
         // from the replay-to-target pass must not burst onto the destination frame.
@@ -502,18 +535,20 @@ impl App {
         argument: &str,
         start_elapsed_ms: Option<i32>,
     ) {
+        self.leave_render_studio_for_launch();
         // Console /demo preserves normal JKA lookup semantics: active fs_game
         // shadows base. The browser passes an explicit source directory instead.
         self.play_demo_named_from_source(argument, start_elapsed_ms, self.game.clone(), false);
     }
 
-    fn play_demo_named_from_source(
+    pub(in crate::app) fn play_demo_named_from_source(
         &mut self,
         argument: &str,
         start_elapsed_ms: Option<i32>,
         source_game: Option<std::path::PathBuf>,
         source_only: bool,
-    ) {
+    ) -> bool {
+        self.leave_render_studio_for_launch();
         if self.demo_video_export.is_some() {
             self.cancel_demo_video_export();
         }
@@ -522,7 +557,7 @@ impl App {
         let argument = argument.trim().trim_matches('"');
         if argument.is_empty() {
             self.push_console_line("^3demo <demoname>".to_owned());
-            return;
+            return false;
         }
         let mut name = argument.replace('\\', "/");
         if let Some(stripped) = name.strip_prefix("demos/") {
@@ -540,7 +575,7 @@ impl App {
             })
         {
             self.push_console_line("^1demo name must stay inside demos/".to_owned());
-            return;
+            return false;
         }
         let qpath = format!("demos/{demo_name}.dm_26");
         const MAX_DEMO_FILE_BYTES: usize = 512 * 1024 * 1024;
@@ -549,10 +584,10 @@ impl App {
         // mod-local demo lookup when /demo is issued while connected to that mod.
         println!("DEMO: {qpath}");
         let mut assets = match if source_only {
-            match source_game.as_deref() {
-                Some(game) => jka_assets::pk3::AssetSearchPath::open_search_dirs([game]),
-                None => jka_assets::pk3::AssetSearchPath::open(&self.base),
-            }
+            let roots = jka_assets::pk3::configured_filesystem_roots(&self.base);
+            jka_assets::pk3::AssetSearchPath::open_search_dirs(
+                jka_assets::pk3::filesystem_game_layer_dirs(&self.base, source_game.as_deref(), &roots)
+            )
         } else {
             jka_assets::pk3::AssetSearchPath::open_game(&self.base, source_game.as_deref())
         } {
@@ -560,7 +595,7 @@ impl App {
             Err(error) => {
                 self.console_status = format!("DEMO ASSET PATH ERROR: {error}");
                 self.push_console_line(format!("^1{}", self.console_status));
-                return;
+                return false;
             }
         };
         let asset = match assets.read(&qpath, MAX_DEMO_FILE_BYTES) {
@@ -568,14 +603,55 @@ impl App {
             Ok(None) => {
                 self.console_status = format!("DEMO NOT FOUND: {qpath}");
                 self.push_console_line(format!("^1{}", self.console_status));
-                return;
+                return false;
             }
             Err(error) => {
                 self.console_status = format!("DEMO READ ERROR: {error}");
                 self.push_console_line(format!("^1{}", self.console_status));
-                return;
+                return false;
             }
         };
+        self.play_demo_asset(qpath, asset, start_elapsed_ms)
+    }
+
+    /// Play a `.dm_26` supplied as an absolute path (dragged onto the exe or
+    /// passed on the command line) rather than found through the VFS.
+    pub(in crate::app) fn play_demo_file(&mut self, path: &Path) -> bool {
+        self.leave_render_studio_for_launch();
+        if self.demo_video_export.is_some() {
+            self.cancel_demo_video_export();
+        }
+        self.demo_export_in_ms = None;
+        self.demo_export_out_ms = None;
+        const MAX_DEMO_FILE_BYTES: u64 = 512 * 1024 * 1024;
+        println!("DEMO FILE: {}", path.display());
+        let bytes = match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_DEMO_FILE_BYTES => Err("file is too large".to_owned()),
+            Ok(_) => std::fs::read(path).map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.console_status = format!("DEMO READ ERROR: {}: {error}", path.display());
+                self.push_console_line(format!("^1{}", self.console_status));
+                return false;
+            }
+        };
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let asset = jka_assets::pk3::Asset { bytes, source: path.to_path_buf() };
+        self.play_demo_asset(format!("demos/{stem}.dm_26"), asset, None)
+    }
+
+    fn play_demo_asset(
+        &mut self,
+        qpath: String,
+        asset: jka_assets::pk3::Asset,
+        start_elapsed_ms: Option<i32>,
+    ) -> bool {
         let source = asset.source.display().to_string();
         crate::logging::write_line_with_path(
             crate::logging::Level::Info,
@@ -587,7 +663,7 @@ impl App {
             Err(error) => {
                 self.console_status = error;
                 self.push_console_line(format!("^1{}", self.console_status));
-                return;
+                return false;
             }
         };
 
@@ -600,9 +676,7 @@ impl App {
             || self.game_session.is_some()
             || self.local_server.is_some()
             || !self.front_end;
-        if transitioning_from_active_session {
-            self.disconnect_for_demo_transition();
-        }
+        if transitioning_from_active_session { self.disconnect_for_demo_transition(); }
         if let Err(error) =
             self.set_session_fs_game_preserving_rendered_world(&probe.fs_game, "demo gamestate")
         {
@@ -611,18 +685,15 @@ impl App {
             if transitioning_from_active_session {
                 self.disconnect_to_main_menu();
             }
-            return;
+            return false;
         }
 
         // Establish CA_LOADING-equivalent presentation before the expensive CGame
         // asset build. `unknownmap_mp` is resident on the renderer, so the next
         // present is intentional even if presenter/VFS setup takes a while.
-        self.loading = Some(MapLoadingState::new(
-            self.latest_request_id.wrapping_add(1),
-            probe.map_name.clone(),
-            self.game.as_deref(),
-        ));
-        self.console_status = format!("LOADING DEMO MAP {}...", probe.map_name);
+        self.loading = Some(MapLoadingState::new(self.latest_request_id.wrapping_add(1),
+            probe.map_name.clone(),self.game.as_deref()));
+        self.console_status = format!("LOADING DEMO MAP {}...",probe.map_name);
         self.publish_ui();
 
         let mut playback = match self.build_game_session(qpath.clone(), source, asset.bytes) {
@@ -632,7 +703,7 @@ impl App {
                 self.push_console_line(format!("^1{}", self.console_status));
                 self.loading = None;
                 self.disconnect_to_main_menu();
-                return;
+                return false;
             }
         };
         let map_name = match playback.read_until_map() {
@@ -643,7 +714,7 @@ impl App {
                 eprintln!("{}", self.console_status);
                 self.loading = None;
                 self.disconnect_to_main_menu();
-                return;
+                return false;
             }
         };
         if Self::normalized_bsp_name(&map_name) != Self::normalized_bsp_name(&probe.map_name) {
@@ -652,7 +723,6 @@ impl App {
                 probe.map_name, map_name
             );
         }
-
         self.console_status = format!("DEMO GAMESTATE READY: {qpath} -> {map_name}");
         self.push_console_line(format!("^2{}", self.console_status));
         println!("{}", self.console_status);
@@ -683,6 +753,7 @@ impl App {
                 self.publish_ui();
             }
         }
+        true
     }
 
     pub(in crate::app) fn choose_demo_missing_map_exit(&mut self) {
@@ -825,7 +896,21 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn apply_demo_camera(&mut self, sample: DemoCameraSample) {
+    pub(in crate::app) fn apply_demo_camera(&mut self, mut sample: DemoCameraSample) {
+        // Vertical PM_AdjustAngleForWallRunUp repeatedly locks player yaw to BSP
+        // plane normals. Suppress camera-only yaw spikes in live play and demos.
+        sample.view_angles[1] = self.game_session.as_ref()
+            .filter(|session| !session.live)
+            .and_then(|session| session.demo_index.as_ref())
+            .and_then(|index| index.wallrun_camera_yaw(
+                sample.presentation_time_ms, sample.policy.legs_anim, sample.client_num,
+                self.wallrun_camera_mode,
+            ))
+            .unwrap_or_else(|| self.wallrun_camera_yaw.apply(
+                sample.view_angles[1], sample.policy.legs_anim, sample.client_num,
+                sample.presentation_time_ms, sample.teleported, self.wallrun_camera_mode,
+            ));
+        self.enforce_server_third_person_angle(sample.velocity);
         self.render_view_latch = ViewLatchMode::Disabled;
         self.camera.clear_first_person_bob();
         let live_follow = sample.following
@@ -856,6 +941,10 @@ impl App {
         let latch_input_available = sample.policy.health > 0
             && sample.policy.vehicle_num == 0
             && spectator_mode.is_none()
+            // The render-only late latch must not reapply the raw wallrun
+            // angle over the stabilized view immediately before drawing.
+            && !(self.wallrun_camera_mode != 0
+                && super::super::wallrun_camera::is_wall_running(sample.policy.legs_anim))
             && self.subframe_input_view_rotation().is_some();
         if render_third_person {
             let mut third_person = self.third_person;
@@ -985,8 +1074,12 @@ impl App {
     pub(in crate::app) fn apply_demo_fake_camera(
         &mut self,
         sample: DemoCameraSample,
-        fake: DemoFakeView,
+        mut fake: DemoFakeView,
     ) {
+        fake.view_angles[1] = self.wallrun_camera_yaw.apply(
+            fake.view_angles[1], fake.legs_anim, fake.client_num,
+            sample.presentation_time_ms, sample.teleported, self.wallrun_camera_mode,
+        );
         self.render_view_latch = ViewLatchMode::Disabled;
         self.camera.clear_first_person_bob();
         match self.spectator_camera.mode {
@@ -1294,11 +1387,12 @@ impl App {
     pub(in crate::app) fn current_ghoul2_view(&self) -> Option<Ghoul2PresentationView> {
         self.window.as_ref().map(|window| {
             let size = window.inner_size();
-            let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+            let (width,height)=(size.width,size.height);
+            let aspect = width.max(1) as f32 / height.max(1) as f32;
             Ghoul2PresentationView::new(
                 self.camera.position.to_array(),
                 self.camera.forward().to_array(),
-                self.camera.fov_y_for_viewport(size.width, size.height),
+                self.camera.fov_y_for_viewport(width, height),
                 aspect,
                 self.effective_distance_cull(),
             )
@@ -1353,15 +1447,13 @@ impl App {
                         DemoViewMode::Free => PresentationViewer::None,
                     }
                 });
+            let effective_spectator=self.spectator_camera.mode;
             playback.demo_spectator_camera_mode =
                 if playback.live || self.demo_view_mode == DemoViewMode::Free {
                     None
-                } else {
-                    Some(self.spectator_camera.mode)
-                };
-            playback.demo_hidden_view_client = if playback.live
-                || self.spectator_camera.mode != SpectatorCameraMode::FirstPerson
-            {
+                } else {Some(effective_spectator)};
+            playback.demo_hidden_view_client = if playback.live ||
+                effective_spectator != SpectatorCameraMode::FirstPerson {
                 None
             } else {
                 match self.demo_view_mode {
@@ -1414,6 +1506,7 @@ impl App {
             playback
                 .player_presenter
                 .set_lod_scale(self.video.lod_scale);
+            playback.player_presenter.set_hair_physics_mode(self.video.hair_physics);
             playback.player_presenter.set_jiggle_config(
                 self.video.client_physics && self.video.jiggle_physics != 0,
                 self.video.jiggle_physics,
@@ -1497,7 +1590,7 @@ impl App {
                 stats: self.video.physics_stats,
             });
             let rt_rigid_casters_enabled = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
-            let blob_shadow_opacity = self.video.player_blob_shadow_opacity();
+            let blob_shadow_settings = self.video.player_blob_shadow_settings();
             playback
                 .weapon_fx
                 .set_rt_lighting(self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware);
@@ -1564,7 +1657,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadow_opacity,
+                    blob_shadow_settings,
                 )?
             } else if playback.live {
                 let Some(net) = self.net.as_ref() else {
@@ -1640,7 +1733,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadow_opacity,
+                    blob_shadow_settings,
                     settings.no_predict,
                     Some(&mut predict),
                     Some(crate::app::PlayerPresentationInput::Remote {
@@ -1658,7 +1751,7 @@ impl App {
                     self.cg_event_workers,
                     ghoul2_view,
                     rt_rigid_casters_enabled,
-                    blob_shadow_opacity,
+                    blob_shadow_settings,
                 )?
             };
             (advance, sample, playback.take_event_debug_lines())
@@ -1702,6 +1795,12 @@ impl App {
         } else {
             Vec::new()
         };
+        // RESTRICT_STRAFETRAIL gates live player traces only. Keep loaded
+        // trail files, ghost routes, and race logging independent of the bit.
+        self.strafe_trails.set_live_restricted(
+            self.server_restrictions()
+                .contains(crate::app::restrictions::STRAFE_TRAILS),
+        );
         // Use the final camera (including third-person orbit/free/fake follow) for spatial audio.
         if let Some(playback) = &mut self.game_session {
             // FX sprites/lines face the final render view.

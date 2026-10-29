@@ -575,12 +575,47 @@ impl App {
         crate::net::mod_support::ServerMod::detect(self.cgame_server_info())
     }
 
+    pub(in crate::app) fn server_restrictions(&self) -> crate::app::restrictions::ServerRestrictions {
+        crate::app::restrictions::ServerRestrictions::from_server_info(self.cgame_server_info())
+    }
+
     pub(in crate::app) fn japro_do_restricted(&self) -> bool {
-        const RESTRICT_DO: i32 = 1 << 9;
-        jka_protocol::commands::info_value(self.cgame_server_info(), b"restricts")
-            .map_or(0, jka_protocol::commands::atoi)
-            & RESTRICT_DO
-            != 0
+        self.server_restrictions().contains(crate::app::restrictions::DO)
+    }
+
+    /// TaystJK CG_DrawActiveFrame: enforce RESTRICT_ANGLE after the latest
+    /// serverinfo/snapshot was processed, before constructing the render camera.
+    pub(in crate::app) fn enforce_server_third_person_angle(&mut self, velocity: [f32; 3]) {
+        let restrictions = self.server_restrictions();
+        if !restrictions.contains(crate::app::restrictions::THIRD_PERSON_ANGLE) {
+            return;
+        }
+        let japro = self.cgame_server_mod() == crate::net::mod_support::ServerMod::Japro;
+        let Some(ps) = self.current_player_state() else {
+            return;
+        };
+        const PMF_FOLLOW: i32 = 4096;
+        const PERS_TEAM: usize = 3;
+        const TEAM_SPECTATOR: i32 = 3;
+        // MV_BOTCPM = 14 in bundled jaPRO bg_public.h (with _SPPHYSICS).
+        const MV_BOTCPM: i32 = 14;
+        let spectator_or_following = ps.persistant[PERS_TEAM] == TEAM_SPECTATOR
+            || ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0;
+        let moving_horizontally = velocity[0].is_finite()
+            && velocity[1].is_finite()
+            && (velocity[0] != 0.0 || velocity[1] != 0.0);
+        if restrictions.restricts_race_angle(
+            japro,
+            ps.stats[crate::japro_cg::STAT_RACEMODE] != 0,
+            spectator_or_following,
+            moving_horizontally,
+            ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] == MV_BOTCPM,
+        ) && self.third_person.angle != 0.0 {
+            // TaystJK writes cg_thirdPersonAngle=0; the change remains even
+            // after stopping. Keep the menu/console/config synchronized.
+            self.third_person.angle = 0.0;
+            self.mark_config_dirty();
+        }
     }
 
     pub(in crate::app) fn japro_do_race_restricted(&self) -> bool {
@@ -627,16 +662,8 @@ impl App {
     }
 
     pub(in crate::app) fn japro_flipkick_restricted(&self) -> bool {
-        const RESTRICT_FLIPKICKBIND: i32 = 1 << 7;
-        let Some(net) = self.net.as_ref() else {
-            return false;
-        };
-        let serverinfo =
-            crate::net::mod_support::server_info(&net.session().decoder().configstrings);
-        jka_protocol::commands::info_value(serverinfo, b"restricts")
-            .map_or(0, jka_protocol::commands::atoi)
-            & RESTRICT_FLIPKICKBIND
-            != 0
+        self.server_restrictions()
+            .contains(crate::app::restrictions::FLIPKICK)
     }
 
     /// TaystJK CG_Flipkick_f: restrictions are server-authored and the command

@@ -264,7 +264,7 @@ impl PlayerPresenter {
                 };
                 let presented_length = if weapon == WP_SABER {
                     self.presented_saber_blade_length(
-                        info.client_num,
+                        if entity.number>=60000 {usize::from(entity.number)}else{info.client_num},
                         saber_num,
                         blade_index,
                         blade.length,
@@ -273,7 +273,7 @@ impl PlayerPresenter {
                     )
                 } else {
                     let key = SaberBladeLengthKey {
-                        client_num: info.client_num,
+                        client_num: if entity.number>=60000 {usize::from(entity.number)}else{info.client_num},
                         saber_num: saber_num as u8,
                         blade_num: blade_index as u8,
                     };
@@ -298,7 +298,7 @@ impl PlayerPresenter {
                             Some(std::array::from_fn(|i| origin_world[i] - dir_world[i]));
                         debug.blade_length[saber_num][blade_index] = presented_length;
                         debug.blade_submitted[saber_num][blade_index] =
-                            process_blades && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
+                            process_blades && !definition.no_blade && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
                     }
                 }
                 let secondary_style = definition.blade_style2_start > 0
@@ -330,9 +330,17 @@ impl PlayerPresenter {
                     trail_style,
                     definition.num_blades as u8,
                     definition.no_dlight,
+                    definition.no_blade,
                     no_wall_marks,
                 ) {
                     self.fx_requests.push(request);
+                }
+                if saber_num == 0 && blade_index == 0 && presented_length > 1.0
+                    && self.studio_saber_clients.contains(&entity.number) {
+                    let dir = normalize_vec3(dir_world);
+                    let tip: [f32; 3] = std::array::from_fn(|i| origin_world[i] + dir[i] * presented_length);
+                    self.studio_saber_tips.insert(entity.number,
+                        (crate::scene::render_position(origin_world), crate::scene::render_position(tip)));
                 }
                 self.report_saber_diagnostic_once(
                     format!("held:{}:{}:{}:submitted", entity.number, saber_num, blade_index),
@@ -561,7 +569,7 @@ impl PlayerPresenter {
                         Some(std::array::from_fn(|i| origin_world[i] - dir_world[i]));
                     debug.blade_length[0][blade_index] = presented_length;
                     debug.blade_submitted[0][blade_index] =
-                        presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
+                        !definition.no_blade && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
                 }
             }
             let secondary_style =
@@ -593,9 +601,16 @@ impl PlayerPresenter {
                 trail_style,
                 definition.num_blades as u8,
                 definition.no_dlight,
+                definition.no_blade,
                 no_wall_marks,
             ) {
                 self.fx_requests.push(request);
+            }
+            // Thrown saber: the Studio hilt / tip anchors follow it in flight.
+            if blade_index == 0 && presented_length > 1.0 && self.studio_saber_clients.contains(&owner.number) {
+                let tip: [f32; 3] = std::array::from_fn(|i| origin_world[i] + dir_world[i] * presented_length);
+                self.studio_saber_tips.insert(owner.number,
+                    (crate::scene::render_position(origin_world), crate::scene::render_position(tip)));
             }
             self.report_saber_diagnostic_once(
                 format!("throw:{}:{}:submitted", owner.number, blade_index),

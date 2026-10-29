@@ -220,29 +220,26 @@ pub(in crate::ui) fn build_console_notify(
     if ui.console_notify_lines.is_empty() {
         return;
     }
-    // TaystJK Con_CheckResize keeps the console charset at physical 8x16
-    // pixels when con_scale is 1.0. Con_DrawNotify then feeds those physical
-    // dimensions straight to SCR_DrawSmallChar; it does *not* scale them from
-    // a 640x480 virtual canvas. Scaling by w/640 and h/480 made notify text
-    // enormous at modern resolutions.
-    const CHAR_W: f32 = 8.0;
-    const CHAR_H: f32 = 16.0;
+    // TaystJK `Con_DrawNotify` uses the same physical charWidth/charHeight
+    // set by `Con_CheckResize` for the open console. Keep the overlay in
+    // physical pixels (never scale from a 640x480 virtual canvas).
+    let (char_w, char_h) = super::console::console_char_metrics(w, ui.console_scale);
     let mut y = 0.0;
     for line in &ui.console_notify_lines {
         fixed_charset_text(
             out,
             &line.text,
-            CHAR_W,
+            char_w,
             y,
-            CHAR_W,
-            CHAR_H,
-            CHAR_W,
+            char_w,
+            char_h,
+            char_w,
             [1.0, 1.0, 1.0, 1.0],
             false,
             w,
             h,
         );
-        y += CHAR_H;
+        y += char_h;
     }
 }
 

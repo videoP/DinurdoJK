@@ -13,6 +13,17 @@ pub use hud::movement::FORCE_ICON_NAMES;
 pub use text::ProportionalGlyph;
 mod chat;
 mod compose;
+mod studio_race;
+pub use studio_race::{StudioRaceUi,StudioRaceRunnerUi};
+pub(crate) use studio_race::leaderboard_bounds;
+mod ttf_font;
+pub(crate) use ttf_font::{
+    list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
+    STUDIO_PACKAGED_FONTS,
+};
+pub(crate) use studio_race::draw_labels as draw_studio_labels;
+mod studio_race_map;
+pub(crate) use studio_race_map::{StudioRaceMap, MAX_MAP_TRIANGLES};
 mod console;
 mod demo;
 mod frametime_graph;
@@ -21,6 +32,8 @@ mod tile_cost;
 pub(crate) use tile_cost::{build_tile_cost_vertices, TileCostView};
 mod diagnostics;
 mod geometry;
+mod combat_effects;
+pub(crate) use combat_effects::{build_combat_hud_vertices, UiZoomScope, UiRocketLock};
 mod hud;
 pub(crate) mod movement_components;
 mod inspector;
@@ -40,7 +53,7 @@ pub use compose::{
 use console::{build_console, rect_gradient, with_alpha, CONSOLE_CHAR_HEIGHT, CONSOLE_CHAR_WIDTH};
 pub use console::{
     console_help_hit, console_suggest_chip_hit, console_suggest_detail_line_count,
-    console_suggest_hit, console_text_hit, console_visible_line_capacity,
+    console_suggest_hit, console_text_hit, console_visible_line_capacity, console_wrap_columns,
 };
 use demo::build_demo_timeline;
 use diagnostics::{build_fps_simple, build_perf, build_reflection_debug_legend, perf_panel_rect};
@@ -50,6 +63,7 @@ use hud::crosshair::build_crosshair;
 pub use hud::crosshair::build_crosshair_vertices;
 use hud::crosshair::{build_crosshair_name, build_force_select, hud_line};
 use hud::weapons::build_weapon_select;
+use hud::inventory::build_inventory_select;
 use hud::draw::{
     build_hud, lighten, CHATBOX_CUTOFF, CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
@@ -60,16 +74,17 @@ pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
+pub(crate) use hud::layout::{hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
 pub(crate) use hud::movement::visible_jka_chars;
 use hud::movement::{
     build_lagometer, build_movement_keys, build_race_timer, build_speedometer, build_strafe_helper,
     center_print_lines, icon_cell_uv, movement_keys_origin, ICON_CROSSHAIR_BASE, ICON_FORCE_BASE,
     ICON_TEXTURE_SOURCE, TEAM_ICON_TEXTURE_SOURCE,
 };
-pub use hud::movement::{ICON_CELL, ICON_COLUMNS, ICON_ROWS, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
-pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF};
+pub use hud::movement::{ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF, ICON_INVENTORY_BASE};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
-use hud::scores::{build_game_timer, build_mini_scores};
+use hud::scores::{build_enemy_info, build_game_timer, build_hud_score, build_mini_scores};
 use hud::siege::build_siege_hud;
 use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_cell};
 use inspector::surface_inspector_frame;
@@ -120,8 +135,8 @@ pub use settings::rendering::{
     VIDEO_ROW_DYNAMIC_LIGHTS, VIDEO_ROW_DYNAMIC_LIGHT_DEBUG, VIDEO_ROW_DYNAMIC_SHADOWS,
     VIDEO_ROW_EMISSIVE_AREA_LIGHTS, VIDEO_ROW_PROMOTE_FX_LIGHTS,
     VIDEO_ROW_PROMOTE_SHADER_ADDITIVE, VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
-    VIDEO_ROW_PROMOTE_SHADER_GLOW, VIDEO_ROW_PROMOTE_SHADER_LIGHTS,
-    VIDEO_ROW_BAKED_LOCAL_LIGHTS, VIDEO_ROW_BAKED_LOCAL_SHADOWS, VIDEO_ROW_BAKED_LOCAL_GLOW, VIDEO_ROW_BAKED_LOCAL_ADDITIVE, VIDEO_ROW_BAKED_LOCAL_EMISSIVE, VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, VIDEO_ROW_BAKED_LOCAL_FX,
+    VIDEO_ROW_PROMOTE_SHADER_GLOW,
+    VIDEO_ROW_BAKED_LOCAL_GLOW, VIDEO_ROW_BAKED_LOCAL_ADDITIVE, VIDEO_ROW_BAKED_LOCAL_EMISSIVE, VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, VIDEO_ROW_BAKED_LOCAL_FX,
     VIDEO_ROW_ENTITY_AMBIENT_LIGHTING, VIDEO_ROW_ENTITY_SHADOW_LIGHT, VIDEO_ROW_FLARES,
     VIDEO_ROW_FLOAT_LIGHTMAP, VIDEO_ROW_FPS_CAP, VIDEO_ROW_FULLSCREEN, VIDEO_ROW_FX_FPS,
     VIDEO_ROW_FX_FPS_SCOPE, VIDEO_ROW_FX_GEOMETRY, VIDEO_ROW_FX_LOD, VIDEO_ROW_FX_PHYSICS,
@@ -141,7 +156,7 @@ pub use settings::rendering::{
     VIDEO_ROW_CRT_CURVATURE, VIDEO_ROW_CRT_CORNER,
     VIDEO_ROW_VOXEL_PROBE_GI, VIDEO_ROW_VSYNC, VIDEO_ROW_WIREFRAME, VIDEO_ROW_WORLD_LIGHTING,
 };
-pub use settings::video::VideoSettings;
+pub use settings::video::{PlayerBlobShadowSettings, VideoSettings};
 pub use text::{
     build_world_player_label_vertices, fallback_font_rgba, parse_fontdat, ProportionalFont,
     UiVertex,
@@ -198,6 +213,8 @@ pub enum OverlayMode {
     StrafeTrails,
     /// Remote/local race demo browser and synchronized visual ghosts.
     RaceGhosts,
+    /// Persistent map-scoped teleport bookmarks.
+    Telemarks,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -213,6 +230,8 @@ pub enum ChatMode {
 pub struct UiChatLine {
     pub text: String,
     pub alpha: f32,
+    /// Received as `tchat` / `ltchat`, not guessed from the rendered text.
+    pub team: bool,
 }
 
 /// Classic idTech/OpenJK console notify line: a recent console print promoted
@@ -220,6 +239,7 @@ pub struct UiChatLine {
 #[derive(Debug, Clone)]
 pub struct UiConsoleNotifyLine {
     pub text: String,
+    pub team: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +309,9 @@ pub(in crate) fn shared_player_icon_paths(ui: &UiSnapshot) -> Vec<String> {
     if let Some(UiMiniScores::Duel { icon_paths, .. }) = ui.mini_scores.as_ref() {
         paths.extend(icon_paths.iter().cloned());
     }
+    if let Some(enemy) = ui.enemy_info.as_ref() {
+        paths.extend(enemy.icon_paths.iter().cloned());
+    }
     if let Some(board) = ui.scoreboard.as_ref() {
         paths.extend(board.icon_paths.iter().cloned());
     }
@@ -299,12 +322,17 @@ pub(in crate::ui) fn duel_icon_atlas_offset(ui: &UiSnapshot) -> usize {
     ui.team_overlay.as_ref().map_or(0, |overlay| overlay.icon_paths.len())
 }
 
-pub(in crate::ui) fn scoreboard_icon_atlas_offset(ui: &UiSnapshot) -> usize {
+pub(in crate::ui) fn enemy_icon_atlas_offset(ui: &UiSnapshot) -> usize {
     duel_icon_atlas_offset(ui)
         + match ui.mini_scores.as_ref() {
             Some(UiMiniScores::Duel { icon_paths, .. }) => icon_paths.len(),
             _ => 0,
         }
+}
+
+pub(in crate::ui) fn scoreboard_icon_atlas_offset(ui: &UiSnapshot) -> usize {
+    enemy_icon_atlas_offset(ui)
+        + ui.enemy_info.as_ref().map_or(0, |enemy| enemy.icon_paths.len())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +607,17 @@ pub struct UiWorldPlayerLabel {
     pub text: String,
     pub health_fraction: Option<f32>,
     pub health_color: [f32; 4],
+}
+
+/// A Render Studio player name, already projected through the shot camera:
+/// `pos` in 0..1 of the output frame (x right, y down).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiStudioLabel {
+    pub color: [f32; 4],
+    pub pos: [f32; 2],
+    pub text: String,
+    pub alpha: f32,
+    pub scale: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -953,6 +992,14 @@ pub struct UiForceSelect {
 /// Temporary TaystJK `CG_DrawWeaponSelect` HUD. This is client-local input
 /// state plus the predicted inventory, not the server's equipped weapon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiInventorySelect {
+    /// HI_* holdable tag, not a bg_itemlist index.
+    pub selected: u8,
+    /// STAT_HOLDABLE_ITEMS bitmask indexed by HI_* tags.
+    pub owned_bits: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiWeaponSelect {
     pub selected: u8,
     pub owned_bits: u32,
@@ -962,6 +1009,23 @@ pub struct UiWeaponSelect {
     pub ammo_available_bits: u32,
     /// `fd.saberDrawAnimLevel`: 6 = dual, 7 = staff.
     pub saber_style: i32,
+}
+
+/// TaystJK `cg_drawScore` content, independent of `cg_drawScores`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiHudScore {
+    pub lines: Vec<String>,
+    pub offset: [f32; 2],
+}
+
+/// TaystJK `CG_DrawEnemyInfo` upper-right player icon/text and duel health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiEnemyInfo {
+    pub icon_paths: Vec<String>,
+    pub title: String,
+    pub name: Option<String>,
+    pub detail: Option<String>,
+    pub health: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1006,6 +1070,7 @@ pub struct UiSiegeHud {
 
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
+    pub studio_race: Option<studio_race::StudioRaceUi>,
     /// The live frontend Main page: render it at its original color and contrast.
     pub frontend_main_scene: bool,
     pub setup_selected: usize,
@@ -1018,6 +1083,8 @@ pub struct UiSnapshot {
     pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
     pub console_scroll: usize,
     pub console_size: ConsoleSize,
+    /// Character scale for console log and prompt; independent of HUD and popup UI.
+    pub console_scale: f32,
     pub console_selection: Option<ConsoleSelection>,
     pub console_search_open: bool,
     pub console_search_query: String,
@@ -1025,6 +1092,8 @@ pub struct UiSnapshot {
     pub console_search_index: Option<usize>,
     pub console_search_matches: Vec<ConsoleSearchMatch>,
     pub console_search_active: Option<ConsoleSearchMatch>,
+    /// Every visible piece of an active search hit spanning multiple rows.
+    pub console_search_active_spans: Vec<ConsoleSearchMatch>,
     pub console_path_links: Vec<ConsolePathLinkUi>,
     /// Total retained log lines and how many the view is scrolled up from the newest.
     pub console_total_lines: usize,
@@ -1048,6 +1117,8 @@ pub struct UiSnapshot {
     pub game_timer: Option<String>,
     /// TaystJK `cg_drawScores` compact score HUD.
     pub mini_scores: Option<UiMiniScores>,
+    pub hud_score: Option<UiHudScore>,
+    pub enemy_info: Option<UiEnemyInfo>,
     /// TaystJK/OpenJK Siege round/timed/respawn/stat-viewer presentation.
     pub siege_hud: Option<UiSiegeHud>,
     /// jaPRO `cg_raceTimer` / `cg_raceStart` readout (updates every frame of a run).
@@ -1065,6 +1136,13 @@ pub struct UiSnapshot {
     pub hud: Option<HudState>,
     pub team_overlay: Option<TeamOverlayUi>,
     pub hud_layout: HudLayout,
+    /// Studio layouts are stored as 1280x720-relative offsets. The render
+    /// source applies them at its actual offscreen dimensions (preview/export).
+    pub studio_hud_virtual_layout: bool,
+    /// Render Studio player names (projected), and whether the crosshair name
+    /// shows without the crosshair itself.
+    pub studio_world_labels: Vec<UiStudioLabel>,
+    pub studio_crosshair_name: bool,
     /// Cached draw list from the extension worker (no per-render-frame scripting).
     pub extension_hud: Vec<crate::extensions::PlacedHudWidget>,
     /// Native elements the running extensions replace. Read through `native_hidden()`.
@@ -1076,6 +1154,11 @@ pub struct UiSnapshot {
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
     pub force_select: Option<UiForceSelect>,
     pub weapon_select: Option<UiWeaponSelect>,
+    pub inventory_select: Option<UiInventorySelect>,
+    /// TaystJK CG_DrawZoomMask (zoomMode from predicted playerState).
+    pub(crate) zoom_scope: Option<UiZoomScope>,
+    /// TaystJK CG_DrawRocketLocking (server-authoritative rocketLockIndex).
+    pub(crate) rocket_lock: Option<UiRocketLock>,
     /// Render-thread-owned UV coordinates for native-resolution icons. Kept
     /// across incoming app snapshots; empty until the atlas is lazily loaded.
     pub(crate) icon_atlas_uvs: Vec<([f32; 2], [f32; 2])>,
@@ -1120,6 +1203,7 @@ impl Default for UiSnapshot {
             console_line_kinds: Vec::new(),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,
+            console_scale: 1.0,
             console_selection: None,
             console_search_open: false,
             console_search_query: String::new(),
@@ -1127,6 +1211,7 @@ impl Default for UiSnapshot {
             console_search_index: None,
             console_search_matches: Vec::new(),
             console_search_active: None,
+            console_search_active_spans: Vec::new(),
             console_path_links: Vec::new(),
             console_total_lines: 0,
             console_scrolled: 0,
@@ -1144,6 +1229,8 @@ impl Default for UiSnapshot {
             follow_name: None,
             game_timer: None,
             mini_scores: None,
+            hud_score: None,
+            enemy_info: None,
             siege_hud: None,
             race_timer: None,
             race_components: [false; 2],
@@ -1155,6 +1242,10 @@ impl Default for UiSnapshot {
             hud: None,
             team_overlay: None,
             hud_layout: HudLayout::default(),
+            studio_hud_virtual_layout: false,
+            studio_race: None,
+            studio_world_labels: Vec::new(),
+            studio_crosshair_name: false,
             extension_hud: Vec::new(),
             native_hidden: crate::extensions::NativeHudMask::default(),
             extension_images: Vec::new(),
@@ -1162,6 +1253,9 @@ impl Default for UiSnapshot {
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,
             weapon_select: None,
+            inventory_select: None,
+            zoom_scope: None,
+            rocket_lock: None,
             icon_atlas_uvs: Vec::new(),
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
@@ -1204,3 +1298,5 @@ impl UiSnapshot {
             .unwrap_or_else(|| hud::movement::icon_cell_uv(index))
     }
 }
+
+pub(crate) use studio_race::draw as draw_studio_race;

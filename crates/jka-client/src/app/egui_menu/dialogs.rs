@@ -172,7 +172,15 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_live_join_pipeline(&mut self, root: &mut egui::Ui) {
-        let Some(join) = self.live_join_ui.clone() else {
+        let Some(join) = self.live_join_ui.clone().or_else(|| {
+            self.net.as_ref().map(|net| crate::app::LiveJoinUiState {
+                map_name: self.loading.as_ref().map_or_else(
+                    || net.server_name.clone(), |loading| loading.name.clone(),
+                ),
+                phase: LiveJoinUiPhase::CheckingContent,
+                detail: "Waiting for the server to accept the connection...".into(),
+            })
+        }) else {
             return;
         };
 
@@ -221,6 +229,20 @@ impl App {
                     )),
                     package_line,
                 )
+            } else if let Some(net) = self.net.as_ref().filter(|net| !net.session().has_gamestate()) {
+                use jka_protocol::session::ConnectionState;
+                let (phase, fraction) = match net.state() {
+                    ConnectionState::Connecting => ("AWAITING CHALLENGE", 0.02),
+                    ConnectionState::Challenging => ("AWAITING CONNECTION", 0.05),
+                    _ => ("AWAITING GAMESTATE", 0.10),
+                };
+                let pending_map = self.loading.as_ref().map(|loading| (
+                    loading.progress_fraction(),
+                    format!("Loading {} asynchronously (not yet connected)", loading.name),
+                    false,
+                ));
+                (phase, "Map preloading does not mean you have joined the server.".to_owned(),
+                    fraction, pending_map, None)
             } else if let Some(loading) = self.loading.as_ref() {
                 let fraction = loading.progress_fraction();
                 let (phase, detail) = if loading.preparation_finished {
@@ -242,6 +264,9 @@ impl App {
                     Some((fraction, format!("Preparing {}", loading.name), false)),
                     None,
                 )
+            } else if self.net.is_some() {
+                ("AWAITING SNAPSHOT", "Gamestate received; waiting for the first active server snapshot and client initialization...".to_owned(),
+                    0.98, None, None)
             } else {
                 match join.phase {
                     LiveJoinUiPhase::CheckingContent => {
@@ -253,6 +278,7 @@ impl App {
                 }
             };
 
+        let mut cancel_join = false;
         egui::Area::new(egui::Id::new("live_join_pipeline"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -322,8 +348,15 @@ impl App {
                                 });
                             }
                         });
+                        ui.add_space(16.0);
+                        if theme::ghost_button(ui, "CANCEL CONNECTION").clicked() {
+                            cancel_join = true;
+                        }
                     });
             });
+        if cancel_join {
+            self.disconnect_to_main_menu();
+        }
     }
 
     pub(in crate::app::egui_menu) fn egui_download_dialog(&mut self, root: &mut egui::Ui) {

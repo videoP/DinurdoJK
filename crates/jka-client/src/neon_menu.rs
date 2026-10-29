@@ -4,8 +4,12 @@
 //! whenever something changes. Nothing here depends on egui or wgpu.
 pub(crate) mod font;
 pub(crate) mod layout;
+pub(crate) mod submenu;
+pub(crate) mod footer;
 
-pub(crate) const ITEM_COUNT: usize = 8;
+pub(crate) const ITEM_COUNT: usize = 7;
+/// Shared visual/audio reveal time for the Main menu.
+pub(crate) const REVEAL_SECS: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -16,7 +20,6 @@ pub(crate) enum Item {
     ChatLogs,
     Screenshots,
     DeveloperTools,
-    Quit,
 }
 
 /// Visual weight of an entry. Groups also decide the neon gas colour.
@@ -25,7 +28,6 @@ pub(crate) enum Group {
     Hero,
     Primary,
     Utility,
-    Exit,
 }
 
 pub(crate) struct ItemInfo {
@@ -50,9 +52,36 @@ pub(crate) const ITEMS: [ItemInfo; ITEM_COUNT] = [
         blurb: "Browse screenshots from base and every mod, inspect capture metadata, or return to a saved spot." },
     ItemInfo { item: Item::DeveloperTools, label: "DEVELOPER TOOLS", group: Group::Utility,
         blurb: "Browse and inspect game assets and source maps." },
-    ItemInfo { item: Item::Quit, label: "QUIT", group: Group::Exit,
-        blurb: "Exit DinurdoJK and return to the desktop." },
 ];
+
+/// The same authored neon/CRT renderer handles Main, Play and Developer Tools.
+/// The submenu descriptions feed the *in-world* television, not a 2D tooltip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum MenuPage { Main, Play, DeveloperTools }
+
+pub(crate) const PLAY_ITEMS: [ItemInfo; 3] = [
+    ItemInfo { item: Item::Play, label: "JOIN A GAME", group: Group::Hero,
+        blurb: "Browse Internet, LAN, favorites, and recent servers." },
+    ItemInfo { item: Item::Play, label: "SOLO GAME", group: Group::Primary,
+        blurb: "Browse compiled maps on the active JKA asset path." },
+    ItemInfo { item: Item::Play, label: "PLAY DEMO", group: Group::Utility,
+        blurb: "Browse and play Jedi Academy demo recordings." },
+];
+pub(crate) const DEV_ITEMS: [ItemInfo; 4] = [
+    ItemInfo { item: Item::DeveloperTools, label: "ASSET VIEWER", group: Group::Hero,
+        blurb: "Browse models, shaders, FX, animations, and other assets." },
+    ItemInfo { item: Item::DeveloperTools, label: "RENDER STUDIO", group: Group::Primary,
+        blurb: "Edit demos, cameras, animation timelines, lighting, and exports." },
+    ItemInfo { item: Item::DeveloperTools, label: "MAP VIEWER", group: Group::Utility,
+        blurb: "Browse source .map files and launch the map editor." },
+    ItemInfo { item: Item::DeveloperTools, label: "PK3 MANAGER", group: Group::Utility,
+        blurb: "Inspect installed game packages and enable or disable their asset mounts." },
+];
+impl MenuPage {
+    pub(crate) fn entries(self) -> &'static [ItemInfo] {
+        match self { Self::Main => &ITEMS, Self::Play => &PLAY_ITEMS, Self::DeveloperTools => &DEV_ITEMS }
+    }
+}
 
 pub(crate) const TITLE: &str = "DINURDOJK";
 
@@ -73,6 +102,7 @@ pub(crate) fn tv_corners(aspect: f32) -> [[f32; 2]; 4] {
 /// renderer animates everything (ignition, wipes, drips) from these edges.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MenuFrame {
+    pub page: MenuPage,
     pub layout: layout::MenuLayout,
     /// Last entry the player pointed at or moved to; the lightbox and the
     /// CRT keep showing it.
@@ -87,4 +117,24 @@ pub(crate) struct MenuFrame {
     pub revealed: bool,
     /// 0 = cached still, 1 = live world. Only affects the background pixels.
     pub live_scene_blend: f32,
+}
+
+/// Static WGPU text and footer geometry for the frontend neon chrome.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChromeLine {
+    pub text: String,
+    pub position: layout::TextLine,
+    pub gas: [f32; 3],
+    pub power: f32,
+    pub tube_scale: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChromeFrame {
+    pub lines: Vec<ChromeLine>,
+    pub footer: footer::FooterLayout,
+    pub back_hovered: bool,
+    pub quit_hovered: bool,
+    pub apply_hovered: bool,
+    pub dimmed: bool,
 }

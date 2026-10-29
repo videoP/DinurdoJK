@@ -71,7 +71,7 @@ impl App {
         }
     }
 
-    fn reset_demo_browser_catalog(&mut self) {
+    pub(in crate::app::egui_menu) fn reset_demo_browser_catalog(&mut self) {
         self.demo_catalog_loaded = false;
         self.demo_catalog_pending = false;
         self.demo_catalog_generation = self.demo_catalog_generation.wrapping_add(1);

@@ -159,13 +159,13 @@ impl App {
             }
         }
         if stop_recording {
-            let active_dir = jka_assets::pk3::active_game_directory(&self.base, self.game.as_deref());
-            if let Err(error) = self.strafe_trails.set_log_name(active_dir, "0") {
+            let active_dir = jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref());
+            if let Err(error) = self.strafe_trails.set_log_name(&active_dir, "0") {
                 self.push_console_line(format!("^1cg_logStrafeTrail:^7 {error}"));
             } else { settings_changed = true; }
         } else if let Some(name) = start_recording {
-            let active_dir = jka_assets::pk3::active_game_directory(&self.base, self.game.as_deref());
-            if let Err(error) = self.strafe_trails.set_log_name(active_dir, &name) {
+            let active_dir = jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref());
+            if let Err(error) = self.strafe_trails.set_log_name(&active_dir, &name) {
                 self.push_console_line(format!("^1cg_logStrafeTrail:^7 {error}"));
             } else { settings_changed = true; }
         }

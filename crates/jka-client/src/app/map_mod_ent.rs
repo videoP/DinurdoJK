@@ -1,8 +1,8 @@
 //! OpenJK-compatible full-entity-lump (.ent) import/export for local placement edits.
-//! This editor deliberately imports only *additive* MD3/inline placements;
+//! This editor imports additive MD3/inline/FX placements and startup shader remaps;
 //! external .ent edits to baked BSP entities require a full entity editor.
 use super::*;
-use super::egui_model_placement::{BmodelPlacement, FxPlacement, ModelPlacement, PlacementKind, bmodel_pivot};
+use super::egui_model_placement::{BmodelPlacement, FxPlacement, ModelPlacement, bmodel_pivot};
 use jka_assets::bsp::{Bsp, Entity, MAX_FILE_BYTES};
 use jka_assets::pk3::AssetSearchPath;
 use std::path::PathBuf;
@@ -147,6 +147,14 @@ fn fx_entity(p: &FxPlacement) -> Entity {
         ("_dinurdo_placement", "fx".into())])
 }
 
+/// JKA startup shader remap, represented as a trigger_always spawn entity.
+/// Do not add private keys: third-party JKA parsers expect the standard pair.
+fn shader_remap_entity(from: &str, to: &str) -> Entity {
+    entity(&[("classname", "trigger_always".into()),
+        ("targetShaderName", from.to_owned()),
+        ("targetShaderNewName", to.to_owned())])
+}
+
 fn clean_map_name(label: &str) -> Result<&str, String> {
     let name = label.strip_suffix(".bsp").ok_or(".ent export requires a loaded BSP map")?;
     if name.is_empty() || name.split('/').any(|part| part.is_empty() ||
@@ -169,7 +177,7 @@ impl App {
     fn map_mod_path(&self) -> Result<PathBuf, String> {
         clean_map_name(&self.model_placement.map_label)?;
         let name = clean_ent_name(&self.model_placement.ent_filename)?;
-        Ok(self.game.as_deref().unwrap_or(&self.base).join("mapmods").join(name))
+        Ok(self.game_write_path("mapmods").join(name))
     }
     fn map_mod_base_entities(&self) -> Result<Vec<Entity>, String> {
         let name = clean_map_name(&self.model_placement.map_label)?;
@@ -201,7 +209,7 @@ impl App {
         if !overwrite && self.map_mod_path()?.exists() {
             let imported = self.import_map_mod()?;
             self.enter_placement_edit();
-            return Ok(format!("{imported}. Edit mode on: aim at a model or effect, LMB picks it up, E toggles"));
+            return Ok(format!("{imported}. Edit mode on: LMB drags selected objects; Map Mods explicitly exits editing"));
         }
         self.model_placement.placed = props
             .iter()
@@ -228,7 +236,7 @@ impl App {
         // and stages the placements for the in-game placement tool.
         let imported = self.import_map_mod()?;
         self.enter_placement_edit();
-        Ok(format!("{exported}. {imported}. Edit mode on: aim at a model, LMB picks it up, E toggles"))
+        Ok(format!("{exported}. {imported}. Edit mode on: LMB drags selected objects; Map Mods explicitly exits editing"))
     }
 
     pub(in crate::app) fn open_map_mods(&mut self) {
@@ -252,6 +260,9 @@ impl App {
         merged.extend(self.model_placement.placed.iter().map(md3_entity));
         merged.extend(self.model_placement.bmodel_placed.iter().map(bmodel_entity));
         merged.extend(self.model_placement.fx_placed.iter().map(fx_entity));
+        merged.extend(self.model_placement.authored_remaps.iter()
+            .filter(|(from, to)| *from != *to)
+            .map(|(from, to)| shader_remap_entity(from, to)));
         let data = write_ent(&merged)?;
         let path = self.map_mod_path()?;
         if path.exists() && !self.model_placement.ent_overwrite {
@@ -278,9 +289,10 @@ impl App {
             return Err(format!("Unable to finalize .ent export: {error}"));
         }
         if had_old { let _ = std::fs::remove_file(&backup); }
-        Ok(format!("Exported {} MD3 + {} BMODEL + {} FX placements with BSP entities to {}",
+        self.model_placement.ent_dirty = false;
+        Ok(format!("Exported {} MD3 + {} BMODEL + {} FX + {} shader remaps with BSP entities to {}",
             self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
-            self.model_placement.fx_placed.len(), path.display()))
+            self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len(), path.display()))
     }
     fn import_map_mod(&mut self) -> Result<String, String> {
         let base = self.map_mod_base_entities()?;
@@ -295,6 +307,7 @@ impl App {
         let mut md3 = Vec::new();
         let mut bsp_models = Vec::new();
         let mut effects = Vec::new();
+        let mut remaps = std::collections::BTreeMap::new();
         for (i, entity) in all.iter().enumerate().skip(base.len()) {
             let cls = property(entity, "classname").unwrap_or("");
             if cls.eq_ignore_ascii_case("fx_runner") {
@@ -334,6 +347,15 @@ impl App {
                 let hit = std::array::from_fn(|j| offset[j] +
                     axis[0][j]*pivot[0] + axis[1][j]*pivot[1] + axis[2][j]*pivot[2]);
                 bsp_models.push(BmodelPlacement { model: id, pivot, bounds, hit, angles: a });
+            } else if cls.eq_ignore_ascii_case("trigger_always")
+                && property(entity, "targetShaderName").is_some()
+                && property(entity, "targetShaderNewName").is_some() {
+                let source = scene::canonical_shader_name(property(entity, "targetShaderName").unwrap());
+                let target = scene::canonical_shader_name(property(entity, "targetShaderNewName").unwrap());
+                if source.is_empty() || target.is_empty() {
+                    return Err(format!("entity {i}: empty shader remap name"));
+                }
+                if source != target { remaps.insert(source, target); }
             } else {
                 return Err(format!("entity {i}: {cls} cannot be represented by the placement editor; no changes applied"));
             }
@@ -348,6 +370,17 @@ impl App {
                     .map_err(|error| format!("{}: {error}", placement.qpath))?;
             }
         }
+        let resume_editing = self.model_placement.edit_mode;
+        self.placement_checkpoint(); // importing is a single reversible transaction
+        let previous_remaps = std::mem::replace(&mut self.model_placement.authored_remaps, remaps);
+        let imported_remaps = self.model_placement.authored_remaps.clone();
+        for from in previous_remaps.keys().filter(|from| !imported_remaps.contains_key(*from)) {
+            self.local_remap_shader(from, from);
+        }
+        for (from, to) in &imported_remaps {
+            if previous_remaps.get(from) != Some(to) { self.local_remap_shader(from, to); }
+        }
+        self.shader_remap_ui.disabled.clear();
         self.model_placement.placed = md3;
         self.model_placement.bmodel_placed = bsp_models;
         self.model_placement.fx_placed = effects;
@@ -356,24 +389,35 @@ impl App {
         self.model_placement.fx_hover = None;
         self.model_placement.bmodel_collision_dirty = true;
         self.model_placement.placed_dirty = true;
-        self.model_placement.active = false;
-        self.model_placement.edit_mode = false;
+        self.model_placement.active = resume_editing;
+        self.model_placement.edit_mode = resume_editing;
         self.model_placement.held = None;
         self.model_placement.hover = None;
-        self.model_placement.edit_undo.clear();
+        self.model_placement.editor_selected = None;
+        self.model_placement.editor_drag = None;
+        self.model_placement.editor_mouse_owned = None;
+        self.model_placement.bmodel_hover = None;
         self.model_placement.rotating = false;
         self.model_placement.hit_valid = false;
         self.model_placement.preview_key = None;
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.ensure_inline_instance_capacity();
-        Ok(format!("Imported {} MD3 + {} BMODEL + {} FX placements from {}",
+        self.model_placement.ent_dirty = false;
+        Ok(format!("Imported {} MD3 + {} BMODEL + {} FX + {} shader remaps from {}",
             self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
-            self.model_placement.fx_placed.len(), path.display()))
+            self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len(), path.display()))
     }
     pub(super) fn egui_map_mods(&mut self, root: &mut egui::Ui) {
         let mut action = None;
         let mut close = false;
         let mut edit = false;
+        let mut exit_edit = false;
+        let mut shader_editor = false;
+        let mut undo = false;
+        let mut redo = false;
+        let mut duplicate = false;
+        let mut delete = false;
+        let mut selected_transform = None;
         egui::Window::new("MAP MODS · .ENT IMPORT / EXPORT")
             .id(egui::Id::new("map_mod_ent_dialog"))
             .default_width(610.0).resizable(true).collapsible(false)
@@ -385,28 +429,106 @@ impl App {
                     });
                 });
                 ui.label(format!("BSP: {}", self.model_placement.map_label));
-                ui.label(format!("Staged placements: {} MD3 / {} BMODEL",
-                    self.model_placement.placed.len(), self.model_placement.bmodel_placed.len()));
+                ui.label(format!("Staged: {} MD3 / {} BMODEL / {} FX / {} authored shader remaps",
+                    self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
+                    self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len()));
+                ui.label(if self.model_placement.ent_dirty { "UNSAVED LOCAL CHANGES" } else { "No unsaved local changes" });
+                if let Some(selected) = self.model_placement.editor_selected {
+                    use super::egui_model_placement::EditSelection;
+                    let detail = match selected {
+                        EditSelection::Md3(i) => self.model_placement.placed.get(i)
+                            .map(|p| (format!("MD3 #{i}: {}", p.qpath), p.origin, p.angles, Some(p.scale))),
+                        EditSelection::Bmodel(i) => self.model_placement.bmodel_placed.get(i)
+                            .map(|p| (format!("BMODEL #{i}: *{}", p.model), p.hit, p.angles, None)),
+                        EditSelection::Fx(i) => self.model_placement.fx_placed.get(i)
+                            .map(|p| (format!("FX #{i}: {}", p.effect), p.origin, p.angles, None)),
+                    };
+                    if let Some((name, mut position, mut angles, mut scale)) = detail {
+                        ui.separator();
+                        ui.strong(format!("SELECTED: {name}"));
+                        let mut changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Position");
+                            for i in 0..3 {
+                                ui.label(["X", "Y", "Z"][i]);
+                                changed |= ui.add(egui::DragValue::new(&mut position[i]).speed(1.0)).changed();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Rotation");
+                            for i in 0..3 {
+                                ui.label(["P", "Y", "R"][i]);
+                                changed |= ui.add(egui::DragValue::new(&mut angles[i]).speed(0.5).suffix("°")).changed();
+                            }
+                        });
+                        if let Some(value) = scale.as_mut() {
+                            ui.horizontal(|ui| {
+                                ui.label("Scale");
+                                changed |= ui.add(egui::DragValue::new(value).speed(0.02).range(0.01..=100.0)).changed();
+                            });
+                        }
+                        if changed { selected_transform = Some((selected, position, angles, scale)); }
+                        ui.horizontal(|ui| {
+                            if ui.button("DUPLICATE SELECTED").clicked() { duplicate = true; }
+                            if ui.button("DELETE SELECTED").clicked() { delete = true; }
+                        });
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("EDIT PLACEMENTS").clicked() { edit = true; }
+                    if ui.button("SHADER REMAPS").clicked() { shader_editor = true; }
+                    if ui.button("UNDO").clicked() { undo = true; }
+                    if ui.button("REDO").clicked() { redo = true; }
+                    if self.model_placement.edit_mode && ui.button("EXIT MAP EDITING").clicked() { exit_edit = true; }
+                });
                 ui.separator();
                 ui.label("File name (relative to mapmods/):");
                 ui.add(egui::TextEdit::singleline(&mut self.model_placement.ent_filename)
                     .desired_width(480.0).hint_text("mp/ffa3.ent"));
-                let root_dir = self.game.as_deref().unwrap_or(&self.base).join("mapmods");
+                let root_dir = self.game_write_path("mapmods");
                 ui.small(format!("Folder: {}", root_dir.display()));
                 ui.horizontal(|ui| {
                     if ui.button("IMPORT .ENT (replace local placements)").clicked() { action = Some(false); }
                     if ui.button("EXPORT .ENT").clicked() { action = Some(true); }
-                    if ui.button("EDIT PLACEMENTS (move / copy / delete)").clicked() { edit = true; }
                 });
                 ui.checkbox(&mut self.model_placement.ent_overwrite, "Allow export to overwrite existing .ent file");
                 ui.separator();
                 ui.label("Export writes a complete OpenJK-style entity list: original BSP entities plus your placements.");
-                ui.label("Import is additive-only: it rejects modified original entities and unknown additions to prevent silent map corruption.");
+                ui.label("Import is additive-only; original entities are preserved. Authored remaps export as trigger_always.");
+                ui.small("Edit: Ctrl+LMB on empty space opens Add (MD3 / FX / BMODEL). LMB on an object drags it; Ctrl+drag moves vertically.");
+                ui.small("MMB yaw/pitch · RMB local roll · Ctrl+Z/Y undo/redo · Ctrl+D duplicate · Backspace cancels Add · Esc opens the normal menu.");
                 ui.label("BMODEL geometry remains unscaled. Server behavior/collision depends on the host game module; imports are local previews only.");
                 if !self.model_placement.ent_status.is_empty() { ui.label(&self.model_placement.ent_status); }
             });
+        if let Some((selection, position, angles, scale)) = selected_transform {
+            use super::egui_model_placement::EditSelection;
+            if position.iter().chain(&angles).all(|v| v.is_finite())
+                && scale.is_none_or(|v| v.is_finite() && (0.01..=100.0).contains(&v)) {
+                self.placement_checkpoint();
+                match selection {
+                    EditSelection::Md3(i) => if let Some(p) = self.model_placement.placed.get_mut(i) {
+                        p.origin = position; p.angles = angles;
+                        if let Some(s) = scale { p.scale = s; }
+                        self.model_placement.placed_dirty = true;
+                    },
+                    EditSelection::Bmodel(i) => if let Some(p) = self.model_placement.bmodel_placed.get_mut(i) {
+                        p.hit = position; p.angles = angles;
+                        self.model_placement.bmodel_collision_dirty = true;
+                    },
+                    EditSelection::Fx(i) => if let Some(p) = self.model_placement.fx_placed.get_mut(i) {
+                        p.origin = position; p.angles = angles;
+                    },
+                }
+            }
+        }
+        if duplicate { self.duplicate_selected_placement(); }
+        if delete { self.delete_hovered_placement(); }
         if close { self.set_overlay(OverlayMode::None); }
+        if exit_edit { self.exit_map_editing(); }
         if edit { self.enter_placement_edit(); }
+        if shader_editor { self.open_shader_remap(None); }
+        if undo { self.undo_model_placement(); }
+        if redo { self.redo_model_placement(); }
         if let Some(export) = action {
             let result = if export { self.export_map_mod() } else { self.import_map_mod() };
             self.model_placement.ent_status = match result {
@@ -435,6 +557,15 @@ mod tests {
         assert_eq!(property(&output, "model"), Some("*2"));
         assert!(property(&output, "modelscale").is_none());
         assert_eq!(point(&output).unwrap(), [-195.0, 5.0, -5.0]);
+    }
+    #[test]
+    fn shader_remap_roundtrips_in_trigger_always() {
+        let entity = shader_remap_entity("models/players/tauntaun/tauntaun_body",
+            "models/map_objects/hoth/tauntaun_body_halfeaten");
+        let decoded = parse_ent(&write_ent(&[entity]).unwrap()).unwrap();
+        assert_eq!(property(&decoded[0], "classname"), Some("trigger_always"));
+        assert_eq!(property(&decoded[0], "targetShaderName"), Some("models/players/tauntaun/tauntaun_body"));
+        assert_eq!(property(&decoded[0], "targetShaderNewName"), Some("models/map_objects/hoth/tauntaun_body_halfeaten"));
     }
     #[test]
     fn input_rejects_invalid_or_escaping_filenames() {

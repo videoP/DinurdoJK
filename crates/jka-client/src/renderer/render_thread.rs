@@ -21,6 +21,16 @@ pub(in crate::renderer) struct SnapshotMailbox {
     pub(in crate::renderer) snapshot: RenderSnapshot,
 }
 
+struct StudioSceneLoad {
+    id: u64,
+    cancelled: bool,
+    game: Option<PathBuf>,
+    map: Option<Box<PreparedMap>>,
+    video: crate::ui::VideoSettings,
+    progress: Arc<crate::runtime::LoadProgress>,
+    worker: Option<JoinHandle<Result<Renderer, String>>>,
+}
+
 /// Panic payloads are `&str` or `String` in practice; anything else is reported
 /// as an unknown panic rather than being dropped silently.
 fn panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -171,6 +181,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetFpsCap(..) => "SetFpsCap",
         RenderCommand::SetGamma(..) => "SetGamma",
         RenderCommand::SetGammaMethod(..) => "SetGammaMethod",
+        RenderCommand::SetHardwareGammaActive(..) => "SetHardwareGammaActive",
         RenderCommand::PrepareGammaMethod(..) => "PrepareGammaMethod",
         RenderCommand::SetModelBrightness(..) => "SetModelBrightness",
         RenderCommand::SetDynamicLightBrightness(..) => "SetDynamicLightBrightness",
@@ -217,9 +228,9 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetRtTraceRate(..) => "SetRtTraceRate",
         RenderCommand::SetMapLightSimulation(..) => "SetMapLightSimulation",
         RenderCommand::SetClassicWorldLighting { .. } => "SetClassicWorldLighting",
-        RenderCommand::SetEmissiveAreaLights(..) => "SetEmissiveAreaLights",
-        RenderCommand::SetShaderLightPromotion { .. } => "SetShaderLightPromotion",
-        RenderCommand::SetBakedLocalLights { .. } => "SetBakedLocalLights",
+        RenderCommand::SetAddedMapLightSources(..) => "SetAddedMapLightSources",
+        RenderCommand::SetLampShadowSources(..) => "SetLampShadowSources",
+        RenderCommand::SetEntityFixtureLightingAB(..) => "SetEntityFixtureLightingAB",
         RenderCommand::SetEntityAmbientLighting(..) => "SetEntityAmbientLighting",
         RenderCommand::SetVoxelProbeGi(..) => "SetVoxelProbeGi",
         RenderCommand::SetLocalLightShadows(..) => "SetLocalLightShadows",
@@ -231,6 +242,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetCsmCoverageAB(..) => "SetCsmCoverageAB",
         RenderCommand::SetCullDebug(..) => "SetCullDebug",
         RenderCommand::SetForceUnifiedWorld(..) => "SetForceUnifiedWorld",
+        RenderCommand::SetFoliageWind(..) => "SetFoliageWind",
         RenderCommand::SetPom(..) => "SetPom",
         RenderCommand::SetPlanarReflectionDebug(..) => "SetPlanarReflectionDebug",
         RenderCommand::SetPuddleDebug(..) => "SetPuddleDebug",
@@ -245,7 +257,10 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
         RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
         RenderCommand::SetUi(..) => "SetUi",
+        RenderCommand::SetStreamerSettings(..) => "SetStreamerSettings",
+        RenderCommand::SetCombatUi { .. } => "SetCombatUi",
         RenderCommand::SetNeonMenu(..) => "SetNeonMenu",
+        RenderCommand::SetNeonChrome(..) => "SetNeonChrome",
         RenderCommand::SetNeonMenuCache(..) => "SetNeonMenuCache",
         RenderCommand::SetExtensionHud(..) => "SetExtensionHud",
         RenderCommand::SetTransientUi { .. } => "SetTransientUi",
@@ -257,6 +272,12 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetCompanionEgui { .. } => "SetCompanionEgui",
         RenderCommand::SetAssetPreviewMode(..) => "SetAssetPreviewMode",
         RenderCommand::SetAssetPreviewViewport(..) => "SetAssetPreviewViewport",
+        RenderCommand::SetStudioWorldViewport(..) => "SetStudioWorldViewport",
+        RenderCommand::SetStudioExportSize(..) => "SetStudioExportSize",
+        RenderCommand::CaptureStudioFrame { .. } => "CaptureStudioFrame",
+        RenderCommand::LoadStudioSource { .. } => "LoadStudioSource",
+        RenderCommand::ReleaseStudioSources => "ReleaseStudioSources",
+        RenderCommand::RemoveStudioSource(..) => "RemoveStudioSource",
         RenderCommand::UnloadMap => "UnloadMap",
         RenderCommand::GrowInlineInstances { .. } => "GrowInlineInstances",
         RenderCommand::LoadMap { .. } => "LoadMap",
@@ -265,6 +286,10 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         _ => "unknown command",
     }
 }
+
+/// Prefix of a Studio scene error caused by GPU memory exhaustion. The app
+/// may evict retained demo scenes and retry instead of failing the clip.
+pub const STUDIO_SCENE_OUT_OF_GPU_MEMORY: &str = "Not enough GPU memory for this demo scene";
 
 pub struct RenderThread {
     pub(in crate::renderer) command_tx: Sender<RenderCommand>,
@@ -379,6 +404,9 @@ impl RenderThread {
         let panic_proxy = proxy.clone();
         let join = thread::Builder::new()
             .name("jka-render".into())
+            // Full scene initialization and rendering have large descriptor
+            // frames. Studio can enter an independent scene from this worker.
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     render_thread_main(
@@ -579,6 +607,232 @@ impl Drop for RenderThread {
     }
 }
 
+pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, video: &crate::ui::VideoSettings) {
+    renderer
+        .dynamic_model_renderer
+        .set_fx_zero_alpha_discard(video.fx_zero_alpha_discard);
+    renderer.set_msaa(video.msaa_samples);
+    renderer.set_texture_filter(video.texture_filter);
+    renderer.set_picmip(video.picmip);
+    renderer.set_detail_textures(video.detail_textures);
+    renderer.set_detail_texture_fade(
+        video.detail_texture_fade,
+        video.detail_texture_fade_distance,
+    );
+    renderer.set_wireframe_mask(video.wireframe_mask);
+    renderer.shader_complexity_enabled = video.shader_complexity;
+    renderer.debug_volumes.triggers_enabled = video.draw_triggers;
+    renderer.debug_volumes.clips_enabled = video.draw_clip_brushes;
+    renderer.set_pvs_mode(video.pvs_mode);
+    renderer.set_face_plane_cull(video.face_plane_cull);
+    renderer.set_gamma_method(
+        if video.gamma_method.is_hardware() {
+            crate::gamma::GammaMethod::Shader
+        } else {
+            video.gamma_method
+        },
+    );
+    renderer.set_gamma(video.gamma);
+    renderer.set_model_brightness(video.effective_model_brightness());
+    renderer.set_dynamic_light_brightness(video.effective_dynamic_light_brightness());
+    renderer
+        .surface_deformation
+        .set_mode(&renderer.queue, video.footprints);
+    let effective_lighting = video.effective_relighting();
+    renderer.set_post_effects(PostEffects {
+        thermal_vision: video.thermal_vision,
+        hdr: video.hdr,
+            hdr_paper_white: video.hdr_paper_white,
+            hdr_peak: video.hdr_peak,
+        auto_exposure: video.auto_exposure,
+        tone_mapping: video.tone_mapping,
+        glow: video.glow,
+        halation: video.halation,
+        ssao: video.ssao,
+        static_bsp_ao: video.static_bsp_ao,
+        static_bsp_ao_lightmap: video.static_bsp_ao_lightmap,
+        static_bsp_ao_samples: video.static_bsp_ao_samples,
+        static_bsp_ao_resolution: video.static_bsp_ao_resolution,
+        static_bsp_ao_strength: video.static_bsp_ao_strength,
+        static_bsp_ao_range: video.static_bsp_ao_range,
+        static_bsp_ao_current_cell: video.static_bsp_ao_current_cell,
+        fxaa: video.fxaa,
+        smaa: video.smaa,
+        taa: video.taa,
+        rt_taa: video.rt_taa,
+        contact_shadows: video.contact_shadows,
+        fog_mode: video.fog_mode,
+        fog_strength: video.fog_strength,
+        sun_override: video.sun_override,
+        sun_yaw: video.sun_yaw,
+        sun_pitch: video.sun_pitch,
+        sun_intensity: video.sun_intensity,
+        sun_shadow_strength: video.sun_shadow_strength,
+        sun_lighting: effective_lighting.sun_lighting,
+        sun_color: video.sun_color,
+        sun_visibility: video.sun_visibility,
+        entity_sun_lighting: effective_lighting.entity_sun_lighting,
+        baked_sun_removal: effective_lighting.baked_sun_removal,
+        baked_sun_cache: video.baked_sun_cache,
+        baked_sun_shadow_map: video.baked_sun_shadow_map,
+        baked_sun_edge_softness: video.baked_sun_edge_softness,
+        baked_sun_direct_limit: video.baked_sun_direct_limit,
+        baked_indirect_scale: effective_lighting.baked_indirect_scale,
+        baked_indirect_saturation: effective_lighting.baked_indirect_saturation,
+        baked_indirect_power: effective_lighting.baked_indirect_power,
+        baked_indirect_highlight_preserve: effective_lighting.baked_indirect_highlight_preserve,
+        sky_fractal_override: video.sky_fractal_override,
+        sky_backend: video.sky_backend,
+        blue_water_environment: effective_lighting.blue_water_environment,
+        cloud_backend: video.cloud_backend,
+        cloud_portal_depth: video.cloud_portal_depth,
+        clouds: video.clouds,
+        cloud_type: video.cloud_type,
+        cloud_quality: video.cloud_quality,
+        cloud_coverage: video.cloud_coverage,
+        cloud_height: video.cloud_height,
+        cloud_thickness: video.cloud_thickness,
+        weather_wind: video.weather_wind,
+        wind_visuals: video.wind_visuals,
+        cloud_shadows: video.cloud_shadows,
+        cloud_render_resolution: video.cloud_render_resolution,
+        cloud_temporal: video.cloud_temporal,
+        cloud_temporal_depth_fix: video.cloud_temporal_depth_fix,
+        cloud_shear: video.cloud_shear,
+        cloud_base_variation: video.cloud_base_variation,
+        cloud_shape_evolution: video.cloud_shape_evolution,
+        cloud_terrain_interaction: video.cloud_terrain_interaction,
+        cloud_empty_skip: video.cloud_empty_skip,
+        cloud_aerial: video.cloud_aerial,
+        cloud_sky_ambient: video.cloud_sky_ambient,
+        cloud_history_blend: video.cloud_history_blend,
+        cloud_motion_reject: video.cloud_motion_reject,
+        cloud_history_depth_reject: video.cloud_history_depth_reject,
+        cloud_thickness_variation: video.cloud_thickness_variation,
+        cloud_size: video.cloud_size,
+        rain: video.rain,
+        rain_intensity: video.rain_intensity,
+        rain_density_scale: 1.0,
+        rain_tint: [1.0; 3],
+        rain_frozen: false,
+        snow: false,
+        snow_density_scale: 1.0,
+        snow_frozen: false,
+        legacy_sand_layers: 0,
+        legacy_space_dust_count: 0,
+        legacy_weather_frozen: false,
+        legacy_acid_rain: 0.0,
+        rain_glass: video.rain_glass,
+        puddle_quality: video.puddle_quality,
+        puddle_scatter: video.puddle_scatter,
+        rain_grade: video.rain_grade,
+        reflection_quality: video.reflection_quality,
+        reflection_debug: video.reflection_debug,
+        chromatic_aberration: video.chromatic_aberration,
+        vignette: video.vignette,
+        film_grain_strength: video.film_grain_strength,
+        motion_blur_strength: video.motion_blur_strength,
+        depth_of_field_strength: video.depth_of_field_strength,
+        dof_mode: video.dof_mode,
+        crt_scope: video.crt_scope,
+        crt_style: video.crt_style,
+        crt_quality: video.crt_quality,
+        crt_reference: video.crt_reference,
+        crt_mask: video.crt_mask,
+        crt_scanline: video.crt_scanline,
+        crt_sharpness: video.crt_sharpness,
+        crt_mask_intensity: video.crt_mask_intensity,
+        crt_curvature: video.crt_curvature,
+        crt_corner: video.crt_corner,
+        dof_quality: video.dof_quality,
+        color_lut: video.color_lut,
+        color_lut_strength: video.color_lut_strength,
+        color_grade: video.color_grade,
+        split_toning: video.split_toning,
+    });
+    renderer.set_grass_enabled(video.grass);
+    renderer.set_grass_precompute(video.grass_precompute);
+    renderer.set_grass_mid_lod(video.grass_mid_lod);
+    renderer.set_grass_front_to_back(video.grass_front_to_back);
+    renderer.set_rain_optimizations(
+        video.rain_fast_post,
+        video.rain_water_field,
+        video.rain_fast_vertex,
+        video.rain_lean_depth,
+        video.rain_static_depth,
+        video.rain_opaque_depth,
+        video.rain_lean_models,
+        video.rain_lean_post,
+    );
+    let mut initial_ocean_settings = video.ocean_settings;
+    initial_ocean_settings.wind = video.weather_wind;
+    renderer.set_ocean_settings(initial_ocean_settings);
+    renderer.set_ocean_enabled(video.ocean);
+    renderer.set_gpu_timings(video.gpu_timings);
+    renderer.set_ghoul2_batch_draws(video.ghoul2_batch_draws);
+    renderer.dynamic_model_renderer.model_state_cache = video.model_state_cache;
+    renderer.dynamic_model_renderer.dynamic_batch_draws = video.dynamic_batch_draws;
+    renderer.world_compact_min_draws = video.world_compact_min_draws;
+    renderer.patch_curve_error = video.lod_curve_error;
+    renderer.bsp_model_lod_scale = video.lod_scale;
+    renderer.bsp_model_lod_bias = video.ghoul2_lod_bias;
+    renderer.bsp_model_lod_debug = video.md3_lod_debug;
+    renderer.bsp_model_lod_enabled = video.md3_auto_lod && video.bsp_model_lod;
+    renderer.patch_no_curves = video.no_curves;
+    renderer.patch_speeds = video.speeds;
+    if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(video.model_prepare_threads) {
+        eprintln!("Model packing workers: {error}");
+    }
+    renderer.dynamic_model_renderer.set_md3_geometry_cache(video.md3_geometry_cache);
+    renderer.dynamic_model_renderer.set_model_render_bundles(video.model_render_bundles);
+    renderer.surface_sprite_effect_renderer.resident_enabled = video.surface_sprites_gpu;
+    renderer.surface_sprite_effect_renderer.enabled = video.surface_sprites;
+    if let Err(error) = renderer.set_encoder_finish_threads(video.encoder_finish_threads) {
+        eprintln!("Encoder finish worker: {error}");
+    }
+    renderer.dynamic_model_renderer.set_model_index_upload_cache(video.model_index_upload_cache);
+    renderer.dynamic_model_renderer.ghoul2_batch_key_cache = video.ghoul2_batch_key_cache;
+    renderer.set_gpu_visibility(video.gpu_driven, video.hiz_occlusion);
+    renderer.early_submit_enabled = video.early_submit;
+    renderer.present_copy_enabled = video.present_copy;
+    renderer.texture_compression = video.texture_compression.min(2);
+    renderer.set_draw_inline_models(video.draw_inline_models);
+    renderer.set_inline_transform_mode(video.inline_transform_mode);
+    renderer.set_fragment_shader_mode(video.fragment_shader_mode);
+    renderer.world_sort_mode = video.world_sort_mode.min(1);
+    renderer.post_specialize = video.post_specialize;
+    renderer.color_clear_mode = video.color_clear_mode.min(1);
+    renderer.set_world_stage_debug(video.draw_bsp_model_surfaces, video.world_stage_probe);
+    renderer.set_fast_sky(video.fast_sky);
+    renderer.set_dynamic_lighting(video.dynamic_lights);
+    renderer.set_rt_samples(video.rt_samples);
+    renderer.set_dynamic_light_falloff(video.dynamic_light_falloff);
+    renderer.set_rt_trace_rate(video.rt_trace_rate);
+    renderer.set_map_light_simulation(effective_lighting.map_light_simulation);
+    renderer.set_added_map_light_sources(video.added_map_light_sources());
+    renderer.set_lamp_shadow_sources(video.baked_local_sources);
+    renderer.set_lamp_shadow_ab(video.lamp_shadow_ab);
+    renderer.set_entity_fixture_lighting_ab(video.entity_fixture_lighting_ab);
+    renderer.set_csm_coverage_ab(video.csm_coverage_ab);
+    renderer.set_entity_ambient_lighting(video.entity_ambient_lighting);
+    renderer.set_voxel_probe_gi(video.voxel_probe_gi);
+    renderer.set_local_light_shadows(video.local_light_shadows);
+    renderer.set_tinted_glass(video.tinted_glass);
+    renderer.set_tinted_glass_debug(video.tinted_glass_debug);
+    renderer.set_entity_shadow_light(video.entity_shadow_light);
+    renderer.set_pbr_settings(
+        video.pbr,
+        video.deluxe_mapping,
+        video.deluxe_specular,
+    );
+    renderer.set_cascaded_shadows(video.effective_shadow_mode());
+    renderer.set_cull_debug(video.cull_debug);
+    renderer.set_force_unified_world(video.force_unified_world);
+    renderer.foliage_wind_enabled = video.foliage_wind;
+    renderer.set_pom_enabled(video.pom);
+    renderer.set_planar_reflection_debug(video.planar_reflection_debug);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::renderer) fn render_thread_main(
     window: Arc<Window>,
@@ -635,23 +889,7 @@ pub(in crate::renderer) fn render_thread_main(
             supported_present_modes: format!("{:?}", renderer.present_modes),
         });
     }
-    renderer
-        .dynamic_model_renderer
-        .set_fx_zero_alpha_discard(initial_ui.video.fx_zero_alpha_discard);
-    renderer.set_msaa(initial_ui.video.msaa_samples);
-    renderer.set_texture_filter(initial_ui.video.texture_filter);
-    renderer.set_picmip(initial_ui.video.picmip);
-    renderer.set_detail_textures(initial_ui.video.detail_textures);
-    renderer.set_detail_texture_fade(
-        initial_ui.video.detail_texture_fade,
-        initial_ui.video.detail_texture_fade_distance,
-    );
-    renderer.set_wireframe_mask(initial_ui.video.wireframe_mask);
-    renderer.shader_complexity_enabled = initial_ui.video.shader_complexity;
-    renderer.debug_volumes.triggers_enabled = initial_ui.video.draw_triggers;
-    renderer.debug_volumes.clips_enabled = initial_ui.video.draw_clip_brushes;
-    renderer.set_pvs_mode(initial_ui.video.pvs_mode);
-    renderer.set_face_plane_cull(initial_ui.video.face_plane_cull);
+    apply_scene_video_settings(&mut renderer, &initial_ui.video);
     let mut fps_cap = initial_ui.video.fps_cap;
     let mut input_latelatch = initial_ui.video.input_latelatch;
     // `inputdiag` force-enables GPU timestamps for the capture, because the CPU
@@ -659,222 +897,6 @@ pub(in crate::renderer) fn render_thread_main(
     // that is missing the cap. These two track what to put back afterwards.
     let mut user_gpu_timings = initial_ui.video.gpu_timings;
     let mut diag_forced_gpu_timings = false;
-    renderer.set_gamma_method(
-        if initial_ui.video.gamma_method == crate::gamma::GammaMethod::Hardware {
-            crate::gamma::GammaMethod::Shader
-        } else {
-            initial_ui.video.gamma_method
-        },
-    );
-    renderer.set_gamma(initial_ui.video.gamma);
-    renderer.set_model_brightness(initial_ui.video.effective_model_brightness());
-    renderer.set_dynamic_light_brightness(initial_ui.video.effective_dynamic_light_brightness());
-    renderer
-        .surface_deformation
-        .set_mode(&renderer.queue, initial_ui.video.footprints);
-    renderer.set_post_effects(PostEffects {
-        hdr: initial_ui.video.hdr,
-            hdr_paper_white: initial_ui.video.hdr_paper_white,
-            hdr_peak: initial_ui.video.hdr_peak,
-        auto_exposure: initial_ui.video.auto_exposure,
-        tone_mapping: initial_ui.video.tone_mapping,
-        glow: initial_ui.video.glow,
-        halation: initial_ui.video.halation,
-        ssao: initial_ui.video.ssao,
-        static_bsp_ao: initial_ui.video.static_bsp_ao,
-        static_bsp_ao_lightmap: initial_ui.video.static_bsp_ao_lightmap,
-        static_bsp_ao_samples: initial_ui.video.static_bsp_ao_samples,
-        static_bsp_ao_resolution: initial_ui.video.static_bsp_ao_resolution,
-        static_bsp_ao_strength: initial_ui.video.static_bsp_ao_strength,
-        static_bsp_ao_range: initial_ui.video.static_bsp_ao_range,
-        static_bsp_ao_current_cell: initial_ui.video.static_bsp_ao_current_cell,
-        fxaa: initial_ui.video.fxaa,
-        smaa: initial_ui.video.smaa,
-        taa: initial_ui.video.taa,
-        rt_taa: initial_ui.video.rt_taa,
-        contact_shadows: initial_ui.video.contact_shadows,
-        fog_mode: initial_ui.video.fog_mode,
-        fog_strength: initial_ui.video.fog_strength,
-        sun_override: initial_ui.video.sun_override,
-        sun_yaw: initial_ui.video.sun_yaw,
-        sun_pitch: initial_ui.video.sun_pitch,
-        sun_intensity: initial_ui.video.sun_intensity,
-        sun_shadow_strength: initial_ui.video.sun_shadow_strength,
-        sun_lighting: initial_ui.video.sun_lighting,
-        sun_color: initial_ui.video.sun_color,
-        sun_visibility: initial_ui.video.sun_visibility,
-        entity_sun_lighting: initial_ui.video.entity_sun_lighting,
-        baked_sun_removal: initial_ui.video.baked_sun_removal,
-        baked_sun_cache: initial_ui.video.baked_sun_cache,
-        baked_sun_shadow_map: initial_ui.video.baked_sun_shadow_map,
-        baked_sun_edge_softness: initial_ui.video.baked_sun_edge_softness,
-        baked_sun_direct_limit: initial_ui.video.baked_sun_direct_limit,
-        baked_indirect_scale: initial_ui.video.baked_indirect_scale,
-        baked_indirect_saturation: initial_ui.video.baked_indirect_saturation,
-        baked_indirect_power: initial_ui.video.baked_indirect_power,
-        baked_indirect_highlight_preserve: initial_ui.video.baked_indirect_highlight_preserve,
-        sky_fractal_override: initial_ui.video.sky_fractal_override,
-        sky_backend: initial_ui.video.sky_backend,
-        blue_water_environment: initial_ui.video.blue_water_environment,
-        cloud_backend: initial_ui.video.cloud_backend,
-        cloud_portal_depth: initial_ui.video.cloud_portal_depth,
-        clouds: initial_ui.video.clouds,
-        cloud_type: initial_ui.video.cloud_type,
-        cloud_quality: initial_ui.video.cloud_quality,
-        cloud_coverage: initial_ui.video.cloud_coverage,
-        cloud_height: initial_ui.video.cloud_height,
-        cloud_thickness: initial_ui.video.cloud_thickness,
-        weather_wind: initial_ui.video.weather_wind,
-        wind_visuals: initial_ui.video.wind_visuals,
-        cloud_shadows: initial_ui.video.cloud_shadows,
-        cloud_render_resolution: initial_ui.video.cloud_render_resolution,
-        cloud_temporal: initial_ui.video.cloud_temporal,
-        cloud_temporal_depth_fix: initial_ui.video.cloud_temporal_depth_fix,
-        cloud_shear: initial_ui.video.cloud_shear,
-        cloud_base_variation: initial_ui.video.cloud_base_variation,
-        cloud_shape_evolution: initial_ui.video.cloud_shape_evolution,
-        cloud_terrain_interaction: initial_ui.video.cloud_terrain_interaction,
-        cloud_empty_skip: initial_ui.video.cloud_empty_skip,
-        cloud_aerial: initial_ui.video.cloud_aerial,
-        cloud_sky_ambient: initial_ui.video.cloud_sky_ambient,
-        cloud_history_blend: initial_ui.video.cloud_history_blend,
-        cloud_motion_reject: initial_ui.video.cloud_motion_reject,
-        cloud_history_depth_reject: initial_ui.video.cloud_history_depth_reject,
-        cloud_thickness_variation: initial_ui.video.cloud_thickness_variation,
-        cloud_size: initial_ui.video.cloud_size,
-        rain: initial_ui.video.rain,
-        rain_intensity: initial_ui.video.rain_intensity,
-        rain_density_scale: 1.0,
-        rain_tint: [1.0; 3],
-        rain_frozen: false,
-        snow: false,
-        snow_density_scale: 1.0,
-        snow_frozen: false,
-        legacy_sand_layers: 0,
-        legacy_space_dust_count: 0,
-        legacy_weather_frozen: false,
-        legacy_acid_rain: 0.0,
-        rain_glass: initial_ui.video.rain_glass,
-        puddle_quality: initial_ui.video.puddle_quality,
-        puddle_scatter: initial_ui.video.puddle_scatter,
-        rain_grade: initial_ui.video.rain_grade,
-        reflection_quality: initial_ui.video.reflection_quality,
-        reflection_debug: initial_ui.video.reflection_debug,
-        chromatic_aberration: initial_ui.video.chromatic_aberration,
-        vignette: initial_ui.video.vignette,
-        film_grain_strength: initial_ui.video.film_grain_strength,
-        motion_blur_strength: initial_ui.video.motion_blur_strength,
-        depth_of_field_strength: initial_ui.video.depth_of_field_strength,
-        dof_mode: initial_ui.video.dof_mode,
-        crt_scope: initial_ui.video.crt_scope,
-        crt_style: initial_ui.video.crt_style,
-        crt_quality: initial_ui.video.crt_quality,
-        crt_reference: initial_ui.video.crt_reference,
-        crt_mask: initial_ui.video.crt_mask,
-        crt_scanline: initial_ui.video.crt_scanline,
-        crt_sharpness: initial_ui.video.crt_sharpness,
-        crt_mask_intensity: initial_ui.video.crt_mask_intensity,
-        crt_curvature: initial_ui.video.crt_curvature,
-        crt_corner: initial_ui.video.crt_corner,
-        dof_quality: initial_ui.video.dof_quality,
-        color_lut: initial_ui.video.color_lut,
-        color_lut_strength: initial_ui.video.color_lut_strength,
-        color_grade: initial_ui.video.color_grade,
-        split_toning: initial_ui.video.split_toning,
-    });
-    renderer.set_grass_enabled(initial_ui.video.grass);
-    renderer.set_grass_precompute(initial_ui.video.grass_precompute);
-    renderer.set_grass_mid_lod(initial_ui.video.grass_mid_lod);
-    renderer.set_grass_front_to_back(initial_ui.video.grass_front_to_back);
-    renderer.set_rain_optimizations(
-        initial_ui.video.rain_fast_post,
-        initial_ui.video.rain_water_field,
-        initial_ui.video.rain_fast_vertex,
-        initial_ui.video.rain_lean_depth,
-        initial_ui.video.rain_static_depth,
-        initial_ui.video.rain_opaque_depth,
-        initial_ui.video.rain_lean_models,
-        initial_ui.video.rain_lean_post,
-    );
-    let mut initial_ocean_settings = initial_ui.video.ocean_settings;
-    initial_ocean_settings.wind = initial_ui.video.weather_wind;
-    renderer.set_ocean_settings(initial_ocean_settings);
-    renderer.set_ocean_enabled(initial_ui.video.ocean);
-    renderer.set_gpu_timings(initial_ui.video.gpu_timings);
-    renderer.set_ghoul2_batch_draws(initial_ui.video.ghoul2_batch_draws);
-    renderer.dynamic_model_renderer.model_state_cache = initial_ui.video.model_state_cache;
-    renderer.dynamic_model_renderer.dynamic_batch_draws = initial_ui.video.dynamic_batch_draws;
-    renderer.world_compact_min_draws = initial_ui.video.world_compact_min_draws;
-    renderer.patch_curve_error = initial_ui.video.lod_curve_error;
-    renderer.bsp_model_lod_scale = initial_ui.video.lod_scale;
-    renderer.bsp_model_lod_bias = initial_ui.video.ghoul2_lod_bias;
-    renderer.bsp_model_lod_debug = initial_ui.video.md3_lod_debug;
-    renderer.bsp_model_lod_enabled = initial_ui.video.md3_auto_lod && initial_ui.video.bsp_model_lod;
-    renderer.patch_no_curves = initial_ui.video.no_curves;
-    renderer.patch_speeds = initial_ui.video.speeds;
-    if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(initial_ui.video.model_prepare_threads) {
-        eprintln!("Model packing workers: {error}");
-    }
-    renderer.dynamic_model_renderer.set_md3_geometry_cache(initial_ui.video.md3_geometry_cache);
-    renderer.dynamic_model_renderer.set_model_render_bundles(initial_ui.video.model_render_bundles);
-    renderer.surface_sprite_effect_renderer.resident_enabled = initial_ui.video.surface_sprites_gpu;
-    renderer.surface_sprite_effect_renderer.enabled = initial_ui.video.surface_sprites;
-    if let Err(error) = renderer.set_encoder_finish_threads(initial_ui.video.encoder_finish_threads) {
-        eprintln!("Encoder finish worker: {error}");
-    }
-    renderer.dynamic_model_renderer.set_model_index_upload_cache(initial_ui.video.model_index_upload_cache);
-    renderer.dynamic_model_renderer.ghoul2_batch_key_cache = initial_ui.video.ghoul2_batch_key_cache;
-    renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
-    renderer.early_submit_enabled = initial_ui.video.early_submit;
-    renderer.present_copy_enabled = initial_ui.video.present_copy;
-    renderer.texture_compression = initial_ui.video.texture_compression.min(2);
-    renderer.set_draw_inline_models(initial_ui.video.draw_inline_models);
-    renderer.set_inline_transform_mode(initial_ui.video.inline_transform_mode);
-    renderer.set_fragment_shader_mode(initial_ui.video.fragment_shader_mode);
-    renderer.world_sort_mode = initial_ui.video.world_sort_mode.min(1);
-    renderer.post_specialize = initial_ui.video.post_specialize;
-    renderer.color_clear_mode = initial_ui.video.color_clear_mode.min(1);
-    renderer.set_world_stage_debug(initial_ui.video.draw_bsp_model_surfaces, initial_ui.video.world_stage_probe);
-    renderer.set_fast_sky(initial_ui.video.fast_sky);
-    renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
-    renderer.set_rt_samples(initial_ui.video.rt_samples);
-    renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
-    renderer.set_rt_trace_rate(initial_ui.video.rt_trace_rate);
-    renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
-    renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
-    let mut shader_light_mask = 0_u32;
-    if initial_ui.video.promote_shader_glow {
-        shader_light_mask |= crate::materials::SHADER_LIGHT_GLOW;
-    }
-    if initial_ui.video.promote_shader_additive {
-        shader_light_mask |= crate::materials::SHADER_LIGHT_ADDITIVE;
-    }
-    if initial_ui.video.promote_shader_emissive {
-        shader_light_mask |= crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION;
-    }
-    renderer.set_shader_light_promotion(
-        initial_ui.video.promote_shader_lights,
-        shader_light_mask,
-    );
-    renderer.set_baked_local_lights(initial_ui.video.baked_local_lights, initial_ui.video.baked_local_sources);
-    renderer.set_lamp_shadow_ab(initial_ui.video.lamp_shadow_ab);
-    renderer.set_csm_coverage_ab(initial_ui.video.csm_coverage_ab);
-    renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
-    renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
-    renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
-    renderer.set_tinted_glass(initial_ui.video.tinted_glass);
-    renderer.set_tinted_glass_debug(initial_ui.video.tinted_glass_debug);
-    renderer.set_entity_shadow_light(initial_ui.video.entity_shadow_light);
-    renderer.set_pbr_settings(
-        initial_ui.video.pbr,
-        initial_ui.video.deluxe_mapping,
-        initial_ui.video.deluxe_specular,
-    );
-    renderer.set_cascaded_shadows(initial_ui.video.dynamic_shadows);
-    renderer.set_cull_debug(initial_ui.video.cull_debug);
-    renderer.set_force_unified_world(initial_ui.video.force_unified_world);
-    renderer.set_pom_enabled(initial_ui.video.pom);
-    renderer.set_planar_reflection_debug(initial_ui.video.planar_reflection_debug);
     let mut perf_trace = initial_ui.video.perf_trace;
     renderer.set_ui(initial_ui);
     renderer.set_dynamic_hud(snapshot.hud, snapshot.movement_hud);
@@ -916,6 +938,7 @@ pub(in crate::renderer) fn render_thread_main(
     // Graph stage attribution is only taken from a completed render frame.
     let mut previous_graph_frame_complete = false;
     let mut last_r_speeds = Instant::now();
+    let mut last_fx_diag_gpu = Instant::now();
     let mut last_ocean_mesh_diag = Instant::now();
     let mut last_measured_input_sequence = 0_u64;
     let mut input_latency_samples = 0_u64;
@@ -1018,10 +1041,100 @@ pub(in crate::renderer) fn render_thread_main(
         String,
         Box<crate::scene::PreparedRemapPlan>,
         usize,
+        Option<(u64, crate::scene::ShaderRemapState)>,
     )> = None;
     let mut hdr_capabilities_last_checked = Instant::now();
+    let mut studio_scene_loads: Vec<StudioSceneLoad> = Vec::new();
 
     loop {
+        // Shader/pipeline initialization must not stop presentation of an
+        // already-playing source. Join only finished jobs on the render owner.
+        let mut i = 0;
+        while i < studio_scene_loads.len() {
+            if studio_scene_loads[i].cancelled && studio_scene_loads[i].worker.is_none() {
+                studio_scene_loads.remove(i); continue;
+            }
+            if studio_scene_loads[i].worker.is_none() {
+                // Count cancelled but still-running initializers too: edits
+                // cannot grow another set of GPU resources behind the cache.
+                let occupied = studio_scene_loads.iter().filter(|l| l.worker.is_some()).count();
+                if occupied < 2 {
+                    let load = &mut studio_scene_loads[i];
+                    // Retain prepared scenes, but allocate full-size targets
+                    // only when a scene is actually drawn.
+                    let size = winit::dpi::PhysicalSize::new(1, 1);
+                    load.progress.set("Preparing preview", 0, 0);
+                    let init = Renderer::new_scene(&renderer, load.game.as_deref(), size);
+                    let video = load.video;
+                    let map = load.map.take().unwrap();
+                    let progress = Arc::clone(&load.progress);
+                    let device = renderer.device.clone();
+                    // Renderer initialization needs the same stack budget as
+                    // the primary render thread (large pipeline/future state).
+                    match thread::Builder::new().name("studio-scene-init".into())
+                        .stack_size(8 * 1024 * 1024).spawn(move || {
+                        // Error scopes are per thread, and every allocation of
+                        // this scene happens here: running out of VRAM fails
+                        // this scene instead of hitting wgpu's fatal handler.
+                        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                        let result = block_on(init).map(|mut source| {
+                            apply_scene_video_settings(&mut source, &video);
+                            source.studio_settings_signature = format!("{video:?}");
+                            source.apply_pending_scene_rebuild();
+                            let mut ui = UiSnapshot::default();
+                            ui.video = video;
+                            ui.video.skip_ui = true;
+                            source.set_ui(ui);
+                            progress.set("Uploading map images", 0, 0);
+                            source.load_shared_studio_map(*map, None);
+                            // Not drawn yet: hold 1x1 shadow arrays until it is.
+                            source.set_shadow_arrays_parked(true);
+                            source.set_local_shadow_cache_parked(true);
+                            progress.set("Ready", 1, 1);
+                            source
+                        });
+                        match block_on(oom.pop()) {
+                            Some(error) => Err(format!("{STUDIO_SCENE_OUT_OF_GPU_MEMORY} ({error})")),
+                            None => result,
+                        }
+                    }) {
+                        Ok(worker) => load.worker = Some(worker),
+                        Err(error) => {
+                            let _ = proxy.send_event(UserEvent::StudioSourceReady {
+                                id: load.id, error: Some(error.to_string()), vram: None, scenes: renderer.studio_scenes.len(),
+                            });
+                            studio_scene_loads.remove(i); continue;
+                        }
+                    }
+                }
+            }
+            if !studio_scene_loads[i].worker.as_ref().is_some_and(|w| w.is_finished()) { i += 1; continue; }
+            let load = studio_scene_loads.remove(i);
+            let result = load.worker.unwrap().join().unwrap_or_else(|_| Err("Studio scene initialization panicked".into()));
+            if load.cancelled { continue; }
+            let result = result.map(|source| {
+                #[cfg(test)]
+                if std::env::var_os("DJK_STUDIO_TEST_FOUR_DEMOS").is_some() {
+                    let shared = source.world.as_ref().and_then(|world| renderer.studio_scenes.values()
+                        .filter_map(|s| s.world.as_ref()).find(|previous|
+                            previous.remap_asset_source == world.remap_asset_source && previous.remap_asset_hash == world.remap_asset_hash));
+                    if let (Some(previous), Some(world)) = (shared, source.world.as_ref()) {
+                        let aliases = world.textures.iter().zip(&previous.textures)
+                            .filter(|(a, b)| a._texture == b._texture).count();
+                        assert!(aliases > 0, "same-map Studio views must share GPU texture handles");
+                        println!("[STUDIO TEST] {aliases} world textures alias the other demo view");
+                    }
+                }
+                renderer.studio_last_scene = None;
+                renderer.studio_scenes.insert(load.id, Box::new(source));
+                load.progress.set("Ready", 1, 1);
+            });
+            let vram = super::diagnostics::vram::query(&renderer.adapter.get_info())
+                .map(|v| (v.usage, v.budget));
+            let _ = proxy.send_event(UserEvent::StudioSourceReady {
+                id: load.id, error: result.err(), vram, scenes: renderer.studio_scenes.len(),
+            });
+        }
         let loop_clock = perf_capture.is_some().then(Instant::now);
         let mut loop_sections = LoopSections::default();
         if let (Some(now), Some(returned)) = (loop_clock, last_render_returned.take()) {
@@ -1087,7 +1200,7 @@ pub(in crate::renderer) fn render_thread_main(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderCommands,
             );
-            if let Some((request_id, started, name, map)) = deferred_load_map.take() {
+            if let Some((request_id, started, name, map, studio_world)) = deferred_load_map.take() {
                 let map: Box<PreparedMap> = map;
                 let triangles = map.triangles;
                 let batches = map.batches.len();
@@ -1095,7 +1208,7 @@ pub(in crate::renderer) fn render_thread_main(
                 let bsp_stats = map.bsp_stats.clone();
                 let upload_started = Instant::now();
                 let received_at = load_map_received_at.take().unwrap_or(upload_started);
-                let upload_timings = renderer.load_map(*map);
+                let upload_timings = renderer.load_studio_map(*map, studio_world);
                 let upload_ended_at = Instant::now();
                 let upload_ms = upload_ended_at.duration_since(upload_started).as_secs_f64() * 1000.0;
                 pending_first_world_phases = Some((started, received_at, upload_started, upload_ended_at));
@@ -1104,13 +1217,13 @@ pub(in crate::renderer) fn render_thread_main(
                     upload_timings, timings, bsp_stats,
                 ));
             }
-            if let Some((request_id, started, name, plan, base_texture_count)) = deferred_remap_map.take() {
+            if let Some((request_id, started, name, plan, base_texture_count, studio_world)) = deferred_remap_map.take() {
                 let triangles = plan.base.triangles;
                 let batches = plan.batches.len();
                 let timings = plan.base.load_timings;
                 let bsp_stats = plan.base.bsp_stats.clone();
                 let upload_started = Instant::now();
-                let upload_timings = renderer.load_remapped_map(*plan, base_texture_count);
+                let upload_timings = renderer.load_remapped_map(*plan, base_texture_count, studio_world);
                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                 pending_world_uploaded = Some((
                     request_id, started, name, triangles, batches, upload_ms,
@@ -1122,9 +1235,10 @@ pub(in crate::renderer) fn render_thread_main(
                 pending_world_uploaded.is_some().then(Instant::now);
             loop {
                 let received = command_rx.try_recv();
-                if received.is_ok() {
-                    // A command may have replaced state the mailbox setters own;
-                    // re-apply the current snapshot this frame.
+                if received.is_ok() && !matches!(received.as_ref(), Ok(RenderCommand::SetCombatUi { .. })) {
+                    // Some commands mutate state owned by the render-snapshot
+                    // mailbox. A combat HUD update only touches UI fields and
+                    // must not force cloning/reapplying the world snapshot.
                     applied_snapshot_generation = u64::MAX;
                 }
                 if diag_command_drain_started.is_some() && received.is_ok() {
@@ -1320,6 +1434,9 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetGammaMethod(method)) => {
                         gamma_preparation = None;
                         renderer.set_gamma_method(method);
+                    }
+                    Ok(RenderCommand::SetHardwareGammaActive(active)) => {
+                        renderer.hardware_gamma_active = active;
                     }
                     Ok(RenderCommand::PrepareGammaMethod(generation)) => {
                         renderer.set_gamma_method(crate::gamma::GammaMethod::Hardware);
@@ -1523,11 +1640,11 @@ pub(in crate::renderer) fn render_thread_main(
                             lightmap_only,
                         );
                     }
-                    Ok(RenderCommand::SetEmissiveAreaLights(enabled)) => {
-                        renderer.set_emissive_area_lights(enabled);
+                    Ok(RenderCommand::SetAddedMapLightSources(mask)) => {
+                        renderer.set_added_map_light_sources(mask);
                     }
-                    Ok(RenderCommand::SetBakedLocalLights { enabled, sources }) => {
-                        renderer.set_baked_local_lights(enabled, sources);
+                    Ok(RenderCommand::SetLampShadowSources(sources)) => {
+                        renderer.set_lamp_shadow_sources(sources);
                     }
                     Ok(RenderCommand::SetCsmCoverageAB(enabled)) => {
                         renderer.set_csm_coverage_ab(enabled);
@@ -1535,8 +1652,8 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetLampShadowAB(mode)) => {
                         renderer.set_lamp_shadow_ab(mode);
                     }
-                    Ok(RenderCommand::SetShaderLightPromotion { enabled, mask }) => {
-                        renderer.set_shader_light_promotion(enabled, mask);
+                    Ok(RenderCommand::SetEntityFixtureLightingAB(enabled)) => {
+                        renderer.set_entity_fixture_lighting_ab(enabled);
                     }
                     Ok(RenderCommand::SetEntityAmbientLighting(mode)) => {
                         renderer.set_entity_ambient_lighting(mode);
@@ -1568,6 +1685,9 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetCullDebug(mode)) => {
                         renderer.set_cull_debug(mode);
+                    }
+                    Ok(RenderCommand::SetFoliageWind(enabled)) => {
+                        renderer.foliage_wind_enabled = enabled;
                     }
                     Ok(RenderCommand::SetForceUnifiedWorld(force)) => {
                         renderer.set_force_unified_world(force);
@@ -1676,7 +1796,16 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha }) => renderer.request_video_frame_capture(frame_index, depth, alpha),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::SetStreamerSettings(settings)) => {
+                        renderer.stream_output.set_settings(settings);
+                        if settings.enabled && (renderer.studio_world_viewport.is_some() || renderer.studio_export_size.is_some()) {
+                            renderer.stream_output.pause_unsupported("Spout is disabled in Render Studio");
+                        }
+                    }
+                    Ok(RenderCommand::SetCombatUi { zoom_scope, rocket_lock }) =>
+                        renderer.set_combat_ui(zoom_scope, rocket_lock),
                     Ok(RenderCommand::SetNeonMenu(frame)) => renderer.set_neon_menu(frame),
+                    Ok(RenderCommand::SetNeonChrome(frame)) => renderer.set_neon_chrome(frame),
                     Ok(RenderCommand::SetNeonMenuCache(image)) => renderer.set_neon_menu_cache(image),
                     Ok(RenderCommand::SetExtensionHud(widgets, hidden, images)) => renderer.set_extension_hud(widgets, hidden, images),
                     Ok(RenderCommand::SetTransientUi {
@@ -1688,9 +1817,12 @@ pub(in crate::renderer) fn render_thread_main(
                         crosshair_target,
                         force_select,
                         weapon_select,
+                        inventory_select,
                         follow_name,
                         game_timer,
                         mini_scores,
+                        hud_score,
+                        enemy_info,
                         race_timer,
                         vote_line,
                         scoreboard,
@@ -1708,9 +1840,12 @@ pub(in crate::renderer) fn render_thread_main(
                             crosshair_target,
                             force_select,
                             weapon_select,
+                            inventory_select,
                             follow_name,
                             game_timer,
                             mini_scores,
+                        hud_score,
+                        enemy_info,
                             race_timer,
                             vote_line,
                             scoreboard,
@@ -1770,10 +1905,63 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                     }
                     Ok(RenderCommand::SetAssetPreviewMode(enabled)) => {
+                        if enabled { renderer.park_inactive_studio_views(&[]); }
                         renderer.set_asset_preview_mode(enabled);
                     }
                     Ok(RenderCommand::SetAssetPreviewViewport(viewport)) => {
                         renderer.asset_preview_viewport = viewport;
+                    }
+                    Ok(RenderCommand::SetStudioWorldViewport(viewport)) => {
+                        renderer.studio_world_viewport = viewport;
+                        if viewport.is_some() && renderer.stream_output.enabled() {
+                            // Studio bypasses the gameplay draw path. Stop an
+                            // existing game sender here, before its next frame.
+                            renderer.stream_output.pause_unsupported("Spout is disabled in Render Studio");
+                        }
+                        if viewport.is_none() {
+                            renderer.studio_transition_gpu = None;
+                        }
+                    }
+                    Ok(RenderCommand::SetStudioExportSize(size)) => {
+                        renderer.studio_export_size = size;
+                        if size.is_some() && renderer.stream_output.enabled() {
+                            renderer.stream_output.pause_unsupported("Spout is disabled in Render Studio");
+                        }
+                        if size.is_none() {
+                            renderer.studio_export_target = None;
+                            renderer.studio_export_preview_at = None;
+                            renderer.studio_export_shown = None;
+                            // A cancelled export must not deliver stale frames.
+                            // Dropping the slots also drops any buffer still mapping.
+                            renderer.studio_capture_queue.clear();
+                            renderer.studio_readbacks.clear();
+                            renderer.studio_readback_slots.clear();
+                            renderer.studio_capture_results.clear();
+                            renderer.studio_unpacking.clear();
+                            renderer.studio_readback_generation += 1;
+                        }
+                    }
+                    Ok(RenderCommand::CaptureStudioFrame { frame_index, depth, scene }) => {
+                        renderer.queue_studio_capture(frame_index, depth, scene);
+                    }
+                    Ok(RenderCommand::LoadStudioSource {id,game,map,video,progress}) => {
+                        // Release an old instance before allocating its replacement.
+                        renderer.studio_scenes.remove(&id);
+                        renderer.studio_last_scene = None;
+                        for load in &mut studio_scene_loads {
+                            if load.id == id { load.cancelled = true; }
+                        }
+                        studio_scene_loads.push(StudioSceneLoad { id, game, map: Some(map), video, progress, worker: None, cancelled: false });
+                    }
+                    Ok(RenderCommand::ReleaseStudioSources) => {
+                        renderer.studio_scenes.clear();
+                        renderer.studio_last_scene = None;
+                        for load in &mut studio_scene_loads { load.cancelled = true; }
+                    }
+                    Ok(RenderCommand::RemoveStudioSource(id)) => {
+                        renderer.studio_scenes.remove(&id);
+                        renderer.studio_last_scene = None;
+                        for load in &mut studio_scene_loads { if load.id == id { load.cancelled = true; } }
                     }
                     Ok(RenderCommand::SetAssetPreviewCheckerboard)=>{
                         renderer.asset_preview_background=super::frame::preview_background::PreviewBackground::checkerboard(
@@ -1794,6 +1982,7 @@ pub(in crate::renderer) fn render_thread_main(
                         started,
                         name,
                         map,
+                        studio_world,
                     }) => {
                         // The upload blocks this thread for seconds, and the loading
                         // screen is drawn by this same thread. Hold the map back,
@@ -1801,11 +1990,11 @@ pub(in crate::renderer) fn render_thread_main(
                         // present the latest loading state ("uploading") first; the
                         // upload itself runs at the top of the next iteration.
                         load_map_received_at = Some(Instant::now());
-                        deferred_load_map = Some((request_id, started, name, map));
+                        deferred_load_map = Some((request_id, started, name, map, studio_world));
                         break;
                     }
-                    Ok(RenderCommand::RemapMap { request_id, started, name, plan, base_texture_count }) => {
-                        deferred_remap_map = Some((request_id, started, name, plan, base_texture_count));
+                    Ok(RenderCommand::RemapMap { request_id, started, name, plan, base_texture_count, studio_world }) => {
+                        deferred_remap_map = Some((request_id, started, name, plan, base_texture_count, studio_world));
                         break;
                     }
                     Ok(RenderCommand::Shutdown) => {
@@ -2033,6 +2222,7 @@ pub(in crate::renderer) fn render_thread_main(
                     .count();
             }
             renderer.model_frame_log.set_source(model_source);
+            renderer.studio_lens=snapshot.studio_lens;
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
             if let Some(ocean) = renderer.ocean.as_mut() {
                 ocean.set_lake_actors(&snapshot.ocean_actors);
@@ -2059,6 +2249,19 @@ pub(in crate::renderer) fn render_thread_main(
                     shader_progress_polled_at = Instant::now();
                     renderer.refresh_shader_compile_progress();
                 }
+                // One queued export capture per loop: it delivers this iteration.
+                if let Some(capture) = renderer.studio_capture_queue.pop_front() {
+                    return renderer.render_studio_capture(capture);
+                }
+                if let Some(scene) = snapshot.studio_scene.as_ref().filter(|_|
+                    renderer.studio_world_viewport.is_some() || renderer.studio_export_size.is_some()) {
+                    return renderer.render_studio_scene(scene);
+                }
+                if renderer.studio_world_viewport.is_some() && !renderer.asset_preview_mode {
+                    renderer.dynamic_model_renderer.set_studio_environment(None,&renderer.queue);
+                    renderer.dynamic_model_renderer.set_studio_lights(&[],&renderer.queue);
+                    return renderer.render_asset_preview(&frame_camera,&[]);
+                }
                 renderer.render(
                     &frame_camera,
                     snapshot.player_position,
@@ -2066,6 +2269,7 @@ pub(in crate::renderer) fn render_thread_main(
                     snapshot.dynamic_models.as_slice(),
                     snapshot.spectator_highlights.as_slice(),
                     snapshot.transient_lights.as_slice(),
+                    snapshot.studio_environment,
                     snapshot.companion_scene.as_ref(),
                     snapshot.dof_focus_target,
                     frame_crosshair_world,
@@ -2102,6 +2306,10 @@ pub(in crate::renderer) fn render_thread_main(
         }
         match render_result {
             Ok(info) => {
+                #[cfg(test)]
+                if let Some(scene)=snapshot.studio_scene.as_ref().filter(|_|renderer.studio_world_viewport.is_some()) {
+                    let _=proxy.send_event(UserEvent::StudioTestScenePresented {overlap:scene.incoming.is_some()});
+                }
                 for cue in &info.native_thunder {
                     if cue.loudness<=0.0 {continue;}
                     let proxy=proxy.clone();let cue=*cue;
@@ -2111,6 +2319,20 @@ pub(in crate::renderer) fn render_thread_main(
                     });
                 }
 
+                if crate::fx::diagnostics::enabled()
+                    && last_fx_diag_gpu.elapsed() >= Duration::from_secs(1)
+                {
+                    // Timestamp readback is already asynchronous. Missing
+                    // samples are marked N/A; never trigger a GPU stall here.
+                    let latest = renderer.gpu_profiler.latest;
+                    let gpu_pass = |pass: GpuPass| latest
+                        .and_then(|sample| sample.milliseconds[pass.index()]);
+                    println!("[FX DIAG GPU] mode={:?} active_lights={} cpu_frame_ms={:.3} gpu_frame_ms={:?} gpu_legacy_dlights_ms={:?} gpu_rt_build_ms={:?} gpu_cluster_ms={:?}",
+                        renderer.dynamic_lights_mode, renderer.active_light_count(), info.frame_ms,
+                        gpu_pass(GpuPass::Frame), gpu_pass(GpuPass::LegacyDlights),
+                        gpu_pass(GpuPass::RtBuild), gpu_pass(GpuPass::Cluster));
+                    last_fx_diag_gpu = Instant::now();
+                }
                 if renderer.patch_speeds > 0 && renderer.patch_speeds != 8
                     && last_r_speeds.elapsed() >= Duration::from_secs(1)
                 {
@@ -2395,7 +2617,9 @@ pub(in crate::renderer) fn render_thread_main(
             }
         }
 
-        if let Some(result) = renderer.take_screenshot_result() {
+        // Export readbacks map asynchronously; collect whatever finished.
+        renderer.finish_studio_readbacks(false);
+        while let Some(result) = renderer.take_screenshot_result() {
             let _ = proxy.send_event(UserEvent::ScreenshotFinished(result));
         }
 
@@ -3022,7 +3246,9 @@ pub(in crate::renderer) fn render_thread_main(
         let mut diag_pace_wake_error_ms = 0.0_f64;
         let mut diag_pace_late_before_wait_ms = 0.0_f64;
         let mut diag_pace_anchor_reset = false;
-        if fps_cap > 0 {
+        // A Studio export is a serial request/readback loop: pacing would add
+        // up to a whole frame to each exported frame. Its preview is throttled.
+        if fps_cap > 0 && renderer.studio_export_size.is_none() {
             let target = Duration::from_secs_f64(1.0 / fps_cap as f64);
             let deadline = frame_pace_anchor + target;
             let before_wait = Instant::now();

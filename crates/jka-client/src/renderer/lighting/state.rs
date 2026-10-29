@@ -13,17 +13,13 @@ impl Renderer {
         &self,
         light: &scene::DynamicLight,
     ) -> bool {
+        let sources = self.added_map_light_sources();
         light.shader_promotion_mask != 0
-            && self.shader_light_promotion_enabled
-            && (light.shader_promotion_mask & self.shader_light_promotion_mask) != 0
-            // If this promoted emitter comes from a material that also has
-            // q3map_surfacelight, authored lighting wins while that path is on.
-            // Turning authored area lights off exposes the promotion candidate
-            // immediately for A/B testing without rebuilding the map.
-            && !((self.emissive_area_lights_enabled || (self.baked_local_lights && self.baked_local_sources & super::lightmap_local::AUTHORED != 0))
-                && (light.shader_promotion_mask
-                    & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP)
-                    != 0)
+            && (light.shader_promotion_mask & sources & crate::materials::SHADER_LIGHT_ALL) != 0
+            // Authored emitter wins if it overlaps a shader-promotion candidate.
+            && !(sources & super::lightmap_local::AUTHORED != 0
+                && light.shader_promotion_mask
+                    & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP != 0)
     }
 
     pub(in crate::renderer) fn static_area_light_enabled(
@@ -33,13 +29,12 @@ impl Renderer {
         if light.shader_promotion_mask != 0 {
             self.shader_promoted_area_light_enabled(light)
         } else {
-            self.emissive_area_lights_enabled
+            self.added_map_light_sources() & super::lightmap_local::AUTHORED != 0
         }
     }
 
     pub(in crate::renderer) fn any_area_lights_enabled(&self) -> bool {
-        self.emissive_area_lights_enabled
-            || (self.shader_light_promotion_enabled && self.shader_light_promotion_mask != 0)
+        self.added_map_light_sources() != 0
     }
 
     pub(in crate::renderer) fn transient_dlight_clusters_enabled(&self) -> bool {
@@ -71,7 +66,6 @@ impl Renderer {
         }
         self.transient_lights
             .iter()
-            .filter(|light|!self.baked_fx_duplicate(light))
             .map(|light| {
                 if self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware {
                     light
@@ -112,8 +106,7 @@ impl Renderer {
             return stats;
         }
 
-        let filtered: Vec<_> = self.transient_lights.iter().filter(|light|!self.baked_fx_duplicate(light)).take(transient_count).cloned().collect();
-        let lights=filtered.as_slice();
+        let lights=&self.transient_lights[..transient_count];
         let mut surfaces_per_light = vec![0u32; transient_count];
         for light in lights {
             stats.radius_sum += f64::from(light.radius.max(0.0));
@@ -196,6 +189,7 @@ impl Renderer {
         let enabled=self.runtime_transient_lights_enabled();
         let baked=self.baked_local_lightmap_active();
         let brightness=self.dynamic_light_brightness;
+        let fixture_accents = self.dynamic_model_renderer.fixture_lighting.is_some();
         let models=&mut self.dynamic_model_renderer;
         models.entity_dlights_rt_per_pixel=rt_per_pixel;models.entity_dlights.clear();
         if enabled {
@@ -209,7 +203,8 @@ impl Renderer {
                 // receivers alone consume the baked lightmap.
                 let remaining=MAX_ENTITY_DLIGHTS.saturating_sub(models.entity_dlights.len());
                 models.entity_dlights.extend(world.static_sun.local_lights.iter()
-                    .filter(|(_,light)| !(enabled && light.shader_promotion_mask & super::lightmap_local::FX != 0))
+                    .filter(|(_,light)| !fixture_accents ||
+                        !super::lightmap_local::source_enabled(light, super::lightmap_local::AUTHORED))
                     .take(remaining).map(|(_,light)| EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0)}));
             }
         }
@@ -230,10 +225,9 @@ impl Renderer {
             .active_transient_light_count()
             .min(32)
             .min(self.transient_lights.len());
-        if self.baked_local_lightmap_active() && self.baked_local_sources & super::lightmap_local::FX != 0 {
-            let filtered:Vec<_>=self.transient_lights.iter().filter(|light|!self.baked_fx_duplicate(light)).take(transient_count).cloned().collect();
-            super::legacy_dlight_lists::update_legacy_dlight_masks(&self.queue,world,&filtered);
-        } else { super::legacy_dlight_lists::update_legacy_dlight_masks(&self.queue,world,&self.transient_lights[..transient_count]); }
+        super::legacy_dlight_lists::update_legacy_dlight_masks(
+            &self.queue, world, &self.transient_lights[..transient_count],
+        );
     }
 
     pub(in crate::renderer) fn upload_light_buffer(&self) {
@@ -348,8 +342,7 @@ impl Renderer {
             gpu_lights.extend(
                 self.transient_lights
                     .iter()
-                    .filter(|light|!self.baked_fx_duplicate(light))
-                    .flat_map(|light| {
+                            .flat_map(|light| {
                         transient_light_samples(
                             light,
                             self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,

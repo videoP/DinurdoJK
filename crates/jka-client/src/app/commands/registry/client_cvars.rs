@@ -136,7 +136,7 @@ app_cvars! {
     }
 
     APP_CL_STREAMERMODE {
-        runtime: CvarDef::new("cl_streamerMode", "0", "0|1", "Use a separately filtered stream presentation snapshot; local game is unaffected.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("cl_streamerMode", "0", "0|1", "Publish a separate Spout2 OBS feed with stream-only privacy filters; local view is unchanged.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::Bool(app.streamer.enabled),
             |app, value| {
                 let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
@@ -170,6 +170,26 @@ app_cvars! {
                 if let Some(flag) = parse_bool(value) { settings.streamer.hide_private_messages = flag; }
             }),
             archive: Some((361, |state| format!("{}", u8::from(state.presentation.streamer.hide_private_messages)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CL_STREAMERHIDETEAMCHAT {
+        runtime: CvarDef::new("cl_streamerHideTeamChat", "1", "0|1", "Mask team chat in the stream-only chatbox, console and input.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Bool(app.streamer.hide_team_chat),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!("validated cvar type") };
+                app.streamer.hide_team_chat = enabled;
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(flag) = parse_bool(value) { settings.streamer.hide_team_chat = flag; }
+            }),
+            archive: Some((370, |state| format!("{}", u8::from(state.presentation.streamer.hide_team_chat)))),
             ..CvarBinding::NONE
         },
         implementations: []
@@ -1046,6 +1066,25 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_CG_WALLRUNYAW {
+        runtime: CvarDef::new(
+            "cg_wallRunYaw", "0", "0|1|2|3",
+            "Vertical wallrun camera A/B: 0=raw JKA, 1=hold entry yaw, 2=85 deg/s clamp, 3=reject transient spikes. Presentation only; session-only.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.wallrun_camera_mode.to_string()),
+            |app: &mut App, value| {
+                let mode = value.to_string().parse::<u8>()
+                    .map_err(|_| "cg_wallRunYaw expects 0, 1, 2, or 3".to_owned())?;
+                if mode > 3 { return Err("cg_wallRunYaw expects 0, 1, 2, or 3".to_owned()); }
+                app.wallrun_camera_mode = mode;
+                app.wallrun_camera_yaw = Default::default();
+                Ok(())
+            },
+        ),
+        config: CvarBinding::NONE,
+        implementations: []
     }
 
     APP_CG_SPECCAMERAMOTION {
@@ -1953,6 +1992,42 @@ app_cvars! {
                         self.set_fps_cap(cap);
                     }
                     self.mark_japro_net_userinfo_dirty();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CON_SCALE {
+        runtime: CvarDef::new(
+            "con_scale", "1.0", "0.2..10.0",
+            "TaystJK/JK2MV: scale console characters and prompt; updates immediately.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.console_scale.to_string()),
+            |app, value| App::cvar_set_con_scale(app, "con_scale", &value.to_string()),
+        )
+        .with_text_setter(App::cvar_set_con_scale, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(scale) = value.trim().parse::<f32>() {
+                    if scale.is_finite() {
+                        settings.console_scale = scale.clamp(0.2, 10.0);
+                    }
+                }
+            }),
+            archive: Some((286, |state| state.presentation.console_scale.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_con_scale(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let scale = value.trim().parse::<f32>()
+                        .ok().filter(|scale| scale.is_finite())
+                        .ok_or_else(|| format!("{name}: expected a finite number"))?;
+                    self.console_scale = scale.clamp(0.2, 10.0);
+                    self.console_scroll = self.console_scroll.min(self.console_max_scroll());
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

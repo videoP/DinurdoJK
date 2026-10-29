@@ -1716,6 +1716,36 @@ impl ClientGameState {
         Some(bytes_to_lossless_ascii(name))
     }
 
+    /// TaystJK `CG_ClientList_f` uses the 32 slots in `cgs.clientinfo`,
+    /// where a nonempty CS_PLAYERS configstring makes a client `infoValid`.
+    /// Return the wire-backed data, not scoreboard entries (which can be stale
+    /// or absent), so the command also works in demo playback.
+    pub fn player_id_list(&self) -> Vec<(usize, i32, String, bool)> {
+        (0..MAX_CLIENTS)
+            .filter_map(|slot| {
+                let index = CS_PLAYERS + slot as u16;
+                let info = self.configstring(index)?;
+                if info.is_empty() {
+                    return None;
+                }
+                // Q_strncpyz(newInfo.name, ..., MAX_NETNAME): 35 bytes + NUL.
+                let name = info_value(info, b"n")
+                    .map(|value| bytes_to_lossless_ascii(&value[..value.len().min(35)]))
+                    .unwrap_or_default();
+                let team = info_value(info, b"t")
+                    .map(jka_protocol::commands::atoi)
+                    .unwrap_or(0);
+                // CG_NewClientInfo: absent/empty `skill` => -1 (human);
+                // any other atoi result is reported as a bot.
+                let bot_skill = info_value(info, b"skill")
+                    .filter(|skill| !skill.is_empty())
+                    .map(jka_protocol::commands::atoi)
+                    .unwrap_or(-1);
+                Some((slot, team, name, bot_skill != -1))
+            })
+            .collect()
+    }
+
     /// OpenJK `clientInfo_t.gender` source used by CG_Obituary. The protocol
     /// exposes it as the `ds` client-info key (`f`, `n`, otherwise male).
     pub fn client_gender(&self, client: usize) -> i32 {
@@ -1736,6 +1766,18 @@ impl ClientGameState {
 
     /// Visual subset of OpenJK `CG_NewClientInfo` with `cg_forceModel == 0`. Siege model/skin
     /// overrides are applied from the same class definitions loaded by `BG_SiegeLoadClasses`.
+    /// TaystJK CG_NewClientInfo: wins and losses are `w` / `l` in CS_PLAYERS.
+    /// Unlike the transient `scores` command these remain valid without a
+    /// scoreboard request (including for a duel between score pushes).
+    pub fn client_duel_record(&self, client_num: usize) -> Option<(i32, i32)> {
+        let index = u16::try_from(usize::from(CS_PLAYERS).checked_add(client_num)?).ok()?;
+        let config = self.configstring(index)?;
+        if config.is_empty() { return None; }
+        let wins = info_value(config, b"w").and_then(parse_i32_ascii).unwrap_or(0);
+        let losses = info_value(config, b"l").and_then(parse_i32_ascii).unwrap_or(0);
+        Some((wins, losses))
+    }
+
     pub fn client_info(
         &self,
         client_num: usize,
@@ -3725,6 +3767,25 @@ mod tests {
             remaining.iter().filter(|action| matches!(action, CgameServerAction::ShaderRemap { .. })).count(),
             2
         );
+    }
+
+    #[test]
+    fn show_player_id_uses_active_configstring_slots_and_tayst_bot_skill() {
+        let mut game = ClientGameState::new();
+        game.configstrings.insert(CS_PLAYERS, br"\n\^1Red\t\1\skill\5".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 2, br"\n\^4Blue\t\2\skill\-1".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 17, br"\n\Spectator\t\3".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 31, br"\n\Free\t\0\skill\0".to_vec());
+        game.configstrings.insert(CS_PLAYERS + 7, Vec::new());
+        game.configstrings.insert(CS_PLAYERS + 32, br"\n\Not a client\t\0".to_vec());
+        assert_eq!(game.player_id_list(), vec![
+            (0, 1, "^1Red".to_owned(), true),
+            (2, 2, "^4Blue".to_owned(), false),
+            (17, 3, "Spectator".to_owned(), false),
+            (31, 0, "Free".to_owned(), true),
+        ]);
+        game.configstrings.remove(&CS_PLAYERS);
+        assert_eq!(game.player_id_list().len(), 3);
     }
 
     #[test]

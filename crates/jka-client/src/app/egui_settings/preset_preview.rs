@@ -91,7 +91,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
         | "r_lodScale" | "r_lodbias" => S::Geometry,
         "r_ssao" | "r_staticBspAo" | "r_staticBspAoSamples" | "r_staticBspAoResolution"
         | "r_entityAmbientLighting" | "r_dynamicLights" | "r_promoteFxLights"
-        | "r_emissiveAreaLights" | "r_voxelProbeGI"
+        | "r_voxelProbeGI"
         | "r_contactShadows" | "r_localLightShadows" | "r_dynamicShadows" => S::Lighting,
         "r_pbr" | "r_genNormalMaps" | "r_deluxeMapping" | "r_deluxeSpecular" => S::Materials,
         "fx_physics" | "r_reflectionQuality" => S::Effects,
@@ -257,7 +257,7 @@ fn preview_target_label_for_row(preset: QualityPreset, reset: theme::Reset) -> O
             Some("off") => "Off".to_owned(),
             Some("blob") => "Blob".to_owned(),
             Some("entity_map") => "Entity map".to_owned(),
-            Some("csm") => "Cascaded maps (CSM)".to_owned(),
+            Some("csm" | "csm_entities") => "Cascaded Shadow Maps".to_owned(),
             Some("ray_traced") => "Ray traced".to_owned(),
             _ => return None,
         },

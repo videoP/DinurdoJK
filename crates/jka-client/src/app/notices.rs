@@ -15,6 +15,7 @@ pub(in crate::app) struct CrosshairSeen {
 
 pub(in crate::app) struct ChatRecord {
     pub(in crate::app) text: String,
+    pub(in crate::app) team: bool,
     pub(in crate::app) created: Instant,
     /// Demo timeline position when this line was authored. Live sessions use wall time.
     pub(in crate::app) demo_elapsed_ms: Option<f64>,
@@ -25,6 +26,7 @@ pub(in crate::app) struct ChatRecord {
 /// like TaystJK's `con.current`; `notify == false` represents a zero timestamp.
 pub(in crate::app) struct ConsoleNotifyRecord {
     pub(in crate::app) text: String,
+    pub(in crate::app) team: bool,
     pub(in crate::app) created: Instant,
     pub(in crate::app) demo_elapsed_ms: Option<f64>,
     /// False is TaystJK's `con.times[row] = 0`: the console row still consumes
@@ -528,10 +530,11 @@ impl App {
                     // Con_DrawNotify. A con_notifywords hit only changes the
                     // console stamp colour / desktop alert; it does not promote
                     // the chat line into the top-left notify overlay.
-                    let console_kind = if highlighted {
-                        crate::logging::ConsoleLineKind::NotifyMention
-                    } else {
-                        crate::logging::ConsoleLineKind::Normal
+                    let console_kind = match (team, highlighted) {
+                        (true, true) => crate::logging::ConsoleLineKind::TeamChatMention,
+                        (true, false) => crate::logging::ConsoleLineKind::TeamChat,
+                        (false, true) => crate::logging::ConsoleLineKind::NotifyMention,
+                        (false, false) => crate::logging::ConsoleLineKind::Normal,
                     };
                     self.push_console_line_no_notify(text.clone(), console_kind);
                     if self.chat_lines.len() >= 16 {
@@ -544,6 +547,7 @@ impl App {
                     let display_text = clean_chatbox_colors(&text, self.clean_chatbox);
                     self.chat_lines.push_back(ChatRecord {
                         text: display_text,
+                        team,
                         created: now,
                         demo_elapsed_ms,
                     });

@@ -23,9 +23,9 @@ impl App {
                 "One small shadow map that only draws players, NPCs and models; the map is not re-rendered, so it costs a few depth-only draws. It is aimed by the baked lightgrid's dominant light direction at the camera (or the runtime sun), and fades out where the baked light is mostly ambient.",
             ),
             (
-                DynamicShadowsMode::CascadedShadowMaps,
-                "Cascaded maps (CSM)",
-                "Bevy 0.19.1 directional-light CSM: four exponential cascades, stable texel snapping, reverse-Z and Bevy shadow filtering.",
+                DynamicShadowsMode::CascadedShadowMapsEntities,
+                "Cascaded Shadow Maps",
+                "Four directional cascades for players, NPCs and brush movers. Static BSP casters remain baked by default; optionally enable static-world CSM in Relighting.",
             ),
         ];
         if let Some(target) = mode_row(
@@ -41,10 +41,18 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
         let mut contact = self.video.player_contact_shadows;
-        if ui.checkbox(&mut contact, "Player foot-contact blobs").on_hover_text(
-            "Subtle ground-contact darkening under players and NPCs, independent of CSM, RT and lamp shadows. Reuses the projected blob system, follows the floor, and fades with height. Classic Blob mode retains its full-size drop shadow."
+        if ui.add(egui::Slider::new(&mut contact, 0.0..=4.0).text("Player contact multiplier")).on_hover_text(
+            "0 disables player foot-contact blobs; 1 is normal and 2 doubles their opacity. Multiplies the shadow strength below and keeps the existing airborne fade. Classic Blob mode is unchanged."
         ).changed() {
-            let _ = self.set_console_cvar("r_playerContactShadows", if contact { "1" } else { "0" });
+            let _ = self.set_console_cvar("r_playerContactShadows", &format!("{contact:.3}"));
+        }
+        let mut strength = self.video.sun_shadow_strength;
+        if ui.add(egui::Slider::new(&mut strength, 0.0..=1.0)
+            .text("CSM & player contact strength"))
+            .on_hover_text("Scales CSM shadow darkening and player foot-contact opacity. Independent of map sun intensity; the contact height fade stays the same.")
+            .changed()
+        {
+            let _ = self.set_console_cvar("r_sunShadowStrength", &format!("{strength:.3}"));
         }
         ui.add_enabled_ui(self.video.dynamic_shadows == DynamicShadowsMode::EntityMap, |ui| {
             const ENTITY_SHADOW_LIGHT_OPTIONS: [(EntityShadowLight, &str); 2] = [

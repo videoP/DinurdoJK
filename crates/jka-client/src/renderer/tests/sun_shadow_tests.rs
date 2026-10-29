@@ -7,7 +7,7 @@ fn box_at(z: f32) -> ([f32; 3], [f32; 3]) {
 #[test]
 fn sunward_casters_are_kept_for_forward_and_reverse_cascades() {
     // Forward-Z cascade: clip z = -view z, so z < 0 is toward the sun.
-    let forward = Mat4::orthographic_rh(-10.0, 10.0, -10.0, 10.0, 0.1, 50.0);
+    let forward = glam::camera::rh::proj::directx::orthographic(-10.0, 10.0, -10.0, 10.0, 0.1, 50.0);
     let (min, max) = box_at(500.0); // 500 units behind the eye, sunward of it
     assert!(aabb_intersects_shadow_frustum(min, max, forward, false));
     let (min, max) = box_at(-500.0); // far beyond the cascade, away from the sun

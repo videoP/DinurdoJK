@@ -551,6 +551,15 @@ pub(in crate::ui) fn console_text(
     width: u32,
     height: u32,
 ) {
+    console_text_sized(out, value, x, y, CONSOLE_CHAR_WIDTH, CONSOLE_CHAR_HEIGHT, color, width, height);
+}
+
+/// Console-only sized path. The ^N color parser is shared with the legacy-size path.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn console_text_sized(
+    out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
+    char_width: f32, char_height: f32, color: [f32; 4], width: u32, height: u32,
+) {
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
@@ -560,7 +569,7 @@ pub(in crate::ui) fn console_text(
         let byte = bytes[index];
         if byte == b'\n' {
             cursor_x = x;
-            cursor_y += CONSOLE_CHAR_HEIGHT;
+            cursor_y += char_height;
             index += 1;
             continue;
         }
@@ -577,14 +586,14 @@ pub(in crate::ui) fn console_text(
                 byte,
                 cursor_x,
                 cursor_y,
-                CONSOLE_CHAR_WIDTH,
-                CONSOLE_CHAR_HEIGHT,
+                char_width,
+                char_height,
                 active_color,
                 width,
                 height,
             );
         }
-        cursor_x += CONSOLE_CHAR_WIDTH;
+        cursor_x += char_width;
         index += 1;
     }
 }
@@ -781,5 +790,29 @@ pub(in crate::ui) fn glyph(ch: char) -> [u8; 7] {
         ],
         ' ' => [0; 7],
         _ => [0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0, 0b00100],
+    }
+}
+
+/// A Render Studio player name at its projected spot, faded by `alpha`
+/// (cinematic names fade near the lens and far away).
+pub fn build_studio_label_vertices(
+    out: &mut Vec<UiVertex>,
+    label: &crate::ui::UiStudioLabel,
+    font: Option<&ProportionalFont>,
+    width: u32,
+    height: u32,
+) {
+    let (x, y) = (label.pos[0] * width.max(1) as f32, label.pos[1] * height.max(1) as f32);
+    let alpha = label.alpha.clamp(0.0, 1.0);
+    if alpha <= 0.01 { return; }
+    let scale = label.scale.clamp(0.3, 2.0);
+    if let Some(font) = font {
+        let sx = width.max(1) as f32 / 640.0;
+        let text_width = proportional_text_width(&label.text, font, scale) * sx;
+        proportional_text(out, &label.text, font, x - text_width * 0.5, y, scale, [label.color[0],label.color[1],label.color[2],alpha], true, width, height);
+    } else {
+        let fallback = (1.25 * scale).max(0.25);
+        let visible = crate::cgame::text_to_jka_bytes(&label.text).iter().filter(|&&c| c != b'^').count() as f32;
+        text(out, &label.text, x - visible * 3.0 * fallback, y - 4.0 * fallback, fallback, [label.color[0],label.color[1],label.color[2],alpha], width, height);
     }
 }

@@ -2,7 +2,30 @@
 use crate::app::{scene, App, Arc, DemoViewMode, JoinMode};
 
 use super::{CommandDef, CommandResult, CommandScope, GameCommand};
+/// TaystJK `CG_ClientList_f` console layout (team code, color and bot marker).
+fn show_player_id_line(slot: usize, team: i32, name: &str, bot: bool) -> String {
+    let team_label = match team {
+        0 => "^3F", // TEAM_FREE
+        1 => "^1R", // TEAM_RED
+        2 => "^4B", // TEAM_BLUE
+        _ => "^3S", // TEAM_SPECTATOR (and unknown values)
+    };
+    format!("{slot:2} {team_label}   ^7{name}^7{}", if bot { " (bot)" } else { "" })
+}
+
 commands! {
+    // TaystJK cg_consolecmds.c: showPlayerId and clientlist share CG_ClientList_f.
+    cmd_show_player_id ["showPlayerId", "clientlist"] ("showPlayerId", "List active client slots with team, name and bot marker (TaystJK).", CommandScope::Always) |self, _command| {
+        let clients = self.game_session.as_ref()
+            .map(|session| session.client_game.player_id_list())
+            .unwrap_or_default();
+        for (slot, team, name, bot) in &clients {
+            self.push_console_line(show_player_id_line(*slot, *team, name, *bot));
+        }
+        self.push_console_line(format!("Listed {:2} clients", clients.len()));
+        CommandResult::Handled
+    }
+
     cmd_weapnext ["weapnext", ] ("weapnext", "Select the next weapon.", CommandScope::Always, game = GameCommand::WeaponNext) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         if self.execute_game_command(command) {
@@ -80,7 +103,7 @@ commands! {
     cmd_grapple_up ["-grapple", ] ("-grapple", "Release TaystJK grapple; JA+ performs use pulse.", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_lowjump ["lowjump", ] ("lowjump", "TaystJK brief jump tap.", CommandScope::Always) |self, command| {
+    cmd_lowjump ["lowjump", ] ("lowjump", "TaystJK brief jump tap.", CommandScope::Always) |self, _command| {
         self.tayst_lowjump(); CommandResult::Handled
     }
 
@@ -123,6 +146,7 @@ commands! {
                         &source,
                     ) {
                         Ok(()) => {
+                            self.leave_render_studio_for_launch();
                             // A local map/devmap launch owns the client state. Tear down any
                             // live netchan first so server snapshots/commands cannot continue
                             // arriving while the local map is being prepared.
@@ -259,6 +283,18 @@ commands! {
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,
+        }
+    }
+
+    // jaPRO amTele X Y Z [YAW]. On network games the command falls through
+    // to normal server forwarding; in solo mode use the local amTele shim.
+    cmd_amtele ["amTele", ] ("amTele <x> <y> <z> [yaw]", "jaPRO: teleport to a location or saved server telemark.", CommandScope::Connected) |self, command| {
+        if self.local_server.is_some() {
+            let words: Vec<_> = command.split_whitespace().collect();
+            self.local_amtele(&words[1..]);
+            CommandResult::Handled
+        } else {
+            CommandResult::Unhandled
         }
     }
 
@@ -649,4 +685,27 @@ commands! {
         }
     }
 
+}
+
+#[cfg(test)]
+mod player_id_tests {
+    use super::{show_player_id_line, CommandScope};
+
+    #[test]
+    fn taystjk_player_id_lines_preserve_slots_colors_and_bot_marker() {
+        assert_eq!(show_player_id_line(0, 0, "^5Alice", false), " 0 ^3F   ^7^5Alice^7");
+        assert_eq!(show_player_id_line(9, 1, "Red", true), " 9 ^1R   ^7Red^7 (bot)");
+        assert_eq!(show_player_id_line(12, 2, "Blue", false), "12 ^4B   ^7Blue^7");
+        assert_eq!(show_player_id_line(31, 3, "Spec", false), "31 ^3S   ^7Spec^7");
+        assert_eq!(show_player_id_line(2, 999, "Unknown", false), " 2 ^3S   ^7Unknown^7");
+    }
+
+    #[test]
+    fn player_id_is_a_local_client_command_with_taystjk_alias() {
+        let registry = super::super::command_registry();
+        let show = registry.find("showplayerid").expect("showPlayerId registered");
+        assert_eq!(show.name, "showPlayerId");
+        assert_eq!(show.scope, CommandScope::Always);
+        assert_eq!(registry.find("clientlist").unwrap().name, show.name);
+    }
 }

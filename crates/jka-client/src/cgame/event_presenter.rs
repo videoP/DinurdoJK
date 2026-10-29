@@ -437,7 +437,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         ];
         let base = vertices.len() as u32;
         for (index, point) in points.into_iter().enumerate() {
-            vertices.push(DynamicModelVertex {
+            vertices.push(DynamicModelVertex { foliage_wind: 0.0,
                 position: scene::render_position(point),
                 normal: scene::render_position(a),
                 uv: match index {

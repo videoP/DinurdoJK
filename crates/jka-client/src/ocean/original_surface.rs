@@ -3,7 +3,7 @@ use super::{OCEAN_MAX_SURFACES, OCEAN_UNITS_PER_METER, OceanGpu, OceanPvsTileMas
 use blue_water_gpu::{
     foam_texture::FoamMap,
     original_surface::{
-        OriginalClipmap, OriginalSurfaceBindings, OriginalSurfacePipeline, SurfaceAppearance,
+        OriginalClipmap, OriginalSurfaceBindings, OriginalSurfacePipeline,
         SurfaceBoundary, SurfaceCamera, LocalWaveHint, LocalTileState, PruneSegmentCache, PruneSource,
     },
     scene_copy::SceneCopy,
@@ -512,8 +512,11 @@ struct SurfaceConfig {
 
 impl SurfaceConfig {
     fn new(target: (u32, u32, u32, wgpu::TextureFormat), settings: super::OceanSettings) -> Self {
+        let fast = settings.backend == 2 && !settings.gerstner_active() && settings.hybrid_material > 0;
         Self { target, reflection_steps: settings.blue_water_ssr_steps,
-            pixel_detail_mode: settings.pixel_detail_mode, cost_probe: settings.surface_cost_probe
+            // Compare actual full-resolution materials. Keep the user's saved
+            // coarse/adaptive setting available when returning to material 0.
+            pixel_detail_mode: if fast { 0 } else { settings.pixel_detail_mode }, cost_probe: settings.surface_cost_probe
                 | if settings.skip_faded_cascades { blue_water_gpu::shader_composer::SURFACE_SKIP_FADED_CASCADES } else { 0 }
                 | match settings.wave_statistics {
                     0 => 0,
@@ -523,7 +526,10 @@ impl SurfaceConfig {
                     _ => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
                         | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_DEBUG,
                 }
-                | if settings.gerstner_active() { blue_water_gpu::shader_composer::SURFACE_GODOT_WATER } else { 0 },
+                | if settings.gerstner_active() { blue_water_gpu::shader_composer::SURFACE_GODOT_WATER } else { 0 }
+                | if fast { blue_water_gpu::shader_composer::SURFACE_FAST_HYBRID
+                    | if settings.blue_water_ssr { 0 } else { blue_water_gpu::shader_composer::COST_PROBE_SSR }
+                } else { 0 },
             ssr_tiles: settings.blue_water_ssr_tiles,
             far_variant: match settings.far_shader {
                 0 => 0,
@@ -660,14 +666,14 @@ pub(super) fn surface_camera(
     let aspect = width / height;
     let fov = camera.fov_y_for_viewport(width as u32, height as u32);
     let position = (camera.position - Vec3::Y * plane) / OCEAN_UNITS_PER_METER;
-    let view = Mat4::look_to_rh(position, camera.forward(), Vec3::Y);
+    let view = glam::camera::rh::view::look_to_mat4(position, camera.forward(), Vec3::Y);
     let near = camera.near_distance() / OCEAN_UNITS_PER_METER;
     let far = camera.far_distance() / OCEAN_UNITS_PER_METER;
     let projection = Mat4::from_translation(Vec3::new(
         2.0 * jitter[0] / width,
         -2.0 * jitter[1] / height,
         0.0,
-    )) * Mat4::perspective_rh(fov, aspect, far, near);
+    )) * glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
     let view_projection = projection * view;
     SurfaceCamera {
         view: view.to_cols_array_2d(),
@@ -1086,6 +1092,11 @@ impl OceanGpu {
                 slot.rain = None;
             }
             let mut boundary = SurfaceBoundary::zeroed();
+            boundary.sky_plane[0] = source.plane_height;
+            if let Some((view, uv)) = &self.sky_admission {
+                boundary.sky_uv = *uv;
+                slot.bindings.set_sky_roof(device, &renderer.pipeline, view);
+            }
             boundary.counts[3] = u32::from(self.settings.blue_water_boundary_mode);
             boundary.bounds = [
                 source.minimum[0],
@@ -1128,7 +1139,7 @@ impl OceanGpu {
                 }
             }
             slot.bindings.write_boundary(queue, &boundary);
-            let mut surface_view = surface_camera(
+            let surface_view = surface_camera(
                 camera,
                 source.plane_height,
                 key.0,
@@ -1221,7 +1232,8 @@ impl OceanGpu {
             slot.bindings.write_hybrid_swell(queue,
                 &super::hybrid_swell_uniform(&promoted.settings, self.elapsed));
             slot.bindings.write_breaker_mode(queue,
-                if promoted.settings.backend == 2 { promoted.settings.hybrid_breaker } else { 0 });
+                if promoted.settings.backend == 2 { promoted.settings.hybrid_breaker } else { 0 },
+                self.settings.hybrid_fast_foam, self.settings.hybrid_fast_foam_detail);
             slot.bindings.write_godot_water(queue,
                 &super::gerstner_uniform(&promoted.settings, self.elapsed, gerstner_foam.unwrap_or([0.0; 4])));
             let sun = self.environment.sun_direction_intensity;

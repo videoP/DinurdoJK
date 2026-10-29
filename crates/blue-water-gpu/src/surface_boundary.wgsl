@@ -13,8 +13,25 @@ struct JkaWaterBoundary {
     triangles: array<vec4<f32>, 512>,
     sky: array<vec4<f32>, 16>,
     candidates: array<vec4<u32>, 128>,
+    sky_uv: vec4<f32>,
+    sky_plane: vec4<f32>,
 }
 @group(1) @binding(16) var<uniform> jka_boundary: JkaWaterBoundary;
+@group(1) @binding(22) var jka_sky_roof: texture_2d<f32>;
+
+// Reuse rain's map-wide roof field, rather than tracing/building a second mask.
+// One nearest load, independent of camera/PVS, and no interpolation across rooms.
+fn jka_water_sky_admission(grid: vec2<f32>) -> f32 {
+    if jka_boundary.sky_uv.z <= 0.0 { return 1.0; }
+    let uv = (grid * jka_boundary.scale.x - jka_boundary.sky_uv.xy) * jka_boundary.sky_uv.zw;
+    if any(uv < vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) { return 1.0; }
+    let p = vec2<i32>(uv * vec2<f32>(textureDimensions(jka_sky_roof)));
+    let roof = textureLoad(jka_sky_roof, p, 0).r;
+    return select(1.0, 0.0, roof > jka_boundary.sky_plane.x + 8.0);
+}
+fn jka_water_sun_admission(grid: vec2<f32>) -> f32 {
+    return jka_water_sky_admission(grid);
+}
 
 fn jka_water_column_contains(position: vec3<f32>) -> bool {
     return (jka_boundary.depth.y < 0.5 || position.y >= jka_boundary.depth.x)

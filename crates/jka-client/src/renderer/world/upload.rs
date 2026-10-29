@@ -12,7 +12,7 @@ use crate::renderer::{
     MaterialFragmentKey, gpu_point_lights, inspector_texture_meta,
     instantiate_portal_draw_plans, is_upward_water_face, legacy_dlight_runs_for_batch, packed_face_plane, authored_face_runs,
     make_cull_record, material_uniform, ocean_surface_key, rt_alpha_mask_source_from_gpu_vertices, rt_glass_source_from_gpu_vertices,
-    same_draw_state, scene, world_blend_probe_bucket, upload_reflection_probes, upload_static_light_grid, upload_texture,
+    same_draw_state, scene, world_blend_probe_bucket, upload_reflection_probes, upload_static_light_grid,
     upload_texture_picmip, upload_voxel_probe_gi,
     visible_batches_by_cluster, water_surface_extent, weather, Arc, Auto4CollapseCache,
     Auto4CollapseWorker, Auto4GeometryState, Auto4Instance, BTreeMap, BTreeSet, BlendMode,
@@ -133,6 +133,7 @@ pub(in crate::renderer) fn build_world(
     compress_pbr_companions: bool,
     picmip: u32,
     texture_compression: u8,
+    mutable_images: &[usize],
     map: PreparedMap,
     reuse_world: Option<&WorldGpu>,
     requested_base_texture_count: usize,
@@ -184,6 +185,7 @@ pub(in crate::renderer) fn build_world(
         inline_models: inline_model_sources,
         mark_surfaces,
         water_brush_bounds,
+        thermal_liquids,
         ..
     } = map;
     // Decide texture usages immediately after receiving the prepared map. BC
@@ -288,6 +290,15 @@ pub(in crate::renderer) fn build_world(
             .then_some(candidate)
     }).collect::<Vec<_>>();
     let reuse_bitmap = reusable_textures.iter().map(Option::is_some).collect::<Vec<_>>();
+    // Streaming video and special world passes own writable/private bindings.
+    // Ordinary material images can share across unrelated maps and mods.
+    let mut private_images: std::collections::HashSet<usize> = mutable_images.iter().copied().collect();
+    for effect in &surface_sprite_effect_sources { private_images.insert(effect.texture); }
+    for source in coarse_sources.iter().chain(full_sources.iter()).chain(inline_batch_sources.iter()).filter(|s| s.water) {
+        private_images.extend(source.texture);
+        private_images.extend(source.emissive_texture);
+        if let Some(animation) = &source.animation { private_images.extend(&animation.frames); }
+    }
     let reused_count = reuse_bitmap.iter().filter(|&&v| v).count();
     if reused_count != 0 {
         rverbose!(1, "[SHADER REMAP] GPU texture reuse: {reused_count}/{} images", texture_usage.len());
@@ -426,6 +437,8 @@ pub(in crate::renderer) fn build_world(
     // the camera at runtime. Do not feed this data to coastal/bathymetry.
     let mut ocean_sky_regions = vec![None; crate::ocean::OCEAN_MAX_SURFACES];
     let mut runtime_ocean_clipmaps = Vec::<RuntimeOceanClipmap>::new();
+    // One pool-neutral promoted grid per mesh quality, shared by every pool.
+    let mut promoted_grid_bases: [Option<u32>; 2] = [None; 2];
     let mut ocean_coarsest_spacing = 0.0f32;
     let ocean_mesh_started = Instant::now();
     let mut diffuse_stages = HashMap::new();
@@ -559,14 +572,17 @@ pub(in crate::renderer) fn build_world(
             // overrides and true 3D camera distance can therefore change the
             // ring topology live instead of being frozen at map upload.
             let ranges = if let Some(appearance) = appearance {
-                let mut low = crate::ocean::build_runtime_promoted_clipmap(
+                // Plane height and mask slot reach the shader through this
+                // pool's promoted render uniform, so the grid itself is shared.
+                let _ = mask_slot;
+                let mut low = crate::ocean::build_runtime_promoted_clipmap_topology(
                     crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
-                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
+                    footprint.minimum, footprint.maximum,
                     appearance.heuristic.amplitude,
                 );
-                let mut high = crate::ocean::build_runtime_promoted_clipmap(
+                let mut high = crate::ocean::build_runtime_promoted_clipmap_topology(
                     crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
-                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
+                    footprint.minimum, footprint.maximum,
                     appearance.heuristic.amplitude,
                 );
                 if sky_candidate.is_some() {
@@ -579,16 +595,19 @@ pub(in crate::renderer) fn build_world(
                     }
                 }
                 ocean_coarsest_spacing = low.coarsest_spacing;
-                upload_timings.ocean_clipmap_vertices +=
-                    (low.vertices.len() + high.vertices.len()) as u64;
                 upload_timings.ocean_clipmap_tris += (high.indices.len() / 3) as u64;
                 upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
                 upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
 
                 let mut append = |quality: usize, clipmap: crate::ocean::RuntimePromotedClipmap| {
                     let half_cells = crate::ocean::promoted_clipmap_half_cells(appearance.heuristic.amplitude);
-                    let (active_range, reserved_range, vertex_base) = indexed_builder.append_runtime_clipmap(
-                        &clipmap.vertices, &clipmap.indices, clipmap.index_capacity,
+                    let vertex_base = *promoted_grid_bases[quality].get_or_insert_with(|| {
+                        let grid = crate::ocean::promoted_clipmap_grid(clipmap.layout.base_spacing);
+                        upload_timings.ocean_clipmap_vertices += grid.len() as u64;
+                        indexed_builder.append_clipmap_vertices(&grid)
+                    });
+                    let (active_range, reserved_range) = indexed_builder.append_runtime_clipmap(
+                        vertex_base, &clipmap.indices, clipmap.index_capacity,
                     );
                     runtime_ocean_clipmaps.push(RuntimeOceanClipmap {
                         slot: slot as u8,
@@ -882,9 +901,12 @@ pub(in crate::renderer) fn build_world(
                 } else {
                     color_compressed += 1;
                 }
-                texture_compression::upload_encoded_texture(device, queue, &data.label, encoded)
+                if private_images.contains(&index) {
+                    texture_compression::upload_encoded_texture(device, queue, &data.label, encoded)
+                } else { texture_compression::upload_cached_encoded_texture(device, queue, &data.label, encoded) }
             } else {
-                upload_texture_picmip(device, queue, data, texture_picmip)
+                if private_images.contains(&index) { upload_texture_picmip(device, queue, data, texture_picmip) }
+                else { crate::renderer::textures::upload_cached_texture_picmip(device, queue, data, texture_picmip) }
             }
         })
         .collect();
@@ -954,9 +976,9 @@ pub(in crate::renderer) fn build_world(
         .enumerate()
         .map(|(index, data)| match encoded_lightmaps.get(index) {
             Some(Some(encoded)) => {
-                texture_compression::upload_encoded_texture(device, queue, &data.label, encoded)
+                texture_compression::upload_cached_encoded_texture(device, queue, &data.label, encoded)
             }
-            _ => upload_texture(device, queue, data),
+            _ => crate::renderer::textures::upload_cached_texture(device, queue, data),
         })
         .collect()
     };
@@ -969,17 +991,17 @@ pub(in crate::renderer) fn build_world(
             source: None,
             width: 1,
             height: 1,
-            rgba: vec![127, 127, 127, 0],
+            rgba: (vec![127, 127, 127, 0]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: true,
             srgb: false,
         };
-        vec![upload_texture(device, queue, &neutral)]
+        vec![crate::renderer::textures::upload_cached_texture(device, queue, &neutral)]
     } else {
         deluxemap_data
             .iter()
-            .map(|data| upload_texture(device, queue, data))
+            .map(|data| crate::renderer::textures::upload_cached_texture(device, queue, data))
             .collect()
     };
     upload_timings.lightmap_gpu_calls_ms = lightmap_gpu_started.elapsed().as_secs_f64() * 1000.0;
@@ -1093,7 +1115,7 @@ pub(in crate::renderer) fn build_world(
             // from becoming an emissive source. This tiny alternate uniform is
             // created only for authored glow batches; no per-frame cost exists
             // for ordinary materials or Glow Off.
-            let authored_glow_fog_buffer = source.authored_glow.then(|| {
+            let authored_glow_fog_buffer = (source.authored_glow || source.thermal_source_stage).then(|| {
                 let glow_fog_uniform = weather::fog::surface_fog_uniform(
                     source.fog,
                     source.fog_is_global,
@@ -1965,139 +1987,11 @@ pub(in crate::renderer) fn build_world(
             },
         ],
     });
-    let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("JKA clustered-light render bind group"),
-        layout: lighting_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: cluster_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: lighting_settings_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: pbr_settings_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.point_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 11,
-                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.area_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 12,
-                resource: voxel_probe_gi.uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 13,
-                resource: wgpu::BindingResource::TextureView(
-                    &static_light_grid_gpu.irradiance_volume_view,
-                ),
-            },
-            wgpu::BindGroupEntry {
-                binding: 14,
-                resource: static_light_grid_gpu
-                    .irradiance_volume_uniform_buffer
-                    .as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 16,
-                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: local_shadows.glass_buffer.as_entire_binding(),
-            },
-        ],
-    });
-
-    let lighting_bind_group_lean = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("JKA clustered-light render bind group (lean baseline)"),
-        layout: lighting_layout_lean,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: cluster_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: lighting_settings_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: pbr_settings_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 16,
-                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: local_shadows.glass_buffer.as_entire_binding(),
-            },
-        ],
-    });
+    let (lighting_bind_group, lighting_bind_group_lean) = create_world_lighting_bind_groups(
+        device, lighting_layout, lighting_layout_lean, &light_buffer, &cluster_buffer,
+        lighting_settings_buffer, pbr_settings_buffer, &local_shadows, &static_light_grid_gpu,
+        &voxel_probe_gi, &legacy_dlight_surface_mask_buffer,
+    );
     upload_timings.lighting_resources_ms = lighting_started.elapsed().as_secs_f64() * 1000.0;
 
     let pipeline_started = Instant::now();
@@ -2469,6 +2363,7 @@ pub(in crate::renderer) fn build_world(
             sky_covers_background,
             ocean_surfaces,
             ocean_bottoms,
+            thermal_liquids,
             ocean_meshes_built: build_ocean_meshes,
             ocean_promotion_decisions,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
@@ -2590,4 +2485,156 @@ pub(in crate::renderer) fn build_world(
         },
         upload_timings,
     )
+}
+
+/// The clustered-light render groups. Also rebuilt when an idle Studio scene
+/// parks or restores its local-light shadow cache (binding 4).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::renderer) fn create_world_lighting_bind_groups(
+    device: &wgpu::Device,
+    lighting_layout: &wgpu::BindGroupLayout,
+    lighting_layout_lean: &wgpu::BindGroupLayout,
+    light_buffer: &wgpu::Buffer,
+    cluster_buffer: &wgpu::Buffer,
+    lighting_settings_buffer: &wgpu::Buffer,
+    pbr_settings_buffer: &wgpu::Buffer,
+    local_shadows: &crate::renderer::LocalShadowResources,
+    static_light_grid_gpu: &super::types::StaticLightGridGpu,
+    voxel_probe_gi: &super::types::VoxelProbeGiGpu,
+    legacy_dlight_surface_mask_buffer: &wgpu::Buffer,
+) -> (wgpu::BindGroup, wgpu::BindGroup) {
+    let lighting_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA clustered-light render bind group"),
+        layout: lighting_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: pbr_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.point_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(&voxel_probe_gi.area_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: voxel_probe_gi.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(
+                    &static_light_grid_gpu.irradiance_volume_view,
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: static_light_grid_gpu
+                    .irradiance_volume_uniform_buffer
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: local_shadows.glass_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let lighting_bind_group_lean = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA clustered-light render bind group (lean baseline)"),
+        layout: lighting_layout_lean,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: pbr_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&local_shadows.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&local_shadows.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.direction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&static_light_grid_gpu.lighting_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&static_light_grid_gpu.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: static_light_grid_gpu.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: local_shadows.glass_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    (lighting_bind_group, lighting_bind_group_lean)
 }

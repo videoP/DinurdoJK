@@ -188,10 +188,14 @@ fn sample_cascade_shadow_bevy(world_position: vec3<f32>, normal: vec3<f32>, casc
     let ndc = clip.xyz / clip.w;
     if (any(ndc.xy < vec2<f32>(-1.0)) || ndc.z < 0.0 || any(ndc > vec3<f32>(1.0))) { return 1.0; }
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    if shadow_settings.params.w > 1.5 {
+        return sample_shadow_map_bevy_castano(uv, ndc.z, cascade+5i);
+    }
     return min(sample_shadow_map_bevy_castano(uv, ndc.z, cascade), sample_shadow_map_bevy_castano(uv, ndc.z, cascade+5i));
 }
 
 fn shader_sun_sky_admission(world_position: vec3<f32>, cascade: i32) -> f32 {
+    if shadow_settings.params.w > 1.5 { return 1.0; }
     let mode = shadow_settings.camera_forward.w;
     if (mode < 0.5) {
         return 1.0;

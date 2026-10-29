@@ -88,7 +88,7 @@ const fn server_command(name: &'static str, description: &'static str) -> Entry 
 /// game module. CG_InitConsoleCommands registers them for completion only.
 pub const SERVER_COMMANDS: &[Entry] = &[
     // TaystJK gcmds[] jaPRO controls. These are reliable server strings.
-    server_command("amTele", "jaPRO: teleport to the saved teleport mark."),
+    server_command("amTele", "jaPRO: teleport to mark, player, or coordinates: amTele [x y z [yaw]]."),
     server_command("amTeleMark", "jaPRO: save the current teleport mark."),
     server_command("engage_fullforceduel", "jaPRO: challenge/accept a full-force duel."),
     server_command("engage_gunduel", "jaPRO: challenge/accept a gun duel."),
@@ -176,7 +176,7 @@ pub const JAPRO_COMMANDS: &[Entry] = &[
     server_command("amSurrender", "jaPRO: Emote: surrender."),
     server_command("amTaunt", "jaPRO: Emote: taunt."),
     server_command("amTaunt2", "jaPRO: Emote: taunt 2."),
-    server_command("amTele", "jaPRO: Teleport: amTele [player] or to your saved mark."),
+    server_command("amTele", "jaPRO: amTele [player] or amTele <x> <y> <z> [yaw (admin)]."),
     server_command("amTeleMark", "jaPRO: Save your position as the teleport mark."),
     server_command("amVictory", "jaPRO: Emote: victory pose."),
     server_command("amVstr", "jaPRO: Admin: run a server vstr: amVstr <name>."),

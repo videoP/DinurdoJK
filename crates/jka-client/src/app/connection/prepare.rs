@@ -5,9 +5,18 @@ use crate::app::{
 };
 
 impl App {
-    pub(in crate::app) fn start_live_cgame_prep(&mut self) {
+    /// Drop the speculative CGame prep. A worker still running is told to stop
+    /// at its next stage boundary instead of finishing work nobody will read.
+    pub(in crate::app) fn cancel_live_cgame_prep(&mut self) {
+        if let Some(cancel) = self.live_cgame_prep_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.live_cgame_prep_rx = None;
         self.live_cgame_prepared = None;
+    }
+
+    pub(in crate::app) fn start_live_cgame_prep(&mut self) {
+        self.cancel_live_cgame_prep();
         self.pending_live_gamestate = false;
 
         let base = self.base.clone();
@@ -15,16 +24,25 @@ impl App {
         let pbr = self.video.pbr;
         let allow_asset_overrides = self.video.allow_asset_overrides;
         let load_stringed = self.stringed.is_none();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let spawn = thread::Builder::new()
             .name("jka-live-cgame-prep".into())
             .spawn(move || {
                 let started = Instant::now();
-                let result =
-                    App::build_cgame_cpu_assets(&base, game.as_deref(), pbr, allow_asset_overrides)
+                let result = App::build_cgame_cpu_assets_cancellable(
+                    &base,
+                    game.as_deref(),
+                    pbr,
+                    allow_asset_overrides,
+                    &worker_cancel,
+                )
                         .map(
                             |(siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets)| {
-                                let stringed = if load_stringed {
+                                let stringed = if load_stringed
+                                    && !worker_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                                {
                                     jka_assets::pk3::AssetSearchPath::open_game(
                                         &base,
                                         game.as_deref(),
@@ -47,16 +65,39 @@ impl App {
                                 }
                             },
                         );
-                let _ = tx.send(result);
+                if !worker_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                }
             });
         match spawn {
-            Ok(_) => self.live_cgame_prep_rx = Some(rx),
+            Ok(_) => {
+                self.live_cgame_prep_rx = Some(rx);
+                self.live_cgame_prep_cancel = Some(cancel);
+            }
             Err(error) => {
                 eprintln!("CGAME PREP: could not start worker: {error}");
                 self.push_console_line(format!(
                     "^3CGAME PREP:^7 worker unavailable ({error}); will build at gamestate"
                 ));
             }
+        }
+    }
+
+    /// Switch to the fs_game this server is expected to run before the
+    /// speculative CGame prep starts: the value it reported earlier this run,
+    /// else the server browser's getinfo. infoResponse/gamestate stay
+    /// authoritative and restart the prep only when the guess was wrong.
+    pub(in crate::app) fn apply_fs_game_hint(&mut self, server: std::net::SocketAddr) {
+        let hint = self.live_fs_game_hints.get(&server).cloned().or_else(|| {
+            self.server_browser
+                .servers
+                .get(&server)
+                .filter(|entry| !entry.map.is_empty())
+                .map(|entry| entry.game.trim().as_bytes().to_vec())
+        });
+        let Some(hint) = hint else { return };
+        if let Err(error) = self.set_session_fs_game(&hint, "cached server info") {
+            devprintln!(1, "FS_GAME: ignoring cached server hint: {error}");
         }
     }
 
@@ -68,6 +109,7 @@ impl App {
         match result {
             Ok(Ok(mut prepared)) => {
                 self.live_cgame_prep_rx = None;
+                self.live_cgame_prep_cancel = None;
                 if self.stringed.is_none() {
                     if let Some(table) = prepared.stringed.take() {
                         devprintln!(
@@ -91,6 +133,7 @@ impl App {
             }
             Ok(Err(error)) => {
                 self.live_cgame_prep_rx = None;
+                self.live_cgame_prep_cancel = None;
                 eprintln!("CGAME PREP: {error}");
                 self.push_console_line(format!(
                     "^3CGAME PREP:^7 {error}; falling back to synchronous init"
@@ -99,6 +142,7 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.live_cgame_prep_rx = None;
+                self.live_cgame_prep_cancel = None;
                 self.push_console_line(
                     "^3CGAME PREP:^7 worker ended without a result; falling back to synchronous init"
                         .to_owned(),
@@ -166,6 +210,9 @@ impl App {
         let wanted = Self::normalized_bsp_name(map_name);
         self.loading.as_ref().is_some_and(|loading| {
             Self::normalized_bsp_name(&loading.name) == wanted
+                // The same qpath in a different fs_game may resolve to a
+                // different BSP, external lightmaps, shaders and textures.
+                && loading.active_game_dir == self.game.as_ref().map(|dir| dir.display().to_string())
                 && self
                     .server_sub_bsp_names_for(&scene::MapSource::Bsp(map_name.to_owned()))
                     .is_ok_and(|names| names == loading.sub_bsp_names)
@@ -254,7 +301,17 @@ impl App {
             return;
         }
 
-        let advertised_game = info.get(b"game").unwrap_or_default();
+        // Some compatible servers advertise `fs_game` instead of `game`.
+        // Use the same fallback as the server browser so an accurate cached
+        // hint is not needlessly invalidated and rebuilt.
+        let advertised_game = info
+            .get(b"game")
+            .filter(|value| !value.is_empty())
+            .or_else(|| info.get(b"fs_game"))
+            .unwrap_or_default();
+        if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
+            self.live_fs_game_hints.insert(server, advertised_game.to_vec());
+        }
         match self.set_session_fs_game(advertised_game, "server info") {
             Ok(true) => self.start_live_cgame_prep(),
             Ok(false) => {}

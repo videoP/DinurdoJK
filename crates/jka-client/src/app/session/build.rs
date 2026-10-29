@@ -17,12 +17,47 @@ impl App {
         ),
         String,
     > {
+        Self::build_cgame_cpu_assets_cancellable(
+            base,
+            game,
+            pbr,
+            allow_asset_overrides,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    /// `build_cgame_cpu_assets` for speculative workers: `cancel` is checked
+    /// between the expensive stages so a superseded prep (for example the base
+    /// prep started at connect before infoResponse named a mod) stops competing
+    /// with the map loader for CPU and archive IO.
+    pub(in crate::app) fn build_cgame_cpu_assets_cancellable(
+        base: &Path,
+        game: Option<&Path>,
+        pbr: bool,
+        allow_asset_overrides: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<
+        (
+            jka_assets::siege::SiegeCatalog,
+            Vec<jka_assets::siege::SiegeClassVisual>,
+            PlayerPresenter,
+            EntityPresenter,
+            jka_assets::pk3::AssetSearchPath,
+        ),
+        String,
+    > {
+        let cancelled = || {
+            cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| "CGame prep superseded".to_owned())
+        };
         let open = || {
             jka_assets::pk3::AssetSearchPath::open_game(base, game).map(|mut assets| {
                 assets.set_allow_asset_overrides(allow_asset_overrides);
                 assets
             })
         };
+        if let Some(error) = cancelled() { return Err(error); }
         let mut assets = open().map_err(|error| format!("ASSET PATH ERROR: {error}"))?;
         let siege_catalog = jka_assets::siege::load_siege_catalog(&mut assets)
             .map_err(|error| format!("SIEGE DATA LOAD ERROR: {error}"))?;
@@ -32,11 +67,14 @@ impl App {
             "CGAME: loaded {} Siege classes, {} teams, {} maps",
             siege_catalog.classes.len(), siege_catalog.teams.len(), siege_catalog.maps.len()
         );
+        if let Some(error) = cancelled() { return Err(error); }
         let player_presenter = PlayerPresenter::new(assets, pbr)
             .map_err(|error| format!("PLAYER ASSET ERROR: {error}"))?;
+        if let Some(error) = cancelled() { return Err(error); }
         let entity_assets = open().map_err(|error| format!("ENTITY ASSET PATH ERROR: {error}"))?;
         let entity_presenter = EntityPresenter::new(entity_assets, pbr)
             .map_err(|error| format!("ENTITY ASSET ERROR: {error}"))?;
+        if let Some(error) = cancelled() { return Err(error); }
         let fx_assets = open().map_err(|error| format!("FX ASSET PATH ERROR: {error}"))?;
         Ok((siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets))
     }
@@ -49,10 +87,16 @@ impl App {
         source: String,
         demo_bytes: Vec<u8>,
     ) -> Result<GameSession, String> {
+        self.build_game_session_with_game(qpath, source, demo_bytes, self.game.as_deref())
+    }
+
+    pub(in crate::app) fn build_game_session_with_game(
+        &self, qpath: String, source: String, demo_bytes: Vec<u8>, game: Option<&Path>,
+    ) -> Result<GameSession, String> {
         let (siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets) =
             Self::build_cgame_cpu_assets(
                 &self.base,
-                self.game.as_deref(),
+                game,
                 self.video.pbr,
                 self.video.allow_asset_overrides,
             )?;
@@ -67,6 +111,15 @@ impl App {
             crate::cgame::weapon_fx::WeaponFx::new(fx_assets),
             self.forced_player_models.clone(),
         );
+        self.configure_game_session(&mut session, game, true);
+        Ok(session)
+    }
+
+    /// Studio builds CPU assets/indexing on a worker, then installs owner-thread
+    /// settings and audio here. Its map comes from its own loader, never gameplay.
+    pub(in crate::app) fn configure_game_session(
+        &self, session: &mut GameSession, game: Option<&Path>, inherit_map: bool,
+    ) {
         session.water_wake_mode = self.video.water_wake;
         session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
         session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
@@ -79,7 +132,7 @@ impl App {
             .set_saber_impact_fx(self.video.saber_impact_fx);
         session.weapon_fx.set_saber_marks(self.video.saber_marks);
         session.weapon_fx.set_mark_count(self.video.mark_count as usize);
-        session
+        if inherit_map { session
             .weapon_fx
             .set_collision_world(self.map_collision.clone());
         session
@@ -87,14 +140,15 @@ impl App {
             .set_mark_surfaces(self.map_mark_surfaces.clone());
         session
             .entity_presenter
-            .set_static_models(Arc::clone(&self.map_static_models));
+            .set_static_models(Arc::clone(&self.map_static_models)); }
         session.entity_presenter.set_static_md3_instances(self.video.static_md3_instances);
         session.entity_presenter.set_static_md3_bvh(self.video.static_md3_bvh);
+        session.entity_presenter.set_static_md3_pvs_fallback(self.video.static_md3_pvs_fallback);
         session.entity_presenter.set_occlusion_stats(self.video.occlusion_stats);
         session.weapon_fx.set_runner_culling(self.video.fx_occlusion == 1);
-        session
+        if inherit_map { session
             .player_presenter
-            .set_collision_world(self.map_collision.clone());
+            .set_collision_world(self.map_collision.clone()); }
         session
             .player_presenter
             .set_head_look_mode(self.head_look);
@@ -127,7 +181,7 @@ impl App {
         session
             .client_game
             .set_predicted_event_correction(self.network.correct_predicted_events);
-        match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+        match jka_assets::pk3::AssetSearchPath::open_game(&self.base, game) {
             Ok(assets) => {
                 let mut sound = crate::cgame::sound_presenter::SoundPresenter::new(
                     assets,
@@ -144,22 +198,21 @@ impl App {
                 sound.set_game_sounds(self.audio.game);
                 sound.set_music_volume(self.effective_music_volume());
                 sound.set_emote_music_volume(self.effective_emote_music_volume());
-                sound.set_steam_audio_map(
+                if inherit_map { sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
-                );
+                ); }
                 if let Some(map_name) = session.map_name.as_deref() { sound.set_eal_map(map_name); }
                 session.sound_presenter = Some(sound);
             }
             Err(error) => eprintln!("AUDIO ASSET PATH UNAVAILABLE: {error}"),
         }
-        if let Err(error) = session
+        if inherit_map { if let Err(error) = session
             .player_presenter
             .set_physics_map_mesh(&self.map_physics_collision)
         {
             eprintln!("RAPIER MAP COLLISION ERROR: {error}");
-        }
-        Ok(session)
+        } }
     }
 
     pub(in crate::app) fn load_local_saber_movement(

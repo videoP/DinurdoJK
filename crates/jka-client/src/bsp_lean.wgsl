@@ -24,6 +24,7 @@ struct Camera {
     unjittered_view_proj: mat4x4<f32>,
     previous_unjittered_view_proj: mat4x4<f32>,
     jump_shade: vec4<f32>,
+    foliage_wind: vec4<f32>,
 };
 struct Material {
     header: vec4<u32>,
@@ -591,7 +592,7 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
             allow_shell
         );
     }
-    let world_position = deformation.xyz;
+    let world_position = foliage_wind_position(deformation.xyz, material_flags_w(), camera.foliage_wind);
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     output.uv = generated_uv(input);
     output.lightmap_uv = input.lightmap_uv;
@@ -920,6 +921,9 @@ fn sample_cascade_shadow_legacy(world_position: vec3<f32>, normal: vec3<f32>, ca
 }
 
 fn sample_cascade_shadow_bevy(world_position: vec3<f32>, normal: vec3<f32>, cascade: i32) -> f32 {
+    if shadow_settings.params.w > 1.5 {
+        return sample_dynamic_cascade(world_position, normal, cascade);
+    }
     let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
     let texel_size = shadow_settings.cascade_texel_sizes[u32(cascade)];
     let normal_offset = shadow_settings.bevy_params.y * texel_size * normal;
@@ -933,6 +937,7 @@ fn sample_cascade_shadow_bevy(world_position: vec3<f32>, normal: vec3<f32>, casc
 }
 
 fn shader_sun_sky_admission(input: VertexOut, cascade: i32) -> f32 {
+    if shadow_settings.params.w > 1.5 { return 1.0; }
     let mode = shadow_settings.camera_forward.w;
     if (mode < 0.5) {
         return 1.0;
@@ -2820,6 +2825,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 
     // Lightmap alpha carries internal sun visibility. Legacy material blending
     // must continue to see an opaque lightmap even when removal is disabled.
+    // Preserve the lighting payload before replacing alpha for stage blending.
+    let explicit_lightmap_flux = source_sample.a;
     if (explicit_lightmap_stage) { source_sample.a = 1.0; }
 
     // Classic id Tech 3 world-lighting controls. Keep them runtime flags so
@@ -2861,7 +2868,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         && !explicit_lightmap_stage;
     if (relight_explicit || relight_vertex_lit) {
         let baked = light_bsp_surface(select(input.color.rgb, source_sample.rgb, relight_explicit),
-            select(0.0, source_sample.a, relight_explicit), input);
+            select(0.0, explicit_lightmap_flux, relight_explicit), input);
         if (lighting_settings.baked_sun_debug_mode.x != 0u) {
             return vec4<f32>(baked, select(stage_color.a, source_sample.a, relight_explicit));
         }
@@ -3665,11 +3672,12 @@ struct MinimalVertexOut {
 
 @vertex fn vs_world_minimal(input: VertexIn) -> MinimalVertexOut {
     var output: MinimalVertexOut;
-    output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    let world_position = foliage_wind_position(input.position, material_flags_w(), camera.foliage_wind);
+    output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     output.uv = generated_uv(input);
     output.lightmap_uv = input.lightmap_uv;
     output.color = input.color;
-    output.world_ao = vec4<f32>(input.position, input.static_ao);
+    output.world_ao = vec4<f32>(world_position, input.static_ao);
     return output;
 }
 

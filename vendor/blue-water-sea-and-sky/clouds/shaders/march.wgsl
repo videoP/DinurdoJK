@@ -143,6 +143,9 @@ fn shadow_optical_depth_pcf(world: vec3<f32>, distance_to_top: f32, distance_off
 
 // The optical depth toward the sun the shadow maps hold at a point, beyond `distance_offset` (`sampleShadowOpticalDepth`).
 fn shadow_optical_depth(position: vec3<f32>, distance_offset: f32, radius: f32, jitter: f32, pixel: vec2<f32>) -> f32 {
+    if clouds.experiments.y > 0.5 {
+        return 0.0;
+    }
     let distance_to_top = distance_to_shadow_top(position);
     if distance_to_top <= 0.0 {
         return 0.0;
@@ -521,7 +524,11 @@ fn sky_light(irradiance: SunSky, weather: WeatherSample, media: MediaSample, col
 // The optical depth from a sample toward the sun: a short march for the detail the shadow maps lack, then the shadow
 // maps' beyond what was marched (filtered only with the sun near the horizon).
 fn sun_optical_depth(position: vec3<f32>, height: f32, surface_normal: vec3<f32>, mip_level: f32, jitter: f32, pixel: vec2<f32>) -> f32 {
-    let toward_sun = march_optical_depth(position, clouds.sun.xyz, i32(clouds.secondary.x), mip_level, jitter);
+    // The zero-step experiment keeps the native mean-depth approximation but guarantees no local texture march.
+    var toward_sun = OpticalDepth(0.5, 0.0);
+    if clouds.experiments.w < 0.5 {
+        toward_sun = march_optical_depth(position, clouds.sun.xyz, i32(clouds.secondary.x), mip_level, jitter);
+    }
     var optical_depth = toward_sun.value;
     if height < clouds.heights.z {
         optical_depth += shadow_optical_depth(
@@ -621,6 +628,36 @@ const NEAR_STEP_REACH: vec2<f32> = vec2<f32>(800.0, 1500.0);
 const SURFACE_STRIDE: f32 = 0.06;
 const SURFACE_REACH: f32 = 12000.0;
 
+// Diagnostic colours are accumulated with the actual primary-ray extinction, so an uncovered *sample* is visible
+// even when the representative front depth would fall in another cascade. These modes do not change density.
+fn cloud_debug_color(position: vec3<f32>, height: f32, mip_level: f32, jitter: f32, pixel: vec2<f32>) -> vec3<f32> {
+    let mode = i32(clouds.experiments.x);
+    if mode == 1 { return vec3<f32>(1.0); }
+    if mode == 2 {
+        let tau = sun_optical_depth(position, height, normalize(position), mip_level, jitter, pixel);
+        return vec3<f32>(exp(-tau));
+    }
+    let world = planet_to_world(position);
+    let cascade = faded_cascade_index(world, jitter);
+    if cascade < 0 { return vec3<f32>(1.0, 0.0, 1.0); }
+    if mode == 3 {
+        let palette = array<vec3<f32>, 4>(vec3<f32>(0.1, 1.0, 0.15), vec3<f32>(0.15, 0.4, 1.0),
+            vec3<f32>(1.0, 0.8, 0.1), vec3<f32>(0.8, 0.1, 1.0));
+        return palette[cascade];
+    }
+    let uv = shadow_uv(world, cascade);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
+        return vec3<f32>(1.0, 0.03, 0.0);
+    }
+    let radius = clouds.shadow_map.z * remap_clamped(dot(clouds.sun.xyz, normalize(position)), 0.1, 0.0);
+    // Orange warns that filtering can reach the edge even though the centre is inside.
+    let border = (radius + 0.5) / clouds.shadow_map.y;
+    if any(uv < vec2<f32>(border)) || any(uv > vec2<f32>(1.0 - border)) {
+        return vec3<f32>(1.0, 0.4, 0.0);
+    }
+    return vec3<f32>(0.03, 1.0, 0.1);
+}
+
 struct CloudMarch {
     // Premultiplied radiance, and opacity (`remapClamped(transmittance, 1, minTransmittance)`).
     color: vec4<f32>,
@@ -646,13 +683,17 @@ fn march_clouds(
 
     let max_ray_distance = ray_near_far.y - ray_near_far.x;
     let perspective = clouds.march_limits.x;
-    var step_size = clouds.march.y + (perspective - 1.0) * ray_near_far.x;
+    // Only rays whose cloud entry is far away take this approximation. Close cloud flights keep native steps.
+    let far_scale = mix(1.0, clouds.experiments.z, smoothstep(1500.0, 5000.0, ray_near_far.x));
+    let min_step = clouds.march.y * far_scale;
+    let max_step = clouds.march.z * far_scale;
+    var step_size = (clouds.march.y + (perspective - 1.0) * ray_near_far.x) * far_scale;
     // takram's step grows with the distance to the layers, which from far above (the chart, 40 km up) leaves a steep
     // ray four samples through the low clouds and every pixel a different four. A steep ray takes at least
     // SHELL_SAMPLES through the shadow-casting layers' depth; level rays keep takram's step.
     let vertical = max(abs(dot(normalize(ray_origin), ray_direction)), 1e-3);
-    let shell = max(clouds.heights.z - clouds.heights.w, clouds.march.y);
-    step_size = min(step_size, max(clouds.march.y, shell / (SHELL_SAMPLES * vertical)));
+    let shell = max(clouds.heights.z - clouds.heights.w, min_step);
+    step_size = min(step_size, max(min_step, shell / (SHELL_SAMPLES * vertical)));
     // takram: spatial aliasing remains unless the jitter is doubled.
     var ray_distance = step_size * jitter * 2.0;
     let max_iterations = i32(clouds.march.x);
@@ -678,7 +719,7 @@ fn march_clouds(
 
         if inside_layer_intervals(height) {
             step_size *= perspective;
-            ray_distance += mix(step_size, clouds.march.z, min(1.0, mip_level));
+            ray_distance += mix(step_size, max_step, min(1.0, mip_level));
             continue;
         }
 
@@ -689,7 +730,7 @@ fn march_clouds(
             // Longer steps through empty air.
             step_size *= perspective;
             let stride = select(0.0, SURFACE_STRIDE * ray_distance, in_band);
-            ray_distance += max(mix(step_size, clouds.march.z, min(1.0, mip_level)), stride);
+            ray_distance += max(mix(step_size, max_step, min(1.0, mip_level)), stride);
             continue;
         }
 
@@ -723,7 +764,11 @@ fn march_clouds(
             // The light the sample scatters toward the eye; its edge term takes the opacity the ray has gathered in
             // front of the sample's stretch and by its end.
             let transmittance = exp(-media.extinction * segment);
-            let radiance = sample_radiance(
+            var radiance: vec3<f32>;
+            if clouds.experiments.x >= 1.0 && clouds.experiments.x <= 4.0 {
+                radiance = cloud_debug_color(position, height, mip_level, jitter, pixel) * media.extinction;
+            } else {
+                radiance = sample_radiance(
                 position,
                 height,
                 uv,
@@ -736,7 +781,8 @@ fn march_clouds(
                 ray,
                 light,
                 pixel,
-            );
+                );
+            }
 
             // Energy-conserving analytical integration of the scattered light (Frostbite 2016, 5.6.3).
             let clamped_extinction = max(media.extinction, 1e-7);

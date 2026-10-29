@@ -11,6 +11,7 @@ struct GlassSettings {
     detail: vec4<f32>, // progressive blur, blur mode, waviness, animation speed
     highlights: vec4<f32>, // rim saturation, rim type, dispersion base, background recovery
 };
+
 fn glass_mask_value(world: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, forward: vec3<f32>) -> vec4<f32> {
     let n=select(vec3<f32>(0.0,0.0,1.0),normal/max(length(normal),0.0001),length(normal)>0.0001);
     var oct=n.xy/(abs(n.x)+abs(n.y)+abs(n.z));
@@ -225,4 +226,45 @@ fn glass_shade(world: vec3<f32>, world_normal: vec3<f32>, fragment: vec4<f32>,
         result=mix(result,vec3<f32>(1.0),intensity);
     }
     return vec4<f32>(mix(clear,result,glass_settings.appearance.z),1.0);
+}
+
+// TaystJK rd-vanilla/tr_shadows.cpp: RB_CaptureScreenImage / RB_DistortionFill.
+// The silhouette masks two screen stretches; neither normals nor skin colour
+// affect the result. Reuse the glass capture, including the original centred
+// power-of-two crop (which is visibly different from sampling the whole screen).
+fn cloak_shade(fragment: vec4<f32>, time: f32) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(glass_scene));
+    let uv = fragment.xy / dims;
+    let crop = exp2(floor(log2(min(dims, vec2<f32>(2048.0)))));
+    let start = floor((dims - crop) * 0.5);
+    let stretch0 = abs(sin(time * 0.5)) * vec2<f32>(0.08, 0.2);
+    let stretch1 = abs(sin(time * 0.8)) * vec2<f32>(0.2, 0.08);
+    let uv0 = (start + (stretch0 + uv * (1.0 - 2.0 * stretch0)) * crop) / dims;
+    let uv1 = (start + (stretch1 + uv * (1.0 - 2.0 * stretch1)) * crop) / dims;
+    let first = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(uv0), 0.0).rgb;
+    let second = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(uv1), 0.0).rgb;
+    // The second quad uses SRC_ALPHA,SRC_ALPHA with alpha 0.5.
+    return vec4<f32>((first + second) * 0.5, 1.0);
+}
+
+// RF_DISTORTION captures a square around the Force half-shield's origin, then
+// maps that image with the model UVs. The shader returns a precomposited colour
+// because the shared Glass pipeline replaces the destination.
+fn force_refraction_shade(fragment: vec4<f32>, st: vec2<f32>, origin: vec3<f32>,
+    view_proj: mat4x4<f32>, eye: vec3<f32>, alpha: f32) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(glass_scene));
+    let distance = length(origin - eye);
+    var radius = 32.0;
+    if (distance < 128.0) { radius = 256.0; }
+    else if (distance < 256.0) { radius = 128.0; }
+    else if (distance < 512.0) { radius = 64.0; }
+    let clip = view_proj * vec4<f32>(origin, 1.0);
+    let centre = (clip.xy / max(clip.w, 0.0001) * vec2<f32>(0.5, -0.5) + 0.5) * dims;
+    let size = min(vec2<f32>(radius), dims);
+    let start = clamp(floor(centre - size * 0.5), vec2<f32>(0.0), dims - size);
+    // GL screen-copy texture has its V origin at the bottom of the capture.
+    let uv = (start + vec2<f32>(fract(st.x), 1.0-fract(st.y)) * size) / dims;
+    let refracted = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(uv), 0.0).rgb;
+    let background = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(fragment.xy/dims), 0.0).rgb;
+    return vec4<f32>(mix(background, refracted, alpha), 1.0);
 }

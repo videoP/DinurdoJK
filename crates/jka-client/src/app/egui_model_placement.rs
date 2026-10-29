@@ -47,6 +47,35 @@ impl BmodelPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlacementKind { Md3, Bmodel, Fx }
 
+/// Editing never removes an object from its collection. Index identities remain
+/// stable for the lifetime of an interaction; structural changes clear selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditSelection { Md3(usize), Bmodel(usize), Fx(usize) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditDragMode { Move, YawPitch, Roll }
+
+#[derive(Clone, Debug)]
+pub(super) struct PlacementSnapshot {
+    pub md3: Vec<ModelPlacement>,
+    pub bmodels: Vec<BmodelPlacement>,
+    pub fx: Vec<FxPlacement>,
+    pub remaps: std::collections::BTreeMap<String, String>,
+    pub disabled_remaps: std::collections::BTreeMap<String, String>,
+    pub ent_dirty: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlacementDrag {
+    pub mode: EditDragMode,
+    pub selected: EditSelection,
+    pub changed: bool,
+    pub before: PlacementSnapshot,
+    /// Accumulated local-roll orientation; yaw/pitch use direct Euler edits.
+    pub orientation: Option<glam::Quat>,
+}
+
+
 /// A placed effect, exported as an `fx_runner` entity: `effect` is the
 /// `fxFile` value (`env/small_fire`), `angles` aim it (JKA pitch/yaw/roll;
 /// `-90 0 0` is straight up) and it replays every `delay_ms` like OpenJK's runner.
@@ -104,16 +133,27 @@ pub(super) struct ModelPlacementUi {
     pub ent_filename: String,
     pub ent_overwrite: bool,
     pub ent_status: String,
-    /// Edit mode: with no model in hand the crosshair picks existing
-    /// placements up (move / copy / delete) instead of stamping a new one.
+    pub ent_dirty: bool,
+    /// Persistent captured-camera map editing; no model is removed for dragging.
     pub edit_mode: bool,
+    /// An asset was chosen while editing; the next LMB stamps exactly one
+    /// object, then returns to selection without ending the editor session.
+    pub editor_placing: bool,
     /// Placement under the crosshair in edit mode.
     pub hover: Option<usize>,
-    /// The original of a picked-up placement, restored by Esc.
+    /// Legacy placement-mode field (editing uses PlacementDrag snapshots).
     pub held: Option<ModelPlacement>,
-    /// Whole-list snapshots (models, effects) taken before each edit-mode
-    /// pickup or delete.
-    pub edit_undo: Vec<(Vec<ModelPlacement>, Vec<FxPlacement>)>,
+    /// Whole-map undo snapshots including local remaps and BSP instances.
+    pub edit_undo: Vec<PlacementSnapshot>,
+    pub edit_redo: Vec<PlacementSnapshot>,
+    /// Explicit map-local remaps only; never serialize server shader state.
+    pub authored_remaps: std::collections::BTreeMap<String, String>,
+    pub editor_selected: Option<EditSelection>,
+    pub bmodel_hover: Option<usize>,
+    pub editor_drag: Option<PlacementDrag>,
+    pub editor_mouse_owned: Option<crate::app::MouseButton>,
+    pub editor_keys_owned: HashSet<crate::app::KeyCode>,
+    pub hover_since: Option<Instant>,
     pub fx_placed: Vec<FxPlacement>,
     /// Effect in hand (placing a new one, or a picked-up one) and its delay.
     pub fx_selection: Option<String>,
@@ -124,10 +164,23 @@ pub(super) struct ModelPlacementUi {
     pub fx_draws: Arc<Vec<DynamicModelSurface>>,
     /// The browser lists effects instead of models.
     pub picker_effects: bool,
+    /// Highlighted browser asset, rendered with real CGame MD3/FX materials in
+    /// the map behind the browser without starting a placement operation.
+    pub picker_preview: Option<(AssetKind, String)>,
+    pub picker_hit: Option<[f32; 3]>,
+    pub picker_draws: Arc<Vec<DynamicModelSurface>>,
+    pub picker_draw_key: Option<(String, [f32; 3], i32, i32)>,
+    pub picker_yaw: f32,
+    pub picker_scale: f32,
+    /// Own FX scheduler, reset per preview asset like Asset Viewer. Browsing
+    /// never consumes the live placement scheduler's 256-effect registry.
+    pub picker_fx_runtime: Option<PlacementFx>,
     pub search: String,
     pub sort: usize,
     pub active: bool,
     pub rotating: bool,
+    /// Cached local roll for the placement preview (Alt+RMB only).
+    pub preview_rotation: Option<glam::Quat>,
     pub hit_valid: bool,
     pub selection: Option<String>,
     pub scale: f32,
@@ -154,12 +207,19 @@ impl Default for ModelPlacementUi {
             bmodel_pivot: [0.0; 3], bmodel_bounds: None,
             bmodel_placed: Vec::new(),
             bmodel_collision_dirty: true, bmodel_collision_local: false,
-            ent_filename: String::new(), ent_overwrite: false, ent_status: String::new(),
-            edit_mode: false, hover: None, held: None, edit_undo: Vec::new(),
+            ent_filename: String::new(), ent_overwrite: false, ent_status: String::new(), ent_dirty: false,
+            edit_mode: false, editor_placing: false, hover: None, held: None, edit_undo: Vec::new(),
+            edit_redo: Vec::new(), authored_remaps: Default::default(),
+            editor_selected: None, bmodel_hover: None, editor_drag: None,
+            editor_mouse_owned: None, editor_keys_owned: HashSet::new(), hover_since: None,
             fx_placed: Vec::new(), fx_selection: None, fx_delay: 200.0, fx_held: None,
             fx_hover: None, fx_runtime: None, fx_draws: Arc::new(Vec::new()),
-            picker_effects: false,
+            picker_effects: false, picker_preview: None, picker_hit: None,
+            picker_draws: Arc::new(Vec::new()), picker_draw_key: None,
+            picker_yaw: 0.0, picker_scale: 1.0,
+            picker_fx_runtime: None,
             search: String::new(), sort: 0, active: false, rotating: false,
+            preview_rotation: None,
             hit_valid: false, selection: None, scale: 1.0, angles: [0.0; 3],
             origin: [0.0; 3], bounds: None, placed: Vec::new(),
             placed_draws: Arc::new(Vec::new()), preview_draws: Arc::new(Vec::new()),
@@ -171,6 +231,39 @@ impl Default for ModelPlacementUi {
 }
 
 /// This is the exact MD3 `angles_to_axis` transform from the CGame presenter.
+// JKA's model_axis is Rz(yaw) * Ry(pitch) * Rx(roll), with columns
+// forward, left and up. Only ROLL composes on the current object's local
+// forward axis. Yaw and pitch intentionally keep v1's direct Euler edits.
+// Cache the quaternion for the duration of a roll drag to avoid unnecessary
+// Euler roundtrips between mouse events.
+pub(in crate::app) fn placement_orientation(angles: [f32; 3]) -> glam::Quat {
+    glam::Quat::from_rotation_z(angles[1].to_radians())
+        * glam::Quat::from_rotation_y(angles[0].to_radians())
+        * glam::Quat::from_rotation_x(angles[2].to_radians())
+}
+
+/// Match v1: screen X edits the stored yaw; screen Y edits pitch.
+/// Unlike local quaternion composition, these two axes remain intuitive
+/// even after the object has been rolled or pitched.
+pub(in crate::app) fn placement_rotate_yaw_pitch(angles: [f32; 3], pitch: f32, yaw: f32) -> [f32; 3] {
+    let mut result = angles;
+    result[0] = (result[0] + pitch).rem_euclid(360.0);
+    result[1] = (result[1] + yaw).rem_euclid(360.0);
+    result
+}
+
+pub(in crate::app) fn placement_rotate_local(orientation: glam::Quat, pitch: f32, yaw: f32, roll: f32) -> glam::Quat {
+    (orientation
+        * glam::Quat::from_rotation_z(yaw.to_radians())
+        * glam::Quat::from_rotation_y(pitch.to_radians())
+        * glam::Quat::from_rotation_x(roll.to_radians())).normalize()
+}
+
+pub(in crate::app) fn placement_rotation_angles(orientation: glam::Quat) -> [f32; 3] {
+    let (yaw, pitch, roll) = orientation.to_euler(glam::EulerRot::ZYX);
+    [pitch, yaw, roll].map(|a| a.to_degrees().rem_euclid(360.0))
+}
+
 pub(super) fn model_axis(angles: [f32; 3], scale: f32) -> [[f32; 3]; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
@@ -287,9 +380,11 @@ impl App {
         }
         self.model_placement.map_label = self.prepared_map_cache.as_ref()
             .map(|map| map.label.clone()).unwrap_or_default();
+        if self.model_placement.editor_placing { self.finish_editor_add(); }
         self.model_placement.kind = PlacementKind::Md3;
         self.model_placement.active = false;
         self.model_placement.rotating = false;
+        self.model_placement.preview_rotation = None;
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.model_placement.preview_key = None;
         self.ensure_asset_viewer_catalog();
@@ -304,9 +399,16 @@ impl App {
         }
         self.model_placement.map_label = self.prepared_map_cache.as_ref()
             .map(|map| map.label.clone()).unwrap_or_default();
+        if self.model_placement.editor_placing { self.finish_editor_add(); }
         self.model_placement.kind = PlacementKind::Bmodel;
+        self.model_placement.picker_preview = None;
+        self.model_placement.picker_hit = None;
+        self.model_placement.picker_draws = Arc::new(Vec::new());
+        self.model_placement.picker_draw_key = None;
+        self.model_placement.picker_fx_runtime = None;
         self.model_placement.active = false;
         self.model_placement.rotating = false;
+        self.model_placement.preview_rotation = None;
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.model_placement.preview_key = None;
         self.model_placement.hit_valid = false;
@@ -324,6 +426,12 @@ impl App {
             return;
         }
         self.model_placement.kind = PlacementKind::Bmodel;
+        self.model_placement.editor_placing = self.model_placement.edit_mode;
+        self.model_placement.editor_selected = None;
+        self.model_placement.hover = None;
+        self.model_placement.bmodel_hover = None;
+        self.model_placement.fx_hover = None;
+        self.model_placement.hover_since = None;
         self.model_placement.bmodel_selection = Some(model);
         self.model_placement.bmodel_pivot = pivot;
         self.model_placement.bmodel_bounds = Some(bounds);
@@ -331,6 +439,7 @@ impl App {
         self.model_placement.angles = [0.0; 3];
         self.model_placement.hit_valid = false;
         self.model_placement.rotating = false;
+        self.model_placement.preview_rotation = None;
         self.model_placement.active = true;
         self.model_placement.status.clear();
         // Grow the model's private GPU slot once at selection, not every frame.
@@ -353,8 +462,14 @@ impl App {
             }
         };
         self.model_placement.kind = PlacementKind::Md3;
-        // Choosing a model from the browser is "place new", not "edit".
-        self.model_placement.edit_mode = false;
+        // During map editing, choose a one-shot ghost without exiting edit mode.
+        // The existing dev-wheel placement tool still supports repeat stamping.
+        self.model_placement.editor_placing = self.model_placement.edit_mode;
+        self.model_placement.editor_selected = None;
+        self.model_placement.hover = None;
+        self.model_placement.bmodel_hover = None;
+        self.model_placement.fx_hover = None;
+        self.model_placement.hover_since = None;
         self.model_placement.held = None;
         self.model_placement.fx_selection = None;
         self.model_placement.fx_held = None;
@@ -364,6 +479,7 @@ impl App {
         self.model_placement.bounds = Some(bounds);
         self.model_placement.active = true;
         self.model_placement.rotating = false;
+        self.model_placement.preview_rotation = None;
         self.model_placement.preview_key = None;
         self.model_placement.status.clear();
         self.set_overlay(OverlayMode::None);
@@ -382,8 +498,14 @@ impl App {
             .map(|map| map.label.clone()).unwrap_or_default();
         state.kind = PlacementKind::Md3;
         state.edit_mode = true;
+        state.editor_placing = false;
         state.active = true;
+        state.editor_drag = None;
+        state.editor_mouse_owned = None;
+        state.editor_selected = None;
+        state.bmodel_hover = None;
         state.rotating = false;
+        state.preview_rotation = None;
         state.selection = None;
         state.bounds = None;
         state.held = None;
@@ -399,117 +521,386 @@ impl App {
         self.egui_repaint_requested = true;
     }
 
-    /// Primary click. In edit mode with nothing in hand it picks up the
-    /// placement under the crosshair (`copy` keeps the original); otherwise it
-    /// stamps the model in hand.
-    pub(in crate::app) fn placement_click(&mut self, copy: bool) {
+    fn placement_snapshot(&self) -> PlacementSnapshot {
+        PlacementSnapshot {
+            md3: self.model_placement.placed.clone(),
+            bmodels: self.model_placement.bmodel_placed.clone(),
+            fx: self.model_placement.fx_placed.clone(),
+            remaps: self.model_placement.authored_remaps.clone(),
+            disabled_remaps: self.shader_remap_ui.disabled.clone(),
+            ent_dirty: self.model_placement.ent_dirty,
+        }
+    }
+
+    pub(in crate::app) fn placement_checkpoint(&mut self) {
+        let before = self.placement_snapshot();
         let state = &mut self.model_placement;
-        if !(state.edit_mode && state.selection.is_none() && state.fx_selection.is_none()
-            && state.kind == PlacementKind::Md3) {
+        if state.edit_undo.len() >= 128 { state.edit_undo.remove(0); }
+        state.edit_undo.push(before);
+        state.edit_redo.clear();
+        state.ent_dirty = true;
+    }
+
+    fn apply_placement_snapshot(&mut self, snapshot: PlacementSnapshot) {
+        let previous = std::mem::replace(&mut self.model_placement.authored_remaps, snapshot.remaps);
+        self.model_placement.placed = snapshot.md3;
+        self.model_placement.bmodel_placed = snapshot.bmodels;
+        self.model_placement.fx_placed = snapshot.fx;
+        let previously_disabled = std::mem::replace(
+            &mut self.shader_remap_ui.disabled, snapshot.disabled_remaps);
+        self.model_placement.editor_selected = None;
+        self.model_placement.hover = None;
+        self.model_placement.fx_hover = None;
+        self.model_placement.bmodel_hover = None;
+        self.model_placement.placed_dirty = true;
+        self.model_placement.bmodel_collision_dirty = true;
+        self.model_placement.ent_dirty = true;
+        self.model_placement.editor_drag = None;
+        self.model_placement.preview_key = None;
+        let new_remaps = self.model_placement.authored_remaps.clone();
+        for source in previous.keys().filter(|key| !new_remaps.contains_key(*key)) {
+            self.local_remap_shader(source, source);
+        }
+        for (source, target) in new_remaps.iter() {
+            if previous.get(source) != Some(target) { self.local_remap_shader(source, target); }
+        }
+        // Disabling a non-authored (e.g. server-provided) redirect is a UI
+        // change, not an exportable map mod. Restore its effective preview on
+        // undo/redo without accidentally promoting it into authored_remaps.
+        let disabled = self.shader_remap_ui.disabled.clone();
+        for (source, target) in &previously_disabled {
+            if !disabled.contains_key(source) && !new_remaps.contains_key(source) {
+                self.local_remap_shader(source, target);
+            }
+        }
+        for source in disabled.keys() {
+            if !previously_disabled.contains_key(source) && !new_remaps.contains_key(source) {
+                self.local_remap_shader(source, source);
+            }
+        }
+    }
+
+    pub(in crate::app) fn redo_model_placement(&mut self) {
+        let Some(next) = self.model_placement.edit_redo.pop() else { return; };
+        let current = self.placement_snapshot();
+        self.model_placement.edit_undo.push(current);
+        self.apply_placement_snapshot(next);
+        self.model_placement.status = "Redo".into();
+    }
+
+    pub(in crate::app) fn placement_click(&mut self, copy: bool) -> bool {
+        if self.model_placement.editor_placing {
+            // An add preview is active *inside* the persistent editor session.
+            // Never let a failed stamp trigger gameplay attacks or noclip binds.
+            if !self.model_placement.hit_valid {
+                self.model_placement.status = "Aim at a solid surface to place the asset".into();
+                return true;
+            }
+            let kind = self.model_placement.kind;
+            let index = match kind {
+                PlacementKind::Md3 => self.model_placement.placed.len(),
+                PlacementKind::Bmodel => self.model_placement.bmodel_placed.len(),
+                PlacementKind::Fx => self.model_placement.fx_placed.len(),
+            };
             self.stamp_placement();
-            return;
+            let added = match kind {
+                PlacementKind::Md3 => self.model_placement.placed.len() > index,
+                PlacementKind::Bmodel => self.model_placement.bmodel_placed.len() > index,
+                PlacementKind::Fx => self.model_placement.fx_placed.len() > index,
+            };
+            if added {
+                self.finish_editor_add();
+                self.model_placement.editor_selected = Some(match kind {
+                    PlacementKind::Md3 => EditSelection::Md3(index),
+                    PlacementKind::Bmodel => EditSelection::Bmodel(index),
+                    PlacementKind::Fx => EditSelection::Fx(index),
+                });
+            }
+            // Consume button-up too; the game never received this press.
+            self.model_placement.editor_mouse_owned = Some(crate::app::MouseButton::Left);
+            return true;
         }
-        // An effect under the crosshair: pick it up the same way.
-        if let Some(index) = state.fx_hover.filter(|&index| index < state.fx_placed.len()) {
-            state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
-            let picked = if copy { state.fx_placed[index].clone() } else { state.fx_placed.remove(index) };
-            state.fx_held = (!copy).then(|| picked.clone());
-            state.fx_selection = Some(picked.effect);
-            state.fx_delay = picked.delay_ms as f32;
-            state.angles = picked.angles;
-            state.origin = picked.origin;
-            state.kind = PlacementKind::Fx;
-            state.fx_hover = None;
-            state.hit_valid = false;
-            state.status = if copy { "Effect copy picked up: click to place".into() }
-                else { "Effect picked up: click to drop (Esc puts it back)".into() };
-            return;
+        if !self.model_placement.edit_mode {
+            if !self.model_placement.hit_valid { return false; }
+            self.stamp_placement();
+            return true;
         }
-        let Some(index) = state.hover.filter(|&index| index < state.placed.len()) else { return; };
-        state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
-        let picked = if copy { state.placed[index].clone() } else { state.placed.remove(index) };
-        state.held = (!copy).then(|| picked.clone());
-        state.selection = Some(picked.qpath);
-        state.bounds = Some(picked.bounds);
-        state.scale = picked.scale;
-        state.angles = picked.angles;
-        state.origin = picked.origin;
-        state.hover = None;
-        state.hit_valid = false;
-        state.preview_key = None;
-        state.placed_dirty = true;
-        state.status = if copy { "Copy picked up: click to place".into() }
-            else { "Picked up: click to drop (Esc puts it back)".into() };
+        let picked = self.model_placement.bmodel_hover.map(EditSelection::Bmodel)
+            .or_else(|| self.model_placement.fx_hover.map(EditSelection::Fx))
+            .or_else(|| self.model_placement.hover.map(EditSelection::Md3));
+        self.model_placement.editor_selected = picked;
+        let Some(mut selected) = picked else { return false; };
+        let before = self.placement_snapshot();
+        if copy {
+            let state = &mut self.model_placement;
+            selected = match selected {
+                EditSelection::Md3(i) => {
+                    let Some(p) = state.placed.get(i).cloned() else { return false; };
+                    state.placed.push(p);
+                    state.placed_dirty = true;
+                    EditSelection::Md3(state.placed.len() - 1)
+                }
+                EditSelection::Bmodel(i) => {
+                    let Some(p) = state.bmodel_placed.get(i).cloned() else { return false; };
+                    state.bmodel_placed.push(p);
+                    state.bmodel_collision_dirty = true;
+                    EditSelection::Bmodel(state.bmodel_placed.len() - 1)
+                }
+                EditSelection::Fx(i) => {
+                    let Some(p) = state.fx_placed.get(i).cloned() else { return false; };
+                    state.fx_placed.push(p);
+                    EditSelection::Fx(state.fx_placed.len() - 1)
+                }
+            };
+            state.editor_selected = Some(selected);
+        }
+        if copy && matches!(selected, EditSelection::Bmodel(_)) {
+            self.ensure_inline_instance_capacity();
+        }
+        self.model_placement.editor_drag = Some(PlacementDrag {
+            mode: EditDragMode::Move, selected, changed: copy, before,
+            orientation: None,
+        });
+        self.model_placement.editor_mouse_owned = Some(crate::app::MouseButton::Left);
+        true
     }
 
-    /// Delete the placement under the crosshair (edit mode, nothing in hand).
-    pub(in crate::app) fn delete_hovered_placement(&mut self) {
+    /// Dismiss a one-shot Add ghost without leaving the editing session.
+    pub(in crate::app) fn finish_editor_add(&mut self) {
         let state = &mut self.model_placement;
-        if !(state.edit_mode && state.selection.is_none() && state.fx_selection.is_none()) { return; }
-        if let Some(index) = state.fx_hover.filter(|&index| index < state.fx_placed.len()) {
-            state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
-            let removed = state.fx_placed.remove(index);
-            state.fx_hover = None;
-            state.status = format!("Deleted effect {} ({} left; Ctrl+Z undoes)", removed.effect, state.fx_placed.len());
-            return;
-        }
-        let Some(index) = state.hover.filter(|&index| index < state.placed.len()) else { return; };
-        state.edit_undo.push((state.placed.clone(), state.fx_placed.clone()));
-        let removed = state.placed.remove(index);
-        state.hover = None;
-        state.placed_dirty = true;
-        state.status = format!("Deleted {} ({} left; Ctrl+Z undoes)", removed.qpath, state.placed.len());
+        state.editor_placing = false;
+        state.kind = PlacementKind::Md3;
+        state.selection = None;
+        state.bounds = None;
+        state.bmodel_selection = None;
+        state.bmodel_bounds = None;
+        state.fx_selection = None;
+        state.hit_valid = false;
+        state.rotating = false;
+        state.preview_rotation = None;
+        state.preview_key = None;
+        state.preview_draws = Arc::new(Vec::new());
     }
 
-    /// `E` toggles between placing a model and editing placed ones.
+    pub(in crate::app) fn placement_begin_rotation(&mut self, button: crate::app::MouseButton) -> bool {
+        if !self.model_placement.edit_mode || self.model_placement.editor_placing { return false; }
+        // Right/middle-clicking empty space must remain available to noclip
+        // and normal bindings, even when a previous object is still selected.
+        let selected = self.model_placement.bmodel_hover.map(EditSelection::Bmodel)
+            .or_else(|| self.model_placement.fx_hover.map(EditSelection::Fx))
+            .or_else(|| self.model_placement.hover.map(EditSelection::Md3));
+        let Some(selected) = selected else { return false; };
+        let before = self.placement_snapshot();
+        let angles = match selected {
+            EditSelection::Md3(i) => self.model_placement.placed.get(i).map(|p| p.angles),
+            EditSelection::Bmodel(i) => self.model_placement.bmodel_placed.get(i).map(|p| p.angles),
+            EditSelection::Fx(i) => self.model_placement.fx_placed.get(i).map(|p| p.angles),
+        };
+        let Some(angles) = angles else { return false; };
+        self.model_placement.editor_selected = Some(selected);
+        self.model_placement.editor_drag = Some(PlacementDrag {
+            mode: if button == crate::app::MouseButton::Middle { EditDragMode::YawPitch }
+                else { EditDragMode::Roll }, selected, changed: false, before,
+            // Only local roll needs a running quaternion; middle mouse
+            // keeps the direct yaw/pitch adjustments from v1.
+            orientation: (button == crate::app::MouseButton::Right)
+                .then(|| placement_orientation(angles)),
+        });
+        self.model_placement.editor_mouse_owned = Some(button);
+        true
+    }
+
+    pub(in crate::app) fn placement_release_drag(&mut self, button: crate::app::MouseButton) -> bool {
+        if self.model_placement.editor_mouse_owned != Some(button) { return false; }
+        self.model_placement.editor_mouse_owned = None;
+        if button == crate::app::MouseButton::Right {
+            self.model_placement.rotating = false;
+            self.model_placement.preview_rotation = None;
+        }
+        if let Some(drag) = self.model_placement.editor_drag.take() {
+            if drag.changed {
+                if self.model_placement.edit_undo.len() >= 128 { self.model_placement.edit_undo.remove(0); }
+                self.model_placement.edit_undo.push(drag.before);
+                self.model_placement.edit_redo.clear();
+                self.model_placement.ent_dirty = true;
+            }
+        }
+        true
+    }
+
+    pub(in crate::app) fn placement_drag_motion(&mut self, delta: (f64, f64)) {
+        let Some(drag) = self.model_placement.editor_drag.as_ref() else { return; };
+        let selection = drag.selected;
+        let mode = drag.mode;
+        if !delta.0.is_finite() || !delta.1.is_finite() { return; }
+        let dx = (delta.0 as f32).clamp(-250.0, 250.0);
+        let dy = (delta.1 as f32).clamp(-250.0, 250.0);
+        if dx.abs() + dy.abs() < 0.0001 { return; }
+        let (origin, angles) = match selection {
+            EditSelection::Md3(i) => match self.model_placement.placed.get(i) {
+                Some(p) => (p.origin, p.angles), None => return,
+            },
+            EditSelection::Bmodel(i) => match self.model_placement.bmodel_placed.get(i) {
+                Some(p) => (p.hit, p.angles), None => return,
+            },
+            EditSelection::Fx(i) => match self.model_placement.fx_placed.get(i) {
+                Some(p) => (p.origin, p.angles), None => return,
+            },
+        };
+        let mut next_origin = origin;
+        let mut next_angles = angles;
+        match mode {
+            EditDragMode::Move => {
+                let eye = scene::jka_position(self.camera.position.to_array());
+                let forward = scene::jka_position(self.camera.forward().to_array());
+                let mut right = [forward[1], -forward[0], 0.0_f32];
+                let len = (right[0]*right[0] + right[1]*right[1]).sqrt();
+                if len < 0.0001 { right = [0.0, -1.0, 0.0]; }
+                else { right[0] /= len; right[1] /= len; }
+                // right × forward points toward world up with JKA Z-up.
+                let up = [ right[1]*forward[2], -right[0]*forward[2],
+                    right[0]*forward[1] - right[1]*forward[0] ];
+                let distance = ((0..3).map(|i| (origin[i]-eye[i]).powi(2)).sum::<f32>()).sqrt();
+                let (width, height) = self.window.as_ref().map_or((1280.0, 720.0), |w| {
+                    let size = w.inner_size(); (size.width as f32, size.height as f32)
+                });
+                let height = height.max(1.0);
+                let aspect = width.max(1.0) / height;
+                let tan_half_vertical = (self.camera.cg_fov().clamp(1.0, 170.0)
+                    * 0.5).to_radians().tan() / aspect;
+                let fine = if self.modifiers.alt_key() { 0.15 } else { 1.0 };
+                let units = (2.0 * distance.max(32.0) * tan_half_vertical / height)
+                    .clamp(0.02, 20.0) * fine;
+                if self.modifiers.control_key() {
+                    next_origin[2] -= dy * units;
+                } else if self.modifiers.shift_key() {
+                    next_origin[0] += right[0] * dx * units - right[1] * dy * units;
+                    next_origin[1] += right[1] * dx * units + right[0] * dy * units;
+                } else {
+                    for axis in 0..3 { next_origin[axis] += (right[axis]*dx - up[axis]*dy)*units; }
+                }
+            }
+            EditDragMode::YawPitch => {
+                // Restore the original middle-mouse feel: directly adjust
+                // JKA pitch/yaw fields rather than rotating object-local axes.
+                next_angles = placement_rotate_yaw_pitch(angles, -dy * 0.20, dx * 0.20);
+            }
+            EditDragMode::Roll => {
+                // Retain v2's right-mouse roll about the model's *current*
+                // forward axis (including any existing yaw and pitch).
+                let orientation = drag.orientation.unwrap_or_else(|| placement_orientation(angles));
+                let rotated = placement_rotate_local(orientation, 0.0, 0.0, (dx - dy) * 0.20);
+                next_angles = placement_rotation_angles(rotated);
+                if let Some(drag) = self.model_placement.editor_drag.as_mut() {
+                    drag.orientation = Some(rotated);
+                }
+            }
+        }
+        match selection {
+            EditSelection::Md3(i) => if let Some(p) = self.model_placement.placed.get_mut(i) {
+                p.origin = next_origin; p.angles = next_angles;
+                self.model_placement.placed_dirty = true;
+            },
+            EditSelection::Bmodel(i) => if let Some(p) = self.model_placement.bmodel_placed.get_mut(i) {
+                p.hit = next_origin; p.angles = next_angles;
+                self.model_placement.bmodel_collision_dirty = true;
+            },
+            EditSelection::Fx(i) => if let Some(p) = self.model_placement.fx_placed.get_mut(i) {
+                p.origin = next_origin; p.angles = next_angles;
+            },
+        }
+        if let Some(drag) = self.model_placement.editor_drag.as_mut() { drag.changed = true; }
+        self.egui_repaint_requested = true;
+    }
+
+    pub(in crate::app) fn duplicate_selected_placement(&mut self) {
+        let Some(selected) = self.model_placement.editor_selected else { return; };
+        self.placement_checkpoint();
+        let state = &mut self.model_placement;
+        state.editor_selected = match selected {
+            EditSelection::Md3(i) => state.placed.get(i).cloned().map(|p| {
+                state.placed.push(p); state.placed_dirty = true; EditSelection::Md3(state.placed.len()-1)
+            }),
+            EditSelection::Bmodel(i) => state.bmodel_placed.get(i).cloned().map(|p| {
+                state.bmodel_placed.push(p); state.bmodel_collision_dirty = true;
+                EditSelection::Bmodel(state.bmodel_placed.len()-1)
+            }),
+            EditSelection::Fx(i) => state.fx_placed.get(i).cloned().map(|p| {
+                state.fx_placed.push(p); EditSelection::Fx(state.fx_placed.len()-1)
+            }),
+        };
+        if matches!(selected, EditSelection::Bmodel(_)) { self.ensure_inline_instance_capacity(); }
+    }
+
+    pub(in crate::app) fn delete_hovered_placement(&mut self) {
+        if !self.model_placement.edit_mode { return; }
+        let selected = self.model_placement.editor_selected
+            .or_else(|| self.model_placement.bmodel_hover.map(EditSelection::Bmodel))
+            .or_else(|| self.model_placement.fx_hover.map(EditSelection::Fx))
+            .or_else(|| self.model_placement.hover.map(EditSelection::Md3));
+        let Some(selected) = selected else { return; };
+        self.placement_checkpoint();
+        let state = &mut self.model_placement;
+        match selected {
+            EditSelection::Md3(i) if i < state.placed.len() => {
+                state.placed.remove(i); state.placed_dirty = true;
+            }
+            EditSelection::Bmodel(i) if i < state.bmodel_placed.len() => {
+                state.bmodel_placed.remove(i); state.bmodel_collision_dirty = true;
+            }
+            EditSelection::Fx(i) if i < state.fx_placed.len() => { state.fx_placed.remove(i); }
+            _ => {}
+        }
+        state.editor_selected = None;
+        state.hover = None;
+        state.bmodel_hover = None;
+        state.fx_hover = None;
+        state.status = "Object deleted (Ctrl+Z to undo)".into();
+    }
+
+    /// E switches between explicitly enabled editing and asset placement.
     pub(in crate::app) fn toggle_placement_edit(&mut self) {
         if self.model_placement.edit_mode {
-            self.model_placement.edit_mode = false;
-            self.cancel_placement();
-        } else {
-            self.enter_placement_edit();
-        }
+            self.model_placement.status = "Map editing stays active. Open Map Mods and choose EXIT MAP EDITING.".into();
+        } else { self.enter_placement_edit(); }
     }
 
-    pub(in crate::app) fn cancel_placement(&mut self) {
-        // Edit mode with a picked-up model or effect: Esc puts it back and stays
-        // in edit mode.
-        if self.model_placement.edit_mode
-            && (self.model_placement.selection.is_some() || self.model_placement.fx_selection.is_some()) {
-            let state = &mut self.model_placement;
-            if let Some(original) = state.held.take() {
-                state.placed.push(original);
+    pub(in crate::app) fn exit_map_editing(&mut self) {
+        if let Some(drag) = self.model_placement.editor_drag.take() {
+            if drag.changed {
+                let was_dirty = drag.before.ent_dirty;
+                self.apply_placement_snapshot(drag.before);
+                self.model_placement.ent_dirty = was_dirty;
             }
-            if let Some(original) = state.fx_held.take() {
-                state.fx_placed.push(original);
-            }
-            state.kind = PlacementKind::Md3;
-            state.fx_selection = None;
-            state.selection = None;
-            state.bounds = None;
-            state.hit_valid = false;
-            state.preview_key = None;
-            state.preview_draws = Arc::new(Vec::new());
-            state.placed_dirty = true;
-            state.status = "Edit mode".into();
-            self.egui_repaint_requested = true;
-            return;
         }
+        self.model_placement.editor_mouse_owned = None;
+        self.model_placement.editor_selected = None;
+        self.model_placement.editor_placing = false;
         self.model_placement.edit_mode = false;
-        self.model_placement.held = None;
-        self.model_placement.hover = None;
-        self.model_placement.fx_held = None;
-        self.model_placement.fx_hover = None;
-        self.model_placement.fx_selection = None;
-        if self.model_placement.kind == PlacementKind::Fx {
-            self.model_placement.kind = PlacementKind::Md3;
-        }
         self.model_placement.active = false;
         self.model_placement.rotating = false;
+        self.model_placement.preview_rotation = None;
         self.model_placement.hit_valid = false;
         self.model_placement.preview_key = None;
         self.model_placement.preview_draws = Arc::new(Vec::new());
-        self.egui_repaint_requested = true;
+    }
+
+    /// Esc only cancels the current interaction or deselects. The editing
+    /// session stays active until Exit Map Editing is explicitly used.
+    pub(in crate::app) fn cancel_placement(&mut self) {
+        if self.model_placement.edit_mode {
+            if let Some(drag) = self.model_placement.editor_drag.take() {
+                let was_dirty = drag.before.ent_dirty;
+                self.apply_placement_snapshot(drag.before);
+                self.model_placement.ent_dirty = was_dirty;
+            } else {
+                self.model_placement.editor_selected = None;
+            }
+            self.model_placement.editor_mouse_owned = None;
+            self.model_placement.status = "Editing — select another object, or exit explicitly".into();
+            return;
+        }
+        self.exit_map_editing();
     }
 
     /// Choose an effect from the browser: it follows the crosshair as a live
@@ -517,7 +908,12 @@ impl App {
     pub(in crate::app) fn choose_placement_effect(&mut self, qpath: String) {
         let state = &mut self.model_placement;
         state.kind = PlacementKind::Fx;
-        state.edit_mode = false;
+        state.editor_placing = state.edit_mode;
+        state.editor_selected = None;
+        state.hover = None;
+        state.bmodel_hover = None;
+        state.fx_hover = None;
+        state.hover_since = None;
         state.held = None;
         state.fx_held = None;
         state.selection = None;
@@ -528,6 +924,7 @@ impl App {
         state.angles = [270.0, 0.0, 0.0];
         state.active = true;
         state.rotating = false;
+        state.preview_rotation = None;
         state.hit_valid = false;
         state.preview_key = None;
         state.preview_draws = Arc::new(Vec::new());
@@ -537,6 +934,7 @@ impl App {
 
     pub(in crate::app) fn stamp_placement(&mut self) {
         if !self.model_placement.active || !self.model_placement.hit_valid { return; }
+        self.placement_checkpoint();
         if self.model_placement.kind == PlacementKind::Fx {
             let state = &mut self.model_placement;
             let Some(effect) = state.fx_selection.clone() else { return; };
@@ -590,38 +988,11 @@ impl App {
     }
 
     pub(in crate::app) fn undo_model_placement(&mut self) {
-        if self.model_placement.edit_mode {
-            let state = &mut self.model_placement;
-            if let Some((models, effects)) = state.edit_undo.pop() {
-                state.placed = models;
-                state.fx_placed = effects;
-                state.fx_selection = None;
-                state.fx_held = None;
-                state.fx_hover = None;
-                if state.kind == PlacementKind::Fx { state.kind = PlacementKind::Md3; }
-                state.selection = None;
-                state.bounds = None;
-                state.held = None;
-                state.hover = None;
-                state.hit_valid = false;
-                state.preview_key = None;
-                state.preview_draws = Arc::new(Vec::new());
-                state.placed_dirty = true;
-                state.status = "Edit undone".into();
-            }
-            return;
-        }
-        if self.model_placement.kind == PlacementKind::Bmodel {
-            if self.model_placement.bmodel_placed.pop().is_some() {
-                self.model_placement.bmodel_collision_dirty = true;
-                self.model_placement.status = "Last BMODEL placement undone".into();
-            }
-            return;
-        }
-        if self.model_placement.placed.pop().is_some() {
-            self.model_placement.placed_dirty = true;
-            self.model_placement.status = "Last placement undone".into();
-        }
+        let Some(before) = self.model_placement.edit_undo.pop() else { return; };
+        let current = self.placement_snapshot();
+        self.model_placement.edit_redo.push(current);
+        self.apply_placement_snapshot(before);
+        self.model_placement.status = "Undo".into();
     }
 
     /// Keep exact CM_TransformedBoxTrace/CM_TransformedPointContents copies
@@ -808,6 +1179,134 @@ impl App {
         self.model_placement.fx_draws = Arc::new(surfaces);
     }
 
+    /// Browser audition uses the real gameplay presentation path, not a fake
+    /// raster FX icon. It stays independent of active placement/undo history.
+    fn update_placement_picker_preview(&mut self) {
+        if self.overlay != OverlayMode::ModelPicker {
+            self.model_placement.picker_preview = None;
+            self.model_placement.picker_hit = None;
+            self.model_placement.picker_draw_key = None;
+            if !self.model_placement.picker_draws.is_empty() {
+                self.model_placement.picker_draws = Arc::new(Vec::new());
+            }
+            return;
+        }
+        let Some((kind, qpath)) = self.model_placement.picker_preview.clone() else {
+            self.model_placement.picker_hit = None;
+            self.model_placement.picker_draw_key = None;
+            self.model_placement.picker_draws = Arc::new(Vec::new());
+            return;
+        };
+        // Same camera ray/trace mask as actual placement. The world remains
+        // fully rendered, with the browser anchored away from the crosshair.
+        use jka_movement::TraceWorld;
+        let start = scene::jka_position(self.camera.position.to_array());
+        let direction = scene::jka_position(self.camera.forward().to_array());
+        let end = std::array::from_fn(|i| start[i] + direction[i] * 131_072.0);
+        let hit = self.map_collision.as_mut().and_then(|world| {
+            let trace = world.trace(jka_movement::TraceQuery {
+                start, end, mins: [0.0; 3], maxs: [0.0; 3],
+                pass_entity: -1, mask: 0x1 | 0x1000,
+            });
+            (trace.fraction < 1.0 && trace.start_solid == 0).then_some(trace.end)
+        });
+        // The Asset Viewer does not require aiming at BSP, either. Keep the
+        // browser usable if the camera faces sky or a very distant wall.
+        let hit = hit.filter(|point| {
+            let d2: f32 = (0..3).map(|i| (point[i] - start[i]).powi(2)).sum();
+            d2 <= 600.0 * 600.0
+        }).or_else(|| Some(std::array::from_fn(|i| start[i] + direction[i] * 220.0)));
+        self.model_placement.picker_hit = hit;
+        if kind != AssetKind::Md3 || hit.is_none() {
+            self.model_placement.picker_draw_key = None;
+            self.model_placement.picker_draws = Arc::new(Vec::new());
+            return; // EFX gets its own isolated, Asset Viewer-style scheduler.
+        }
+        let key = (qpath.clone(), hit.unwrap(),
+            (self.model_placement.picker_yaw * 10.0).round() as i32,
+            (self.model_placement.picker_scale * 1000.0).round() as i32);
+        if self.model_placement.picker_draw_key.as_ref() == Some(&key) { return; }
+        if let Err(error) = self.ensure_asset_preview_entity_presenter() {
+            self.model_placement.status = error;
+            return;
+        }
+        let presenter = self.asset_preview_entity_presenter.as_mut().unwrap();
+        match presenter.present_static_md3(1023, &qpath, hit.unwrap(),
+                model_axis([0.0, self.model_placement.picker_yaw, 0.0],
+                    self.model_placement.picker_scale), [1.0; 4], 0) {
+            Ok(draws) => {
+                self.model_placement.picker_draws = Arc::new(draws);
+                self.model_placement.picker_draw_key = Some(key);
+            }
+            Err(error) => {
+                self.model_placement.picker_draws = Arc::new(Vec::new());
+                self.model_placement.picker_draw_key = Some(key);
+                self.model_placement.status = format!("Preview {qpath}: {error}");
+            }
+        }
+    }
+
+    /// Replay an EFX through the same authored scheduler and FX tessellation
+    /// used by Asset Viewer, but in a *separate* map-browser runtime. Nothing
+    /// in the placement scheduler, stamps, or undo history is touched.
+    fn update_placement_picker_fx(&mut self) {
+        let effect = if self.overlay == OverlayMode::ModelPicker {
+            self.model_placement.picker_preview.as_ref().and_then(|(kind, qpath)|
+                (*kind == AssetKind::Efx).then(|| fx_runner_name(qpath)))
+        } else { None };
+        let (Some(effect), Some(origin)) = (effect, self.model_placement.picker_hit) else {
+            self.model_placement.picker_fx_runtime = None;
+            return;
+        };
+        if let Err(error) = self.ensure_asset_preview_entity_presenter() {
+            self.model_placement.status = error;
+            return;
+        }
+        let changed = self.model_placement.picker_fx_runtime.as_ref()
+            .is_none_or(|state| !state.ids.contains_key(&effect));
+        if changed {
+            let mut assets = match jka_assets::pk3::AssetSearchPath::open_game(
+                &self.base, self.game.as_deref()) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    self.model_placement.status = format!("EFX PREVIEW VFS: {error}");
+                    return;
+                }
+            };
+            assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+            let mut system = crate::fx::system::FxSystem::new();
+            let id = system.register(&effect, &mut |path| {
+                assets.read(path, 32 * 1024 * 1024).ok().flatten().map(|data| data.bytes)
+            });
+            if id == 0 {
+                self.model_placement.status = format!("Could not preview {effect}");
+                self.model_placement.picker_fx_runtime = None;
+                return;
+            }
+            system.reset_time(0);
+            let mut ids = HashMap::new();
+            ids.insert(effect.clone(), id);
+            self.model_placement.picker_fx_runtime = Some(PlacementFx {
+                system, started: Instant::now(), ids, next: Vec::new(), ghost_next: 0,
+            });
+        }
+        let runtime = self.model_placement.picker_fx_runtime.as_mut().unwrap();
+        let now_ms = (runtime.started.elapsed().as_millis().min(i32::MAX as u128) as i32).max(1);
+        runtime.system.adjust_time(now_ms);
+        if now_ms >= runtime.ghost_next {
+            let id = runtime.ids[&effect];
+            runtime.system.play_effect_dir(id, origin, [0.0, 0.0, 1.0]);
+            runtime.ghost_next = now_ms.saturating_add(1500);
+        }
+        let frame = runtime.system.frame();
+        let view = crate::fx::draw::FxView::from_camera(&self.camera);
+        let presenter = self.asset_preview_entity_presenter.as_mut().unwrap();
+        let surfaces = crate::fx::draw::tessellate(&frame.draws, &view, &mut |shader| {
+            presenter.fx_material_stages(shader)
+        });
+        self.model_placement.picker_draws = Arc::new(surfaces);
+    }
+
     /// Called before the RenderSnapshot is published. Model vertices for fixed
     /// placements are built only on a stamp/undo, not once per game frame.
     pub(in crate::app) fn update_model_placement(&mut self) {
@@ -818,7 +1317,9 @@ impl App {
             };
         }
         self.sync_bmodel_collision();
-        if self.model_placement.active && !self.model_placement.rotating {
+        self.update_placement_picker_preview();
+        self.update_placement_picker_fx();
+        if self.model_placement.active && (!self.model_placement.edit_mode || self.model_placement.editor_placing) && !self.model_placement.rotating {
             use jka_movement::TraceWorld;
             let start = scene::jka_position(self.camera.position.to_array());
             // Use the center camera ray, never weapon muzzle/dynamic-crosshair
@@ -837,33 +1338,48 @@ impl App {
                 }
             }
         }
-        if self.model_placement.edit_mode
-            && self.model_placement.selection.is_none() && self.model_placement.fx_selection.is_none() {
-            // Nothing in hand: find the model or effect under the crosshair
-            // (whichever the ray meets first).
+        if self.model_placement.edit_mode && !self.model_placement.editor_placing {
+            // Pick from the camera ray, respecting solid BSP geometry. Editing a
+            // currently selected item never removes it from rendering.
             let start = scene::jka_position(self.camera.position.to_array());
             let direction = scene::jka_position(self.camera.forward().to_array());
+            let (mut hit_limit, mut model, mut bmodel, mut fx) = (f32::INFINITY, None, None, None);
+            if let Some(world) = self.map_collision.as_mut() {
+                use jka_movement::TraceWorld;
+                let end = std::array::from_fn(|i| start[i] + direction[i] * 131_072.0);
+                let hit = world.trace(jka_movement::TraceQuery { start, end,
+                    mins: [0.0; 3], maxs: [0.0; 3], pass_entity: -1,
+                    mask: 0x1 | 0x1000 });
+                if hit.fraction < 1.0 { hit_limit = hit.fraction * 131_072.0 + 4.0; }
+            }
+            let state = &self.model_placement;
+            for (i,p) in state.placed.iter().enumerate() {
+                if let Some(distance) = ray_hits_placement(start, direction, p) {
+                    if distance < hit_limit { hit_limit = distance; model = Some(i); bmodel = None; fx = None; }
+                }
+            }
+            for (i,p) in state.bmodel_placed.iter().enumerate() {
+                let proxy = ModelPlacement { qpath: String::new(), origin: p.instance().origin,
+                    angles: p.angles, scale: 1.0, bounds: p.bounds };
+                if let Some(distance) = ray_hits_placement(start, direction, &proxy) {
+                    if distance < hit_limit { hit_limit = distance; model = None; bmodel = Some(i); fx = None; }
+                }
+            }
+            for (i,p) in state.fx_placed.iter().enumerate() {
+                if let Some(distance) = ray_hits_sphere(start, direction, p.origin, FX_PICK_RADIUS) {
+                    if distance < hit_limit + 32.0 {
+                        hit_limit = distance; model = None; bmodel = None; fx = Some(i);
+                    }
+                }
+            }
             let state = &mut self.model_placement;
-            let model = state.placed.iter().enumerate()
-                .filter_map(|(index, placement)| {
-                    ray_hits_placement(start, direction, placement).map(|distance| (index, distance))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            let effect = state.fx_placed.iter().enumerate()
-                .filter_map(|(index, placement)| {
-                    ray_hits_sphere(start, direction, placement.origin, FX_PICK_RADIUS)
-                        .map(|distance| (index, distance))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            // Effect gizmos are small and often sit inside a model's bounds, so
-            // an effect wins unless a model is clearly nearer.
-            let effect_wins = match (model, effect) {
-                (Some(m), Some(e)) => e.1 <= m.1 + 64.0,
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            state.fx_hover = effect.filter(|_| effect_wins).map(|(index, _)| index);
-            state.hover = model.filter(|_| !effect_wins).map(|(index, _)| index);
+            if (state.hover, state.bmodel_hover, state.fx_hover) != (model, bmodel, fx) {
+                state.hover_since = if model.is_some() || bmodel.is_some() || fx.is_some() {
+                    Some(Instant::now()) } else { None };
+            }
+            state.hover = model;
+            state.bmodel_hover = bmodel;
+            state.fx_hover = fx;
         }
         self.update_placement_fx();
         if self.model_placement.kind == PlacementKind::Bmodel {
@@ -933,27 +1449,43 @@ impl App {
         let mut selected = None;
         let mut selected_effect = None;
         let mut close = false;
+        let mut bmodels = false;
         let mut image_requests = Vec::new();
         let state = &mut self.model_placement;
-        egui::Window::new("MD3 MODEL PLACEMENT")
+        egui::Window::new("ADD TO MAP · ASSET BROWSER")
             .id(egui::Id::new("md3_model_placement_catalog"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(18.0, 72.0))
             .default_width(690.0).default_height(560.0)
             .resizable(true).collapsible(false)
             .show(root.ctx(), |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("PLACE MODEL");
+                    ui.heading("ADD TO MAP");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("CLOSE").clicked() { close = true; }
                     });
                 });
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut state.picker_effects, false, "MD3 MODELS");
-                    ui.selectable_value(&mut state.picker_effects, true, "EFFECTS (.efx)");
+                    let md3_clicked = ui.selectable_value(&mut state.picker_effects, false, "MD3 MODELS").clicked();
+                    let fx_clicked = ui.selectable_value(&mut state.picker_effects, true, "EFFECTS (.efx)").clicked();
+                    if md3_clicked || fx_clicked { state.picker_preview = None; }
+                    if ui.button("BSP BMODELS (*N)").clicked() { bmodels = true; }
                 });
                 if state.picker_effects {
-                    ui.label("Choose an effect: it plays live at the crosshair. Place it as an fx_runner; aim with right-drag (Shift pitch, Alt roll), wheel sets its repeat delay.");
+                    ui.label("Hover PREVIEW to play the authored EFX live at the crosshair (behind this pane). PLACE creates a movable fx_runner ghost; wheel sets its repeat delay.");
                 } else {
-                    ui.label("Choose any loaded MD3. Thumbnails show actual model geometry; the live world preview shows its authored materials.");
+                    ui.label("Hover PREVIEW to inspect the MD3 with its real materials in the map. PLACE starts placement; thumbnails show textured frame-zero geometry when available.");
+                }
+                if !state.picker_effects {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut state.picker_yaw, 0.0..=360.0)
+                            .text("Preview yaw"));
+                        ui.add(egui::Slider::new(&mut state.picker_scale, 0.1..=5.0)
+                            .text("Preview size"));
+                        if ui.small_button("RESET VIEW").clicked() {
+                            state.picker_yaw = 0.0;
+                            state.picker_scale = 1.0;
+                        }
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut state.search)
@@ -992,49 +1524,71 @@ impl App {
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().id_salt("model_placement_results")
-                    .auto_shrink([false, false]).show_rows(ui, 46.0, models.len(), |ui, rows| {
+                    .auto_shrink([false, false]).show_rows(ui, 74.0, models.len(), |ui, rows| {
                         for i in rows {
                             let entry = models[i];
-                            ui.horizontal(|ui| {
-                                if state.picker_effects {
+                            let kind = entry.kind;
+                            let qpath = &entry.qpath;
+                            let row = ui.horizontal(|ui| {
+                                if kind == AssetKind::Efx {
                                     let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(34.0, 34.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 3.0, theme::CONTROL);
+                                        egui::vec2(60.0, 60.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL);
                                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                                        "EFX", egui::FontId::monospace(10.0), theme::TEXT_DIM);
-                                } else if let Some(texture) = state.thumbnails.get(&entry.qpath) {
+                                        "▶ FX", egui::FontId::monospace(12.0), theme::TEXT_DIM);
+                                } else if let Some(texture) = state.thumbnails.get(qpath) {
                                     ui.add(egui::Image::new(texture)
-                                        .fit_to_exact_size(egui::vec2(34.0, 34.0)));
+                                        .fit_to_exact_size(egui::vec2(60.0, 60.0)));
                                 } else {
                                     let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(34.0, 34.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 3.0, theme::CONTROL);
-                                    if !state.thumbnails_missing.contains(&entry.qpath)
-                                        && state.thumbnails_pending.insert(entry.qpath.clone()) {
-                                        image_requests.push(entry.qpath.clone());
+                                        egui::vec2(60.0, 60.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL);
+                                    if !state.thumbnails_missing.contains(qpath)
+                                        && state.thumbnails_pending.insert(qpath.clone()) {
+                                        image_requests.push(qpath.clone());
                                     }
                                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                                        "MD3", egui::FontId::monospace(10.0), theme::TEXT_DIM);
+                                        "MD3", egui::FontId::monospace(12.0), theme::TEXT_DIM);
                                 }
-                                if ui.button(&entry.qpath).clicked() {
-                                    if state.picker_effects {
-                                        selected_effect = Some(entry.qpath.clone());
-                                    } else {
-                                        selected = Some(entry.qpath.clone());
-                                    }
-                                }
+                                ui.vertical(|ui| {
+                                    ui.label(qpath.as_str());
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("PREVIEW").clicked() {
+                                            state.picker_preview = Some((kind, qpath.clone()));
+                                        }
+                                        if ui.small_button("PLACE").clicked() {
+                                            if kind == AssetKind::Efx {
+                                                selected_effect = Some(qpath.clone());
+                                            } else {
+                                                selected = Some(qpath.clone());
+                                            }
+                                        }
+                                        if state.picker_preview.as_ref().is_some_and(|v|
+                                            v.0 == kind && v.1.as_str() == qpath.as_str()) {
+                                            ui.small("● LIVE AT CROSSHAIR");
+                                        }
+                                    });
+                                });
                             });
+                            // Hovering rows auditions immediately, without ever
+                            // mutating saved or in-hand placements.
+                            if row.response.hovered()
+                                && state.picker_preview.as_ref().is_none_or(|v|
+                                    v.0 != kind || v.1.as_str() != qpath.as_str()) {
+                                state.picker_preview = Some((kind, qpath.clone()));
+                            }
                         }
                     });
                 if !state.status.is_empty() { ui.label(&state.status); }
                 ui.separator();
-                ui.label("Place: left click · Size: wheel · Rotate: hold right click and move mouse · Undo: Ctrl+Z · Change model: Tab · Exit: Esc");
+                ui.label("Place: LMB · Size: wheel · Rotate: RMB · Ctrl+Z/Y undo/redo · E edit · Tab browser");
             });
         for qpath in image_requests {
             self.ui_catalog.request(&self.base, self.game.as_deref(),
                 ui_catalog::CatalogRequest::ModelThumbnail { qpath });
         }
         if close { self.set_overlay(OverlayMode::None); }
+        if bmodels { self.open_bmodel_placement_picker(); }
         if let Some(qpath) = selected { self.choose_placement_model(qpath); }
         if let Some(qpath) = selected_effect { self.choose_placement_effect(qpath); }
     }
@@ -1084,7 +1638,9 @@ impl App {
                 size.width as f32 / pixels_per_point * 0.5,
                 size.height as f32 / pixels_per_point * 0.5,
             );
-            let color = if state.hover.is_some() || state.fx_hover.is_some() {
+            let color = if state.editor_drag.is_some() {
+                egui::Color32::from_rgb(92, 204, 235)
+            } else if state.hover.is_some() || state.bmodel_hover.is_some() || state.fx_hover.is_some() {
                 egui::Color32::from_rgb(255, 214, 90)
             } else {
                 egui::Color32::from_rgb(255, 255, 255)
@@ -1095,7 +1651,7 @@ impl App {
                 painter.line_segment([near, center + egui::vec2(dx, dy)], egui::Stroke::new(1.5, color));
             }
         }
-        if state.hit_valid {
+        if state.hit_valid && (!state.edit_mode || state.editor_placing) {
             let color = if state.rotating { egui::Color32::from_rgb(255, 179, 73) }
                 else { egui::Color32::from_rgb(76, 220, 191) };
             match state.kind {
@@ -1125,33 +1681,76 @@ impl App {
                 }
             }
         }
-        // Edit mode, nothing in hand: show every effect, and outline the model or
-        // effect under the crosshair.
-        let edit_idle = state.edit_mode && state.selection.is_none()
-            && state.fx_selection.is_none() && state.kind == PlacementKind::Md3;
+        let edit_idle = state.edit_mode && !state.editor_placing;
         if edit_idle {
             for placement in &state.fx_placed {
                 draw_fx(placement.origin, placement.angles,
                     egui::Color32::from_rgba_unmultiplied(255, 122, 216, 150));
             }
         }
-        let hovered = state.hover.filter(|_| edit_idle)
-            .and_then(|index| state.placed.get(index).map(|p| (index, p)));
-        let hovered_fx = state.fx_hover.filter(|_| edit_idle)
-            .and_then(|index| state.fx_placed.get(index).map(|p| (index, p)));
+        let hovered = state.hover.and_then(|index| state.placed.get(index).map(|p| (index, p)));
+        let hovered_fx = state.fx_hover.and_then(|index| state.fx_placed.get(index).map(|p| (index, p)));
         let gold = egui::Color32::from_rgb(255, 214, 90);
         if let Some((_, placement)) = hovered { draw_box(placement_corners(placement), gold); }
         if let Some((_, placement)) = hovered_fx { draw_fx(placement.origin, placement.angles, gold); }
+        if let Some(index) = state.bmodel_hover {
+            if let Some(p) = state.bmodel_placed.get(index) { draw_box(bmodel_corners(p), gold); }
+        }
+        let cyan = egui::Color32::from_rgb(92, 204, 235);
+        match state.editor_selected {
+            Some(EditSelection::Md3(i)) => if let Some(p) = state.placed.get(i) {
+                draw_box(placement_corners(p), cyan);
+            },
+            Some(EditSelection::Bmodel(i)) => if let Some(p) = state.bmodel_placed.get(i) {
+                draw_box(bmodel_corners(p), cyan);
+            },
+            Some(EditSelection::Fx(i)) => if let Some(p) = state.fx_placed.get(i) {
+                draw_fx(p.origin, p.angles, cyan);
+            },
+            _ => {}
+        }
+        if state.edit_mode && state.hover_since.is_some_and(|since|
+            since.elapsed().as_millis() >= 500) {
+            let hovered_name = hovered.map(|(_, p)| p.qpath.clone())
+                .or_else(|| hovered_fx.map(|(_, p)| p.effect.clone()))
+                .or_else(|| state.bmodel_hover.and_then(|i| state.bmodel_placed.get(i))
+                    .map(|p| format!("BMODEL *{}", p.model)));
+            if let Some(name) = hovered_name {
+                let screen_center = egui::pos2(size.width as f32 / pixels_per_point * 0.5,
+                    size.height as f32 / pixels_per_point * 0.5);
+                painter.text(screen_center + egui::vec2(20.0, 20.0),
+                    egui::Align2::LEFT_TOP, name, egui::FontId::monospace(11.0), theme::ACCENT);
+            }
+        }
         let bounds = root.max_rect();
         let top = bounds.min + egui::vec2(20.0, 20.0);
         painter.rect_filled(egui::Rect::from_min_size(top, egui::vec2(690.0, 78.0)),
             5.0, egui::Color32::from_black_alpha(188));
         painter.text(top + egui::vec2(12.0, 11.0), egui::Align2::LEFT_TOP,
             match state.kind {
+                _ if state.editor_placing => match state.kind {
+                    PlacementKind::Md3 => format!("ADD MD3   {}", state.selection.as_deref().unwrap_or("")),
+                    PlacementKind::Bmodel => format!("ADD BMODEL   *{}", state.bmodel_selection.unwrap_or(0)),
+                    PlacementKind::Fx => format!("ADD FX   {}", state.fx_selection.as_deref().unwrap_or("")),
+                },
+                _ if edit_idle && state.editor_selected.is_some() => {
+                    match state.editor_selected.unwrap() {
+                        EditSelection::Md3(i) => state.placed.get(i)
+                            .map(|p| format!("EDIT SELECTED   MD3 #{i}   {}", p.qpath))
+                            .unwrap_or_else(|| "EDIT SELECTED".into()),
+                        EditSelection::Bmodel(i) => state.bmodel_placed.get(i)
+                            .map(|p| format!("EDIT SELECTED   BMODEL #{i} *{}", p.model))
+                            .unwrap_or_else(|| "EDIT SELECTED".into()),
+                        EditSelection::Fx(i) => state.fx_placed.get(i)
+                            .map(|p| format!("EDIT SELECTED   FX #{i}   {}", p.effect))
+                            .unwrap_or_else(|| "EDIT SELECTED".into()),
+                    }
+                }
                 _ if edit_idle => match (hovered, hovered_fx) {
                     (_, Some((index, placement))) => format!("EDIT   FX #{index}   {}", placement.effect),
                     (Some((index, placement)), _) => format!("EDIT   MD3 #{index}   {}", placement.qpath),
-                    _ => "EDIT   (aim at a model or effect)".to_owned(),
+                    _ if state.bmodel_hover.is_some() => format!("EDIT   BMODEL *{}", state.bmodel_placed[state.bmodel_hover.unwrap()].model),
+                    _ => "EDIT   (aim at MD3, BMODEL or FX)".to_owned(),
                 },
                 PlacementKind::Md3 if state.edit_mode => format!("MD3 EDIT   holding   {}", state.selection.as_deref().unwrap_or("")),
                 PlacementKind::Md3 => format!("MD3 PLACEMENT   {}", state.selection.as_deref().unwrap_or("")),
@@ -1188,17 +1787,15 @@ impl App {
             egui::FontId::monospace(11.0), theme::ACCENT);
         painter.text(top + egui::vec2(12.0, 56.0), egui::Align2::LEFT_TOP,
             if edit_idle {
-                "LMB Pick up · Ctrl+LMB Copy · Del/X Delete · Ctrl+Z Undo · Tab Place new · E Place mode · Esc Exit"
-            } else if state.kind == PlacementKind::Fx && state.edit_mode {
-                "LMB Drop · Wheel Delay · RMB Aim · Shift Pitch · Alt Roll · Esc Put back · Ctrl+Z Undo edit"
+                "Ctrl+LMB empty: ADD · LMB drag · Ctrl+drag vertical · MMB yaw/pitch · RMB local roll · Esc: Menu"
+            } else if state.editor_placing {
+                "LMB Place once · RMB orient (Alt local roll) · Wheel adjust · Backspace cancel · Esc menu"
             } else if state.kind == PlacementKind::Fx {
-                "LMB Place · Wheel Repeat delay · RMB Aim (Shift pitch, Alt roll) · Tab Browser · E Edit placed · Ctrl+Z Undo · Esc Exit"
-            } else if state.kind == PlacementKind::Md3 && state.edit_mode {
-                "LMB Drop · Wheel Size · RMB Rotate · Shift Pitch · Alt Roll · Esc Put back · Ctrl+Z Undo edit"
+                "LMB Place · Wheel Repeat delay · RMB Rotate (Shift pitch, Alt local roll) · Tab Browser · Ctrl+Z Undo"
             } else if state.kind == PlacementKind::Md3 {
-                "LMB Place · Wheel Size · RMB Hold Pivot + Rotate · Shift Pitch · Alt Roll · Tab Browser · E Edit placed · Ctrl+Z Undo · Esc Exit"
+                "LMB Place · Wheel Size · RMB Yaw · Shift Pitch · Alt Local Roll · Tab Browser · Ctrl+Z Undo"
             } else {
-                "LMB Place · RMB Rotate · Shift Pitch · Alt Roll · Tab Browser · Ctrl+Z Undo · Esc Exit (scale locked)"
+                "LMB Place · RMB Yaw · Shift Pitch · Alt Local Roll · Tab Browser · Ctrl+Z Undo (scale locked)"
             },
             egui::FontId::monospace(9.0), theme::TEXT_DIM);
     }
@@ -1211,17 +1808,20 @@ impl App {
         };
         let mut picked = None;
         let mut close = false;
+        let mut models = false;
         let state = &mut self.model_placement;
-        egui::Window::new("BMODEL PLACEMENT · BSP INLINE MODELS")
+        egui::Window::new("ADD TO MAP · BSP BMODELS")
             .id(egui::Id::new("bsp_bmodel_placement_catalog"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(18.0, 72.0))
             .default_width(680.0).default_height(560.0)
             .resizable(true).collapsible(false).show(root.ctx(), |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("PLACE BMODEL");
+                    ui.heading("ADD BSP BMODEL");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("CLOSE").clicked() { close = true; }
                     });
                 });
+                if ui.button("MD3 MODELS / EFFECTS (.efx)").clicked() { models = true; }
                 ui.label("Re-use any drawable BSP inline *N model from this map. Thumbnails are sampled wireframes of its actual geometry.");
                 ui.small("Native brush collision is active in the local game. On remote servers these placements remain visual-only until loaded server-side.");
                 ui.horizontal(|ui| {
@@ -1279,10 +1879,11 @@ impl App {
                     });
                 ui.separator();
                 ui.label("Original BSP pivot is preserved. Translation/rotation use the pivot; BMODEL scaling is disabled for server compatibility.");
-                ui.label("LMB Place · RMB Hold to Lock and Rotate · Tab Reopen · Ctrl+Z Undo · Esc Exit");
+                ui.label("Choose a BSP inline model, aim at a surface, and left-click to place. Esc closes the browser.");
                 if !state.status.is_empty() { ui.label(&state.status); }
             });
         if close { self.set_overlay(OverlayMode::None); }
+        if models { self.open_model_placement_picker(); }
         if let Some(model) = picked { self.choose_placement_bmodel(model); }
     }
 }
@@ -1309,6 +1910,58 @@ mod tests {
         let rotated = pose.rotate(rotated_placed.pivot);
         for axis in 0..3 {
             assert!((pose.origin[axis] + rotated[axis] - rotated_placed.hit[axis]).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn quaternion_matches_jka_model_axis_in_arbitrary_pose() {
+        for angles in [[0.0, 0.0, 0.0], [22.0, 107.0, 53.0],
+            [-82.0, 221.0, 300.0], [90.0, 45.0, 10.0]] {
+            let q = placement_orientation(angles);
+            let axes = model_axis(angles, 1.0);
+            for i in 0..3 {
+                let basis = match i { 0 => glam::Vec3::X, 1 => glam::Vec3::Y, _ => glam::Vec3::Z };
+                let rotated = (q * basis).to_array();
+                for k in 0..3 {
+                    assert!((rotated[k] - axes[i][k]).abs() < 1.0e-4,
+                        "basis {i} component {k}, angles {angles:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yaw_pitch_keep_v1_euler_behavior_even_on_a_rolled_object() {
+        let initial = [31.0, 123.0, 71.0];
+        let result = placement_rotate_yaw_pitch(initial, -7.0, 15.0);
+        assert_eq!(result, [24.0, 138.0, 71.0]);
+        assert_eq!(placement_rotate_yaw_pitch([359.0, 357.0, 90.0], 5.0, 8.0),
+            [4.0, 5.0, 90.0]);
+    }
+
+    #[test]
+    fn local_roll_after_euler_yaw_pitch_keeps_forward_axis() {
+        let initial = placement_rotate_yaw_pitch([34.0, 68.0, 24.0], -17.0, 23.0);
+        let before = model_axis(initial, 1.0)[0];
+        let q = placement_rotate_local(placement_orientation(initial), 0.0, 0.0, 32.0);
+        let after = model_axis(placement_rotation_angles(q), 1.0)[0];
+        for i in 0..3 {
+            assert!((before[i] - after[i]).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn local_rotation_keeps_the_selected_object_axis_fixed() {
+        let initial = [24.0, 116.0, 51.0];
+        let start = model_axis(initial, 1.0);
+        for (axis, pitch, yaw, roll) in [(0, 0.0, 0.0, 34.0),
+            (1, 33.0, 0.0, 0.0), (2, 0.0, 40.0, 0.0)] {
+            let q = placement_rotate_local(placement_orientation(initial), pitch, yaw, roll);
+            let final_axes = model_axis(placement_rotation_angles(q), 1.0);
+            for k in 0..3 {
+                assert!((start[axis][k] - final_axes[axis][k]).abs() < 1.0e-4,
+                    "local axis {axis} component {k} moved");
+            }
         }
     }
 

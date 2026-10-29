@@ -485,6 +485,9 @@ impl WorldFlareRenderer {
         width: u32, height: u32,
         visibility: Option<&jka_assets::bsp::Visibility>,
         pvs_enabled: bool, fog_mode: u8,
+        // Only active thermal captures re-use the already-computed flare
+        // occlusion results in the authored-glow texture.
+        thermal_glow: Option<(&wgpu::TextureView, Option<&wgpu::TextureView>)>,
     ) {
         let forward = camera.forward();
         let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
@@ -493,7 +496,7 @@ impl WorldFlareRenderer {
             FlareView {
                 view_proj: camera.view_projection(width, height), eye: camera.position,
                 forward, right, up, clip_plane: None, cluster: None,
-            }, width, height, visibility, pvs_enabled, fog_mode);
+            }, width, height, visibility, pvs_enabled, fog_mode, thermal_glow);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -512,7 +515,7 @@ impl WorldFlareRenderer {
         self.draw_view(device, queue, encoder, color, None, depth, format, samples,
             FlareView { view_proj, eye: position, forward, right, up,
                 clip_plane: None, cluster: None },
-            width, height, visibility, pvs_enabled, fog_mode);
+            width, height, visibility, pvs_enabled, fog_mode, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -534,7 +537,7 @@ impl WorldFlareRenderer {
                 view_proj: reflection.view_proj, eye: reflection.camera_position,
                 forward, right, up, clip_plane: Some(reflection.plane),
                 cluster: reflection.cluster,
-            }, width, height, visibility, pvs_enabled, fog_mode);
+            }, width, height, visibility, pvs_enabled, fog_mode, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +549,7 @@ impl WorldFlareRenderer {
         width: u32, height: u32,
         visibility: Option<&jka_assets::bsp::Visibility>,
         pvs_enabled: bool, fog_mode: u8,
+        thermal_glow: Option<(&wgpu::TextureView, Option<&wgpu::TextureView>)>,
     ) {
         let begin = Instant::now();
         self.last_candidates = self.candidates.len();
@@ -668,6 +672,44 @@ impl WorldFlareRenderer {
                             pass.set_bind_group(1, &stage.bind_group, &[]);
                             pass.draw(0..6, first as u32..end as u32);
                             self.last_stage_draws += 1;
+                        }
+                    }
+                }
+                first = end;
+            }
+        }
+        if let Some((glow_view, glow_resolve)) = thermal_glow {
+            // Replay only visible flare sprites, not their GPU occlusion probe.
+            // The color attachment is the same format/MSAA as the scene; its
+            // source was cleared and populated by authored JKA glow earlier.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Thermal world flare heat sources"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: glow_view, depth_slice: None, resolve_target: glow_resolve,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth, depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store,
+                    }), stencil_ops: None,
+                }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            });
+            pass.set_bind_group(0, self.draw_bind_group.as_ref().unwrap(), &[]);
+            let mut first = 0usize;
+            while first < self.scratch.len() {
+                let shader = self.candidates[self.scratch[first].normal[3] as usize].shader_index;
+                let mut end = first + 1;
+                while end < self.scratch.len()
+                    && self.candidates[self.scratch[end].normal[3] as usize].shader_index == shader {
+                    end += 1;
+                }
+                if let Some(stages) = self.stages.get(&shader) {
+                    for stage in stages {
+                        if let Some(pipeline) = self.stage_pipeline.get(&stage.blend) {
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(1, &stage.bind_group, &[]);
+                            pass.draw(0..6, first as u32..end as u32);
                         }
                     }
                 }

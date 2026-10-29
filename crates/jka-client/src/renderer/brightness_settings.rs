@@ -3,7 +3,7 @@ use super::{GammaPostUniform, Renderer};
 
 impl Renderer {
     pub(super) fn output_gamma(&self) -> f32 {
-        if self.gamma_method == crate::gamma::GammaMethod::Hardware
+        if self.gamma_method.is_hardware()
             || self.baked_brightness.overrides_output()
         {
             1.0
@@ -19,6 +19,20 @@ impl Renderer {
             return;
         }
         let old_output_gamma = self.output_gamma();
+        // Baked gamma writes texels. Detach shared immutable color images
+        // before registering them, and rebuild bindings to those private copies.
+        if self.baked_brightness.enabled {
+            if let Some(mut world) = self.world.take() {
+                let mut changed = false;
+                for image in &mut world.textures {
+                    if image._texture.format() == wgpu::TextureFormat::Rgba8UnormSrgb && image.is_shared() {
+                        changed |= image.detach_for_write(&self.device, &self.queue);
+                    }
+                }
+                if changed { self.rebuild_world_surface_bind_groups(&mut world); }
+                self.world = Some(world);
+            }
+        }
         let mut textures = Vec::new();
         if let Some(world) = &self.world {
             textures.extend(
@@ -63,7 +77,18 @@ impl Renderer {
     }
 
     pub(super) fn set_gamma_method(&mut self, method: crate::gamma::GammaMethod) {
+        if method == crate::gamma::GammaMethod::Baked && self.dynamic_model_renderer.textures.values().any(|t| t._image.is_shared()) {
+            self.dynamic_model_renderer.textures.clear();
+            self.dynamic_model_renderer.frame_texture_keys.clear();
+            self.dynamic_model_renderer.model_bundles.clear();
+        }
         self.gamma_method = method;
+        if method == crate::gamma::GammaMethod::HardwareSceneOnly {
+            self.ensure_native_ui_gamma();
+        } else {
+            // The large UI intermediate is only needed for this strategy.
+            self.ui_gamma_egui = None;
+        }
         self.baked_brightness
             .set_target(method == crate::gamma::GammaMethod::Baked, self.gamma);
         self.sync_baked_brightness_assets();
@@ -98,6 +123,7 @@ impl Renderer {
             }),
         );
         self.rebuild_frame_plan();
+        self.sync_ui_gamma_uniforms();
         self.update_post_uniform();
         self.rebuild_ui();
     }

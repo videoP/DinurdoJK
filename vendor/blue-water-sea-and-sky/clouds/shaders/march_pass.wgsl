@@ -52,7 +52,7 @@ fn march_pixel(pixel: vec2<u32>, jitter: f32) -> Marched {
     // less the camera would lose the direction to f32 steps of the camera's position (2.4e-4 m at 2.6 km up, a fifth of
     // a pixel), which reprojection would read as the view moving.
     let tangent = 1.0 / clouds.forward.w;
-    let view_ray = vec3<f32>(ndc.x * tangent * size.x / size.y, ndc.y * tangent, -1.0);
+    let view_ray = vec3<f32>(ndc.x * tangent * clouds.viewport.x / clouds.viewport.y, ndc.y * tangent, -1.0);
     let rotation = mat3x3<f32>(clouds.view[0].xyz, clouds.view[1].xyz, clouds.view[2].xyz);
     let ray_direction = normalize(transpose(rotation) * view_ray);
     let camera = camera_planet();
@@ -64,7 +64,9 @@ fn march_pixel(pixel: vec2<u32>, jitter: f32) -> Marched {
     var haze_ray_near_far = haze_near_far(ranges);
 
     // The opaque scene ends the rays (`getRayDistanceToScene`).
-    let depth = textureLoad(scene_depth, vec2<i32>(pixel), 0);
+    let depth_size = textureDimensions(scene_depth);
+    let depth_pixel = min(vec2<u32>(uv * vec2<f32>(depth_size)), depth_size - 1u);
+    let depth = textureLoad(scene_depth, depth_pixel, 0);
     var scene_view_z = 0.0;
     var ray_distance_to_scene = 0.0;
     if depth > 0.0 {
@@ -121,8 +123,10 @@ fn march_pixel(pixel: vec2<u32>, jitter: f32) -> Marched {
             }
             // The air between the eye and the clouds' front, as every material takes it (the aerial-perspective volume:
             // the atmosphere and the weather's haze).
-            let air = aerial_along(uv, front_depth);
-            color = vec4<f32>(color.rgb * air.transmittance + air.inscatter * color.a, color.a);
+            if clouds.experiments.x < 0.5 || clouds.experiments.x > 4.5 {
+                let air = aerial_along(uv, front_depth);
+                color = vec4<f32>(color.rgb * air.transmittance + air.inscatter * color.a, color.a);
+            }
             // Motion of the clouds' front for the reconstruction, from the camera in the world: the planet frame's
             // heights carry the planet's radius, and its half-metre steps in f32 would move a still view's history by a
             // tenth of a pixel an update, which bilinear reads of the history smear into streaks. The front stood where
@@ -156,7 +160,7 @@ fn march_pixel(pixel: vec2<u32>, jitter: f32) -> Marched {
         velocity = uv - clip_to_uv(previous);
     }
 
-    if clouds.switches.z > 0.5 && !submerged {
+    if clouds.switches.z > 0.5 && !submerged && (clouds.experiments.x < 0.5 || clouds.experiments.x > 4.5) {
         let haze = approximate_haze(
             clouds.planes.x * ray_direction + camera,
             ray_direction,

@@ -52,7 +52,7 @@ pub(in crate::renderer) struct StaticAoBaseLightmap {
     pub(in crate::renderer) label: String,
     pub(in crate::renderer) width: u32,
     pub(in crate::renderer) height: u32,
-    pub(in crate::renderer) rgba: Vec<u8>,
+    pub(in crate::renderer) rgba: crate::materials::SharedPixels<u8>,
     pub(in crate::renderer) clamp: bool,
     pub(in crate::renderer) srgb: bool,
 }

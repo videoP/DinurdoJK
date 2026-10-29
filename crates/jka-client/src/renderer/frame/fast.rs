@@ -41,7 +41,7 @@ impl Renderer {
                 render_camera.position.x,
                 render_camera.position.y,
                 render_camera.position.z,
-                self.started.elapsed().as_secs_f32(),
+                self.frame_time(),
             ],
             clip_plane: [0.0; 4],
             render_flags: [
@@ -59,6 +59,7 @@ impl Renderer {
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
             jump_shade: [0.0; 4],
+            foliage_wind: crate::foliage::wind_uniform(self.weather_wind, self.frame_time(), self.foliage_wind_enabled),
         };
         let defer_camera_write = latest_view.is_some() && !needs_early_latch;
         if !defer_camera_write {
@@ -194,29 +195,7 @@ impl Renderer {
             .sum();
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
 
-        let acquire_started = Instant::now();
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Timeout);
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Occluded);
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Outdated);
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Lost);
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
-        };
-        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        let frame = self.acquire_render_frame(&mut info)?;
         let surface_view = self.surface_texture_view(&frame);
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
@@ -1005,6 +984,7 @@ impl Renderer {
                 self.world.as_ref().and_then(|world| world.visibility.as_ref()),
                 self.pvs_mode != PvsMode::Off,
                 self.weather.fog.legacy_drawfog_value(),
+                None, // thermal runs through the unified renderer
             );
         }
         if let Some(started) = perf_scene_started {
@@ -1103,9 +1083,15 @@ impl Renderer {
                 &self.screen_fx_textures,
                 &self.screen_fx_white_bind_group,
             );
+            // No extra scene pass: only the native UI pixels are counter-adjusted.
+            let ui_gamma = if self.ui_gamma_active() { self.ui_gamma_native.as_ref() } else { None };
+            let ui_pipeline = ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline);
+            if let Some(resources) = ui_gamma {
+                pass.set_bind_group(1, &resources.group, &[]);
+            }
             Self::draw_ui_batches(
                 &mut pass,
-                &self.ui_pipeline,
+                ui_pipeline,
                 &self.ui_bind_group,
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
@@ -1210,8 +1196,7 @@ impl Renderer {
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
-        self.window.pre_present_notify();
-        self.queue.present(frame);
+        self.present_render_frame(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented(
             present_completed_at,

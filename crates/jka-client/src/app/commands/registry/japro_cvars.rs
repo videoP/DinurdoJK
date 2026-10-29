@@ -5,25 +5,18 @@ settings_cvars! { JaproCgame;
     APP_CG_REMAPS {
         runtime: CvarDef::new(
                 "cg_remaps",
-                "",
+                "1",
                 "0 | 1 | other nonzero",
-                "TaystJK shader-remap policy: 0 blocks server remaps; 1 filters models/players/* from CS_SHADERSTATE; other non-zero values allow all. Local /remapShader is unaffected.",
+                "TaystJK shader-remap policy: 0 blocks incoming server remaps; 1 filters models/players/* from CS_SHADERSTATE; other non-zero values allow all. Local /remapShader is unaffected. Session-only; changes apply to subsequent server remaps immediately.",
                 CvarType::String,
-                CvarFlags::ARCHIVE,
-                LatchScope::MapLoadOrVidRestart,
+                CvarFlags::NONE,
+                LatchScope::None,
                 |app| CvarValue::String(App::cvar_get_cg_remaps(app)),
                 |app, value| App::cvar_set_cg_remaps(app, APP_CG_REMAPS.entry.name, &value.to_string()),
             )
             .with_text_setter(App::cvar_set_cg_remaps, None),
-        config: CvarBinding {
-                load_presentation: Some(|settings, name, value| {
-                    let _ = settings.japro.set_cvar(name, value);
-                }),
-                archive: Some((412, |state| {
-                    format!("{}", state.presentation.japro.remaps)
-                })),
-                ..CvarBinding::NONE
-            },
+        // Not archived or loaded from old configs: always start each launch at 1.
+        config: CvarBinding::NONE,
         settings: SETTINGS_CG_REMAPS = APP_CG_REMAPS
                 .bind(
                     |state: &JaproCgame| CvarValue::String(state.remaps.to_string()),
@@ -53,7 +46,6 @@ settings_cvars! { JaproCgame;
                             self.network.plugin_disable,
                         );
                     }
-                    self.mark_config_dirty();
                     self.publish_snapshot();
                     self.publish_ui();
                     Ok(())
@@ -98,6 +90,64 @@ settings_cvars! { JaproCgame;
                 }
                 fn cvar_set_cg_drainfx(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_CG_DRAINFX.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.apply_client_options(
+                            self.screen_shake,
+                            self.audio.game,
+                            self.video.footprints,
+                            self.japro_cg,
+                            self.network.plugin_disable,
+                        );
+                    }
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_RENDERTOTEXTUREFX {
+        runtime: CvarDef::new("cg_renderToTextureFX", "", "0 | 1 | 2 | 3 | 4 | 5", "0 TaystJK blue cloak; 1 TaystJK refraction; 2 Predator UV grid; 3 Predator object-space rings; 4 Predator world-space rings; 5 Predator view-space rings. Predator modes use experimental WGPU optics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_rendertotexturefx(app)), |app, value| App::cvar_set_cg_rendertotexturefx(app, APP_CG_RENDERTOTEXTUREFX.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_rendertotexturefx, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.japro.set_cvar(name, value);
+                }),
+                archive: Some((359, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", presentation.japro.render_to_texture_fx)
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CG_RENDERTOTEXTUREFX = APP_CG_RENDERTOTEXTUREFX
+                .bind(
+                    |state: &JaproCgame| CvarValue::String(state.render_to_texture_fx.to_string()),
+                    |state, value| {
+                        JaproCgame::cvar_set_cg_rendertotexturefx(
+                            state,
+                            APP_CG_RENDERTOTEXTUREFX.entry.name,
+                            &value.to_string(),
+                        )
+                    },
+                )
+                .with_text_setter(JaproCgame::cvar_set_cg_rendertotexturefx, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_rendertotexturefx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    japro_integer(name, value).and_then(|v| {
+                        if v < 0 { self.render_to_texture_fx = 1; Ok(()) }
+                        else if v <= 5 { self.render_to_texture_fx = v as u8; Ok(()) }
+                        else { Err(format!("{name} accepts 0..5 (got {v})")) }
+                    })
+                }
+            }
+            impl App {
+                fn cvar_get_cg_rendertotexturefx(&self) -> String {
+                    (SETTINGS_CG_RENDERTOTEXTUREFX.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cg_rendertotexturefx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_RENDERTOTEXTUREFX.set_text.unwrap())(&mut self.japro_cg, name, value)?;
                     if let Some(session) = self.game_session.as_mut() {
                         session.apply_client_options(
                             self.screen_shake,
@@ -1683,20 +1733,20 @@ settings_cvars! { JaproCgame;
     }
 
     APP_CL_COMMANDSIZE {
-        runtime: CvarDef::new("cl_commandsize", "", "4..512", "How many usercmds back the connection-interrupted warning looks: it appears once the server has not acknowledged a command that old. (The usercmd history itself is always 512 deep.)", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_commandsize(app)), |app, value| App::cvar_set_cl_commandsize(app, APP_CL_COMMANDSIZE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_commandsize, None),
+        runtime: CvarDef::new("cl_commandsize", "auto", "auto|64|128|256|512", "TaystJK-style command history window shared by prediction, network command selection and CONNECTION INTERRUPTED. AUTO scales with cl_commandRate and ping (minimum 64). Manual numbers snap UP to a supported power of two.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_commandsize(app)), |app, value| App::cvar_set_cl_commandsize(app, APP_CL_COMMANDSIZE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_commandsize, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.japro.set_cvar(name, value);
                 }),
                 archive: Some((357, |state| {
                     let presentation = state.presentation;
-                    format!("{}", presentation.japro.lagometer.command_size)
+                    presentation.japro.lagometer.command_size_cvar()
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_CL_COMMANDSIZE = APP_CL_COMMANDSIZE
                 .bind(
-                    |state: &JaproCgame| CvarValue::String(state.lagometer.command_size.to_string()),
+                    |state: &JaproCgame| CvarValue::String(state.lagometer.command_size_cvar()),
                     |state, value| {
                         JaproCgame::cvar_set_cl_commandsize(
                             state,
@@ -1709,10 +1759,15 @@ settings_cvars! { JaproCgame;
         implementations: [
             impl JaproCgame {
                 fn cvar_set_cl_commandsize(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    japro_integer(name, value).map(|v| {
-                        self.lagometer.command_size =
-                            v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-                    })
+                    if value.eq_ignore_ascii_case("auto") {
+                        self.lagometer.command_size = crate::lagometer::AUTO_COMMAND_SIZE;
+                        Ok(())
+                    } else {
+                        japro_integer(name, value).map(|v| {
+                            self.lagometer.command_size =
+                                crate::lagometer::Settings::normalize_command_size(v);
+                        })
+                    }
                 }
             }
             impl App {

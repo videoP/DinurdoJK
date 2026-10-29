@@ -191,6 +191,9 @@ pub const SHADER_LIGHT_EMISSIVE_COMPANION: u32 = 1 << 2;
 pub const SHADER_LIGHT_AUTHORED_OVERLAP: u32 = 1 << 31;
 pub const SHADER_LIGHT_ALL: u32 =
     SHADER_LIGHT_GLOW | SHADER_LIGHT_ADDITIVE | SHADER_LIGHT_EMISSIVE_COMPANION;
+/// Independent authored-area source in the unified added-map-light mask.
+pub const ADDED_MAP_LIGHT_AUTHORED: u32 = 1 << 3;
+pub const ADDED_MAP_LIGHT_ALL: u32 = SHADER_LIGHT_ALL | ADDED_MAP_LIGHT_AUTHORED;
 
 static GLASS_PROMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -248,6 +251,23 @@ pub struct SurfaceSpriteEffectMaterial {
     pub godot_candidate: bool,
 }
 
+/// Authored color emission independent of the normal JKA bloom toggle.
+/// A `blendFunc` is not sufficient on its own: ordinary alpha translucency,
+/// lightmap modulation and environment reflections do not create heat.
+pub(crate) fn thermal_emission_stage(stage: &MaterialStage) -> u8 {
+    use BlendFactor::{One, OneMinusSrcColor, SrcColor};
+    if stage.glow { return 2; }
+    if !matches!(stage.tc_gen, TcGen::Base)
+        || matches!(stage.texture, StageTexture::Lightmap) { return 0; }
+    let Some(blend) = stage.blend else { return 0; };
+    match (blend.src, blend.dst) {
+        (One, One) | (One, OneMinusSrcColor) | (One, SrcColor) => {
+            if !stage.tc_mods.is_empty() || stage.animation.is_some() { 2 } else { 1 }
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SurfaceMaterial {
     /// Authored image resolution exemption, also implied by noMipMaps.
@@ -256,6 +276,13 @@ pub struct SurfaceMaterial {
     pub clamp_time: Option<f32>,
     pub stages: Vec<MaterialStage>,
     pub surface_material: u8,
+    /// Authored surfaceparm lava (also augmented with compiled BSP CONTENTS_LAVA).
+    pub thermal_lava: bool,
+    /// Thermal evidence, independent from ordinary JKA Dynamic Glow:
+    /// 0 = none, 1 = additive/screen stage, 2 = strong authored glow stage,
+    /// 3 = explicit q3map_surfacelight. Levels 1/2 are *stage-local* and
+    /// must never increase the entire base surface's heat in the prepass.
+    pub thermal_emission: u8,
     /// Explicit Glass shader promoted to a single transmissive surface.
     pub glass_promotion: bool,
     /// Normalized linear tint inferred from the authored stage image.
@@ -278,6 +305,8 @@ pub struct SurfaceMaterial {
     /// Geometric shader deformation amplitude used by promoted water, in map units.
     pub water_amplitude: f32,
     pub water_deformed: bool,
+    /// Named, alpha-tested foliage cards eligible for shared atmospheric wind.
+    pub foliage_wind: bool,
     /// q3map2 `surfaceparm alphashadow`.
     pub alpha_shadow: bool,
     /// Compiler shadow image (q3map_lightimage, otherwise the base image).
@@ -334,6 +363,8 @@ impl Default for SurfaceMaterial {
             clamp_time: None,
             stages: Vec::new(),
             surface_material: 0,
+            thermal_lava: false,
+            thermal_emission: 0,
             glass_promotion: false,
             glass_tint: [1.0; 3],
             glass_reflectance: 0.04,
@@ -345,6 +376,7 @@ impl Default for SurfaceMaterial {
             water: false,
             water_amplitude: crate::ocean::appearance::DEFAULT_PROMOTED_AMPLITUDE,
             water_deformed: false,
+            foliage_wind: false,
             alpha_shadow: false,
             baked_shadow_texture: None,
             light_filter: false,
@@ -366,6 +398,10 @@ impl Default for SurfaceMaterial {
     }
 }
 
+#[path = "materials/shared_pixels.rs"]
+mod shared_pixels;
+pub use shared_pixels::SharedPixels;
+
 #[derive(Debug, Clone)]
 pub struct TextureData {
     pub label: String,
@@ -376,11 +412,11 @@ pub struct TextureData {
     pub height: u32,
     /// All mip levels, largest to smallest, tightly packed. For non-mipmapped
     /// images this contains only the base level.
-    pub rgba: Vec<u8>,
+    pub rgba: SharedPixels<u8>,
     /// Optional native FP16 texels, RGBA channel order. Used by HDR lightmaps.
     /// When present, upload ignores `rgba` for rendering but keeps it as an
     /// inspector/AO fallback copy.
-    pub rgba16f: Option<Vec<u16>>,
+    pub rgba16f: Option<SharedPixels<u16>>,
     pub mip_level_count: u32,
     pub clamp: bool,
     /// Color textures use sRGB sampling; data maps stay linear.
@@ -388,6 +424,10 @@ pub struct TextureData {
 }
 
 impl TextureData {
+    pub(crate) fn intern_pixels(&mut self) {
+        self.rgba = self.rgba.interned();
+        if let Some(pixels) = self.rgba16f.as_mut() { *pixels = pixels.interned(); }
+    }
     /// Retained CPU pixel allocations, including all mips and the FP16 copy.
     pub(crate) fn pixel_storage_bytes(&self) -> usize {
         self.rgba.capacity()
@@ -421,7 +461,7 @@ pub fn missing_texture_data() -> TextureData {
         source: None,
         width: SIZE as u32,
         height: SIZE as u32,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -795,7 +835,8 @@ impl Textures {
         hashes
     }
 
-    fn push_image(&mut self, image: TextureData) {
+    fn push_image(&mut self, mut image: TextureData) {
+        image.intern_pixels();
         self.hashes.resize(self.images.len(), 0);
         self.hashes.push(std::mem::take(&mut self.last_hash));
         self.images.push(image);
@@ -930,7 +971,7 @@ impl Textures {
                 source: Some(physical_source),
                 width,
                 height,
-                rgba,
+                rgba: (rgba).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: false,
@@ -1296,7 +1337,7 @@ impl Textures {
             source: base_source,
             width: base_width,
             height: base_height,
-            rgba,
+            rgba: (rgba).into(),
             rgba16f: None,
             mip_level_count,
             clamp: base_clamp,
@@ -1500,8 +1541,8 @@ pub fn decode_hdr_texture_data(
         source: None,
         width,
         height,
-        rgba,
-        rgba16f: Some(rgba16f),
+        rgba: (rgba).into(),
+        rgba16f: (Some(rgba16f)).map(Into::into),
         mip_level_count: 1,
         clamp,
         srgb: false,
@@ -1535,7 +1576,7 @@ pub fn promote_lightmap_to_float(image: &mut TextureData) {
             f32_to_f16_bits(1.0),
         ]);
     }
-    image.rgba16f = Some(rgba16f);
+    image.rgba16f = Some(rgba16f.into());
     image.srgb = false;
     image.mip_level_count = 1;
 }
@@ -1668,7 +1709,7 @@ fn decode_texture_data_profiled(
             source: None,
             width,
             height,
-            rgba,
+            rgba: (rgba).into(),
             rgba16f: None,
             mip_level_count,
             clamp,
@@ -1946,9 +1987,9 @@ fn stage_blend(stage: &shader::Stage) -> Option<BlendFunc> {
 }
 
 /// Shared authored-stage topology check for both parsed shaders and resolved
-/// material stages. The same classification drives the Off material variant
-/// and the Ultra planar-substitution guard; neither needs a shader-name list.
-/// Run only during map/material preparation, never in a draw loop.
+/// material stages. The Ultra planar-substitution guard uses this classification;
+/// Off additionally considers whether an opaque environment base has a usable
+/// diffuse replacement. No shader-name list or per-frame work is needed.
 pub(crate) fn authored_environment_composite_stage<T>(
     stages: &[T],
     stage: &T,
@@ -2000,9 +2041,10 @@ pub(crate) fn authored_environment_composite_stage<T>(
         })
 }
 
-/// An authored composite uses environment UVs as a mandatory part of its
-/// shader, not as an interchangeable optional reflection technique. Keep it
-/// even when enhanced reflections are Off, just as Ultra must not replace it.
+/// An authored composite uses environment UVs as part of its framebuffer
+/// blending. The Ultra planar-substitution guard retains these stages as-is;
+/// the Off policy is allowed to remove an opaque environment *base* when a
+/// diffuse stage can take over its coverage.
 /// Explicit portals and water are separately handled by the renderer.
 fn preserves_authored_environment_composite(shader: &Shader) -> bool {
     if shader.portal || shader.water {
@@ -2019,11 +2061,76 @@ fn preserves_authored_environment_composite(shader: &Shader) -> bool {
     })
 }
 
-/// Explicit glass can be authored entirely as an additive environment stage
-/// (e.g. common/env_glass). It is the material's visible coverage and must
-/// survive reflection-quality filtering so promotion can be disabled.
+/// In an opaque world shader, an unblended environment stage at the front
+/// can be an authored reflection *under* an alpha-blended diffuse layer (e.g.
+/// imperial/square). The two passes are a composite for Ultra's substitution
+/// guard, but Off should remove the reflection and promote the diffuse stage
+/// to the opaque/depth-writing base. A real opaque diffuse image must survive;
+/// a lone environment stage or a $lightmap is not a replacement.
+fn opaque_environment_base_has_diffuse_successor(shader: &Shader) -> bool {
+    if shader.is_glass()
+        || shader.translucent
+        || shader.portal
+        || shader.water
+        || shader.sort.is_some_and(|sort| !sort.is_finite() || sort >= 5.0)
+    {
+        return false;
+    }
+    let mut ordinary = shader
+        .stages
+        .iter()
+        .filter(|stage| !stage.image.is_empty() && stage.surface_sprite.is_none());
+    let Some(base) = ordinary.next() else { return false; };
+    let opaque_blend = BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero };
+    if !matches!(base.tc_gen, TcGen::Environment)
+        || !(stage_blend(base).is_none() || stage_blend(base) == Some(opaque_blend))
+    {
+        return false;
+    }
+    // Only the narrow env-base + alpha-diffuse + optional lightmap recipe is
+    // safe to rewrite. An additive sprite, tint/filter, further environment
+    // layer, or animated/depth-equal overlay is NOT a new opaque base.
+    // The old broad `any(non-environment texture)` rule promoted all of these
+    // and could turn an almost-invisible pass into a depth occluder.
+    let alpha_blend = Some(BlendFunc {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::OneMinusSrcAlpha,
+    });
+    let lightmap_filter = Some(BlendFunc {
+        src: BlendFactor::DstColor,
+        dst: BlendFactor::Zero,
+    });
+    let mut found_diffuse = false;
+    for stage in ordinary {
+        if stage.image == "$lightmap" && stage_blend(stage) == lightmap_filter {
+            continue;
+        }
+        if found_diffuse
+            || stage.image.starts_with('$')
+            || !matches!(stage.tc_gen, TcGen::Base)
+            || stage_blend(stage) != alpha_blend
+            || stage.animation.is_some()
+            || stage.video
+            || stage.depth_equal
+        {
+            return false;
+        }
+        found_diffuse = true;
+    }
+    found_diffuse
+}
+
+/// A lone tcGen environment stage IS the material, not an optional reflection
+/// overlay. Never discard it in Off: translucent effects (e.g. rift/env_crystal)
+/// would vanish, and opaque env-only surfaces have no authored diffuse image
+/// to use instead. Keep authored glass/composites for the same coverage reason.
+/// Only multi-stage materials with a surviving diffuse can lose env stages.
 fn keeps_authored_environment_stages(shader: &Shader) -> bool {
-    shader.is_glass() || preserves_authored_environment_composite(shader)
+    (shader.stages.len() == 1
+        && matches!(shader.stages[0].tc_gen, TcGen::Environment))
+        || shader.is_glass()
+        || (preserves_authored_environment_composite(shader)
+            && !opaque_environment_base_has_diffuse_successor(shader))
 }
 
 fn alpha_cutoff(stage: &shader::Stage) -> f32 {
@@ -2036,6 +2143,45 @@ fn alpha_cutoff(stage: &shader::Stage) -> f32 {
         // A negative cutoff denotes the reverse test.
         "lt128" => -0.5,
         _ => 0.0,
+    }
+}
+
+/// If Off promotes a formerly alpha-blended diffuse layer into the first
+/// depth-writing pass, preserve its alpha *coverage*. Otherwise a fully
+/// transparent texel can write opaque depth and make an unrelated world mesh
+/// behind it appear to vanish. Only the prepared Off material uses this mask.
+fn promoted_off_alpha_cutoff(
+    source: &shader::Stage,
+    texture: StageTexture,
+    textures: &Textures,
+) -> f32 {
+    let authored = alpha_cutoff(source);
+    let alpha_blend = Some(BlendFunc {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::OneMinusSrcAlpha,
+    });
+    if stage_blend(source) != alpha_blend {
+        return authored;
+    }
+    let texture_has_alpha = match texture {
+        StageTexture::Image(index) => textures.images.get(index).is_some_and(|image| {
+            let bytes = (image.width as usize)
+                .saturating_mul(image.height as usize)
+                .saturating_mul(4);
+            image.rgba.get(..bytes).is_some_and(|base| {
+                base.iter().skip(3).step_by(4).any(|&a| a != 255)
+            })
+        }),
+        StageTexture::White | StageTexture::Lightmap => false,
+    };
+    if texture_has_alpha
+        || source.alpha.is_some_and(|alpha| alpha < 1.0)
+        || !matches!(source.alpha_gen, AlphaGen::Identity)
+    {
+        // GE128-style coverage is preferable to writing invisible depth.
+        authored.max(0.5)
+    } else {
+        authored
     }
 }
 
@@ -2579,9 +2725,11 @@ pub fn describe(
     let empty = Shader::default();
     let definition = definition.unwrap_or(&empty);
     let explicit = !definition.stages.is_empty();
-    // Keep mandatory authored coverage: explicit glass can have just one
-    // additive environment stage, while other composites have several stages.
-    let keep_authored_env = keeps_authored_environment_stages(definition);
+    // Keep mandatory translucent authored coverage (including BSPs that mark
+    // Glass in the compiled surface flags without a shader material name),
+    // but let Off replace an opaque environment base with its diffuse stage.
+    let keep_authored_env = (flags & MATERIAL_MASK) == MATERIAL_GLASS
+        || keeps_authored_environment_stages(definition);
     let stage_is_omitted = |stage: &shader::Stage| {
         omit_environment_stages
             && !keep_authored_env
@@ -2835,7 +2983,11 @@ pub fn describe(
                     animation: resolve_stage_animation(source, assets, textures, preferred_source),
                     enhancements,
                     blend,
-                    alpha_cutoff: alpha_cutoff(source),
+                    alpha_cutoff: if promote_to_base {
+                        promoted_off_alpha_cutoff(source, texture, textures)
+                    } else {
+                        alpha_cutoff(source)
+                    },
                     opacity: source.alpha.unwrap_or(1.0),
                     color: source.color.unwrap_or([1.0; 3]),
                     rgb_gen: source.rgb_gen,
@@ -3055,6 +3207,13 @@ pub fn describe(
     SurfaceMaterial {
         // A model shader (and an uncompiled source-map preview) has no BSP
         // material bits. Prefer its explicit Glass declaration when present.
+        thermal_lava: definition.lava,
+        thermal_emission: if definition.surface_light > 0.0 {
+            3 // explicit authored area emitter; unlike glow, affects the whole material
+        } else {
+            if definition.water || definition.is_glass() { 0 }
+            else { stages.iter().map(thermal_emission_stage).max().unwrap_or(0) }
+        },
         surface_material: if definition.is_glass() {
             MATERIAL_GLASS as u8
         } else {
@@ -3072,6 +3231,7 @@ pub fn describe(
         grass_stages,
         surface_sprite_effects,
         surface_sprite_cull_quirk,
+        foliage_wind: crate::foliage::promotes_shader(name, definition),
         auto_sprite2: definition.auto_sprite2,
         stages,
         cull: cull_mode(&definition.cull),
@@ -3127,7 +3287,9 @@ mod tests {
     fn authored_texture_policies_do_not_mutate_shared_images() {
         let mut textures = Textures::new();
         let mut image = missing_texture_data();
-        (image.rgba, image.mip_level_count) = build_mip_chain(image.width, image.height, image.rgba);
+        let (pixels, mips) = build_mip_chain(image.width, image.height, image.rgba.into_vec());
+        image.rgba = pixels.into();
+        image.mip_level_count = mips;
         textures.push_image(image.clone());
         let single_mip = textures.shader_texture(0, true, true);
         let full_resolution = textures.shader_texture(0, false, true);
@@ -3230,6 +3392,31 @@ mod tests {
     }
 
     #[test]
+    fn thermal_sources_recognize_lava_glow_and_energized_blends() {
+        let lava = material("test {\nsurfaceparm lava\n{\nmap $whiteimage\n}\n}\n");
+        assert!(lava.thermal_lava);
+        let bulb = material("test {\n{\nmap $whiteimage\n}\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE\nglow\n}\n}\n");
+        assert_eq!(bulb.thermal_emission, 2);
+        let field = material("test {\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE_MINUS_SRC_COLOR\ntcMod rotate 400\n}\n}\n");
+        assert_eq!(field.thermal_emission, 2);
+        let tube = material("test {\n{\nmap $whiteimage\nblendFunc GL_ONE GL_SRC_COLOR\ntcMod scroll 0 0.5\n}\n}\n");
+        assert_eq!(tube.thermal_emission, 2);
+        let filter = material("test {\n{\nmap $whiteimage\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}\n");
+        assert_eq!(filter.thermal_emission, 0);
+        let transparent = material("test {\n{\nmap $whiteimage\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n}\n");
+        assert_eq!(transparent.thermal_emission, 0);
+        // The two reported false positives (landing_pad and control2) are
+        // local additive overlays: the base stage has no thermal emission.
+        let landing = material("test {\n{\nmap $whiteimage\n}\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE\n}\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE\ntcMod scroll 0.25 0\n}\n}\n");
+        assert_eq!(landing.thermal_emission, 2);
+        assert_eq!(thermal_emission_stage(&landing.stages[0]), 0);
+        assert_eq!(thermal_emission_stage(&landing.stages[1]), 1);
+        assert_eq!(thermal_emission_stage(&landing.stages[2]), 2);
+        let authored = material("test {\nq3map_surfacelight 600\n{\nmap $whiteimage\n}\n}\n");
+        assert_eq!(authored.thermal_emission, 3);
+    }
+
+    #[test]
     fn authored_clamptime_survives_material_preparation() {
         let m = material("test {\nclampTime 1.25\n{\nmap $whiteimage\n}\n}\n");
         assert_eq!(m.clamp_time, Some(1.25));
@@ -3266,7 +3453,7 @@ mod tests {
             source: None,
             width: 2,
             height: 2,
-            rgba: [0_u8, 0, 0, 255].repeat(4),
+            rgba: ([0_u8, 0, 0, 255].repeat(4)).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -3279,7 +3466,7 @@ mod tests {
             source: None,
             width: 2,
             height: 2,
-            rgba: [255_u8, 32, 16, 255].repeat(4),
+            rgba: ([255_u8, 32, 16, 255].repeat(4)).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -3341,15 +3528,99 @@ mod tests {
     }
 
     #[test]
-    fn reflection_off_preserves_multistage_environment_composite() {
-        let material = material_with_environment_policy(
-            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n{\nmap $lightmap\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}",
-            true,
-        );
-        assert!(material.explicit);
-        assert_eq!(material.stages.len(), 3);
-        assert!(matches!(material.stages[0].tc_gen, TcGen::Environment));
-        assert!(matches!(material.stages[2].tc_gen, TcGen::Lightmap));
+    fn reflection_off_strips_opaque_environment_base_with_alpha_diffuse() {
+        // Exact stage topology from japro-assets: imperial/square. The shader
+        // is SolidMetal, not transparent glass, despite its blended diffuse.
+        let script = "test {\nq3map_material SolidMetal\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n{\nmap $lightmap\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}";
+        let legacy = material_with_environment_policy(script, false);
+        assert_eq!(legacy.stages.len(), 3);
+        let off = material_with_environment_policy(script, true);
+        assert!(off.explicit);
+        assert_eq!(off.stages.len(), 2);
+        assert!(matches!(off.stages[0].tc_gen, TcGen::Base));
+        assert_eq!(off.stages[0].blend, None, "the diffuse must replace the removed base");
+        assert!(off.stages[0].depth_write);
+        assert!(!off.stages[0].depth_equal);
+        assert!(matches!(off.stages[1].tc_gen, TcGen::Lightmap));
+        assert_eq!(off.stages[1].blend, Some(BlendFunc {
+            src: BlendFactor::DstColor, dst: BlendFactor::Zero,
+        }));
+        let shaders = shader::parse(script).unwrap();
+        let requests = primary_texture_requests(&["test".into()], &shaders, true);
+        assert!(!requests.iter().any(|(path, _, _)| path == "textures/factory/enviro"));
+        assert!(requests.iter().any(|(path, _, _)| path == "textures/imperial/square"));
+    }
+
+    #[test]
+    fn reflection_off_does_not_promote_additive_or_multiple_coverage_passes() {
+        // Guard against a hidden-depth surface in front of an unrelated
+        // implicit BSP material (such as rift/crystal_pilar_b).
+        for extra in [
+            "{\nmap textures/effect/glow\nblendFunc add\n}",
+            "{\nmap textures/effect/glow\nblendFunc blend\n}\n{\nmap textures/effect/tint\nblendFunc blend\n}",
+            "{\nmap textures/effect/tint\nblendFunc blend\n}\n{\nmap textures/effect/other\ntcGen environment\nblendFunc add\n}",
+        ] {
+            let script = format!(
+                "test {{\n{{\nmap textures/factory/enviro\ntcGen environment\n}}\n{}\n}}",
+                extra,
+            );
+            let off = material_with_environment_policy(&script, true);
+            assert_eq!(off.stages[0].tc_gen, TcGen::Environment, "{extra}");
+        }
+    }
+
+    #[test]
+    fn promoted_diffuse_masks_zero_alpha_instead_of_occluding_world() {
+        let library = shader::parse("test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc blend\n}\n}").unwrap();
+        let diffuse = &library.get("test").unwrap().stages[1];
+        let mut textures = Textures::new();
+        let mut image = missing_texture_data();
+        image.width = 2;
+        image.height = 1;
+        image.rgba = vec![100, 100, 100, 0, 200, 200, 200, 255].into();
+        image.mip_level_count = 1;
+        let index = textures.images.len();
+        textures.push_image(image);
+        assert_eq!(promoted_off_alpha_cutoff(diffuse, StageTexture::Image(index), &textures), 0.5);
+    }
+
+    #[test]
+    fn reflection_off_keeps_implicit_material_identical_to_legacy() {
+        // No parsed shader / no tcGen environment: OFF cannot hide the BSP
+        // surface by stripping its lone opaque, vertex-lit base.
+        let root = std::env::temp_dir().join(format!("jka-implicit-off-fixture-{}", std::process::id()));
+        let mut assets = AssetSearchPath::open(&root).unwrap();
+        let mut textures = Textures::new();
+        let prepare = |off, assets: &mut AssetSearchPath, textures: &mut Textures| {
+            describe("models/map_objects/rift/crystal_pilar_b", 0, None, None,
+                assets, textures, false, off)
+        };
+        let legacy = prepare(false, &mut assets, &mut textures);
+        let off = prepare(true, &mut assets, &mut textures);
+        assert!(!off.hidden);
+        assert_eq!(legacy.stages.len(), 1);
+        assert_eq!(off.stages.len(), 1);
+        assert_eq!(legacy.stages[0].blend, off.stages[0].blend);
+        assert_eq!(legacy.stages[0].alpha_cutoff, off.stages[0].alpha_cutoff);
+        assert_eq!(legacy.stages[0].tc_gen, off.stages[0].tc_gen);
+    }
+
+    #[test]
+    fn reflection_off_preserves_translucent_environment_base() {
+        // This must remain an authored composite: the replacement is not an
+        // opaque wall, and the environment stage contributes visible coverage.
+        let script = "test {\nsurfaceparm trans\n{\nmap textures/glass/enviro\ntcGen environment\n}\n{\nmap textures/glass/tint\nblendFunc blend\n}\n}";
+        let off = material_with_environment_policy(script, true);
+        assert_eq!(off.stages.len(), 2);
+        assert_eq!(off.stages[0].tc_gen, TcGen::Environment);
+    }
+
+    #[test]
+    fn reflection_off_preserves_explicit_transparent_sort_with_environment_base() {
+        let script = "test {\nsort additive\n{\nmap textures/effect/enviro\ntcGen environment\n}\n{\nmap textures/effect/tint\nblendFunc blend\n}\n}";
+        let off = material_with_environment_policy(script, true);
+        assert_eq!(off.stages.len(), 2);
+        assert_eq!(off.stages[0].tc_gen, TcGen::Environment);
     }
 
     #[test]
@@ -3428,17 +3699,40 @@ mod tests {
     }
 
     #[test]
-    fn reflection_off_keeps_environment_only_opaque_surface_as_occluder() {
-        let material = material_with_environment_policy(
-            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n}",
-            true,
-        );
-        assert_eq!(material.stages.len(), 1);
-        assert!(material.stages[0].blend.is_none());
-        assert!(material.stages[0].depth_write);
-        assert!(!material.stages[0].depth_equal);
-        assert!(matches!(material.stages[0].tc_gen, TcGen::Base));
-        assert!(!material.hidden);
+    fn reflection_off_preserves_lone_opaque_environment_stage() {
+        // No authored diffuse exists. Keep the only stage instead of replacing
+        // it with a synthetic white/implicit base or hiding the surface.
+        let script = "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n}";
+        let legacy = material_with_environment_policy(script, false);
+        let off = material_with_environment_policy(script, true);
+        assert_eq!(off.stages.len(), 1);
+        assert_eq!(off.stages[0].tc_gen, legacy.stages[0].tc_gen);
+        assert_eq!(off.stages[0].blend, legacy.stages[0].blend);
+        assert_eq!(off.stages[0].depth_write, legacy.stages[0].depth_write);
+        assert!(!off.hidden);
+    }
+
+    #[test]
+    fn reflection_off_preserves_lone_additive_forcefield_environment_stage() {
+        // mapJumpxtreme4 shaders/retreat.shader: removing this lone env stage
+        // makes the crystal fully invisible. Not an optional reflection pass.
+        let script = "test {\nsurfaceparm nonopaque\nsurfaceparm forcefield\nq3map_nolightmap\n{\nmap textures/rift/env_crystal_2\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}\n}";
+        let legacy = material_with_environment_policy(script, false);
+        let off = material_with_environment_policy(script, true);
+        assert!(!off.hidden);
+        assert_eq!(legacy.stages.len(), 1);
+        assert_eq!(off.stages.len(), 1);
+        assert_eq!(off.stages[0].tc_gen, TcGen::Environment);
+        assert_eq!(off.stages[0].tc_gen, legacy.stages[0].tc_gen);
+        assert_eq!(off.stages[0].blend, legacy.stages[0].blend);
+        assert_eq!(off.stages[0].blend, Some(BlendFunc {
+            src: BlendFactor::One,
+            dst: BlendFactor::One,
+        }));
+        assert_eq!(off.stages[0].depth_write, legacy.stages[0].depth_write);
+        let shaders = shader::parse(script).unwrap();
+        let requests = primary_texture_requests(&["test".into()], &shaders, true);
+        assert!(requests.iter().any(|(path, _, _)| path == "textures/rift/env_crystal_2"));
     }
 
     #[test]
@@ -3630,7 +3924,7 @@ rgbGen const ( 0 0 0 )
             source: None,
             width: 2,
             height: 2,
-            rgba: [255_u8, 64, 16, 255].repeat(4),
+            rgba: ([255_u8, 64, 16, 255].repeat(4)).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,

@@ -1162,6 +1162,40 @@ pub(in crate::cgame::player_presenter) fn gpu_bones_from_pose(
     )
 }
 
+/// `gpu_bones_from_pose` plus thermal vision's heat sources. AvP (1999)
+/// Predator heat vision (hmodel.c `FindHeatSource_Recursion`) colours a
+/// creature by each vertex's distance to the nearest section flagged
+/// `section_flag_heatsource`: the chest and the head. Their posed model-space
+/// pivots ride after the skeleton as one extra matrix (row0 = thoracic, row1 =
+/// cranium) for the Ghoul2 prepass. Returns that matrix's index, or 0 when the
+/// skeleton has neither bone (no heat source: not drawn as a warm body).
+pub(in crate::cgame::player_presenter) fn gpu_bones_with_heat_sources(
+    pose: &[Matrix3x4],
+    gla: &jka_assets::ghoul2::GlaAnimation,
+) -> (Arc<Vec<Ghoul2GpuBone>>, u32) {
+    // A bone's pivot is its base-pose origin carried through its skinning matrix.
+    let pivot = |name: &str| -> Option<[f32; 4]> {
+        let index = jka_assets::ghoul2::Ghoul2Animator::bone_index(gla, name)?;
+        let matrix = pose.get(index)?;
+        let base = &gla.skeleton.get(index)?.base_pose;
+        let origin = [base[0][3], base[1][3], base[2][3], 1.0];
+        let row = |r: [f32; 4]| r[0] * origin[0] + r[1] * origin[1] + r[2] * origin[2] + r[3];
+        Some([row(matrix[0]), row(matrix[1]), row(matrix[2]), 0.0])
+    };
+    let mut bones = gpu_bones_from_pose(pose);
+    let (chest, head) = (pivot("thoracic"), pivot("cranium"));
+    let Some(first) = chest.or(head) else {
+        return (bones, 0);
+    };
+    let index = u32::try_from(bones.len()).unwrap_or(0);
+    Arc::make_mut(&mut bones).push(Ghoul2GpuBone {
+        row0: first,
+        row1: head.unwrap_or(first),
+        row2: first,
+    });
+    (bones, index)
+}
+
 /// Marker carried by errors that only mean "still loading". Presentation code
 /// treats it as "skip this frame", never as a failure to report.
 pub(in crate::cgame::player_presenter) const ASSET_PENDING: &str = "asset loading";

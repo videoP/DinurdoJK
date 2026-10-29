@@ -1,7 +1,7 @@
 //! Frame.
 use crate::app::{
     rendering_third_person, ui, App, Arc, ClientFramePerf, FrontendPage, InputLatencySample,
-    DemoViewMode, Instant, LocalServer, MapEditor, OverlayMode, PlayerViewPolicyState, RenderCommand,
+    DemoViewMode, Duration, Instant, LocalServer, MapEditor, OverlayMode, PlayerViewPolicyState, RenderCommand,
     RenderSnapshot, SessionPhase, SpectatorHighlight, SpectatorHighlightTeam, ViewLatchMode,
 };
 
@@ -37,7 +37,8 @@ impl App {
             .game_session
             .as_ref()
             .and_then(|playback| playback.player_position);
-        let dynamic_models = if self.profile_preview_active {
+        let studio_demo = self.studio_demo_scene_active();
+        let dynamic_models = if self.profile_preview_active && !studio_demo {
             Arc::clone(&self.profile_dynamic_models)
         } else {
             self.game_session
@@ -83,14 +84,17 @@ impl App {
         };
         let dynamic_models = if !self.model_placement.placed_draws.is_empty()
             || !self.model_placement.preview_draws.is_empty()
+            || !self.model_placement.picker_draws.is_empty()
             || !self.model_placement.fx_draws.is_empty() {
             let mut merged = Vec::with_capacity(dynamic_models.len()
                 + self.model_placement.placed_draws.len()
                 + self.model_placement.preview_draws.len()
+                + self.model_placement.picker_draws.len()
                 + self.model_placement.fx_draws.len());
             merged.extend(dynamic_models.iter().cloned());
             merged.extend(self.model_placement.placed_draws.iter().cloned());
             merged.extend(self.model_placement.preview_draws.iter().cloned());
+            merged.extend(self.model_placement.picker_draws.iter().cloned());
             merged.extend(self.model_placement.fx_draws.iter().cloned());
             Arc::new(merged)
         } else {
@@ -149,7 +153,7 @@ impl App {
         // Profile/asset previews are isolated UI scenes, equivalent to the
         // RDF_NOWORLDMODEL model widgets in the JKA UI. They must never inherit
         // gameplay view rotation (including the render-thread subframe latch).
-        let isolated_preview = self.profile_preview_active
+        let isolated_preview = (self.profile_preview_active && !studio_demo)
             || (self.front_end && self.frontend_page == FrontendPage::AssetViewer);
         let input_view_rotation = if isolated_preview || self.front_end {
             // Menu cameras never consume live mouse/third-person late-latch data.
@@ -159,7 +163,7 @@ impl App {
         };
         let spectator_highlights = if !isolated_preview
             && self.japro_cg.spec_hud
-            && self.spectator_binding_context()
+            && (self.demo_playback_active() || self.live_spec_hud_eligible())
         {
             self.game_session.as_ref().map_or_else(
                 || Arc::new(Vec::new()),
@@ -221,6 +225,48 @@ impl App {
             Arc::new(Vec::new())
         };
         RenderSnapshot {
+            studio_lens: (self.front_end&&self.frontend_page==FrontendPage::RenderStudio)
+                .then(|| {
+                    let key=self.render_studio.camera_rig_runtime.camera.filter(|_|self.render_studio.timeline.camera_rig.active())
+                        .unwrap_or_else(||self.studio_camera_key_at(self.render_studio.timeline_time()));
+                    let mut lens=key.lens;
+                    // The Scene view has its own editor camera; otherwise show
+                    // the authored lens during playback just as in the export.
+                    if self.render_studio.spatial.scene_camera.is_some()
+                        && self.render_studio.export.is_none() && self.render_studio.still.is_none(){lens.aperture=None;}
+                    lens
+                }),
+            studio_scene: self.render_studio.scene_frame.clone().or_else(||{
+                if !self.studio_bsp_active() {return None;}
+                let world=self.render_studio.bsp_world.as_ref()?;
+                let id=world.id;
+                let camera=self.asset_preview_camera();
+                let time=self.render_studio.timeline_time();
+                let timeline=&self.render_studio.timeline;
+                let environment=timeline.scene_lighting.sample(time,
+                    timeline.interpolation!=super::render_studio_timeline::StudioInterpolation::Linear).render_sample();
+                Some(Arc::new(crate::renderer::StudioSceneFrame {
+                    outgoing:crate::renderer::StudioSourceFrame {
+                        id,revision:0,shot_camera:camera,camera,
+                        lens: self.studio_camera_key_at(time).lens,
+                        environment:Some(environment),time:time as f32,
+                        player_position:None,area_mask:None,
+                        dynamic_models:Arc::clone(&dynamic_models),
+                        inline_models:Arc::clone(&world.inline_models),
+                        lights:Arc::new(timeline.lights_at(time)),
+                        screen_fx:Arc::new(Vec::new()),cloud_foreground:Arc::new(Vec::new()),
+                        ocean_actors:Arc::new(Vec::new()),hud:None,
+                    },
+                    incoming:None,effect:0,progress:0.0,video:self.video,
+                    offline_capture:self.render_studio.export.is_some() || self.render_studio.still.is_some(),
+                }))
+            }),
+            studio_environment: (self.profile_preview_active && !studio_demo
+                && self.frontend_page==FrontendPage::RenderStudio).then(|| {
+                let timeline=&self.render_studio.timeline;
+                timeline.scene_lighting.sample(self.render_studio.timeline_time(),
+                    timeline.interpolation!=super::render_studio_timeline::StudioInterpolation::Linear).render_sample()
+            }),
             model_frame_source: self.network.model_frame_debug.then(|| {
                 let playback = self.game_session.as_ref();
                 crate::model_frame_log::FrameSource::new(
@@ -274,8 +320,10 @@ impl App {
                 Arc::new(self.water_wetness.profiles(Instant::now()))
             },
             spectator_highlights,
-            transient_lights: if self.profile_preview_active {
-                Arc::new(Vec::new())
+            transient_lights: if self.profile_preview_active && !studio_demo {
+                Arc::new(if self.frontend_page==FrontendPage::RenderStudio {
+                    self.render_studio.timeline.lights_at(self.render_studio.timeline_time())
+                } else {Vec::new()})
             } else if self.front_end && self.frontend_cinematic.is_some() {
                 self.menu_props.as_ref().map_or_else(
                     || Arc::new(Vec::new()), |props| Arc::clone(&props.lights))
@@ -289,7 +337,7 @@ impl App {
                 || Arc::new(Vec::new()),
                 |playback| Arc::clone(&playback.screen_fx),
             ),
-            cloud_foreground: if self.profile_preview_active {
+            cloud_foreground: if self.profile_preview_active && !studio_demo {
                 Arc::new(Vec::new())
             } else {
                 self.game_session.as_ref().map_or_else(
@@ -418,6 +466,7 @@ impl App {
             return;
         }
         self.render_command(RenderCommand::SetUi(self.ui_snapshot()));
+        self.render_command(RenderCommand::SetStreamerSettings(self.streamer));
     }
 
     /// Start a batch of settings changes. The renderer defers pipeline-variant
@@ -433,6 +482,42 @@ impl App {
             self.publish_ui();
         }
         self.render_command(RenderCommand::BatchEnd);
+    }
+
+    /// Both invnext/invprev and TaystJK's force->inventory cycling use this
+    /// selector. Like the weapon/Force strips, only the most recently used
+    /// selection occupies the bottom-center HUD area.
+    pub(in crate::app) fn show_inventory_selection(&mut self, ps: &jka_protocol::server::PlayerState) {
+        if ps.stats[0] <= 0 || ps.stats[1] == 0 || ps.stats[2] == 0
+            || ps.persistant[3] == 3
+            || ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0
+            || ps.field_i32("pm_type").unwrap_or(0) == 4
+            || !(1..12).contains(&self.live_input.inventory_select)
+            || matches!(self.live_input.inventory_select, 7 | 8 | 9)
+        {
+            return;
+        }
+        self.inventory_select_until = Some(Instant::now() + Duration::from_millis(1400));
+        self.weapon_select_until = None;
+        self.force_select_until = None;
+        self.publish_transient_ui();
+    }
+
+    pub(in crate::app) fn inventory_select_ui(&self, now: Instant) -> Option<ui::UiInventorySelect> {
+        if now >= self.inventory_select_until? { return None; }
+        let ps = self.live_player_state()?;
+        let selected = self.live_input.inventory_select;
+        if ps.stats[0] <= 0 || ps.stats[1] == 0 || ps.stats[2] == 0
+            || ps.persistant[3] == 3
+            || ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0
+            || ps.field_i32("pm_type").unwrap_or(0) == 4
+            || !(1..12).contains(&selected)
+            || ps.stats[2] & (1 << selected) == 0
+        { return None; }
+        Some(ui::UiInventorySelect {
+            selected,
+            owned_bits: ps.stats[2] as u32,
+        })
     }
 
     pub(in crate::app) fn force_select_ui(&self, now: Instant) -> Option<ui::UiForceSelect> {
@@ -488,7 +573,10 @@ impl App {
     pub(in crate::app) fn publish_transient_ui(&self) {
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
         let mut console_notify_lines = self.console_notify_ui_snapshot();
-        let demo_timeline = self.demo_timeline_ui(Instant::now());
+        // Studio owns the transport and IN/OUT selection when editing a demo;
+        // don't paint the native viewer's timeline over its preview rectangle.
+        let demo_timeline = if self.studio_demo_scene_active() {None}
+            else {self.demo_timeline_ui(Instant::now())};
         let prediction_debug = self.prediction_debug_ui();
         let mut crosshair_target = self.crosshair_target.clone();
         let mut follow_name = self.current_follow_name();
@@ -503,6 +591,7 @@ impl App {
         let scoreboard_focus_client = self.scoreboard_focus_client();
         let force_select = self.force_select_ui(Instant::now());
         let weapon_select = self.weapon_select_ui(Instant::now());
+        let inventory_select = self.inventory_select_ui(Instant::now());
         if self.overlay == OverlayMode::HudEdit {
             self.hud_edit_transient_samples(
                 &mut chat_lines,
@@ -526,9 +615,12 @@ impl App {
             crosshair_target,
             force_select,
             weapon_select,
+            inventory_select,
             follow_name,
             game_timer: self.game_timer_text(),
             mini_scores: self.mini_scores_ui(),
+            hud_score: self.hud_score_ui(),
+            enemy_info: self.enemy_info_ui(),
             race_timer,
             vote_line,
             scoreboard,

@@ -696,7 +696,7 @@ fn fast_module() -> Module {
     let source = format!(
         "{}\n{}\n{}",
         include_str!("../../bsp_fast.wgsl"),
-        include_str!("../../surface_deformation.wgsl"),
+        crate::foliage::surface_shader(),
         include_str!("../../sky_fractal.wgsl")
     );
     naga::front::wgsl::parse_str(&source)
@@ -1104,21 +1104,73 @@ fn authored_baked_sun_removes_known_photons_on_gpu() {
         let enabled = if enabled { 1.0 } else { 0.0 };
         cases.push_str(&format!("if (id.x == {index}u) {{ input.world_normal = vec3<f32>(0.0, 1.0, 0.0); lighting_settings.baked_sun_direction_strength.w = {strength:?}; lighting_settings.runtime_sun_direction = vec4<f32>({direction}, 0.0); lighting_settings.runtime_sun_radiance = vec4<f32>({:?}, {:?}, {:?}, {enabled:?}); test_visibility = {visibility:?}; output[{index}] = vec4<f32>(light_bsp_surface(vec3<f32>(0.1, 0.15, 0.05), 0.0, input), 1.0); }}\n", radiance[0] * gain, radiance[1] * gain, radiance[2] * gain));
     }
-    // A composed lightmap already contains static sunlight. Moving occlusion
-    // may remove only that contribution; it must leave indirect light intact.
+    // Explicit runtime sun removes its direct contribution. Legacy alpha
+    // already contains user-controlled moving-shadow contrast.
     for (enabled,visibility) in [(true,0.0f32),(true,0.5),(true,1.0),(false,0.0),(false,1.0)] {
         let index=expected.len();let flux=if enabled {1.0}else{0.3};
         let rgb=if enabled {[1.6,1.4,1.2]}else{[1.0;3]};
         expected.push(std::array::from_fn(|c|if enabled {rgb[c]-[0.6,0.4,0.2][c]*flux*(1.0-visibility)}else{rgb[c]*(1.0-flux*(1.0-visibility))}));
         cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_debug_mode.z=1u; lighting_settings.runtime_sun_radiance=vec4<f32>(0.6,0.4,0.2,{:?}); test_visibility={visibility:?}; output[{index}]=vec4<f32>(light_bsp_surface(vec3<f32>({:?},{:?},{:?}),{flux:?},input),1.0); }}\n",if enabled {1.0}else{0.0},rgb[0],rgb[1],rgb[2]));
     }
+    for strength in [0.0_f32, 0.25, 1.0] {
+        let index = expected.len();
+        expected.push([1.6 - 0.6 * strength, 1.4 - 0.4 * strength, 1.2 - 0.2 * strength]);
+        cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_debug_mode.z=1u; lighting_settings.runtime_sun_radiance=vec4<f32>(0.6,0.4,0.2,1.0); shadow_settings.params.z={strength:?}; test_visibility=0.0; output[{index}]=vec4<f32>(light_bsp_surface(vec3<f32>(1.6,1.4,1.2),1.0,input),1.0); }}\n"));
+    }
     let composed=crate::renderer::rt_models::declaration(include_str!("../lighting/lightmap_sun.wgsl"),"fn shade_composed_sun(").unwrap();
-    let live_helper=format!("{live_helper}\n{composed}");
+    // Run the actual explicit-stage alpha handling and relight call from both
+    // world families. A filter lightmap must match a folded base*lightmap,
+    // including zero/partial sunlight, while still supplying opaque blend alpha.
+    let mut explicit_helpers = String::new();
+    for (family, shader) in [("full", full), ("lean", include_str!("../../bsp_lean.wgsl"))] {
+        let alpha_start = shader.find("// Lightmap alpha carries internal sun visibility.").unwrap();
+        let alpha_end = alpha_start + shader[alpha_start..].find("// Classic id Tech 3").unwrap();
+        let relight_start = shader.find("let relight_explicit =").unwrap();
+        let relight_end = relight_start + shader[relight_start..].find("var base =").unwrap();
+        explicit_helpers.push_str(&format!(r#"
+fn explicit_{family}(sample: vec4<f32>, input: VertexOut) -> vec4<f32> {{
+    var source_sample = sample;
+    let explicit_lightmap_stage = true;
+    let classic_flags = 0u;
+    var stage_color = vec4<f32>(1.0);
+    {}
+    {}
+    return source_sample;
+}}
+"#, &shader[alpha_start..alpha_end], &shader[relight_start..relight_end]));
+        for flux in [0.0_f32, 0.3, 0.75, 1.0] {
+            for visibility in [0.0_f32, 0.5, 1.0] {
+                for enabled in [false, true] {
+                    let rgb = [1.6_f32, 1.4, 1.2];
+                    let wanted = std::array::from_fn(|c| if enabled {
+                        rgb[c] - [0.6, 0.4, 0.2][c] * flux * (1.0 - visibility)
+                    } else { rgb[c] * (1.0 - flux * (1.0 - visibility)) });
+                    for explicit in [false, true] {
+                        let index = expected.len();
+                        expected.push(wanted);
+                        let result = if explicit {
+                            format!("explicit_{family}(vec4<f32>(1.6,1.4,1.2,{flux:?}), input)")
+                        } else {
+                            format!("vec4<f32>(light_bsp_surface(vec3<f32>(1.6,1.4,1.2),{flux:?},input),1.0)")
+                        };
+                        cases.push_str(&format!("if (id.x == {index}u) {{ lighting_settings.baked_sun_debug_mode.z=1u; lighting_settings.runtime_sun_radiance=vec4<f32>(0.6,0.4,0.2,{:?}); test_visibility={visibility:?}; output[{index}]={result}; }}\n", if enabled {1.0} else {0.0}));
+                    }
+                }
+            }
+        }
+    }
+    let live_helper=format!("{live_helper}\n{composed}\n{explicit_helpers}");
     let source = format!("{}\n{}\n{}\n{}", r#"
 struct Settings { baked_sun_direction_strength: vec4<f32>, baked_sun_radiance: vec4<f32>, baked_sun_debug_mode: vec4<u32>, runtime_sun_direction: vec4<f32>, runtime_sun_radiance: vec4<f32> }
 var<private> lighting_settings: Settings;
 var<private> test_visibility: f32;
-struct VertexOut { baked_sun_fit: vec4<f32>, world_normal: vec3<f32>, lightmap_uv: vec2<f32> }
+struct ShadowSettings { params: vec4<f32> }
+var<private> shadow_settings: ShadowSettings;
+struct VertexOut { baked_sun_fit: vec4<f32>, world_normal: vec3<f32>, lightmap_uv: vec2<f32>, color: vec4<f32> }
+const ENABLE_BAKED_SUN_RELIGHT: bool = true;
+struct Material { color: vec4<f32> }
+var<private> material: Material;
+fn material_flags() -> u32 { return 0u; }
 @group(0) @binding(0) var<storage, read_write> output: array<vec4<f32>>;
 @group(0) @binding(1) var lightmap_texture: texture_2d<f32>;
 fn baked_luminance(rgb: vec3<f32>) -> f32 { return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722)); }
@@ -1131,7 +1183,7 @@ fn composed_lightmap_receiver(input: VertexOut) -> bool { return static_sun_ligh
 fn baked_local_total(input: VertexOut) -> vec3<f32> { return vec3(0.0); }
 fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> { return lightmap; }
 
-"#, helpers, live_helper, format!("@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ var input: VertexOut; lighting_settings.baked_sun_radiance = vec4<f32>(900.0 / 255.0, 900.0 / 255.0, 900.0 / 255.0, 0.0); {cases} }}"));
+"#, helpers, live_helper, format!("@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ var input: VertexOut; shadow_settings.params.z = 1.0; lighting_settings.baked_sun_radiance = vec4<f32>(900.0 / 255.0, 900.0 / 255.0, 900.0 / 255.0, 0.0); {cases} }}"));
     crate::renderer::block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = instance.request_adapter(&Default::default()).await.expect("sun subtraction GPU adapter");
@@ -1166,6 +1218,7 @@ fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> { retur
         let data = readback.slice(..).get_mapped_range().unwrap();
         let values: &[[f32; 4]] = bytemuck::cast_slice(&data);
         for (index, (actual, expected)) in values.iter().zip(expected).enumerate() {
+            assert_eq!(actual[3], 1.0, "sun case {index}: internal flux must not leak into blend alpha");
             let tolerance = if index == 8 { 0.01 } else { 0.0001 };
             for channel in 0..3 { assert!((actual[channel] - expected[channel]).abs() < tolerance, "sun case {index} channel {channel}: {} != {}", actual[channel], expected[channel]); }
         }

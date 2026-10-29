@@ -12,6 +12,18 @@ impl App {
     }
 
     pub(in crate::app) fn connect_to_server(&mut self, target: &str) {
+        self.connect_to_server_with_hint(target, None);
+    }
+
+    /// A browser refresh is an early map/mod *hint*, not a verified gamestate.
+    /// Start BSP preparation as soon as the socket is open. The next getinfo or
+    /// gamestate can supersede it via the normal map request generation IDs.
+    pub(in crate::app) fn connect_to_server_with_hint(
+        &mut self,
+        target: &str,
+        browser_hint: Option<(&str, &str)>,
+    ) {
+        self.leave_render_studio_for_launch();
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
         }
@@ -50,8 +62,49 @@ impl App {
                 self.predictor.reset();
                 self.pending_frontend_map_launch = false;
                 self.pending_live_server_commands.clear();
-                self.start_live_cgame_prep();
+
+                // Select the expected VFS before either the CGame worker or
+                // BSP worker starts. The browser's own entry wins for a browser
+                // join (its map hint came from the same getinfo); otherwise use
+                // what this server reported earlier this run. A later
+                // authoritative fs_game change invalidates both speculative
+                // requests and their prepared-asset caches.
+                let hinted_map = match browser_hint {
+                    Some((map, game)) => match self.set_session_fs_game(game.as_bytes(), "browser cache") {
+                        Ok(_) => Some(map.to_owned()),
+                        Err(error) => {
+                            devprintln!(1, "[JOIN] ignoring invalid browser fs_game hint: {error}");
+                            None
+                        }
+                    },
+                    None => {
+                        self.apply_fs_game_hint(resolved_server);
+                        None
+                    }
+                };
                 self.net = Some(net);
+                self.start_live_cgame_prep();
+                if let Some(map_name) = hinted_map {
+                    let source = scene::MapSource::Bsp(map_name.clone());
+                    match scene::verify_map_source_exists(
+                        &self.base,
+                        self.game.as_deref(),
+                        &source,
+                    ) {
+                        Ok(()) => {
+                            if let Some(timing) = self.live_join_timing.as_mut() {
+                                timing.prefetched_map = Some(map_name.clone());
+                            }
+                            devprintln!(1, "[JOIN] browser hint: immediately prefetching {map_name}");
+                            self.prefetch_live_map(source);
+                        }
+                        Err(error) => {
+                            // An old/incorrect browser entry must not show the
+                            // missing-map prompt. Wait for fresh server info.
+                            devprintln!(1, "[JOIN] browser map hint unavailable: {error}");
+                        }
+                    }
+                }
                 self.begin_chat_log_for_current_connection();
                 self.publish_ui();
             }
@@ -284,7 +337,15 @@ impl App {
         } else {
             self.live_provisional = None;
         }
+        // TaystJK cl_commandsize is shared by CL_GetUserCmd / packet selection
+        // and CG_DrawDisconnect. Apply the same effective value to this session
+        // before writing packets; no server cvar or protocol extension is sent.
+        let effective_window = self.japro_cg.lagometer.effective_command_backup(
+            self.network.command_rate,
+            self.net.as_ref().map(|net| net.session().ping()),
+        );
         let net = self.net.as_mut().expect("checked above");
+        net.session_mut().set_command_window(effective_window as usize);
         net.session_mut()
             .set_packet_dup(self.network.packet_dup as i32);
         net.session_mut()
@@ -327,31 +388,8 @@ impl App {
                 for line in text.lines().filter(|line| !line.is_empty()) {
                     self.push_console_line(line.to_owned());
                 }
-                // A wrong/missing g_password is rejected by the game module as
-                // a connectionless `print`, not as SessionEvent::Disconnected.
-                // Keep the console copy, but surface a password retry dialog
-                // instead of leaving the user stuck at "Awaiting connection".
-                let awaiting_connect = self.net.as_ref().is_some_and(|net| {
-                    matches!(
-                        net.session().state(),
-                        ConnectionState::Connecting | ConnectionState::Challenging
-                    )
-                });
-                if awaiting_connect && Self::is_server_password_rejection(&text) {
-                    let target = self
-                        .reconnect_target
-                        .clone()
-                        .or_else(|| {
-                            self.net
-                                .as_ref()
-                                .map(|net| net.session().server().to_string())
-                        })
-                        .unwrap_or_default();
-                    self.show_server_password_prompt(
-                        target,
-                        Some(crate::logging::strip_jka_colors(&text)),
-                    );
-                }
+                // Pre-gamestate connectionless prints are refusal events in
+                // ClientSession; only informational post-gamestate prints land here.
             }
             SessionEvent::Gamestate => {
                 self.reset_remote_emotes();
@@ -420,6 +458,10 @@ impl App {
                 }
             }
             SessionEvent::Disconnected(reason) => {
+                let awaiting_admission = self.net.as_ref().is_some_and(|net| !net.session().has_gamestate());
+                let target = self.reconnect_target.clone().or_else(|| {
+                    self.net.as_ref().map(|net| net.session().server().to_string())
+                });
                 let reason = self.translate_server_text(reason.as_bytes());
                 println!("NET: disconnected: {reason}");
                 self.push_console_line(format!("^1{reason}"));
@@ -436,7 +478,14 @@ impl App {
                 // Mirrors jaPRO/stock JKA's com_errorMessage -> error_popmenu: an
                 // involuntary drop (kick/ban/server message) gets a popup the
                 // player actually sees, not just a line buried in the console.
-                self.disconnect_notice = Some(crate::logging::strip_jka_colors(&reason));
+                let readable = crate::logging::strip_jka_colors(&reason);
+                if awaiting_admission && Self::is_server_password_rejection(&readable) {
+                    if let Some(target) = target {
+                        self.show_server_password_prompt(target, Some(readable));
+                        return;
+                    }
+                }
+                self.disconnect_notice = Some(readable);
             }
         }
     }
@@ -550,6 +599,9 @@ impl App {
                 decoder.checksum_feed,
             )
         };
+        if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
+            self.live_fs_game_hints.insert(server, fs_game.clone());
+        }
         match self.set_session_fs_game(&fs_game, "gamestate systeminfo") {
             Ok(true) => self.start_live_cgame_prep(),
             Ok(false) => {}
@@ -766,7 +818,8 @@ impl App {
                 1,
                 "[JOIN] adopting already-rendered prefetched map {map_name}"
             );
-            self.live_join_ui = None;
+            // Map upload is not server admission. Keep the joining overlay
+            // until the first accepted active snapshot starts CGame.
             self.egui_repaint_requested = true;
             self.prime_live_session(&map_name);
             self.publish_snapshot();
@@ -862,6 +915,9 @@ impl App {
         };
         match result {
             Ok(true) => {
+                // The connection is actually usable now, not merely mapped.
+                self.live_join_ui = None;
+                self.egui_repaint_requested = true;
                 self.previous_tick = Instant::now();
                 if is_local {
                     devprintln!(

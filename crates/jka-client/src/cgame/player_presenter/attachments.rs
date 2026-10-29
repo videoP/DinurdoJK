@@ -66,6 +66,8 @@ pub enum PlayerFxRequest {
         num_blades: u8,
         /// Authored OpenJK `noDlight` / SFL2_NO_DLIGHT.
         no_dlight: bool,
+        /// OpenJK noBlade: suppress core/glow, not necessarily the dynamic light.
+        no_blade: bool,
         /// Authored OpenJK noWallMarks/noWallMarks2 for the active blade style.
         no_wall_marks: bool,
     },
@@ -97,6 +99,9 @@ pub(in crate::cgame::player_presenter) const JETPACK_MODEL: &str =
 pub(in crate::cgame::player_presenter) const PW_DISINT_4: i32 = 9;
 
 pub(in crate::cgame::player_presenter) const FP_GRIP: i32 = 6;
+
+/// Force-power index, not GENCMD_FORCE_SEEING (which is 13).
+pub(in crate::cgame::player_presenter) const FP_SEE: i32 = 14;
 
 pub(in crate::cgame::player_presenter) const MAX_GRIP_DISTANCE: f32 = 256.0;
 

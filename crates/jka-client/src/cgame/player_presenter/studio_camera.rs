@@ -97,7 +97,42 @@ impl ProfileAttachmentFrame {
     }
 }
 
+pub(crate) const DEMO_BONE_NAMES: [&str;6] = ["*head_top","*head_eyes","*chestg","pelvis","*r_hand","*l_hand"];
+/// Pseudo bone for the Studio camera: the primary saber's first blade tip.
+pub const SABER_TIP_ANCHOR: &str = "@saber_tip";
+/// Pseudo bone: the base of that blade (the hilt), held or thrown.
+pub const SABER_HILT_ANCHOR: &str = "@saber_hilt";
+
 impl PlayerPresenter {
+    /// Only the two active follow subjects (and possible independent aim
+    /// subject) are sampled. Never request expensive bolt queries for other
+    /// demo players or ordinary gameplay.
+    pub(crate) fn studio_capture_demo_bones(&mut self, requests: &[(i32,&str)]) {
+        self.studio_bone_masks.clear();
+        self.studio_bones.clear();
+        self.studio_saber_clients.clear();
+        for &(client,name) in requests {
+            let Some(client)=u16::try_from(client).ok() else {continue;};
+            if name==SABER_TIP_ANCHOR || name==SABER_HILT_ANCHOR {
+                if !self.studio_saber_clients.contains(&client) {self.studio_saber_clients.push(client);}
+                continue;
+            }
+            let Some(index)=DEMO_BONE_NAMES.iter().position(|&bone|bone==name) else {continue;};
+            *self.studio_bone_masks.entry(client).or_insert(0)|=1<<index;
+        }
+    }
+    /// (blade base, blade tip) of `client`'s primary saber, renderer space;
+    /// captured when the client was requested with SABER_TIP_ANCHOR.
+    pub(crate) fn studio_demo_blade(&self,client:i32)->Option<([f32;3],[f32;3])> {
+        self.studio_saber_tips.get(&u16::try_from(client).ok()?).copied()
+    }
+    pub(crate) fn studio_demo_bone(&self,client:i32,name:&str)->Option<[f32;3]> {
+        if name==SABER_TIP_ANCHOR {return self.studio_saber_tips.get(&u16::try_from(client).ok()?).map(|b|b.1);}
+        if name==SABER_HILT_ANCHOR {return self.studio_saber_tips.get(&u16::try_from(client).ok()?).map(|b|b.0);}
+        let points=self.studio_bones.get(&u16::try_from(client).ok()?)?;
+        let index=DEMO_BONE_NAMES.iter().position(|&n|n==name)?;
+        points[index]
+    }
     pub(crate) fn profile_attachment_model_id(&mut self,info:&ClientInfo)->Result<usize,String> {
         Ok(std::sync::Arc::as_ptr(&self.load_model(info)?) as usize)
     }

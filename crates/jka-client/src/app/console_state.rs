@@ -17,6 +17,93 @@ pub(in crate::app) struct ConsolePathLink {
     pub(in crate::app) target: PathBuf,
 }
 
+/// One physical text row, referring to a visible-character interval in an
+/// unchanged logical console message. Explicit line breaks are separate sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) struct ConsoleWrappedRow {
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::app) struct ConsoleReflow {
+    pub columns: usize,
+    pub valid: bool,
+    pub rows: Vec<ConsoleWrappedRow>,
+}
+
+impl ConsoleReflow {
+    fn push(&mut self, line: &str, line_index: usize) -> usize {
+        // Preserve original character offsets for selection, links and Ctrl+C.
+        // Prefer a word boundary when a word would straddle the final column;
+        // exceptionally long words still split to guarantee forward progress.
+        let plain = crate::logging::strip_jka_colors(line);
+        let chars: Vec<char> = plain.chars().collect();
+        let capacity = self.columns.max(1);
+        let mut start: usize = 0;
+        let before = self.rows.len();
+        loop {
+            let mut end = start.saturating_add(capacity).min(chars.len());
+            if end < chars.len()
+                && !chars[end - 1].is_whitespace()
+                && !chars[end].is_whitespace()
+            {
+                if let Some(split) = (start + 1..end)
+                    .rev()
+                    .find(|&index| chars[index - 1].is_whitespace())
+                {
+                    end = split;
+                }
+            }
+            self.rows.push(ConsoleWrappedRow {
+                line: line_index,
+                start_col: start,
+                end_col: end,
+            });
+            if end == chars.len() { break; }
+            start = end;
+        }
+        self.rows.len() - before
+    }
+
+    pub fn row_for_point(&self, point: ConsolePoint, end_point: bool) -> usize {
+        // The beginning of a selection on a wrap boundary belongs to the
+        // next physical row; its end belongs to the preceding one.
+        let row = self.rows.partition_point(|row| {
+            row.line < point.line ||
+                (row.line == point.line && (row.end_col < point.col ||
+                 (!end_point && row.end_col == point.col && row.start_col != row.end_col)))
+        });
+        row.min(self.rows.len().saturating_sub(1))
+    }
+}
+
+/// Extract a physical segment without breaking JKA `^N` color codes. Repeat
+/// the active color at the beginning of a continuation row, like TaystJK's
+/// colored character buffer does after Con_Resize.
+pub(in crate::app) fn console_colored_fragment(raw: &str, start: usize, end: usize) -> String {
+    let mut chars = raw.chars().peekable();
+    let mut column = 0;
+    let mut active = None;
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '^' && chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            let code = chars.next().expect("peeked digit");
+            active = Some(code);
+            if column >= start && column < end { out.push('^'); out.push(code); }
+            continue;
+        }
+        if column == start && start > 0 {
+            if let Some(code) = active { out.push('^'); out.push(code); }
+        }
+        if column >= start && column < end { out.push(ch); }
+        column += 1;
+        if column >= end { break; }
+    }
+    out
+}
+
 pub(in crate::app) fn parse_console_notify_terms(value: &str) -> Vec<String> {
     value
         .split_whitespace()
@@ -36,6 +123,7 @@ pub(in crate::app) fn parse_console_notify_terms(value: &str) -> Vec<String> {
 
 impl App {
     pub(in crate::app) fn clear_console_output(&mut self) {
+        self.console_reflow.borrow_mut().valid = false;
         self.console_lines.clear();
         self.console_line_kinds.clear();
         // TaystJK's Con_Clear_f blanks the console text backing the recent
@@ -65,6 +153,7 @@ impl App {
         const MAX_CONSOLE_LINES: usize = 10_000;
         let preserve_scroll = self.console_scroll > 0;
         if self.console_lines.len() >= MAX_CONSOLE_LINES {
+            self.console_reflow.borrow_mut().valid = false;
             self.console_lines.pop_front();
             self.console_line_kinds.pop_front();
             self.console_path_links.pop_front();
@@ -87,6 +176,15 @@ impl App {
                 ))
             });
         }
+        let added_rows = {
+            let mut layout = self.console_reflow.borrow_mut();
+            if layout.valid {
+                let index = self.console_lines.len();
+                layout.push(&line, index)
+            } else {
+                0
+            }
+        };
         self.console_lines.push_back(line);
         self.console_line_kinds.push_back(kind);
         self.console_path_links.push_back(path_links);
@@ -96,7 +194,14 @@ impl App {
         // viewport anchored on that same content as new lines arrive. At the
         // live bottom, remain pinned to the newest line as before.
         if preserve_scroll {
-            self.console_scroll = (self.console_scroll + 1).min(self.console_max_scroll());
+            // Preserve the inspected physical row as new wrapped rows arrive.
+            let added_rows = if added_rows > 0 { added_rows } else {
+                let layout = self.console_wrap_layout();
+                layout.rows.last().map_or(1, |last| {
+                    layout.rows.iter().rev().take_while(|row| row.line == last.line).count()
+                })
+            };
+            self.console_scroll = (self.console_scroll + added_rows).min(self.console_max_scroll());
         } else {
             self.console_scroll = 0;
         }
@@ -171,7 +276,7 @@ impl App {
         (line, skip_notify)
     }
 
-    fn record_console_notify_print(&mut self, text: &str, notify: bool) {
+    fn record_console_notify_print(&mut self, text: &str, notify: bool, team: bool) {
         // TaystJK keeps NUM_CON_TIMES (64) timestamps for console *rows*. A
         // completed CL_ConsolePrint line leaves con.current on the next blank
         // row, and CL_ConsolePrint timestamps that current row too. Preserve that
@@ -181,6 +286,7 @@ impl App {
         if self.console_notify.is_empty() {
             self.console_notify.push_back(ConsoleNotifyRecord {
                 text: String::new(),
+                team: false,
                 created: now,
                 demo_elapsed_ms,
                 notify: false,
@@ -195,6 +301,7 @@ impl App {
             if let Some(current) = self.console_notify.back_mut() {
                 current.text.clear();
                 current.text.push_str(segment);
+                current.team = team;
                 current.created = now;
                 current.demo_elapsed_ms = demo_elapsed_ms;
                 current.notify = notify;
@@ -204,6 +311,7 @@ impl App {
             }
             self.console_notify.push_back(ConsoleNotifyRecord {
                 text: String::new(),
+                team: false,
                 created: now,
                 demo_elapsed_ms,
                 notify: false,
@@ -228,7 +336,8 @@ impl App {
     ) {
         let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
         crate::logging::write_console_line(kind, format_args!("{line}"));
-        self.record_console_notify_print(&line, notify_eligible && !skip_notify);
+        let team = matches!(kind, crate::logging::ConsoleLineKind::TeamChat | crate::logging::ConsoleLineKind::TeamChatMention | crate::logging::ConsoleLineKind::TeamChatCommandEcho);
+        self.record_console_notify_print(&line, notify_eligible && !skip_notify, team);
 
         let console_changed = self.sync_console_log();
         if console_changed && self.overlay == OverlayMode::Console {
@@ -265,10 +374,26 @@ impl App {
         self.push_console_line_kind(line, crate::logging::ConsoleLineKind::Normal);
     }
 
+    /// Local team-chat echo uses the same console/notify policy as an ordinary
+    /// local print, but preserves its protocol category for stream-only redaction.
+    pub(in crate::app) fn push_console_team_chat_line(&mut self, line: impl Into<String>) {
+        self.push_console_line_kind(line, crate::logging::ConsoleLineKind::TeamChat);
+    }
+
     /// Console command echo. The amber gutter is explicit metadata rather than
     /// inferred from rendered `] ...` text.
     pub(in crate::app) fn push_console_command_echo(&mut self, line: impl Into<String>) {
-        self.push_console_line_kind(line, crate::logging::ConsoleLineKind::CommandEcho);
+        let line = line.into();
+        // The trusted local echo prefix is `] `, unlike arbitrary server text.
+        // Preserve the normal amber command styling while marking team sends.
+        let plain = crate::logging::strip_jka_colors(&line);
+        let command = plain.trim_start().strip_prefix(']').unwrap_or(&plain).trim_start();
+        let kind = if crate::streamer::is_team_chat_command(command) {
+            crate::logging::ConsoleLineKind::TeamChatCommandEcho
+        } else {
+            crate::logging::ConsoleLineKind::CommandEcho
+        };
+        self.push_console_line_kind(line, kind);
     }
 
     /// Genuine engine/client error. Red JKA text by itself is not an error tag.
@@ -306,7 +431,7 @@ impl App {
             format_args!("{line}"),
             path.into(),
         );
-        self.record_console_notify_print(&line, !skip_notify);
+        self.record_console_notify_print(&line, !skip_notify, false);
         let console_changed = self.sync_console_log();
         if console_changed && self.overlay == OverlayMode::Console {
             self.publish_ui();
@@ -353,7 +478,7 @@ impl App {
                 allowed_roots.push(root);
             }
         }
-        let active_game = jka_assets::pk3::active_game_directory(&self.base, self.game.as_deref());
+        let active_game = jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref());
         if let Ok(root) = std::fs::canonicalize(active_game) {
             allowed_roots.push(root);
         }
@@ -441,6 +566,24 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn console_wrap_layout(&self) -> std::cell::Ref<'_, ConsoleReflow> {
+        let columns = self.window.as_ref().map(|window| {
+            ui::console_wrap_columns(window.inner_size().width, self.console_scale)
+        }).unwrap_or(98);
+        {
+            let mut layout = self.console_reflow.borrow_mut();
+            if !layout.valid || layout.columns != columns {
+                layout.columns = columns;
+                layout.rows.clear();
+                for (index, line) in self.console_lines.iter().enumerate() {
+                    layout.push(line, index);
+                }
+                layout.valid = true;
+            }
+        }
+        self.console_reflow.borrow()
+    }
+
     pub(in crate::app) fn console_point_at(
         &self,
         width: u32,
@@ -448,21 +591,18 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<ConsolePoint> {
-        let (row, col) = ui::console_text_hit(width, height, self.console_size, x, y)?;
-        let capacity = ui::console_visible_line_capacity(height, self.console_size);
-        let scroll = self.console_scroll.min(self.console_max_scroll());
-        let end = self.console_lines.len().saturating_sub(scroll);
+        let (row, col) = ui::console_text_hit(width, height, self.console_size, self.console_scale, x, y)?;
+        let capacity = ui::console_visible_line_capacity(width, height, self.console_size, self.console_scale);
+        let layout = self.console_wrap_layout();
+        // The layout is already borrowed: don't call console_max_scroll(),
+        // which would try to mutably borrow the same RefCell again.
+        let max_scroll = layout.rows.len().saturating_sub(capacity.max(1));
+        let end = layout.rows.len().saturating_sub(self.console_scroll.min(max_scroll));
         let start = end.saturating_sub(capacity);
-        let line = start + row;
-        if line >= end {
-            return None;
-        }
-        let visible_len = crate::logging::strip_jka_colors(&self.console_lines[line])
-            .chars()
-            .count();
+        let segment = layout.rows.get(start + row)?;
         Some(ConsolePoint {
-            line,
-            col: col.min(visible_len),
+            line: segment.line,
+            col: (segment.start_col + col).min(segment.end_col),
         })
     }
 
@@ -471,11 +611,11 @@ impl App {
             .window
             .as_ref()
             .map(|window| {
-                ui::console_visible_line_capacity(window.inner_size().height, self.console_size)
+                ui::console_visible_line_capacity(window.inner_size().width, window.inner_size().height, self.console_size, self.console_scale)
             })
             .unwrap_or(1)
             .max(1);
-        self.console_lines.len().saturating_sub(visible_lines)
+        self.console_wrap_layout().rows.len().saturating_sub(visible_lines)
     }
 
     pub(in crate::app) fn scroll_console(&mut self, rows: i32) {
@@ -657,12 +797,13 @@ impl App {
             .window
             .as_ref()
             .map(|window| {
-                ui::console_visible_line_capacity(window.inner_size().height, self.console_size)
+                ui::console_visible_line_capacity(window.inner_size().width, window.inner_size().height, self.console_size, self.console_scale)
             })
             .unwrap_or(1)
             .max(1);
-        let scroll = self.console_scroll.min(self.console_max_scroll());
-        let end = self.console_lines.len().saturating_sub(scroll);
+        let layout = self.console_wrap_layout();
+        let max_scroll = layout.rows.len().saturating_sub(capacity.max(1));
+        let end = layout.rows.len().saturating_sub(self.console_scroll.min(max_scroll));
         (end.saturating_sub(capacity), end)
     }
 
@@ -673,8 +814,12 @@ impl App {
         else {
             return;
         };
+        let row_index = self.console_wrap_layout().row_for_point(ConsolePoint {
+            line: hit.line,
+            col: hit.start_col,
+        }, false);
         let (visible_start, visible_end) = self.console_visible_range();
-        if hit.line >= visible_start && hit.line < visible_end {
+        if row_index >= visible_start && row_index < visible_end {
             return;
         }
 
@@ -682,24 +827,22 @@ impl App {
             .window
             .as_ref()
             .map(|window| {
-                ui::console_visible_line_capacity(window.inner_size().height, self.console_size)
+                ui::console_visible_line_capacity(window.inner_size().width, window.inner_size().height, self.console_size, self.console_scale)
             })
             .unwrap_or(1)
             .max(1);
-        let centered_start = hit.line.saturating_sub(capacity / 2);
-        let centered_end = (centered_start + capacity).min(self.console_lines.len());
-        self.console_scroll = self
-            .console_lines
-            .len()
-            .saturating_sub(centered_end)
-            .min(self.console_max_scroll());
+        let centered_start = row_index.saturating_sub(capacity / 2);
+        let total_rows = self.console_wrap_layout().rows.len();
+        let centered_end = (centered_start + capacity).min(total_rows);
+        self.console_scroll = total_rows.saturating_sub(centered_end).min(self.console_max_scroll());
     }
 
     pub(in crate::app) fn rebuild_console_search(&mut self, reveal: bool) {
         let previous = self
             .console_search_index
             .and_then(|index| self.console_search_matches.get(index).copied());
-        let visible_start = self.console_visible_range().0;
+        let visible_start_row = self.console_visible_range().0;
+        let visible_start = self.console_wrap_layout().rows.get(visible_start_row).map_or(0, |row| row.line);
         let needle = self.console_search_input.to_ascii_lowercase();
         let mut matches = Vec::new();
 
@@ -775,5 +918,28 @@ impl App {
             None => 0,
         });
         self.reveal_console_search_match();
+    }
+}
+
+#[cfg(test)]
+mod reflow_tests {
+    use super::{console_colored_fragment, ConsolePoint, ConsoleReflow};
+
+    #[test]
+    fn reflow_preserves_source_columns_and_prefers_whole_words() {
+        let mut layout = ConsoleReflow { columns: 7, ..Default::default() };
+        assert_eq!(layout.push("foo bar baz", 0), 2);
+        assert_eq!((layout.rows[0].start_col, layout.rows[0].end_col), (0, 7));
+        assert_eq!((layout.rows[1].start_col, layout.rows[1].end_col), (7, 11));
+        assert_eq!(layout.row_for_point(ConsolePoint { line: 0, col: 7 }, false), 1);
+        assert_eq!(layout.row_for_point(ConsolePoint { line: 0, col: 7 }, true), 0);
+        assert_eq!(layout.push("abcdefghijk", 1), 2); // a word longer than a row
+        assert_eq!(layout.push("", 2), 1); // empty messages retain one row
+    }
+
+    #[test]
+    fn fragments_keep_the_color_active_at_a_wrap_boundary() {
+        assert_eq!(console_colored_fragment("^1hell^2oworld", 2, 7), "^1ll^2owo");
+        assert_eq!(console_colored_fragment("^4abcdef", 0, 3), "^4abc");
     }
 }

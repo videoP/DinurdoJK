@@ -865,6 +865,8 @@ impl FxSystem {
         }
         // Death/emitter effects spawned above are drawn from next frame on,
         // like OpenJK's FX_Add iterating a list that grows behind it.
+        crate::fx::diagnostics::peak(crate::fx::diagnostics::ACTIVE_FX_MAX, self.active.len() as u64);
+        crate::fx::diagnostics::peak(crate::fx::diagnostics::SCHEDULED_FX_MAX, self.scheduled.len() as u64);
         out
     }
 
@@ -969,13 +971,56 @@ impl FxSystem {
                     outer_cone_cos: spot.outer_cone_cos,
                 })
             }),
-        });
+        }).or_else(|| (fx.kind == PrimType::Line).then_some(AutoLightRuntime {
+            // This line may not be the EFX catalog's chosen light driver.
+            // Still submit it: aggressive promotion projects *all* lines.
+            // A negative score prevents new conservative promotions.
+            effect: id, score: -1000, spot: None,
+        }));
 
         let mut org2 = [0.0; 3];
         if matches!(fx.kind, PrimType::Line | PrimType::Electricity) {
             if fx.spawn_flags & FX_ORG2_FROM_TRACE != 0 {
-                // No world trace from the FX thread: use the untraced endpoint.
-                org2 = add(org, scale(ax[0], MAX_TRACE_DIST));
+                // FxScheduler CreateEffect: raycast the endpoint from the FX
+                // forward axis. The FX worker already owns a CollisionWorld
+                // clone, so do not use render-thread traces or `fx_physics`.
+                let direction = normalize(ax[0]);
+                let mut ray_end = add(org, scale(direction, MAX_TRACE_DIST));
+                if fx.spawn_flags & FX_ORG2_IS_OFFSET != 0 {
+                    let offset = [fx.origin2[0].get(rng), fx.origin2[1].get(rng), fx.origin2[2].get(rng)];
+                    ray_end = add(ray_end, if fx.spawn_flags & FX_CHEAP_ORG2_CALC != 0 {
+                        offset
+                    } else {
+                        combine(ax, offset)
+                    });
+                }
+                org2 = ray_end;
+                if direction.iter().all(|v| v.is_finite()) && dot(direction, direction) > 0.5
+                    && org.iter().chain(&ray_end).all(|v| v.is_finite())
+                {
+                    if let Some(world) = self.collision.as_mut() {
+                        let diag_started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
+                        let hit = world.trace(TraceQuery {
+                            start: org, mins: [0.0; 3], maxs: [0.0; 3],
+                            end: ray_end, pass_entity: -1, mask: MASK_SOLID,
+                        });
+                        if let Some(started) = diag_started {
+                            use crate::fx::diagnostics as diag;
+                            diag::add(diag::FX_TRACES, 1);
+                            diag::add(diag::FX_TRACE_US, diag::micros(started.elapsed()));
+                        }
+                        org2 = hit.end;
+                        if fx.spawn_flags & FX_TRACE_IMPACT_FX != 0
+                            && hit.fraction < 1.0 && hit.start_solid == 0
+                            && hit.all_solid == 0 && hit.surface_flags & SURF_NOIMPACT == 0
+                        {
+                            if !links.impact.is_empty() {
+                                let picked = links.impact[rng.irand(0, links.impact.len() as i32 - 1) as usize];
+                                self.runner_queue.push((picked, hit.end, impact_axis(hit.normal), class));
+                            }
+                        }
+                    }
+                }
             } else {
                 let o2 = [fx.origin2[0].get(rng), fx.origin2[1].get(rng), fx.origin2[2].get(rng)];
                 org2 = if fx.spawn_flags & FX_CHEAP_ORG2_CALC != 0 { o2 } else { combine(ax, o2) };
@@ -2019,6 +2064,79 @@ mod tests {
             }
         }
         (min_z, went_up, fx)
+    }
+
+    #[test]
+    fn authored_line_org2_trace_hits_wall_and_spawns_impact() {
+        // laserMP.efx uses these same two spawnflags. They must work even
+        // with fx_physics=off (world tracing is intrinsic to Line spawning).
+        const LASER: &str = "Line\n{\nspawnflags org2fromTrace traceImpactFx\nlife 100\nsize\n{\nstart 2\n}\nimpactFx\n[\nt/hit\n]\nshaders\n[\ngfx/misc/whiteLine2\n]\n}\n";
+        const HIT: &str = "OrientedParticle\n{\nlife 100\nsize\n{\nstart 2\n}\nshaders\n[\ngfx/effects/whiteFlare\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("t/laser", &mut read_fixture(&[
+            ("effects/t/laser.efx", LASER), ("effects/t/hit.efx", HIT),
+        ]));
+        assert_ne!(id, 0);
+        fx.set_collision(Some(Box::new(Floor)));
+        fx.set_physics_mode(0);
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.play_effect_dir(id, [5.0, 7.0, 32.0], [0.0, 0.0, -1.0]);
+        let frame = fx.frame();
+        assert!(frame.draws.iter().any(|draw| match draw {
+            FxDraw::Line { start, end, .. } => *start == [5.0, 7.0, 32.0] &&
+                (end[2].abs() < 0.01) && (end[0] - 5.0).abs() < 0.01,
+            _ => false,
+        }), "org2fromTrace must stop the authored beam at collision");
+        assert!(frame.draws.iter().any(|draw| match draw {
+            FxDraw::OrientedQuad { origin, .. } => origin[2].abs() < 0.01,
+            _ => false,
+        }), "traceImpactFx must spawn the impact EFX on the hit plane");
+    }
+
+    #[test]
+    fn authored_line_org2_trace_preserves_endpoint_offsets() {
+        const LOCAL: &str = "Line\n{\nspawnflags org2fromTrace org2isoffset\norigin2 0 8192 0\nlife 100\nshaders\n[\ngfx/misc/whiteLine2\n]\n}\n";
+        const ABSOLUTE: &str = "Line\n{\nspawnflags org2fromTrace org2isoffset cheapOrg2Calc\norigin2 0 8192 0\nlife 100\nshaders\n[\ngfx/misc/whiteLine2\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let mut read = read_fixture(&[("effects/t/local.efx", LOCAL), ("effects/t/absolute.efx", ABSOLUTE)]);
+        let local = fx.register("t/local", &mut read);
+        let absolute = fx.register("t/absolute", &mut read);
+        fx.set_collision(Some(Box::new(Floor)));
+        fx.set_physics_mode(0);
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        let axis = [[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]];
+        fx.play_effect(local, [5.0, 7.0, 32.0], axis);
+        fx.play_effect(absolute, [5.0, 7.0, 32.0], axis);
+        let frame = fx.frame();
+        for expected in [[21.0, 7.0, 0.0], [5.0, 23.0, 0.0]] {
+            assert!(frame.draws.iter().any(|draw| match draw {
+                FxDraw::Line { end, .. } => end.iter().zip(expected).all(|(a, b)| (a - b).abs() < 0.01),
+                _ => false,
+            }), "endpoint offset must be applied before tracing: {expected:?}");
+        }
+    }
+
+    #[test]
+    fn authored_line_org2_trace_without_collision_has_no_impact() {
+        const LASER: &str = "Line\n{\nspawnflags org2fromTrace traceImpactFx\nlife 100\nimpactFx\n[\nt/hit\n]\nshaders\n[\ngfx/misc/whiteLine2\n]\n}\n";
+        const HIT: &str = "Particle\n{\nlife 100\nshaders\n[\ngfx/effects/whiteFlare\n]\n}\n";
+        for world in [false, true] {
+            let mut fx = FxSystem::new();
+            let id = fx.register("t/laser", &mut read_fixture(&[
+                ("effects/t/laser.efx", LASER), ("effects/t/hit.efx", HIT),
+            ]));
+            if world { fx.set_collision(Some(Box::new(Floor))); }
+            fx.adjust_time(1000);
+            fx.adjust_time(1016);
+            // A horizontal ray misses Floor; no world uses the same fallback.
+            fx.play_effect_dir(id, [5.0, 7.0, 32.0], [1.0, 0.0, 0.0]);
+            let frame = fx.frame();
+            assert_eq!(frame.draws.len(), 1, "a missed trace must not spawn an impact");
+            let FxDraw::Line { end, .. } = frame.draws[0] else { panic!("expected beam") };
+            assert_eq!(end, [5.0 + MAX_TRACE_DIST, 7.0, 32.0]);
+        }
     }
 
     #[test]

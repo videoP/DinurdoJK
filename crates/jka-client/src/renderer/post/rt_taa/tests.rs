@@ -167,7 +167,7 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
             ..Default::default()
         });
         let mut post = PostUniform::zeroed();
-        post.inv_view_proj = glam::Mat4::perspective_rh(1.0, 2.0, 1.0, 100.0)
+        post.inv_view_proj = glam::camera::rh::proj::directx::perspective(1.0, 2.0, 1.0, 100.0)
             .inverse()
             .to_cols_array_2d();
         post.scene.history_valid = 1.0;

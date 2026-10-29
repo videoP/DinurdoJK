@@ -449,10 +449,11 @@ impl DynamicModelRenderer {
                 };
                 let draw_index = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
                 gpu_draw_data.push(Ghoul2GpuDrawUniform {
-                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], 0.0],
+                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], if skin.foliage_wind { crate::foliage::model_tag(skin.origin) } else { 0.0 }],
                     axis1: [skin.axis[1][0], skin.axis[1][1], skin.axis[1][2], 0.0],
                     axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
-                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
+                    // w: thermal heat-source matrix index (ghoul2_skin.wgsl thermal_body_heat).
+                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], skin.heat_bone as f32],
                     color: skin.color,
                     params: [
                         bone_base,

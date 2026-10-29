@@ -414,14 +414,14 @@ impl Renderer {
                 summary: vec![
                     (
                         "ENTITY".into(),
-                        format!("#{} · {}", surface.entity_num, entity_kind),
+                        format!("#{} Â· {}", surface.entity_num, entity_kind),
                     ),
                     ("DISTANCE".into(), format!("{distance:.2} u")),
                     ("MATERIAL".into(), texture_name.to_owned()),
                     (
                         "GEOMETRY".into(),
                         format!(
-                            "{} tris · {} verts",
+                            "{} tris Â· {} verts",
                             surface.index_count() / 3,
                             surface.vertex_count()
                         ),
@@ -902,6 +902,9 @@ impl Renderer {
             source.authored_environment_composite,
             source.reflection_probe,
         ));
+        lines.push(format!("FOLIAGE WIND: {}", if source.foliage_wind {
+            if self.foliage_wind_enabled { "AUTO (shared atmospheric wind)" } else { "AUTO (disabled by r_foliageWind)" }
+        } else { "OFF" }));
         lines.push(format!(
             "REFLECTION POLICY: quality={}    planar_mode={}    tcGen environment={}",
             self.reflection_quality.label(),
@@ -909,8 +912,10 @@ impl Renderer {
             if self.reflection_quality.omits_environment_stages() {
                 if source.authored_environment_composite {
                     "PRESERVED (integral authored effect; enhancements OFF)"
+                } else if matches!(source.tc_gen, TcGen::Environment) {
+                    "PRESERVED (authored environment stage still drawn; enhancements OFF)"
                 } else {
-                    "STRIPPED (standalone environment stage; reflections OFF)"
+                    "STRIPPED (optional environment stages; reflections OFF)"
                 }
             } else {
                 "PRESERVED"
@@ -1182,7 +1187,7 @@ impl Renderer {
             (
                 "DRAW".into(),
                 format!(
-                    "{:?} · {:?} · {:?}",
+                    "{:?} Â· {:?} Â· {:?}",
                     source.pipeline.class, source.pipeline.blend, source.pipeline.cull
                 ),
             ),
@@ -1198,7 +1203,7 @@ impl Renderer {
                 title: "SURFACE".into(),
                 lines: vec![
                     format!(
-                        "Batch {batch_index} · {} triangles · {vertex_count} vertices",
+                        "Batch {batch_index} Â· {} triangles Â· {vertex_count} vertices",
                         vertex_count / 3
                     ),
                     format!("Hit {:.1}, {:.1}, {:.1}", hit.x, hit.y, hit.z),
@@ -1215,12 +1220,13 @@ impl Renderer {
                 lines: vec![
                     format!("Texture: {texture_summary}"),
                     format!("Lighting: {lighting_summary}"),
+                    format!("Foliage wind: {}", if source.foliage_wind { if self.foliage_wind_enabled { "AUTO (shared atmospheric wind)" } else { "AUTO (disabled by r_foliageWind)" } } else { "OFF" }),
                     format!(
-                        "Fog: {fog_assignment} · PVS visible: {}",
+                        "Fog: {fog_assignment} Â· PVS visible: {}",
                         if pvs_visible { "YES" } else { "NO" }
                     ),
                     format!(
-                        "Planar: {} · env candidate: {} · probe: {:?}",
+                        "Planar: {} Â· env candidate: {} Â· probe: {:?}",
                         source.planar_reflection,
                         source.planar_environment_candidate,
                         source.reflection_probe
@@ -1445,15 +1451,24 @@ impl Renderer {
             self.shadow_resources.last_csm_mode = None;
         }
         self.cascaded_shadow_mode = mode;
+        // Clear immediately: switching CSM off can enter the fast frame path,
+        // which intentionally bypasses full-frame fixture synchronization.
+        if !mode.is_csm() {
+            self.dynamic_model_renderer.fixture_lighting = None;
+        }
+        if mode == DynamicShadowsMode::CascadedShadowMapsEntities {
+            self.shadow_resources.sky_snapshot = None;
+            self.shadow_resources.dynamic_sky_layers = 0;
+        }
         // Shadow-mode transitions must synchronously rebuild lamp pipeline
         // specialization and GPU inputs. UI greying alone is not a gate.
-        self.set_baked_local_lights(self.baked_local_lights, self.baked_local_sources);
+        self.set_lamp_shadow_sources(self.baked_local_sources);
         self.update_lighting_settings();
         // The Entity map is receiver-compatible with the cascade path (same
         // shader variant, one cascade), so it shares the enabled flag.
         self.cascaded_shadows_enabled = matches!(
             mode,
-            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::EntityMap
+            DynamicShadowsMode::CascadedShadowMaps | DynamicShadowsMode::CascadedShadowMapsEntities | DynamicShadowsMode::EntityMap
         );
         // Re-aim on entry instead of easing from a stale light.
         self.entity_shadow.initialized = false;

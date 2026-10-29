@@ -15,10 +15,11 @@
 //! The app lays the page out with Taffy (`crate::neon_menu::layout`) and sends
 //! a `MenuFrame` on change; all animation happens here (`anim.rs`).
 mod anim;
+mod chrome;
 mod pipelines;
 mod text;
 
-use crate::neon_menu::{font, Group, MenuFrame, ITEMS, ITEM_COUNT, TITLE};
+use crate::neon_menu::{font, Group, ItemInfo, MenuFrame, MenuPage, ITEM_COUNT, TITLE};
 use crate::pipeline_jobs::{hash_config as pipeline_hash, PipelineJobKey};
 use crate::renderer::{ui, Renderer};
 use crate::ui::ProportionalFont;
@@ -34,11 +35,9 @@ pub(super) const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub(super) const CRT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const CRT_SOURCE: [u32; 2] = [320, 240];
 const BLUR_LEVELS: u32 = 6;
-const TITLE_LINE: usize = ITEM_COUNT;
-const SABER_BLADE: usize = ITEM_COUNT + 1;
-const SABER_HILT: usize = ITEM_COUNT + 2;
-/// Sign state entries: the items, the title, the saber blade and hilt.
-const LIGHTS: usize = ITEM_COUNT + 3;
+/// The main page now owns only its interactive menu items. The title
+/// and saber use the persistent footer renderer, including on Main.
+const LIGHTS: usize = ITEM_COUNT;
 /// Power-on front far right of any sign: the whole tube is lit.
 const FULLY_LIT: f32 = 1.0e6;
 
@@ -102,10 +101,9 @@ fn gas(group: Group) -> [f32; 3] {
         Group::Hero => [1.0, 0.09, 0.28],
         Group::Primary => [0.04, 0.80, 1.0],
         Group::Utility => [1.0, 0.40, 0.07],
-        Group::Exit => [0.55, 0.66, 1.0],
     }
 }
-const TITLE_GAS: [f32; 3] = [0.80, 0.88, 1.0];
+pub(super) const TITLE_GAS: [f32; 3] = [0.80, 0.88, 1.0];
 
 struct Fonts {
     aurebesh: ProportionalFont,
@@ -128,7 +126,7 @@ struct Chain {
 impl Chain {
     fn new(
         device: &wgpu::Device,
-        p: &Pipelines,
+        blur_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         input: &wgpu::TextureView,
         width: u32,
@@ -164,7 +162,7 @@ impl Chain {
         let group = |source: &wgpu::TextureView, current: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &p.blur_layout,
+                layout: blur_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(current) },
@@ -199,12 +197,12 @@ impl Chain {
         &self.up_mips[0]
     }
 
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder, p: &Pipelines) {
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, down: &wgpu::RenderPipeline, up: &wgpu::RenderPipeline) {
         for (target, group) in self.down_mips.iter().zip(&self.down_groups) {
-            fullscreen(encoder, "JKA neon menu blur down", &p.blur_down, group, target, None);
+            fullscreen(encoder, "JKA neon menu blur down", down, group, target, None);
         }
         for i in (0..self.up_groups.len()).rev() {
-            fullscreen(encoder, "JKA neon menu blur up", &p.blur_up, &self.up_groups[i], &self.up_mips[i], None);
+            fullscreen(encoder, "JKA neon menu blur up", up, &self.up_groups[i], &self.up_mips[i], None);
         }
     }
 }
@@ -347,6 +345,7 @@ struct Shared {
 
 #[derive(Default)]
 pub(in crate::renderer) struct NeonMenu {
+    chrome: chrome::Chrome,
     frame: Option<MenuFrame>,
     cached_scene: Option<CachedScene>,
     pipelines: Option<Pipelines>,
@@ -361,7 +360,7 @@ pub(in crate::renderer) struct NeonMenu {
     anim: Anim,
     last_tick: Option<Instant>,
     // Geometry for the current layout and size.
-    built_for: Option<(crate::neon_menu::layout::MenuLayout, u32, u32, u32)>,
+    built_for: Option<(MenuPage, crate::neon_menu::layout::MenuLayout, u32, u32, u32)>,
     prims: Option<wgpu::Buffer>,
     instances: Option<wgpu::Buffer>,
     instance_count: u32,
@@ -526,6 +525,7 @@ impl NeonMenu {
 
         // Geometry from the Taffy layout, in pixels.
         let layout = frame.layout;
+        let entries = frame.page.entries();
         let w = width as f32;
         let h = height as f32;
         // The scene's wall screen that shows the CRT, and its bounds in pixels.
@@ -554,8 +554,8 @@ impl NeonMenu {
         let targets = self.targets.as_ref().expect("built above");
 
         let letterforms = font::generation();
-        if self.built_for != Some((layout, width, height, letterforms)) {
-            let (prims, instances) = build_glyphs(&layout, w, h);
+        if self.built_for != Some((frame.page, layout, width, height, letterforms)) {
+            let (prims, instances) = build_glyphs(&layout, entries, w, h);
             let prims_moved = upload(&device, &queue, &mut self.prims, "JKA neon menu tube centre lines",
                 wgpu::BufferUsages::STORAGE, bytemuck::cast_slice(&prims));
             upload(&device, &queue, &mut self.instances, "JKA neon menu glyphs",
@@ -574,7 +574,7 @@ impl NeonMenu {
                     ],
                 }));
             }
-            self.built_for = Some((layout, width, height, letterforms));
+            self.built_for = Some((frame.page, layout, width, height, letterforms));
         }
         let mut geometry = Geometry {
             scale: h / 1080.0,
@@ -583,8 +583,9 @@ impl NeonMenu {
             sill: h * 0.93,
             width: w,
             monitor,
+            entry_count: entries.len(),
         };
-        for (index, info) in ITEMS.iter().enumerate() {
+        for (index, info) in entries.iter().enumerate() {
             let line = layout.items[index];
             let (x, baseline, cap) = (line.x * w, line.baseline * h, line.cap * h);
             let ink = font::measure(info.label) * cap;
@@ -598,7 +599,7 @@ impl NeonMenu {
         // Per-frame sign state.
         let anim = &self.anim;
         let mut lights = [ItemLight::default(); LIGHTS];
-        for (index, info) in ITEMS.iter().enumerate() {
+        for (index, info) in entries.iter().enumerate() {
             let item = &anim.items[index];
             let [x0, x1] = geometry.ink[index];
             let cap = layout.items[index].cap * h;
@@ -615,29 +616,6 @@ impl NeonMenu {
                 ],
             };
         }
-        let title_cap = layout.title.cap * h;
-        lights[TITLE_LINE] = ItemLight {
-            color: [TITLE_GAS[0], TITLE_GAS[1], TITLE_GAS[2], 0.8],
-            state: [anim.title_level, FULLY_LIT, (title_cap * font::tube_ratio() * 1.15).max(0.9), 0.0],
-            fault: [-1.0, 1.0, 0.0, 0.0],
-        };
-        let saber = saber(&layout, w, h);
-        let blade_len = saber.blade[1][0] - saber.blade[0][0];
-        lights[SABER_BLADE] = ItemLight {
-            color: [0.22, 0.52, 1.0, 0.85],
-            state: [
-                anim.saber_level,
-                if anim.saber_fill >= 1.0 { FULLY_LIT } else { saber.blade[0][0] + (blade_len + saber.blade_tube * 4.0) * anim.saber_fill },
-                saber.blade_tube,
-                0.0,
-            ],
-            fault: [-1.0, 1.0, 0.0, 0.0],
-        };
-        lights[SABER_HILT] = ItemLight {
-            color: [0.72, 0.76, 0.84, 0.8],
-            state: [anim.title_level * 0.6, FULLY_LIT, saber.hilt_tube, 0.0],
-            fault: [-1.0, 1.0, 0.0, 0.0],
-        };
         queue.write_buffer(self.items.as_ref().expect("uploaded with the glyphs"), 0, bytemuck::cast_slice(&lights));
         let time = anim.time;
         queue.write_buffer(&shared.signs_view, 0, bytemuck::bytes_of(&ViewUniform { size: [w, h, 0.0, 0.0], time: [time, 0.0, 0.0, 0.0] }));
@@ -651,15 +629,15 @@ impl NeonMenu {
         let mut hdr_text = Vec::new();
         let mut crt_text = Vec::new();
         if let Some(fonts) = &self.fonts {
-            lightbox_text(&mut hdr_text, fonts, anim, &layout, w, h);
-            monitor_text(&mut crt_text, fonts, anim);
+            lightbox_text(&mut hdr_text, fonts, anim, &layout, entries, w, h);
+            monitor_text(&mut crt_text, fonts, anim, entries);
         }
         upload(&device, &queue, &mut self.text_hdr, "JKA neon menu lightbox quads", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&hdr_text));
         upload(&device, &queue, &mut self.text_crt, "JKA neon menu CRT quads", wgpu::BufferUsages::VERTEX, bytemuck::cast_slice(&crt_text));
         self.text_hdr_count = hdr_text.len() as u32;
         self.text_crt_count = crt_text.len() as u32;
 
-        let reveal = anim.revealed_at.map_or(0.0, |at| ((time - at) / 0.8).clamp(0.0, 1.0));
+        let reveal = anim.revealed_at.map_or(0.0, |at| ((time - at) / crate::neon_menu::REVEAL_SECS).clamp(0.0, 1.0));
         let cache_mix = if self.cached_scene.is_some() {
             1.0 - frame.live_scene_blend.clamp(0.0, 1.0)
         } else {
@@ -685,16 +663,16 @@ impl NeonMenu {
         // (its source is the dry street). The TV patch keeps its drops.
         let rain_active = self.rain.as_ref().is_some_and(RainGlassResources::active);
         window.counts = [
-            ITEM_COUNT as f32 + 1.0,
+            entries.len() as f32 + 1.0,
             anim.drips.len().min(16) as f32,
-            if rain_active { ITEM_COUNT as f32 } else { 0.0 },
+            if rain_active { entries.len() as f32 } else { 0.0 },
             0.0,
         ];
         // Someone wiped a patch to watch the TV; it never fogs over.
         let pad = [(monitor[2] - monitor[0]) * 0.06, (monitor[3] - monitor[1]) * 0.06];
-        window.wipes[ITEM_COUNT * 2] = [monitor[0] - pad[0], monitor[1] - pad[1], monitor[2] + pad[0], monitor[3] + pad[1]];
-        window.wipes[ITEM_COUNT * 2 + 1] = [1.0, 1.0, 0.0, 0.37];
-        for (index, item) in anim.items.iter().enumerate() {
+        window.wipes[entries.len() * 2] = [monitor[0] - pad[0], monitor[1] - pad[1], monitor[2] + pad[0], monitor[3] + pad[1]];
+        window.wipes[entries.len() * 2 + 1] = [1.0, 1.0, 0.0, 0.37];
+        for (index, item) in anim.items.iter().take(entries.len()).enumerate() {
             let wipe = item.wipe;
             // The hand accelerates into the stroke and slows at the end.
             let t = wipe.progress.clamp(0.0, 1.0);
@@ -752,14 +730,14 @@ impl NeonMenu {
             }
         }
         fullscreen(encoder, "JKA neon menu crt-lottes", &p.crt, &shared.crt_group, &targets.crt_out, None);
-        targets.halo.encode(encoder, p);
+        targets.halo.encode(encoder, &p.blur_down, &p.blur_up);
         let rain = self.rain.as_ref().filter(|rain| rain.active());
         let street_target = rain.map_or(&targets.street, |rain| rain.source_view());
         fullscreen(encoder, "JKA neon menu street", &p.outside, &targets.outside_group, street_target, None);
         if let Some(rain) = rain {
             rain.render(encoder, &targets.street);
         }
-        targets.fog.encode(encoder, p);
+        targets.fog.encode(encoder, &p.blur_down, &p.blur_up);
         fullscreen(encoder, "JKA neon menu window", &p.window, &targets.window_group, output, None);
         true
     }
@@ -830,8 +808,8 @@ fn create_targets(
 ) -> Targets {
     let (signs_texture, signs) = target_texture(device, "JKA neon menu signs", [width, height], HDR);
     let (street_texture, street) = target_texture(device, "JKA neon menu street", [width, height], HDR);
-    let halo = Chain::new(device, p, &shared.sampler, &signs, width, height, "JKA neon menu halo");
-    let fog = Chain::new(device, p, &shared.sampler, &street, width, height, "JKA neon menu condensation");
+    let halo = Chain::new(device, &p.blur_layout, &shared.sampler, &signs, width, height, "JKA neon menu halo");
+    let fog = Chain::new(device, &p.blur_layout, &shared.sampler, &street, width, height, "JKA neon menu condensation");
     let (crt_texture, crt_out) = target_texture(device, "JKA neon menu CRT", monitor, CRT_FORMAT);
     fn tex(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
         wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }
@@ -896,15 +874,15 @@ fn screen_to_quad(corners: &[[f32; 2]; 4]) -> [[f32; 3]; 3] {
 
 /// The lightsaber under the title, all neon: a bent-tube hilt outline and one
 /// blade tube. Hilt to tip spans exactly the title's ink width.
-struct Saber {
-    hilt: Vec<[[f32; 2]; 2]>,
-    blade: [[f32; 2]; 2],
-    hilt_tube: f32,
-    blade_tube: f32,
+pub(super) struct Saber {
+    pub(super) hilt: Vec<[[f32; 2]; 2]>,
+    pub(super) blade: [[f32; 2]; 2],
+    pub(super) hilt_tube: f32,
+    pub(super) blade_tube: f32,
 }
 
-fn saber(layout: &crate::neon_menu::layout::MenuLayout, w: f32, h: f32) -> Saber {
-    let title = layout.title;
+/// Original main-menu saber geometry, now attached to the footer brand.
+pub(super) fn saber(title: crate::neon_menu::layout::TextLine, w: f32, h: f32) -> Saber {
     let (x0, baseline, cap) = (title.x * w, title.baseline * h, title.cap * h);
     let x1 = x0 + font::measure(TITLE) * cap;
     let y = baseline + 0.75 * cap;
@@ -930,14 +908,13 @@ fn saber(layout: &crate::neon_menu::layout::MenuLayout, w: f32, h: f32) -> Saber
 
 /// Tube centre lines in pixels, two vec4 per primitive, and one instance per
 /// glyph. Font space is +y up; the screen is +y down, so arcs flip direction.
-fn build_glyphs(layout: &crate::neon_menu::layout::MenuLayout, w: f32, h: f32) -> (Vec<[f32; 4]>, Vec<GlyphInstance>) {
+fn build_glyphs(layout: &crate::neon_menu::layout::MenuLayout, entries: &[ItemInfo], w: f32, h: f32) -> (Vec<[f32; 4]>, Vec<GlyphInstance>) {
     let mut prims = Vec::new();
     let mut instances = Vec::new();
-    let lines = ITEMS.iter().enumerate().map(|(i, info)| (i, info.label, layout.items[i]))
-        .chain(std::iter::once((TITLE_LINE, TITLE, layout.title)));
+    let lines = entries.iter().enumerate().map(|(i, info)| (i, info.label, layout.items[i]));
     for (line_index, label, line) in lines {
         let (ox, baseline, cap) = (line.x * w, line.baseline * h, line.cap * h);
-        let tube = (cap * font::tube_ratio() * if line_index == TITLE_LINE { 1.15 } else { 1.0 }).max(0.9);
+        let tube = (cap * font::tube_ratio()).max(0.9);
         let margin = tube * 7.0 + 2.0;
         for (glyph_index, placed) in font::place(label).iter().enumerate() {
             let start = (prims.len() / 2) as u32;
@@ -973,30 +950,11 @@ fn build_glyphs(layout: &crate::neon_menu::layout::MenuLayout, w: f32, h: f32) -
             });
         }
     }
-    let saber = saber(layout, w, h);
-    for (line_index, lines, tube) in [
-        (SABER_HILT, saber.hilt.clone(), saber.hilt_tube),
-        (SABER_BLADE, vec![saber.blade], saber.blade_tube),
-    ] {
-        let start = (prims.len() / 2) as u32;
-        let margin = tube * 7.0 + 2.0;
-        let mut bounds = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-        for [a, b] in &lines {
-            prims.push([0.0, a[0], a[1], b[0]]);
-            prims.push([b[1], 0.0, 0.0, 0.0]);
-            bounds = [bounds[0].min(a[0].min(b[0])), bounds[1].min(a[1].min(b[1])),
-                bounds[2].max(a[0].max(b[0])), bounds[3].max(a[1].max(b[1]))];
-        }
-        instances.push(GlyphInstance {
-            rect: [bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin],
-            range: [start, lines.len() as u32, line_index as u32, 0],
-        });
-    }
     (prims, instances)
 }
 
 /// The vertical backlit sign: the selected entry's name in Aurebesh.
-fn lightbox_text(out: &mut Vec<text::TextVertex>, fonts: &Fonts, anim: &Anim, layout: &crate::neon_menu::layout::MenuLayout, w: f32, h: f32) {
+fn lightbox_text(out: &mut Vec<text::TextVertex>, fonts: &Fonts, anim: &Anim, layout: &crate::neon_menu::layout::MenuLayout, entries: &[ItemInfo], w: f32, h: f32) {
     let r = [layout.lightbox[0] * w, layout.lightbox[1] * h, layout.lightbox[2] * w, layout.lightbox[3] * h];
     if r[2] - r[0] < 4.0 {
         return;
@@ -1009,21 +967,21 @@ fn lightbox_text(out: &mut Vec<text::TextVertex>, fonts: &Fonts, anim: &Anim, la
     let glow = 0.04 + 0.62 * power;
     text::quad(out, r, [0.0, 0.0, 1.0, 1.0], [face[0] * glow, face[1] * glow, face[2] * glow, 1.0], [text::PANEL, size[0], size[1], 0.0]);
     let ink = 0.02 + 0.2 * power;
-    let label = ITEMS[anim.lightbox_item].label;
+    let label = entries[anim.lightbox_item.min(entries.len() - 1)].label;
     text::vertical(out, &fonts.aurebesh, label, (r[0] + r[2]) * 0.5, r[1] + size[0] * 0.45, r[3] - size[0] * 0.45,
         size[0] * 0.56, [ink, ink * 0.04, ink * 0.10, 1.0]);
 }
 
 /// The CRT's 320x240 picture: channel bug, the entry name, its description
 /// typed out, and an Aurebesh ticker.
-fn monitor_text(out: &mut Vec<text::TextVertex>, fonts: &Fonts, anim: &Anim) {
+fn monitor_text(out: &mut Vec<text::TextVertex>, fonts: &Fonts, anim: &Anim, entries: &[ItemInfo]) {
     let power = anim.monitor_power;
     if power <= 0.0 {
         return;
     }
     let time = anim.time;
     let index = anim.selected;
-    let info = &ITEMS[index];
+    let info = &entries[index.min(entries.len() - 1)];
     let c = gas(info.group);
     let k = power;
     let dim = [0.20 * k, 0.55 * k, 0.62 * k, 1.0];
@@ -1082,8 +1040,9 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn set_neon_menu(&mut self, frame: Option<MenuFrame>) {
-        if frame.is_none() {
-            // Leaving the page: next visit replays the power-on.
+        if frame.as_ref().map(|f| f.page) != self.neon_menu.frame.as_ref().map(|f| f.page) {
+            // Different pages re-ignite their real tubes and reset the TV
+            // selection, instead of carrying over Main's active sign.
             self.neon_menu.anim = Anim::default();
             self.neon_menu.last_tick = None;
         }
@@ -1168,23 +1127,46 @@ mod tests {
 
     #[test]
     fn saber_stays_within_the_title() {
-        let layout = crate::neon_menu::layout::compute(1920.0, 1080.0).expect("layout");
-        let s = saber(&layout, 1920.0, 1080.0);
-        let x0 = layout.title.x * 1920.0;
-        let x1 = x0 + font::measure(TITLE) * layout.title.cap * 1080.0;
+        // Test the very same saber against a footer-sized title.
+        let title = crate::neon_menu::footer::compute(1920.0, 1080.0, false).unwrap().brand;
+        let s = saber(title, 1920.0, 1080.0);
+        let x0 = title.x * 1920.0;
+        let x1 = x0 + font::measure(TITLE) * title.cap * 1080.0;
         let left = s.hilt.iter().flat_map(|l| [l[0][0], l[1][0]]).fold(f32::MAX, f32::min) - s.hilt_tube;
         assert!(left >= x0 - 0.01 && s.blade[1][0] + s.blade_tube <= x1 + 0.01);
     }
 
     #[test]
-    fn every_label_produces_tubes() {
+    fn main_page_only_builds_menu_items() {
         let layout = crate::neon_menu::layout::compute(1920.0, 1080.0).expect("layout");
-        let (prims, instances) = build_glyphs(&layout, 1920.0, 1080.0);
-        assert!(!instances.is_empty());
+        let (prims, instances) = build_glyphs(&layout, crate::neon_menu::MenuPage::Main.entries(), 1920.0, 1080.0);
+        assert_eq!(instances.len(), crate::neon_menu::MenuPage::Main.entries().iter().map(|item| font::place(item.label).len()).sum::<usize>());
         for instance in &instances {
             let end = (instance.range[0] + instance.range[1]) as usize * 2;
             assert!(end <= prims.len());
             assert!(instance.rect[0] < instance.rect[2] && instance.rect[1] < instance.rect[3]);
         }
+    }
+}
+
+impl Renderer {
+    pub(in crate::renderer) fn neon_chrome_wanted(&self) -> bool {
+        self.neon_menu.chrome.wanted()
+    }
+
+    pub(in crate::renderer) fn set_neon_chrome(&mut self, frame: Option<crate::neon_menu::ChromeFrame>) {
+        self.neon_menu.chrome.set(frame);
+    }
+
+    /// Draw custom frontend signage before egui. The input layer and the GPU
+    /// use the same Taffy positions; neither depends on a stock egui footer.
+    pub(in crate::renderer) fn encode_neon_chrome(&mut self, encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView, format: wgpu::TextureFormat, clear: bool) -> bool {
+        if !self.neon_menu.chrome.wanted() { return false; }
+        let mut chrome = std::mem::take(&mut self.neon_menu.chrome);
+        chrome.prepare(self, format);
+        let rendered = chrome.encode(encoder,view,clear);
+        self.neon_menu.chrome = chrome;
+        rendered
     }
 }

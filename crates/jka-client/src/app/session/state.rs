@@ -103,13 +103,30 @@ impl GameSession {
             None
         } else {
             match build_demo_index(&demo_bytes) {
-                Ok(index) => Some(index),
+                Ok(index) => Some(Arc::new(index)),
                 Err(error) => {
                     eprintln!("DEMO INDEX WARNING: {error}");
                     None
                 }
             }
         };
+        Self::new_with_recording(qpath, source, demo_bytes, demo_index, siege_catalog,
+            siege_classes, player_presenter, entity_presenter, weapon_fx, forced_player_models)
+    }
+
+    /// A second Studio view borrows the same immutable recording and index.
+    pub(in crate::app) fn new_with_recording(
+        qpath: String,
+        source: String,
+        demo_bytes: Arc<[u8]>,
+        demo_index: Option<Arc<crate::app::DemoIndex>>,
+        siege_catalog: jka_assets::siege::SiegeCatalog,
+        siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
+        player_presenter: PlayerPresenter,
+        entity_presenter: EntityPresenter,
+        weapon_fx: crate::cgame::weapon_fx::WeaponFx,
+        forced_player_models: Option<ForcedPlayerModels>,
+    ) -> Self {
         Self {
             live: false,
             local: false,
@@ -174,6 +191,8 @@ impl GameSession {
             race_stats: crate::japro_cg::RaceStats::default(),
             race_timer_ui: None,
             race_ghosts: Vec::new(),
+            studio_external_player_entities: Vec::new(),
+            studio_visible_players: None,
             race_ghost_alpha: 0.35,
             race_ghost_live_sample: None,
             lagometer: crate::lagometer::Lagometer::default(),

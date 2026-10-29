@@ -19,36 +19,68 @@ pub(in crate::ui) const CONSOLE_CHAR_HEIGHT: f32 = 16.0;
 /// Top of the first log row, just under the header band.
 pub(in crate::ui) const CONSOLE_FIRST_Y: f32 = 52.0;
 
-pub fn console_visible_line_capacity(h: u32, size: ConsoleSize) -> usize {
-    let ph = console_panel_height(h, size);
-    let input_y = ph - 34.0;
-    let line_step = CONSOLE_CHAR_HEIGHT;
-    let first_y = CONSOLE_FIRST_Y;
-    (((input_y - first_y - 8.0) / line_step).floor().max(0.0)) as usize
+/// TaystJK `Con_CheckResize`: derive actual glyph dimensions from con_scale.
+/// Keep at least 20 characters readable even at the largest settings.
+pub(in crate::ui) fn console_char_metrics(w: u32, scale: f32) -> (f32, f32) {
+    let scale = if scale.is_finite() { scale.clamp(0.2, 10.0) } else { 1.0 };
+    let char_width = (CONSOLE_CHAR_WIDTH * scale).floor().max(1.0);
+    let char_width = char_width.min((w as f32 / 22.0).floor().max(1.0));
+    (char_width, char_width / CONSOLE_CHAR_WIDTH * CONSOLE_CHAR_HEIGHT)
+}
+
+/// Number of drawable console characters per row. Use the actual log text
+/// viewport (20px left inset, 8px right margin), with TaystJK-style font metrics.
+pub fn console_wrap_columns(w: u32, scale: f32) -> usize {
+    let (char_width, _) = console_char_metrics(w, scale);
+    ((w.saturating_sub(28) as f32 / char_width).floor() as usize).max(1)
+}
+
+fn console_input_y(w: u32, h: u32, size: ConsoleSize, scale: f32) -> f32 {
+    let (_, char_height) = console_char_metrics(w, scale);
+    console_panel_height(h, size) - char_height - 18.0
+}
+
+pub fn console_visible_line_capacity(w: u32, h: u32, size: ConsoleSize, scale: f32) -> usize {
+    let input_y = console_input_y(w, h, size, scale);
+    let (_, line_step) = console_char_metrics(w, scale);
+    (((input_y - CONSOLE_FIRST_Y - 8.0) / line_step).floor().max(0.0)) as usize
 }
 
 pub fn console_text_hit(
     w: u32,
     h: u32,
     size: ConsoleSize,
+    scale: f32,
     x: f64,
     y: f64,
 ) -> Option<(usize, usize)> {
-    let ph = console_panel_height(h, size);
-    let input_y = ph - 34.0;
-    let line_step = CONSOLE_CHAR_HEIGHT as f64;
+    let input_y = console_input_y(w, h, size, scale);
+    let (char_width, line_step) = console_char_metrics(w, scale);
     let first_y = CONSOLE_FIRST_Y as f64;
-    let max_lines = console_visible_line_capacity(h, size);
+    let max_lines = console_visible_line_capacity(w, h, size, scale);
     if x < 20.0 || x > w as f64 - 8.0 || y < first_y || y >= input_y as f64 - 8.0 {
         return None;
     }
-    let row = ((y - first_y) / line_step).floor() as usize;
+    let row = ((y - first_y) / line_step as f64).floor() as usize;
     if row >= max_lines {
         return None;
     }
-    let char_width = CONSOLE_CHAR_WIDTH as f64;
-    let col = ((x - 20.0) / char_width).max(0.0).round() as usize;
+    let col = ((x - 20.0) / char_width as f64).max(0.0).round() as usize;
     Some((row, col))
+}
+
+/// Same mono-grid placement as `console_plain`, using the con_scale dimensions.
+#[allow(clippy::too_many_arguments)]
+fn console_plain_sized(
+    out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
+    char_width: f32, char_height: f32, color: [f32; 4], width: u32, height: u32,
+) {
+    for (index, byte) in value.bytes().enumerate() {
+        if byte != b' ' {
+            glyph_quad_sized(out, byte, x + index as f32 * char_width, y,
+                             char_width, char_height, color, width, height);
+        }
+    }
 }
 
 pub(in crate::ui) fn visible_text_len(value: &str) -> usize {
@@ -245,9 +277,10 @@ pub(in crate::ui) fn console_line_tone(
     use crate::logging::ConsoleLineKind;
     match kind {
         ConsoleLineKind::Normal => None,
-        ConsoleLineKind::CommandEcho => Some(CON_AMBER),
+        ConsoleLineKind::CommandEcho | ConsoleLineKind::TeamChatCommandEcho => Some(CON_AMBER),
         ConsoleLineKind::Error => Some(CON_MAGENTA),
-        ConsoleLineKind::NotifyMention => Some(CON_CYAN),
+        ConsoleLineKind::NotifyMention | ConsoleLineKind::TeamChatMention => Some(CON_CYAN),
+        ConsoleLineKind::TeamChat => None,
         ConsoleLineKind::NotifyConnect => Some([0.96, 0.84, 0.30, 1.0]),
         ConsoleLineKind::NotifyVote => Some([1.0, 0.56, 0.20, 1.0]),
     }
@@ -303,6 +336,7 @@ pub fn console_suggest_geometry(
     w: u32,
     h: u32,
     size: ConsoleSize,
+    scale: f32,
     count: usize,
     selected: usize,
     detail_lines: usize,
@@ -315,7 +349,7 @@ pub fn console_suggest_geometry(
     let visible = count.clamp(1, SUGGEST_MAX_ROWS.min(max_rows_fit));
     let total_h = SUGGEST_PAD + visible as f32 * SUGGEST_ROW_H + detail_h + SUGGEST_FOOTER_H;
     let ph = console_panel_height(h, size);
-    let input_y = ph - 34.0;
+    let input_y = console_input_y(w, h, size, scale);
     // Hang below the panel like a drop-down when there is room, otherwise
     // (full-height console) float just above the input line.
     let below = h as f32 - ph >= total_h + 12.0;
@@ -344,6 +378,7 @@ pub fn console_suggest_hit(
     w: u32,
     h: u32,
     size: ConsoleSize,
+    scale: f32,
     count: usize,
     selected: usize,
     detail_lines: usize,
@@ -353,7 +388,7 @@ pub fn console_suggest_hit(
     if count == 0 {
         return None;
     }
-    let g = console_suggest_geometry(w, h, size, count, selected, detail_lines);
+    let g = console_suggest_geometry(w, h, size, scale, count, selected, detail_lines);
     let rows_y = (g.y + SUGGEST_PAD) as f64;
     if x < g.x as f64 || x >= (g.x + g.w) as f64 || y < rows_y {
         return None;
@@ -365,8 +400,8 @@ pub fn console_suggest_hit(
 pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let ph = console_panel_height(h, ui.console_size);
     let wf = w as f32;
-    let input_y = ph - 34.0;
-    let line_step = CONSOLE_CHAR_HEIGHT;
+    let input_y = console_input_y(w, h, ui.console_size, ui.console_scale);
+    let (char_width, line_step) = console_char_metrics(w, ui.console_scale);
     let first_y = CONSOLE_FIRST_Y;
 
     // Body: indigo asphalt, a touch lighter toward the input so the eye lands there.
@@ -583,7 +618,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
     }
 
     // Log.
-    let max_lines = (((input_y - first_y - 8.0) / line_step).floor().max(0.0)) as usize;
+    let max_lines = console_visible_line_capacity(w, h, ui.console_size, ui.console_scale);
     let history_end = ui.console_lines.len().saturating_sub(ui.console_scroll);
     let history_start = history_end.saturating_sub(max_lines);
     let mut line_y = first_y;
@@ -625,14 +660,12 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                 .iter()
                 .filter(|hit| hit.line == absolute_line)
             {
-                let active = ui
-                    .console_search_active
-                    .is_some_and(|active| active == *hit);
+                let active = ui.console_search_active_spans.contains(hit);
                 rect(
                     out,
-                    20.0 + hit.start_col as f32 * CONSOLE_CHAR_WIDTH,
+                    20.0 + hit.start_col as f32 * char_width,
                     line_y - 2.0,
-                    (hit.end_col - hit.start_col) as f32 * CONSOLE_CHAR_WIDTH,
+                    (hit.end_col - hit.start_col) as f32 * char_width,
                     line_step,
                     if active {
                         [0.95, 0.62, 0.10, 0.88]
@@ -676,7 +709,6 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                     visible_len
                 };
                 if right_col > left_col {
-                    let char_width = CONSOLE_CHAR_WIDTH;
                     rect(
                         out,
                         20.0 + left_col as f32 * char_width,
@@ -690,7 +722,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                 }
             }
         }
-        console_text(out, line, 20.0, line_y, CON_TEXT, w, h);
+        super::text::console_text_sized(out, line, 20.0, line_y, char_width, line_step, CON_TEXT, w, h);
 
         // Trusted engine-authored local paths get conventional hyperlink
         // treatment. Draw this *after* the normal colored console text so a
@@ -712,20 +744,15 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                     .skip(link.start_col)
                     .take(link.end_col - link.start_col)
                     .collect();
-                console_plain(
-                    out,
-                    &linked_text,
-                    20.0 + link.start_col as f32 * CONSOLE_CHAR_WIDTH,
-                    line_y,
-                    CON_CYAN,
-                    w,
-                    h,
+                console_plain_sized(
+                    out, &linked_text, 20.0 + link.start_col as f32 * char_width,
+                    line_y, char_width, line_step, CON_CYAN, w, h,
                 );
                 rect(
                     out,
-                    20.0 + link.start_col as f32 * CONSOLE_CHAR_WIDTH,
-                    line_y + CONSOLE_CHAR_HEIGHT - 2.0,
-                    (link.end_col - link.start_col) as f32 * CONSOLE_CHAR_WIDTH,
+                    20.0 + link.start_col as f32 * char_width,
+                    line_y + line_step - 2.0,
+                    (link.end_col - link.start_col) as f32 * char_width,
                     1.0,
                     with_alpha(CON_CYAN, 0.95),
                     w,
@@ -736,7 +763,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         line_y += line_step;
     }
     if ui.console_lines.is_empty() && !ui.console_status.is_empty() {
-        console_plain(out, "NO OUTPUT YET", 20.0, first_y, CON_FAINT, w, h);
+        console_plain_sized(out, "NO OUTPUT YET", 20.0, first_y, char_width, line_step, CON_FAINT, w, h);
     }
 
     // Scroll position: a thin rail on the right plus a "newer output below" pill.
@@ -818,8 +845,8 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         h,
     );
     rect(out, 0.0, bar_y, wf, 1.0, with_alpha(CON_CYAN, 0.18), w, h);
-    console_plain(out, ">", 20.0, input_y, CON_AMBER, w, h);
-    let text_x = 38.0;
+    console_plain_sized(out, ">", 20.0, input_y, char_width, line_step, CON_AMBER, w, h);
+    let text_x = 30.0 + char_width;
     let cursor = ui.console_cursor.min(ui.console_input.len());
     let cursor = if ui.console_input.is_char_boundary(cursor) {
         cursor
@@ -827,17 +854,14 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         ui.console_input.len()
     };
     if ui.console_input.is_empty() {
-        console_plain(
-            out,
-            "type a command or cvar",
-            text_x + 6.0,
-            input_y,
-            CON_FAINT,
-            w,
-            h,
+        console_plain_sized(
+            out, "type a command or cvar", text_x + 6.0, input_y,
+            char_width, line_step, CON_FAINT, w, h,
         );
     } else {
-        console_text(out, &ui.console_input, text_x, input_y, CON_BRIGHT, w, h);
+        super::text::console_text_sized(
+            out, &ui.console_input, text_x, input_y, char_width, line_step, CON_BRIGHT, w, h,
+        );
         // Ghost completion: the rest of the highlighted suggestion, dimmed.
         if !ui.console_suggest_hint && cursor == ui.console_input.len() {
             let typed = ui.console_input.trim_start();
@@ -856,28 +880,23 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                             .eq_ignore_ascii_case(fragment.as_bytes())
                 }) {
                     let end_x =
-                        text_x + visible_text_len(&ui.console_input) as f32 * CONSOLE_CHAR_WIDTH;
-                    console_plain(
-                        out,
-                        &name[fragment.len()..],
-                        end_x,
-                        input_y,
-                        with_alpha(CON_CYAN, 0.42),
-                        w,
-                        h,
+                        text_x + visible_text_len(&ui.console_input) as f32 * char_width;
+                    console_plain_sized(
+                        out, &name[fragment.len()..], end_x, input_y,
+                        char_width, line_step, with_alpha(CON_CYAN, 0.42), w, h,
                     );
                 }
             }
         }
     }
     let caret_x =
-        text_x + visible_text_len(&ui.console_input[..cursor]) as f32 * CONSOLE_CHAR_WIDTH;
+        text_x + visible_text_len(&ui.console_input[..cursor]) as f32 * char_width;
     rect(
         out,
         caret_x,
         input_y - 1.0,
         2.0,
-        CONSOLE_CHAR_HEIGHT + 2.0,
+        line_step + 2.0,
         CON_AMBER,
         w,
         h,
@@ -995,7 +1014,7 @@ pub(in crate::ui) fn build_console_suggestions(
         .get(selected)
         .map_or("", |item| item.description);
     let detail_lines = console_suggest_detail_line_count(w, h, description);
-    let g = console_suggest_geometry(w, h, ui.console_size, count, selected, detail_lines);
+    let g = console_suggest_geometry(w, h, ui.console_size, ui.console_scale, count, selected, detail_lines);
     let (x, y, pw) = (g.x, g.y, g.w);
     let inner_chars = ((pw - 28.0) / CONSOLE_CHAR_WIDTH) as usize;
 
@@ -1224,5 +1243,39 @@ pub(in crate::ui) fn build_console_suggestions(
             w,
             h,
         );
+    }
+}
+
+#[cfg(test)]
+mod con_scale_tests {
+    use super::*;
+
+    #[test]
+    fn console_scale_changes_rows_and_hit_columns_together() {
+        let w = 1920;
+        let h = 1080;
+        let normal = console_visible_line_capacity(w, h, ConsoleSize::Normal, 1.0);
+        let large = console_visible_line_capacity(w, h, ConsoleSize::Normal, 2.0);
+        let small = console_visible_line_capacity(w, h, ConsoleSize::Normal, 0.5);
+        assert!(small > normal && normal > large);
+        let first = console_text_hit(w, h, ConsoleSize::Normal, 2.0, 52.0, 53.0);
+        assert_eq!(first, Some((0, 2))); // (52 - log origin 20) / (8 * 2)
+        assert!(console_text_hit(w, h, ConsoleSize::Normal, 2.0, 52.0, 53.0 + 32.0)
+            .is_some());
+    }
+
+    #[test]
+    fn console_wrap_columns_follow_taystjk_width() {
+        assert_eq!(console_wrap_columns(800, 1.0), 96);
+        assert_eq!(console_wrap_columns(800, 2.0), 48);
+        assert_eq!(console_wrap_columns(440, 10.0), 20);
+    }
+
+    #[test]
+    fn console_scale_caps_glyph_width_for_narrow_windows() {
+        let (width, height) = console_char_metrics(440, 10.0);
+        assert_eq!(width, 20.0);
+        assert_eq!(height, 40.0);
+        assert_eq!(console_char_metrics(1920, 1.0), (8.0, 16.0));
     }
 }

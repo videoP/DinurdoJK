@@ -1,0 +1,170 @@
+{
+  "sources": [
+    {
+      "path": "Engine/Plugins/Experimental/WaterAdvanced/Source/WaterAdvanced/Private/ShallowWaterRiverActor.cpp",
+      "sha256": "e413ba4cf55f7d51e4ed18aece852d28a42792a3166bb8c5489d5031d7df30b2",
+      "contracts": [
+        {
+          "text": "SourceSize = 1000",
+          "character_offset": 1777
+        },
+        {
+          "text": "SystemPos = CombinedBounds.Origin - FVector(0, 0, CombinedBounds.BoxExtent.Z)",
+          "character_offset": 13472
+        },
+        {
+          "text": "float Overshoot = 1000.f",
+          "character_offset": 20276
+        },
+        {
+          "text": "float FinalSourceHeight = 2. * CombinedBounds.BoxExtent.Z + Overshoot",
+          "character_offset": 20303
+        },
+        {
+          "text": "float SinkBoxHeight = 100000",
+          "character_offset": 22944
+        },
+        {
+          "text": "FVector BaseVector = {0,1,0}",
+          "character_offset": 21258
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Core/Public/Math/Vector.h",
+      "sha256": "af7ba43ca35bab89a04f0fdd69e3d8b4a484e4435ca728b50d6e113e2015478e",
+      "contracts": [
+        {
+          "text": "bool Normalize(T Tolerance=UE_SMALL_NUMBER)",
+          "character_offset": 18158
+        },
+        {
+          "text": "if(SquareSum > Tolerance)",
+          "character_offset": 56146
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Shaders/Private/WaterInfoMerge.usf",
+      "sha256": "20ceb811450de8dc335425658329b35a0f0bea2a5ccd989d754577006d15db2b",
+      "contracts": [
+        {
+          "text": "WaterZ + 128.0f < GroundZ",
+          "character_offset": 2728
+        },
+        {
+          "text": "DilatedZ = GroundZ - UndergroundDilationDepthOffset",
+          "character_offset": 3224
+        },
+        {
+          "text": "bool bPixelHasValidWaterData = WaterZ >= WaterZMin",
+          "character_offset": 2509
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Shaders/Private/WaterInfoFinalize.usf",
+      "sha256": "a6fdc793d72be45fd936e8bdacdede21378cbe43d9beccdb241654a58642a578",
+      "contracts": [
+        {
+          "text": "if (WaterZ > GroundZ)",
+          "character_offset": 1186
+        },
+        {
+          "text": "WaterInfoTexture.Load(int3(CurrentTextureCoordinates, 0))",
+          "character_offset": 934
+        },
+        {
+          "text": "Accum.xy /= Neighbors",
+          "character_offset": 1306
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Shaders/Private/WaterDataFunctions.ush",
+      "sha256": "7a570533dd0af1f24faa3d8a9f4f875ca5736256152e2008a6cd69748afb4130",
+      "contracts": [
+        {
+          "text": "if (WaterZNormalized <= 0.0)",
+          "character_offset": 6033
+        },
+        {
+          "text": "DecodeWaterInfoGroundHeight(WaterInfoSample, WaterZoneIndex) - 256.0",
+          "character_offset": 6076
+        },
+        {
+          "text": "return (NormalizedFlow - 0.5) * 2.0 * MaxVelocity",
+          "character_offset": 6297
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Private/WaterInfoRendering.cpp",
+      "sha256": "25e5de8fd3cfcb27d85789743f25df80bfa5952c45ba3476c65208f9d8cba9c9",
+      "contracts": [
+        {
+          "text": "FMath::Clamp(Context.ZoneToRender->GetVelocityBlurRadius(), 0, 16)",
+          "character_offset": 14876
+        },
+        {
+          "text": "WaterInfoRenderTarget->GetRenderTargetTexture()->GetDesc().Format",
+          "character_offset": 20556
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Public/WaterZoneActor.h",
+      "sha256": "4288d3b75284709a753e44e0f8d1533326a76b6da5c128bebed91790c3fae72d",
+      "contracts": [
+        {
+          "text": "bool bHalfPrecisionTexture = true",
+          "character_offset": 8572
+        },
+        {
+          "text": "int32 VelocityBlurRadius = 1",
+          "character_offset": 8775
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Engine/Private/TextureRenderTarget2DArray.cpp",
+      "sha256": "e19e771d0b5086ce16998b3195d4c3b32d537f46da8ba95ea9d8ffceadc23ef5",
+      "contracts": [
+        {
+          "text": "AM_Wrap,\n\t\tAM_Wrap,\n\t\tAM_Wrap",
+          "character_offset": 9740
+        }
+      ]
+    },
+    {
+      "path": "Engine/Config/BaseDeviceProfiles.ini",
+      "sha256": "282781854a1b6e636e89ca0a74e1d998c302ddfd8320eaf9ceb0970250a596e4",
+      "contracts": [
+        {
+          "text": "Group=TEXTUREGROUP_RenderTarget",
+          "character_offset": 11835
+        },
+        {
+          "text": "MinMagFilter=aniso,MipFilter=point",
+          "character_offset": 8846
+        }
+      ]
+    }
+  ],
+  "source_size_cm": 1000,
+  "source_height_overshoot_cm": 1000,
+  "sink_height_cm": 100000,
+  "native_origin": "XY bounds centre, minimum Z",
+  "default_half_precision": true,
+  "default_blur_radius": 1,
+  "blur_radius_clamp": [
+    0,
+    16
+  ],
+  "merge_dilation_threshold_cm": 128,
+  "empty_water_below_ground_cm": 256,
+  "water_info_address": "AM_Wrap",
+  "hydraulic_grid_address": "AM_Clamp",
+  "explicit_lod_sampling_spec": "https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#Inst_SAMPLE_L",
+  "caveat": "Pinned native source contracts, not general C++ evaluation, arbitrary device-profile expansion, a WaterBody mesh producer or runtime Unreal parity."
+}

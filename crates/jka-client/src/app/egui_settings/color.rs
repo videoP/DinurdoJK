@@ -11,7 +11,7 @@ impl App {
         theme::row(
             ui,
             "Brightness method",
-            "Shader corrects the finished game image. Baked textures avoids the brightness pass but changes material colors before lighting and uses extra RAM. Hardware corrects the monitor output without a game brightness pass; supports Windows SDR displays and restores desktop brightness on focus loss, exit and crashes.",
+            "Shader corrects the finished game image. Baked textures avoids the brightness pass but changes material colors before lighting and uses extra RAM. Hardware changes the Windows SDR display ramp (including menus, HUD and desktop). Hardware (scene only) keeps the fast hardware ramp and counter-adjusts the UI; it adds an overlay composite pass only while an egui menu is visible. Both restore desktop brightness on focus loss and exit.",
             theme::Reset::Color("r_gammaMethod"),
             |ui| {
                 egui::ComboBox::from_id_salt("gamma_method")
@@ -19,7 +19,7 @@ impl App {
                     .width(230.0)
                     .show_ui(ui, |ui| {
                         for method in crate::gamma::GammaMethod::ALL {
-                            if ui.add_enabled(!self.native_hdr_blocks_hardware_gamma() || method != crate::gamma::GammaMethod::Hardware, egui::Button::selectable(self.video.gamma_method == method, method.label())).clicked() {
+                            if ui.add_enabled(!self.native_hdr_blocks_hardware_gamma() || !method.is_hardware(), egui::Button::selectable(self.video.gamma_method == method, method.label())).clicked() {
                                 self.set_gamma_method(method);
                             }
                         }

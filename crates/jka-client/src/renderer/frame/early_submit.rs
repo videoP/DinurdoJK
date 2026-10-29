@@ -67,7 +67,8 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -81,7 +82,7 @@ impl Renderer {
     }
 
     /// Copy the submitted offscreen frame into the acquired swapchain image.
-    pub(in crate::renderer) fn submit_early_present_copy(&self, frame: &wgpu::SurfaceTexture) {
+    pub(in crate::renderer) fn submit_early_present_copy(&self, frame: &super::super::context::RenderFrame) {
         let target = self
             .early_present_target
             .as_ref()
@@ -102,6 +103,88 @@ impl Renderer {
             size,
         );
         self.queue.submit([encoder.finish()]);
+    }
+
+    /// Present only the embedded world rectangle. The demo world and its post
+    /// processing are rendered to an offscreen texture, never the swapchain.
+    /// Clear the editor backing surface first, then GPU-copy the live POV region;
+    /// egui will paint its chrome, timeline and inspector over the clean result.
+    /// Unlike an egui masking trick, no world pixels exist under those panels.
+    /// Editor-owned swapchain clear. It must run even before egui has supplied
+    /// a nonzero preview rect, or the acquired surface can display an old frame.
+    pub(in crate::renderer) fn submit_studio_editor_clear(&self, view:&wgpu::TextureView) {
+        let mut encoder=self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label:Some("Render Studio neutral editor clear"),
+        });
+        {
+            let _clear=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label:Some("Studio neutral editor backing"),
+                color_attachments:&[Some(wgpu::RenderPassColorAttachment {
+                    view,depth_slice:None,resolve_target:None,
+                    ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color {
+                        r:0.039,g:0.063,b:0.098,a:1.0}),store:wgpu::StoreOp::Store},
+                })],
+                depth_stencil_attachment:None,timestamp_writes:None,
+                occlusion_query_set:None,multiview_mask:None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    pub(in crate::renderer) fn submit_studio_world_composite(
+        &mut self,
+        frame: &super::super::context::RenderFrame,
+        viewport: [u32; 4],
+    ) {
+        let frame_view=self.surface_texture_view(frame);
+        let mut encoder=self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label:Some("Render Studio world viewport composite"),
+        });
+        // Clear even with an unknown (zero) editor rect on the first frame.
+        // Keep the clear + texture copy in ONE submit, preserving low latency.
+        {
+            let _clear=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label:Some("Studio neutral editor backing"),
+                color_attachments:&[Some(wgpu::RenderPassColorAttachment {
+                    view:&frame_view,depth_slice:None,resolve_target:None,
+                    ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color {
+                        r:0.039,g:0.063,b:0.098,a:1.0}),store:wgpu::StoreOp::Store},
+                })],
+                depth_stencil_attachment:None,timestamp_writes:None,
+                occlusion_query_set:None,multiview_mask:None,
+            });
+        }
+        let source=self.early_present_target.as_ref().map(|t|&t.texture);
+        if let Some(source)=source {
+            let size=source.size();
+            if frame.texture.size()==size {
+                if let Some([x,y,w,h])=Self::clamped_studio_composite_rect(viewport,size.width,size.height) {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture:source,mip_level:0,
+                            origin:wgpu::Origin3d {x,y,z:0},aspect:wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture:&frame.texture,mip_level:0,
+                            origin:wgpu::Origin3d {x,y,z:0},aspect:wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {width:w,height:h,depth_or_array_layers:1},
+                    );
+                }
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    pub(in crate::renderer) fn clamped_studio_composite_rect(
+        viewport: [u32;4], width:u32,height:u32
+    ) -> Option<[u32;4]> {
+        let [x,y,w,h]=viewport;
+        let x=x.min(width);
+        let y=y.min(height);
+        let w=w.min(width.saturating_sub(x));
+        let h=h.min(height.saturating_sub(y));
+        (w>0 && h>0).then_some([x,y,w,h])
     }
 
     /// `Surface::get_current_texture()` with the JKA_SURFACE_DIAG scope and the
@@ -170,5 +253,20 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Validation => Err(RenderError::Validation),
         }
+    }
+}
+
+#[cfg(test)]
+mod studio_composite_tests {
+    use super::Renderer;
+
+    #[test]
+    fn studio_copy_never_exceeds_swapchain_bounds() {
+        let clip = Renderer::clamped_studio_composite_rect;
+        assert_eq!(clip([100, 70, 640, 360], 1920, 1080), Some([100,70,640,360]));
+        assert_eq!(clip([1850, 990, 300, 200], 1920, 1080), Some([1850,990,70,90]));
+        assert_eq!(clip([1920, 0, 100, 100], 1920, 1080), None);
+        assert_eq!(clip([0, 0, 0, 360], 1920, 1080), None);
+        assert_eq!(clip([0, 1000, u32::MAX, u32::MAX], 1920, 1080), Some([0,1000,1920,80]));
     }
 }

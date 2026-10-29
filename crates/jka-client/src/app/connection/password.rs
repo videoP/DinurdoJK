@@ -31,7 +31,17 @@ impl App {
             return;
         }
         self.server_password_prompt = None;
-        self.connect_to_server(&prompt.target);
+        // Password-required browser joins should keep their early map hint
+        // after the dialog, too. A direct hostname /connect stays unchanged.
+        let hint = prompt
+            .target
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .and_then(|address| self.browser_map_hint(address));
+        self.connect_to_server_with_hint(
+            &prompt.target,
+            hint.as_ref().map(|(map, game)| (map.as_str(), game.as_str())),
+        );
     }
 
     pub(in crate::app) fn cancel_server_password_prompt(&mut self) {

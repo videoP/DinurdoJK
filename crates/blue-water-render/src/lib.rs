@@ -310,7 +310,7 @@ pub mod camera {
     pub const HORIZON_FAR: f32 = 450_000.0;
     pub const EARTH_CURVATURE: f32 = 1.0 / (2.0 * 6_360_000.0);
     pub fn reversed_perspective(fov: f32, aspect: f32, near: f32, far: f32) -> glam::Mat4 {
-        glam::Mat4::perspective_rh(fov, aspect, far, near)
+        glam::camera::rh::proj::directx::perspective(fov, aspect, far, near)
     }
 }
 /// The preserved camera.wgsl block, including curvature and temporal fields.
@@ -347,7 +347,7 @@ pub struct Camera {
 }
 impl Camera {
     pub fn view(&self) -> glam::Mat4 {
-        glam::Mat4::look_at_rh(self.eye, self.target, glam::Vec3::Y)
+        glam::camera::rh::view::look_at_mat4(self.eye, self.target, glam::Vec3::Y)
     }
     pub fn projection(&self, aspect: f32) -> glam::Mat4 {
         camera::reversed_perspective(self.fov_y_degrees.to_radians(), aspect, self.near, self.far)

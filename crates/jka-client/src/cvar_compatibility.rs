@@ -31,6 +31,7 @@ pub(crate) fn digest(text: &str) -> String {
     // compatibility digest focused on pre-existing behavior; each addition has
     // a dedicated load/archive test below.
     let projected = text
+        .replace(", cloud_quality: 4", "")
         // These fields were added after the frozen Debug layout. Project them
         // out for legacy fixtures; promoted defaults and live A/B setters are
         // checked by the headless runtime test. Ghoul2's intentional default
@@ -39,6 +40,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", md3_geometry_cache: false", "")
         .replace(", md3_geometry_cache: true", "")
         .replace(", static_md3_instances: false", "")
+        .replace(", static_md3_pvs_fallback: true", "")
         .replace(", static_md3_bvh: false, fx_occlusion: 0, md3_occlusion: 0, occlusion_stats: false", "")
         .replace(", surface_sprites_gpu: true, surface_sprites: true", "")
         .replace(", md3_auto_lod: false, md3_lod_debug: false", "")
@@ -87,6 +89,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", baked_sun_removal: 0.0", "")
         .replace(", baked_sun_cache: false", "")
         .replace(", sun_shadow_strength: 0.3", "")
+        .replace(", sun_shadow_strength: 0.6", "")
         .replace(", sun_lighting: false", "")
         .replace(", baked_sun_shadow_map: true", "")
         .replace(", baked_sun_edge_softness: 2.5", "")
@@ -145,7 +148,8 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_sunLighting ")
                     && !line.starts_with("seta r_bakedSunShadowMap ")
                     && !line.starts_with("seta r_rtTaa ") &&
-                !line.starts_with("seta con_notifylines ")
+                !line.starts_with("seta con_scale ")
+                    && !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
                     && !line.starts_with("seta cg_scoreSpectatorGuess ")
                     && !line.starts_with("seta s_steamAudioHrtfInterpolation ")
@@ -169,6 +173,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_jiggleStomachDamping ")
                     && !line.starts_with("seta cl_serverFilters ")
                     // New controls are outside the frozen pre-registry archive.
+                    && !line.starts_with("seta r_blueCloudQuality ")
                     && !line.starts_with("seta r_worldFlares ")
                     && !line.starts_with("seta r_saberFlares ")
                     && !line.starts_with("seta r_md3AutoLod ")
@@ -674,4 +679,26 @@ fn baked_sun_removal_loads_and_archives_without_changing_legacy_fixtures() {
     assert!(saved.contains("seta r_bakedSunCache \"1\""));
     assert!(saved.contains("seta r_sunShadowStrength \"0.850\""));
     assert!(saved.contains("seta r_sunLighting \"1\""));
+}
+
+#[test]
+fn blue_cloud_quality_loads_and_archives_independently_of_sky_and_resolution() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("cloud-quality.cfg");
+    fs::write(&path, "seta r_blueSkyQuality 3\nseta r_blueCloudQuality 1\nseta r_cloudRenderResolution 75\n").unwrap();
+    let video = config::load_video_settings(&path);
+    assert_eq!(video.blue_water_environment.quality(), blue_water_sky::SkyQuality::Ultra);
+    assert_eq!(video.blue_water_environment.cloud_quality(), blue_water_sky::SkyQuality::Medium);
+    assert_eq!(video.cloud_render_resolution, crate::ui::CloudRenderResolution::ThreeQuarter);
+    config::save_video_settings(
+        &path, video, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default(),
+    ).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("seta r_blueCloudQuality \"1\""));
+    let loaded = config::load_video_settings(&path);
+    assert_eq!(loaded.blue_water_environment, video.blue_water_environment);
+    assert_eq!(loaded.cloud_render_resolution, video.cloud_render_resolution);
+    fs::write(&path, "seta r_blueSkyQuality 0\nseta r_blueCloudQuality NaN\n").unwrap();
+    assert_eq!(config::load_video_settings(&path).blue_water_environment.cloud_quality(), blue_water_sky::SkyQuality::Low);
 }

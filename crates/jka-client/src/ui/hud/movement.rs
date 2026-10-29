@@ -5,8 +5,10 @@ use crate::ui::{
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
     MovementKeysSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_IMAGE_NAMES, KEY_ART_SIZE, KEY_ATLAS_COLUMNS, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
-    SHELPER_CGAZ, SHELPER_ORIGINAL, SHELPER_UPDATED, SHELPER_XONOTIC, SHELPER_Q3DF, SHELPER_WARSOW_HUD, SHELPER_COMPONENT_MASK,
+    SHELPER_XONOTIC, SHELPER_Q3DF, SHELPER_WARSOW_HUD, SHELPER_COMPONENT_MASK,
 };
+#[cfg(test)]
+use crate::ui::SHELPER_UPDATED;
 
 /// jaPRO `DF_RaceTimer`: `CG_Text_Paint(x, y, size, ..)` at the configured
 /// 640x480 position, shadowed, for the timer block and the start-speed line.
@@ -24,6 +26,31 @@ pub(in crate::ui) fn speedometer_color(color: [f32; 4]) -> [f32; 4] {
 
 /// jaPRO `cg_speedometer`: text at the 640x480 positions `DF_DrawSpeedometer`
 /// and friends pick, in the same shadowed font as the race timer.
+/// Both native jaPRO text and the Q3DF provider use one saved HUD layout.
+/// Map their actual glyph bounds to the same stock rectangle; this also keeps
+/// switching between providers from jumping to the center of the viewport.
+fn position_speedometer_batch(
+    batch: &mut [UiVertex], ui: &UiSnapshot, w: u32, h: u32,
+    native_font_aspect: bool,
+) {
+    if batch.is_empty() || w == 0 || h == 0 { return; }
+    let ctx = crate::ui::HudRectContext::from_snapshot(ui);
+    let stock = crate::ui::hud_stock_rect(HudElementId::Speedometer, &ctx, w, h);
+    let target_x = (stock.x + stock.width * 0.5) / w as f32 * 2.0 - 1.0;
+    let target_y = 1.0 - (stock.y + stock.height * 0.5) / h as f32 * 2.0;
+    let min_x = batch.iter().map(|v| v.position[0]).fold(f32::INFINITY, f32::min);
+    let max_x = batch.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY, f32::max);
+    let min_y = batch.iter().map(|v| v.position[1]).fold(f32::INFINITY, f32::min);
+    let max_y = batch.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY, f32::max);
+    let center_x = (min_x + max_x) * 0.5;
+    let center_y = (min_y + max_y) * 0.5;
+    let x_aspect = if native_font_aspect { 2.0 * (h as f32 / 480.0) / (w as f32 / 640.0) } else { 1.0 };
+    for v in batch {
+        v.position[0] = target_x + (v.position[0] - center_x) * x_aspect;
+        v.position[1] = target_y + (v.position[1] - center_y);
+    }
+}
+
 pub(in crate::ui) fn build_speedometer(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
@@ -83,19 +110,10 @@ pub(in crate::ui) fn build_speedometer(
             for item in &speedo.rects[rects.clone()] { fill(out, item); }
             for item in &speedo.texts[texts.clone()] { paint(out, item); }
             if *id == HudElementId::Speedometer && out.len() > start {
-                // A component keeps its editor position when its provider is
-                // changed. Center the native font's actual bounds on the same
-                // stock anchor as the Q3DF number before applying saved layout.
-                let batch = &mut out[start..];
-                let min_x = batch.iter().map(|v| v.position[0]).fold(f32::INFINITY,f32::min);
-                let max_x = batch.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY,f32::max);
-                let min_y = batch.iter().map(|v| v.position[1]).fold(f32::INFINITY,f32::min);
-                let max_y = batch.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY,f32::max);
-                let target_y = 1.0-2.0*215.0/480.0;
-                for v in batch {
-                    v.position[0] = (v.position[0] - (min_x+max_x)*0.5) * 2.0 * sy / sx;
-                    v.position[1] = target_y + (v.position[1] - (min_y+max_y)*0.5) * 2.0;
-                }
+                // Keep the fonts square in widescreen and center the drawn
+                // speedometer inside the editor's *configured* 640x480 stock
+                // rectangle rather than forcibly placing it mid-screen.
+                position_speedometer_batch(&mut out[start..], ui, w, h, true);
             }
         });
     }
@@ -170,10 +188,38 @@ pub(crate) const ICON_WEAPON_NO_AMMO_BASE: usize = ICON_WEAPON_BASE + WEAPON_ICO
 pub(crate) const ICON_WEAPON_STAFF: usize = ICON_WEAPON_NO_AMMO_BASE + WEAPON_ICON_NAMES.len();
 pub(in crate::ui) const ICON_WEAPON_DUAL: usize = ICON_WEAPON_STAFF + 1;
 
+// TaystJK CG_Init cgs.media.invenIcons[tag] uses the IT_HOLDABLE
+// bg_itemlist icon for each HI_* tag. Pack once with the other native art.
+// Index zero (HI_NONE) is intentionally empty.
+pub const INVENTORY_ICON_NAMES: [&str; 12] = [
+    "",
+    "gfx/hud/i_icon_seeker",
+    "gfx/hud/i_icon_shieldwall",
+    "gfx/hud/i_icon_bacta",
+    "gfx/hud/i_icon_big_bacta",
+    "gfx/hud/i_icon_zoom",
+    "gfx/hud/i_icon_sentrygun",
+    "gfx/hud/i_icon_jetpack",
+    "gfx/hud/i_icon_healthdisp",
+    "gfx/hud/i_icon_ammodisp",
+    "gfx/hud/i_icon_eweb",
+    "gfx/hud/i_icon_cloak",
+];
+pub(crate) const ICON_INVENTORY_BASE: usize = ICON_WEAPON_DUAL + 1;
+
+// TaystJK CG_DrawZoomMask and CG_DrawRocketLocking artwork. Appending to
+// the native-resolution atlas preserves every existing icon index.
+pub(crate) const ICON_COMBAT_BASE: usize = ICON_INVENTORY_BASE + INVENTORY_ICON_NAMES.len();
+pub const COMBAT_ICON_NAMES: [&str; 12] = [
+    "gfx/2d/cropCircle2", "gfx/2d/cropCircle", "gfx/2d/insertTick",
+    "gfx/2d/crop_charge", "gfx/2d/binMask", "gfx/2d/binocularWindow",
+    "gfx/2d/binSideArrow", "gfx/2d/wedge", "gfx/2d/lock",
+    "gfx/2d/binCircle", "gfx/2d/binTopTri", "gfx/2d/binocularNumOverlay",
+];
 // Maintain the old atlas indices for crosshair/force icons, so existing HUD
 // paths don't change; NA cells use the corresponding qpath + "_na" at load time.
-pub const ICON_NAMES: [&str; ICON_WEAPON_DUAL + 1] = {
-    let mut names = [""; ICON_WEAPON_DUAL + 1];
+pub const ICON_NAMES: [&str; ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len()] = {
+    let mut names = [""; ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len()];
     names[0] = "gfx/2d/lag";
     names[1] = "gfx/2d/net";
     let mut i = 0;
@@ -194,6 +240,16 @@ pub const ICON_NAMES: [&str; ICON_WEAPON_DUAL + 1] = {
     }
     names[ICON_WEAPON_STAFF] = "gfx/hud/w_icon_saberstaff";
     names[ICON_WEAPON_DUAL] = "gfx/hud/w_icon_duallightsaber";
+    i = 0;
+    while i < INVENTORY_ICON_NAMES.len() {
+        names[ICON_INVENTORY_BASE + i] = INVENTORY_ICON_NAMES[i];
+        i += 1;
+    }
+    i = 0;
+    while i < COMBAT_ICON_NAMES.len() {
+        names[ICON_COMBAT_BASE + i] = COMBAT_ICON_NAMES[i];
+        i += 1;
+    }
     names
 };
 
@@ -803,7 +859,13 @@ pub(in crate::ui) fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapsho
             });
         } else {
             let hud = crate::strafehelper::extended_hud(&part, &state, aspect);
-            draw_placed(out, ui, id, w, h, |out| draw_extended(out, hud, w, h));
+            draw_placed(out, ui, id, w, h, |out| {
+                let start = out.len();
+                draw_extended(out, hud, w, h);
+                if id == HudElementId::Speedometer && out.len() > start {
+                    position_speedometer_batch(&mut out[start..], ui, w, h, false);
+                }
+            });
         }
     }
 }

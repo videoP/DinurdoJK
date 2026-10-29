@@ -1,6 +1,104 @@
 use super::*;
 
 #[test]
+fn foliage_world_camera_uniform_matches_shader_layouts() {
+    use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
+    use std::mem::{offset_of, size_of};
+    for source in [
+        compose_world_shader(include_str!("../../bsp.wgsl")),
+        compose_world_shader(include_str!("../../bsp_lean.wgsl")),
+        format!("{}\n{}\n{}", include_str!("../../bsp_fast.wgsl"),
+            crate::foliage::surface_shader(), include_str!("../../sky_fractal.wgsl")),
+        crate::glass::model_shader(include_str!("../../md3.wgsl"), 2),
+        crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3),
+    ] {
+        let (size, members) = wgsl_struct_layout(&source, "Camera");
+        assert_eq!(size as usize, size_of::<CameraUniform>());
+        assert_eq!(offset_of_member(&members, "foliage_wind") as usize,
+            offset_of!(CameraUniform, foliage_wind));
+    }
+}
+
+#[test]
+fn foliage_wind_vertex_gpu_moves_only_promoted_cards() {
+    use wgpu::util::DeviceExt;
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let source = format!("{}\n{}", crate::foliage::SHADER, r#"
+@group(0) @binding(0) var<storage, read_write> result: array<vec4<f32>, 8>;
+@compute @workgroup_size(8) fn main(@builtin(local_invocation_index) i: u32) {
+    let p = vec3<f32>(10.0, 50.0, 20.0);
+    var tag = 1.234;
+    var wind = vec4<f32>(0.3, 0.4, 0.0, 0.0);
+    if (i == 0u) { tag = 0.0; }
+    if (i == 1u) { wind = vec4<f32>(0.0); }
+    if (i == 3u) { wind = vec4<f32>(wind.xy, 2.0, 0.0); }
+    if (i == 6u) { tag = 1.876; }
+    if (i == 7u) { wind = vec4<f32>(wind.xy * 2.0, wind.zw); }
+    let position = p + select(vec3<f32>(0.0), vec3<f32>(1.0, 0.0, 0.0), i == 5u);
+    result[i] = vec4<f32>(foliage_model_position(position, tag, wind) - position, 0.0);
+}
+"#);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("foliage displacement regression"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: None, module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: &[0u8; 128],
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: 128, mapped_at_creation: false,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        });
+        let (noise, sampler) = crate::foliage::test_noise_resources(&device, &queue);
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &pipeline.get_bind_group_layout(0),
+            entries: &crate::foliage::camera_entries(&output, &noise, &sampler),
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, 128);
+        queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |status| tx.send(status).unwrap());
+        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(30)) }).unwrap();
+        rx.recv().unwrap().unwrap();
+        let bytes = slice.get_mapped_range().expect("foliage shader readback is mapped");
+        let samples: &[[f32; 4]] = bytemuck::cast_slice(&bytes);
+        assert_eq!(samples[0], [0.0; 4], "ordinary geometry must stay still");
+        assert_eq!(samples[1], [0.0; 4], "zero wind must stop the sway");
+        assert_ne!(samples[2], samples[3], "advecting grass noise must move the leaf");
+        assert_ne!(samples[2], samples[6], "separate plants must get different local motion");
+        assert_eq!(samples[2], samples[4], "shared positions must not develop seams");
+        for sample in &samples[2..] {
+            assert!(sample.iter().all(|v| v.is_finite() && v.abs() < crate::foliage::BOUNDS_PADDING));
+        }
+        for axis in 0..3 {
+            assert!((samples[7][axis] - 2.0 * samples[2][axis]).abs() < 1e-4,
+                "doubling inherited wind speed must double unsaturated bend");
+            assert!((samples[2][axis] - samples[5][axis]).abs() < 0.4,
+                "neighboring vertices must sway coherently");
+        }
+    });
+}
+
+#[test]
 fn csm_coverage_ab_variants_specialize_and_emit_spirv() {
     use wgpu::naga;
     for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
@@ -33,7 +131,7 @@ fn promoted_glass_shader_variants_validate() {
         ("lean", compose_world_shader(include_str!("../../bsp_lean.wgsl"))),
         ("fast", format!("{}\n{}\n{}",
             include_str!("../../bsp_fast.wgsl"),
-            include_str!("../../surface_deformation.wgsl"),
+            crate::foliage::surface_shader(),
             include_str!("../../sky_fractal.wgsl"))),
         ("md3", crate::glass::model_shader(include_str!("../../md3.wgsl"), 2)),
         ("ghoul2", crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3)),
@@ -529,7 +627,7 @@ fn rt_alpha_cache_reuses_textures_and_accepts_changed_skins() {
         source: None,
         width: 2,
         height: 1,
-        rgba: vec![255, 255, 255, 0, 255, 255, 255, 192],
+        rgba: (vec![255, 255, 255, 0, 255, 255, 255, 192]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: false,
@@ -1032,7 +1130,7 @@ fn planar_selection_scores_larger_screen_coverage_higher() {
 
 #[test]
 fn planar_selection_keeps_large_plane_visible_when_camera_is_over_its_middle() {
-    let view_proj = Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 1000.0);
+    let view_proj = glam::camera::rh::proj::directx::perspective(60.0_f32.to_radians(), 1.0, 0.1, 1000.0);
     let importance = projected_planar_importance(
         [-100.0, -1.0, -100.0],
         [100.0, -1.0, 100.0],
@@ -1057,10 +1155,10 @@ fn skybox_average_linearises_and_uses_the_smallest_mip() {
         source: None,
         width: 2,
         height: 2,
-        rgba: vec![
+        rgba: (vec![
             0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, // base
             188, 188, 188, 255, // 1x1 mip
-        ],
+        ]).into(),
         rgba16f: None,
         mip_level_count: 2,
         clamp: true,
@@ -1083,7 +1181,7 @@ fn skybox_average_weights_cube_face_slots_not_batches() {
         source: None,
         width: 1,
         height: 1,
-        rgba: color.to_vec(),
+        rgba: (color.to_vec()).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1108,7 +1206,7 @@ fn skybox_average_preserves_srgb_transfer_for_mipless_image() {
         source: None,
         width: 2,
         height: 1,
-        rgba: vec![64, 128, 188, 255, 255, 0, 0, 255],
+        rgba: (vec![64, 128, 188, 255, 255, 0, 0, 255]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1136,7 +1234,7 @@ fn skybox_average_uses_only_selected_primary_skybox() {
         source: None,
         width: 1,
         height: 1,
-        rgba: vec![rgb[0], rgb[1], rgb[2], 255],
+        rgba: (vec![rgb[0], rgb[1], rgb[2], 255]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1209,6 +1307,7 @@ fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry()
 fn hiz_occlusion_shaders_validate() {
     for (name, source) in [
         ("depth_prepass", include_str!("../../depth_prepass.wgsl")),
+        ("studio_lens", include_str!("../../studio_lens.wgsl")),
         ("shadow", include_str!("../../shadow.wgsl")),
         ("world_flares", include_str!("../../world_flares.wgsl")),
         ("gpu_cull", include_str!("../../gpu_cull.wgsl")),
@@ -1253,7 +1352,7 @@ fn all_renderer_shaders_validate() {
     let bsp_fast = format!(
         "{}\n{}\n{}",
         include_str!("../../bsp_fast.wgsl"),
-        include_str!("../../surface_deformation.wgsl"),
+        crate::foliage::surface_shader(),
         include_str!("../../sky_fractal.wgsl")
     );
     let post = weather::with_weather_surface(&weather::with_post_settings(include_str!(
@@ -1385,20 +1484,9 @@ fn entity_shadow_pass_writes_caster_depth() {
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX
-                    | wgpu::ShaderStages::FRAGMENT
-                    | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            label: None, entries: &crate::foliage::camera_layout_entries(),
         });
+        let (foliage_noise, foliage_sampler) = crate::foliage::test_noise_resources(&device, &queue);
         let white = upload_texture(
             &device,
             &queue,
@@ -1407,7 +1495,7 @@ fn entity_shadow_pass_writes_caster_depth() {
                 source: None,
                 width: 1,
                 height: 1,
-                rgba: vec![255; 4],
+                rgba: (vec![255; 4]).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -1424,7 +1512,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             &white,
         );
         let mut pipeline_jobs = PipelineJobManager::new();
-        let vertex = |x: f32, z: f32| DynamicModelVertex {
+        let vertex = |x: f32, z: f32| DynamicModelVertex { foliage_wind: 0.0,
             position: [x, 0.0, z],
             normal: [0.0, 1.0, 0.0],
             uv: [0.0, 0.0],
@@ -1491,9 +1579,9 @@ fn entity_shadow_pass_writes_caster_depth() {
         );
 
         // Light straight down at the origin; the triangle lies in y = 0.
-        let view = Mat4::look_at_rh(Vec3::new(0.0, 1000.0, 0.0), Vec3::ZERO, Vec3::Z);
-        let projection = Mat4::orthographic_rh(-256.0, 256.0, -256.0, 256.0, 0.1, 2000.0);
-        let state = EntityShadowState::new(&device, &camera_layout);
+        let view = glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 1000.0, 0.0), Vec3::ZERO, Vec3::Z);
+        let projection = glam::camera::rh::proj::directx::orthographic(-256.0, 256.0, -256.0, 256.0, 0.1, 2000.0);
+        let state = EntityShadowState::new(&device, &camera_layout, &foliage_noise, &foliage_sampler);
         state.write_camera(&queue, 0, projection * view);
 
         for reverse_z in [false, true] {
@@ -1633,6 +1721,7 @@ fn blob_shadow_request_projects_onto_a_render_space_floor() {
         left,
         up,
         0.5,
+        false,
         &mut vertices,
         &mut indices,
     );
@@ -1719,7 +1808,7 @@ fn ocean_material_uniform_matches_world_shader_layouts() {
     let shaders = [
         compose_world_shader(include_str!("../../bsp.wgsl")),
         compose_world_shader(include_str!("../../bsp_lean.wgsl")),
-        format!("{}\n{}\n{}", include_str!("../../bsp_fast.wgsl"), include_str!("../../surface_deformation.wgsl"), include_str!("../../sky_fractal.wgsl")),
+        format!("{}\n{}\n{}", include_str!("../../bsp_fast.wgsl"), crate::foliage::surface_shader(), include_str!("../../sky_fractal.wgsl")),
     ];
     for shader in shaders {
         let (size, members) = wgsl_struct_layout(&shader, "Material");
@@ -1812,7 +1901,7 @@ fn promoted_water_gpu_views_and_spray_validate() {
                     has_dynamic_offset:false,min_binding_size:None },count:None }]
         });
         let albedo = upload_texture(&device,&queue,&TextureData { label:"spray test".into(),
-            source:None,width:1,height:1,rgba:vec![255;4],rgba16f:None,mip_level_count:1,
+            source:None,width:1,height:1,rgba: (vec![255;4]).into(),rgba16f: None,mip_level_count:1,
             clamp:true,srgb:true });
         let layout = OceanGpu::create_render_layout(&device);
         let _spray = crate::ocean::create_spray_pipeline(&device,&camera_layout,&layout,

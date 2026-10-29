@@ -33,6 +33,12 @@ const PROMOTED_LIGHT_MIN_LIFE_MS: i32 = 40;
 const MAX_EFX_BYTES: usize = 65_536;
 const MAX_TEXTURE_SAMPLES: usize = 4096;
 const MAX_PROMOTED_LIGHTS: usize = 64;
+// Shared, material-independent parameters for EVERY aggressive FX_AddLine
+// projector. Preserve per-line RGB/alpha, but don't let normalized emissive
+// colour create a full-bright floodlight with a long beam falloff range.
+const AGGRESSIVE_LINE_STRENGTH: f32 = 0.25;
+const AGGRESSIVE_LINE_MIN_OUTER_HALF_ANGLE_DEG: f32 = 6.0;
+const AGGRESSIVE_LINE_MAX_OUTER_HALF_ANGLE_DEG: f32 = 12.0;
 
 #[derive(Clone, Debug)]
 struct ProjectileLightDriver {
@@ -129,30 +135,122 @@ pub fn effect_asset_names(assets: &AssetSearchPath) -> Vec<String> {
     names
 }
 
-/// Build every promotion profile on a map worker.  `progress(done, total)` is
-/// called after each EFX so the normal map-loading UI can expose the work.
+/// Every material key the serial catalog walk analyzes for `template`, in the
+/// order it reaches them: aggressive-driver candidates, then the semantic
+/// driver's media. `fixed_light_profile` only reads the driver's media, which
+/// this includes, so a catalog prefilled with these keys is identical.
+fn template_material_names<'a>(template: &'a template::EffectTemplate, out: &mut Vec<&'a str>) {
+    let Some(profile) = template.auto_light else { return };
+    for primitive in &template.primitives {
+        if !matches!(primitive.kind,
+            PrimType::Particle | PrimType::OrientedParticle | PrimType::Line |
+            PrimType::Tail | PrimType::Cylinder | PrimType::Electricity)
+        { continue; }
+        for media in &primitive.media {
+            if template::token_score(media, false) >= 0 {
+                out.push(media);
+            }
+        }
+    }
+    if let Some(driver) = template.primitives.get(profile.driver_primitive) {
+        out.extend(driver.media.iter().map(String::as_str));
+    }
+}
+
+/// Build every promotion profile on a map worker.  `progress(done, total)`
+/// reports the EFX parse (first half) and material analysis (second half) so
+/// the normal map-loading UI can expose the work.
+///
+/// EFX reads/parses and material analyses (texture decode + sampling) are
+/// pure per item, so both fan out over rayon with per-thread VFS forks; the
+/// catalog is then assembled serially in effect order with every material
+/// already cached, giving the same result as the one-thread walk.
 pub fn build_catalog<F>(
     assets: &mut AssetSearchPath,
     shaders: &BTreeMap<String, Shader>,
     effect_names: &[String],
-    mut progress: F,
+    progress: F,
 ) -> FxLightPromotionCatalog
 where
-    F: FnMut(u32, u32),
+    F: FnMut(u32, u32) + Send,
 {
+    use rayon::prelude::*;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Mutex, PoisonError,
+    };
+
     let total = effect_names.len().min(u32::MAX as usize) as u32;
+    let half = total / 2;
+    let progress = Mutex::new(progress);
+    let report = |done: u32| {
+        let mut progress = progress.lock().unwrap_or_else(PoisonError::into_inner);
+        (*progress)(done.min(total), total);
+    };
+    let reader = assets.fork();
+
+    let parsed_done = AtomicU32::new(0);
+    let parsed: Vec<(String, Option<template::EffectTemplate>)> = effect_names
+        .par_iter()
+        .map_init(
+            || reader.fork(),
+            |reader, qpath| {
+                let relative = effect_relative_key(qpath);
+                let parsed = reader
+                    .read(qpath, MAX_EFX_BYTES)
+                    .ok()
+                    .flatten()
+                    .map(|asset| template::parse_effect(&relative, &super::gp2::parse(&asset.bytes)));
+                let done = parsed_done.fetch_add(1, Ordering::Relaxed) + 1;
+                if total > 0 {
+                    report((u64::from(done) * u64::from(half) / u64::from(total)) as u32);
+                }
+                (relative, parsed)
+            },
+        )
+        .collect();
+
+    // Unique material keys, first-seen name kept (analysis depends only on
+    // the canonical key), plus the stock beam shaders analyzed at the end.
+    let mut seen = std::collections::HashSet::new();
+    let mut material_names = Vec::new();
+    let mut names = Vec::new();
+    for template in parsed.iter().filter_map(|(_, template)| template.as_ref()) {
+        names.clear();
+        template_material_names(template, &mut names);
+        for name in names.drain(..) {
+            if seen.insert(scene::canonical_shader_name(name)) {
+                material_names.push(name);
+            }
+        }
+    }
+    for name in ["gfx/effects/blueLine", "gfx/effects/redLine", "gfx/misc/whiteline2"] {
+        if seen.insert(scene::canonical_shader_name(name)) {
+            material_names.push(name);
+        }
+    }
+
+    let material_total = material_names.len().max(1) as u64;
+    let analyzed_done = AtomicU32::new(0);
+    let analyzed: Vec<(String, Option<MaterialLightAnalysis>)> = material_names
+        .par_iter()
+        .map_init(
+            || (reader.fork(), Textures::new()),
+            |(reader, textures), name| {
+                let analysis = analyze_shader_material(reader, textures, shaders, name);
+                let done = u64::from(analyzed_done.fetch_add(1, Ordering::Relaxed) + 1);
+                report(half + (done * u64::from(total - half) / material_total) as u32);
+                (scene::canonical_shader_name(name), analysis)
+            },
+        )
+        .collect();
+
     let mut catalog = FxLightPromotionCatalog::default();
+    catalog.materials.extend(analyzed);
     let mut textures = Textures::new();
 
-    for (index, qpath) in effect_names.iter().enumerate() {
+    for (relative, parsed) in parsed {
         catalog.scanned_effects += 1;
-        let relative = effect_relative_key(qpath);
-        let parsed = assets
-            .read(qpath, MAX_EFX_BYTES)
-            .ok()
-            .flatten()
-            .map(|asset| template::parse_effect(&relative, &super::gp2::parse(&asset.bytes)));
-
         if let Some(template) = parsed {
             // The aggressive mode can use a different primitive from mode 1:
             // material evidence decides which available shader actually glows,
@@ -246,10 +344,8 @@ where
                 catalog.fixed_effects.insert(relative, fixed);
             }
         }
-
-        let done = (index + 1).min(u32::MAX as usize) as u32;
-        progress(done, total);
     }
+    report(total);
 
     // Direct CG_Disruptor/Concussion beam visuals bypass .efx entirely.
     // Prepare their stock materials once with the catalog on the map worker,
@@ -368,6 +464,19 @@ fn analyze_shader_material(
     )
 }
 
+/// Fallback for stock, code-constructed beam lines only; never an arbitrary
+/// unknown or deliberately non-emissive EFX material. Their shaders are known
+/// from TaystJK fx_disruptor.c and fx_concussion.c.
+fn stock_beam_fallback(key: &str) -> Option<MaterialLightAnalysis> {
+    let texture_color = match key {
+        "gfx/effects/redline" => [1.0, 0.10, 0.04],
+        "gfx/effects/blueline" => [0.25, 0.4, 1.0],
+        "gfx/misc/whiteline2" => [1.0; 3],
+        _ => return None,
+    };
+    material_analysis(FxBlend::Add, false, texture_color, true, [1.0; 3], false, 1.0)
+}
+
 fn material_analysis(
     blend: FxBlend,
     authored_glow: bool,
@@ -461,8 +570,12 @@ impl FxLightPromoter {
         struct Pending {
             effect: u32,
             light: FxLight,
+            // Retain actual line endpoints for *identity*, even though the
+            // GPU light packs this as a spotlight with segment=None.
+            line: Option<[[f32; 3]; 2]>,
         }
 
+        let diag_start = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
         if level == 0 { self.recent_short_lights.clear(); return Vec::new(); }
         if time < self.last_promotion_time { self.recent_short_lights.clear(); }
         self.last_promotion_time = time;
@@ -478,14 +591,35 @@ impl FxLightPromoter {
                 } else {
                     let resolved = materials(&candidate.shader);
                     let analyzed = analyze_materials(&resolved);
-                    self.runtime_materials.insert(key, analyzed);
+                    self.runtime_materials.insert(key.clone(), analyzed);
                     analyzed
                 }
             } else {
                 self.catalog.material_analysis(&candidate.shader)
             };
+            // The direct FX_AddLine weapons are generated by CG_Disruptor and
+            // CG_Concussion, not by any EFX template. The original game always
+            // draws these named beam materials even when a PK3 lacks a separate
+            // .shader definition. If map-load image analysis cannot resolve
+            // that stock media, an aggressive beam still deserves its light.
+            // Non-line FX keep their existing material requirements. Only
+            // aggressive straight lines bypass shader evidence as requested.
+            // Aggressive means *every* actual FX_AddLine. Don't require a
+            // semantic driver, decoded texture, or emissive shader classification
+            // before giving a displayed line its forward-facing projector.
+            // Conservative mode retains all of its original evidence gates.
+            let aggressive_line = level == 2 && candidate.kind == PrimType::Line
+                && line_projector(candidate.segment, candidate.radius).is_some();
+            let analysis = if aggressive_line {
+                analysis.or_else(|| stock_beam_fallback(&key)).or_else(|| {
+                    material_analysis(FxBlend::Add, false, [1.0; 3], true,
+                        [1.0; 3], false, 1.0)
+                })
+            } else {
+                analysis
+            };
             let Some(analysis) = analysis else { continue };
-            if candidate.score + analysis.score < threshold {
+            if !aggressive_line && candidate.score + analysis.score < threshold {
                 continue;
             }
 
@@ -526,28 +660,36 @@ impl FxLightPromoter {
             // control. Alpha/fades still modulate the light.
             let chroma_peak = peak.max(0.20);
             color = color.map(|value| (value / chroma_peak).clamp(0.0, 1.0));
+            // Affect ALL aggressive FX_AddLine lights, not named weapons,
+            // individual shaders or FX file paths. Keep per-line hue and fade.
+            if aggressive_line {
+                color = color.map(|value| value * AGGRESSIVE_LINE_STRENGTH);
+            }
 
             let mut origin = candidate.origin;
             let mut spot = candidate.spot;
             let mut segment = candidate.segment;
+            let mut radius = inferred_radius(candidate);
             if let Some([start, end]) = candidate.segment {
-                origin = std::array::from_fn(|i| 0.5 * (start[i] + end[i]));
-                // Level 2 can treat truly long straight FX lines as a projector;
-                // short blaster trails remain segment emitters. The renderer
-                // already supports spots, so this adds no new shading path.
-                let direction: [f32; 3] = std::array::from_fn(|i| end[i] - start[i]);
-                let length = distance_squared(start, end).sqrt();
-                if level == 2 && candidate.kind == PrimType::Line && length >= 384.0 {
-                    let cone = (candidate.radius.abs().max(6.0) / length).atan().clamp(0.10, 0.45);
-                    spot = Some(super::system::FxSpotLight {
-                        direction: direction.map(|v| v / length),
-                        inner_cone_cos: (cone * 0.65).cos(), outer_cone_cos: cone.cos(),
-                    });
-                    segment = None;
-                    origin = start;
+                if level == 2 && candidate.kind == PrimType::Line {
+                    if let Some((projector, length)) = line_projector(candidate.segment, candidate.radius) {
+                        // FX_AddLine(start, end) points outward from the
+                        // weapon muzzle. Never substitute a midpoint tube or
+                        // aim the cone from the impact point. Every valid line
+                        // gets a spotlight, including very short lines.
+                        origin = start;
+                        spot = Some(projector);
+                        // Packing a segment would overwrite GPU spotlight.w=3.
+                        segment = None;
+                        // Beam lights must illuminate the target AND the
+                        // nearby scene, instead of using a ~100u point radius.
+                        radius = radius.max(length + 64.0).min(16_384.0);
+                    }
+                } else {
+                    // Preserve non-aggressive segment handling unchanged.
+                    origin = std::array::from_fn(|i| 0.5 * (start[i] + end[i]));
                 }
             }
-            let radius = inferred_radius(candidate);
             let source_radius = inferred_source_radius(candidate, radius);
             let light = FxLight {
                 kind: FxLightKind::PromotedEffect,
@@ -574,11 +716,21 @@ impl FxLightPromoter {
                 }
             }
 
-            // Continuous JKA effects may be invoked repeatedly while an older
-            // driver primitive is still alive. Merge only same-effect lights
-            // that are spatially close, preserving distinct explosions/bolts.
+            // Aggressive line lights are a *projection of visible geometry*.
+            // A persistent EFX may retain several historical submissions of
+            // its same line (plus parallel core/glow layers). Those are ONE
+            // physical beam and should use one spotlight, not fill 64 slots.
+            // Check both endpoints: same muzzle alone must never merge
+            // independent disruptor bolts, split beams or different targets.
             let merge_distance = (radius * 0.35).clamp(24.0, 96.0);
             if let Some(existing) = pending.iter_mut().find(|existing| {
+                if aggressive_line {
+                    return match (existing.line, candidate.segment) {
+                        (Some(a), Some(b)) => same_visible_line(a, b),
+                        _ => false,
+                    };
+                }
+                if existing.line.is_some() { return false; }
                 let directional_match = match (existing.light.spot, light.spot) {
                     (Some(a), Some(b)) => {
                         a.direction[0] * b.direction[0]
@@ -626,6 +778,7 @@ impl FxLightPromoter {
             } else if pending.len() < MAX_PROMOTED_LIGHTS {
                 pending.push(Pending {
                     effect: candidate.effect,
+                    line: if aggressive_line { candidate.segment } else { None },
                     light,
                 });
             }
@@ -638,11 +791,37 @@ impl FxLightPromoter {
                 if !pending.iter().any(|present| present.effect == *effect
                     && distance_squared(present.light.origin, light.origin) <= 48.0 * 48.0)
                 {
-                    pending.push(Pending { effect: *effect, light: light.clone() });
+                    pending.push(Pending { effect: *effect, light: light.clone(), line: None });
                 }
             }
         }
-        pending.into_iter().map(|pending| pending.light).collect()
+        let result: Vec<FxLight> = pending.into_iter().map(|pending| pending.light).collect();
+        if let Some(started) = diag_start {
+            use crate::fx::diagnostics as diag;
+            diag::add(diag::PROMOTION_CALLS, 1);
+            diag::add(diag::PROMOTION_US, diag::micros(started.elapsed()));
+            diag::add(diag::CANDIDATES, candidates.len() as u64);
+            diag::peak(diag::MAX_CANDIDATES_FRAME, candidates.len() as u64);
+            diag::add(diag::CANDIDATE_LINES,
+                candidates.iter().filter(|c| c.kind == PrimType::Line).count() as u64);
+            diag::add(diag::PROMOTED, result.len() as u64);
+            diag::peak(diag::MAX_PROMOTED_FRAME, result.len() as u64);
+            diag::add(diag::SPOTS, result.iter().filter(|l| l.spot.is_some()).count() as u64);
+            for light in &result {
+                if light.spot.is_some() && light.radius.is_finite() {
+                    diag::peak(diag::MAX_SPOT_RADIUS_10, (light.radius.max(0.0) * 10.0) as u64);
+                }
+            }
+            for candidate in candidates {
+                if let Some([start, end]) = candidate.segment {
+                    let distance = start.iter().zip(end).map(|(a, b)| (a-b)*(a-b)).sum::<f32>().sqrt();
+                    if distance.is_finite() {
+                        diag::peak(diag::MAX_BEAM_LENGTH_10, (distance.max(0.0) * 10.0) as u64);
+                    }
+                }
+            }
+        }
+        result
     }
 }
 
@@ -741,6 +920,46 @@ fn srgb_to_linear(value: f64) -> f64 {
     }
 }
 
+/// Treat only the same geometric line as one projected light. Multiple
+/// historical instances and authored glow/core overlays can share it, but
+/// nearby parallel lines or beams aimed at different endpoints cannot.
+fn same_visible_line(a: [[f32; 3]; 2], b: [[f32; 3]; 2]) -> bool {
+    // Small epsilon tolerates FX float interpolation without merging adjacent
+    // laser paths or different impact points.
+    const ENDPOINT_EPS_SQ: f32 = 1.0;
+    distance_squared(a[0], b[0]) <= ENDPOINT_EPS_SQ
+        && distance_squared(a[1], b[1]) <= ENDPOINT_EPS_SQ
+}
+
+/// One forward-facing muzzle/start spotlight per valid aggressive FX_AddLine.
+/// A beam needs a small projected cone, not a 70-degree floodlight. Use the
+/// actual visible line width to widen the half-angle slightly (within narrow
+/// bounds), independent of effect/weapon/shader names or beam travel distance.
+fn line_projector(
+    segment: Option<[[f32; 3]; 2]>,
+    visible_width: f32,
+) -> Option<(super::system::FxSpotLight, f32)> {
+    let [start, end] = segment?;
+    if !start.iter().chain(end.iter()).all(|value| value.is_finite()) { return None; }
+    let delta = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+    let length_squared = delta.iter().map(|v| v * v).sum::<f32>();
+    if !length_squared.is_finite() || length_squared <= 1.0e-8 { return None; }
+    let length = length_squared.sqrt();
+    let width = if visible_width.is_finite() {
+        visible_width.abs().min(32.0)
+    } else {
+        0.0
+    };
+    let outer_half_angle_deg = (AGGRESSIVE_LINE_MIN_OUTER_HALF_ANGLE_DEG + width * 0.35)
+        .min(AGGRESSIVE_LINE_MAX_OUTER_HALF_ANGLE_DEG);
+    let inner_half_angle_deg = outer_half_angle_deg * 0.60;
+    Some((super::system::FxSpotLight {
+        direction: delta.map(|v| v / length),
+        inner_cone_cos: inner_half_angle_deg.to_radians().cos(),
+        outer_cone_cos: outer_half_angle_deg.to_radians().cos(),
+    }, length))
+}
+
 fn inferred_radius(candidate: &FxAutoLightCandidate) -> f32 {
     let visual = candidate.radius.abs().max(1.0);
     let mut radius = match candidate.kind {
@@ -797,7 +1016,7 @@ mod tests {
             source: None,
             width: 2,
             height: 1,
-            rgba: vec![0, 0, 0, 255, 255, 64, 0, 255],
+            rgba: (vec![0, 0, 0, 255, 255, 64, 0, 255]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -847,6 +1066,124 @@ mod promotion_level_tests {
         let mut no_materials = |_: &str| Vec::new();
         assert!(promoter.promote(&[candidate()], &mut no_materials, 1000, 1).is_empty());
         assert_eq!(promoter.promote(&[candidate()], &mut no_materials, 1000, 2).len(), 1);
+    }
+
+    #[test]
+    fn stock_direct_beam_can_promote_without_catalog_texture() {
+        let mut promoter = FxLightPromoter::default();
+        let mut no_materials = |_: &str| Vec::new();
+        let beam = FxAutoLightCandidate {
+            effect: 42, score: 3, kind: PrimType::Line,
+            origin: [0.0; 3], radius: 5.0, rgba: [255; 4],
+            shader: "gfx/effects/redLine".into(), life_ms: 150,
+            spot: None, segment: Some([[0.0; 3], [1000.0, 0.0, 0.0]]),
+        };
+        assert!(promoter.promote(&[beam.clone()], &mut no_materials, 1000, 1).is_empty());
+        let lights = promoter.promote(&[beam], &mut no_materials, 1000, 2);
+        assert_eq!(lights.len(), 1);
+        assert!(lights[0].spot.is_some());
+        assert!(lights[0].rgb[0] > lights[0].rgb[2]);
+    }
+
+    #[test]
+    fn aggressive_long_disruptor_line_becomes_muzzle_spot_reaching_impact() {
+        let mut catalog = FxLightPromotionCatalog::default();
+        catalog.materials.insert(scene::canonical_shader_name("gfx/effects/redLine"),
+            Some(MaterialLightAnalysis { static_emission: true, score: 6, texture_color: [1.0, 0.12, 0.04],
+                rgb_vertex: true, rgb_const: [1.0; 3], alpha_vertex: false,
+                alpha_const: 1.0, blend: FxBlend::Add }));
+        let mut promoter = FxLightPromoter::default();
+        promoter.set_catalog(Arc::new(catalog));
+        let beam = FxAutoLightCandidate {
+            effect: 19, score: 3, kind: PrimType::Line,
+            origin: [0.0; 3], radius: 6.0, rgba: [255; 4],
+            shader: "gfx/effects/redLine".into(), life_ms: 150,
+            spot: None, segment: Some([[0.0, 0.0, 0.0], [1200.0, 0.0, 0.0]]),
+        };
+        let mut no_materials = |_: &str| Vec::new();
+        let lights = promoter.promote(&[beam.clone()], &mut no_materials, 1000, 2);
+        assert_eq!(lights.len(), 1);
+        assert_eq!(lights[0].origin, [0.0; 3]);
+        assert!(lights[0].spot.is_some());
+        assert_eq!(lights[0].segment, None);
+        assert!(lights[0].radius >= 1200.0);
+        let conservative = promoter.promote(&[beam], &mut no_materials, 1000, 1);
+        assert_eq!(conservative.len(), 1);
+        assert!(conservative[0].spot.is_none());
+        assert!(conservative[0].segment.is_some());
+    }
+
+    #[test]
+    fn aggressive_projects_every_line_from_muzzle_even_without_shader_evidence() {
+        let mut promoter = FxLightPromoter::default();
+        let mut no_materials = |_: &str| Vec::new();
+        let beam = FxAutoLightCandidate {
+            effect: 10, score: -1000, kind: PrimType::Line,
+            origin: [123.0; 3], radius: 1.0, rgba: [255, 100, 50, 255],
+            shader: "custom/unclassified_line".into(), life_ms: 150,
+            spot: None, segment: Some([[2.0, 3.0, 4.0], [1202.0, 3.0, 4.0]]),
+        };
+        assert!(promoter.promote(&[beam.clone()], &mut no_materials, 1000, 1).is_empty());
+        let promoted = promoter.promote(&[beam.clone()], &mut no_materials, 1000, 2);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].origin, [2.0, 3.0, 4.0]);
+        assert_eq!(promoted[0].segment, None);
+        assert_eq!(promoted[0].spot.unwrap().direction, [1.0, 0.0, 0.0]);
+        assert!(promoted[0].radius >= 1200.0);
+        assert!(promoted[0].spot.unwrap().outer_cone_cos > 0.97);
+
+        // Identical historical submissions (and core/glow .efx layers)
+        // represent the SAME visible beam, hence only one physical spotlight.
+        let two = promoter.promote(&[beam.clone(), beam.clone()], &mut no_materials, 1005, 2);
+        assert_eq!(two.len(), 1);
+        assert!(two[0].spot.is_some());
+
+        let mut core = beam.clone();
+        core.effect = 999; // Different effect IDs must not prevent dedup.
+        core.shader = "different/hot_core".into();
+        core.radius = 0.2;
+        assert_eq!(promoter.promote(&[beam.clone(), core], &mut no_materials, 1005, 2).len(), 1);
+
+        // Nearby but genuinely different lines still get their own spotlights.
+        let mut parallel = beam.clone();
+        parallel.segment = Some([[2.0, 5.0, 4.0], [1202.0, 5.0, 4.0]]);
+        let mut other_target = beam.clone();
+        other_target.segment = Some([[2.0, 3.0, 4.0], [1202.0, 12.0, 4.0]]);
+        assert_eq!(promoter.promote(&[beam.clone(), parallel, other_target], &mut no_materials, 1005, 2).len(), 3);
+
+        // Even a short line is a projector: the old 384u threshold is gone.
+        let mut short = beam.clone();
+        short.segment = Some([[2.0, 3.0, 4.0], [12.0, 3.0, 4.0]]);
+        assert!(promoter.promote(&[short], &mut no_materials, 1010, 2)[0].spot.is_some());
+    }
+
+    #[test]
+    fn aggressive_line_tuning_is_generic_and_preserves_per_line_colour() {
+        let mut promoter = FxLightPromoter::default();
+        let mut no_materials = |_: &str| Vec::new();
+        let beam = FxAutoLightCandidate {
+            effect: 80, score: -100, kind: PrimType::Line,
+            origin: [99.0; 3], radius: 2.0, rgba: [200, 100, 50, 255],
+            shader: "mods/beam_a".into(), life_ms: 150,
+            spot: None, segment: Some([[0.0; 3], [1000.0, 0.0, 0.0]]),
+        };
+        let light_a = promoter.promote(&[beam.clone()], &mut no_materials, 1000, 2).remove(0);
+        let mut alternate = beam.clone();
+        alternate.shader = "mods/beam_b".into();
+        let light_b = promoter.promote(&[alternate], &mut no_materials, 1010, 2).remove(0);
+        assert_eq!(light_a.rgb, light_b.rgb);
+        assert!((light_a.rgb[0] - AGGRESSIVE_LINE_STRENGTH).abs() < 1.0e-5);
+        assert!(light_a.rgb[0] > light_a.rgb[1] && light_a.rgb[1] > light_a.rgb[2]);
+        assert_eq!(light_a.spot, light_b.spot);
+        assert_eq!(light_a.origin, [0.0; 3]);
+        let narrow = line_projector(beam.segment, 0.1).unwrap().0;
+        let thick = line_projector(beam.segment, 32.0).unwrap().0;
+        assert!(thick.outer_cone_cos < narrow.outer_cone_cos);
+        assert!(thick.outer_cone_cos >= AGGRESSIVE_LINE_MAX_OUTER_HALF_ANGLE_DEG.to_radians().cos());
+        assert!(narrow.inner_cone_cos > narrow.outer_cone_cos);
+        // The aggressive tuning never changes Conservative line promotion.
+        let conservative = promoter.promote(&[beam], &mut no_materials, 1020, 1);
+        assert!(conservative.is_empty());
     }
 
     #[test]

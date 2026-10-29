@@ -70,8 +70,10 @@ pub(crate) fn with_bound_weather_surface(base: &str) -> String {
 /// own: the values ride in the entity-lighting uniform they already bind.
 pub(crate) fn with_model_weather(base: &str) -> String {
     format!("{base}
+{}
 {WEATHER_SURFACE_WGSL}
-{MODEL_WEATHER_WGSL}")
+{MODEL_WEATHER_WGSL}
+{}", crate::foliage::SHADER, include_str!("legacy_model_blend.wgsl"))
 }
 
 /// `base` plus the shared weather maths and forward weather shading for the world

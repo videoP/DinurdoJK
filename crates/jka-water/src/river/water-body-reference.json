@@ -1,0 +1,303 @@
+{
+  "sources": [
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Private/WaterBodyRiverComponent.cpp",
+      "sha256": "b04c15fc3d656991769f00fefaa10ea8aa7efbbe67fa2ac8c2a07d345af85926",
+      "contracts": [
+        {
+          "text": "OutwardDistance.Z = 0.f",
+          "character_offset": 4544
+        },
+        {
+          "text": "const FVector DilationOffset = Normal * DilationAmount",
+          "character_offset": 6563
+        },
+        {
+          "text": "TangentialOffset.Z = 0.f",
+          "character_offset": 9586
+        },
+        {
+          "text": "OutMesh.AppendTriangle(BaseIndex - 2, BaseIndex + 1, BaseIndex - 1)",
+          "character_offset": 6047
+        },
+        {
+          "text": "ConvertSplineToPolyLineWithDistances(ESplineCoordinateSpace::Local, FMath::Square(5.f), Points, Distances)",
+          "character_offset": 11714
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Private/WaterUtils.cpp",
+      "sha256": "98877a09c1f1a8f07d702947f246796b4d2e350e1303bbb662af55ccdc3b3948",
+      "contracts": [
+        {
+          "text": "FMath::Clamp(VelocityMagnitude / MaxVelocity, 0.f, 1.f)",
+          "character_offset": 8236
+        },
+        {
+          "text": "FMath::Clamp(DirectionAngle / TWO_PI, 0.f, 1.f)",
+          "character_offset": 8306
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Private/WaterBodyMeshBuilder.cpp",
+      "sha256": "925fff859c9b4b47dcdcb736208893269e60c8c9fd985211962e6ef9f4340a1b",
+      "contracts": [
+        {
+          "text": "FDynamicMeshToMeshDescription DynamicMeshToMeshDescription",
+          "character_offset": 23348
+        },
+        {
+          "text": "DynamicMeshToMeshDescription.Convert(&Mesh, Result)",
+          "character_offset": 23410
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/MeshConversion/Public/MeshConversionOptions.h",
+      "sha256": "d591b616b9d675d52e48a13236a168a8004e9a2ef74d16d4b9b4d567c378ee88",
+      "contracts": [
+        {
+          "text": "bool bTransformVtxColorsSRGBToLinear = true",
+          "character_offset": 952
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/MeshConversion/Private/DynamicMeshToMeshDescription.cpp",
+      "sha256": "273eadabed3f4d2c2790922bd285e0628bcb32272a785746f8c8b286a2bf84fe",
+      "contracts": [
+        {
+          "text": "if (ConversionOptions.bTransformVtxColorsSRGBToLinear)",
+          "character_offset": 57025
+        },
+        {
+          "text": "LinearColors::SRGBToLinear(Color)",
+          "character_offset": 57087
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/GeometryCore/Public/Util/ColorConstants.h",
+      "sha256": "87c433b6e905003bbba2b624a3bde8252c60f16d58237f9e0eb2607971230164",
+      "contracts": [
+        {
+          "text": "(Color <= 0.04045f) ? Color / 12.92f : FMathf::Pow((Color + 0.055f) / 1.055f, 2.4f)",
+          "character_offset": 676
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Developer/MeshBuilder/Private/StaticMeshBuilder.cpp",
+      "sha256": "ac4845329704bd8f9b1ffbe1b26c9adf0ffce864fa690521308c0792dcce6508",
+      "contracts": [
+        {
+          "text": "VertexColor = LinearColor.ToFColor(true)",
+          "character_offset": 68160
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Core/Private/Math/Color.cpp",
+      "sha256": "617fb2ea6fe546bff611435c99f0ea3d154269cedfccacc7c946dafcad8c860a",
+      "contracts": [
+        {
+          "text": "stb_fp32_to_srgb8_tab4[104]",
+          "character_offset": 4102
+        },
+        {
+          "text": "((bias + scale*t) >> 16)",
+          "character_offset": 6336
+        }
+      ]
+    },
+    {
+      "path": "Engine/Shaders/Private/LocalVertexFactory.ush",
+      "sha256": "6d921e56de043d4554068e0c8838ed4a8dde4a90c2c5e1c067d271156b247c58",
+      "contracts": [
+        {
+          "text": "Intermediates.Color = Input.Color FCOLOR_COMPONENT_SWIZZLE",
+          "character_offset": 34326
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Engine/Private/StaticMeshSceneProxy.cpp",
+      "sha256": "86c3cc3514d88304576e3a49d8d2bf3c36f191f37556b4d9de1c482582b3abfd",
+      "contracts": [
+        {
+          "text": "return bReverseCulling != IsLocalToWorldDeterminantNegative()",
+          "character_offset": 51421
+        }
+      ]
+    },
+    {
+      "path": "Engine/Plugins/Experimental/Water/Source/Runtime/Private/WaterInfoRendering.cpp",
+      "sha256": "25e5de8fd3cfcb27d85789743f25df80bfa5952c45ba3476c65208f9d8cba9c9",
+      "contracts": [
+        {
+          "text": "const FMatrix::FReal NearPlane = 0.f",
+          "character_offset": 13313
+        },
+        {
+          "text": "const FMatrix::FReal FarPlane = UE_FLOAT_HUGE_DISTANCE / 4.0f",
+          "character_offset": 13353
+        },
+        {
+          "text": "FVector(0.f, -1.f, 0.f)",
+          "character_offset": 14714
+        },
+        {
+          "text": "PF_A32B32G32R32F",
+          "character_offset": 4228
+        },
+        {
+          "text": "FCustomRenderPassBase::ERenderOutput::SceneColorAndDepth",
+          "character_offset": 19220
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Engine/Public/EngineDefines.h",
+      "sha256": "06a1b72eaaeb9caeb79ea325e7406b57210ce61bc2f2b219a6653c751ea87881",
+      "contracts": [
+        {
+          "text": "#define UE_FLOAT_HUGE_DISTANCE\t\t1048576.0",
+          "character_offset": 2638
+        }
+      ]
+    },
+    {
+      "path": "Engine/Source/Runtime/Engine/Private/SceneView.cpp",
+      "sha256": "8ee3de0ded7b6454fc814e5f7357d48d989116b79ac2ef61972585a4bd1d9fd0",
+      "contracts": [
+        {
+          "text": "(float)(1.0f / ProjMatrix.M[2][2])",
+          "character_offset": 23370
+        },
+        {
+          "text": "(float)(-ProjMatrix.M[3][2] / ProjMatrix.M[2][2] + 1.0f)",
+          "character_offset": 23410
+        }
+      ]
+    }
+  ],
+  "vertex_color_table": [
+    7536653,
+    7995405,
+    8388621,
+    8847373,
+    9240589,
+    9699341,
+    10092557,
+    10551309,
+    10944538,
+    11796506,
+    12648474,
+    13500442,
+    14286874,
+    15138842,
+    15990810,
+    16842778,
+    17694771,
+    19398707,
+    21037107,
+    22741043,
+    24444979,
+    26148915,
+    27787315,
+    29491251,
+    31195239,
+    34537575,
+    37945447,
+    41287783,
+    44695655,
+    48037991,
+    51445863,
+    54788199,
+    58196174,
+    64946382,
+    71696590,
+    78446798,
+    85197006,
+    91947205,
+    98369724,
+    104530101,
+    110559576,
+    121766210,
+    132317488,
+    142278944,
+    151716114,
+    160694534,
+    169279740,
+    177537266,
+    185532875,
+    200540590,
+    214630805,
+    227869056,
+    240517486,
+    252510558,
+    263979344,
+    274923843,
+    285672036,
+    305660478,
+    324469277,
+    342229505,
+    359006697,
+    374997459,
+    390332864,
+    405012911,
+    419300145,
+    446038782,
+    471139026,
+    494797485,
+    517210765,
+    538575472,
+    559022678,
+    578617920,
+    597623875,
+    633340926,
+    666829764,
+    698418066,
+    728367975,
+    756876097,
+    784204575,
+    810353408,
+    835782064,
+    883426645,
+    928122119,
+    970261701,
+    1010238603,
+    1048314968,
+    1084752938,
+    1119683585,
+    1153566616,
+    1217267486,
+    1276905142,
+    1333134941,
+    1386546704,
+    1437337036,
+    1485964687,
+    1532560729,
+    1577847331,
+    1662781824,
+    1742407926,
+    1817512063,
+    1888749592,
+    1956644797,
+    2021459820,
+    2083718947
+  ],
+  "far_cm": 262144.0,
+  "input_contract": "Evaluated native spline samples, local cm; native adaptive spline evaluation remains a separate port",
+  "material": {
+    "path": "/Water/Materials/WaterInfo/DrawWaterInfo",
+    "sha1": "3b04ef02def973adb7472e1c08330a25a0dac7b9",
+    "sha256": "4f39641914c2d0d42b144f9ffac872fc2da993c11683aa646aef2e1788aa52cc",
+    "flow_code": "float Magnitude = Flow.x * MaxVelocity;\r\nfloat Direction = Flow.y * 2 * PI;\r\n\r\nfloat FlowX = Magnitude * cos(Direction);\r\nfloat FlowY = Magnitude * sin(Direction);\r\n\r\nfloat NormalizedFlowX = (FlowX / (2 * MaxVelocity)) + 0.5;\r\nfloat NormalizedFlowY = (FlowY / (2 * MaxVelocity)) + 0.5;\r\n\r\nreturn float2(NormalizedFlowX, NormalizedFlowY);",
+    "default_maximum_velocity": 1024.0,
+    "order": "VertexColor RG -> polar-to-Cartesian custom -> append UV -> VertexInterpolator -> emissive"
+  },
+  "caveat": "Pinned source/graph evidence. No running Unreal comparison, inferred map spline, mesh material masking/displacement or normal-game renderer integration."
+}

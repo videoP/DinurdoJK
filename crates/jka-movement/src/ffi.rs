@@ -245,6 +245,14 @@ pub(crate) fn in_callback() -> bool {
 unsafe fn vector(pointer: *const f32) -> [f32; 3] {
     unsafe { [*pointer, *pointer.add(1), *pointer.add(2)] }
 }
+
+/// OpenJK's trace API accepts NULL mins/maxs for a point trace. In particular,
+/// PM_RocketLock passes both as NULL while holding rocket alt-fire. Never
+/// dereference these optional native bounds; NULL means zero extents.
+unsafe fn trace_extent(pointer: *const f32) -> [f32; 3] {
+    if pointer.is_null() { [0.0; 3] } else { unsafe { vector(pointer) } }
+}
+
 pub(crate) unsafe extern "C" fn trace_callback<W: TraceWorld>(
     context: *mut c_void,
     out: *mut TraceResult,
@@ -259,8 +267,8 @@ pub(crate) unsafe extern "C" fn trace_callback<W: TraceWorld>(
     let query = unsafe {
         TraceQuery {
             start: vector(start),
-            mins: vector(mins),
-            maxs: vector(maxs),
+            mins: trace_extent(mins),
+            maxs: trace_extent(maxs),
             end: vector(end),
             pass_entity: pass,
             mask,
@@ -351,6 +359,60 @@ mod tests {
                 &mut result, start.as_ptr(), zero.as_ptr(), zero.as_ptr(), zero.as_ptr(), 0, 1);
         }
         result
+    }
+
+    #[test]
+    fn rocket_alt_lock_null_trace_bounds_are_point_traces() {
+        // TaystJK bg_pmove.c PM_RocketLock uses pm->trace(start, NULL,
+        // NULL, end, ...). This must not dereference NULL at the FFI edge.
+        struct CaptureWorld { last_query: Option<TraceQuery> }
+        impl TraceWorld for CaptureWorld {
+            fn trace(&mut self, query: TraceQuery) -> TraceResult {
+                self.last_query = Some(query);
+                TraceResult::clear(query.end)
+            }
+            fn point_contents(&mut self, _: [f32; 3], _: i32) -> i32 { 0 }
+        }
+
+        let mut world = CaptureWorld { last_query: None };
+        let start = [5.0, 6.0, 7.0];
+        let end = [100.0, 200.0, 300.0];
+        let nonzero = [-1.0, -2.0, -3.0];
+        let mut result = TraceResult::clear(end);
+        {
+            let mut callbacks = Callbacks::new(&mut world);
+            let context = (&mut callbacks as *mut Callbacks<'_, CaptureWorld>).cast();
+            unsafe {
+                // Both missing: the actual rocket-lock path.
+                trace_callback::<CaptureWorld>(context, &mut result, start.as_ptr(),
+                    std::ptr::null(), std::ptr::null(), end.as_ptr(), 4, 0x111);
+            }
+            assert_eq!(result.fraction, 1.0);
+            assert!(callbacks.finish().is_ok());
+        }
+        let query = world.last_query.expect("point trace must reach the world");
+        assert_eq!(query.start, start);
+        assert_eq!(query.end, end);
+        assert_eq!(query.mins, [0.0; 3]);
+        assert_eq!(query.maxs, [0.0; 3]);
+        assert_eq!(query.pass_entity, 4);
+        assert_eq!(query.mask, 0x111);
+
+        // Keep the other optional bound when just one pointer is NULL.
+        for null_mins in [true, false] {
+            let mut callbacks = Callbacks::new(&mut world);
+            let context = (&mut callbacks as *mut Callbacks<'_, CaptureWorld>).cast();
+            unsafe {
+                trace_callback::<CaptureWorld>(context, &mut result, start.as_ptr(),
+                    if null_mins { std::ptr::null() } else { nonzero.as_ptr() },
+                    if null_mins { nonzero.as_ptr() } else { std::ptr::null() },
+                    end.as_ptr(), 4, 0x111);
+            }
+            assert!(callbacks.finish().is_ok());
+            let query = world.last_query.expect("trace must reach the world");
+            assert_eq!(query.mins, if null_mins { [0.0; 3] } else { nonzero });
+            assert_eq!(query.maxs, if null_mins { nonzero } else { [0.0; 3] });
+        }
     }
 
     #[test]

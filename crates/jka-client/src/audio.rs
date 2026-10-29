@@ -192,6 +192,25 @@ impl SoundAssets {
         }
     }
 
+    /// Long ambience needs MP3 padding removed and a short overlap at its seam.
+    /// Keep legacy one-shot decoding unchanged: some JKA clips have bad tags.
+    pub(crate) fn register_ambient_loop(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
+        let mut sound = decode_sound_with_gapless(self.load_bytes(qpath)?, true)?;
+        let overlap = (sound.sample_rate.get() as usize / 20).min(sound.samples.len() / 4);
+        if overlap > 1 {
+            let mut samples = sound.samples[overlap..].to_vec();
+            let tail = samples.len() - overlap;
+            for i in 0..overlap {
+                let t = i as f32 / (overlap - 1) as f32;
+                // Equal-power overlap keeps steady rain from dipping at the seam.
+                let angle = t * std::f32::consts::FRAC_PI_2;
+                samples[tail + i] = samples[tail + i] * angle.cos() + sound.samples[i] * angle.sin();
+            }
+            sound.samples = samples.into();
+        }
+        Ok(Arc::new(sound))
+    }
+
     pub fn register(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
         let key = qpath.replace('\\', "/").to_ascii_lowercase();
         if key.starts_with("emotes/.bundles/") {
@@ -434,6 +453,10 @@ impl SoundAssets {
 }
 
 fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
+    decode_sound_with_gapless(bytes, false)
+}
+
+fn decode_sound_with_gapless(bytes: Vec<u8>, gapless_mp3: bool) -> Result<RegisteredSound, String> {
     if bytes.starts_with(b"fLaC") || bytes.starts_with(b"OggS") { jka_emotes::validate_audio(&bytes)?; }
     let expected_frames = if bytes.starts_with(b"fLaC") || bytes.starts_with(b"OggS") { Some(jka_emotes::audio_frame_count(&bytes)?) } else { None };
     // Gapless playback (rodio's default) trims the encoder delay/padding a
@@ -449,7 +472,7 @@ fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
         .with_data(Cursor::new(bytes))
         .with_byte_len(byte_len)
         .with_seekable(true)
-        .with_gapless(vorbis);
+        .with_gapless(vorbis || gapless_mp3);
     let builder = if flac { builder.with_hint("flac") } else if vorbis { builder.with_hint("ogg") } else { builder };
     let mut decoder = builder
         .build()
@@ -2619,7 +2642,7 @@ impl AudioBackend {
         self.play_scaled(request, sound, 1.0);
     }
 
-    fn play_scaled(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
+    fn play_scaled(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
         self.play_with_loop(request, sound, volume, None);
     }
     pub fn play_emote(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>, loop_start_sample: Option<u64>) {
@@ -2899,6 +2922,29 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_rain_mp3_padding_and_loop_seam() {
+        use super::*;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut assets = SoundAssets::new(AssetSearchPath::open(&path).unwrap());
+        let qpath = "sound/japro/rainloop_00.mp3";
+        let bytes = assets.load_bytes(qpath).unwrap();
+        let raw = decode_sound(bytes.clone()).unwrap();
+        let gapless = decode_sound_with_gapless(bytes, true).unwrap();
+        let prepared = assets.register_ambient_loop(qpath).unwrap();
+        let overlap = gapless.sample_rate.get() as usize / 20;
+        assert!(gapless.samples.len() < raw.samples.len(), "MP3 encoder padding must be removed");
+        assert_eq!(prepared.samples.len(), gapless.samples.len() - overlap);
+        // The wrap now joins adjacent samples from the original head, rather
+        // than jumping from the recording's unrelated tail into its head.
+        assert!((prepared.samples.last().unwrap() - gapless.samples[overlap - 1]).abs() < 0.000001);
+        assert_eq!(prepared.samples[0], gapless.samples[overlap]);
+        println!("Menu rain: removed {} MP3 padding frames ({:.1} ms), overlapped {} frames (50 ms)",
+            raw.samples.len() - gapless.samples.len(),
+            (raw.samples.len() - gapless.samples.len()) as f32 * 1000.0 / gapless.sample_rate.get() as f32,
+            overlap);
+    }
+
     #[test]
     #[ignore = "requires DJK_EMOTE_AUDIO_LIBRARY with compiled bundles"]
     fn emote_library_decodes_every_scheduled_track_to_its_declared_length() {

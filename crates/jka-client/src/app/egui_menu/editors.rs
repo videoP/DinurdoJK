@@ -3,6 +3,24 @@ use crate::app::egui_menu::{
     scene, theme, ui, App, HudElementId, HudLayout, MapEditTool, OverlayMode,
 };
 
+/// HUD items have different stock origins and anchor conventions. Align the
+/// screen rectangle, then turn the correction back into an offset so snap
+/// always follows the editor's visible grid and the neighbor's real edges.
+fn snap_gameplay_hud_position(
+    id: HudElementId, mut layout: ui::HudElementLayout,
+    context: &ui::HudRectContext, w: u32, h: u32,
+    grid: f32, neighbors: &[(HudElementId, ui::HudRect)],
+) -> (ui::HudElementLayout, [bool; 2]) {
+    let rect = ui::hud_element_rect(id, layout, context, w, h);
+    let (position, matched) = ui::snap_hud_rect_position(
+        rect, neighbors.iter().filter(|(other, _)| *other != id).map(|(_, rect)| *rect),
+        grid, 12.0, 32.0,
+    );
+    layout.offset[0] += position[0] - rect.x;
+    layout.offset[1] += position[1] - rect.y;
+    (layout, matched)
+}
+
 impl App {
     pub(in crate::app::egui_menu) fn egui_hud_editor(&mut self, root: &mut egui::Ui) {
         let Some(window) = self.window.as_ref() else {
@@ -67,7 +85,16 @@ impl App {
             self.threads.len(),
             &self.japro_cg,
             self.strafe_helper,
+            self.video.draw_timer,
+            [self.draw_score_x, self.draw_score_y],
+            self.draw_scores,
         );
+        let neighbors: Vec<_> = HudElementId::ALL.into_iter()
+            .filter(|id| self.hud_edit_element_enabled(*id)
+                && !ui::hud_element_replaced(self.extensions.native_hidden, self.video.draw_hud, *id))
+            .map(|id| (id, ui::hud_element_rect(id, self.hud_layout.element(id),
+                &rect_ctx, size.width, size.height)))
+            .collect();
         // Register broad panels first so small readouts remain grabbable when
         // their bounds overlap a graph, compass, guide, or profiler panel.
         let mut draw_order = HudElementId::ALL.to_vec();
@@ -251,6 +278,38 @@ impl App {
                             }
                         }
 
+                        // Neighbor-size snapping overrides grid rounding when
+                        // a dragged chat edge nearly matches a nearby HUD
+                        // element. The opposite edge stays fixed, so snapping
+                        // adjusts the box's actual width/height, not its anchor.
+                        let mut matched_size = [false; 2];
+                        if self.hud_layout.snap_to_grid && !alt_bypass {
+                            let proposed = ui::HudRect {
+                                x: left, y: top,
+                                width: (right - left).max(0.0),
+                                height: (bottom - top).max(0.0),
+                            };
+                            let neighbors = HudElementId::ALL.into_iter()
+                                .filter(|other| *other != HudElementId::Chat
+                                    && self.hud_edit_element_enabled(*other)
+                                    && !ui::hud_element_replaced(self.extensions.native_hidden,
+                                        self.video.draw_hud, *other))
+                                .map(|other| ui::hud_element_rect(other,
+                                    self.hud_layout.element(other), &rect_ctx,
+                                    size.width, size.height));
+                            let (sizes, matched) = ui::snap_hud_neighbor_size(
+                                proposed, neighbors, 14.0, 32.0);
+                            matched_size = matched;
+                            if matched[0] {
+                                if move_left { left = right - sizes[0]; }
+                                else { right = left + sizes[0]; }
+                            }
+                            if matched[1] {
+                                if move_top { top = bottom - sizes[1]; }
+                                else { bottom = top + sizes[1]; }
+                            }
+                        }
+
                         let mut base_layout = start_layout;
                         base_layout.offset = [0.0, 0.0];
                         base_layout.extent = [1.0, 1.0];
@@ -278,6 +337,20 @@ impl App {
                             bottom = bottom.clamp(top + min_h, (top + max_h).min(screen_h));
                         }
 
+                        // Small edge markers show which dimension locked to
+                        // a neighbor. Never draw these into the actual game HUD.
+                        if matched_size[0] && (right - left) > 0.0 {
+                            painter.line_segment([
+                                egui::pos2(full.left() + to_points(left), full.top() + to_points(bottom)),
+                                egui::pos2(full.left() + to_points(right), full.top() + to_points(bottom)),
+                            ], egui::Stroke::new(2.0, theme::ACCENT));
+                        }
+                        if matched_size[1] && (bottom - top) > 0.0 {
+                            painter.line_segment([
+                                egui::pos2(full.left() + to_points(right), full.top() + to_points(top)),
+                                egui::pos2(full.left() + to_points(right), full.top() + to_points(bottom)),
+                            ], egui::Stroke::new(2.0, theme::ACCENT));
+                        }
                         let next_extent = [
                             ((right - left) / base.width.max(1.0)).clamp(0.25, 4.0),
                             ((bottom - top) / base.height.max(1.0)).clamp(0.25, 8.0),
@@ -330,8 +403,10 @@ impl App {
                 let alt_bypass = root.input(|input| input.modifiers.alt);
                 if self.hud_layout.snap_to_grid && !alt_bypass {
                     let grid = self.hud_layout.grid_size.clamp(1.0, 64.0);
-                    offset[0] = (offset[0] / grid).round() * grid;
-                    offset[1] = (offset[1] / grid).round() * grid;
+                    let proposed = ui::HudElementLayout { offset, ..layout };
+                    let (snapped, _) = snap_gameplay_hud_position(
+                        id, proposed, &rect_ctx, size.width, size.height, grid, &neighbors);
+                    offset = snapped.offset;
                 }
                 let target = self.hud_layout.element_mut(id);
                 if target.offset != offset {
@@ -352,10 +427,12 @@ impl App {
                 egui::Color32::from_rgba_premultiplied(170, 205, 230, 150)
             };
             painter.rect_stroke(
-                rect.expand(3.0),
+                // Draw the handle on the true snapped edge. The previous
+                // 3-pixel expansion made even an 8-aligned default appear off-grid.
+                rect,
                 egui::CornerRadius::ZERO,
                 egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, outline),
-                egui::StrokeKind::Outside,
+                egui::StrokeKind::Inside,
             );
             let disabled = match id {
                 HudElementId::MovementKeys => self.movement_keys_hud.mode == 0,
@@ -434,10 +511,18 @@ impl App {
             // still available for exact values.
             let scroll = root.input(|input| input.smooth_scroll_delta.y);
             if scroll.abs() > f32::EPSILON {
-                let target = self.hud_layout.element_mut(selected);
-                let next = (target.scale + scroll * 0.0025).clamp(0.5, 2.0);
-                if (target.scale - next).abs() > f32::EPSILON {
-                    target.scale = next;
+                let original = self.hud_layout.element(selected);
+                let mut next = original;
+                next.scale = (original.scale + scroll * 0.0025).clamp(0.5, 2.0);
+                if self.hud_layout.snap_to_grid && !root.input(|i| i.modifiers.alt) {
+                    let grid = self.hud_layout.grid_size.clamp(1.0, 64.0);
+                    next.scale = ui::snap_hud_scale_to_grid(
+                        selected, next, next.scale, &rect_ctx, size.width, size.height, grid);
+                    next = snap_gameplay_hud_position(
+                        selected, next, &rect_ctx, size.width, size.height, grid, &neighbors).0;
+                }
+                if original != next {
+                    *self.hud_layout.element_mut(selected) = next;
                     layout_changed = true;
                 }
             }
@@ -505,7 +590,7 @@ impl App {
                             theme::label(
                                 ui,
                                 theme::plain(
-                                    "Drag panels. Mouse wheel scales the selected item. Drag the chat corner grips to resize its wrapping area. ALT bypasses snapping; arrows nudge 1 px; SHIFT+arrow uses the grid step.",
+                                    "Drag snaps actual panel edges to grid and nearby panels (align/touch). Wheel/Scale snaps dimensions to the grid; chat corners snap bounds and nearby sizes. ALT bypasses; arrows nudge 1 px, SHIFT+arrows use grid step.",
                                     10.5,
                                     theme::TEXT_FAINT,
                                 ),
@@ -522,10 +607,20 @@ impl App {
             self.hud_layout.grid_size = clamped_grid;
         }
         if let Some(selected) = self.hud_edit_selected {
-            let scale = selected_scale.clamp(0.5, 2.0);
+            let original = self.hud_layout.element(selected);
+            let mut candidate = original;
+            candidate.scale = selected_scale.clamp(0.5, 2.0);
+            if candidate.scale != original.scale && self.hud_layout.snap_to_grid
+                && !root.input(|i| i.modifiers.alt) {
+                let grid = self.hud_layout.grid_size.clamp(1.0, 64.0);
+                candidate.scale = ui::snap_hud_scale_to_grid(
+                    selected, candidate, candidate.scale, &rect_ctx, size.width, size.height, grid);
+                candidate = snap_gameplay_hud_position(
+                    selected, candidate, &rect_ctx, size.width, size.height, grid, &neighbors).0;
+            }
             let target = self.hud_layout.element_mut(selected);
-            if (target.scale - scale).abs() > f32::EPSILON {
-                target.scale = scale;
+            if *target != candidate {
+                *target = candidate;
                 layout_changed = true;
             }
             if selected == HudElementId::Chat {
@@ -586,6 +681,7 @@ impl App {
         if reset_selected {
             if let Some(selected) = self.hud_edit_selected {
                 self.hud_layout.reset_element(selected);
+                self.hud_layout.align_reset_element_to_grid(selected, &rect_ctx, size.width, size.height);
                 self.hud_edit_drag_origin = None;
                 self.hud_edit_drag_delta = [0.0, 0.0];
                 self.hud_edit_chat_resize_origin = None;
@@ -594,7 +690,11 @@ impl App {
             }
         }
         if reset_all {
+            // Reset must normalize the on-screen bounds of *every* element;
+            // old cvar positions must not survive because they were not exact
+            // `Default` values when the first pass ran.
             self.hud_layout = HudLayout::default();
+            self.hud_layout.align_default_elements_to_grid(&rect_ctx, size.width, size.height);
             self.hud_edit_drag_origin = None;
             self.hud_edit_drag_delta = [0.0, 0.0];
             self.hud_edit_chat_resize_origin = None;
@@ -934,8 +1034,8 @@ impl App {
             let outline = if selected { theme::ACCENT }
                 else if response.hovered() { theme::TEXT }
                 else { egui::Color32::from_rgba_premultiplied(170,205,230,150) };
-            painter.rect_stroke(rect.expand(3.0),egui::CornerRadius::ZERO,
-                egui::Stroke::new(if selected {2.0}else{1.0},outline),egui::StrokeKind::Outside);
+            painter.rect_stroke(rect,egui::CornerRadius::ZERO,
+                egui::Stroke::new(if selected {2.0}else{1.0},outline),egui::StrokeKind::Inside);
             painter.text(rect.left_top()+egui::vec2(0.0,-8.0),egui::Align2::LEFT_BOTTOM,
                 format!("EXT: {}{}", widget.name, if p.visible {""} else {" (hidden)"}),
                 egui::FontId::proportional(11.0),outline);

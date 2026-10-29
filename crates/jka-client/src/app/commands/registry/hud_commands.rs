@@ -75,6 +75,13 @@ commands! {
         }
     }
 
+    cmd_amtelegui ["amtelegui", ] ("amtelegui", "Open persistent map-scoped teleport bookmarks.", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => { self.open_telemarks(); CommandResult::Handled }
+            _ => CommandResult::Unhandled,
+        }
+    }
+
     cmd_trailmenu ["trailMenu", ] ("trailMenu", "Open the Strafe Trails GUI.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -243,6 +250,7 @@ commands! {
                     self.hud_edit_drag_delta = [0.0, 0.0];
                     self.hud_edit_chat_resize_origin = None;
                     self.hud_edit_chat_resize_corner = None;
+                    self.align_hud_defaults_for_editor();
                     self.set_overlay(OverlayMode::HudEdit);
                 }
                 CommandResult::Handled

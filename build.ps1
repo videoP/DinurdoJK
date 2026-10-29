@@ -186,7 +186,13 @@ try {
         (Get-FileHash -LiteralPath $runtimeAssetPackage).Hash) {
         Copy-Item -LiteralPath $assetPackage -Destination $runtimeAssetPackage -Force
     }
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg') -Destination (Join-Path $runtimeBase 'shader_modes_ab.cfg') -Force
+    $shaderModes = Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg'
+    $runtimeShaderModes = Join-Path $runtimeBase 'shader_modes_ab.cfg'
+    if (-not (Test-Path -LiteralPath $runtimeShaderModes) -or
+        (Get-FileHash -LiteralPath $shaderModes).Hash -ne
+        (Get-FileHash -LiteralPath $runtimeShaderModes).Hash) {
+        Copy-Item -LiteralPath $shaderModes -Destination $runtimeShaderModes -Force
+    }
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }
     Write-Host 'Place a GameData-style base folder beside the executable. Assets may be loose files or live in any .pk3.'

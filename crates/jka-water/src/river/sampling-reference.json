@@ -1,0 +1,56 @@
+{
+  "asset": "Engine/Plugins/Experimental/WaterAdvanced/Content/Niagara/Systems/Grid2D_SW_River.uasset",
+  "asset_sha1": "ef7c1d07a697489503a4a5819e5a5074711e09a1",
+  "grids": [
+    {
+      "path": "Grid2D_SW_River.ShallowWaterRiverEmitter_1.NiagaraScriptSource_1_2.NiagaraGraph_0.NiagaraNodeInput_23.SetVariables_0F55809C4D7E393EDC8F078EF1E9A6BA_Emitter_WaterGrid",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollection",
+      "template_index": 0,
+      "bOverrideFormat": true,
+      "override_flag_offset": 1424232,
+      "OverrideBufferFormat": "Float (omitted, native constructor default)",
+      "pixel_format": "PF_R32_FLOAT",
+      "cached_system_spawn_binding": {
+        "name": "ShallowWaterRiverEmitter.SetVariables_0F55809C4D7E393EDC8F078EF1E9A6BA.Emitter.WaterGrid",
+        "registered_write": "ShallowWaterRiverEmitter.WaterGrid",
+        "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollection_47",
+        "binding_source_offset": 10997183,
+        "bOverrideFormat": true,
+        "override_flag_offset": 1424996
+      }
+    },
+    {
+      "path": "Grid2D_SW_River.ShallowWaterRiverEmitter_1.NiagaraScriptSource_1_2.NiagaraGraph_0.NiagaraNodeInput_22.SetVariables_0F55809C4D7E393EDC8F078EF1E9A6BA_Emitter_VelocityGrid",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollection",
+      "template_index": 0,
+      "bOverrideFormat": true,
+      "override_flag_offset": 1424194,
+      "OverrideBufferFormat": "Float (omitted, native constructor default)",
+      "pixel_format": "PF_R32_FLOAT",
+      "cached_system_spawn_binding": {
+        "name": "ShallowWaterRiverEmitter.SetVariables_0F55809C4D7E393EDC8F078EF1E9A6BA.Emitter.VelocityGrid",
+        "registered_write": "ShallowWaterRiverEmitter.VelocityGrid",
+        "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollection_46",
+        "binding_source_offset": 10996792,
+        "bOverrideFormat": true,
+        "override_flag_offset": 1424958
+      }
+    }
+  ],
+  "sampler": {
+    "filter": "SF_Bilinear",
+    "address": "AM_Clamp on U/V/W",
+    "level": 0
+  },
+  "sources": [
+    {
+      "path": "Engine/Plugins/FX/Niagara/Source/Niagara/Private/NiagaraDataInterfaceGrid2DCollection.cpp",
+      "sha256": "82c46da38fe42173ab9288bbd64de6bd399cb3f5265f8da84ae39b7d591a6ffa"
+    },
+    {
+      "path": "Engine/Plugins/FX/Niagara/Source/Niagara/Private/NiagaraCommon.cpp",
+      "sha256": "ea04319a198f2222779f0fd8c14a471bbd5f67de6364b0081427ca3e93010a8d"
+    }
+  ],
+  "caveat": "Saved selected graph/native defaults and source sampling, not an executing Niagara system or project/global format overrides."
+}

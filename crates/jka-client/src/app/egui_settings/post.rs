@@ -6,6 +6,24 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_post_processing(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "THERMAL VISION", "Experimental scene heat estimation with separate thermal palettes. Off has no thermal passes or shader variant. World shader material types are classified; dynamic models use a warm-biased fallback.");
+        const THERMAL_PALETTES: [(u8, &str); 6] = [
+            (0, "Off"), (1, "Predator"), (2, "White hot"),
+            (3, "Black hot"), (4, "Ironbow"), (5, "Heat debug"),
+        ];
+        if let Some(mode) = segmented_row(
+            ui, "Heat vision",
+            "Predator uses the Geeks3D blue-yellow-red palette. White hot, black hot and ironbow share the same scalar heat estimate; heat debug shows it as grayscale.",
+            theme::Reset::None,
+            self.video.thermal_vision,
+            &THERMAL_PALETTES,
+        ) {
+            self.video.thermal_vision = mode;
+            self.sync_post_effects();
+            self.mark_config_dirty();
+            self.publish_ui();
+        }
+
         theme::section(
             ui,
             "CRT",

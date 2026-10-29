@@ -5,7 +5,7 @@ use crate::app::egui_settings::{
     PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
     PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
     PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES, PHYS_JIGGLE,
-    PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z,
+    PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_HAIR,
     PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE, PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z,
     PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z,
     PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG, PHYS_JIGGLE_JP_GRAVITY,
@@ -190,6 +190,19 @@ impl App {
             &JIGGLE_TARGETS,
         ) {
             let _ = self.set_console_cvar("r_jigglePhysics", &mode.to_string());
+        }
+        const HAIR_MODES: [(u8, &str); 3] = [
+            (0, "Off"), (1, "Authored"), (2, "Authored + GLM"),
+        ];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Hair physics",
+            "0 disables procedural hair motion. 1 uses authored jigglebones on imported Source models. 2 also simulates native JKA GLM surfaces beginning with hair (case-insensitive). Does not use cloth or body jiggle settings.",
+            theme::Reset::Physics(PHYS_HAIR),
+            self.video.hair_physics,
+            &HAIR_MODES,
+        ) {
+            let _ = self.set_console_cvar("cg_hairPhysics", &mode.to_string());
         }
         const JIGGLE_SOLVER: [(u8, &str); 2] = [(0, "KawaiiPhysics"), (1, "JigglePhysics")];
         if let Some(mode) = segmented_row(

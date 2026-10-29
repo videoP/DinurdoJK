@@ -10,6 +10,37 @@ const TEAM_SPECTATOR: i32 = 3;
 const PW_REDFLAG: i32 = 4;
 const PW_BLUEFLAG: i32 = 5;
 
+/// Spectator outlines require the connected client's spectator team when it
+/// is known. The snapshot's PERS_TEAM/PMF_FOLLOW are only a fallback because
+/// both can represent a different camera owner under follow/NPC-control mods.
+fn live_spec_hud_eligible(connected_team: Option<i32>, snapshot_team: i32, pm_flags: i32) -> bool {
+    connected_team.map_or(
+        snapshot_team == TEAM_SPECTATOR || pm_flags & PMF_FOLLOW != 0,
+        |team| team == TEAM_SPECTATOR,
+    )
+}
+
+#[cfg(test)]
+mod spec_hud_tests {
+    use super::*;
+
+    #[test]
+    fn live_spec_hud_uses_connected_team_over_borrowed_camera_flags() {
+        // Spectators in freecam and followcam retain their own userinfo team.
+        assert!(live_spec_hud_eligible(Some(TEAM_SPECTATOR), TEAM_SPECTATOR, 0));
+        assert!(live_spec_hud_eligible(Some(TEAM_SPECTATOR), 0, PMF_FOLLOW));
+        // NPC-control mods can set follow/spectator bits without transferring
+        // the actual connected player to the spectator team.
+        assert!(!live_spec_hud_eligible(Some(0), 0, PMF_FOLLOW));
+        assert!(!live_spec_hud_eligible(Some(0), TEAM_SPECTATOR, PMF_FOLLOW));
+        assert!(!live_spec_hud_eligible(Some(0), 0, 0));
+        // Before userinfo is available, retain the original snapshot gate.
+        assert!(live_spec_hud_eligible(None, TEAM_SPECTATOR, 0));
+        assert!(live_spec_hud_eligible(None, 0, PMF_FOLLOW));
+        assert!(!live_spec_hud_eligible(None, 0, 0));
+    }
+}
+
 /// What the spectator can see of everyone's speed.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SpectateInfo {
@@ -113,6 +144,30 @@ impl App {
     /// unless the user explicitly gave that key a spectator override.
     pub(super) fn spectator_binding_context(&self) -> bool {
         self.is_spectating_live() || self.demo_playback_active()
+    }
+
+    /// Live `cg_specHud` belongs to the connected spectator, not necessarily
+    /// to the playerState currently used to render the camera. In ordinary
+    /// follow mode the snapshot borrows the followed player's PERS_TEAM and
+    /// clientNum; conversely, custom NPC-control mods can borrow spectator-like
+    /// playerState flags while the connected client remains a playing client.
+    ///
+    /// Prefer CS_PLAYERS for our actual network client slot; only fall back to
+    /// the snapshot when no such userinfo is available (e.g. early gamestate).
+    pub(super) fn live_spec_hud_eligible(&self) -> bool {
+        let Some(session) = self.game_session.as_ref().filter(|session| session.live) else {
+            return false;
+        };
+        let Some(ps) = session.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state) else {
+            return false;
+        };
+        let connected_team = self
+            .net
+            .as_ref()
+            .and_then(|net| usize::try_from(net.session().client_num()).ok())
+            .and_then(|client| session.client_game.client_info(client, &session.siege_classes))
+            .map(|info| info.team);
+        live_spec_hud_eligible(connected_team, ps.persistant[PERS_TEAM], ps.field_i32("pm_flags").unwrap_or(0))
     }
 
     /// Orbit input only owns the mouse while actually following somebody. A

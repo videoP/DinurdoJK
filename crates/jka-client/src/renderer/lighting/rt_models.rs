@@ -12,6 +12,7 @@ struct CompiledRtModelReceivers {
 
 pub(super) struct RtModelReceivers {
     pub key: (wgpu::TextureFormat, u32, bool, bool),
+    pub lights_layout: wgpu::BindGroupLayout,
     pub lights: wgpu::BindGroup,
     pub opaque: wgpu::RenderPipeline,
     pub mask: wgpu::RenderPipeline,
@@ -56,39 +57,13 @@ impl Renderer {
             let Some(world) = self.world.as_ref() else {
                 return;
             };
-            let lights = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("RT model local lights"),
-                layout: &compiled.lights_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: world.light_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: world._cluster_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.lighting_settings_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&world.local_shadows.cube_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::Sampler(&world.local_shadows.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 17,
-                        resource: world.local_shadows.glass_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            let lights = model_lights_bind_group(
+                &self.device, &compiled.lights_layout, world, &self.lighting_settings_buffer,
+            );
             if let Some(rt) = self.ray_traced_shadows.as_mut() {
                 rt.model_receivers = Some(RtModelReceivers {
                     key: compiled.key,
+                    lights_layout: compiled.lights_layout,
                     lights,
                     opaque: compiled.opaque,
                     mask: compiled.mask,
@@ -137,6 +112,46 @@ impl Renderer {
                 }
             });
     }
+}
+
+/// Map-owned light buffers and the local-light shadow cache. Rebuilt on
+/// install and when a Studio scene parks or restores that cache.
+pub(super) fn model_lights_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    world: &crate::renderer::WorldGpu,
+    lighting_settings_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("RT model local lights"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: world.light_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: world._cluster_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: lighting_settings_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&world.local_shadows.cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&world.local_shadows.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: world.local_shadows.glass_buffer.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn discard_incompatible_receivers(
@@ -225,7 +240,7 @@ pub(super) fn declaration<'a>(source: &'a str, anchor: &str) -> Result<&'a str, 
 // past all of them, and on the same location the pipeline's second vertex buffer
 // binds; a new vertex field otherwise silently collides with it.
 const _: () = assert!(
-    RT_RECEIVER_RAW_COLOR_LOCATION == 6,
+    RT_RECEIVER_RAW_COLOR_LOCATION == 7,
     "update the injected VertexIn raw_color location in model_shader_source"
 );
 
@@ -237,6 +252,7 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             &include_str!("../../md3.wgsl").replace("\r\n", "\n"),
         )
     );
+    source.push_str(include_str!("../../studio_lighting.wgsl"));
     // RT model receivers only compile the opaque, mask, and blend entry points.
     // The regular model's glass entry points need a separate glass resource
     // group, which is absent from this receiver layout.
@@ -338,12 +354,14 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
     for (from, to, count) in [
         (
             "@location(3) color: vec4<f32>,",
-            "@location(3) color: vec4<f32>,\n    @location(6) raw_color: vec4<f32>,",
+            "@location(3) color: vec4<f32>,\n    @location(7) raw_color: vec4<f32>,",
             1,
         ),
         (
             "@location(3) world_position: vec3<f32>,",
-            "@location(3) world_position: vec3<f32>,\n    @location(5) raw_color: vec4<f32>,",
+            // MD3 outputs 6/7 are cloak varyings; preserve the raw-color
+            // vertex input at 7 and use a free inter-stage output location.
+            "@location(3) world_position: vec3<f32>,\n    @location(8) raw_color: vec4<f32>,",
             1,
         ),
         (
@@ -352,7 +370,7 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             1,
         ),
         (
-            "lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness)",
+            "studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness)",
             "rt_model_color(input, tex), input.normal, input.world_position, input.water_wetness)",
             2,
         ),
@@ -413,7 +431,7 @@ mod tests {
                 });
                 let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
                 let lights = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[] });
-                RtModelReceivers { key, lights, opaque: pipeline.clone(), mask: pipeline.clone(), blend: pipeline.clone(), mask_blend: pipeline }
+                RtModelReceivers { key, lights_layout: layout, lights, opaque: pipeline.clone(), mask: pipeline.clone(), blend: pipeline.clone(), mask_blend: pipeline }
             };
             let encode = |pipeline: &wgpu::RenderPipeline, key: (wgpu::TextureFormat, u32, bool, bool)| {
                 let target = device.create_texture(&wgpu::TextureDescriptor {

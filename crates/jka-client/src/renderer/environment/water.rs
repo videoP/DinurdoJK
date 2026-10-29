@@ -311,6 +311,7 @@ impl Renderer {
                     &self.ocean_spray_albedo.view,
                     self.ocean_settings,
                     &self.ocean_interaction.render,
+                    &self.lake_normal,
                 );
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);
@@ -364,6 +365,7 @@ impl Renderer {
                     &self.ocean_spray_albedo.view,
                     settings,
                     &self.ocean_interaction.render,
+                    &self.lake_normal,
                 )
             };
             gpu.set_settings(&self.queue, settings);
@@ -420,6 +422,7 @@ impl Renderer {
                     &self.ocean_spray_albedo.view,
                     self.ocean_settings,
                     &self.ocean_interaction.render,
+                    &self.lake_normal,
                 );
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);

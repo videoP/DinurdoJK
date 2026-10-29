@@ -690,6 +690,7 @@ impl App {
             width,
             height,
             self.console_size,
+            self.console_scale,
             hits.len(),
             selected,
             detail_lines,

@@ -62,6 +62,7 @@ mod entity_graph;
 mod extensions;
 mod fx;
 mod grass;
+mod foliage;
 mod japro_cg;
 mod jump_shade;
 mod keybinds;
@@ -78,6 +79,16 @@ mod neon_menu;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;
+mod river_capture;
+mod river_gpu;
+mod river_grid_mesh;
+mod river_material;
+mod river_ocean;
+mod river_map;
+mod river_water_info;
+mod river_water_info_capture;
+#[cfg(test)]
+mod river_port_tests;
 mod blue_water_environment;
 mod player;
 mod pipeline_cache;
@@ -87,6 +98,7 @@ mod renderer;
 mod runtime;
 mod scene;
 mod screenshot;
+mod filesystem_paths;
 mod streamer;
 mod server_browser;
 mod speedometer;
@@ -192,6 +204,9 @@ struct Options {
     /// onto DinurdoJK.exe in Explorer.
     screenshot_path: Option<PathBuf>,
     screenshot_metadata: Option<screenshot::ScreenshotMetadata>,
+    /// `.dm_26` supplied as a positional argument, e.g. by dragging a demo
+    /// onto DinurdoJK.exe in Explorer.
+    demo_path: Option<PathBuf>,
 }
 
 impl Options {
@@ -215,6 +230,7 @@ impl Options {
             startup_commands: Vec::new(),
             screenshot_path: None,
             screenshot_metadata: None,
+            demo_path: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -252,6 +268,15 @@ impl Options {
                     };
                     options.screenshot_path = Some(path);
                 }
+                demo if !demo.starts_with('-')
+                    && options.startup_commands.is_empty()
+                    && is_demo_path(std::path::Path::new(demo)) =>
+                {
+                    if options.demo_path.is_some() {
+                        return Err("only one startup demo can be opened at a time".into());
+                    }
+                    options.demo_path = Some(PathBuf::from(demo));
+                }
                 word if !word.starts_with("--") && !options.startup_commands.is_empty() => {
                     let line = options.startup_commands.last_mut().expect("checked non-empty");
                     line.push(' ');
@@ -259,7 +284,7 @@ impl Options {
                 }
                 _ => {
                     return Err(
-                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [--console] [screenshot.jpg] [+command args ...]"
+                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [--console] [screenshot.jpg] [demo.dm_26] [+command args ...]"
                             .into(),
                     )
                 }
@@ -294,6 +319,14 @@ fn is_screenshot_path(path: &std::path::Path) -> bool {
             .is_some_and(|extension| {
                 matches!(extension.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png")
             })
+}
+
+fn is_demo_path(path: &std::path::Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dm_26"))
 }
 
 fn main() -> std::process::ExitCode {
@@ -384,6 +417,37 @@ fn main() -> std::process::ExitCode {
     // The grass noise images are CPU-generated and deterministic; build them while
     // the window and GPU device are being created.
     grass::prewarm_noise();
+
+    // Bootstrap filesystem roots before any worker indexes or reads assets.
+    // CLI +set fs_* overrides the small exe-local paths file on this run.
+    let mut fs_roots = filesystem_paths::load(&options.base);
+    if let Err(error) = filesystem_paths::apply_startup_commands(
+        &options.base, &mut fs_roots, &options.startup_commands
+    ) {
+        eprintln!("Invalid filesystem startup setting: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    jka_assets::pk3::configure_filesystem_roots(&options.base, fs_roots.clone());
+
+    // A missing retail installation is not fatal (2D menu and tools still work).
+    // Explain the fix once on startup instead of flooding the console with
+    // secondary missing-map/texture errors. fs_cdpath points to GameData, NOT base/.
+    let asset_dirs = jka_assets::pk3::filesystem_search_dirs(
+        &options.base, game_dir.as_deref(), &fs_roots,
+    );
+    if let Some(cdpath) = &fs_roots.cdpath {
+        if !cdpath.join("base").is_dir() {
+            eprintln!(
+                "[FILESYSTEM] fs_cdpath={} has no base/ directory; expected <fs_cdpath>/base/assets0.pk3. Restart after correcting the cvar.",
+                cdpath.display()
+            );
+        }
+    }
+    if !asset_dirs.iter().any(|dir| (0..=3).any(|n| dir.join(format!("assets{n}.pk3")).is_file())) {
+        eprintln!(
+            "[FILESYSTEM] No retail JKA assets0.pk3..assets3.pk3 found in mounted base folders. Set fs_cdpath to the GameData directory containing base/assets0.pk3, then restart. The 2D menu remains available."
+        );
+    }
 
     // Index the asset packages now, in parallel with window, adapter and device
     // creation. The index is cached process-wide (jka_assets::pk3), so the
@@ -539,6 +603,7 @@ fn main() -> std::process::ExitCode {
     let startup_commands = options.startup_commands;
     let startup_screenshot_path = options.screenshot_path.clone();
     let startup_screenshot_metadata = options.screenshot_metadata.clone();
+    let startup_demo_path = options.demo_path.clone();
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppBegin);
     let mut application = match app::App::new(
         options.base,
@@ -550,6 +615,9 @@ fn main() -> std::process::ExitCode {
         Ok(mut application) => {
             if let Some(path) = startup_screenshot_path {
                 application.configure_startup_screenshot(path, startup_screenshot_metadata);
+            }
+            if let Some(path) = startup_demo_path {
+                application.configure_startup_demo(path);
             }
             application.queue_startup_commands(startup_commands);
             application

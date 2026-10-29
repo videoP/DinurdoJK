@@ -68,7 +68,8 @@ impl Renderer {
             shadow_params: [
                 SHADOW_MAP_SIZE as f32,
                 0.0006,
-                if self.cascaded_shadows_enabled && shadow_matrices.is_some() {
+                if self.cascaded_shadows_enabled && shadow_matrices.is_some()
+                    && self.cascaded_shadow_mode != DynamicShadowsMode::CascadedShadowMapsEntities {
                     1.0
                 } else {
                     0.0

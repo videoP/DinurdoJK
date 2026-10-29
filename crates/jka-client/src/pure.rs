@@ -64,7 +64,24 @@ pub fn build_pure_command(
     // first pak in search order holding it; fs_game paks outrank base). Only paks
     // below assets3 can be reached by the walk.
     let bsp = format!("maps/{}.bsp", map_name.trim_end_matches(".bsp"));
-    let has_bsp = |path: &Path| jka_assets::pak_checksum::pk3_has_entry(path, &[bsp.as_str()]).unwrap_or(false);
+    // The shared VFS index already knows every package holding the BSP, so
+    // answer from it instead of parsing each PK3's central directory here on
+    // the gamestate path (base can hold ~100 paks). Opening the zips directly
+    // stays the fallback when the index is unavailable.
+    let bsp_paks = jka_assets::pk3::AssetSearchPath::open_game(base_dir, game_dir)
+        .ok()
+        .map(|assets| {
+            assets
+                .indexed_providers(&bsp)
+                .into_iter()
+                .filter(|provider| provider.archive)
+                .map(|provider| provider.source)
+                .collect::<Vec<_>>()
+        });
+    let has_bsp = |path: &Path| match &bsp_paks {
+        Some(paks) => paks.iter().any(|pak| pak == path),
+        None => jka_assets::pak_checksum::pk3_has_entry(path, &[bsp.as_str()]).unwrap_or(false),
+    };
     let bsp_in_game_dir = game_dir
         .filter(|game| *game != base_dir)
         .is_some_and(|game| pk3_search_order(game).iter().any(|path| has_bsp(path)));
@@ -115,7 +132,7 @@ fn pk3_search_order(dir: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            path.is_file() && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
+            path.is_file() && jka_assets::pk3::package_enabled(path) && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
         })
         .collect();
     paks.sort_by_key(|path| Reverse(path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase())));

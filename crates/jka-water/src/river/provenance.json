@@ -1,0 +1,334 @@
+{
+  "reference_engine": "Unreal Engine 5.8.1",
+  "manifest_sha256": "c00d24b84a80772b7c82c517044e80e8316166c109297722fa767162c5ee746c",
+  "asset": "/WaterAdvanced/Niagara/Systems/Grid2D_SW_River",
+  "asset_sha1": "ef7c1d07a697489503a4a5819e5a5074711e09a1",
+  "cached_gpu_shader_sha256": "cfee665bcae66dd803d819bd536c3a059be9e351ca4aba5acb9a338ea9de4b7d",
+  "status": "Native captures feed bed preparation and hydraulic dispatches without CPU readback. Reset-only Niagara grid geometry, native half material output textures/mips, final normal blur, shared native 512-cell FFT normal/height producer and live-grid displacement with bracketed three-phase wave advection are ported. Native spline evaluation/map authoring, discharge enforcement, remaining detail/foam/optical graphs and normal-game integration remain",
+  "kernels": [
+    {
+      "stage": 1,
+      "name": "Create Vertices",
+      "source_functions": ["ScratchModule_05_Emitter_Func"],
+      "cpu": "grid_mesh.rs::GridMesh::vertex",
+      "wgsl": "grid_mesh.wgsl::create_vertices",
+      "notes": "Reset only; native flat local positions, Float32 UVs and GPU-DI packed SNORM8 tangent basis/UNORM8 white colour. Displacement is a separate material operation"
+    },
+    {
+      "stage": 2,
+      "name": "Create Triangles",
+      "source_functions": ["ScratchModule_06_Emitter_Func"],
+      "cpu": "grid_mesh.rs::GridMesh::quad",
+      "wgsl": "grid_mesh.wgsl::create_triangles",
+      "notes": "Reset only; one native section with 2 triangles per cell and (NumCellsX+1)*(NumCellsY+1) vertices. Selected MeshResMult is 1"
+    },
+    {
+      "stage": 6,
+      "name": "Source and Sink",
+      "source_functions": [
+        "CustomHlslF1BB3DEAD3E4E4B8C668CD05E9354708F2635488User_SinkPosArrayUser_SinkAngleArrayUser_SinkSizeArray_Func",
+        "CustomHlslF1BB3DEAD3E4E4B8C668CD05E9354708F2635488User_SourcePosArrayUser_SourceAngleArrayUser_SourceSizeArray_Func"
+      ],
+      "cpu": "boundary.rs::apply",
+      "wgsl": "shallow.wgsl::source_and_sink",
+      "notes": "Selected graph source velocity is zero/nonadditive; sink is a band and uses Engine.DeltaTime"
+    },
+    {
+      "stage": 7,
+      "name": "Distribute Overlap Volume",
+      "source_functions": [
+        "CustomHlslF1EBCB1B73FFCC4DF038DC765241B52593FAEE1EEmitter_GridCollection_Func"
+      ],
+      "wgsl": "shallow.wgsl::distribute_overlap",
+      "notes": "Selected graph passes zero overlap multiplier and radius; retains depth clamp/height reconstruction"
+    },
+    {
+      "stage": 8,
+      "name": "Extrapolate Velocities",
+      "source_functions": [
+        "CustomHlsl53CAFB41F644B6073D52EF486E9B29309BD834F6Emitter_GridCollectionEmitter_VelocityGridEmitter_WaterGrid_Func"
+      ],
+      "cpu": "transport.rs::Field::extrapolate_velocity",
+      "wgsl": "shallow.wgsl::extrapolate_velocity"
+    },
+    {
+      "stage": 9,
+      "name": "Advect Water",
+      "source_functions": [
+        "CustomHlslB7813AB53ADB0CCD1787B92098BC9D7F7F642E88Emitter_GridCollectionEmitter_VelocityGridEmitter_WaterGrid_Func",
+        "CustomHlsl3941C115C22D5DD267B63F53AADD1B528B3B5923_Func"
+      ],
+      "cpu": "transport.rs::Field::advect",
+      "wgsl": "shallow.wgsl::advect_water",
+      "notes": "Basic2DCubic interpolation, component-specific bilinear fallback, staggered velocities and changed-bottom suppression"
+    },
+    {
+      "stage": 10,
+      "name": "Extrapolate Height",
+      "source_functions": [
+        "CustomHlsl8F2AD6637FC15856A8C54A400A2420FD2A0B1C91Emitter_GridCollectionEmitter_WaterGrid_Func"
+      ],
+      "cpu": "transport.rs::Field::extrapolate_height",
+      "wgsl": "shallow.wgsl::extrapolate_height"
+    },
+    {
+      "stage": 11,
+      "name": "Update Velocity",
+      "source_functions": [
+        "CustomHlsl0026392BB667750A56EB0872523D397A15EB368A462Emitter_GridCollectionEmitter_WaterGrid_Func"
+      ],
+      "cpu": "stages.rs::velocity",
+      "wgsl": "shallow.wgsl::update_velocity"
+    },
+    {
+      "stage": 12,
+      "name": "Update Depth",
+      "source_functions": [
+        "CustomHlslF08CD7C566B1E17CF3B100F2D814C16A16FCDB98Emitter_VelocityGridEmitter_WaterGrid_Func"
+      ],
+      "cpu": "stages.rs::depth",
+      "wgsl": "shallow.wgsl::update_depth",
+      "selected_branches": [
+        "ComplexUpwind",
+        "Upwind",
+        "DepthLimiter",
+        "KeepWaterDepthInsideColliders"
+      ]
+    },
+    {
+      "stage": 12,
+      "name": "Match Spline",
+      "source_functions": [
+        "CustomHlsl87176964D90CF0AAE7C2EC2AAE394EDB3D15E314_Func"
+      ],
+      "cpu": "boundary.rs::match_spline",
+      "wgsl": "shallow.wgsl::match_spline",
+      "notes": "Separate f32 dispatch for same-cell graph operation; original height/removal behavior retained"
+    },
+    {
+      "stage": 13,
+      "name": "Post Sim",
+      "source_functions": [
+        "CustomHlsl1AB45664D417AF8218C02A5A2137E6ADB33F5E64Emitter_GridCollectionEmitter_WaterGrid_Func",
+        "CustomHlsl3F1DEFC4DEFC31575D9149CCA649715E77912686Emitter_VelocityGrid_Func"
+      ],
+      "cpu": "transport.rs::Field::present",
+      "wgsl": "shallow.wgsl::prepare_surface",
+      "notes": "Only smoothed height enters WaterGrid; render depth/blurred velocity enter separate surface buffer"
+    },
+    {
+      "stage": 14,
+      "name": "Compute Normals",
+      "source_functions": [
+        "CustomHlsl549A2785D336F9BE31E400858729568EFB2B3AC6Emitter_WaterGrid_Func",
+        "Grid2D_SW_ComputeNormals_Emitter_Func"
+      ],
+      "cpu": "transport.rs::Field::normal_and_reset",
+      "wgsl": "shallow.wgsl::compute_normals_and_reset",
+      "notes": "Normals read smoothed height, then hydraulic height resets to bottom plus depth"
+    }
+  ],
+  "outstanding_parity": [
+    "Fresh compilation of current Niagara graphs versus cached shader",
+    "Original grid formats and quantization (including fused depth/spline stage write)",
+    "Map capture classification, material masking/displacement and managed camera clip-plane selection",
+    "Native adaptive spline evaluation and BSP WaterBody authoring; mesh construction currently takes evaluated native spline samples rather than inventing a centreline",
+    "Map discharge/velocity and outlet-rate demands are retained metadata, not enforced by the selected native height-controlled source/sink graph",
+    "Remaining foam initialization and dynamic collision preparation",
+    "Full foam/secondary and material presentation",
+    "Equivalent Unreal/game scene and channel comparisons"
+  ],
+  "ocean_reference": {
+    "evidence": "ocean-reference.json",
+    "seed": "ocean-noise.g8",
+    "reproduce": "scripts/ue-river-ocean.py <engine> <cached-ocean-shader.hlsl> crates/jka-water/src/river/ocean-reference.json crates/jka-water/src/river/ocean-noise.g8",
+    "cpu": "ocean.rs",
+    "wgsl": "ocean.wgsl",
+    "gpu": "jka-client/src/river_ocean.rs",
+    "notes": [
+      "Selected 512x512 grid, 256-thread groups, native shared-memory radix-two butterfly/exchange order and positive unnormalized transform signs; spectrum sign/mask carry across the two local coefficients is retained",
+      "Seed UV helper receives scanline/group before thread, preserving the native wrapper call order; negative folded UVs use wrap SampleLevel",
+      "The exact Good64x64TilingNoiseHighFreq source bulk is resolved through its serialized FEditorBulkData pointer, checked against its uncompressed FCompressedBuffer header/CRC/sizes and PNG chunk CRCs, then source R is extracted as G8 per current texture build rules",
+      "G8 raw Niagara samples are R001 on the selected D3D/Vulkan formats, not replicated grayscale; no sRGB or mip chain. No arbitrary random texture replaces the source asset",
+      "Real and imaginary grid attributes use default half stores between axes, with full f32 shared-memory intermediates. Two attributes pack into RG of RGBA16f scratch; B/A are unused",
+      "Normals preserve native wrapped forward differences/cross/guard and dx=150/512 despite ocean length parameter 250; final RGBA16f holds RGB normal and alpha RealPart, followed by native linear post-simulate mips",
+      "One shared owner animates independently of frozen hydraulics. Prepared frames retain immutable 48-byte age/settings snapshots; encode creates no resources or CPU readback. Normal game/frame-uniform integration remains",
+      "This is a cached-source port and reconstructed source-build G8 input, not an executing Unreal or cooked-resource/scene comparison"
+    ]
+  },
+  "wave_advection_reference": {
+    "evidence": "wave-advection-reference.json",
+    "reproduce": "scripts/ue-river-wave-advection.py <engine> <cached-ocean-shader.hlsl> crates/jka-water/src/river/wave-advection-reference.json",
+    "cpu": "wave_advection.rs",
+    "wgsl": ["wave_advection.wgsl", "wave_vertex.wgsl"],
+    "notes": [
+      "Selected MF_TextureAdvection Custom 5 with Bracketing=true and ThreePhase=true; four direction/magnitude brackets times three phase samples, native fmod cycles, weights and PseudoRandom offsets",
+      "Wave advection projects speed-scaled velocity against the filtered unnormalized simulation normal; fragment mip derivatives instead use original unscaled/unprojected velocity. Vertex mip is the parent bias 2",
+      "The same random scalar offset is added to both UV coordinates; native dot/frac hash arithmetic is retained rather than replaced with a cross-platform deterministic hash",
+      "Required shared OceanNormalRT RGB contains normals and alpha contains RealPart height. Cached output code is checked against the serialized shader in the exact native Grid2D_OceanPatch asset",
+      "The wave evidence's cached shader hash uses CRLF-to-LF normalized UTF-8 text; the recovered mixed-line-ending file's byte SHA256 is 2b60388108538a51e73eb051a35c7a69c70d90b1e310d632a4714540d0d5ac7c",
+      "Alpha wave height retains selected parent attenuation 0..400, low-speed scale 0.1, exponent 3, height multiplier 5, PositiveClampedPow threshold and increasing camera smoothstep 200..250 cm",
+      "Connected live-grid WPO takes each phase's upstream time, position, distance and transforms; tests separately evaluate current and previous time and execute the connected path in a real vertex stage",
+      "Native atan2(0,0) is undefined: tested DXC/Vulkan produce finite unused zero-flow angles, but FXC propagates NaNs. An independent primitive classifies this; undefined sampling/raster results are excluded from finite-result checks. No guard/direction is invented, and FXC zero-flow rendering remains an integration limitation",
+      "The required shared FFT producer is now ported separately in ocean.rs/ocean.wgsl and river_ocean.rs. Full detail/foam/optics, cached VT and normal game integration remain; diagnostic fixture textures are never production replacements"
+    ]
+  },
+  "material_output_reference": {
+    "evidence": "presentation-reference.json",
+    "reproduce": "scripts/ue-river-presentation.py <engine> <cached-shader.hlsl> crates/jka-water/src/river/presentation-reference.json",
+    "cpu": "material.rs",
+    "gpu": "jka-client/src/river_material.rs",
+    "wgsl": ["material_outputs.wgsl", "material.wgsl"],
+    "notes": [
+      "Native default NormalGrid is R16f per attribute, distinct from the explicit R32f water/velocity grids. A temporary RGBA16f image preserves each component's half conversion before the final native radius-one normal blur",
+      "Stage-17 blur retains X-major clamped sampling, vector-length weights, total normalization and the 1e-5 length guard. Final NormalsRT is RGBA16f with alpha zero and no mip chain",
+      "SimGridRT is RGBA16f with native post-simulate linear mips: consecutive levels sample the previous level at destination pixel centres; half quantization occurs at every write",
+      "New live output_fields shares only stage-13/14 handles after those stages are encoded. Material pass groups/uniforms are allocated once, encode adds no CPU upload or resource creation, and freeze drops scratch/input bindings while retaining only final textures",
+      "Live non-VT material field sampling preserves four explicit mip-zero Loads with zero outside the texture, separate from filtered/wrapped normal RT resource sampling",
+      "Live grid WPO preserves required upstream advected wave height and incoming WPO, local-Z direction transform, native low-speed attenuation, velocity scaling order and the unnormalized filtered-normal plane projection for previous frame",
+      "Each frame phase is evaluated separately with its own upstream inputs, retaining native PreviousFrameSwitch and GameTime/PrevFrameGameTime semantics. Identical animated wave height is not silently reused across phases",
+      "Effective Motion defaults are resolved through the parent instance: LowVelocityWaveScale 0.1 and WaveAttenMin/Max 0/200 replace raw material-function defaults 0.96 and 150/800",
+      "This is the native default live-grid path. Global/user format overrides, virtual-texture residency/cached material, advected wave-height production, optical shading, masking/foam and normal game-frame integration remain unimplemented; no flat-water fallback or substituted water material is installed"
+    ]
+  },
+  "grid_mesh_reference": {
+    "evidence": "grid-mesh-reference.json",
+    "reproduce": "scripts/ue-river-grid-mesh.py <engine> <cached-shader.hlsl> crates/jka-water/src/river/grid-mesh-reference.json",
+    "gpu": "jka-client/src/river_grid_mesh.rs",
+    "notes": [
+      "Selected current emitter and scratchpad version, allocation count graph, reset dispatch dimensions, live/cached renderer material and parameter bindings are traced separately from legacy emitter data",
+      "Interleaved 32-byte WGPU vertices retain native attribute types and packed values; native RHI-dependent planar stream alignment is not reproduced",
+      "The tangent sign byte is 0x80 from cross(X,Z).dot(Y); the renderer fetches SNORM8, not the DI's UnpackTangent helper or a static WaterBody sRGB chain",
+      "GPU initialization queues multiple distinct meshes without shared mutable uniform uploads. No CPU vertex/index upload or per-frame rebuilding is introduced",
+      "Native LiveSim/BakedSim grid presentation does not require a full WaterBody centreline mesh. This does not establish brush-only WaterInfo/bridge initialization or disable default bMatchSpline",
+      "Offscreen attribute diagnostic is test-only and does not implement or substitute for native water material shading/displacement"
+    ]
+  },
+  "control_reference": {
+    "cpu": "control.rs::Grid / control.rs::Frame",
+    "gpu": "jka-client/src/river_gpu.rs::Simulation::encode_reference_frame",
+    "vectors": "control-reference.json",
+    "reproduce": "scripts/ue-river-controls.py <engine> crates/jka-water/src/river/control-reference.json",
+    "module": "/NiagaraFluids/Modules/Grid2D/ShallowWater/Grid2D_SW_UpdateSimAttributes",
+    "module_sha1": "88ad108e6b543d5234c5f7de16f000e1901fd837",
+    "module_version": "1.2",
+    "module_version_guid": [3612507619, 1087816312, 3019695006, 2516571793],
+    "saved_frame_budget_f32": 0.016666999086737633,
+    "saved_substep_cap_f32": 0.011110999621450901,
+    "formula": "SimDt = min(saved_frame_budget / User.NumSteps, saved_substep_cap) * User.SimSpeed",
+    "loops": [
+      {"start": 0, "end": 7, "count": 1},
+      {"start": 8, "end": 12, "binding": "ShallowWaterRiverEmitter.NumSubsteps"},
+      {"start": 13, "end": 17, "count": 1}
+    ],
+    "notes": [
+      "Divide_Float.A is a saved rapid-iteration constant, not Engine.DeltaTime; sinks still consume Engine.DeltaTime separately",
+      "Selected module WorldScale/MaxDepthMult/MaxVelocityMult are 1; initialization gravity is 980 cm/s^2",
+      "MaxDepth = ((dx / SimDt)^2 / Gravity) * MaxDepthMult; DtOverDx = 1 / (dx / SimDt); MaxVelocity = ((MaxDepth * DtOverDx) * Gravity) * MaxVelocityMult",
+      "Source/sink and overlap run once per frame, transport/velocity/depth/spline repeat per substep, presentation/normals run once",
+      "Grid2D_SetResolution Max Axis pads the shorter world extent to square cells",
+      "Graph arithmetic vectors and GPU/CPU tests do not replace fresh Niagara compilation/runtime comparison",
+      "Frame controls upload with recorded GPU copies, so frames with differing speed/substep count/sink delta may queue together without queue-write races; cell-size mismatches reject before encoding"
+    ]
+  },
+  "capture_reference": {
+    "cpu": "capture.rs::project / capture.rs::geometry",
+    "wgsl": "capture.wgsl::project_contours / capture.wgsl::prepare_geometry",
+    "gpu": "jka-client/src/river_capture.rs",
+    "source_functions": [
+      "Grid2D_SW_ComputeBottomContour_Emitter_Func",
+      "Grid2D_SW_ComputeBottomContour003_Emitter_Func",
+      "Grid2D_SW_ComputeBottomContour001_Emitter_Func",
+      "Grid2D_SW_ComputeBottomContour004_Emitter_Func",
+      "Grid2D_SW_ComputeBottomContour002_Emitter_Func",
+      "CustomHlsl0265E81144F614B44183B79FE37D901D90DF4ED0Emitter_GridCollection_Func",
+      "CustomHlsl14EFA242294FAD07C61DE7EEA1EC1169965A1502_Func",
+      "CustomHlsl8DA87775FEB677C94712E675FC77016CECB1C4CD_Func",
+      "SetVariables_BC78FE1F49F6AF94ACE5CDBD83AA77AB_Emitter_Func"
+    ],
+    "notes": [
+      "Five R32f orthographic captures: landscape, actors top/under, dilated actors top/under",
+      "Both dilated contour channels use MAX with a -100000 seed; undilated underside then merges with MIN",
+      "Bridge selection depends on WaterInfo height; capture images are independent of hydraulic settings",
+      "Camera/clip planes and mesh classification/sidedness are explicit inputs, not inferred defaults",
+      "Static PreSim history snapshot precedes subsequent cycles; reset history and water are zero",
+      "Source ScratchModule_02001 computes transient bed-change outputs, but its source wrapper subsequently reads previous WaterGrid/VelocityGrid; unused transient values are not injected"
+    ],
+    "source_files": [
+      {"path": "Engine/Plugins/Experimental/WaterAdvanced/Source/WaterAdvanced/Private/ShallowWaterRiverActor.cpp", "sha256": "e413ba4cf55f7d51e4ed18aece852d28a42792a3166bb8c5489d5031d7df30b2"},
+      {"path": "Engine/Plugins/FX/Niagara/Source/Niagara/Private/DataInterface/NiagaraDataInterfaceSceneCapture2D.cpp", "sha256": "6005696c83bd24f2b969928fa19e4a4c38c7f3c7ddea9e23f64cfe004c2aba59"},
+      {"path": "Engine/Shaders/Private/SceneCapturePixelShader.usf", "sha256": "501c34aaeaa96399c02aac5f1c5eaa7d71a60aba34e4f986fb35687c03005531"}
+    ]
+  },
+  "authoring_reference": {
+    "vectors": "authoring-reference.json",
+    "reproduce": "scripts/ue-river-authoring.py <engine> crates/jka-water/src/river/authoring-reference.json",
+    "cpu": "authoring.rs::Domain / authoring.rs::Endpoint",
+    "map_adapter": "jka-client/src/river_map.rs",
+    "notes": [
+      "Native origin is XY bounds centre and minimum Z; source raw horizontal tangent offsets its position before direction normalization",
+      "Native source size is 1000 cm; source height is twice bounds Z extent plus 1000 cm; sink height is 100000 cm",
+      "BSP adapter clips a transverse line at the marker's bounds centre against actual convex brush planes, retaining all disjoint intervals",
+      "The native endpoint has scalar width rather than a brush mask: the explicit BSP adapter uses outer span width/midpoint, retaining gaps as metadata, without changing native sink bands",
+      "Map CFS converts using 28316.846592 cm^3 per ft^3 and remains an unenforced demand; no inferred spline, flow field or discharge-to-velocity substitute"
+    ]
+  },
+  "water_info_reference": {
+    "cpu": "water_info.rs::Zone",
+    "wgsl": "water_info.wgsl::merge / finalize / decode",
+    "gpu": "jka-client/src/river_water_info.rs",
+    "source_evidence": "authoring-reference.json",
+    "producer_material_evidence": {
+      "asset": "/Water/Materials/WaterInfo/DrawWaterInfo",
+      "asset_sha1": "3b04ef02def973adb7472e1c08330a25a0dac7b9",
+      "asset_sha256": "4f39641914c2d0d42b144f9ffac872fc2da993c11683aa646aef2e1788aa52cc",
+      "decoded_graph": "Development Docs/Patch20/river-reference/DrawWaterInfo.graph.json",
+      "status": "DrawWaterInfo polar-to-Cartesian vertex operation and native static-mesh colour encoding are ported into the GPU capture producer; saved default MaxFlowVelocity is 1024. Map spline authoring/evaluation remains"
+    },
+    "notes": [
+      "Both merged and finalized encoded textures use the selected RGBA16f or RGBA32f zone format; default native half precision and blur radius 1 are explicit inputs",
+      "Merge preserves the hardcoded 128 cm dilation overwrite threshold and underground offset, including the shader's unused separate threshold uniform",
+      "Finalize keeps strict water-above-ground neighbour tests, X-major loop order, zero out-of-range loads and blur radius clamp 0..16",
+      "Decode samples the native resource's wrap addressing at explicit LOD zero, then preserves the 256 cm below-ground missing-water rule and unclamped flow decode with selected max velocity 1024",
+      "One immutable GPU decoded field feeds capture preparation and simulation in the same command stream; its identity hashes inputs/settings/source, not GPU output bytes",
+      "river_water_info_capture now renders raw ground/water/dilation inputs from explicit ground triangles and evaluated-spline meshes, resolves the hardware depth buffer, and feeds encode_buffer without CPU readback; supplied CPU pixels remain a diagnostic path",
+      "CPU merge/finalize arithmetic is f32; GPU fixtures separately check half store rounding at both writes, full/half mapping and wrap. This is not an executing Unreal comparison"
+    ]
+  },
+  "water_body_capture_reference": {
+    "cpu": "water_body.rs::from_evaluated_samples",
+    "gpu": "jka-client/src/river_water_info_capture.rs",
+    "wgsl": "jka-client/src/river_water_info_capture.wgsl",
+    "evidence": "water-body-reference.json",
+    "reproduce": "scripts/ue-river-waterinfo-producer.py <engine> <DrawWaterInfo.uasset> crates/jka-water/src/river/water-body-reference.json",
+    "notes": [
+      "Native ribbon triangle ordering, hollow dilation side strips and start/end caps; outward width and terminal tangent offsets flatten Z while dilation normal offset retains Z",
+      "Signed velocity reversal and magnitude clamp precede native SRGBToLinear/static-mesh fast-LUT colour packing and UNorm8 fetch; original float colour is not uploaded directly",
+      "Default native WaterInfo method 2: separate reverse-Z ground, water-colour and dilation depth layers; DrawWaterInfo flow conversion executes before vertex interpolation",
+      "Native StaticMeshSceneProxy negative-determinant culling reversal is preserved for mirrored body transforms; seam/origin fixture includes a reflected body",
+      "Near zero, far UE_FLOAT_HUGE_DISTANCE / 4 = 262144 cm; native orthographic inverse depth transforms a cleared device Z of zero to far scene depth",
+      "Point-centre resolve assembles raw pixels on GPU, followed by merge/finalize/decode, bed preparation and multiple queued hydraulic frames in one command stream",
+      "CPU barycentric test reference covers hollow dilation below raised ground, overlapping body heights, native background, squashed dilation edges and a packed-angle 0/360-degree seam",
+      "Evaluated spline sampling, explicit ground classification, material masking/displacement and native runtime scene comparisons remain required. Local yaw is constrained to +/-360 degrees rather than approximating unbounded UnwindRadians input"
+    ]
+  },
+  "interpolation_reference": {
+    "path": "Engine/Plugins/FX/Niagara/Shaders/Private/NiagaraDataInterfaceGrid2DCollection.ush",
+    "sha256": "7e29cce9f3f99c02059b97c022ff8d4e29dcc6598bd8b8424a541273001cd740",
+    "functions": [
+      "Basic1DCubic",
+      "Basic2DCubic"
+    ],
+    "sampler": "SF_Bilinear / AM_Clamp, NiagaraDataInterfaceGrid2DCollection.cpp",
+    "format_reference": "sampling-reference.json",
+    "notes": [
+      "Advection preserves IndexToUnit then Basic2DCubic GridPos conversion; algebraically cancelling the f32 round trip caused a DX12 velocity sign reversal near an integer cell boundary",
+      "Water/velocity use R32Float texture array layers, matching saved bOverrideFormat=true and the native Float constructor default; no per-advection buffer-to-texture snapshot or manual runtime filter",
+      "Boundary and cubic overshoot fallback use hardware SampleLevel with the original normalized UV, bilinear min/mag, point mip and clamp U/V/W",
+      "CPU reference defaults to ideal f32 bilinear arithmetic; GPU comparisons supply an independent hardware SampleLevel oracle, not guessed fractional rounding or wider tolerances",
+      "FLOAT32_FILTERABLE must be enabled on the device; unsupported creation rejects explicitly. Renderer requests advertised support without substituting a lower precision format",
+      "Geometry/history, foam and remaining presentation resource formats plus executing Niagara comparison remain unresolved; the default material surface/normal texture precision and mip chain are now ported separately"
+    ],
+    "compiler_notes": "Depth limiter TotalWeight preserves the source's four scalar integer ternaries accumulated into f32; a vector dot/select rewrite failed DXIL validation with the game's bundled DXC"
+  }
+}

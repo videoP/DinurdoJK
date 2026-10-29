@@ -14,6 +14,12 @@ impl App {
             || self.demo_missing_map_prompt.is_some()
             || self.live_download.is_some()
             || self.live_join_ui.is_some()
+            || self.net.as_ref().is_some_and(|net| {
+                net.state() != jka_protocol::session::ConnectionState::Active
+                    || self.game_session.as_ref().is_none_or(|session| {
+                        session.phase != crate::app::SessionPhase::Playing
+                    })
+            })
     }
 
     pub(in crate::app) fn set_capture(&mut self, captured: bool) {
@@ -32,6 +38,9 @@ impl App {
             self.noclip_alt_down = false;
         }
         if self.captured == captured {
+            // egui can update OS cursor visibility after the last capture call.
+            // Reassert it even when the logical state hasn't changed.
+            if let Some(window) = &self.window { window.set_cursor_visible(!captured); }
             return;
         }
         let Some(window) = &self.window else {
@@ -67,13 +76,68 @@ impl App {
         }
     }
 
+    /// OpenJK/TaystJK `in_restart` equivalent for Winit's persistent input backend.
+    /// SDL's IN_Shutdown/IN_Init becomes an unconditional native cursor release,
+    /// an input-state reset, then a fresh grab when the active input owner wants
+    /// one. The Winit event loop itself must not be destroyed or recreated here.
+    pub(in crate::app) fn restart_input_subsystem(&mut self) {
+        // Studio's free-look acquires its cursor separately from gameplay.
+        // Release that ownership before touching the underlying window.
+        let studio_looking = self.render_studio.navigation.looking;
+        if studio_looking {
+            self.set_studio_mouse_look(false);
+        }
+
+        // Don't rely on `self.captured`: recovering from an OS grab that is out
+        // of sync with our cached flag is one reason to run in_restart.
+        if let Some(window) = self.window.as_ref() {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        self.captured = false;
+        self.mouse_grab_mode = "none";
+
+        // Key_ClearStates / IN_Shutdown: clear every held owner, including
+        // manually issued +commands and synthesized input sources. Releasing
+        // only physical key binds would leave those kbuttons stuck.
+        let was_scores = self.scores_showing;
+        let was_demo_modifier = self.live_buttons.contains("+speed");
+        let was_zoomed = self.live_buttons.contains("+zoom");
+        self.keys.clear();
+        self.mouse_buttons_down.clear();
+        self.modifiers = Default::default();
+        self.live_buttons.clear();
+        self.live_button_sources.clear();
+        self.sync_button_transitions(was_scores, was_demo_modifier, was_zoomed);
+        self.live_input.cancel_pending_actions();
+        self.last_mouse_motion_at = None;
+        self.last_simulated_mouse_input = None;
+        self.render_studio.navigation.raw_delta = [0.0; 2];
+        self.japro_flipkick_moveup = false;
+        if let Some(player) = self.local_server.as_mut() {
+            // Drop unsent solo input pulses without resetting the player/map.
+            player.pause();
+        }
+
+        // IN_Init: let the current input owner restore capture. Executing the
+        // command in the console/menu must NOT grab the cursor behind the UI.
+        if studio_looking {
+            self.set_studio_mouse_look(true);
+        } else if self.demo_playback_active() {
+            self.sync_demo_camera_capture();
+        } else {
+            self.set_capture(true);
+        }
+        self.push_console_line("^2in_restart:^7 input restarted".to_owned());
+    }
+
     /// Enter the single Profile experience. Both front-end and in-game routes
     /// use this same initialization; studio/old tab names are command aliases.
     pub(in crate::app) fn open_profile_studio(&mut self, tab: Option<&str>) {
         self.profile_selected_section = match tab {
             Some("emotes") => 5,
             Some("force") => 2,
-            Some("visibility") | Some("cosmetics") => 4,
+            Some("visibility") | Some("cosmetics") => 1, // Legacy routes now open Look.
             _ => 1, // Look includes sabers and the player name.
         };
         self.profile_studio_started = Instant::now();
@@ -144,6 +208,24 @@ impl App {
         if toggling_console {
             self.console_notify.clear();
             self.last_console_notify_refresh = Instant::now();
+        }
+        // Opening a wheel/menu during a drag must commit and release the mouse
+        // transaction before the overlay consumes the physical button-up.
+        if previous_overlay == OverlayMode::None && overlay != OverlayMode::None {
+            if let Some(button) = self.model_placement.editor_mouse_owned {
+                self.placement_release_drag(button);
+            }
+            self.model_placement.rotating = false;
+            self.model_placement.preview_rotation = None;
+        }
+        // Closing an asset browser without picking an asset resumes edit mode.
+        if overlay == OverlayMode::None
+            && matches!(previous_overlay, OverlayMode::ModelPicker | OverlayMode::BmodelPicker)
+            && self.model_placement.edit_mode {
+            self.model_placement.active = true;
+            if !self.model_placement.editor_placing {
+                self.model_placement.kind = super::egui_model_placement::PlacementKind::Md3;
+            }
         }
         self.overlay = overlay;
         // Console is a temporary input/paint layer over its originating menu.
@@ -267,6 +349,10 @@ impl App {
     }
 
     pub(in crate::app) fn frontend_back(&mut self) {
+        if self.frontend_quit_confirmation {
+            self.frontend_quit_confirmation = false;
+            return;
+        }
         if !self.front_end {
             return;
         }
@@ -281,6 +367,7 @@ impl App {
             self.set_studio_mouse_look(false);
             self.render_studio.navigation.selected = false;
             self.cancel_render_studio_export();
+            self.studio_cfg_exit();
             self.sync_profile_preview_mode(false);
             self.render_command(RenderCommand::SetAssetPreviewBackground(None));
             self.profile_background_requested = None;
@@ -301,7 +388,7 @@ impl App {
             FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo => {
                 FrontendPage::Play
             }
-            FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::RenderStudio => FrontendPage::DeveloperTools,
+            FrontendPage::AssetViewer | FrontendPage::Pk3Manager | FrontendPage::MapViewer | FrontendPage::RenderStudio => FrontendPage::DeveloperTools,
         };
         self.egui_repaint_requested = true;
         self.publish_ui();
@@ -883,6 +970,15 @@ impl App {
         }
 
         if code != KeyCode::Escape {
+            return;
+        }
+
+        // Render Studio: Esc backs out of the current thing first and only
+        // asks before leaving the editor.
+        if self.front_end && self.frontend_page == FrontendPage::RenderStudio {
+            if !event.repeat {
+                self.render_studio_escape();
+            }
             return;
         }
 

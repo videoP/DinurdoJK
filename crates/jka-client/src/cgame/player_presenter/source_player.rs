@@ -140,7 +140,7 @@ fn decode_normal_image(qpath: &str, bytes: &[u8]) -> Result<TextureData, String>
         source: None,
         width: image.width(),
         height: image.height(),
-        rgba: image.into_raw(),
+        rgba: (image.into_raw()).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: false,
@@ -565,6 +565,8 @@ fn finish_source_player_model(
             0
         }
     };
+    // Source/UE imports keep only their authored jigglebones: never infer
+    // additional spring bones from surface or material names.
     let source_native_pivots = rig.native_pivots.map(Arc::new);
     let source_jiggles = (!rig.source_jiggles.is_empty()).then(|| Arc::new(rig.source_jiggles));
     let glm = Arc::new(rig.glm);

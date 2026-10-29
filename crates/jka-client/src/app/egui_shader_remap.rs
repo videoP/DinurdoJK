@@ -136,6 +136,9 @@ impl App {
     }
 
     fn apply_remap_editor_action(&mut self, action: RemapAction) {
+        if matches!(&action, RemapAction::Toggle(..) | RemapAction::Apply | RemapAction::Reset) {
+            self.placement_checkpoint();
+        }
         match action {
             RemapAction::Close => self.set_overlay(OverlayMode::None),
             RemapAction::Select(source) => self.select_shader_remap(source),
@@ -143,6 +146,7 @@ impl App {
                 if enabled {
                     if let Some(target) = self.shader_remap_ui.disabled.remove(&source) {
                         self.local_remap_shader(&source, &target);
+                        self.model_placement.authored_remaps.insert(source.clone(), target);
                     }
                 } else {
                     // Own the replacement before mutating `self`: the iterator
@@ -155,6 +159,7 @@ impl App {
                         // old == new clears the live redirect in the existing
                         // renderer, preserving the original material unchanged.
                         self.local_remap_shader(&source, &source);
+                        self.model_placement.authored_remaps.remove(&source);
                     }
                 }
                 if self.shader_remap_ui.selected.as_deref() == Some(&source) {
@@ -177,10 +182,16 @@ impl App {
                 }
                 if self.shader_remap_ui.disabled.contains_key(&source) && source != target {
                     self.shader_remap_ui.disabled.insert(source.clone(), target.clone());
+                    self.model_placement.authored_remaps.remove(&source);
                     self.shader_remap_ui.status = "Replacement saved. Enable this remap to apply it.".to_owned();
                 } else {
                     self.shader_remap_ui.disabled.remove(&source);
                     self.local_remap_shader(&source, &target);
+                    if source == target {
+                        self.model_placement.authored_remaps.remove(&source);
+                    } else {
+                        self.model_placement.authored_remaps.insert(source.clone(), target.clone());
+                    }
                     self.shader_remap_ui.status = if source == target {
                         "Original shader restored.".to_owned()
                     } else { format!("Remapping {source} → {target}") };
@@ -190,6 +201,7 @@ impl App {
                 let Some(source) = self.shader_remap_ui.selected.clone() else { return; };
                 self.shader_remap_ui.disabled.remove(&source);
                 self.local_remap_shader(&source, &source);
+                self.model_placement.authored_remaps.remove(&source);
                 self.shader_remap_ui.target = source;
                 self.shader_remap_ui.status = "Original shader restored.".to_owned();
             }

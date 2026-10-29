@@ -21,7 +21,7 @@ mod coordinates;
 mod entities;
 mod environment;
 mod menu_look;
-pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage, MenuFx, MenuProp};
+pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage};
 mod geometry;
 mod lighting;
 mod memory;
@@ -38,7 +38,7 @@ pub mod surface_sprite_bake;
 mod visibility;
 pub(crate) use cache::FoldHasher;
 pub(crate) use shader_remap::{
-    apply_shader_remaps, apply_shader_remaps_in_place, apply_reverse_lightmap_collapse_in_place,
+    apply_shader_remaps_in_place, apply_reverse_lightmap_collapse_in_place,
     expand_additive_stage_fusion_in_place, fuse_additive_stage_fusion_in_place,
     canonical_shader_name, prepare_remap_plan, ShaderRemapState,
 };
@@ -291,6 +291,11 @@ pub struct DrawBatch {
     /// Two packed u32s keep this developer metadata to 8 bytes per draw batch.
     pub material_debug_index: u32,
     pub surface_material: u8,
+    pub thermal_lava: bool,
+    pub thermal_emission: u8,
+    /// This *stage*, not the whole surface, has additive/screen emission.
+    /// Distinct from authored_glow: regular JKA bloom never picks it up.
+    pub thermal_source_stage: bool,
     /// First and only pass of an explicitly authored Glass material.
     pub glass_primary: bool,
     pub glass_tint: [f32; 3],
@@ -412,6 +417,8 @@ pub struct DrawBatch {
     /// Amplitude hint for ordinary water promotion, in map units.
     pub water_amplitude: f32,
     pub water_deformed: bool,
+    /// Material-wide promotion; all stages deform identically.
+    pub foliage_wind: bool,
     /// q3map2 lighting-only transparency metadata retained for future fidelity
     /// work; runtime sun visibility does not consume these authored compile flags yet.
     #[allow(dead_code)]
@@ -688,10 +695,7 @@ pub fn verify_map_source_exists(
             let asset_name = map_asset_name(name, "bsp")?;
             let assets =
                 AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
-            if assets
-                .names()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&asset_name))
-            {
+            if assets.contains_qpath(&asset_name) {
                 Ok(())
             } else {
                 Err(format!(
@@ -703,10 +707,7 @@ pub fn verify_map_source_exists(
             let asset_name = map_asset_name(name, "map")?;
             let assets =
                 AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
-            if assets
-                .names()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&asset_name))
-            {
+            if assets.contains_qpath(&asset_name) {
                 Ok(())
             } else {
                 Err(format!(
@@ -1519,6 +1520,46 @@ impl PreparedRemapPlan {
     }
 }
 
+/// Contents-only collision medium used by thermal vision. Prepared once from
+/// BSP world brushes; render frames examine these volumes only while thermal
+/// vision is active. The full brush planes avoid false positives for slopes.
+#[derive(Clone, Debug)]
+pub struct ThermalLiquidVolume {
+    pub kind: u8, // 1: CONTENTS_WATER, 2: CONTENTS_LAVA
+    pub planes: Vec<([f32; 3], f32)>, // in native JKA coordinates
+}
+
+impl ThermalLiquidVolume {
+    pub fn contains(&self, point: [f32; 3]) -> bool {
+        self.planes.iter().all(|(normal, distance)| {
+            normal[0] * point[0] + normal[1] * point[1] + normal[2] * point[2] <= *distance + 0.125
+        })
+    }
+}
+
+#[cfg(test)]
+mod thermal_liquid_tests {
+    use super::ThermalLiquidVolume;
+
+    #[test]
+    fn lava_brush_camera_medium_uses_actual_planes() {
+        let volume = ThermalLiquidVolume {
+            kind: 2,
+            planes: vec![
+                ([1.0, 0.0, 0.0], 64.0),
+                ([-1.0, 0.0, 0.0], 64.0),
+                ([0.0, 1.0, 0.0], 32.0),
+                ([0.0, -1.0, 0.0], 32.0),
+                ([0.0, 0.0, 1.0], 16.0),
+                ([0.0, 0.0, -1.0], 16.0),
+            ],
+        };
+        assert!(volume.contains([0.0, 0.0, 0.0]));
+        assert!(!volume.contains([100.0, 0.0, 0.0]));
+        assert!(!volume.contains([0.0, 0.0, -100.0]));
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedMap {
     pub patch_draws: Vec<PreparedPatchDraw>,
@@ -1537,6 +1578,7 @@ pub struct PreparedMap {
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     /// Real water brush bounds in renderer coordinates, independent of visible faces.
     pub water_brush_bounds: Vec<crate::ocean::WaterVolume>,
+    pub thermal_liquids: Vec<ThermalLiquidVolume>,
     pub movement: Option<jka_movement::PmoveContext>,
     pub collision: Option<jka_movement::CollisionWorld>,
     /// Drawn-and-markable world surfaces (OpenJK R_MarkFragments), shared by

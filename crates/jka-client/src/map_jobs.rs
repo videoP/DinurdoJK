@@ -1,7 +1,7 @@
 use crate::thread_activity::{self, Task, ThreadSlot};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -110,6 +110,9 @@ pub struct MapJobPool {
     workers: Vec<JoinHandle<()>>,
     worker_count: usize,
     progress: Arc<ProgressState>,
+    latest_requested: Option<Arc<AtomicU64>>,
+    /// Off for requests outside the shared generation (Render Studio ids).
+    supersedable: AtomicBool,
 }
 
 pub struct JobHandle<T> {
@@ -144,10 +147,25 @@ impl MapJobPool {
     where
         F: Fn(MapJobProgress) + Send + Sync + 'static,
     {
-        Self::create(Some(Arc::new(reporter)))
+        Self::create(Some(Arc::new(reporter)), None)
     }
 
-    fn create(reporter: Option<ProgressReporter>) -> Result<Self, String> {
+    /// Map loader only: current request generation can advance before this
+    /// worker finishes, so long map prep has opportunities to give way.
+    pub fn new_with_progress_and_latest<F>(
+        reporter: F,
+        latest_requested: Arc<AtomicU64>,
+    ) -> Result<Self, String>
+    where
+        F: Fn(MapJobProgress) + Send + Sync + 'static,
+    {
+        Self::create(Some(Arc::new(reporter)), Some(latest_requested))
+    }
+
+    fn create(
+        reporter: Option<ProgressReporter>,
+        latest_requested: Option<Arc<AtomicU64>>,
+    ) -> Result<Self, String> {
         let logical = thread::available_parallelism().map_or(1, |count| count.get());
         // Keep MAIN and RENDER responsive, then use the remaining hardware
         // parallelism for CPU-heavy map preparation. The map-loader coordinator
@@ -185,7 +203,23 @@ impl MapJobPool {
             workers,
             worker_count,
             progress,
+            latest_requested,
+            supersedable: AtomicBool::new(true),
         })
+    }
+
+    /// Pure map-preparation cold-path check. No game-frame work calls this.
+    pub fn is_superseded(&self) -> bool {
+        self.supersedable.load(Ordering::Relaxed)
+            && self.latest_requested.as_ref().is_some_and(|latest| {
+                latest.load(Ordering::Acquire) != self.progress.request_id.load(Ordering::Acquire)
+            })
+    }
+
+    /// Whether the current request belongs to the shared generation that
+    /// `is_superseded` compares against. Set by the loader per request.
+    pub fn set_supersedable(&self, supersedable: bool) {
+        self.supersedable.store(supersedable, Ordering::Relaxed);
     }
 
     pub fn begin_request(&self, request_id: u64) {
@@ -279,5 +313,30 @@ impl Drop for MapJobPool {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod supersession_tests {
+    use super::*;
+
+    #[test]
+    fn queued_replacement_invalidates_old_map_without_disrupting_new_one() {
+        let latest = Arc::new(AtomicU64::new(11));
+        let jobs = MapJobPool::new_with_progress_and_latest(|_| {}, Arc::clone(&latest))
+            .expect("worker pool");
+        jobs.begin_request(11);
+        assert!(!jobs.is_superseded());
+        latest.store(12, Ordering::Release);
+        assert!(jobs.is_superseded());
+        jobs.begin_request(12);
+        assert!(!jobs.is_superseded());
+    }
+
+    #[test]
+    fn ordinary_map_job_pool_has_no_external_supersession_token() {
+        let jobs = MapJobPool::new_with_progress(|_| {}).expect("worker pool");
+        jobs.begin_request(42);
+        assert!(!jobs.is_superseded());
     }
 }

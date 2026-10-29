@@ -228,6 +228,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.console_history_index = pending_history_index;
                 self.publish_ui();
             }
+            UserEvent::StudioSourceReady {id,error,vram,scenes} => {
+                if self.render_studio.bsp_world.as_ref().is_some_and(|world|world.id==id) {
+                    self.studio_bsp_ready(id,error);
+                } else {self.on_studio_source_ready(id,error,vram,scenes);}
+            },
+            #[cfg(test)]
+            UserEvent::StudioTestScenePresented {..} => {},
             UserEvent::ScreenshotFinished(result) => {
                 match result {
                     Ok(ScreenshotOutput::FrontendSceneSaved(path)) => {
@@ -256,11 +263,12 @@ impl ApplicationHandler<UserEvent> for App {
                         height,
                         bgra,
                         depth_f32le,
+                        timing,
                     }) => {
                         if self.render_studio.still.is_some() {
                             self.on_render_studio_still_frame(frame_index, width, height, bgra, depth_f32le);
                         } else if self.render_studio.export.is_some() {
-                            self.on_render_studio_frame(frame_index, width, height, bgra, depth_f32le);
+                            self.on_render_studio_frame(frame_index, width, height, bgra, depth_f32le, timing);
                         } else if self.demo_video_export.is_some() {
                             self.on_demo_video_frame(frame_index, width, height, bgra, depth_f32le);
                         }
@@ -285,7 +293,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.hdr_available_modes = available_modes;
                 self.hdr_modes_known = true;
                 self.demote_unsupported_hdr_output();
-                if self.hdr_output_active && self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
+                if self.hdr_output_active && self.video.gamma_method.is_hardware() {
                     self.set_gamma_method(crate::gamma::GammaMethod::Shader);
                 }
                 // A live Windows HDR->SDR transition changes the format of an
@@ -307,6 +315,16 @@ impl ApplicationHandler<UserEvent> for App {
                 adapter_type,
             } => {
                 crate::startup_timeline::mark(crate::startup_timeline::Milestone::RendererReady);
+                self.reload_studio_gpu_sources();
+                // A restarted renderer has no Studio viewer rectangle: clear the
+                // send latches so the next UI frame re-sends them. Without this,
+                // a vid_restart/mode change left Studio frames rendering (and
+                // exporting) as full-window draws with the editor UI in them.
+                self.render_studio_world_compositor = None;
+                self.asset_preview_viewport_key = None;
+                if let Some(size) = self.render_studio.capture_size {
+                    self.render_command(RenderCommand::SetStudioExportSize(Some(size)));
+                }
                 self.active_gpu_name = adapter_name;
                 self.active_gpu_type = adapter_type;
                 self.hdr_output_status = hdr_output_status;
@@ -322,7 +340,7 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.applied_hdr_output = 0;
                 }
-                if self.hdr_output_active && self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
+                if self.hdr_output_active && self.video.gamma_method.is_hardware() {
                     self.set_gamma_method(crate::gamma::GammaMethod::Shader);
                 }
                 self.supported_msaa = supported_msaa;
@@ -440,6 +458,9 @@ impl ApplicationHandler<UserEvent> for App {
                     println!("STARTUP COMMAND: {command}");
                     self.push_console_command_echo(format!("^7] {command}"));
                     self.append_console_commands(split_console_script(&command));
+                }
+                if let Some(path) = self.startup_demo_file.take() {
+                    self.play_demo_file(&path);
                 }
             }
             UserEvent::RendererFirstMenuFrame => {
@@ -603,6 +624,10 @@ impl ApplicationHandler<UserEvent> for App {
                 completed,
                 total,
             } => {
+                if request_id & super::render_studio_demo::STUDIO_REQUEST_BIT != 0 {
+                    self.studio_map_progress(request_id, task, completed, total);
+                    return;
+                }
                 if request_id != self.latest_request_id {
                     return;
                 }
@@ -786,6 +811,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match result {
                     Ok(plan) => self.render_command(RenderCommand::RemapMap {
                         request_id, started, name, plan, base_texture_count,
+                        studio_world: None,
                     }),
                     Err(error) => {
                         self.shader_remap_upload = false;
@@ -801,6 +827,14 @@ impl ApplicationHandler<UserEvent> for App {
                 mut map,
                 fx_light_promotion,
             } => {
+                if self.render_studio.bsp_world.as_ref().is_some_and(|world|world.id==request_id) {
+                    self.studio_bsp_prepared(request_id,map);
+                    return;
+                }
+                if request_id & super::render_studio_demo::STUDIO_REQUEST_BIT != 0 {
+                    self.on_studio_source_prepared(request_id,map,fx_light_promotion);
+                    return;
+                }
                 if request_id != self.latest_request_id {
                     return;
                 }
@@ -889,6 +923,7 @@ impl ApplicationHandler<UserEvent> for App {
                         started,
                         name,
                         map,
+                        studio_world: None,
                     });
                     self.publish_snapshot();
                     return;
@@ -960,14 +995,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 let cache_started = Instant::now();
-                self.prepared_map_cache = Some(PreparedMapCache {
-                    label: name.clone(),
-                    prepare_options: self.latest_prepare_options,
-                    // Keep the authored/unremapped world as the restart source.
-                    // Runtime R_RemapShader changes are presentation state, not
-                    // a destructive rewrite of this cache.
-                    map: Arc::new(map.as_ref().clone()),
-                });
+                    self.prepared_map_cache = Some(PreparedMapCache {
+                        label: name.clone(),
+                        prepare_options: self.latest_prepare_options,
+                        // Keep the authored/unremapped world as the restart source.
+                        // Runtime R_RemapShader changes are presentation state, not
+                        // a destructive rewrite of this cache.
+                        map: Arc::new(map.as_ref().clone()),
+                    });
                 rverbose!(
                     2,
                     "Map restart cache: retained prepared CPU map in {:.1} ms",
@@ -1368,11 +1403,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Apply the configured effects before upload so the world is
                 // compiled for their scene format on its first upload.
                 self.sync_post_effects();
+                let studio_world = None;
                 self.render_command(RenderCommand::LoadMap {
                     request_id,
                     started,
                     name,
                     map,
+                    studio_world,
                 });
                 self.publish_snapshot();
             }
@@ -1385,6 +1422,14 @@ impl ApplicationHandler<UserEvent> for App {
                 name,
                 error,
             } => {
+                if self.render_studio.bsp_world.as_ref().is_some_and(|world|world.id==request_id) {
+                    self.studio_bsp_ready(request_id,Some(error));
+                    return;
+                }
+                if request_id & super::render_studio_demo::STUDIO_REQUEST_BIT != 0 {
+                    self.on_studio_source_ready(request_id,Some(error),None,usize::MAX);
+                    return;
+                }
                 if request_id != self.latest_request_id {
                     return;
                 }
@@ -1612,7 +1657,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 })
                         }));
                 if join_first_world {
-                    self.live_join_ui = None;
+                    // A speculative first render does not prove server admission.
+                    // The handshake overlay remains until the active snapshot.
                     self.egui_repaint_requested = true;
                     let elapsed = self
                         .live_join_timing
@@ -1854,8 +1900,9 @@ impl ApplicationHandler<UserEvent> for App {
                         ));
                     }
                 }
-                self.console_status =
-                    format!("LOADED {name}: {:.3} seconds", first_frame_ms / 1000.0);
+                self.console_status = format!("{} {name}: {:.3} seconds",
+                    if upload_timings.studio_world_reused { "RESTORED" } else { "LOADED" },
+                    first_frame_ms / 1000.0);
                 self.push_console_line(format!("^2{}", self.console_status));
                 self.loading = None;
                 // Runtime shader-remap uploads go straight to the render thread
@@ -1883,6 +1930,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // thread has produced the first real world frame, so initialize
                 // the demo clock from the first snapshot now.
                 self.start_demo_after_map_load(&name);
+                if self.studio_demo_scene_active() {
+                    self.render_command(RenderCommand::SetAssetPreviewMode(false));
+                }
 
                 // The world is now actually visible. Restore gameplay/audio
                 // before the separate keep/revert confirmation window begins.
@@ -2148,19 +2198,67 @@ impl ApplicationHandler<UserEvent> for App {
         // and before spectator demo controls.
         if self.overlay == OverlayMode::None && self.model_placement.active {
             if let WindowEvent::MouseInput { state, button, .. } = &event {
-                match button {
-                    MouseButton::Left => {
-                        if *state == ElementState::Pressed && !self.model_placement.rotating {
-                            // Edit mode: pick up (Ctrl = copy); otherwise stamp.
-                            self.placement_click(self.modifiers.control_key());
+                if *state == ElementState::Released && self.placement_release_drag(*button) {
+                    return; // Never leak an editor-owned release into a game bind.
+                }
+                if *state == ElementState::Pressed {
+                    if self.model_placement.edit_mode {
+                        // Ctrl+LMB on empty editor space opens the Add browser.
+                        // Ctrl+LMB on a hit object still starts vertical drag.
+                        // While previewing a new asset, LMB places it first.
+                        if *button == MouseButton::Left
+                            && self.modifiers.control_key()
+                            && !self.model_placement.editor_placing
+                            && self.model_placement.hover.is_none()
+                            && self.model_placement.bmodel_hover.is_none()
+                            && self.model_placement.fx_hover.is_none()
+                        {
+                            self.open_model_placement_picker();
+                            return;
                         }
-                        return;
+                        let owned = if self.model_placement.editor_placing {
+                            match button {
+                                MouseButton::Left => self.placement_click(false),
+                                MouseButton::Right => {
+                                    self.model_placement.rotating = true;
+                                    self.model_placement.preview_rotation = None;
+                                    // Own the release even if Esc/Backspace
+                                    // interrupts a preview rotation.
+                                    self.model_placement.editor_mouse_owned = Some(*button);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            match button {
+                                MouseButton::Left => self.placement_click(false),
+                                MouseButton::Middle | MouseButton::Right => self.placement_begin_rotation(*button),
+                                _ => false,
+                            }
+                        };
+                        if owned { return; }
+                        // Empty-space clicks are gameplay/noclip input, not an
+                        // editor operation; pass both press and release through.
+                    } else {
+                        match button {
+                            MouseButton::Left => {
+                                if self.placement_click(false) { return; }
+                            }
+                            MouseButton::Right => {
+                                self.model_placement.rotating = true;
+                                // Only Alt+RMB (local roll) uses a quaternion;
+                                // normal yaw and Shift pitch retain v1 controls.
+                                self.model_placement.preview_rotation = None;
+                                return;
+                            }
+                            _ => {}
+                        }
                     }
-                    MouseButton::Right => {
-                        self.model_placement.rotating = *state == ElementState::Pressed;
-                        return;
-                    }
-                    _ => {}
+                } else if (!self.model_placement.edit_mode || self.model_placement.editor_placing)
+                    && *button == MouseButton::Right {
+                    self.model_placement.rotating = false;
+                    self.model_placement.preview_rotation = None;
+                    return;
                 }
             }
         }
@@ -2274,7 +2372,20 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 120.0).clamp(-8.0, 8.0),
                 };
-                if amount.is_finite() && self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Md3 {
+                if self.model_placement.edit_mode && !self.model_placement.editor_placing {
+                    // Scale the selected MD3, not the placement ghost. All
+                    // wheel ticks in a burst currently form separate undo units.
+                    if amount.is_finite() && amount.abs() > 0.0 {
+                        if let Some(crate::app::egui_model_placement::EditSelection::Md3(i)) = self.model_placement.editor_selected {
+                            if i < self.model_placement.placed.len() {
+                                self.placement_checkpoint();
+                                let p = &mut self.model_placement.placed[i];
+                                p.scale = (p.scale * (amount * 0.085).exp()).clamp(0.01, 100.0);
+                                self.model_placement.placed_dirty = true;
+                            }
+                        }
+                    }
+                } else if amount.is_finite() && self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Md3 {
                     self.model_placement.scale = (self.model_placement.scale
                         * (amount * 0.085).exp()).clamp(0.01, 100.0);
                     self.egui_repaint_requested = true;
@@ -2643,34 +2754,45 @@ impl ApplicationHandler<UserEvent> for App {
                 // exclusive fullscreen. Capture the actual WGPU surface instead
                 // and replace the clipboard image, but do not write a screenshot
                 // file. /screenshot is the explicit file-writing path.
+                // Key ownership is remembered at key-down. Even if Tab opens
+                // an overlay, the subsequent release still belongs to editing.
+                if self.model_placement.editor_keys_owned.contains(&code) {
+                    if event.state == ElementState::Released {
+                        self.model_placement.editor_keys_owned.remove(&code);
+                    }
+                    return;
+                }
                 if self.overlay == OverlayMode::None && self.model_placement.active {
                     if event.state == ElementState::Pressed && !event.repeat {
-                        match code {
-                            KeyCode::Escape => { self.cancel_placement(); return; }
+                        let controlled = match code {
                             KeyCode::Tab => {
                                 if self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Bmodel {
                                     self.open_bmodel_placement_picker();
-                                } else {
-                                    self.open_model_placement_picker();
-                                }
-                                return;
+                                } else { self.open_model_placement_picker(); }
+                                true
                             }
                             KeyCode::KeyZ if self.modifiers.control_key() => {
-                                self.undo_model_placement(); return;
+                                self.undo_model_placement(); true
                             }
-                            KeyCode::KeyE if !self.modifiers.control_key() => {
-                                self.toggle_placement_edit(); return;
+                            KeyCode::KeyY if self.modifiers.control_key() => {
+                                self.redo_model_placement(); true
                             }
-                            KeyCode::Delete | KeyCode::KeyX if self.model_placement.edit_mode => {
-                                self.delete_hovered_placement(); return;
+                            KeyCode::KeyD if self.modifiers.control_key() && self.model_placement.edit_mode => {
+                                self.duplicate_selected_placement(); true
                             }
-                            _ => {}
+                            KeyCode::Backspace if self.model_placement.editor_placing => {
+                                self.finish_editor_add(); true
+                            }
+                            KeyCode::Delete | KeyCode::KeyX if self.model_placement.edit_mode
+                                && !self.model_placement.editor_placing => {
+                                self.delete_hovered_placement(); true
+                            }
+                            _ => false,
+                        };
+                        if controlled {
+                            self.model_placement.editor_keys_owned.insert(code);
+                            return;
                         }
-                    }
-                    if matches!(code, KeyCode::Escape | KeyCode::Tab | KeyCode::KeyE)
-                        || (code == KeyCode::KeyZ && self.modifiers.control_key())
-                        || (self.model_placement.edit_mode && matches!(code, KeyCode::Delete | KeyCode::KeyX)) {
-                        return;
                     }
                 }
                 if code == KeyCode::PrintScreen {
@@ -2717,6 +2839,7 @@ impl ApplicationHandler<UserEvent> for App {
                             | OverlayMode::StrafeTrails
                             | OverlayMode::ShaderRemap
                             | OverlayMode::RaceGhosts
+                            | OverlayMode::Telemarks
                     )
                     && self.surface_inspector.is_some()
                 {
@@ -2844,6 +2967,15 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    OverlayMode::Telemarks => {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && code == KeyCode::Escape
+                        {
+                            self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
                     OverlayMode::RaceGhosts => {
                         if event.state == ElementState::Pressed
                             && !event.repeat
@@ -2928,6 +3060,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let bind_key = keybinds::bind_key_for_code(code);
                 if event.state == ElementState::Pressed && !event.repeat {
                     if code == KeyCode::Escape {
+                        // Editing is persistent, but Escape must still open the
+                        // ordinary JKA menu. Roll back only the current drag.
+                        if self.model_placement.edit_mode && self.model_placement.editor_drag.is_some() {
+                            self.cancel_placement();
+                        }
                         let overlay = self.remembered_in_game_menu_overlay();
                         self.set_overlay(overlay);
                         return;
@@ -2988,22 +3125,39 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
+        if self.model_placement.active && self.model_placement.editor_drag.is_some()
+            && self.overlay == OverlayMode::None && self.window_focused {
+            if let DeviceEvent::MouseMotion { delta } = event {
+                self.placement_drag_motion(delta);
+            }
+            return;
+        }
         if self.model_placement.active && self.model_placement.rotating
             && self.overlay == OverlayMode::None && self.window_focused {
             if let DeviceEvent::MouseMotion { delta } = event {
-                // Blender-like constrained rotation: RMB+X = yaw, Shift+RMB
-                // = pitch, Alt+RMB = roll. Sensitivity is intentionally not
-                // coupled to the gameplay m_sensitivity cvar.
-                let degrees = delta.0 as f32 * 0.20;
                 if self.modifiers.alt_key() {
-                    self.model_placement.angles[2] += degrees;
-                } else if self.modifiers.shift_key() {
-                    self.model_placement.angles[0] -= delta.1 as f32 * 0.20;
+                    // Keep v2: roll around the preview object's local forward
+                    // axis, tracking a quaternion while Alt remains held.
+                    let orientation = self.model_placement.preview_rotation.unwrap_or_else(||
+                        super::egui_model_placement::placement_orientation(self.model_placement.angles));
+                    let next = super::egui_model_placement::placement_rotate_local(
+                        orientation, 0.0, 0.0, delta.0 as f32 * 0.20);
+                    self.model_placement.preview_rotation = Some(next);
+                    self.model_placement.angles =
+                        super::egui_model_placement::placement_rotation_angles(next);
                 } else {
-                    self.model_placement.angles[1] += degrees;
-                }
-                for angle in &mut self.model_placement.angles {
-                    *angle = angle.rem_euclid(360.0);
+                    // Keep v1: directly edit yaw or pitch, without local
+                    // quaternion composition. Invalidate cached roll when
+                    // changing modifiers mid-drag to prevent orientation jumps.
+                    self.model_placement.preview_rotation = None;
+                    let (pitch, yaw) = if self.modifiers.shift_key() {
+                        (-delta.1 as f32 * 0.20, 0.0)
+                    } else {
+                        (0.0, delta.0 as f32 * 0.20)
+                    };
+                    self.model_placement.angles =
+                        super::egui_model_placement::placement_rotate_yaw_pitch(
+                            self.model_placement.angles, pitch, yaw);
                 }
                 self.egui_repaint_requested = true;
             }
@@ -3223,8 +3377,8 @@ impl ApplicationHandler<UserEvent> for App {
             let step = BENCH_TURN_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bench_turn = if period != 0 && (step / period) % 2 == 1 { -bench_turn } else { bench_turn };
             let captured = std::mem::replace(&mut self.captured, true);
-            // SAFETY: dummy ids are only compared/hashed by the handler.
-            let device = unsafe { winit::event::DeviceId::dummy() };
+            // Dummy ids are only compared/hashed by the handler.
+            let device = winit::event::DeviceId::dummy();
             self.device_event(event_loop, device, DeviceEvent::MouseMotion { delta: (bench_turn as f64, 0.0) });
             self.captured = captured;
         }

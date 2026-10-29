@@ -614,6 +614,54 @@ app_cvars! {
         config: CvarBinding::NONE,
         implementations: []
     }
+    APP_R_HYBRIDMATERIAL {
+        runtime: CvarDef::new("r_hybridMaterial", "1", "0..2",
+            "Hybrid ocean quality: 0 original material; 1 optimized full-resolution Godot-style GGX/foam material honoring r_hybridSSR (default); 2 same with environment reflections only. Keeps native wave geometry and sky/roof admission; simpler foam and smoother glints. Fast material uses full resolution regardless of r_oceanPixelDetail. No effect on Gerstner or pure Blue Water.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.hybrid_material)),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.hybrid_material = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_material = v.min(2); }
+            }),
+            archive: Some((25206, |state| state.video.ocean_settings.hybrid_material.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_HYBRIDFASTFOAM {
+        runtime: CvarDef::new("r_hybridFastFoam", "1", "0..3",
+            "Hybrid compact material only (r_hybridMaterial 1/2), session A/B: foam opacity gain. 0 no foam, 1 reference, up to 3 stronger. Applies live without recompiling or changing the FFT.",
+            CvarType::Float { min: 0.0, max: 3.0 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_fast_foam),
+            |app, value| {
+                let CvarValue::Float(v) = value else { unreachable!() };
+                app.video.ocean_settings.hybrid_fast_foam = v;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_HYBRIDFASTFOAMDETAIL {
+        runtime: CvarDef::new("r_hybridFastFoamDetail", "1", "0|1",
+            "Hybrid compact material only, session A/B: 1 keep the native foam pattern layout; 0 one-pattern approximation (more visibly different). Applies live without recompiling. Does not change wave geometry or simulation.",
+            CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.hybrid_fast_foam_detail),
+            |app, value| {
+                let CvarValue::Bool(v) = value else { unreachable!() };
+                app.video.ocean_settings.hybrid_fast_foam_detail = v;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_R_HYBRIDSSR {
         runtime: CvarDef::new("r_hybridSSR", "0", "0|1",
             "Hybrid only: native screen-space reflection tracing (sky/env reflection remains).",
@@ -1421,7 +1469,7 @@ app_cvars! {
     }
     APP_R_OCEANCOSTPROBE {
         runtime: CvarDef::new("r_oceanCostProbe", "0", "0..67108863",
-            "Diagnostic A/B, not archived: bitmask stubbing Blue Water surface features to size their GPU cost (changes the image). 1 SSR, 2 foam, 4 glints, 8 wake, 16 rain, 32 refraction, 64 FFT waves, 128 fog, 256 shadows, 512 sky lobe, 1024 hull shelter, 2048 underside, 4096 admission floor only; foam parts 131072 spread reads, 262144 breaking groups, 524288 gale streaks, 1048576 pattern reads; 2097152 value_noise reduced to a fract (noise cost bound); 4194304 wave sample + foam patterns as 8 reads (baked-cache bound); register packing across the reflection march: 8388608 fp16 pack2x16float, 16777216 fp16 wider set (sky, daylight, variances), 33554432 bfloat16 by shifts (not folded by the driver).",
+            "Diagnostic A/B, not archived: bitmask stubbing Blue Water surface features to size their GPU cost (changes the image). 1 SSR, 2 foam, 4 glints, 8 wake, 16 rain, 32 refraction, 64 FFT waves, 128 fog, 256 shadows, 512 sky lobe, 1024 hull shelter, 2048 underside, 4096 admission floor only; equivalent-math experiments 8192 defer water body until after SSR, 32768 serial SSR refinement; 16384 native FFT single-copy tiling (changes wave pattern); foam parts 131072 spread reads, 262144 breaking groups, 524288 gale streaks, 1048576 pattern reads; 2097152 value_noise reduced to a fract (noise cost bound); 4194304 wave sample + foam patterns as 8 reads (baked-cache bound); register packing across the reflection march: 8388608 fp16 pack2x16float, 16777216 fp16 wider set (sky, daylight, variances), 33554432 bfloat16 by shifts (not folded by the driver).",
             CvarType::Int { min: 0, max: 67108863 }, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.ocean_settings.surface_cost_probe as i32),
             |app, value| {

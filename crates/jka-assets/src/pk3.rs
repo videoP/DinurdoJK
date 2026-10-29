@@ -6,7 +6,7 @@
 //! override earlier ones. Every caller uses package-relative qpaths such as
 //! `maps/mp/ffa3.bsp`, `textures/foo/bar.tga`, or `shaders/common.shader`.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fs::{self, File},
@@ -154,12 +154,255 @@ pub fn resolve_fs_game_directory(base: &Path, value: &[u8]) -> Result<Option<Pat
     Ok(Some(candidate))
 }
 
+/// Filesystem roots configured by the client. All physical roots contain a
+/// `base/` child; `base` is the existing executable-relative GameData/base.
+/// These settings never cause a PK3 to be unpacked or a DLL to be executed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilesystemRoots {
+    /// Writable/readable root, or None for the executable-relative root.
+    pub homepath: Option<PathBuf>,
+    /// Extra, lowest-priority read-only root (usually a shared retail install).
+    pub cdpath: Option<PathBuf>,
+    /// Always-on, highest-priority game directory name (not a path).
+    pub forcegame: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstalledFilesystemRoots {
+    base: PathBuf,
+    roots: FilesystemRoots,
+}
+
+// A single executable owns one filesystem. Storing its active roots here lets
+// map workers, the renderer and presenters keep using open_game(base, game)
+// without silently bypassing newly configured layers.
+static FILESYSTEM_ROOTS: std::sync::OnceLock<std::sync::RwLock<Option<InstalledFilesystemRoots>>> =
+    std::sync::OnceLock::new();
+
+pub fn configure_filesystem_roots(base: &Path, roots: FilesystemRoots) {
+    let lock = FILESYSTEM_ROOTS.get_or_init(|| std::sync::RwLock::new(None));
+    *lock.write().unwrap_or_else(PoisonError::into_inner) =
+        Some(InstalledFilesystemRoots { base: base.to_path_buf(), roots: roots.clone() });
+    configure_package_policy(base, &roots);
+}
+
+pub fn configured_filesystem_roots(base: &Path) -> FilesystemRoots {
+    FILESYSTEM_ROOTS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|state| state.as_ref().filter(|state| state.base == base).map(|state| state.roots.clone()))
+        .unwrap_or_default()
+}
+
+/// Inventory of an installed archive, including disabled ones. The inventory
+/// scans directory entries only: opening this page does not decode any PK3s.
+#[derive(Debug, Clone)]
+pub struct PackageInfo {
+    pub path: PathBuf,
+    pub directory: PathBuf,
+    pub bytes: u64,
+    pub stock: bool,
+    pub enabled: bool,
+}
+
+#[derive(Default)]
+struct PackagePolicy {
+    disabled: HashSet<PathBuf>,
+    generation: u64,
+}
+
+fn package_policy() -> &'static std::sync::RwLock<PackagePolicy> {
+    static POLICY: std::sync::OnceLock<std::sync::RwLock<PackagePolicy>> = std::sync::OnceLock::new();
+    POLICY.get_or_init(Default::default)
+}
+
+/// A process-wide package policy shared by every VFS reader and the pure/
+/// download scanners. Paths are fully-qualified to distinguish identically
+/// named PK3s in different roots and game directories.
+pub fn package_enabled(path: &Path) -> bool {
+    let state = package_policy().read().unwrap_or_else(PoisonError::into_inner);
+    is_stock_asset_archive(path) || !state.disabled.contains(path)
+}
+
+pub fn disabled_package_paths() -> HashSet<PathBuf> {
+    package_policy().read().unwrap_or_else(PoisonError::into_inner).disabled.clone()
+}
+
+fn disabled_packages_path(base: &Path, roots: &FilesystemRoots) -> PathBuf {
+    // A single per-installation policy, independent of current fs_game or
+    // fs_forcegame. All sessions read the same enabled/disabled package set.
+    roots.homepath.as_deref().unwrap_or_else(|| base.parent().unwrap_or(base))
+        .join("base").join("pk3-disabled.txt")
+}
+
+fn read_disabled_packages(path: &Path) -> HashSet<PathBuf> {
+    let Ok(text) = fs::read_to_string(path) else { return HashSet::new() };
+    text.lines().filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from).filter(|path| !is_stock_asset_archive(path)).collect()
+}
+
+/// Install the persisted policy before the first VFS prewarm. Reconfiguring
+/// roots (mainly tests and standalone tools) re-reads the corresponding file.
+fn configure_package_policy(base: &Path, roots: &FilesystemRoots) {
+    let path = disabled_packages_path(base, roots);
+    let disabled = read_disabled_packages(&path);
+    let mut state = package_policy().write().unwrap_or_else(PoisonError::into_inner);
+    state.disabled = disabled;
+    state.generation = state.generation.wrapping_add(1);
+}
+
+/// Persist and atomically apply a new disabled set. Reject stock archives and
+/// unknown paths: remote-controlled filesystem names must never become writes.
+/// The caller follows this with fs_restart to refresh existing readers.
+pub fn apply_disabled_packages(base: &Path, game: Option<&Path>, requested: &HashSet<PathBuf>) -> Result<(), String> {
+    let roots = configured_filesystem_roots(base);
+    let directories = filesystem_search_dirs(base, game, &roots);
+    let mut installed = HashSet::new();
+    for dir in &directories {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_file()) && is_archive_package(&entry.path()) {
+                    installed.insert(entry.path());
+                }
+            }
+        }
+    }
+    // Keep disabled packages belonging to an inactive mod/root, provided they
+    // were already saved. Their membership remains immutable from this menu.
+    let current = disabled_package_paths();
+    for path in requested {
+        if is_stock_asset_archive(path) || (!installed.contains(path) && !current.contains(path)) {
+            return Err(format!("cannot disable unknown or required archive: {}", path.display()));
+        }
+    }
+    let path = disabled_packages_path(base, &roots);
+    let mut lines = requested.iter().collect::<Vec<_>>();
+    lines.sort();
+    let contents = lines.into_iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n");
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let temporary = path.with_extension("txt.tmp");
+    fs::write(&temporary, contents).map_err(|e| e.to_string())?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        // Windows cannot rename over an existing destination. A failed write
+        // must not apply a policy that cannot be persisted.
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+            fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+        } else { return Err(error.to_string()); }
+    }
+    let mut state = package_policy().write().unwrap_or_else(PoisonError::into_inner);
+    state.disabled = requested.clone();
+    state.generation = state.generation.wrapping_add(1);
+    Ok(())
+}
+
+/// Every visible PK3 in actual VFS search order, including disabled packages.
+pub fn installed_packages(base: &Path, game: Option<&Path>) -> Vec<PackageInfo> {
+    let roots = configured_filesystem_roots(base);
+    let mut packages = Vec::new();
+    for directory in filesystem_search_dirs(base, game, &roots) {
+        let Ok(entries) = fs::read_dir(&directory) else { continue };
+        let mut layer = entries.flatten().filter_map(|entry| {
+            if !entry.file_type().ok()?.is_file() || !is_archive_package(&entry.path()) { return None; }
+            let path = entry.path();
+            Some(PackageInfo { bytes: entry.metadata().ok()?.len(),
+                stock: is_stock_asset_archive(&path), enabled: package_enabled(&path),
+                directory: directory.clone(), path })
+        }).collect::<Vec<_>>();
+        layer.sort_by_key(|info| std::cmp::Reverse(info.path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase())));
+        packages.extend(layer);
+    }
+    packages
+}
+
+/// Resolve the write destination independently of the server-selected fs_game
+/// whenever fs_forcegame has been configured. Never writes into fs_cdpath.
+pub fn game_write_directory(base: &Path, game: Option<&Path>) -> PathBuf {
+    let roots = configured_filesystem_roots(base);
+    filesystem_write_directory(base, game, &roots)
+}
+
+/// Pure counterpart for testing and for callers that already know the roots.
+pub fn filesystem_write_directory(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> PathBuf {
+    let parent = roots.homepath.as_deref().unwrap_or_else(|| base.parent().unwrap_or(base));
+    if let Some(forcegame) = &roots.forcegame {
+        return parent.join(forcegame);
+    }
+    parent.join(game.and_then(Path::file_name).or_else(|| base.file_name()).unwrap_or_else(|| std::ffi::OsStr::new("base")))
+}
+
+fn add_unique_directory(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !dirs.iter().any(|existing| existing == &path) { dirs.push(path); }
+}
+
+fn add_game_layer(dirs: &mut Vec<PathBuf>, local: &Path, home: Option<&Path>, game: &std::ffi::OsStr) {
+    if let Some(home) = home {
+        add_unique_directory(dirs, home.join(game));
+    }
+    add_unique_directory(dirs, local.join(game));
+}
+
+/// One game's own content, in homepath first then installation root. Used by
+/// demo browser selections that must not inherit unrelated mods or base demos.
+pub fn filesystem_game_layer_dirs(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> Vec<PathBuf> {
+    let local = base.parent().unwrap_or(base);
+    let name = game.and_then(Path::file_name).or_else(|| base.file_name()).unwrap_or_else(|| std::ffi::OsStr::new("base"));
+    let mut dirs = Vec::new();
+    add_game_layer(&mut dirs, local, roots.homepath.as_deref(), name);
+    dirs
+}
+
+/// Priority: always-on forcegame, current mod, base; within each layer, home
+/// precedes local. The cdpath is a retail-asset fallback *only* (cdpath/base),
+/// never used as a mod override or write destination.
+pub fn filesystem_search_dirs(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> Vec<PathBuf> {
+    let local = base.parent().unwrap_or(base);
+    let home = roots.homepath.as_deref();
+    let mut dirs = Vec::new();
+    if let Some(forced) = &roots.forcegame {
+        add_game_layer(&mut dirs, local, home, std::ffi::OsStr::new(forced.as_str()));
+    }
+    if let Some(mod_name) = game.and_then(Path::file_name) {
+        if Some(mod_name) != base.file_name() {
+            add_game_layer(&mut dirs, local, home, mod_name);
+        }
+    }
+    add_game_layer(&mut dirs, local, home, base.file_name().unwrap_or_else(|| std::ffi::OsStr::new("base")));
+    if let Some(cd) = &roots.cdpath {
+        add_unique_directory(&mut dirs, cd.join("base"));
+    }
+    dirs
+}
+
 /// Indexed reusable JKA/OpenJK-style asset search path.
 ///
 /// All `.pk3` files, Rend2 `cubemaps.zip`, and loose files beneath each game directory are visible
 /// through one package-relative namespace. Search directories are passed from
 /// highest to lowest priority. For each directory, PK3s are mounted first and
 /// then loose files, matching JKA's normal package-before-directory behavior.
+
+/// Opaque identity of one built VFS index; see [`AssetSearchPath::index_token`].
+/// Weak, so a cached token never keeps a replaced index (and the idle archive
+/// handles that lock its PK3 files) alive; it still pins the allocation, so the
+/// address cannot be reused by a newer index.
+#[derive(Clone)]
+pub struct VfsIndexToken(std::sync::Weak<VfsIndex>);
+
+impl PartialEq for VfsIndexToken {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for VfsIndexToken {}
+
+/// Source information from the indexed virtual filesystem, without reading file bytes.
+#[derive(Debug, Clone)]
+pub struct AssetProviderInfo {
+    pub source: PathBuf,
+    pub archive: bool,
+    pub selected: bool,
+}
 
 pub struct AssetSearchPath {
     shared: Arc<VfsIndex>,
@@ -182,12 +425,8 @@ impl AssetSearchPath {
 
     /// Open an optional active mod/game directory above base priority.
     pub fn open_game(base: &Path, game: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut dirs = Vec::with_capacity(2);
-        if let Some(game) = game.filter(|game| *game != base) {
-            dirs.push(game);
-        }
-        dirs.push(base);
-        Self::open_search_dirs(dirs)
+        let roots = configured_filesystem_roots(base);
+        Self::open_search_dirs(filesystem_search_dirs(base, game, &roots))
     }
 
     /// Open the search directories (highest priority first).
@@ -263,6 +502,14 @@ impl AssetSearchPath {
         Ok(())
     }
 
+    /// Identity of the shared namespace index this view reads. Two views give
+    /// equal tokens only while nothing beneath their search directories (or
+    /// the package policy) has changed, so results derived purely from the VFS
+    /// can be cached against it.
+    pub fn index_token(&self) -> VfsIndexToken {
+        VfsIndexToken(Arc::downgrade(&self.shared))
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.shared.entries.iter().map(|entry| entry.key.as_str())
     }
@@ -312,6 +559,32 @@ impl AssetSearchPath {
             Provider::Archive { archive, .. } => Some(self.shared.archive_paths[*archive].as_path()),
             Provider::Loose { path } => Some(path.as_path()),
         }
+    }
+
+    /// Every indexed provider for a qpath in virtual filesystem priority order.
+    /// Unlike reading a file, this only consults the shared PK3/loose index.
+    /// The first entry is the ordinary winner when overrides are enabled.
+    pub fn indexed_providers(&self, name: &str) -> Vec<AssetProviderInfo> {
+        if validate_asset_name(name).is_err() { return Vec::new(); }
+        let Some(entry) = self.shared.find(&normalize_asset_name(name)) else {
+            return Vec::new();
+        };
+        let selected = self.provider_for_ordinary_read(&entry.key);
+        entry.providers().map(|provider| {
+            let (source, archive) = match provider {
+                Provider::Archive { archive, .. } => (self.shared.archive_paths[*archive].clone(), true),
+                Provider::Loose { path } => (path.clone(), false),
+            };
+            AssetProviderInfo {
+                source,
+                archive,
+                selected: selected.as_ref().is_some_and(|winner| match (winner, provider) {
+                    (Provider::Archive { archive: a, entry: b }, Provider::Archive { archive: c, entry: d }) => a == c && b == d,
+                    (Provider::Loose { path: a }, Provider::Loose { path: b }) => a == b,
+                    _ => false,
+                }),
+            }
+        }).collect()
     }
 
     /// Physical loose file selected by ordinary asset lookup, when the winning
@@ -585,6 +858,9 @@ enum Scanned {
 }
 
 fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
+    // One consistent mount policy for this index build, even when the menu
+    // applies a change while a background map worker is indexing packages.
+    let disabled = disabled_package_paths();
     let mut sources = Vec::new();
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
@@ -596,7 +872,8 @@ fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if entry.file_type()?.is_file() && is_archive_package(&path) {
+            if entry.file_type()?.is_file() && is_archive_package(&path)
+                && (is_stock_asset_archive(&path) || !disabled.contains(&path)) {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
                 packages.push((path, size));
             }
@@ -791,6 +1068,10 @@ struct Fingerprint {
 fn fingerprint_search_dirs(dirs: &[PathBuf]) -> Fingerprint {
     let mut hasher = DefaultHasher::new();
     let mut newest = SystemTime::UNIX_EPOCH;
+    // A checkbox change invalidates the shared index even when no filesystem
+    // modification time changes. Existing readers keep their old Arc until refreshed.
+    package_policy().read().unwrap_or_else(PoisonError::into_inner)
+        .generation.hash(&mut hasher);
     for dir in dirs {
         dir.hash(&mut hasher);
         fingerprint_tree(dir, true, &mut hasher, &mut newest);
@@ -890,7 +1171,15 @@ fn shared_index(dirs: &[PathBuf]) -> Result<(Arc<VfsIndex>, Option<ArchiveHandle
             return Ok((Arc::clone(&entry.index), None));
         }
     }
-    let (index, handles) = build_index(dirs)?;
+    let build_generation = package_policy().read().unwrap_or_else(PoisonError::into_inner).generation;
+    let (mut index, mut handles) = build_index(dirs)?;
+    let mut fingerprint = fingerprint;
+    // If Apply raced the scan, retry against the new generation. Avoid walking
+    // the entire filesystem a second time unless that race actually happened.
+    if package_policy().read().unwrap_or_else(PoisonError::into_inner).generation != build_generation {
+        fingerprint = fingerprint_search_dirs(dirs);
+        (index, handles) = build_index(dirs)?;
+    }
     let index = Arc::new(index);
     *cached = Some(CachedIndex {
         fingerprint: fingerprint.hash,
@@ -1118,6 +1407,57 @@ mod tests {
     }
 
     #[test]
+    fn disabling_package_and_refresh_reverts_to_lower_priority_provider() {
+        let root = test_root("pk3-manager-remount");
+        let base = root.join("base");
+        fs::create_dir_all(&base).unwrap();
+        let qpath = "textures/test/override.tga";
+        let stock = base.join("assets0.pk3");
+        let optional = base.join("zz_optional.pk3");
+        write_package(&stock, qpath, b"stock");
+        write_package(&optional, qpath, b"optional");
+        let mut assets = AssetSearchPath::open(&base).unwrap();
+        assert_eq!(assets.read(qpath, 32).unwrap().unwrap().bytes, b"optional");
+        let mut disabled = HashSet::new();
+        disabled.insert(optional.clone());
+        apply_disabled_packages(&base, None, &disabled).unwrap();
+        assert!(!package_enabled(&optional));
+        assert!(package_enabled(&stock));
+        assert_eq!(installed_packages(&base, None).len(), 2);
+        // Existing index stays valid until its owner explicitly refreshes.
+        assert_eq!(assets.read(qpath, 32).unwrap().unwrap().bytes, b"optional");
+        assets.refresh().unwrap();
+        assert_eq!(assets.read(qpath, 32).unwrap().unwrap().bytes, b"stock");
+        assert!(apply_disabled_packages(&base, None, &HashSet::from([stock.clone()])).is_err());
+        apply_disabled_packages(&base, None, &HashSet::new()).unwrap();
+        assets.refresh().unwrap();
+        assert_eq!(assets.read(qpath, 32).unwrap().unwrap().bytes, b"optional");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn which_index_lists_active_and_shadowed_pk3_sources() {
+        let root = test_root("which-provenance");
+        let base = root.join("base");
+        let mod_dir = root.join("whichmod");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&mod_dir).unwrap();
+        let qpath = "models/players/test/model_default.skin";
+        write_package(&base.join("assets0.pk3"), qpath, b"retail skin");
+        write_package(&mod_dir.join("custom.pk3"), qpath, b"custom skin");
+        let mut assets = AssetSearchPath::open_game(&base, Some(&mod_dir)).unwrap();
+        let found = assets.indexed_providers("MODELS/PLAYERS/TEST/MODEL_DEFAULT.SKIN");
+        assert_eq!(found.len(), 2);
+        assert!(found[0].source.ends_with("custom.pk3") && found[0].archive && found[0].selected);
+        assert!(found[1].source.ends_with("assets0.pk3") && !found[1].selected);
+        assets.set_allow_asset_overrides(false);
+        let stock = assets.indexed_providers(qpath);
+        assert!(!stock[0].selected && stock[1].selected);
+        assert!(assets.indexed_providers("../secret").is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn trace_index_provider_respects_stock_first_and_never_reads() {
         let root = test_root("trace-provider-priority");
         let base = root.join("base");
@@ -1327,4 +1667,38 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+}
+
+#[cfg(test)]
+mod filesystem_roots_tests {
+    use super::*;
+
+    #[test]
+    fn layers_keep_forcegame_above_server_mod_and_retail_below_base() {
+        let base = Path::new("/client/base");
+        let game = Path::new("/client/japro");
+        let roots = FilesystemRoots {
+            homepath: Some(PathBuf::from("/user")),
+            cdpath: Some(PathBuf::from("/retail")),
+            forcegame: Some("dinurdojk".into()),
+        };
+        assert_eq!(filesystem_write_directory(base, Some(game), &roots), PathBuf::from("/user/dinurdojk"));
+        assert_eq!(filesystem_search_dirs(base, Some(game), &roots), vec![
+            PathBuf::from("/user/dinurdojk"), PathBuf::from("/client/dinurdojk"),
+            PathBuf::from("/user/japro"), PathBuf::from("/client/japro"),
+            PathBuf::from("/user/base"), PathBuf::from("/client/base"),
+            PathBuf::from("/retail/base"),
+        ]);
+    }
+
+    #[test]
+    fn redundant_layers_are_deduplicated_and_legacy_layout_unchanged() {
+        let base = Path::new("/client/base");
+        assert_eq!(filesystem_write_directory(base, Some(Path::new("/client/japro")), &FilesystemRoots::default()), PathBuf::from("/client/japro"));
+        assert_eq!(filesystem_search_dirs(base, Some(Path::new("/client/japro")), &FilesystemRoots::default()),
+            vec![PathBuf::from("/client/japro"), PathBuf::from("/client/base")]);
+        let roots = FilesystemRoots { forcegame: Some("japro".into()), ..Default::default() };
+        assert_eq!(filesystem_search_dirs(base, Some(Path::new("/client/japro")), &roots),
+            vec![PathBuf::from("/client/japro"), PathBuf::from("/client/base")]);
+    }
 }

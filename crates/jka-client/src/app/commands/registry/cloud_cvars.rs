@@ -2,6 +2,112 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_BLUECLOUDDEBUG {
+        runtime: CvarDef::new("r_blueCloudDebug", "0", "0..5",
+            "0 normal; 1 cloud opacity without lighting/air; 2 sun transmittance; 3 selected Beer cascade; 4 Beer UV coverage (green valid, red outside); 5 copied scene depth. Diagnostics are not performance comparisons.",
+            CvarType::Int { min: 0, max: 5 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_debug as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_debug = value as u8;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDFREEZE {
+        runtime: CvarDef::new("r_blueCloudFreeze", "0", "0..1",
+            "Freeze native atmosphere wind/time and weather simulation at the current frame; camera remains movable. Also enables still-frame convergence, so do not benchmark FPS while frozen.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_freeze as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_freeze = value != 0;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDSHADOWMODE {
+        runtime: CvarDef::new("r_blueCloudShadowMode", "0", "0..1",
+            "0 native; 1 bypass distant Beer attenuation in cloud lighting/shafts (diagnostic). Shadow-map generation and ground shadows continue.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_shadow_mode as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_shadow_mode = value as u8;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDSUNSTEPS {
+        runtime: CvarDef::new("r_blueCloudSunSteps", "-1", "-1..8",
+            "Local sunlight march samples: -1 native tier; 0..8 override. Lower values trade small cloud lighting detail for speed; Beer shadows remain.",
+            CvarType::Int { min: -1, max: 8 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_sun_steps as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_sun_steps = value;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDCOMPOSITE {
+        runtime: CvarDef::new("r_blueCloudComposite", "1", "0..1",
+            "0 hide the cloud overlay while retaining cloud march, environment and shadows; 1 normal. Isolates ocean capture/order; not an ocean-order fix or full cloud-cost benchmark.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_composite as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_composite = value != 0;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDALTITUDEREBASE {
+        runtime: CvarDef::new("r_blueCloudAltitudeRebase", "0", "0..1",
+            "Experimental negative-altitude A/B: 0 current placement; 1 translate all resolved cloud layers once into the lowered reference. Haze/rain particles/lightning are unchanged; not a complete atmosphere fix.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_altitude_rebase as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_water_environment.cloud_altitude_rebase = value != 0;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUECLOUDSHADOWFAR {
+        runtime: CvarDef::new("r_blueCloudShadowFar", "0", "0..200000",
+            "Beer cascade fitting distance in metres: 0 native camera; try 10000/60000/200000. Independent fitting projection preserves scene depth. Larger ranges reduce shadow texel density.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.blue_water_environment.cloud_shadow_far.to_string()),
+            |app, value| App::cvar_set_bluecloud_shadow_far(app, APP_R_BLUECLOUDSHADOWFAR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_bluecloud_shadow_far, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_bluecloud_shadow_far(app: &mut Self, name: &str, value: &str) -> Result<(), String> {
+                app.video.blue_water_environment.cloud_shadow_far = App::parse_cvar_finite(name, value)?.clamp(0.0, 200000.0);
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }
+        }]
+    }
+    APP_R_BLUECLOUDFARSTEPSCALE {
+        runtime: CvarDef::new("r_blueCloudFarStepScale", "1", "1..4",
+            "Distant primary-ray step multiplier. 1 native; try 1.5/2. Ramps for cloud entry 1500..5000m away, preserves near-ray steps, max distance and iteration limit. May miss thin distant wisps.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.blue_water_environment.cloud_far_step_scale.to_string()),
+            |app, value| App::cvar_set_bluecloud_far_step_scale(app, APP_R_BLUECLOUDFARSTEPSCALE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_bluecloud_far_step_scale, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_bluecloud_far_step_scale(app: &mut Self, name: &str, value: &str) -> Result<(), String> {
+                app.video.blue_water_environment.cloud_far_step_scale = App::parse_cvar_finite(name, value)?.clamp(1.0, 4.0);
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }
+        }]
+    }
     APP_R_BLUESKYALTITUDE {
         runtime:CvarDef::new("r_blueSkyAltitude","","-1000.0..15000.0","Cloud base (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.altitude.to_string()),|app,value|App::cvar_set_bluesky_altitude(app,APP_R_BLUESKYALTITUDE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_altitude,None),
@@ -127,6 +233,12 @@ app_cvars! {
             |app:&App|CvarValue::String(app.video.blue_water_environment.quality.to_string()),|app,value|App::cvar_set_bluesky_quality(app,APP_R_BLUESKYQUALITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_quality,None),
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.quality=v.clamp(0.0, 3.0) as u8;}}}),archive:Some((27319,|state|state.video.blue_water_environment.quality.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_quality(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.quality=App::parse_cvar_finite(name,value)?.clamp(0.0,3.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUECLOUDQUALITY {
+        runtime:CvarDef::new("r_blueCloudQuality","4","0..4","Blue Water clouds: 0 Low, 1 Medium, 2 High, 3 Ultra, 4 match sky quality. Controls march detail, lighting and cloud shadow budgets independently of the sky.",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.cloud_quality.to_string()),|app,value|App::cvar_set_bluecloud_quality(app,APP_R_BLUECLOUDQUALITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluecloud_quality,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.cloud_quality=v.clamp(0.0, 4.0) as u8;}}}),archive:Some((27328,|state|state.video.blue_water_environment.cloud_quality.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluecloud_quality(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.cloud_quality=App::parse_cvar_finite(name,value)?.clamp(0.0,4.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYGENUS {
         runtime:CvarDef::new("r_blueSkyGenus","","0..7","Native cloud type",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
@@ -744,7 +856,7 @@ app_cvars! {
                 "r_cloudQuality",
                 "",
                 "custom",
-                "Controls r_cloudQuality.",
+                "JKA cloud raymarch quality (0..1): steps, shadow samples and detailed distance. Blue Water clouds use r_blueCloudQuality.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -791,7 +903,7 @@ app_cvars! {
                 "r_cloudRenderResolution",
                 "",
                 "custom",
-                "Controls r_cloudRenderResolution.",
+                "Cloud buffer resolution for both JKA and Blue Water clouds: quarter (25%), half (50%), 75, full (100%). Lower resolutions reduce march/reconstruction cost and soften detail; shadow maps are controlled separately by the cloud quality tier.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -832,7 +944,7 @@ app_cvars! {
                 ) -> Result<(), String> {
                     {
                         self.video.cloud_render_resolution = CloudRenderResolution::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected full|half|quarter"))?;
+                            .ok_or_else(|| format!("{name}: expected full|75|half|quarter"))?;
                         self.sync_post_effects();
                         self.mark_config_dirty();
                         self.publish_ui();

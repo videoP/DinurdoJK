@@ -1,4 +1,20 @@
 #[test]
+#[ignore = "requires JKA_TEST_BASE stock assets"]
+fn force_seeing_preserves_both_environment_mapped_shader_layers() {
+    let base = std::env::var_os("JKA_TEST_BASE").expect("JKA_TEST_BASE");
+    let assets = AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+    let mut presenter = PlayerPresenter::new(assets, false).unwrap();
+    let primary = presenter.custom_shader_uv_xform("powerups/sightshell", 2.0);
+    let overlays = presenter.custom_shader_overlay_stages("powerups/sightshell", 2.0, false);
+    assert_eq!(overlays.len(), 1, "stock Force Seeing has two stages total");
+    let (texture, mode, uv, _, environment) = &overlays[0];
+    assert!(texture.is_some());
+    assert_eq!(*mode, DynamicModelAlphaMode::AdditiveOne);
+    assert!(*environment);
+    assert!((uv[5] - primary[5]).abs() > 0.3, "the two layers scroll in opposite directions");
+}
+
+#[test]
 fn local_body_deformation_stays_on_connection_owned_player() {
     use super::presentation::local_body_for_entity as owned;
     // Connection client 2; camera is following client 3.
@@ -347,6 +363,19 @@ fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices
         anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,
         idle_effects: Vec::new(),
     };
+    // Name-promoted GLM hair only moves in mode 2, but an imported
+    // Source rig keeps its authored jiggle in modes 1 and 2.
+    assert!(!model.procedural_jiggles_enabled(2));
+    model.source_jiggles_enabled = true;
+    assert!(!model.procedural_jiggles_enabled(0));
+    assert!(!model.procedural_jiggles_enabled(1));
+    assert!(model.procedural_jiggles_enabled(2));
+    model.source_imported = true;
+    assert!(!model.procedural_jiggles_enabled(0));
+    assert!(model.procedural_jiggles_enabled(1));
+    assert!(model.procedural_jiggles_enabled(2));
+    model.source_imported = false;
+    model.source_jiggles_enabled = false;
     let mut animator = Ghoul2Animator::new(&animation);
     animator.set_bone_angles_postmult(&animation, "lower_lumbar", [14., 6., 0.], 3, 4, 5).unwrap();
     let stock = animator.evaluate_pose_openjk_root(&animation, 0).unwrap();
@@ -997,6 +1026,7 @@ fn zero_length_saber_request_reaches_weapon_fx_cleanup() {
         false,
         0,
         1,
+        false,
         false,
         false,
     )

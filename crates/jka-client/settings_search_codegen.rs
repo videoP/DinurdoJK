@@ -8,15 +8,16 @@ const SOURCES: &[(&str, usize, &str)] = &[
     ("src/app/egui_pages.rs", 2, "None"),
     ("src/app/egui_pages.rs", 5, "None"),
     ("src/app/egui_pages.rs", 6, "None"),
-    ("src/app/egui_pages.rs", 9, "None"),
+    ("src/app/egui_pages.rs", 10, "None"),
     ("src/app/egui_settings/mod_options.rs", 1, "None"),
-    ("src/app/egui_settings/mod_options.rs", 9, "None"),
+    ("src/app/egui_settings/mod_options.rs", 10, "None"),
     ("src/app/egui_settings/display.rs", 3, "Display"),
     ("src/app/egui_settings/image.rs", 3, "Display"),
     ("src/app/egui_settings/image.rs", 3, "Geometry"),
     ("src/app/egui_settings/geometry.rs", 3, "Geometry"),
     ("src/app/egui_settings/models.rs", 3, "Geometry"),
     ("src/app/egui_settings/lighting.rs", 3, "Lighting"),
+    ("src/app/egui_settings/relighting.rs", 3, "Relighting"),
     ("src/app/egui_settings/materials.rs", 3, "Materials"),
     ("src/app/egui_settings/effects.rs", 3, "Effects"),
     ("src/app/egui_settings/reflections.rs", 3, "Effects"),
@@ -51,7 +52,7 @@ const FUNCTIONS: &[&str] = &[
     "linked_ocean_slider", "audio_slider!", "camera_number!",
     "self.egui_physics_toggle", "self.egui_physics_slider", "self.egui_physics_number",
     "self.egui_toggle_row", "self.egui_environment_toggle", "self.audio_choice_row",
-    "self.cvar_choice_row", "self.cvar_switch_row",
+    "self.cvar_choice_row", "self.cvar_switch_row", "self.baked_slider",
     "sky_slider", "locked_slider", "slider", "slider_with", "choice",
 ];
 
@@ -123,13 +124,13 @@ pub fn generate(manifest: &Path, out: &Path) -> std::io::Result<()> {
                 2 => &text[camera..network],
                 5 => &text[network..vote],
                 6 => &text[hud..game],
-                9 => &text[game..companion],
+                10 => &text[game..companion],
                 _ => "",
             }
         } else if path.ends_with("mod_options.rs") {
             let movement = text.find("fn egui_mod_movement_settings(").unwrap();
             let setup = text.find("fn egui_mod_setup_settings(").unwrap();
-            match tab { 1 => &text[movement..setup], 9 => &text[setup..], _ => "" }
+            match tab { 1 => &text[movement..setup], 10 => &text[setup..], _ => "" }
         } else if path.ends_with("native_environment.rs") {
             let clouds = text.find("fn egui_native_clouds(").unwrap();
             let moon = text.find("fn egui_native_moon(").unwrap();

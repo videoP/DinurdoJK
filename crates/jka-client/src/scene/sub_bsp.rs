@@ -72,6 +72,9 @@ pub(crate) fn prepare_source_with_sub_bsps(
     // collision to the main-map-only pipeline on a later join/restart.
     let seed = seed.filter(|map| map.sub_bsp_names.is_empty());
     let mut map = super::prepare_source_with_jobs(root, game, source, jobs, options, seed)?;
+    if jobs.is_superseded() {
+        return Err("superseded map preparation".into());
+    }
     if names.is_empty() {
         return Ok(map);
     }
@@ -103,6 +106,9 @@ pub(crate) fn prepare_source_with_sub_bsps(
     imported_options.planar_reflections = false;
     imported_options.planar_environment = false;
     for name in names {
+        if jobs.is_superseded() {
+            return Err("superseded map preparation".into());
+        }
         let stem = &name[5..name.len() - 4];
         // Prepare each BSP separately so its external lightmaps, shader providers,
         // atlas UVs and PBR companions retain their own map/asset context.

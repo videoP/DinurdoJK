@@ -39,15 +39,21 @@ mod lighting;
 mod models;
 mod neon_menu;
 mod overlay;
+mod ui_gamma;
 mod portal_depth;
 mod post;
 mod reflections;
 mod render_thread;
 mod static_ao;
 mod spectator_highlight;
+mod stream_output;
+mod studio_entity_mask;
 mod targets;
 mod texture_compression;
 mod textures;
+mod image_cache;
+mod studio_lens;
+pub use studio_lens::StudioLens;
 mod brightness;
 mod brightness_settings;
 mod uniforms;
@@ -64,6 +70,7 @@ pub use api::{
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
     RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
+    StudioSourceFrame, StudioSceneFrame, StudioSceneLighting,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
     PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
     PBR_PROFILE_POM_ADAPTIVE_STEPS, PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL,
@@ -112,6 +119,7 @@ use environment::water::{
     MAX_OCEAN_SURFACES,
 };
 use frame::early_submit::EarlyPresentTarget;
+use frame::studio_transition::StudioTransitionGpu;
 use frame::late_latch::{sample_view_rotation, LatestViewState, ViewSampleMeasurement};
 use input_diagnostic::{
     InputDiagFrameSample, InputDiagLatchPhase, InputDiagRendererMetadata, InputDiagnostic,
@@ -167,7 +175,8 @@ use models::types::{
 };
 use overlay::{
     empty_ui_font_texture, load_ui_font_texture, load_ui_loading_texture,
-    load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot, ScreenFxTexture,
+    load_studio_overlay_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
+    ScreenFxTexture,
 };
 use post::bindings::{
     create_auto_exposure_bind_group, create_bloom_bind_groups, create_dof_bind_group,
@@ -196,7 +205,7 @@ use reflections::planar::reflection_matrix;
 use reflections::planar::{
     collect_planar_reflectors, create_planar_reflection_resources, select_planar_reflection_views,
 };
-pub use render_thread::RenderThread;
+pub use render_thread::{RenderThread, STUDIO_SCENE_OUT_OF_GPU_MEMORY};
 use spectator_highlight::SpectatorHighlightResources;
 use static_ao::bake::{
     collect_static_ao_lightmap_triangles, collect_static_ao_render_triangles,
@@ -223,7 +232,7 @@ use textures::{
     create_shader_module_timed, create_texture_sampler, gpu_blend_factor,
     load_texture_asset_or_missing, load_ui_key_atlas, timed_init_step, try_load_texture_asset,
     try_load_texture_asset_from_search_path, try_load_ui_font_asset, upload_texture,
-    upload_texture_bc3_picmip, upload_texture_picmip, GpuImage,
+    upload_texture_picmip, GpuImage,
 };
 use uniforms::{
     transient_light_gpu, transient_light_samples, AutoExposureState, AutoExposureUniform,
@@ -256,7 +265,7 @@ use visibility::readback::CullDiagnosticsReadback;
 use visibility::settings::{fast_sky_clear_color, world_blend_probe_bucket, world_stage_probe_excludes};
 use world::bindings::{
     advance_world_animations, build_world_animation, create_fast_world_bind_group,
-    create_world_bind_group, rebuild_world_bind_groups, sync_auto4_bind_groups,
+    create_world_bind_group, rebuild_world_bind_groups,
 };
 use world::detail_textures::{
     auto_detail_fallback_index, build_auto_detail_by_base_texture, detail_texture_for_source,
@@ -601,7 +610,18 @@ struct Renderer {
     /// Retained so auxiliary surfaces can query capabilities against the same GPU adapter.
     adapter: wgpu::Adapter,
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+    surface: Arc<wgpu::Surface<'static>>,
+    /// Scene renderers share the device, but never acquire/configure/present
+    /// the window surface. Their complete normal frame goes into this texture.
+    offscreen_output: Option<wgpu::Texture>,
+    studio_scenes: HashMap<u64, Box<Renderer>>,
+    studio_last_scene: Option<Arc<StudioSceneFrame>>,
+    studio_last_depth: bool,
+    studio_entity_mask: Option<studio_entity_mask::StudioEntityMask>,
+    studio_revision: u64,
+    scene_time: Option<f32>,
+    studio_settings_signature: String,
+    scene_depth_capture: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline_jobs: PipelineJobManager,
@@ -666,6 +686,7 @@ struct Renderer {
     glass_world: Option<glass::WorldPipeline>,
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
+    lake_normal: wgpu::TextureView,
     detail_texture: GpuImage,
     detail_texture_auto: bool,
     detail_texture_game: Option<PathBuf>,
@@ -760,6 +781,8 @@ struct Renderer {
     ui_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
+    /// Studio overlay font, keyed by its choice (None inner = failed to load).
+    studio_race_font: Option<(String, Option<(GpuImage, crate::ui::ProportionalFont, wgpu::BindGroup)>)>,
     _ui_splash: GpuImage,
     /// TaystJK `gfx/hud/keys/*` art packed into one atlas (UI texture source 4).
     _ui_keys: GpuImage,
@@ -807,6 +830,7 @@ struct Renderer {
     player_names: Option<ui::UiWorldPlayerNames>,
     ui_trace: bool,
     ui_state: UiSnapshot,
+    stream_output: stream_output::StreamOutput,
     egui_renderer: egui_wgpu::Renderer,
     egui_paint_jobs: Vec<egui::ClippedPrimitive>,
     egui_pixels_per_point: f32,
@@ -816,6 +840,31 @@ struct Renderer {
     egui_pending_free: Vec<egui::TextureId>,
     asset_preview_mode: bool,
     asset_preview_viewport: Option<[u32; 4]>,
+    studio_world_viewport: Option<[u32; 4]>,
+    studio_transition_gpu: Option<StudioTransitionGpu>,
+    /// Fixed Render Studio output size while exporting. Sources render at it
+    /// and captures read an offscreen composite: never the window/swapchain.
+    studio_export_size: Option<[u32; 2]>,
+    studio_export_target: Option<(StudioTransitionGpu, wgpu::Texture)>,
+    /// Last editor preview presented during an export (preview is throttled).
+    studio_export_preview_at: Option<std::time::Instant>,
+    /// Scene of the latest export capture; the export preview shows it.
+    studio_export_shown: Option<Arc<StudioSceneFrame>>,
+    /// Export/still captures, oldest first; one is rendered per render loop.
+    studio_capture_queue: std::collections::VecDeque<frame::studio_scene::StudioCapture>,
+    /// Export readback buffers and the submitted frames mapping into them.
+    studio_readback_slots: Vec<frame::studio_scene::StudioReadbackSlot>,
+    studio_readbacks: std::collections::VecDeque<frame::studio_scene::PendingStudioReadback>,
+    /// Finished export frames, delivered one per `take_screenshot_result`.
+    studio_capture_results: std::collections::VecDeque<Result<ScreenshotOutput, String>>,
+    /// Repacks mapped export readbacks off the render thread (lazily started).
+    studio_unpacker: Option<frame::studio_scene::StudioUnpacker>,
+    /// Readback slots the unpacker is still reading.
+    studio_unpacking: Vec<usize>,
+    /// Bumped when an export ends: late unpacker results are dropped.
+    studio_readback_generation: u64,
+    studio_lens: Option<StudioLens>,
+    studio_lens_gpu: Option<studio_lens::StudioLensGpu>,
     asset_preview_background: Option<frame::preview_background::PreviewBackground>,
     // Created only after opening a menu page that requests the live blurred/
     // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
@@ -824,6 +873,9 @@ struct Renderer {
     /// Renderer-drawn frontend main page (rainy café window).
     neon_menu: neon_menu::NeonMenu,
     world: Option<WorldGpu>,
+    studio_active_world: Option<(u64, crate::scene::ShaderRemapState)>,
+    /// Three inactive worlds, moved rather than cloned. Never serialized.
+    studio_cached_worlds: Vec<world::lifecycle::StudioCachedWorld>,
     /// `videoMap` cinematics of the current world, streamed into `world.textures`.
     world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
@@ -861,6 +913,10 @@ struct Renderer {
     gamma: f32,
     baked_brightness: brightness::BakedBrightness,
     gamma_method: crate::gamma::GammaMethod,
+    /// True only after Windows confirms the display gamma ramp is installed.
+    hardware_gamma_active: bool,
+    ui_gamma_native: Option<ui_gamma::NativeUiGamma>,
+    ui_gamma_egui: Option<ui_gamma::EguiUiGamma>,
     hdr_enabled: bool,
     tone_mapping_enabled: bool,
     tone_mapping_strength: f32,
@@ -979,6 +1035,7 @@ struct Renderer {
     previous_frame_time: f32,
     color_lut_preset: ColorLutPreset,
     color_lut_strength: f32,
+    thermal_vision: u8,
     color_grade: crate::color_grading::ColorGradeSettings,
     split_toning: crate::color_grading::SplitToningSettings,
     color_lut_effective_strength: f32,
@@ -990,6 +1047,7 @@ struct Renderer {
     frame_plan: FramePlan,
     /// Benchmark control: never select `WorldRenderPath::FastBaseline`.
     force_unified_world: bool,
+    foliage_wind_enabled: bool,
     indirect_supported: bool,
     gpu_compaction_supported: bool,
     world_compact_min_draws: u32,
@@ -1075,16 +1133,14 @@ struct Renderer {
     cloud_foreground: Vec<CloudForegroundBlade>,
     /// Setup > Video brightness multiplier applied to runtime dynamic lights.
     dynamic_light_brightness: f32,
-    emissive_area_lights_enabled: bool,
-    shader_light_promotion_enabled: bool,
-    baked_local_lights: bool,
+    added_map_light_sources_mask: u32,
     baked_local_sources: u32,
+    entity_fixture_lighting_ab: bool,
     baked_local_shadows: bool,
     baked_local_had_casters: bool,
     /// Session-only lamp-shadow experiment: 0 baseline, 1 receiver octants, 2 caster prefilter, 3 both.
     lamp_shadow_ab: u8,
     csm_coverage_ab: bool,
-    shader_light_promotion_mask: u32,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
     local_light_shadows_enabled: bool,
@@ -1166,6 +1222,11 @@ struct Renderer {
     /// `None` until the background compile finishes and a frame needs it; see
     /// `ensure_post_pipeline`.
     post_pipeline: Option<wgpu::RenderPipeline>,
+    /// Separate thermal fragment entry point, created only on first activation.
+    thermal_post_pipeline: Option<wgpu::RenderPipeline>,
+    thermal_depth_pipeline: Option<wgpu::RenderPipeline>,
+    thermal_depth_mask_pipeline: Option<wgpu::RenderPipeline>,
+    thermal_taa_pipeline: Option<wgpu::RenderPipeline>,
     /// r_postSpecialize: full-post pipelines keyed by `POST_FEATURES` mask,
     /// compiled on the pipeline workers the first time a mask is used.
     post_specialize: bool,

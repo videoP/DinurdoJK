@@ -599,7 +599,7 @@ mod calibration_tests {
     fn baked_sun_foliage_uses_compiler_alpha_color_and_wrapped_uvs() {
         use super::{compiler_sun_transmission, Vec3};
         let image = crate::materials::TextureData { label: "compiler leaf image".into(), source: None,
-            width: 2, height: 1, rgba: vec![64,128,255,0, 255,255,255,128], rgba16f: None,
+            width: 2, height: 1, rgba: (vec![64,128,255,0, 255,255,255,128]).into(), rgba16f: None,
             mip_level_count: 1, clamp: true, srgb: true };
         // Compiler samples wrap, even if the runtime stage is clamped, and
         // continuous inverse alpha differs from the renderer's GE128 cutoff.
@@ -658,7 +658,7 @@ mod calibration_tests {
             texels.push(Some(crate::renderer::StaticAoTexelSample { position: [x as f32 * 16.0, 0.0, y as f32 * 16.0], normal: [0.0, 1.0, 0.0] }));
         } }
         let original = rgba.clone();
-        let make_image = || crate::materials::TextureData { label: "inverse sun edge fixture".into(), source: None, width: 16, height: 16, rgba: original.clone(), rgba16f: None, mip_level_count: 1, clamp: true, srgb: true };
+        let make_image = || crate::materials::TextureData { label: "inverse sun edge fixture".into(), source: None, width: 16, height: 16, rgba: (original.clone()).into(), rgba16f: None, mip_level_count: 1, clamp: true, srgb: true };
         let mut image = make_image();
         assert!(refine_authored_sun_edges(&mut image, &texels, &vec![1; 256], Vec3::Y, 500.0, encoding, &std::sync::atomic::AtomicBool::new(false)) > 0);
         assert_eq!(image.rgba[(8 * 16 + 7) * 4 + 3], 0, "displaced edge must not subtract direct sun from baked shadow");
@@ -673,7 +673,7 @@ mod calibration_tests {
     #[test]
     fn baked_sun_alpha_survives_old_opaque_ao_cache() {
         let base = crate::renderer::StaticAoBaseLightmap { label: "sun mask".into(), width: 2, height: 1,
-            rgba: vec![10,20,30,0, 40,50,60,255], clamp: true, srgb: true };
+            rgba: vec![10,20,30,0, 40,50,60,255].into(), clamp: true, srgb: true };
         let mut cached = [1,2,3,255].repeat(4);
         crate::renderer::static_ao::bake::restore_baked_sun_alpha(&base, &mut cached, 4, 1);
         assert_eq!(cached.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>(), [0,64,191,255]);
@@ -716,7 +716,7 @@ fn map_sun_projection(world: &super::super::world::types::WorldGpu, sun_travel: 
     }
     if !found { return None; }
     let up = if sun_travel.dot(Vec3::Y).abs() > 0.95 { Vec3::Z } else { Vec3::Y };
-    let light_from_world = Mat4::look_to_rh(Vec3::ZERO, sun_travel.normalize(), up);
+    let light_from_world = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, sun_travel.normalize(), up);
     let mut lmin = Vec3::splat(f32::MAX);
     let mut lmax = Vec3::splat(-f32::MAX);
     for x in [low.x, high.x] {

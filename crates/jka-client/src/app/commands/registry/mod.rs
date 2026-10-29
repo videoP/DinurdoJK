@@ -200,6 +200,7 @@ pub(crate) mod material_cvars;
 mod media;
 pub(crate) mod movement_cvars;
 pub(crate) mod network_cvars;
+pub(crate) mod filesystem_cvars;
 pub(crate) mod ocean_cvars;
 pub(crate) mod physics_cvars;
 pub(crate) mod postprocess_cvars;
@@ -276,6 +277,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(movement_cvars::DEFINITIONS.iter());
         definitions.extend(race_ghost_cvars::DEFINITIONS.iter());
         definitions.extend(network_cvars::DEFINITIONS.iter());
+        definitions.extend(filesystem_cvars::DEFINITIONS.iter());
         definitions.extend(japro_cvars::DEFINITIONS.iter());
         definitions.extend(postprocess_cvars::DEFINITIONS.iter());
         definitions.extend(color_cvars::DEFINITIONS.iter());
@@ -392,6 +394,19 @@ mod tests {
         }
     }
     #[test]
+    fn cg_remaps_is_live_session_only_and_defaults_to_one() {
+        use crate::console::cvars::CvarFlags;
+        let definition = cvar_registry().find("cg_remaps").expect("cg_remaps registered");
+        assert_eq!(definition.entry.default, "1");
+        assert_eq!(definition.entry.latch, LatchScope::None);
+        assert!(!definition.flags.contains(CvarFlags::ARCHIVE));
+        let config = cvar_definition("cg_remaps").expect("cg_remaps config binding");
+        assert!(config.config.archive.is_none());
+        assert!(config.config.load_presentation.is_none());
+        assert_eq!(crate::japro_cg::JaproCgame::default().remaps, 1);
+    }
+
+    #[test]
     fn archived_cvars_have_complete_bindings_and_stable_order() {
         let mut order = std::collections::HashSet::new();
         for def in cvar_definitions() {
@@ -457,6 +472,14 @@ mod tests {
     }
 
     #[test]
+    fn in_restart_is_a_local_discoverable_command() {
+        let def = command_registry().find("IN_RESTART").expect("in_restart registered");
+        assert_eq!(def.scope, CommandScope::Always);
+        assert_eq!(crate::console::find_command("in_restart", false).unwrap().name, "in_restart");
+        assert!(crate::console::commands(false).any(|entry| entry.name == "in_restart"));
+    }
+
+    #[test]
     fn input_buttons_register_both_press_and_release_commands() {
         for name in [
             "+movedown",
@@ -512,7 +535,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(cvar_registry().archived().count(), 425);
+        assert_eq!(cvar_registry().archived().count(), 424);
         for name in ["cg_debugEvents", "cg_eventWorkers", "cg_asyncAssets"] {
             assert!(!cvar_registry()
                 .find(name)

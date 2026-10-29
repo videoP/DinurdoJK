@@ -148,13 +148,18 @@ impl App {
             ChatMode::Direct(_) => crate::cgame::ChatKind::Say,
         };
         self.play_chat_sound(kind, &rendered);
-        self.push_console_line(rendered.clone());
+        if matches!(mode, ChatMode::Team) {
+            self.push_console_team_chat_line(rendered.clone());
+        } else {
+            self.push_console_line(rendered.clone());
+        }
         if self.chat_lines.len() >= 16 {
             self.chat_lines.pop_front();
         }
         let now = Instant::now();
         self.chat_lines.push_back(ChatRecord {
             text: rendered,
+            team: matches!(mode, ChatMode::Team),
             created: now,
             demo_elapsed_ms: self.current_demo_elapsed_ms(now),
         });

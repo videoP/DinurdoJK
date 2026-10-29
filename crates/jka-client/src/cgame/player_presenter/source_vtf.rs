@@ -223,7 +223,7 @@ fn decode_vtf(label: &str, bytes: &[u8], srgb: bool) -> Result<TextureData, Stri
         source: None,
         width: w as u32,
         height: h as u32,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: mips as u32,
         clamp: false,

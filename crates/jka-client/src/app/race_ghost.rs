@@ -1,6 +1,6 @@
 //! Visual-only jaPRO race ghosts loaded from native `.dm_26` demos.
 //!
-//! A ghost deliberately does not own a second CGame. The worker reduces the
+//! A ghost deliberately does not own a second playback session. The worker reduces the
 //! recorded POV to the last `duelTime` race segment, retains the configstrings
 //! needed to rebuild the recorded ClientInfo, and runtime presentation feeds
 //! those playerState samples through the ordinary Ghoul2 PlayerPresenter.
@@ -33,6 +33,13 @@ pub(super) struct RaceGhostTrack {
     /// Human-facing label (archive `username` for web ghosts, demo name locally).
     pub display_name: String,
     pub map_name: String,
+    /// The reset/start anchor of the *selected* race segment, in DM26 server time.
+    /// This is deliberately not the continuously advancing race HUD timer.
+    pub race_start_server_ms: i32,
+    /// The same reset on the Studio / seek clock: source time 0 is the first
+    /// active snapshot (as in `frontend::scan_demo_bytes`), so a race frame
+    /// sits at `race_source_start_ms + frame.elapsed_ms` in a StudioDemoClip.
+    pub race_source_start_ms: i32,
     pub client_num: usize,
     pub frames: Vec<RaceGhostFrame>,
     pub configstrings: BTreeMap<u16, Vec<u8>>,
@@ -105,6 +112,8 @@ pub(super) fn parse_track(demo_name: String, bytes: Vec<u8>) -> Result<RaceGhost
     let mut current = None::<SegmentBuilder>;
     let mut last_completed = None::<SegmentBuilder>;
     let mut messages = 0usize;
+    let mut first_active = None::<i32>;
+    const SNAPFLAG_NOT_ACTIVE: u8 = 1 << 1;
 
     let finish = |current: &mut Option<SegmentBuilder>, last_completed: &mut Option<SegmentBuilder>| {
         if let Some(segment) = current.take() {
@@ -152,6 +161,9 @@ pub(super) fn parse_track(demo_name: String, bytes: Vec<u8>) -> Result<RaceGhost
                 }
                 ServerMessageEvent::Snapshot { .. } => {
                     let Some(snapshot) = decoder.latest_snapshot().cloned() else { continue };
+                    if snapshot.snap_flags & SNAPFLAG_NOT_ACTIVE == 0 && first_active.is_none() {
+                        first_active = Some(snapshot.server_time);
+                    }
                     let duel_time = snapshot.player_state.field_i32("duelTime").unwrap_or(0);
                     if duel_time <= 0 || snapshot.server_time < duel_time {
                         finish(&mut current, &mut last_completed);
@@ -208,16 +220,23 @@ pub(super) fn parse_track(demo_name: String, bytes: Vec<u8>) -> Result<RaceGhost
         .iter()
         .filter_map(|frame| playerstate_vec3(&frame.player_state, "origin"))
         .collect::<Vec<_>>();
-    let strafe_trail = LoadedTrail::from_points(
+    let mut strafe_trail = LoadedTrail::from_points(
         format!("race-ghost:{demo_name}"),
         0,
         &trail_points,
     );
+    let timed_samples = segment.frames.iter().filter_map(|frame| {
+        playerstate_vec3(&frame.player_state, "origin")
+            .map(|origin| (frame.elapsed_ms, origin))
+    }).collect::<Vec<_>>();
+    strafe_trail.set_race_ticks(&timed_samples);
     Ok(RaceGhostTrack {
         source_key: demo_name.clone(),
         display_name: demo_name.clone(),
         demo_name,
         map_name: segment.map_name,
+        race_start_server_ms: segment.duel_time,
+        race_source_start_ms: segment.duel_time.saturating_sub(first_active.unwrap_or(segment.duel_time)),
         client_num: segment.client_num,
         frames: segment.frames,
         configstrings: segment.configstrings,
@@ -238,6 +257,8 @@ pub(super) struct RaceGhost {
     last_live_duel_time: Option<i32>,
     last_elapsed_ms: i32,
     pub visual_sample: Option<RaceGhostVisualSample>,
+    pub studio_sound_game: Option<ClientGameState>,
+    studio_audio_clock: Option<i32>,
 }
 
 impl RaceGhost {
@@ -271,7 +292,52 @@ impl RaceGhost {
             last_live_duel_time: None,
             last_elapsed_ms: -1,
             visual_sample: None,
+            studio_sound_game: None,
+            studio_audio_clock: None,
         })
+    }
+
+    /// Studio companions retain their recorded loadout. Gameplay ghosts keep
+    /// the existing body-only, silent presentation.
+    pub fn enable_studio_presentation(&mut self, siege_classes: &[SiegeClassVisual]) {
+        let mut game=ClientGameState::new();
+        game.reset_gamestate(&self.track.configstrings,0);
+        if let Some(info)=game.client_info(self.track.client_num,siege_classes) {
+            self.info.saber_name=info.saber_name;
+            self.info.saber2_name=info.saber2_name;
+        }
+        self.studio_sound_game=Some(game);
+    }
+
+    pub fn studio_audio_events(&mut self, clock:i32, audible:bool) -> Vec<crate::cgame::PresentationEvent> {
+        let previous=self.studio_audio_clock.replace(clock);
+        let Some(previous)=previous else{return Vec::new()};
+        if !audible || clock<=previous || clock-previous>250 {return Vec::new();}
+        let start=self.track.frames.partition_point(|f|f.elapsed_ms<=previous);
+        let end=self.track.frames.partition_point(|f|f.elapsed_ms<=clock);
+        let mut events=Vec::new();
+        for index in start.max(1)..end {
+            let old=&self.track.frames[index-1].player_state;
+            let frame=&self.track.frames[index];let ps=&frame.player_state;
+            let mut emit=|raw:i32,parm:i32| {
+                use jka_protocol::entity_event::{EntityEvent,EV_EVENT_BITS};
+                let Ok(event)=EntityEvent::try_from(raw & !EV_EVENT_BITS) else{return};
+                if event==EntityEvent::EV_NONE {return;}
+                let Some(state)=crate::cgame::player_state_to_entity_state(ps) else{return};
+                events.push(crate::cgame::PresentationEvent {receive_sequence:0,source_entity_num:state.number,
+                    entity_num:state.number,event,raw_event:raw,parm,position:playerstate_vec3(ps,"origin").unwrap_or([0.0;3]),
+                    event_only_entity:false,server_time:self.track.race_start_server_ms+frame.elapsed_ms,state});
+            };
+            let external=ps.field_i32("externalEvent").unwrap_or(0);
+            if external!=0 && external!=old.field_i32("externalEvent").unwrap_or(0) {emit(external,ps.field_i32("externalEventParm").unwrap_or(0));}
+            let sequence=ps.field_i32("eventSequence").unwrap_or(0);
+            let old_sequence=old.field_i32("eventSequence").unwrap_or(0);
+            for n in old_sequence.max(sequence-2)..sequence {
+                let slot=n & 1;
+                emit(ps.field_i32(&format!("events[{slot}]")).unwrap_or(0),ps.field_i32(&format!("eventParms[{slot}]")).unwrap_or(0));
+            }
+        }
+        events
     }
 
     pub fn reset_sync(&mut self) {

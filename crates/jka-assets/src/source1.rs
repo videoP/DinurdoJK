@@ -19,7 +19,7 @@ pub const JIGGLE_IS_BOING: u32 = 0x80;
 /// The actual Source 1 binary jiggle rule (35 four-byte fields; v48/v49).
 /// Values are kept in Source's authored units. The secondary-motion solver
 /// converts length into model units after rig fitting.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SourceJiggleParams {
     pub flags: u32,
     pub length: f32,

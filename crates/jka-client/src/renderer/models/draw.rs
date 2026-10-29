@@ -164,6 +164,7 @@ impl DynamicModelRenderer {
         prepare_authored_glow: bool,
     ) {
         self.rt_prepared = false;
+        if let Some(fixtures) = &mut self.fixture_lighting { fixtures.raw_colors.clear(); }
         self.perf_phase_calls.set(ModelPhaseCalls::default());
         self.capture_prepare = crate::renderer::diagnostics::perf_capture::enabled();
         self.perf_prepare = PreparePerf::default();
@@ -317,10 +318,11 @@ impl DynamicModelRenderer {
                     }
                 };
                 let uniform = Ghoul2GpuDrawUniform {
-                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], 0.0],
+                    axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], if skin.foliage_wind { crate::foliage::model_tag(skin.origin) } else { 0.0 }],
                     axis1: [skin.axis[1][0], skin.axis[1][1], skin.axis[1][2], 0.0],
                     axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
-                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], 0.0],
+                    // w: thermal heat-source matrix index (ghoul2_skin.wgsl thermal_body_heat).
+                    origin: [skin.origin[0], skin.origin[1], skin.origin[2], skin.heat_bone as f32],
                     color: skin.color,
                     params: [
                         bone_base,
@@ -423,6 +425,14 @@ impl DynamicModelRenderer {
             }
             let base_vertex = vertices.len() as u32;
             let first_index = indices.len() as u32;
+            if let Some(fixtures) = &mut self.fixture_lighting {
+                // Keep this stream aligned with CPU vertices, including gaps
+                // occupied by sprites/FX. Never derive albedo from baked RGB.
+                fixtures.raw_colors.resize(base_vertex as usize, [0.0;4]);
+                let lit = surface.lighting_origin.is_some() || surface.authored_lighting;
+                fixtures.raw_colors.extend(surface.vertices.iter().map(|v|
+                    if lit { v.color } else { [0.0;4] }));
+            }
             self.record_cpu_geometry(surface.geometry_source, surface.vertices.len(), surface.indices.len());
             let cached_md3 = self.md3_geometry_cache
                 && surface.geometry_source == crate::renderer::ModelGeometrySource::Md3
@@ -698,6 +708,12 @@ impl DynamicModelRenderer {
         }
 
         self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
+        if let Some(fixtures) = &mut self.fixture_lighting {
+            fixtures.raw_colors.resize(vertices.len(), [0.0;4]);
+            fixtures.upload_raw(device, queue);
+            for draw in &self.draws { fixtures.ensure(device,jobs,draw.alpha_mode,false,false); }
+            for draw in &self.skin_draws { fixtures.ensure(device,jobs,draw.alpha_mode,true,draw.source_material); }
+        }
         self.upload_prepared_fx_sprites(jobs, device, queue, &fx_sprite_instances, prepare_authored_glow);
 
         let bone_bytes = bytemuck::cast_slice(bones.as_slice());
@@ -740,7 +756,25 @@ impl DynamicModelRenderer {
         authored_glow_only: bool,
     ) {
         self.draw_phase_inner(pass,camera,depth_writing_phase,rt_receivers,gpu_profiler,
-            excluded_entity,authored_glow_only,false);
+            excluded_entity,authored_glow_only,false,None);
+    }
+
+    /// Primary scene draws these legacy shells in a separate encoded pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn draw_scene_phase<'a>(
+        &'a self, pass:&mut wgpu::RenderPass<'a>, camera:&'a wgpu::BindGroup,
+        depth_writing_phase:bool,
+        rt_receivers:Option<(&'a rt_models::RtModelReceivers,&'a wgpu::BindGroup)>,
+        profiler:Option<&mut GpuProfiler>, excluded:Option<u16>, glow:bool,
+    ) {
+        let split = !depth_writing_phase && !glow && self.legacy_blend_active();
+        self.draw_phase_inner(pass,camera,depth_writing_phase,rt_receivers,profiler,excluded,glow,false,
+            split.then_some(false));
+    }
+
+    pub(in crate::renderer) fn draw_encoded_legacy_models<'a>(&'a self,
+        pass:&mut wgpu::RenderPass<'a>,camera:&'a wgpu::BindGroup) {
+        self.draw_phase_inner(pass,camera,false,None,None,None,false,false,Some(true));
     }
 
     fn draw_phase_inner<'a>(
@@ -748,7 +782,7 @@ impl DynamicModelRenderer {
         depth_writing_phase:bool,
         rt_receivers:Option<(&'a rt_models::RtModelReceivers,&'a wgpu::BindGroup)>,
         mut gpu_profiler:Option<&mut GpuProfiler>, excluded_entity:Option<u16>,
-        authored_glow_only:bool,studio_capture:bool,
+        authored_glow_only:bool,studio_capture:bool,legacy_effects:Option<bool>,
     ) {
         let capture_calls = crate::renderer::diagnostics::perf_capture::enabled();
         let mut calls = self.perf_phase_calls.get();
@@ -764,9 +798,12 @@ impl DynamicModelRenderer {
             let preserve_order = !depth_writing_phase && self.draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
             for (alpha_mode, draw_range) in model_phase_runs(
                 self.draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
-            ).filter(|(mode, _)| self.model_alpha_mask & (1 << mode.index()) != 0)
+            ).filter(|(mode, _)| self.model_alpha_mask & (1 << mode.index()) != 0
+                && legacy_effects.is_none_or(|encoded| super::legacy_blend::eligible(*mode) == encoded))
             {
-                let pipeline = if studio_capture {
+                let pipeline = if legacy_effects == Some(true) {
+                    self.legacy_model_pipelines[alpha_mode.index()].as_ref()
+                } else if studio_capture {
                     self.studio_capture_pipelines[alpha_mode.index()].as_ref()
                 } else if authored_glow_only {
                     self.model_glow_pipelines[alpha_mode.index()].as_ref()
@@ -776,7 +813,10 @@ impl DynamicModelRenderer {
                 let Some(pipeline) = pipeline else {
                     continue;
                 };
-                if !studio_capture && alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
+                let fixture = self.fixture_lighting.as_ref().filter(|f|
+                    legacy_effects != Some(true) && !studio_capture && !authored_glow_only && !self.rt_prepared
+                        && f.pipeline(alpha_mode,false,false).is_some());
+                if legacy_effects != Some(true) && !studio_capture && fixture.is_none() && alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
                     && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
                 {
                     if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
@@ -840,6 +880,12 @@ impl DynamicModelRenderer {
                     } else {
                         pipeline
                     };
+                let pipeline = if let Some(fixture) = fixture {
+                    pass.set_bind_group(2,&fixture.bind_group,&[]);
+                    pass.set_vertex_buffer(1,fixture.raw_buffer.as_ref().expect("fixture raw tint prepared").slice(..));
+                    if capture_calls { calls.set_bind_group += 1; calls.set_vertex_buffer += 1; }
+                    fixture.pipeline(alpha_mode,false,false).unwrap()
+                } else { pipeline };
                 if capture_calls { calls.set_pipeline += 1; }
                 pass.set_pipeline(pipeline);
                 if alpha_mode == DynamicModelAlphaMode::Glass {
@@ -872,123 +918,126 @@ impl DynamicModelRenderer {
             }
         }
 
-        let has_fx_sprites_in_phase = self.fx_sprite_draws.iter().any(|draw| {
-            dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
-                && Some(draw.entity_num) != excluded_entity
-                && (!authored_glow_only || draw.authored_glow)
-        });
-        if has_fx_sprites_in_phase {
-            let timed_pass = if depth_writing_phase {
-                GpuPass::FxSpritesOpaque
-            } else {
-                GpuPass::FxSpritesTranslucent
-            };
-            if let Some(profiler) = gpu_profiler.as_deref_mut() {
-                profiler.write_render_pass_timestamp(pass, timed_pass, false);
-            }
-            if capture_calls { calls.set_vertex_buffer += 1; }
-            pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
-            if capture_calls { calls.set_bind_group += 1; }
-            pass.set_bind_group(0, camera, &[]);
-            let preserve_order = !depth_writing_phase && self.fx_sprite_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
-            for (alpha_mode, draw_range) in model_phase_runs(
-                self.fx_sprite_draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
-            )
-                // FX sprite pipelines are intentionally lazy.  Only visit alpha
-                // modes that actually have sprite draws this frame; otherwise a
-                // missing (correctly-unbuilt) pipeline would be mistaken for an
-                // error when GPU FX is enabled.
-                .filter(|(mode, _)| {
-                    self.fx_sprite_draws.iter().any(|draw| {
-                        draw.alpha_mode == *mode
-                            && Some(draw.entity_num) != excluded_entity
-                            && (!authored_glow_only || draw.authored_glow)
-                    })
-                })
-            {
-                let pipeline = if authored_glow_only {
-                    self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
-                } else {
-                    self.fx_sprite_pipeline(alpha_mode)
-                };
-                let Some(pipeline) = pipeline else {
-                    // Runtime-lazy PSO still compiling; skip this FX variant for
-                    // the handful of frames needed to finish rather than hitch.
-                    continue;
-                };
-                if capture_calls { calls.set_pipeline += 1; }
-                pass.set_pipeline(pipeline);
-                let mut current_texture = None;
-                for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
-                    draw.alpha_mode == alpha_mode
-                        && Some(draw.entity_num) != excluded_entity
-                        && (!authored_glow_only || draw.authored_glow)
-                }), self.dynamic_batch_draws) {
-                    let bind_group = draw
-                        .texture_key
-                        .as_ref()
-                        .and_then(|key| self.textures.get(key))
-                        .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                    if !self.model_state_cache
-                        || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
-                    {
-                        if capture_calls { calls.set_bind_group += 1; }
-                        pass.set_bind_group(1, bind_group, &[]);
-                        current_texture = Some(bind_group);
-                    }
-                    if capture_calls { calls.fx_draw += 1; }
-                    pass.draw(0..6, instances);
-                }
-            }
-            if let Some(profiler) = gpu_profiler.as_deref_mut() {
-                profiler.write_render_pass_timestamp(pass, timed_pass, true);
-            }
-        }
-
-        // GPU-resident effects use the SAME material group as FX sprites but
-        // their independent group 2 binds persistent spawn data, draw slots and
-        // the demo/FX clock. They never borrow Ghoul2's group 2 or weather's.
-        if let Some(resident) = self.resident_fx.as_ref() {
-            let relevant = self.resident_fx_draws.iter().any(|draw| {
+        if legacy_effects != Some(true) {
+            let has_fx_sprites_in_phase = self.fx_sprite_draws.iter().any(|draw| {
                 dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
                     && Some(draw.entity_num) != excluded_entity
                     && (!authored_glow_only || draw.authored_glow)
             });
-            if relevant {
+            if has_fx_sprites_in_phase {
+                let timed_pass = if depth_writing_phase {
+                    GpuPass::FxSpritesOpaque
+                } else {
+                    GpuPass::FxSpritesTranslucent
+                };
+                if let Some(profiler) = gpu_profiler.as_deref_mut() {
+                    profiler.write_render_pass_timestamp(pass, timed_pass, false);
+                }
+                if capture_calls { calls.set_vertex_buffer += 1; }
+                pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+                if capture_calls { calls.set_bind_group += 1; }
                 pass.set_bind_group(0, camera, &[]);
-                pass.set_bind_group(2, resident.bind_group(), &[]);
-                if capture_calls { calls.set_bind_group += 2; }
-                let mut last_pipeline = None;
-                let mut last_texture = None;
-                for draw in &self.resident_fx_draws {
-                    if dynamic_model_writes_depth(draw.alpha_mode) != depth_writing_phase
-                        || Some(draw.entity_num) == excluded_entity
-                        || (authored_glow_only && !draw.authored_glow)
-                    { continue; }
-                    // Stage `glow` replay is never promoted until it has an
-                    // independently-specialized FORCE_FOG_BLACK pipeline.
-                    if authored_glow_only || draw.authored_glow { continue; }
-                    let Some(pipeline) = resident.pipeline(draw.alpha_mode) else { continue; };
-                    if !last_pipeline.is_some_and(|mode| mode == draw.alpha_mode) {
-                        pass.set_pipeline(pipeline);
-                        last_pipeline = Some(draw.alpha_mode);
-                        last_texture = None;
-                        if capture_calls { calls.set_pipeline += 1; }
+                let preserve_order = !depth_writing_phase && self.fx_sprite_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
+                for (alpha_mode, draw_range) in model_phase_runs(
+                    self.fx_sprite_draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
+                )
+                    // FX sprite pipelines are intentionally lazy.  Only visit alpha
+                    // modes that actually have sprite draws this frame; otherwise a
+                    // missing (correctly-unbuilt) pipeline would be mistaken for an
+                    // error when GPU FX is enabled.
+                    .filter(|(mode, _)| {
+                        self.fx_sprite_draws.iter().any(|draw| {
+                            draw.alpha_mode == *mode
+                                && Some(draw.entity_num) != excluded_entity
+                                && (!authored_glow_only || draw.authored_glow)
+                        })
+                    })
+                {
+                    let pipeline = if authored_glow_only {
+                        self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
+                    } else {
+                        self.fx_sprite_pipeline(alpha_mode)
+                    };
+                    let Some(pipeline) = pipeline else {
+                        // Runtime-lazy PSO still compiling; skip this FX variant for
+                        // the handful of frames needed to finish rather than hitch.
+                        continue;
+                    };
+                    if capture_calls { calls.set_pipeline += 1; }
+                    pass.set_pipeline(pipeline);
+                    let mut current_texture = None;
+                    for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
+                        draw.alpha_mode == alpha_mode
+                            && Some(draw.entity_num) != excluded_entity
+                            && (!authored_glow_only || draw.authored_glow)
+                    }), self.dynamic_batch_draws) {
+                        let bind_group = draw
+                            .texture_key
+                            .as_ref()
+                            .and_then(|key| self.textures.get(key))
+                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                        if !self.model_state_cache
+                            || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                        {
+                            if capture_calls { calls.set_bind_group += 1; }
+                            pass.set_bind_group(1, bind_group, &[]);
+                            current_texture = Some(bind_group);
+                        }
+                        if capture_calls { calls.fx_draw += 1; }
+                        pass.draw(0..6, instances);
                     }
-                    let bind_group = draw.texture_key.as_ref()
-                        .and_then(|key| self.textures.get(key))
-                        .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                    if !self.model_state_cache
-                        || !last_texture.is_some_and(|prior| std::ptr::eq(prior, bind_group))
-                    {
-                        pass.set_bind_group(1, bind_group, &[]);
-                        last_texture = Some(bind_group);
-                        if capture_calls { calls.set_bind_group += 1; }
-                    }
-                    pass.draw(0..6, draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
-                    if capture_calls { calls.fx_draw += 1; }
+                }
+                if let Some(profiler) = gpu_profiler.as_deref_mut() {
+                    profiler.write_render_pass_timestamp(pass, timed_pass, true);
                 }
             }
+
+            // GPU-resident effects use the SAME material group as FX sprites but
+            // their independent group 2 binds persistent spawn data, draw slots and
+            // the demo/FX clock. They never borrow Ghoul2's group 2 or weather's.
+            if let Some(resident) = self.resident_fx.as_ref() {
+                let relevant = self.resident_fx_draws.iter().any(|draw| {
+                    dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
+                        && Some(draw.entity_num) != excluded_entity
+                        && (!authored_glow_only || draw.authored_glow)
+                });
+                if relevant {
+                    pass.set_bind_group(0, camera, &[]);
+                    pass.set_bind_group(2, resident.bind_group(), &[]);
+                    if capture_calls { calls.set_bind_group += 2; }
+                    let mut last_pipeline = None;
+                    let mut last_texture = None;
+                    for draw in &self.resident_fx_draws {
+                        if dynamic_model_writes_depth(draw.alpha_mode) != depth_writing_phase
+                            || Some(draw.entity_num) == excluded_entity
+                            || (authored_glow_only && !draw.authored_glow)
+                        { continue; }
+                        // Stage `glow` replay is never promoted until it has an
+                        // independently-specialized FORCE_FOG_BLACK pipeline.
+                        if authored_glow_only || draw.authored_glow { continue; }
+                        let Some(pipeline) = resident.pipeline(draw.alpha_mode) else { continue; };
+                        if !last_pipeline.is_some_and(|mode| mode == draw.alpha_mode) {
+                            pass.set_pipeline(pipeline);
+                            last_pipeline = Some(draw.alpha_mode);
+                            last_texture = None;
+                            if capture_calls { calls.set_pipeline += 1; }
+                        }
+                        let bind_group = draw.texture_key.as_ref()
+                            .and_then(|key| self.textures.get(key))
+                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                        if !self.model_state_cache
+                            || !last_texture.is_some_and(|prior| std::ptr::eq(prior, bind_group))
+                        {
+                            pass.set_bind_group(1, bind_group, &[]);
+                            last_texture = Some(bind_group);
+                            if capture_calls { calls.set_bind_group += 1; }
+                        }
+                        pass.draw(0..6, draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
+                        if capture_calls { calls.fx_draw += 1; }
+                    }
+                }
+            }
+
         }
 
         if !self.skin_draws.is_empty() {
@@ -997,7 +1046,8 @@ impl DynamicModelRenderer {
             let preserve_order = !depth_writing_phase && self.skin_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
             for (alpha_mode, draw_range) in model_phase_runs(
                 self.skin_draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
-            ).filter(|(mode, _)| self.skin_alpha_mask & (1 << mode.index()) != 0)
+            ).filter(|(mode, _)| self.skin_alpha_mask & (1 << mode.index()) != 0
+                && legacy_effects.is_none_or(|encoded| super::legacy_blend::eligible(*mode) == encoded))
             {
                 // Source 1 materials need their own pipeline, so this mode is
                 // submitted twice when the frame has both kinds. A frame with no
@@ -1011,7 +1061,9 @@ impl DynamicModelRenderer {
                     &[false, true]
                 };
                 for &source_material in source_variants {
-                    let pipeline = if authored_glow_only {
+                    let pipeline = if legacy_effects == Some(true) {
+                        self.legacy_skin_pipelines[alpha_mode.index()].as_ref()
+                    } else if authored_glow_only {
                         self.skin_glow_pipelines[alpha_mode.index()].as_ref()
                     } else if source_material {
                         self.skin_source_pipelines[alpha_mode.index()].as_ref()
@@ -1021,6 +1073,13 @@ impl DynamicModelRenderer {
                     let Some(pipeline) = pipeline else {
                         continue;
                     };
+                    let fixture = self.fixture_lighting.as_ref().filter(|f|
+                        legacy_effects != Some(true) && !authored_glow_only && f.pipeline(alpha_mode,true,source_material).is_some());
+                    let pipeline = if let Some(fixture) = fixture {
+                        pass.set_bind_group(3,&fixture.bind_group,&[]);
+                        if capture_calls { calls.set_bind_group += 1; }
+                        fixture.pipeline(alpha_mode,true,source_material).unwrap()
+                    } else { pipeline };
                     if capture_calls { calls.set_pipeline += 1; }
                     pass.set_pipeline(pipeline);
                     if capture_calls { calls.set_bind_group += 1; }
@@ -1090,7 +1149,7 @@ impl DynamicModelRenderer {
 
     pub(in crate::renderer) fn draw_studio_capture<'a>(&'a self,pass:&mut wgpu::RenderPass<'a>,camera:&'a wgpu::BindGroup) {
         for phase in [true,false] {
-            self.draw_phase_inner(pass,camera,phase,None,None,None,false,true);
+            self.draw_phase_inner(pass,camera,phase,None,None,None,false,true,None);
         }
     }
 

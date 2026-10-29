@@ -12,11 +12,6 @@ use std::sync::{Arc, OnceLock};
 
 const SEA_FOAM_PNG: &[u8] = include_bytes!("../../../../vendor/godot-water-shader/textures/sea_foam.png");
 
-pub(super) fn cheapwater_normal(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
-    let image = image::load_from_memory_with_format(include_bytes!("../../../../assets/cheapwater/water_normal.png"), image::ImageFormat::Png)
-        .expect("Cheapwater normal map decodes").to_rgba8();
-    blue_water_gpu::lakes::LakePipeline::normal_map(device, queue, image.as_raw(), image.width(), image.height())
-}
 /// NoiseTexture2D's default size and seamless blend skirt.
 const NOISE_SIZE: usize = 512;
 const BLEND_SKIRT: f32 = 0.1;

@@ -739,6 +739,10 @@ pub struct Camera {
     cg_fov: f32,
     near: f32,
     far: f32,
+    /// Optional subregion of the physical swapchain for an embedded full-world
+    /// preview. Unlike the model-only asset viewport this preserves the native
+    /// BSP/entity/FX renderer, including its post-processing path.
+    studio_viewport: Option<[u32; 4]>,
 }
 impl Camera {
     #[cfg(test)]
@@ -757,6 +761,7 @@ impl Camera {
             cg_fov: cg_fov.clamp(MIN_CG_FOV, MAX_CG_FOV),
             near: 1.0,
             far: far_distance_for_cull(DEFAULT_DISTANCE_CULL),
+            studio_viewport: None,
         }
     }
 
@@ -842,6 +847,14 @@ impl Camera {
         2.0 * ((height / width) * (fov_x * 0.5).tan()).atan()
     }
 
+    /// Present the *same* perspective camera inside a rectangle of the full
+    /// render target. The homogeneous clip transform maps NDC [-1,1] into the
+    /// rectangle, without requiring a second shader/scene graph or a second
+    /// demo decoder. Screen-space passes still use the full render resolution.
+    pub fn set_studio_viewport(&mut self, viewport: Option<[u32; 4]>) {
+        self.studio_viewport = viewport;
+    }
+
     pub fn frustum_corners(
         &self,
         width: u32,
@@ -849,6 +862,7 @@ impl Camera {
         near_distance: f32,
         far_distance: f32,
     ) -> [Vec3; 8] {
+        let (width, height) = self.studio_viewport.map_or((width, height), |v| (v[2], v[3]));
         let fov_y = self.fov_y_for_viewport(width, height);
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
@@ -907,30 +921,56 @@ impl Camera {
         height: u32,
         jitter_pixels: [f32; 2],
     ) -> Mat4 {
-        let fov_y = self.fov_y_for_viewport(width, height);
+        let rect = self.studio_viewport;
+        let (proj_width, proj_height) = rect.map_or((width, height), |v| (v[2], v[3]));
+        let fov_y = self.fov_y_for_viewport(proj_width, proj_height);
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
-        let aspect = width / height;
+        let aspect = proj_width.max(1) as f32 / proj_height.max(1) as f32;
         let forward = self.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
         let base_up = right.cross(forward).normalize_or_zero();
         let up = glam::Quat::from_axis_angle(forward, self.roll) * base_up;
-        let view = Mat4::look_to_rh(self.position, forward, up);
+        let view = glam::camera::rh::view::look_to_mat4(self.position, forward, up);
         // Camera depth is permanently reversed-Z: near -> 1, far -> 0.
         // Shadow maps keep their own conventional depth convention.
-        let projection = Mat4::perspective_rh(fov_y, aspect, self.far, self.near);
+        let projection = glam::camera::rh::proj::directx::perspective(fov_y, aspect, self.far, self.near);
         let jitter = Mat4::from_translation(Vec3::new(
             2.0 * jitter_pixels[0] / width,
             -2.0 * jitter_pixels[1] / height,
             0.0,
         ));
-        jitter * projection * view
+        // After projecting with the viewport's own aspect ratio, remap clip
+        // coordinates to the physical screen. Translation in homogeneous clip
+        // space is intentional: multiplying by `w` keeps perspective correct.
+        let placement = rect.map_or(Mat4::IDENTITY, |v| {
+            let sx = (v[2] as f32 / width).clamp(0.0, 1.0);
+            let sy = (v[3] as f32 / height).clamp(0.0, 1.0);
+            let tx = (2.0 * v[0] as f32 + v[2] as f32) / width - 1.0;
+            let ty = 1.0 - (2.0 * v[1] as f32 + v[3] as f32) / height;
+            Mat4::from_translation(Vec3::new(tx, ty, 0.0))
+                * Mat4::from_scale(Vec3::new(sx, sy, 1.0))
+        });
+        placement * jitter * projection * view
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_viewport_projects_center_into_embedded_rectangle() {
+        let mut camera = Camera::new_with_fov([0., 0., 0.], 0., 90.);
+        camera.set_studio_viewport(Some([320, 120, 640, 360]));
+        let center = camera.project_to_screen(1280, 720, Vec3::new(100., 0., 0.)).unwrap();
+        assert!((center.x - 640.).abs() < 0.01);
+        assert!((center.y - 300.).abs() < 0.01);
+        camera.set_studio_viewport(None);
+        let fullscreen = camera.project_to_screen(1280, 720, Vec3::new(100., 0., 0.)).unwrap();
+        assert!((fullscreen.x - 640.).abs() < 0.01);
+        assert!((fullscreen.y - 360.).abs() < 0.01);
+    }
 
     fn bob_input() -> ViewBobInput {
         ViewBobInput {
@@ -1123,7 +1163,7 @@ mod tests {
     fn reversed_z_maps_near_to_one_and_far_to_zero() {
         let camera = Camera::new([0.0, 0.0, 0.0], 0.0);
         let projection = camera.view_projection(1280, 720);
-        let view = Mat4::look_to_rh(camera.position, camera.forward(), Vec3::Y);
+        let view = glam::camera::rh::view::look_to_mat4(camera.position, camera.forward(), Vec3::Y);
         let projection_only = projection * view.inverse();
 
         let near_clip = projection_only * Vec3::new(0.0, 0.0, -camera.near).extend(1.0);

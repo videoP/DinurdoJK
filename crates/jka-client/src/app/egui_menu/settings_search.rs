@@ -29,6 +29,7 @@ fn category(item: SearchItem) -> &'static str {
             VideoSection::Display => "Display & graphics",
             VideoSection::Geometry => "Geometry",
             VideoSection::Lighting => "Lighting",
+            VideoSection::Relighting => "Relighting",
             VideoSection::Materials => "Material rendering",
             VideoSection::Effects => "Effects",
             VideoSection::PostProcessing => "Post processing",
@@ -53,6 +54,7 @@ fn category(item: SearchItem) -> &'static str {
             SETUP_TAB_INTERFACE => "Interface",
             SETUP_TAB_EXTENSIONS => "Extensions",
             SETUP_TAB_STREAMER => "Streamer mode",
+            SETUP_TAB_PK3 => "PK3 Manager",
             SETUP_TAB_MOD => "Mod",
             _ => "Video",
         }
@@ -130,8 +132,19 @@ impl App {
             .filter_map(|item| score(item, &tokens, &joined).map(|score| (score, item)))
             .filter(|(_, item)| item.tab != SETUP_TAB_MOD || self.ui_mod().is_some())
             .collect();
+        // Inside Render Studio the search runs in the Studio graphics window,
+        // which shows graphics pages only: other matches can't be opened there.
+        let hidden = if self.render_studio.graphics_gameplay.is_some() {
+            let before = results.len();
+            results.retain(|(_, item)| item.tab == SETUP_TAB_VIDEO);
+            before - results.len()
+        } else { 0 };
         results.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(b.1.label)));
         theme::page_title(ui, "SEARCH RESULTS", &format!("{} matching settings across Setup", results.len()));
+        if hidden > 0 {
+            theme::hint(ui, &format!("{hidden} gameplay / interface setting(s) also match. They live in Setup, outside \
+                Render Studio. The Studio camera (third person, FOV) is set on camera keys and Director shots."), theme::WARNING);
+        }
         let mut chosen = None;
         egui::ScrollArea::vertical()
             .id_salt("jka_settings_search_results")

@@ -625,33 +625,30 @@ pub fn build_promoted_clipmap(
     )
 }
 
-/// Upload-once promoted-water clipmap. The maximum vertex grids are retained,
-/// while only the current profile's indices are active. Runtime amplitude and
-/// camera-distance changes rewrite those indices in-place without rebuilding
-/// the rest of the BSP world.
-pub fn build_runtime_promoted_clipmap(
-    base_spacing: f32,
-    plane_height: f32,
-    footprint_minimum: [f32; 2],
-    footprint_maximum: [f32; 2],
-    mask_slot: Option<usize>,
-    amplitude: f32,
-) -> RuntimePromotedClipmap {
-    let extent = (footprint_maximum[0] - footprint_minimum[0])
-        .max(footprint_maximum[1] - footprint_minimum[1]);
-    let mask_slot = mask_slot.map_or(-1.0, |slot| slot as f32);
-    let mut vertices = Vec::new();
-    let mut level_vertex_bases = [0u32; PROMOTED_CLIPMAP_MAX_LEVELS as usize];
-    let mut level_vertex_half_cells = [0i32; PROMOTED_CLIPMAP_MAX_LEVELS as usize];
-
+/// Per-level vertex offsets and half-widths of the promoted grid. They depend
+/// only on the constant level profile, never on the pool.
+fn promoted_clipmap_vertex_levels() -> ([u32; PROMOTED_CLIPMAP_MAX_LEVELS as usize], [i32; PROMOTED_CLIPMAP_MAX_LEVELS as usize]) {
+    let mut bases = [0u32; PROMOTED_CLIPMAP_MAX_LEVELS as usize];
+    let mut halves = [0i32; PROMOTED_CLIPMAP_MAX_LEVELS as usize];
+    let mut count = 0u32;
     for level in 0..PROMOTED_CLIPMAP_MAX_LEVELS {
-        let vertex_half = if level < CLIPMAP_LEVELS {
-            CLIPMAP_HALF_CELLS
-        } else {
-            CLIPMAP_HALF_CELLS / 2
-        };
-        level_vertex_bases[level as usize] = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
-        level_vertex_half_cells[level as usize] = vertex_half;
+        let vertex_half = if level < CLIPMAP_LEVELS { CLIPMAP_HALF_CELLS } else { CLIPMAP_HALF_CELLS / 2 };
+        bases[level as usize] = count;
+        halves[level as usize] = vertex_half;
+        count += ((vertex_half * 2 + 1) as u32).pow(2);
+    }
+    (bases, halves)
+}
+
+/// The promoted-water vertex grid for one mesh quality. It is pool-neutral:
+/// plane height, footprint and mask slot come from the pool's promoted render
+/// uniform (`spray_planes[0]`, `authored_bounds`), so every promoted pool of a
+/// map indexes this one grid instead of uploading ~25 MiB of its own.
+pub fn promoted_clipmap_grid(base_spacing: f32) -> Vec<crate::scene::GpuVertex> {
+    let (_, halves) = promoted_clipmap_vertex_levels();
+    let mut vertices = Vec::new();
+    for level in 0..PROMOTED_CLIPMAP_MAX_LEVELS {
+        let vertex_half = halves[level as usize];
         let spacing = base_spacing * (1u32 << level) as f32;
         let side = (vertex_half * 2 + 1) as usize;
         for row in 0..side {
@@ -659,9 +656,9 @@ pub fn build_runtime_promoted_clipmap(
                 let cell_x = column as i32 - vertex_half;
                 let cell_z = row as i32 - vertex_half;
                 vertices.push(crate::scene::GpuVertex {
-                    position: [cell_x as f32 * spacing, plane_height, cell_z as f32 * spacing],
-                    uv: footprint_minimum,
-                    lightmap_uv: footprint_maximum,
+                    position: [cell_x as f32 * spacing, 0.0, cell_z as f32 * spacing],
+                    uv: [0.0; 2],
+                    lightmap_uv: [0.0; 2],
                     normal: [0.0, 1.0, 0.0],
                     // Dynamic promoted vertices keep their grid capacity in G.
                     // Extra coverage-only levels use a negative sign so the
@@ -670,14 +667,29 @@ pub fn build_runtime_promoted_clipmap(
                         spacing,
                         if level < CLIPMAP_LEVELS { vertex_half as f32 } else { -(vertex_half as f32) },
                         0.0,
-                        mask_slot,
+                        -1.0,
                     ],
                     alpha_cutoff: OCEAN_CLIPMAP_VERTEX_MARKER,
                 });
             }
         }
     }
+    vertices
+}
 
+/// Upload-once promoted-water clipmap topology for one pool. Its indices are
+/// relative to `promoted_clipmap_grid`; `vertices` is left empty because the
+/// grid is shared. Runtime amplitude and camera-distance changes rewrite those
+/// indices in-place without rebuilding the rest of the BSP world.
+pub fn build_runtime_promoted_clipmap_topology(
+    base_spacing: f32,
+    footprint_minimum: [f32; 2],
+    footprint_maximum: [f32; 2],
+    amplitude: f32,
+) -> RuntimePromotedClipmap {
+    let extent = (footprint_maximum[0] - footprint_minimum[0])
+        .max(footprint_maximum[1] - footprint_minimum[1]);
+    let (level_vertex_bases, level_vertex_half_cells) = promoted_clipmap_vertex_levels();
     let layout = PromotedClipmapLayout {
         base_spacing,
         extent,
@@ -688,12 +700,29 @@ pub fn build_runtime_promoted_clipmap(
     let indices = layout.indices_for(half_cells, 0);
     let index_capacity = layout.maximum_index_count();
     RuntimePromotedClipmap {
-        vertices,
+        vertices: Vec::new(),
         indices,
         index_capacity,
         coarsest_spacing: base_spacing * (1u32 << (CLIPMAP_LEVELS - 1)) as f32,
         layout,
     }
+}
+
+/// Topology plus its (pool-neutral) grid, for tests that inspect both.
+#[cfg(test)]
+pub fn build_runtime_promoted_clipmap(
+    base_spacing: f32,
+    _plane_height: f32,
+    footprint_minimum: [f32; 2],
+    footprint_maximum: [f32; 2],
+    _mask_slot: Option<usize>,
+    amplitude: f32,
+) -> RuntimePromotedClipmap {
+    let mut clipmap = build_runtime_promoted_clipmap_topology(
+        base_spacing, footprint_minimum, footprint_maximum, amplitude,
+    );
+    clipmap.vertices = promoted_clipmap_grid(base_spacing);
+    clipmap
 }
 
 fn build_clipmap_profile(
@@ -1599,6 +1628,10 @@ pub struct OceanSettings {
     /// This does not influence surface selection, tint, wave simulation, or culling.
     pub hybrid_waterline_debug: u8,
     pub hybrid_ssr: bool,
+    /// Hybrid quality: 0 original; 1 optimized honoring SSR; 2 optimized sky-only.
+    pub hybrid_material: u8,
+    pub hybrid_fast_foam: f32,
+    pub hybrid_fast_foam_detail: bool,
     /// Hybrid owns its appearance; editing it must not overwrite native Blue Water.
     /// 1x uses the stock Godot fog-distance and native Blue Water calibration.
     pub hybrid_transparency: f32,
@@ -1720,6 +1753,9 @@ impl Default for OceanSettings {
             hybrid_underwater_mode: 4,
             hybrid_waterline_debug: 0,
             hybrid_ssr: false,
+            hybrid_material: 1,
+            hybrid_fast_foam: 1.0,
+            hybrid_fast_foam_detail: true,
             hybrid_transparency: 1.0,
             hybrid_fog_color: optics::Settings::default().fog_color,
             hybrid_water_color: BlueWaterOptics::default().water_color,
@@ -1861,6 +1897,10 @@ impl OceanSettings {
             self.blue_water_caustics_mode = self.hybrid_caustics_mode;
             self.blue_water_underwater_mode = self.hybrid_underwater_mode;
             self.blue_water_ssr = self.hybrid_ssr;
+            if self.hybrid_material > 0 && !self.gerstner_water {
+                self.pixel_detail_mode = 0;
+                if self.hybrid_material == 2 { self.blue_water_ssr = false; }
+            }
             // Both the Blue Water surface above and legacy submerged optics
             // observe Hybrid's own appearance. Preserve each pure backend's
             // saved appearance for switching/A-B.
@@ -1891,6 +1931,10 @@ impl OceanSettings {
     pub fn sanitize(mut self) -> Self {
         self.backend = self.backend.min(3);
         self.hybrid_breaker = self.hybrid_breaker.min(2);
+        self.hybrid_material = self.hybrid_material.min(2);
+        self.hybrid_fast_foam = if self.hybrid_fast_foam.is_finite() {
+            self.hybrid_fast_foam.clamp(0.0, 3.0)
+        } else { 1.0 };
         self.lake = self.lake.sanitize();
         self.blue_water_waves = self.blue_water_waves.sanitize();
         self.hybrid_fft_blend = if self.hybrid_fft_blend.is_finite() {
@@ -2128,6 +2172,7 @@ fn ocean_lod_deadline(next: &mut f32, now: f32, hz: f32) -> bool {
 pub struct OceanGpu {
     blue_water: Option<blue_water::BlueWaterOcean>,
     lakes: Option<lakes::LakeRenderer>,
+    lake_normal: wgpu::TextureView,
     lake_actors: std::sync::Arc<Vec<interaction::ActorSample>>,
     /// Lazily created: only Hybrid classification asks for the real eye-wave height.
     eye_wave: Option<eye_wave::EyeWaveProbe>,
@@ -2197,6 +2242,9 @@ pub struct OceanGpu {
     render_sampler: wgpu::Sampler,
     spray_view: wgpu::TextureView,
     promoted_surfaces: Vec<PromotedRenderSurface>,
+    /// Shared map-wide weather roof field and its world-space UV transform.
+    /// Keep one reference; no additional water mask bake or texture allocation.
+    sky_admission: Option<(wgpu::TextureView, [f32; 4])>,
     interaction_view: wgpu::TextureView,
     interaction_uniform: wgpu::Buffer,
     interaction_splash_uniform: wgpu::Buffer,
@@ -2386,13 +2434,15 @@ impl OceanGpu {
         requested_settings: OceanSettings,
     ) -> Self {
         let interaction = interaction::RenderResources::inert(device);
-        Self::new_with_interaction(device, queue, render_layout, spray_albedo_view, requested_settings, &interaction)
+        let lake_normal = blue_water_gpu::lakes::LakePipeline::normal_map(device, queue, &[128, 128, 255, 255], 1, 1);
+        Self::new_with_interaction(device, queue, render_layout, spray_albedo_view, requested_settings, &interaction, &lake_normal)
     }
 
     pub fn new_with_interaction(
         device: &wgpu::Device, queue: &wgpu::Queue, render_layout: &wgpu::BindGroupLayout,
         spray_albedo_view: &wgpu::TextureView, requested_settings: OceanSettings,
         interaction: &interaction::RenderResources,
+        lake_normal: &wgpu::TextureView,
     ) -> Self {
         let settings = requested_settings.sanitize();
         let map_size = settings.map_size;
@@ -2594,9 +2644,10 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, lakes:None, lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, lakes:None, lake_normal:lake_normal.clone(), lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
+            sky_admission: None,
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
             interaction_splash_uniform: interaction.splash_uniform.clone(),
             coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES], promoted_far_radii: [None;OCEAN_MAX_SURFACES], native_meshes: [None;OCEAN_MAX_SURFACES] };
@@ -2843,6 +2894,14 @@ impl OceanGpu {
         shared.swell_motion[3]=self.elapsed;
         let wave=make_promoted_render_uniform(&shared,&surface.settings,&surface.descriptor,surface.manual,self.promoted_surfaces.len());
         coastal.encode(queue,encoder,delta,&wave);
+    }
+
+    /// Rebind only when the shared roof field changes (map load/reset).
+    pub fn set_sky_admission(&mut self, field: (wgpu::TextureView, [f32; 4])) {
+        if self.sky_admission.as_ref() != Some(&field) {
+            if let Some(lakes) = self.lakes.as_mut() { lakes.resources = None; }
+            self.sky_admission = Some(field);
+        }
     }
 
     pub fn set_promoted_surfaces(

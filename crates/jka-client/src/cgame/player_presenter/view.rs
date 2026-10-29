@@ -86,8 +86,8 @@ pub(in crate::cgame::player_presenter) const CLASS_REMOTE: i32 = 39;
 
 pub(in crate::cgame::player_presenter) const CLASS_SEEKER: i32 = 41;
 
-// Stock OpenJK MP CG_PlayerShadow uses SHADOW_DISTANCE 128; jaPRO, TaystJK and
-// EternalJK raise it to 512, so the blob stays visible far below a jumping player.
+// Match jaPRO CG_PlayerShadow's SHADOW_DISTANCE (codemp/cgame/cg_players.c),
+// so the blob stays visible far below a jumping player.
 pub(in crate::cgame::player_presenter) const BLOB_SHADOW_DISTANCE: f32 = 512.0;
 
 pub(in crate::cgame::player_presenter) const BLOB_SHADOW_RADIUS: f32 = 24.0;

@@ -1,4 +1,4 @@
-//! Secondary motion for procedural Source 1 StudioMDL jigglebones.
+//! Secondary motion for procedural Source 1 jigglebones and promoted hair* GLM surfaces.
 //!
 //! Unlike a baked animation, these are persistent per-character spring states.
 //! The Source rest rig is already rebound into JKA geometry; these *additional*
@@ -79,6 +79,159 @@ fn rotate_between(from: [f32; 3], to: [f32; 3]) -> Matrix3x4 {
     out
 }
 
+/// Promote native JKA GLM `hair*` surfaces to per-player spring simulation.
+/// Call only from the native GLM registration path: imported Source/UE
+/// models must retain their authored jigglebones without name-based guessing.
+/// This runs once at model registration, before any GPU meshes are built.
+/// Existing procedural-bone influences are left untouched for safety.
+/// Returns the number of newly created surface springs.
+pub fn promote_named_hair_surfaces(
+    glm: &mut crate::ghoul2::GlmModel,
+    gla: &crate::ghoul2::GlaAnimation,
+    bindings: &mut Vec<SourceJiggleBinding>,
+) -> usize {
+    let gla_bones = gla.skeleton.len();
+    let head = gla.skeleton.iter().position(|bone| bone.name.eq_ignore_ascii_case("cranium"))
+        .or_else(|| gla.skeleton.iter().position(|bone| bone.name.eq_ignore_ascii_case("head")));
+    promote_named_hair_with_head(glm, gla_bones, head, bindings)
+}
+
+fn promote_named_hair_with_head(
+    glm: &mut crate::ghoul2::GlmModel,
+    gla_bones: usize,
+    head: Option<usize>,
+    bindings: &mut Vec<SourceJiggleBinding>,
+) -> usize {
+    use crate::ghoul2::GlmWeight;
+    let mut added = 0;
+    for surface_index in 0..glm.hierarchy.len() {
+        let name = &glm.hierarchy[surface_index].name;
+        // Only a *prefix* match, not names such as `forehair` or shader names.
+        if !name.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("hair")) {
+            continue;
+        }
+        let Some(base) = glm.lods.first().and_then(|lod| lod.surfaces.iter()
+            .find(|surface| surface.surface_index == surface_index)) else { continue; };
+        if base.triangles.is_empty() || base.vertices.len() < 3 {
+            continue;
+        }
+        // All Source procedural bones are appended after the ordinary GLA.
+        // Do not replace or double-simulate any authored Source hair rig.
+        if glm.lods.iter().flat_map(|lod| &lod.surfaces)
+            .filter(|surface| surface.surface_index == surface_index)
+            .any(|surface| surface.vertices.iter().any(|vertex| vertex.weights.iter().any(|weight| {
+                weight.weight > 0.0001 && surface.bone_references
+                    .get(weight.local_bone_index).is_some_and(|&index| index >= gla_bones)
+            }))) {
+            continue;
+        }
+        let vertices = &base.vertices;
+        if vertices.iter().any(|vertex| vertex.position.iter().any(|component| !component.is_finite())) {
+            continue;
+        }
+        let min_z = vertices.iter().map(|vertex| vertex.position[2]).fold(f32::INFINITY, f32::min);
+        let max_z = vertices.iter().map(|vertex| vertex.position[2]).fold(f32::NEG_INFINITY, f32::max);
+        let height = max_z - min_z;
+        // The upper band is attached to the scalp; the lower/tip geometry
+        // receives a smooth motion gradient. A nearly flat hair card instead
+        // uses the outside of its footprint as the free end.
+        let top_band = height.max(0.0) * 0.12;
+        let roots: Vec<[f32; 3]> = vertices.iter()
+            .filter(|vertex| vertex.position[2] >= max_z - top_band)
+            .map(|vertex| vertex.position).collect();
+        let average = |points: &[[f32; 3]]| -> [f32; 3] {
+            let mut sum = [0.0; 3];
+            for point in points { for i in 0..3 { sum[i] += point[i]; } }
+            sum.map(|v| v / points.len().max(1) as f32)
+        };
+        let anchor = average(&roots);
+        let distal = if height > 0.5 {
+            let band = height * 0.12;
+            average(&vertices.iter().filter(|vertex| vertex.position[2] <= min_z + band)
+                .map(|vertex| vertex.position).collect::<Vec<_>>())
+        } else {
+            // A horizontal hair card may have no Z range at all.
+            vertices.iter().max_by(|a, b| {
+                let dist2 = |p: [f32; 3]| (p[0] - anchor[0]).powi(2) + (p[1] - anchor[1]).powi(2);
+                dist2(a.position).total_cmp(&dist2(b.position))
+            }).map_or(anchor, |vertex| vertex.position)
+        };
+        let span = sub(distal, anchor);
+        let span_length = norm(span);
+        if !span_length.is_finite() || span_length < 0.5 { continue; }
+        let direction = unit(span);
+        let max_distance = vertices.iter().map(|vertex| dot(sub(vertex.position, anchor), direction))
+            .fold(0.0f32, f32::max);
+        if max_distance < 0.5 { continue; }
+
+        // The skull is the kinematic driver; falling back to the dominant
+        // original skin bone handles otherwise valid non-humanoid models.
+        let parent_gla = head.or_else(|| {
+            let mut counts = vec![0.0f32; gla_bones];
+            for vertex in vertices {
+                for weight in &vertex.weights {
+                    if let Some(&bone) = base.bone_references.get(weight.local_bone_index) {
+                        if let Some(sum) = counts.get_mut(bone) { *sum += weight.weight.max(0.0); }
+                    }
+                }
+            }
+            counts.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i)
+        });
+        let Some(parent_gla) = parent_gla else { continue; };
+        let extra_bone = gla_bones + bindings.len();
+        let mut affected = false;
+        for lod in &mut glm.lods {
+            for surface in lod.surfaces.iter_mut().filter(|s| s.surface_index == surface_index) {
+                let extra_local = surface.bone_references.len();
+                surface.bone_references.push(extra_bone);
+                for vertex in &mut surface.vertices {
+                    let distance = dot(sub(vertex.position, anchor), direction).max(0.0);
+                    let t = (distance / max_distance).clamp(0.0, 1.0);
+                    let t = ((t - 0.08) / 0.84).clamp(0.0, 1.0);
+                    let motion_weight = (t * t * (3.0 - 2.0 * t)) * 0.85;
+                    if motion_weight < 0.0001 { continue; }
+                    // Ghoul2 has four GPU skin influences. Retain the three
+                    // strongest originals, normalize them to (1 - motion),
+                    // and use the fourth slot for the generated spring.
+                    vertex.weights.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+                    vertex.weights.truncate(3);
+                    let total = vertex.weights.iter().map(|weight| weight.weight).sum::<f32>();
+                    if total <= 0.0001 { continue; }
+                    for weight in &mut vertex.weights {
+                        weight.weight = weight.weight / total * (1.0 - motion_weight);
+                    }
+                    vertex.weights.push(GlmWeight { local_bone_index: extra_local, weight: motion_weight });
+                    affected = true;
+                }
+            }
+        }
+        if !affected {
+            for lod in &mut glm.lods {
+                for surface in lod.surfaces.iter_mut().filter(|s| s.surface_index == surface_index) {
+                    surface.bone_references.pop();
+                }
+            }
+            continue;
+        }
+        let rotate = rotate_between([0.0, 0.0, 1.0], direction);
+        let mut rest_frame = rotate;
+        for i in 0..3 { rest_frame[i][3] = anchor[i]; }
+        bindings.push(SourceJiggleBinding {
+            name: name.clone(), parent_gla, parent_jiggle: None, rest_frame,
+            length: span_length,
+            parameters: crate::source1::SourceJiggleParams {
+                flags: JIGGLE_IS_FLEXIBLE,
+                yaw_stiffness: 28.0, pitch_stiffness: 28.0,
+                yaw_damping: 7.0, pitch_damping: 7.0,
+                tip_mass: 15.0,
+                ..Default::default()
+            },
+        });
+        added += 1;
+    }
+    added
+}
+
 #[derive(Clone, Default)]
 struct JiggleState {
     initialized: bool,
@@ -98,7 +251,7 @@ pub struct SourceJiggleAnimator {
 impl SourceJiggleAnimator {
     pub fn reset(&mut self) { self.states.clear(); self.last_time_ms = None; }
 
-    /// Update the Source-only extension of the pose. `pose[..gla_bones]` is
+    /// Update the supplemental spring-bone palette. `pose[..gla_bones]` is
     /// untouched. The `actor_axis` has the same basis/scale as the final draw;
     /// simulation happens in world space so walking and turning create inertia.
     pub fn update(
@@ -247,6 +400,65 @@ mod tests {
         raw[0..4].copy_from_slice(&JIGGLE_IS_FLEXIBLE.to_le_bytes());
         raw[4..8].copy_from_slice(&5.0f32.to_le_bytes());
         crate::source1::test_parse_jiggle_for_animator(&raw)
+    }
+
+    fn hair_glm(name: &str, source_weight: bool) -> crate::ghoul2::GlmModel {
+        use crate::ghoul2::{GlmLod, GlmModel, GlmSurface, GlmSurfaceHierarchy, GlmVertex, GlmWeight};
+        let refs = if source_weight { vec![1, 2] } else { vec![1] };
+        let vertices = (0..4).map(|index| GlmVertex {
+            position: [index as f32 % 2.0, 0.0, 10.0 - (index / 2) as f32 * 8.0],
+            normal: [0.0, 1.0, 0.0],
+            weights: vec![GlmWeight { local_bone_index: usize::from(source_weight), weight: 1.0 }],
+        }).collect::<Vec<_>>();
+        let lod = GlmLod { surfaces: vec![GlmSurface {
+            surface_index: 0, vertices,
+            texcoords: vec![[0.0, 0.0]; 4],
+            triangles: vec![[0, 1, 2], [1, 3, 2]],
+            bone_references: refs,
+        }] };
+        GlmModel {
+            name: "test".into(), anim_name: "test".into(), num_bones: 2,
+            hierarchy: vec![GlmSurfaceHierarchy {
+                name: name.into(), flags: 0, shader: String::new(),
+                parent_index: -1, children: vec![],
+            }],
+            lods: vec![lod.clone(), lod],
+        }
+    }
+
+    #[test]
+    fn hair_prefix_is_case_insensitive_and_load_time_only() {
+        let mut model = hair_glm("HaIr_Ponytail", false);
+        let mut springs = Vec::new();
+        assert_eq!(promote_named_hair_with_head(&mut model, 2, Some(1), &mut springs), 1);
+        assert_eq!(springs[0].parent_gla, 1);
+        assert_eq!(springs[0].parent_jiggle, None);
+        for lod in &model.lods {
+            let surface = &lod.surfaces[0];
+            assert_eq!(surface.bone_references, vec![1, 2]);
+            assert_eq!(surface.vertices[0].weights.len(), 1); // scalp stays bound
+            let tip = &surface.vertices[2];
+            assert!(tip.weights.iter().any(|w| surface.bone_references[w.local_bone_index] == 2));
+            assert!((tip.weights.iter().map(|w| w.weight).sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+        // Registering the same mesh again cannot append duplicate springs.
+        assert_eq!(promote_named_hair_with_head(&mut model, 2, Some(1), &mut springs), 0);
+        assert_eq!(springs.len(), 1);
+    }
+
+    #[test]
+    fn unprefixed_names_and_authored_source_jiggle_weights_are_untouched() {
+        for (name, authored) in [("forehair", false), ("hairstyle", true)] {
+            let mut model = hair_glm(name, authored);
+            let original = model.clone();
+            let mut springs = Vec::new();
+            assert_eq!(promote_named_hair_with_head(&mut model, 2, Some(1), &mut springs), 0);
+            assert!(springs.is_empty());
+            assert_eq!(model.lods[0].surfaces[0].bone_references,
+                       original.lods[0].surfaces[0].bone_references);
+            assert_eq!(model.lods[0].surfaces[0].vertices[2].weights,
+                       original.lods[0].surfaces[0].vertices[2].weights);
+        }
     }
 
     #[test]

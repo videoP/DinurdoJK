@@ -94,6 +94,9 @@ fn compatible_live_stage_layout(
             || (old.source.water && !crate::renderer::same_draw_state(&old.source, &next.source))
             || old.source.skybox != next.source.skybox
             || old.source.authored_glow != next.source.authored_glow
+            || old.source.thermal_source_stage != next.source.thermal_source_stage
+            || old.source.thermal_lava != next.source.thermal_lava
+            || old.source.thermal_emission != next.source.thermal_emission
             || old.source.planar_reflection != next.source.planar_reflection
             || old.source.planar_environment_candidate != next.source.planar_environment_candidate
             || old.full_indexed_range != next.full_indexed_range
@@ -282,6 +285,7 @@ impl Renderer {
                         && old.source.bsp_shader_index == source.bsp_shader_index
                         && old.source.material_debug_index == source.material_debug_index
                         && old.source.authored_glow == source.authored_glow
+                        && old.source.thermal_source_stage == source.thermal_source_stage
                         && old.source.water == source.water
                         && old.source.additive_companions.len() == source.additive_companions.len()
                         && old.source.additive_companions.iter().zip(&source.additive_companions)
@@ -298,6 +302,7 @@ impl Renderer {
                             && prior.source.detail_texture_eligible == source.detail_texture_eligible
                             && prior.source.surface_material == source.surface_material
                             && prior.source.authored_glow == source.authored_glow
+                            && prior.source.thermal_source_stage == source.thermal_source_stage
                             && prior.source.additive_companions.len() == source.additive_companions.len()
                             && prior.source.additive_companions.iter().zip(&source.additive_companions)
                                 .all(|(a,b)| crate::renderer::same_draw_state(a,b)
@@ -335,7 +340,7 @@ impl Renderer {
                 let fog = weather::fog::surface_fog_uniform(source.fog, source.fog_is_global,
                     source.fog_color_override, source.legacy2_fog_in_stage_safe, source.global_fog_post_eligible);
                 let fog_buffer = fog_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&fog));
-                let glow_fog_buffer = source.authored_glow.then(|| {
+                let glow_fog_buffer = (source.authored_glow || source.thermal_source_stage).then(|| {
                     let glow = weather::fog::surface_fog_uniform(source.fog, source.fog_is_global,
                         weather::fog::FogColorOverride::Black,
                         source.legacy2_fog_in_stage_safe, source.global_fog_post_eligible);
@@ -778,6 +783,12 @@ impl Renderer {
         self.map_has_water = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b| b.source.water));
         self.map_has_snow_surfaces = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b|
             u32::from(b.source.surface_material) == crate::renderer::MATERIAL_SNOW && b.source.pipeline.class != DrawClass::Sky));
+        if self.surface_deformation.set_field_enabled(&self.device, self.map_has_snow_surfaces) {
+            if let Some(mut world) = self.world.take() {
+                self.rebuild_world_surface_bind_groups(&mut world);
+                self.world = Some(world);
+            }
+        }
         // Alpha cutouts, blending, and opaque/sky classification may change
         // without rebuilding the BSP. All cached static shadow depths must
         // be recaptured before they can be sampled again.

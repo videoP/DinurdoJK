@@ -367,6 +367,17 @@ pub(in crate::renderer) fn create_post_pipeline_for(
     surface_format: wgpu::TextureFormat,
     features: Option<u32>,
 ) -> wgpu::RenderPipeline {
+    create_post_pipeline_with_entry(device, layout, shader, surface_format, features, "fs_main")
+}
+
+pub(in crate::renderer) fn create_post_pipeline_with_entry(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    features: Option<u32>,
+    entry: &str,
+) -> wgpu::RenderPipeline {
     let constants = features.map(|mask| [("POST_FEATURES", f64::from(mask))]);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if features.is_some() {
@@ -386,7 +397,7 @@ pub(in crate::renderer) fn create_post_pipeline_for(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(entry),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: constants.as_ref().map_or(&[][..], |c| &c[..]),
                 ..Default::default()
@@ -442,6 +453,17 @@ pub(in crate::renderer) fn create_taa_post_pipeline(
     surface_format: wgpu::TextureFormat,
     history_format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    create_taa_post_pipeline_with_entry(device, layout, shader, surface_format, history_format, "fs_main_taa")
+}
+
+pub(in crate::renderer) fn create_taa_post_pipeline_with_entry(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    history_format: wgpu::TextureFormat,
+    entry: &str,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA TAA/post-process pipeline"),
         layout: Some(layout),
@@ -456,7 +478,7 @@ pub(in crate::renderer) fn create_taa_post_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main_taa"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {

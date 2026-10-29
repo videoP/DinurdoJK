@@ -179,10 +179,7 @@ impl MaskUpload {
                     pass.set_bind_group(0, &group, &[]);
                     pass.draw(0..3, 0..1);
                 }
-                GpuImage {
-                    _texture: texture,
-                    view,
-                }
+                GpuImage::new(texture, view)
             })
             .collect();
         queue.submit([encoder.finish()]);

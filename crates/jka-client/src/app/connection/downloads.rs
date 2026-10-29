@@ -446,8 +446,7 @@ impl App {
             join_ui.detail =
                 "Refreshing downloaded assets and requesting a fresh gamestate...".into();
         }
-        self.live_cgame_prep_rx = None;
-        self.live_cgame_prepared = None;
+        self.cancel_live_cgame_prep();
         // A downloaded PK3 can contribute strings as well as map/render assets.
         // Force the post-download prep to rebuild from the refreshed search path.
         self.stringed = None;

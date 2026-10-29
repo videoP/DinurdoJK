@@ -251,12 +251,9 @@ fn local_cubemap_captured_entity_blocks_baked_light_on_all_faces_on_gpu() {
             .unwrap();
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[crate::renderer::uniform_entry(
-                0,
-                wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
-            )],
+            label: None, entries: &crate::foliage::camera_layout_entries(),
         });
+        let (foliage_noise, foliage_sampler) = crate::foliage::test_noise_resources(&device, &queue);
         let white = upload_texture(
             &device,
             &queue,
@@ -265,7 +262,7 @@ fn local_cubemap_captured_entity_blocks_baked_light_on_all_faces_on_gpu() {
                 source: None,
                 width: 1,
                 height: 1,
-                rgba: vec![255; 4],
+                rgba: (vec![255; 4]).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -303,7 +300,7 @@ fn local_cubemap_captured_entity_blocks_baked_light_on_all_faces_on_gpu() {
                 center - u * 10.0 + v * 10.0,
                 center - v * 16.0,
             ] {
-                vertices.push(DynamicModelVertex {
+                vertices.push(DynamicModelVertex { foliage_wind: 0.0,
                     position: p.to_array(),
                     normal: Vec3::Y.to_array(),
                     uv: [0.0; 2],
@@ -522,7 +519,7 @@ fn lamp_raster_receiver_culling_safe()->bool {{return true;}}
         let cameras = crate::renderer::lighting::entity_shadows::EntityShadowState::with_count(
             &device,
             &camera_layout,
-            6,
+            6, &foliage_noise, &foliage_sampler,
         );
         let entities = std::collections::HashSet::from([1]);
         // Test the old and corrected projections against real cubemap sampling.

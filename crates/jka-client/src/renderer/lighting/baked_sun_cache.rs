@@ -9,6 +9,7 @@ struct Composition {
     radiance: [f32; 3],
     direction: [f32; 3],
     strength: f32,
+    moving_strength: f32,
     mode: f32,
     adjust: [f32; 4],
     curve: [f32; 4],
@@ -83,14 +84,14 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {{
         if parameters.sun.w<1.5 {{
             result=vec4(indirect+parameters.sun.rgb*incident,incident);
         }} else {{
-            // Legacy CSM darkens existing illumination. Store the removable
-            // fraction so moving shadows never darken indirect light twice.
+            // Keep static-world darkening separate from moving actors: baked
+            // world shadows already have contrast in the original lightmap.
             let facing=parameters.direction_strength.w;
             // Flux already includes cosine; the unoccluded facing is stored
             // separately in the second half of the incident image (below).
             let cosine=max(textureLoad(sun_flux,vec2<i32>(id.xy)+vec2(0,i32(dims.y)),0).r,0.0);
             let factor=max(1.0-facing*(cosine-incident),1e-5);
-            result=vec4(indirect*factor,clamp(facing*incident/factor,0.0,1.0));
+            result=vec4(indirect*factor,clamp(parameters.curve.w*incident/factor,0.0,1.0));
         }}
     }}
     if parameters.curve.z > 0.0 {{
@@ -137,10 +138,7 @@ fn corrected_images(device: &wgpu::Device, sizes: &[[u32; 2]]) -> Vec<GpuImage> 
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
-            GpuImage {
-                _texture: texture,
-                view,
-            }
+            GpuImage::new(texture, view)
         })
         .collect()
 }
@@ -329,6 +327,7 @@ impl LightmapCache {
                 curve: {
                     let mut value = composition.map_or([1.0, 1.0, 0.0, 0.0], |c| c.curve);
                     value[2] = colors.len() as f32;
+                    value[3] = composition.map_or(0.0, |c| c.moving_strength);
                     value
                 },
                 sun: composition.map_or([0.0; 4], |c| {
@@ -419,7 +418,7 @@ impl Renderer {
         let Some(world) = self.world.as_ref() else {
             return;
         };
-        let supported = (self.baked_sun_cache || self.baked_local_lights) && !world.source_map;
+        let supported = (self.baked_sun_cache || (self.added_map_light_sources() != 0)) && !world.source_map;
         let removal = supported
             && world.baked_sun_encoding.is_some()
             && world.baked_sun_radiance.is_some()
@@ -428,7 +427,7 @@ impl Renderer {
         let sun_ready = self.baked_sun_cache
             && world.static_sun.ready()
             && (removal || self.baked_sun_removal <= 0.0 || world.sun.is_none());
-        let local_ready = self.baked_local_lights && world.static_sun.local_ready();
+        let local_ready = (self.added_map_light_sources() != 0) && world.static_sun.local_ready();
         let composition = (supported
             && (sun_ready || local_ready)
             && self.baked_sun_debug_mode == 0)
@@ -436,9 +435,11 @@ impl Renderer {
                 generation: world.static_sun.generation,
                 radiance: sun.color.map(|c| c * sun.intensity.max(0.0) / 255.0),
                 direction: sun.direction,
-                strength: (self.sun_shadow_strength
-                    * (sun.intensity / 250.0).max(0.0).sqrt().clamp(0.0, 1.5))
-                .min(1.0),
+                strength: if self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMapsEntities {
+                    0.0
+                } else { self.sun_shadow_strength },
+                // User-controlled contrast, independent of map sun intensity.
+                moving_strength: self.sun_shadow_strength,
                 mode: if !sun_ready {
                     0.0
                 } else if self.sun_lighting {
@@ -583,7 +584,7 @@ mod tests {
                     source: None,
                     width: 1,
                     height: 1,
-                    rgba: vec![255; 4],
+                    rgba: (vec![255; 4]).into(),
                     rgba16f: None,
                     mip_level_count: 1,
                     clamp: true,
@@ -612,10 +613,7 @@ mod tests {
                 bytemuck::cast_slice(&[1.0f32, 0.0, 1.0, 1.0]),
             );
             let view = texture.create_view(&Default::default());
-            let flux = vec![GpuImage {
-                _texture: texture,
-                view,
-            }];
+            let flux = vec![GpuImage::new(texture, view)];
             let half = |bits: u16| {
                 let sign = if bits & 32768 != 0 { -1.0 } else { 1.0 };
                 let e = ((bits >> 10) & 31) as i32;
@@ -649,23 +647,24 @@ mod tests {
                 dimension: Some(wgpu::TextureViewDimension::D2Array),
                 ..Default::default()
             });
-            let local_flux = vec![GpuImage {
-                _texture: local_texture,
-                view: local_view,
-            }];
+            let local_flux = vec![GpuImage::new(local_texture, local_view)];
             let colors = [[1.0f32, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
-            for (mode, local_enabled) in [
-                (1.0, false),
-                (1.0, true),
-                (0.0, true),
-                (2.0, true),
-                (1.0, false),
+            for (mode, local_enabled, world_strength, moving_strength) in [
+                (1.0, false, 0.3, 0.6),
+                (1.0, true, 0.3, 0.6),
+                (0.0, true, 0.3, 0.6),
+                (2.0, true, 0.3, 0.6),
+                (2.0, true, 0.0, 0.0),
+                (2.0, true, 0.0, 0.25),
+                (2.0, true, 0.0, 1.0),
+                (1.0, false, 0.3, 0.6),
             ] {
                 let composition = Composition {
                     generation: 1,
                     radiance: [0.6, 0.4, 0.2],
                     direction: [0.0, -1.0, 0.0],
-                    strength: 0.3,
+                    strength: world_strength,
+                    moving_strength,
                     mode,
                     adjust: [1.0, 1.0, 0.0, 0.0],
                     curve: [1.0, 1.0, 0.0, 0.0],
@@ -724,14 +723,14 @@ mod tests {
                             } else if mode == 1.0 {
                                 incident
                             } else {
-                                0.3 * incident / (1.0 - 0.3 * (1.0 - incident))
+                                moving_strength * incident / (1.0 - world_strength * (1.0 - incident))
                             }
                         } else if mode == 0.0 {
                             1.0
                         } else if mode == 1.0 {
                             1.0 + composition.radiance[c] * incident
                         } else {
-                            1.0 - 0.3 * (1.0 - incident)
+                            1.0 - world_strength * (1.0 - incident)
                         };
                         if local_enabled && c < 3 {
                             expected += match (x, c) {
@@ -900,7 +899,7 @@ fn baked_local_moving_visibility(light:PointLight,position:vec3<f32>,normal:vec3
                     source: None,
                     width: 3,
                     height: 2,
-                    rgba,
+                    rgba: (rgba).into(),
                     rgba16f: None,
                     mip_level_count: 1,
                     clamp: true,

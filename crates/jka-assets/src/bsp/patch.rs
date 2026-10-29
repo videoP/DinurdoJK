@@ -321,6 +321,7 @@ fn refresh_normals(g: &mut PatchGrid) {
     g.vertices = rows.into_iter().flatten().collect();
 }
 
+#[cfg(test)]
 fn stitch_pair(a: &PatchGrid, b: &mut PatchGrid) -> bool {
     match find_stitch(a, merged_edges(a), b) {
         Some((target, at, point, error)) => {

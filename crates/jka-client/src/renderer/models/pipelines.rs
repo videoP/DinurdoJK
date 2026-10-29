@@ -54,6 +54,9 @@ impl DynamicModelRenderer {
         // ensure_model_pipelines for only the modes that have draws.
         self.model_bundles.clear();
         self.model_pipelines = Default::default();
+        self.legacy_model_pipelines = Default::default();
+        self.legacy_skin_pipelines = Default::default();
+        self.legacy_blend = None;
         self.studio_capture_pipelines = Default::default();
         self.model_glow_pipelines = Default::default();
         self.model_alpha_mask = 0;
@@ -264,6 +267,7 @@ impl DynamicModelRenderer {
                 skin_glow_mask |= 1 << draw.alpha_mode.index();
             }
         }
+        self.prepare_legacy_blend(jobs, device, model_mask, skin_mask);
         self.model_alpha_mask = model_mask;
         self.skin_alpha_mask = skin_mask;
         self.skin_source_mask = skin_source_mask;
@@ -330,7 +334,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.is_some(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.is_some(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.is_some(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => false,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => false,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.is_some(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.is_some(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.is_some(),
@@ -350,7 +354,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.as_ref(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.as_ref(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.as_ref(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => None,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => None,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.as_ref(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.as_ref(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.as_ref(),
@@ -371,7 +375,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline = Some(pipeline),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => {},
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => {},
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline = Some(pipeline),
             DynamicModelAlphaMode::AdditiveOne => {
                 self.fx_sprite_additive_one_pipeline = Some(pipeline)
@@ -786,7 +790,7 @@ pub(in crate::renderer) fn fx_sprite_blend(
                 operation: wgpu::BlendOperation::Add,
             },
         }),
-        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+        DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
                 dst_factor: wgpu::BlendFactor::One,
@@ -862,6 +866,7 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
     left: Vec3,
     up: Vec3,
     shade: f32,
+    legacy_blob: bool,
     vertices: &mut Vec<DynamicModelVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -887,7 +892,7 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
         center_jka - a1 + a2,
     ]
     .map(|point| point.to_array());
-    surfaces.project(
+    surfaces.project_blob(
         &quad,
         (normal_jka * -BLOB_MARK_PROJECTION).to_array(),
         buffer,
@@ -899,7 +904,7 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
         for point in polygon {
             let world = Vec3::from_array(*point);
             let delta = world - center_jka;
-            vertices.push(DynamicModelVertex {
+            vertices.push(DynamicModelVertex { foliage_wind: 0.0,
                 position: (to_render(world) + render_normal * BLOB_MARK_SURFACE_LIFT).to_array(),
                 normal: render_normal.to_array(),
                 uv: [
@@ -909,7 +914,9 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
                 // Stock markShadow uses alphaGen vertex and source-alpha
                 // blending. RGB-only fading does nothing to its black image.
                 color: [shade, shade, shade, shade],
-                depth_hack: 0.0,
+                // Negative metadata tags classic blobs without a new vertex
+                // layout or changing the positive RF_DEPTHHACK values.
+                depth_hack: if legacy_blob { -1.0 } else { 0.0 },
                 water_wetness: 0.0,
             });
         }
@@ -959,7 +966,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                 "JKA GPU FX sprite alpha-test forced-alpha pipeline"
             }
             DynamicModelAlphaMode::AdditiveOne => "JKA GPU FX sprite GL_ONE GL_ONE pipeline",
-            DynamicModelAlphaMode::Additive => "JKA GPU FX sprite src-alpha additive pipeline",
+            DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => "JKA GPU FX sprite src-alpha additive pipeline",
             DynamicModelAlphaMode::BlendUnlit => "JKA GPU FX sprite alpha-blend pipeline",
             DynamicModelAlphaMode::Modulate => "JKA GPU FX sprite modulate pipeline",
             DynamicModelAlphaMode::DstColorAdd => "JKA GPU FX sprite GL_DST_COLOR GL_ONE pipeline",
@@ -986,7 +993,9 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
-            depth_compare: Some(camera_depth_compare()),
+            depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
+                wgpu::CompareFunction::Always
+            } else { camera_depth_compare() }),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1002,6 +1011,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                     "fs_unlit_fog_black"
                 }
                 DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::SightShellNoDepth
                 | DynamicModelAlphaMode::Blend
                 | DynamicModelAlphaMode::BlendUnlit
                     if zero_alpha_discard =>
@@ -1009,6 +1019,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                     "fs_unlit_zero_alpha"
                 }
                 DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::SightShellNoDepth
                 | DynamicModelAlphaMode::BlendUnlit
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
@@ -1189,7 +1200,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                 operation: wgpu::BlendOperation::Add,
             },
         }),
-        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+        DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
                 dst_factor: wgpu::BlendFactor::One,
@@ -1266,7 +1277,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             DynamicModelAlphaMode::AdditiveOne => {
                 "JKA dynamic model GL_ONE GL_ONE additive unlit pipeline"
             }
-            DynamicModelAlphaMode::Additive => {
+            DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => {
                 "JKA dynamic model src-alpha additive unlit pipeline"
             }
             DynamicModelAlphaMode::BlendUnlit => "JKA dynamic model alpha-blend unlit pipeline",
@@ -1297,7 +1308,9 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
-            depth_compare: Some(camera_depth_compare()),
+            depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
+                wgpu::CompareFunction::Always
+            } else { camera_depth_compare() }),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1316,6 +1329,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                     "fs_unlit_fog_black"
                 }
                 DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::SightShellNoDepth
                 | DynamicModelAlphaMode::BlendUnlit
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
@@ -1363,7 +1377,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 operation: wgpu::BlendOperation::Add,
             },
         }),
-        DynamicModelAlphaMode::Additive => Some(wgpu::BlendState {
+        DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
                 dst_factor: wgpu::BlendFactor::One,
@@ -1439,7 +1453,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             DynamicModelAlphaMode::AdditiveOne => {
                 "JKA Ghoul2 GPU skin GL_ONE GL_ONE additive unlit pipeline"
             }
-            DynamicModelAlphaMode::Additive => {
+            DynamicModelAlphaMode::Additive | DynamicModelAlphaMode::SightShellNoDepth => {
                 "JKA Ghoul2 GPU skin src-alpha additive unlit pipeline"
             }
             DynamicModelAlphaMode::BlendUnlit => "JKA Ghoul2 GPU skin alpha-blend unlit pipeline",
@@ -1485,7 +1499,9 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
-            depth_compare: Some(camera_depth_compare()),
+            depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
+                wgpu::CompareFunction::Always
+            } else { camera_depth_compare() }),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1504,6 +1520,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                     "fs_unlit_fog_black"
                 }
                 DynamicModelAlphaMode::Additive
+                | DynamicModelAlphaMode::SightShellNoDepth
                 | DynamicModelAlphaMode::BlendUnlit
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd

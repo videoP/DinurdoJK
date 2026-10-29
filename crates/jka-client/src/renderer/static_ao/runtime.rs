@@ -205,7 +205,7 @@ impl Renderer {
                     source: None,
                     width: image.width,
                     height: image.height,
-                    rgba: image.rgba,
+                    rgba: (image.rgba).into(),
                     rgba16f: None,
                     mip_level_count: 1,
                     clamp: image.clamp,

@@ -1,10 +1,9 @@
 //! Environment surface sprites.
 pub(in crate::renderer) use crate::scene::surface_sprite_bake::{
     surface_sprite_byte, surface_sprite_random, SurfaceSpriteBake, SurfaceSpriteChunk,
-    SurfaceSpriteInstance,
 };
 #[cfg(test)]
-use crate::scene::surface_sprite_bake::{bucket_resident_instances, build_vegetation_instances};
+use crate::scene::surface_sprite_bake::{bucket_resident_instances, build_vegetation_instances, SurfaceSpriteInstance};
 use crate::renderer::{
     aabb_intersects_clip_frustum, camera_depth_compare, gpu_blend_factor, pipeline_hash,
     sampler_entry, scene, storage_buffer_entry, texture_entry, uniform_entry, BTreeMap,
@@ -1041,13 +1040,14 @@ pub(in crate::renderer) fn append_jka_vegetation_surface_sprites(
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
     0 => Float32x3,
     1 => Float32x3,
     2 => Float32x2,
     3 => Float32x4,
     4 => Float32,
-    5 => Float32
+    5 => Float32,
+    6 => Float32
 ];
 
 /// The RT receiver variant of the dynamic-model pipeline binds a second vertex

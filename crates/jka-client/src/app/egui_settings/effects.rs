@@ -1,6 +1,6 @@
 //! Effects.
 use crate::app::egui_settings::{
-    index_of, segmented_row, theme, ui, App, FxGeometryMode, Ghoul2SkinningMode,
+    index_of, segmented_row, theme, ui, App, Ghoul2SkinningMode,
 };
 
 impl App {

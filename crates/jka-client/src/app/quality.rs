@@ -89,7 +89,7 @@ impl QualityPreset {
                     "r_promoteFxLights" => *value = "2",
                     "r_dynamicLights" => *value = "clustered_lite",
                     "r_deluxeSpecular" => *value = "1",
-                    "r_dynamicShadows" => *value = "csm",
+                    "r_dynamicShadows" => *value = "csm_entities",
                     "r_glassPromotion" => *value = "1",
                     "r_hdr" => *value = "1",
                     "r_ocean" => *value = "1",
@@ -99,7 +99,7 @@ impl QualityPreset {
             return settings;
         }
 
-        // Ultra is High with ray-traced lights, CSM shadows, RT regional TAA and 4x MSAA.
+        // Ultra is High with ray-traced lights, CSM (moving entities) shadows, RT regional TAA and 4x MSAA.
         if self == Self::Ultra {
             let mut settings = Self::High.settings();
             for (name, value) in &mut settings {
@@ -107,7 +107,7 @@ impl QualityPreset {
                     "r_ext_multisample" => *value = "4",
                     "r_taa" => *value = "0",
                     "r_dynamicLights" => *value = "ray_traced",
-                    "r_dynamicShadows" => *value = "csm",
+                    "r_dynamicShadows" => *value = "csm_entities",
                     "r_hdr" => *value = "1",
                     _ => {}
                 }
@@ -169,7 +169,6 @@ impl QualityPreset {
                 ("r_deluxeMapping", "0"),
                 ("r_deluxeSpecular", "0"),
                 ("r_dynamicShadows", "off"),
-                ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
                 ("r_glassPromotion", "0"),
@@ -225,7 +224,6 @@ impl QualityPreset {
                 ("r_deluxeMapping", "0"),
                 ("r_deluxeSpecular", "0"),
                 ("r_dynamicShadows", "blob"),
-                ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
                 ("r_glassPromotion", "0"),
@@ -287,6 +285,9 @@ impl App {
     ) {
         let settings: Vec<_> = preset.settings().into_iter().filter(|(name, _)| {
             section.is_none_or(|section| super::egui_settings::preset_cvar_section(name) == Some(section))
+                // Inside Render Studio a preset only touches the Studio profile.
+                && (self.render_studio.graphics_gameplay.is_none()
+                    || super::render_studio_cfg::studio_graphics_cvar(name))
         }).collect();
         if settings.is_empty() {
             return;
@@ -446,7 +447,7 @@ mod tests {
                 assert_eq!(value("r_lodScale").parse::<f32>().unwrap(), crate::fx::LOD_SCALE_MAX);
             }
             if preset == QualityPreset::Ultra {
-                assert_eq!(value("r_dynamicShadows"), "csm");
+                assert_eq!(value("r_dynamicShadows"), "csm_entities");
             }
             let mut names = std::collections::BTreeSet::new();
             assert!(settings.iter().all(|(name, _)| names.insert(*name)), "duplicate preset setting");

@@ -54,17 +54,18 @@ impl App {
         if self.render.is_none() || self.quit_requested {
             return;
         }
-        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method == GammaMethod::Hardware {
+        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method.is_hardware() {
             self.video.gamma_method = GammaMethod::Shader;
             self.mark_config_dirty();
         }
         self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
         let generation = self.gamma_runtime.generation;
-        if self.video.gamma_method != GammaMethod::Hardware
+        if !self.video.gamma_method.is_hardware()
             && !self.gamma_runtime.hardware_active
             && matches!(self.gamma_runtime.phase, Phase::Idle)
         {
             self.gamma_runtime.message = None;
+            self.render_command(RenderCommand::SetHardwareGammaActive(false));
             self.render_command(RenderCommand::SetGammaMethod(self.video.gamma_method));
             return;
         }
@@ -75,6 +76,7 @@ impl App {
         self.gamma_runtime.message = Some("Applying brightness method...".into());
         // Neutral output first; baked originals and desktop calibration must both
         // be restored before the next method can start. Generation rejects late events.
+        self.render_command(RenderCommand::SetHardwareGammaActive(false));
         self.render_command(RenderCommand::PrepareGammaMethod(generation));
         let notify = self.gamma_notify();
         if let Err(error) = self
@@ -91,7 +93,7 @@ impl App {
         }
     }
     pub(super) fn gamma_slider_changed(&mut self) {
-        if self.video.gamma_method != GammaMethod::Hardware {
+        if !self.video.gamma_method.is_hardware() {
             return;
         }
         if self.native_hdr_blocks_hardware_gamma() {
@@ -128,14 +130,14 @@ impl App {
             return;
         }
         self.gamma_runtime.hardware_active = false;
-        if self.video.gamma_method == GammaMethod::Hardware {
+        if self.video.gamma_method.is_hardware() {
             if self.window_focused && self.pending_renderer_restart.is_none() {
                 self.apply_hardware_gamma();
             } else {
                 self.gamma_runtime.phase = Phase::Idle;
                 self.gamma_runtime.message =
                     Some("Hardware brightness paused while the game is unfocused.".into());
-                self.render_command(RenderCommand::SetGammaMethod(GammaMethod::Hardware));
+                self.render_command(RenderCommand::SetGammaMethod(self.video.gamma_method));
             }
         } else {
             self.gamma_runtime.phase = Phase::Idle;
@@ -212,10 +214,11 @@ impl App {
             self.console_status = self.gamma_runtime.message.clone().unwrap();
             self.push_console_line(format!("^3{}", self.console_status));
             // A shader curve is safe only after desktop calibration is confirmed.
+            self.render_command(RenderCommand::SetHardwareGammaActive(!status.restored && self.gamma_runtime.hardware_active));
             self.render_command(RenderCommand::SetGammaMethod(if status.restored {
                 GammaMethod::Shader
             } else {
-                GammaMethod::Hardware
+                self.video.gamma_method
             }));
             self.publish_ui();
             return;
@@ -230,7 +233,8 @@ impl App {
                 self.gamma_runtime.hardware_active = status.active;
                 self.gamma_runtime.phase = Phase::Idle;
                 self.gamma_runtime.message = None;
-                self.render_command(RenderCommand::SetGammaMethod(GammaMethod::Hardware));
+                self.render_command(RenderCommand::SetGammaMethod(self.video.gamma_method));
+                self.render_command(RenderCommand::SetHardwareGammaActive(status.active));
                 self.gamma_runtime.monitor = self
                     .hardware_target()
                     .ok()
@@ -241,12 +245,12 @@ impl App {
         }
     }
     pub(super) fn sync_gamma_focus(&mut self) {
-        if self.video.gamma_method == GammaMethod::Hardware || self.gamma_runtime.hardware_active {
+        if self.video.gamma_method.is_hardware() || self.gamma_runtime.hardware_active {
             self.sync_gamma_method();
         }
     }
     pub(super) fn sync_gamma_monitor(&mut self) {
-        if self.video.gamma_method != GammaMethod::Hardware || !self.window_focused {
+        if !self.video.gamma_method.is_hardware() || !self.window_focused {
             return;
         }
         let monitor = self
@@ -262,7 +266,7 @@ impl App {
         if !self.gamma_runtime.controller.was_started() {
             return;
         }
-        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method == GammaMethod::Hardware {
+        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method.is_hardware() {
             self.video.gamma_method = GammaMethod::Shader;
             self.mark_config_dirty();
         }

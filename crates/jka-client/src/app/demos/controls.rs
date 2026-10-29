@@ -38,6 +38,7 @@ impl App {
                 };
                 Some(UiChatLine {
                     text: line.text.clone(),
+                    team: line.team,
                     alpha: alpha.clamp(0.0, 1.0),
                 })
             })
@@ -99,6 +100,7 @@ impl App {
                 };
                 (age_ms <= lifetime_ms).then(|| ui::UiConsoleNotifyLine {
                     text: line.text.clone(),
+                    team: line.team,
                 })
             })
             .collect()
@@ -119,7 +121,7 @@ impl App {
         for entry in notices
             .iter()
             .filter(|entry| {
-                entry.kind == DemoConsoleKind::Chat
+                matches!(entry.kind, DemoConsoleKind::Chat | DemoConsoleKind::TeamChat)
                     && entry.elapsed_ms >= chat_start
                     && entry.elapsed_ms <= elapsed_ms
             })
@@ -131,6 +133,7 @@ impl App {
         {
             self.chat_lines.push_back(ChatRecord {
                 text: entry.text.clone(),
+                team: entry.kind == DemoConsoleKind::TeamChat,
                 created: now,
                 demo_elapsed_ms: Some(f64::from(entry.elapsed_ms)),
             });
@@ -403,21 +406,20 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn seek_demo_scrub_fraction(
-        &mut self,
-        fraction: f32,
-        now: Instant,
+    /// A session-level exact elapsed-time seek shared by the ordinary demo
+    /// viewer, Studio timeline, and (eventually) Studio's offline exporter.
+    /// It owns transients and camera state so UI callers never need to know
+    /// about decoder internals or how checkpoint seeking works.
+    pub(in crate::app) fn seek_demo_elapsed_ms(
+        &mut self, elapsed: i32, now: Instant,
     ) -> Result<(), String> {
         let (sample, elapsed) = {
-            let session = self
-                .game_session
-                .as_mut()
+            let session = self.game_session.as_mut()
                 .filter(|session| !session.live)
                 .ok_or_else(|| "NO DEMO SESSION".to_owned())?;
-            let duration = session
-                .demo_duration_ms()
+            let duration = session.demo_duration_ms()
                 .ok_or_else(|| "DEMO TIMELINE IS NOT READY".to_owned())?;
-            let elapsed = (duration as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+            let elapsed = elapsed.clamp(0,duration.max(0));
             (session.seek_demo(now, elapsed)?, elapsed)
         };
         self.restore_demo_transients(elapsed, now);
@@ -425,6 +427,18 @@ impl App {
         self.apply_demo_view(sample);
         self.previous_tick = now;
         Ok(())
+    }
+
+    pub(in crate::app) fn seek_demo_scrub_fraction(
+        &mut self, fraction: f32, now: Instant,
+    ) -> Result<(), String> {
+        let session = self.game_session.as_ref()
+            .filter(|session| !session.live)
+            .ok_or_else(|| "NO DEMO SESSION".to_owned())?;
+        let duration = session.demo_duration_ms()
+            .ok_or_else(|| "DEMO TIMELINE IS NOT READY".to_owned())?;
+        let elapsed = (duration as f32 * fraction.clamp(0.0,1.0)).round() as i32;
+        self.seek_demo_elapsed_ms(elapsed, now)
     }
 
     pub(in crate::app) fn begin_demo_scrub(&mut self, fraction: f32) {

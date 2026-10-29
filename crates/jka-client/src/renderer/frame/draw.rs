@@ -67,6 +67,7 @@ impl Renderer {
         dynamic_models: &[DynamicModelSurface],
         spectator_highlights: &[SpectatorHighlight],
         transient_lights: &[TransientLight],
+        studio_environment:Option<crate::renderer::StudioSceneLighting>,
         companion_scene: Option<&CompanionSceneView>,
         dof_focus_target: f32,
         dynamic_crosshair_world: Option<[f32; 3]>,
@@ -98,8 +99,12 @@ impl Renderer {
         }
 
         if self.asset_preview_mode {
+            self.dynamic_model_renderer.set_studio_environment(studio_environment,&self.queue);
+            self.dynamic_model_renderer.set_studio_lights(transient_lights,&self.queue);
             return self.render_asset_preview(camera, dynamic_models);
         }
+        self.dynamic_model_renderer.set_studio_environment(None,&self.queue);
+        self.dynamic_model_renderer.set_studio_lights(&[],&self.queue);
         self.dynamic_model_renderer
             .set_companion_excluded_entity(companion_scene.map(|view| view.target_entity));
         if companion_scene.is_some() && self.world.is_some() {
@@ -116,7 +121,7 @@ impl Renderer {
             || self.weather.rain.surface_wetness > weather::RAIN_WETNESS_EPSILON
             || self.weather.rain.puddle_amount > weather::RAIN_PUDDLE_EPSILON;
         if update_weather_surface {
-            let wetness_time = self.started.elapsed().as_secs_f32();
+            let wetness_time = self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32());
             if self.advance_surface_wetness(wetness_time, camera.position) {
                 self.update_weather_surface_uniform();
                 self.rebuild_frame_plan();
@@ -256,7 +261,7 @@ impl Renderer {
         }
         self.update_world_videos();
         if let Some(world) = self.world.as_mut() {
-            advance_world_animations(world, self.started.elapsed().as_secs_f32());
+            advance_world_animations(world, self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32()));
         }
         self.ensure_lazy_scene_pipelines();
 
@@ -266,6 +271,12 @@ impl Renderer {
         // diagnostics deliberately use the full path; GPU timestamps are
         // recorded by both paths so they can be compared.
         if self.frame_plan.world_path == WorldRenderPath::FastBaseline
+            // The Spout source is intentionally composed in the unified path.
+            // Never switch into a path that cannot supply a filtered stream.
+            && !self.stream_output.enabled()
+            && !dynamic_models.iter().any(|surface| surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass
+                || (surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode)))
+            && self.studio_world_viewport.is_none()
             && !self.surface_diag_pending
             && !self.frame_diag_pending
             && !self.video_depth_capture_requested()
@@ -307,7 +318,7 @@ impl Renderer {
                 DofMode::UnderwaterOnly =>
                     self.camera_water_surface > crate::renderer::NO_WATER_SURFACE,
             };
-        let frame_time = fixed_shader_time().unwrap_or_else(|| self.started.elapsed().as_secs_f32());
+        let frame_time = fixed_shader_time().unwrap_or_else(|| self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32()));
         let frame_delta = if self.previous_frame_time > 0.0 {
             (frame_time - self.previous_frame_time).clamp(0.0, 0.25)
         } else {
@@ -358,7 +369,9 @@ impl Renderer {
         let glass_scene_possible = self.world.as_ref().is_some_and(|world| {
             world.has_glass_primary
         }) || dynamic_models.iter().any(|surface| surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
-        if glass_scene_possible && !plan.use_post {
+        let legacy_models_possible = dynamic_models.iter().any(|surface|
+            surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode));
+        if (glass_scene_possible || legacy_models_possible) && !plan.use_post {
             // Scene transmission needs a sampleable color attachment. The
             // swapchain image does not guarantee TEXTURE_BINDING support.
             plan.use_post = true;
@@ -374,14 +387,17 @@ impl Renderer {
         {
             self.ensure_post_pipeline(true);
         }
-        let rt_taa_active = self.rt_taa_active();
+        if self.thermal_vision != 0 { self.ensure_thermal_post_pipeline(); }
+        let rt_taa_active = self.thermal_vision == 0 && self.rt_taa_active();
         if self.video_depth_capture_requested() {
             // Export the exact linear depth texture used by the compositor/DOF
             // path without making ordinary maximum-FPS frames pay for it.
             plan.needs_linear_depth = true;
             plan.hiz_early = false;
         }
-        let jitter = if self.taa_enabled {
+        // Thermal builds its image from the prepass, not the TAA resolve, so a
+        // jittered camera would make every heat edge crawl frame to frame.
+        let jitter = if self.taa_enabled && self.thermal_vision == 0 {
             temporal_jitter(self.taa_frame_index)
         } else {
             [0.0, 0.0]
@@ -634,6 +650,7 @@ impl Renderer {
             unjittered_view_proj: unjittered_view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: previous_unjittered_view_proj.to_cols_array_2d(),
             jump_shade: self.jump_shade.uniform(),
+            foliage_wind: crate::foliage::wind_uniform(self.weather_wind, frame_time, self.foliage_wind_enabled),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -657,6 +674,7 @@ impl Renderer {
                         previous_unjittered_view_proj: portal_unjittered,
                         unjittered_view_proj: portal_unjittered,
                         jump_shade: [0.0; 4],
+                        foliage_wind: uniform.foliage_wind,
                         ..uniform
                     };
                     self.queue.write_buffer(
@@ -717,7 +735,13 @@ impl Renderer {
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_local_rate(view_proj, camera.position);
         self.prepare_rt_receiver_flags();
-        if self.blue_water_environment.weather_backend==1 {self.ensure_weather_occlusion();}
+        if self.blue_water_environment.weather_backend == 1 || self.sky_backend == 1
+            || (self.ocean_enabled && self.ocean_settings.backend != 0) {
+            self.ensure_weather_occlusion();
+        }
+        if let Some(ocean) = self.ocean.as_mut() {
+            ocean.set_sky_admission(self.weather.rain.sky_admission());
+        }
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
         }
@@ -774,6 +798,7 @@ impl Renderer {
             .duration_since(frame_started)
             .as_secs_f64()
             * 1000.0;
+        let moving_csm = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsEntities;
         let entity_shadow_frame = (self.cascaded_shadow_mode == DynamicShadowsMode::EntityMap)
             .then(|| self.prepare_entity_shadow(camera, player_position, frame_delta));
         let shadow_matrices = if entity_shadow_frame.is_some() {
@@ -795,7 +820,7 @@ impl Renderer {
             // It must never be rewritten to the new camera matrix without also
             // rebuilding the depth texture, or stationary shadows will slide.
             let world_key = self.world.as_ref().map(|world| world.remap_asset_hash).unwrap_or(0);
-            for cascade in 0..SHADOW_CASCADES {
+            if !moving_csm { for cascade in 0..SHADOW_CASCADES {
                 let retained = self.shadow_resources.static_cascades[cascade].filter(|cached| {
                     cached.map_id == world_key
                         && cached.sun_direction == sun.direction
@@ -826,6 +851,7 @@ impl Renderer {
                         generation: self.shadow_resources.next_generation,
                     });
                 }
+            }
             }
             self.write_shadow_uniforms(
                 &matrices,
@@ -1134,6 +1160,7 @@ impl Renderer {
                     unjittered_view_proj: view.view_proj.to_cols_array_2d(),
                     previous_unjittered_view_proj: view.view_proj.to_cols_array_2d(),
                     jump_shade: [0.0; 4],
+                    foliage_wind: uniform.foliage_wind,
                 };
                 self.queue.write_buffer(
                     &self.planar_camera_buffers[slot],
@@ -1171,6 +1198,7 @@ impl Renderer {
             * 1000.0;
         self.update_local_shadow_selection(camera,player_position);
         self.ensure_local_shadow_cache();
+        self.sync_entity_fixture_lighting();
         prep_shadow_ms += prep_local_shadow_started.elapsed().as_secs_f64() * 1000.0;
         info.prep_shadow_ms = prep_shadow_ms;
 
@@ -1269,23 +1297,50 @@ impl Renderer {
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         // r_earlySubmit: record into an offscreen frame and acquire the
         // swapchain image only after the main submit (see early_submit.rs).
-        let early_submit = self.early_submit_frame(menu_backdrop_active);
+        // Studio's world owns its own color surface. The window is only the
+        // compositor destination, never the world render target. Unsupported
+        // presentation variants temporarily use the existing scene path; this
+        // stays off for all ordinary gameplay and animation-only Studio frames.
+        let studio_composite = self.studio_world_viewport.filter(|_| {
+            !self.asset_preview_mode
+                && self.config.usage.contains(wgpu::TextureUsages::COPY_DST)
+                && self.hdr_output.is_none()
+                && self.crt_scope == ui::CrtScope::Off
+        });
+        let early_submit = studio_composite.is_none() && self.early_submit_frame(menu_backdrop_active);
         info.early_submit = early_submit;
         // r_presentCopy: acquire as usual, render offscreen, copy at the end of
         // the main encoder (see present_copy_frame).
-        let present_copy = !early_submit && self.present_copy_frame(menu_backdrop_active);
-        let (frame, surface_view) = if early_submit {
+        // Streaming defers local HUD drawing until after the scene copy. The
+        // present-copy path copies earlier, so use acquire-first while streaming.
+        let present_copy = studio_composite.is_none() && !early_submit
+            && !self.stream_output.enabled() && self.present_copy_frame(menu_backdrop_active);
+        let (frame, surface_view) = if studio_composite.is_some() {
+            let frame = self.acquire_render_frame(&mut info)?;
+            (Some(frame), self.early_present_view())
+        } else if early_submit {
             (None, self.early_present_view())
         } else if present_copy {
-            let frame = self.acquire_surface_frame(&mut info)?;
+            let frame = self.acquire_render_frame(&mut info)?;
             (Some(frame), self.early_present_view())
         } else {
-            let frame = self.acquire_surface_frame(&mut info)?;
+            let frame = self.acquire_render_frame(&mut info)?;
             let surface_view = self.surface_texture_view(&frame);
             (Some(frame), surface_view)
         };
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
+        // A Studio world capture must never silently fall back to copying the
+        // whole editor swapchain (including UI). HDR/CRT need a dedicated
+        // offscreen resolve before they can be supported here.
+        if self.studio_world_viewport.is_some() && !self.asset_preview_mode
+            && studio_composite.is_none() && screenshot_readback.as_ref().is_some_and(|r|
+                matches!(r.destination, crate::renderer::ScreenshotDestination::VideoFrame {..}))
+        {
+            screenshot_readback = None;
+            self.screenshot_result = Some(Err(
+                "Render Studio demo export requires SDR and CRT Off".into()));
+        }
 
         // One-shot validation capture for the first diagnostic frame. The first
         // surface acquisition succeeds, while later acquisitions report
@@ -1568,26 +1623,26 @@ impl Renderer {
 
         let mut live_csm_coverage = [[0;4]; SHADOW_CASCADES];
         if let Some(shadow_matrices) = shadow_matrices.as_ref() {
-            self.shadow_resources.ensure_sky_snapshot(&self.device);
+            if !moving_csm { self.shadow_resources.ensure_sky_snapshot(&self.device); }
             if let Some(world) = &self.world {
                 for cascade in 0..SHADOW_CASCADES {
                     let cache_generation = self.shadow_resources.static_cascades[cascade]
-                        .expect("CSM matrices must publish a cache record").generation;
-                    let rebuild_static = self.shadow_resources.rendered_generations[cascade] != cache_generation;
+                        .map_or(0, |cached| cached.generation);
+                    let rebuild_static = !moving_csm && self.shadow_resources.rendered_generations[cascade] != cache_generation;
                     self.shadow_resources.cache_debug_captures += u32::from(rebuild_static);
                     let inline_casters = world.coarse_batches.iter()
                         .any(|batch| ((batch.is_inline_entity && self.draw_inline_models)
-                            || (!batch.is_inline_entity && crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility)))
+                            || (!moving_csm && !batch.is_inline_entity && crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility)))
                             && !hidden_inline_batch(batch, &world.inline_models)
                             && aabb_intersects_shadow_frustum(batch.bounds_min, batch.bounds_max,
                                 shadow_matrices[cascade], true));
-                    let inline_sky_casters = self.draw_inline_models && self.sun_visibility != SunVisibilityMode::Legacy
+                    let inline_sky_casters = !moving_csm && self.draw_inline_models && self.sun_visibility != SunVisibilityMode::Legacy
                         && world.coarse_batches.iter().any(|b| b.is_inline_entity
                             && b.source.pipeline.class == DrawClass::Sky
                             && !matches!(b.source.tc_gen, TcGen::SkyCloud(_))
                             && !hidden_inline_batch(b, &world.inline_models));
                     let models_in_cascade = csm_entity_casters && cascade < ENTITY_SHADOW_CAMERAS;
-                    let grass_in_cascade = cascade == 0 && self.grass_enabled
+                    let grass_in_cascade = !moving_csm && cascade == 0 && self.grass_enabled
                         && world.grass.is_some() && prepared_grass.is_some();
                     let dynamic_overlay = inline_casters || models_in_cascade || grass_in_cascade;
                     // Use the ACTIVE shader key: a requested variant may still be compiling.
@@ -1595,11 +1650,11 @@ impl Renderer {
                     live_csm_coverage[cascade] = if coverage_enabled {
                         crate::renderer::lighting::entity_shadows::live_csm_coverage(
                             world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models,
-                            models_in_cascade, inline_casters, grass_in_cascade)
+                            models_in_cascade, inline_casters, grass_in_cascade, !moving_csm)
                     } else {
                         crate::renderer::lighting::entity_shadows::live_csm_region(
                             world, &self.dynamic_model_renderer, shadow_matrices[cascade], dynamic_models,
-                            models_in_cascade, inline_casters, grass_in_cascade).map(f32::to_bits)
+                            models_in_cascade, inline_casters, grass_in_cascade, !moving_csm).map(f32::to_bits)
                     };
                     // Static world depth and live caster depth have separate layers.
 
@@ -1658,7 +1713,7 @@ impl Renderer {
                         }
                     }
 
-                    if (rebuild_static || inline_sky_casters || (self.shadow_resources.dynamic_sky_layers & (1u32 << cascade)) != 0
+                    if !moving_csm && (rebuild_static || inline_sky_casters || (self.shadow_resources.dynamic_sky_layers & (1u32 << cascade)) != 0
                         || self.shadow_resources.last_csm_mode != Some(self.cascaded_shadow_mode))
                         && self.sun_visibility != SunVisibilityMode::Legacy {
                         self.shadow_resources.cache_debug_sky_copies += 1;
@@ -1810,7 +1865,7 @@ impl Renderer {
                     let render_live_layer = crate::renderer::lighting::shadow_coverage::update_live_layer(
                         &mut self.shadow_resources.live_layers_initialized,
                         &mut self.shadow_resources.live_layers_occupied, cascade, has_live_casters);
-                    if !coverage_enabled || render_live_layer {
+                    if (!coverage_enabled && !moving_csm) || render_live_layer {
                         if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("JKA CSM live casters"),
@@ -1833,7 +1888,7 @@ impl Renderer {
                         if dynamic_overlay && inline_casters {
                             let mut mask_pipeline_active = false;
                             for batch in &world.coarse_batches {
-                                if (!batch.is_inline_entity && !crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility))
+                                if (!batch.is_inline_entity && (moving_csm || !crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility)))
                                     || (batch.is_inline_entity && !self.draw_inline_models)
                                     || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                                     || hidden_inline_batch(batch, &world.inline_models)
@@ -1900,13 +1955,14 @@ impl Renderer {
             if *CSM_DEBUG.get_or_init(|| std::env::var("JKA_CSM_CACHE_DEBUG").ok().as_deref() == Some("1"))
                 && self.shadow_resources.cache_debug_epoch.elapsed().as_secs_f32() >= 1.0
             {
-                println!("[CSM STATIC CACHE] mode={:?} frames={} static_passes_skipped={} static_recaptures={} depth_copies=0 sky_copies={} extra_vram=128MiB",
+                println!("[CSM STATIC CACHE] mode={:?} frames={} static_passes_skipped={} static_recaptures={} depth_copies=0 sky_copies={} sky_snapshot={}",
                     self.cascaded_shadow_mode,
                     self.shadow_resources.cache_debug_frames,
                     self.shadow_resources.cache_debug_frames.saturating_mul(SHADOW_CASCADES as u32)
                         .saturating_sub(self.shadow_resources.cache_debug_captures),
                     self.shadow_resources.cache_debug_captures,
-                    self.shadow_resources.cache_debug_sky_copies);
+                    self.shadow_resources.cache_debug_sky_copies,
+                    self.shadow_resources.sky_snapshot.is_some());
                 self.shadow_resources.cache_debug_epoch = std::time::Instant::now();
                 self.shadow_resources.cache_debug_frames = 0;
                 self.shadow_resources.cache_debug_captures = 0;
@@ -2009,6 +2065,8 @@ impl Renderer {
             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
             pass.set_pipeline(if lean_rain_depth {
                 &self.rain_depth_prepass_pipeline
+            } else if self.thermal_vision != 0 && self.thermal_depth_pipeline.is_some() {
+                self.thermal_depth_pipeline.as_ref().unwrap()
             } else {
                 &self.depth_prepass_pipeline
             });
@@ -2044,7 +2102,17 @@ impl Renderer {
                     // using depthFunc equal is NOT an independent depth writer:
                     // replaying it here would turn the transparent holes from
                     // an earlier GE128 stage into a solid fog receiver.
-                    if !batch.source.pipeline.depth_write || batch.source.pipeline.depth_equal {
+                    // Lava is opaque to thermal imaging even when the authored
+                    // visible-color stage is transparent. Give that surface a
+                    // depth/heat receiver only in the active thermal prepass;
+                    // normal transparency and all other depth users are unchanged.
+                    let thermal_lava_sheet = self.thermal_vision != 0
+                        && self.thermal_depth_pipeline.is_some()
+                        && batch.source.thermal_lava
+                        && batch.source.pipeline.class == DrawClass::Transparent;
+                    if (!batch.source.pipeline.depth_write && !thermal_lava_sheet)
+                        || batch.source.pipeline.depth_equal
+                    {
                         continue;
                     }
                     if batch.source.pipeline.class != DrawClass::Sky
@@ -2057,11 +2125,13 @@ impl Renderer {
                         continue;
                     }
                     match batch.source.pipeline.class {
-                        DrawClass::Opaque => {
+                        DrawClass::Opaque | DrawClass::Transparent if batch.source.pipeline.class == DrawClass::Opaque || thermal_lava_sheet => {
                             if mask_pipeline_active {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_pipeline
+                                } else if self.thermal_vision != 0 && self.thermal_depth_pipeline.is_some() {
+                                    self.thermal_depth_pipeline.as_ref().unwrap()
                                 } else {
                                     &self.depth_prepass_pipeline
                                 });
@@ -2080,6 +2150,8 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_mask_pipeline
+                                } else if self.thermal_vision != 0 && self.thermal_depth_mask_pipeline.is_some() {
+                                    self.thermal_depth_mask_pipeline.as_ref().unwrap()
                                 } else {
                                     &self.depth_prepass_mask_pipeline
                                 });
@@ -2921,6 +2993,8 @@ impl Renderer {
             && self.precipitation_haze_mask_needed();
         let native_eye_adaptation = self.native_display_mapping_active();
         let auto_exposure_effective = self.effective_auto_exposure_strength() > 0.0;
+        // Check before SMAA takes a long-lived mutable borrow of self.smaa_target.
+        let native_ui_gamma_active = self.ui_gamma_active();
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
                 .as_mut()
@@ -2938,6 +3012,8 @@ impl Renderer {
         // target. HUD/debug/UI remain after it and therefore stay undistorted.
         let rain_glass_active = plan.use_post && self.weather.rain.lens_glass_active();
 
+        self.dynamic_model_renderer.resize_legacy_blend(&self.device,
+            self.config.width,self.config.height,self.msaa_samples,flare_scene_format);
         let scene_output = if plan.use_post {
             &self.targets.scene_view
         } else {
@@ -3059,7 +3135,7 @@ impl Renderer {
                 atmosphere.prepare(&self.device, &self.queue, &mut encoder, key, camera, jitter,
                     camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane, self.sky_backend == 1 && self.fast_sky == 0,
                     self.cloud_backend == 1 && self.clouds_enabled, self.cloud_coverage,
-                    [self.weather_wind.speed, self.weather_wind.direction], self.blue_water_environment, ocean_sun.intensity, frame_delta, self.weather.rain.native_sheltered(camera.position.to_array()));
+                    [self.weather_wind.speed, self.weather_wind.direction], self.blue_water_environment, self.cloud_render_resolution.scale(), ocean_sun.intensity, frame_delta, self.weather.rain.native_sheltered(camera.position.to_array()));
                 info.native_thunder.extend(atmosphere.take_thunder());
                 if let Some((_, matrix)) = sky_portal_view { atmosphere.write_portal_camera(&self.queue, matrix); }
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSkyPrepare, true);
@@ -4713,7 +4789,7 @@ impl Renderer {
                 // composited after the ocean surface and spray, otherwise the
                 // opaque water pass overwrites them because they do not write
                 // depth themselves.
-                self.dynamic_model_renderer.draw_phase(
+                self.dynamic_model_renderer.draw_scene_phase(
                     &mut pass,
                     &self.camera_bind_group,
                     true,
@@ -4734,7 +4810,7 @@ impl Renderer {
             } else {
                 // On the non-ocean path, postpone the non-depth-writing entity
                 // phase until after the deferred transparent world shaders.
-                self.dynamic_model_renderer.draw_phase(
+                self.dynamic_model_renderer.draw_scene_phase(
                     &mut pass,
                     &self.camera_bind_group,
                     true,
@@ -4872,9 +4948,9 @@ impl Renderer {
                     ocean.apply_original_caustics(&self.device, &mut encoder, color_view, &self.targets.depth_view);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsReceiver, true);
                 }
-                if let Some(atmosphere) = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1) {
+                if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, false);
-                    atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder, color_view, resolve_target, &self.targets.depth_view);
+                    atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder, color_view, resolve_target, &self.targets.depth_view, &self.weather.rain.sky_admission());
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, true);
                 }
                 self.gpu_profiler.write_encoder_timestamp(
@@ -5519,7 +5595,7 @@ impl Renderer {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
                     atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
-                    atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view);
+                    atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,&self.weather.rain.sky_admission());
                 }
                 pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("scene after native clouds"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()});
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
@@ -5863,7 +5939,7 @@ impl Renderer {
                     GpuPass::DynamicModelsTranslucent,
                     false,
                 );
-                self.dynamic_model_renderer.draw_phase(
+                self.dynamic_model_renderer.draw_scene_phase(
                     &mut pass,
                     &self.camera_bind_group,
                     false,
@@ -6505,7 +6581,7 @@ impl Renderer {
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
                         if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
-                            || !batch.source.authored_glow
+                            || !(batch.source.authored_glow || (self.thermal_vision != 0 && batch.source.thermal_source_stage))
                             || (self.fast_sky != 0 && batch.source.pipeline.class == DrawClass::Sky)
                             || batch.is_inline_entity
                             || !batch_area_visible(batch, effective_area_mask)
@@ -6576,7 +6652,10 @@ impl Renderer {
                         .inline_visible_scratch
                         .iter()
                         .copied()
-                        .filter(|&index| active.batches[index].source.authored_glow)
+                        .filter(|&index| {
+                            let source = &active.batches[index].source;
+                            source.authored_glow || (self.thermal_vision != 0 && source.thermal_source_stage)
+                        })
                         .collect::<Vec<_>>();
                     if !glow_inline_visible.is_empty() {
                         let packed = pack_inline_draws(
@@ -6789,7 +6868,7 @@ impl Renderer {
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, false);
             for depth_writing_phase in [true, false] {
-                self.dynamic_model_renderer.draw_phase(
+                self.dynamic_model_renderer.draw_scene_phase(
                     &mut pass,
                     &self.camera_bind_group,
                     depth_writing_phase,
@@ -6850,6 +6929,8 @@ impl Renderer {
                 }
             }
         }
+        self.dynamic_model_renderer.composite_legacy_blend(&self.device,&mut encoder,
+            scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group);
         // In non-threaded mode, resolve after the last main scene pass closes.
         // Threaded mode already resolved in the prefix before handing it off.
         self.frame_time_graph.resolve_stats(&mut encoder);
@@ -6880,6 +6961,12 @@ impl Renderer {
                 self.world.as_ref().and_then(|world| world.visibility.as_ref()),
                 self.pvs_mode != PvsMode::Off,
                 self.weather.fog.legacy_drawfog_value(),
+                if self.thermal_vision != 0 {
+                    self.targets.authored_glow.as_ref().map(|glow| {
+                        (glow.msaa_view.as_ref().unwrap_or(&glow.view),
+                         glow.msaa_view.as_ref().map(|_| &glow.view))
+                    })
+                } else { None },
             );
         }
         self.compact_group_scratch = compact_group_drawn;
@@ -7300,7 +7387,10 @@ impl Renderer {
             self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::PostFinal, false);
             let regional = rt_taa_active.then_some(self.rt_taa_resources.as_ref()).flatten()
                 .filter(|r| r.input.is_some() && r.pipeline.is_some());
-            let temporal_pipeline = if self.taa_enabled { self.taa_post_pipeline.as_ref() }
+            let temporal_pipeline = if self.taa_enabled {
+                if self.thermal_vision != 0 { self.thermal_taa_pipeline.as_ref().or(self.taa_post_pipeline.as_ref()) }
+                else { self.taa_post_pipeline.as_ref() }
+            }
                 else { regional.and_then(|r| r.pipeline.as_ref()) };
             if let Some(taa_post_pipeline) = temporal_pipeline {
                 // Persist the *resolved* temporal color, not the raw jittered
@@ -7374,7 +7464,13 @@ impl Renderer {
                     multiview_mask: None,
                 });
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
-                if plan.rain_only_post {
+                if self.thermal_vision != 0 && self.thermal_post_pipeline.is_some() {
+                    pass.set_pipeline(self.thermal_post_pipeline.as_ref().unwrap());
+                    pass.set_bind_group(0,
+                        &self.post_bind_groups[self.history_read_index]
+                            [self.ssao_history_read_index][self.ssr_history_read_index]
+                            [self.cloud_history_read_index], &[]);
+                } else if plan.rain_only_post {
                     if let Some(pipeline) = self.rain_post_pipeline.as_ref() {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(pipeline);
@@ -7543,8 +7639,11 @@ impl Renderer {
         // otherwise be drawn into the main target before the readback.
         let scene_snapshot_requested = screenshot_readback.as_ref().is_some_and(|readback| {
             matches!(readback.destination, crate::renderer::ScreenshotDestination::FrontendScene { .. })
+                || (studio_composite.is_some() && !self.asset_preview_mode
+                    && matches!(readback.destination, crate::renderer::ScreenshotDestination::VideoFrame { .. }))
         });
-        let native_ui_in_main = !menu_backdrop_active
+        let native_ui_in_main = !self.stream_output.enabled()
+            && !menu_backdrop_active
             && !scene_snapshot_requested
             && match self.crt_scope {
                 ui::CrtScope::Off => !self.egui_active,
@@ -7593,9 +7692,15 @@ impl Renderer {
                 &self.screen_fx_textures,
                 &self.screen_fx_white_bind_group,
             );
+            // No extra scene pass: only the native UI pixels are counter-adjusted.
+            let ui_gamma = if native_ui_gamma_active { self.ui_gamma_native.as_ref() } else { None };
+            let ui_pipeline = ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline);
+            if let Some(resources) = ui_gamma {
+                pass.set_bind_group(1, &resources.group, &[]);
+            }
             Self::draw_ui_batches(
                 &mut pass,
-                &self.ui_pipeline,
+                ui_pipeline,
                 &self.ui_bind_group,
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
@@ -7605,11 +7710,11 @@ impl Renderer {
                 self.ui_vertex_count,
             );
             if !self.egui_active {
-                self.frame_time_graph.draw(&mut pass, &self.ui_pipeline, &self.ui_bind_group);
+                self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
             }
             if tile_cost_overlay_ready {
                 if let Some(overlay) = self.tile_cost_overlay.as_ref() {
-                    overlay.draw(&mut pass, &self.ui_pipeline, &self.ui_bind_group);
+                    overlay.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
                 }
             }
             drop(pass);
@@ -7655,7 +7760,7 @@ impl Renderer {
         // SMAA and the menu backdrop both submit work after this encoder, so
         // those paths intentionally do a tiny late copy submit instead.
         if self.hdr_output.is_none() && !self.smaa_enabled && !menu_backdrop_active && !self.egui_active && !crt_active
-            && !scene_snapshot_requested
+            && !scene_snapshot_requested && !self.stream_output.enabled()
         {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
@@ -7777,10 +7882,44 @@ impl Renderer {
         } else {
             &frame_view
         };
+        // The main submission is complete before we compose the world into
+        // the window. Egui must then draw to the *real* swapchain image.
+        if let (Some(viewport), Some(frame)) = (studio_composite, frame.as_ref()) {
+            self.submit_studio_world_composite(frame, viewport);
+        }
+        let studio_editor_surface = studio_composite.and_then(|_| frame.as_ref())
+            .map(|frame| self.surface_texture_view(frame));
+        let ui_composite_target = studio_editor_surface.as_ref().unwrap_or(ui_composite_target);
         if menu_backdrop_active {
             // In Everything mode the backdrop itself is part of the CRT source;
             // otherwise it goes straight to the swapchain as before.
             self.submit_menu_backdrop(ui_composite_target, scene_snapshot_requested);
+        }
+        // Capture only the scene, BEFORE unfiltered local native UI or egui.
+        // The stream draws its own privacy-filtered HUD over this shared scene.
+        if self.stream_output.enabled() {
+            if self.hdr_output.is_some() {
+                self.stream_output.pause_unsupported("HDR output has no isolated SDR stream resolve");
+            } else if studio_composite.is_some() || self.studio_world_viewport.is_some() || self.studio_export_size.is_some() {
+                // Never stream the editor compositor and accidentally include
+                // its private chrome or unrelated sources.
+                self.stream_output.pause_unsupported("Render Studio viewport is active");
+            } else {
+                // For CRT Everything, the normal CRT presentation is after
+                // UI. Produce a scene-only CRT resolve for the Spout sender.
+                if crt_everything {
+                    self.submit_crt(&frame_view);
+                }
+                let mut stream = std::mem::take(&mut self.stream_output);
+                if early_submit || present_copy {
+                    if let Some(target) = &self.early_present_target {
+                        stream.submit_scene(self, &target.texture);
+                    }
+                } else if let Some(frame) = frame.as_ref() {
+                    stream.submit_scene(self, &frame.texture);
+                }
+                self.stream_output = stream;
+            }
         }
         if scene_snapshot_requested {
             // When CRT includes UI, render a separate scene-only CRT image for
@@ -7791,7 +7930,12 @@ impl Renderer {
             if let Some(readback) = screenshot_readback.as_mut() {
                 // Cache the scene after its ordinary post/backdrop but before
                 // egui or any late native UI overlays draw over it.
-                if let Some(output) = &self.hdr_output {
+                if studio_composite.is_some() && !self.asset_preview_mode {
+                    let source = &self.early_present_target.as_ref()
+                        .expect("Studio worlds always render into their own color texture")
+                        .texture;
+                    self.submit_screenshot_copy(source, readback);
+                } else if let Some(output) = &self.hdr_output {
                     // Independent SDR capture from HDR, while UI is absent.
                     output.submit(&self.device, &self.queue, &surface_view, true);
                     self.submit_screenshot_copy(&output.capture, readback);
@@ -7814,13 +7958,34 @@ impl Renderer {
                 self.submit_menu_backdrop(ui_composite_target, false);
             }
         }
+        // Unsupported Studio presentation modes must fail CLOSED. Never
+        // expose a fullscreen recording under the menu if HDR/CRT/COPY_DST
+        // prevents the isolated copy: show the neutral editor background.
+        if self.studio_world_viewport.is_some()
+            && !self.asset_preview_mode && studio_composite.is_none() {
+            self.submit_studio_editor_clear(ui_composite_target);
+        }
+        // Streaming kept this HUD out of the first CRT resolve so the stream
+        // could copy a clean scene. Restore local Scene+HUD layering before egui.
+        let stream_scene_hud_crt = self.stream_output.enabled()
+            && self.crt_scope == ui::CrtScope::SceneHud && !menu_backdrop_active
+            && (self.studio_world_viewport.is_none() || self.ui_state.mode == ui::OverlayMode::Console);
+        if stream_scene_hud_crt {
+            self.submit_ui_overlay(crt_view.as_ref().expect("CRT resources must exist while enabled"));
+            self.submit_crt(&frame_view);
+        }
         self.submit_egui(ui_composite_target);
-        let late_native_ui = !native_ui_in_main
+        let late_native_ui = !native_ui_in_main && !stream_scene_hud_crt
             && (menu_backdrop_active
                 || self.egui_active
                 || scene_snapshot_requested
+                || self.stream_output.enabled()
                 || self.crt_scope == ui::CrtScope::Scene);
-        if late_native_ui {
+        if late_native_ui && (self.studio_world_viewport.is_none()
+            || self.ui_state.mode == ui::OverlayMode::Console) {
+            // Editor chrome owns this window. A recorded demo's native HUD,
+            // crosshair and scoreboard must not paint over the Studio panels.
+            // The developer console remains usable while editing.
             self.submit_ui_overlay(ui_composite_target);
         }
         if crt_everything {
@@ -7850,7 +8015,7 @@ impl Renderer {
             None => {
                 // Early submit: the GPU already has this frame. Wait for the
                 // image now and copy the offscreen result into it.
-                match self.acquire_surface_frame(&mut info) {
+                match self.acquire_render_frame(&mut info) {
                     Ok(frame) => {
                         self.submit_early_present_copy(&frame);
                         frame
@@ -7869,8 +8034,7 @@ impl Renderer {
             }
         };
         let present_started = Instant::now();
-        self.window.pre_present_notify();
-        self.queue.present(frame);
+        self.present_render_frame(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented(
             present_completed_at,

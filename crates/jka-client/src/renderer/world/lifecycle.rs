@@ -6,9 +6,54 @@ use crate::{materials::VideoSourceData, renderer::{
     PBR_PROFILE_COMPANION_COMPRESSION, VideoDecoder, Mp4Video, RoqWorker,
 }};
 
+pub(in crate::renderer) struct StudioCachedWorld {
+    key: (u64, crate::scene::ShaderRemapState),
+    world: crate::renderer::WorldGpu,
+    videos: Vec<WorldVideoPlayer>,
+}
+
 impl Renderer {
     pub(in crate::renderer) fn load_map(&mut self, map: PreparedMap) -> WorldUploadTimings {
-        self.load_map_internal(map, None)
+        self.load_studio_map(map, None)
+    }
+
+    /// Studio views share immutable uploads on the same device. Mutable world
+    /// buffers, deformation, video decoders and temporal targets remain local.
+    pub(in crate::renderer) fn load_shared_studio_map(
+        &mut self, map: PreparedMap, shared: Option<&crate::renderer::WorldGpu>,
+    ) -> WorldUploadTimings {
+        // Individual immutable uploads now use the device's asset pool. Never
+        // borrow a renderer's mutable/baked texture just because its map matches.
+        let _ = shared;
+        self.load_map_internal(map, None, None, None)
+    }
+
+    pub(in crate::renderer) fn load_studio_map(
+        &mut self, map: PreparedMap,
+        key: Option<(u64, crate::scene::ShaderRemapState)>,
+    ) -> WorldUploadTimings {
+        // Remove the incoming entry before enforcing the bound on the outgoing
+        // one. Both CPU/session and GPU caches use three inactive entries.
+        let resident = key.as_ref().and_then(|key| {
+            self.studio_cached_worlds.iter().position(|entry| &entry.key == key)
+                .map(|index| self.studio_cached_worlds.remove(index))
+        });
+        if key.is_some() {
+            if let (Some(old_key), Some(world)) =
+                (self.studio_active_world.take(), self.world.take()) {
+                self.studio_cached_worlds.retain(|entry| entry.key.0 != old_key.0);
+                self.studio_cached_worlds.push(StudioCachedWorld {
+                    key: old_key, world, videos: std::mem::take(&mut self.world_videos),
+                });
+                if self.studio_cached_worlds.len() > 3 {
+                    self.studio_cached_worlds.remove(0);
+                }
+            }
+        } else {
+            self.studio_cached_worlds.clear();
+        }
+        self.studio_active_world = key;
+        self.load_map_internal(map, None, resident, None)
     }
 
     /// Material-only plan: no clone of the PreparedMap or deferred destruction
@@ -18,20 +63,24 @@ impl Renderer {
         &mut self,
         plan: crate::scene::PreparedRemapPlan,
         base_texture_count: usize,
+        studio_world: Option<(u64, crate::scene::ShaderRemapState)>,
     ) -> WorldUploadTimings {
+        // Park this world under its new material state, never its old key.
+        self.studio_active_world = studio_world;
         match self.remap_resident_world(&plan, base_texture_count) {
             Ok(timings) => timings,
             Err(reason) => {
                 rverbose!(1, "[SHADER REMAP] resident update unavailable ({reason}); using full compatibility reconstruction");
-                let mut timings = self.load_map_internal(plan.into_full_map(), Some(base_texture_count));
+                let mut timings = self.load_map_internal(plan.into_full_map(), Some(base_texture_count), None, None);
                 timings.remap_full_fallback = true;
                 timings
             }
         }
     }
 
-    fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>) -> WorldUploadTimings {
+    fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>, resident: Option<StudioCachedWorld>, shared: Option<&crate::renderer::WorldGpu>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
+        self.dynamic_model_renderer.fixture_lighting = None;
         self.promoted_ocean_overrides.clear();
         self.ocean_interaction.clear(&self.queue);
         // A new world must not inherit transient RE_AddLightToScene submissions
@@ -109,6 +158,10 @@ impl Renderer {
                 u32::from(batch.surface_material) == MATERIAL_SNOW
                     && batch.pipeline.class != DrawClass::Sky
             });
+        // Before the world bind groups are built; a reused world is rebound below.
+        let snow_fields_changed = self
+            .surface_deformation
+            .set_field_enabled(&self.device, self.map_has_snow_surfaces);
         self.map_has_water = map
             .batches
             .iter()
@@ -117,6 +170,19 @@ impl Renderer {
             .any(|batch| batch.water);
         self.model_wet_latched = false;
         let videos = std::mem::take(&mut map.videos);
+        let mutable_images: Vec<_> = videos.iter().map(|v| v.texture).collect();
+        // Target format/MSAA and upload policy may change while a world is
+        // parked. Such entries are rebuilt from the retained prepared source.
+        let resident = resident.filter(|entry| {
+            let world = &entry.world;
+            world.remap_scene_format == self.scene_format()
+                && world.remap_msaa_samples == self.msaa_samples
+                && world.remap_picmip == self.picmip
+                && world.remap_compression == if self.bc_compression_supported { self.texture_compression } else { 0 }
+                && world.remap_pbr_compression == (self.pbr_enabled && PBR_PROFILE_COMPANION_COMPRESSION && self.bc_compression_supported)
+        });
+        let restored = resident.is_some();
+        let mut retained_videos = None;
         // The BLAS needs the uploaded world buffers, so map upload always creates
         // a normal raster variant first.  If RT Shadows is selected we build the
         // acceleration structures immediately after WorldGpu is installed, then
@@ -142,7 +208,16 @@ impl Renderer {
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
         };
         let pre_build_ms = load_map_started.elapsed().as_secs_f64() * 1000.0;
-        let (mut world, mut upload_timings) = build_world(
+        let shared_texture_count = map.textures.len();
+        let (mut world, mut upload_timings) = if let Some(entry) = resident {
+            retained_videos = Some(entry.videos);
+            let timings = WorldUploadTimings {
+                studio_world_reused: true,
+                promoted_oceans: entry.world.promoted_oceans.clone(),
+                ..Default::default()
+            };
+            (entry.world, timings)
+        } else { build_world(
             &self.device,
             &self.queue,
             &self.surface_layout,
@@ -184,10 +259,14 @@ impl Renderer {
             self.pbr_enabled && PBR_PROFILE_COMPANION_COMPRESSION && self.bc_compression_supported,
             self.picmip,
             if self.bc_compression_supported { self.texture_compression } else { 0 },
+            &mutable_images,
             map,
-            if reuse.is_some() { self.world.as_ref() } else { None },
-            reuse.unwrap_or(0),
-        );
+            if reuse.is_some() { self.world.as_ref() } else { shared },
+            reuse.unwrap_or(if shared.is_some() { shared_texture_count } else { 0 }),
+        ) };
+        if restored {
+            self.rebuild_world_surface_bind_groups(&mut world);
+        }
         world.refresh_pso_slots();
         upload_timings.pre_build_ms = pre_build_ms;
         let post_bind_started = Instant::now();
@@ -229,6 +308,12 @@ impl Renderer {
         self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
         self.shadow_resources.last_csm_mode = None;
         self.world = Some(world);
+        if snow_fields_changed {
+            if let Some(mut world) = self.world.take() {
+                self.rebuild_world_surface_bind_groups(&mut world);
+                self.world = Some(world);
+            }
+        }
         // A map replaced while the A/B diagnostic was enabled must receive
         // the same forced-alpha upload as a live toggle.
         if self.debug_world_vertex_alpha_one {
@@ -250,7 +335,7 @@ impl Renderer {
                 );
             }
         }
-        self.world_videos = videos.into_iter().filter_map(|source| {
+        self.world_videos = retained_videos.unwrap_or_else(|| videos.into_iter().filter_map(|source| {
             let decoder = match source.data {
                 VideoSourceData::Roq(bytes) => {
                     RoqWorker::open(bytes).map(VideoDecoder::Roq)
@@ -277,7 +362,7 @@ impl Renderer {
                     None
                 }
             }
-        }).collect();
+        }).collect());
         self.sync_baked_brightness_assets();
         if self.hardware_rt_requested() {
             self.ensure_ray_traced_shadow_resources();
@@ -322,6 +407,9 @@ impl Renderer {
         upload_timings.variant_ms = variant_started.elapsed().as_secs_f64() * 1000.0;
         let finalize_started = Instant::now();
         self.update_lighting_settings();
+        if restored {
+            println!("[STUDIO CACHE] GPU world restored; skipped geometry/texture upload");
+        }
         upload_timings.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
         upload_timings
     }
@@ -433,6 +521,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn unload_map(&mut self) {
+        self.studio_active_world = None;
+        self.studio_cached_worlds.clear();
         // BLAS/TLAS resources refer to the current world's static geometry.
         self.ray_traced_shadows = None;
         // Returning to the front end is a real world teardown, not just another

@@ -6,6 +6,7 @@ use std::fmt;
 pub mod adaptive_huffman;
 pub mod commands;
 pub mod demo;
+pub mod demo_bake;
 mod entity_fields;
 pub mod entity_event;
 pub mod gamestate;

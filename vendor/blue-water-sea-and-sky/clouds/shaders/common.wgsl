@@ -22,8 +22,10 @@ struct CloudUniforms {
     camera: vec4<f32>,
     // xyz the camera's forward (world), w 1 / tan(half the vertical field of view).
     forward: vec4<f32>,
-    // xy the drawing buffer (px), zw the march buffer (px, a quarter of it rounded up).
+    // xy the cloud history/reconstruction buffer (px), zw its quarter-size march buffer.
     screen: vec4<f32>,
+    // xy the full output viewport (px). Depth/probe inputs and dome fragments use this resolution.
+    viewport: vec4<f32>,
     // x the update counter, yz this update's cell of the 4 × 4 Bayer block (x right, y down), w 1 when the
     // reconstruction may read its history.
     frame: vec4<f32>,
@@ -112,6 +114,8 @@ struct CloudUniforms {
     // x 1 while a lightning flash's light on the clouds changes (it, or the last update's, lit them): the reconstruction
     // clips its history to the march as a moving view's does, so the flash shows and goes with the march. yzw unused.
     flash: vec4<f32>,
+    // x debug view, y bypass Beer attenuation, z far-ray step multiplier, w use mean local sun depth.
+    experiments: vec4<f32>,
 }
 
 @group(2) @binding(0) var<uniform> clouds: CloudUniforms;

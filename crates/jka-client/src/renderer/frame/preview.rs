@@ -10,6 +10,22 @@ impl Renderer {
         camera: &Camera,
         dynamic_models: &[DynamicModelSurface],
     ) -> Result<FrameInfo, RenderError> {
+        // The editor can route an ESC/menu frame here immediately after an
+        // FP16 demo scene. SetAssetPreviewMode only *queues* a target/PSO
+        // rebuild, so using the old MSAA view would attempt to resolve
+        // Rgba16Float into Bgra8UnormSrgb and panic at encoder.finish().
+        // Also covers Studio's empty-scene fallback, which calls this method
+        // directly even when the explicit asset-preview toggle is off.
+        let preview_format = self.preview_scene_format();
+        if self.targets._scene_texture.format() != preview_format
+            || self.scene_pipeline_compat != (preview_format, self.msaa_samples)
+        {
+            if !self.asset_preview_mode {
+                self.set_asset_preview_mode(true);
+            }
+            self.request_scene_rebuild();
+        }
+        self.apply_pending_scene_rebuild();
         let frame_started = Instant::now();
         let full_width = self.config.width.max(1);
         let full_height = self.config.height.max(1);
@@ -25,7 +41,7 @@ impl Renderer {
             .max(1);
         let view_proj = camera.view_projection(viewport[2], viewport[3]);
         if let Some(background)=&mut self.asset_preview_background{
-            background.prepare(&self.device,&self.queue,self.config.format,self.msaa_samples,[viewport[2],viewport[3]]);
+            background.prepare(&self.device,&self.queue,preview_format,self.msaa_samples,[viewport[2],viewport[3]]);
         }
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
@@ -33,7 +49,7 @@ impl Renderer {
                 camera.position.x,
                 camera.position.y,
                 camera.position.z,
-                self.started.elapsed().as_secs_f32(),
+                self.frame_time(),
             ],
             clip_plane: [0.0; 4],
             render_flags: [0, 0, 0, 0],
@@ -41,6 +57,7 @@ impl Renderer {
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
             jump_shade: [0.0; 4],
+            foliage_wind: [0.0; 4],
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -76,31 +93,17 @@ impl Renderer {
             .sum();
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
 
-        let acquire_started = Instant::now();
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Timeout);
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Occluded);
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Outdated);
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Lost);
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
-        };
-        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
+        let frame = self.acquire_render_frame(&mut info)?;
         let surface_view = self.surface_texture_view(&frame);
-        let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
+        let presentation_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
+        let lens=self.studio_lens.filter(|l|l.aperture.is_some());
+        if lens.is_some() {
+            let size=[full_width,full_height];
+            if self.studio_lens_gpu.as_ref().is_none_or(|g|!g.matches(size,preview_format)) {
+                self.studio_lens_gpu=Some(super::super::studio_lens::StudioLensGpu::new(&self.device,size,preview_format));
+            }
+        } else {self.studio_lens_gpu=None;}
+        let frame_view=if lens.is_some(){self.studio_lens_gpu.as_ref().unwrap().view.clone()}else{presentation_view.clone()};
         let mut screenshot_readback=self.prepare_screenshot_readback();
         let clean_video_frame = screenshot_readback.as_ref().is_some_and(|readback|
             matches!(&readback.destination, crate::renderer::ScreenshotDestination::VideoFrame { .. }));
@@ -130,6 +133,11 @@ impl Renderer {
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(if transparent_capture {
                             wgpu::Color::TRANSPARENT
+                        } else if self.studio_world_viewport.is_some() && !clean_video_frame {
+                            // Match the Studio world's editor backing color.
+                            // Switching between model preview and demo playback
+                            // must not flash black against the editor chrome.
+                            wgpu::Color {r:0.039,g:0.063,b:0.098,a:1.0}
                         } else { wgpu::Color::BLACK }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -171,7 +179,7 @@ impl Renderer {
         // Single-sampled radial-depth prepass for isolated studio exports.
         // Reuse the existing skinned Ghoul2/MD3 pipelines and the same
         // 1,000,000-unit background convention used by demo depth EXRs.
-        if depth_capture {
+        if depth_capture || lens.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Studio radial depth"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -196,9 +204,14 @@ impl Renderer {
             pass.set_scissor_rect(viewport[0], viewport[1], viewport[2], viewport[3]);
             if draw_preview { self.dynamic_model_renderer.draw_rain_prepass(&mut pass, &self.camera_bind_group); }
         }
+        if let Some(lens)=lens {
+            self.studio_lens_gpu.as_ref().unwrap().encode(&self.device,&self.queue,&mut encoder,
+                &frame_view,&self.targets.linear_depth_view,&presentation_view,camera,lens,viewport);
+        }
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
         self.queue.submit([encoder.finish()]);
+        let frame_view=presentation_view;
         if !clean_video_frame {
             self.submit_egui(&frame_view);
             if self.egui_active {
@@ -212,8 +225,7 @@ impl Renderer {
         }
         // After the HDR output pass: its capture texture holds the final image.
         if let Some(readback)=&mut screenshot_readback{self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture),readback);}
-        self.window.pre_present_notify();
-        self.queue.present(frame);
+        self.present_render_frame(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented_without_scene(
             present_completed_at,

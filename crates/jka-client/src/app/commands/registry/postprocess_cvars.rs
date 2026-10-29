@@ -28,6 +28,38 @@ mod strength_tests {
 }
 
 app_cvars! {
+    APP_R_THERMALVISION {
+        runtime: CvarDef::new(
+            "r_thermalVision", "", "0..5",
+            "Thermal scene palette: 0 off, 1 Predator blue/yellow/red, 2 white-hot, 3 black-hot, 4 ironbow, 5 heat diagnostic. Lazy thermal PSO; no thermal rendering when off.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_thermalvision(app)),
+            |app, value| App::cvar_set_r_thermalvision(app, APP_R_THERMALVISION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_thermalvision, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() { settings.thermal_vision = mode.min(5); }
+            }),
+            archive: Some((900, |state| format!("{}", state.video.thermal_vision))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_thermalvision(&self) -> String { self.video.thermal_vision.to_string() }
+                fn cvar_set_r_thermalvision(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .map_err(|_| format!("{name}: expected integer 0..5"))?;
+                    if mode > 5 { return Err(format!("{name}: expected integer 0..5")); }
+                    self.video.thermal_vision = mode;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_AUTOEXPOSURE {
         runtime: CvarDef::new(
                 "r_autoExposure",

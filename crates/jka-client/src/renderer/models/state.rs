@@ -130,7 +130,7 @@ impl DynamicModelRenderer {
                 width: 1,
                 height: 1,
                 // Tangent space's own +Z once decoded by `tex * 2 - 1`.
-                rgba: vec![128, 128, 255, 255],
+                rgba: vec![128, 128, 255, 255].into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -292,7 +292,10 @@ impl DynamicModelRenderer {
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             entity_sun_relight: None,
             entity_dlights: Vec::new(),
+            studio_lights: Vec::new(),
+            studio_environment:None,
             entity_dlights_rt_per_pixel: false,
+            fixture_lighting: None,
             model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
             entity_weather: EntityWeather::default(),
@@ -306,6 +309,9 @@ impl DynamicModelRenderer {
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
+            legacy_blend: None,
+            legacy_model_pipelines: Default::default(),
+            legacy_skin_pipelines: Default::default(),
             studio_capture_pipelines: Default::default(),
             model_glow_pipelines: Default::default(),
             model_alpha_mask: 0,
@@ -778,13 +784,15 @@ impl DynamicModelRenderer {
     /// share a bind group while a repack must not reuse a stale one.
     fn texture_identity(texture: &TextureData) -> String {
         format!(
-            "{}|{}x{}|m{}|c{}|s{}",
+            "{}|{}x{}|m{}|c{}|s{}|p{}|f{}",
             texture.label,
             texture.width,
             texture.height,
             texture.mip_level_count,
             u8::from(texture.clamp),
             u8::from(texture.srgb),
+            texture.rgba.identity(),
+            texture.rgba16f.as_ref().map_or(0, |p| p.identity()),
         )
     }
 
@@ -823,11 +831,12 @@ impl DynamicModelRenderer {
         if let Entry::Vacant(entry) = self.textures.entry(Arc::clone(&key)) {
             let binding_id = self.next_texture_binding_id;
             self.next_texture_binding_id += 1;
-            let image = upload_texture(device, queue, texture);
+            let image = if brightness.overrides_output() { upload_texture(device, queue, texture) }
+                else { crate::renderer::textures::upload_cached_texture(device, queue, texture) };
             brightness.register(&image._texture);
             // Deliberately not registered with baked brightness: a normal map is
             // data, not colour, and `register` already skips non-sRGB textures.
-            let normal_image = normal_map.map(|normal| upload_texture(device, queue, normal));
+            let normal_image = normal_map.map(|normal| crate::renderer::textures::upload_cached_texture(device, queue, normal));
             let sampler = if texture.clamp {
                 &self.clamp_sampler
             } else {
@@ -920,17 +929,40 @@ impl DynamicModelRenderer {
     }
 
     pub(in crate::renderer) fn write_entity_lighting(&self, queue: &wgpu::Queue) {
+        let mut uniform=DynamicEntityLightingUniform::new(self.entity_ambient_lighting,self.entity_legacy_fog,
+            self.model_brightness,self.cloud_shadow_sun,self.entity_weather);
+        uniform.values[2]=self.studio_lights.len().min(32) as u32;
+        if let Some(env)=self.studio_environment {
+            uniform.values[3]=1;
+            uniform.studio_ambient=env.ambient;
+            uniform.studio_sun=env.sun;
+            uniform.studio_sun_direction=env.sun_direction;
+        }
+        for (i,light) in self.studio_lights.iter().take(32).enumerate() {
+            uniform.studio_lights[i*4]=[light.position[0],light.position[1],light.position[2],light.radius];
+            uniform.studio_lights[i*4+1]=[light.color[0],light.color[1],light.color[2],light.intensity];
+            if let Some(spot)=light.spot {
+                uniform.studio_lights[i*4+2]=[spot.direction[0],spot.direction[1],spot.direction[2],spot.inner_cone_cos];
+                uniform.studio_lights[i*4+3]=[spot.outer_cone_cos,1.0,0.0,0.0];
+            }
+        }
         queue.write_buffer(
             &self.entity_lighting_buffer,
             0,
-            bytemuck::bytes_of(&DynamicEntityLightingUniform::new(
-                self.entity_ambient_lighting,
-                self.entity_legacy_fog,
-                self.model_brightness,
-                self.cloud_shadow_sun,
-                self.entity_weather,
-            )),
+            bytemuck::bytes_of(&uniform),
         );
+    }
+
+    pub(in crate::renderer) fn set_studio_lights(&mut self, lights:&[crate::renderer::TransientLight],queue:&wgpu::Queue) {
+        let lights=&lights[..lights.len().min(32)];
+        if self.studio_lights!=lights {self.studio_lights=lights.to_vec();self.write_entity_lighting(queue);}
+    }
+
+    pub(in crate::renderer) fn set_studio_environment(&mut self,
+        environment:Option<crate::renderer::StudioSceneLighting>,queue:&wgpu::Queue) {
+        if self.studio_environment!=environment {
+            self.studio_environment=environment;self.write_entity_lighting(queue);
+        }
     }
 
     /// Wet weather on entities (model_weather.wgsl). Called every frame; only

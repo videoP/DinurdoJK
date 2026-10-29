@@ -282,6 +282,9 @@ impl App {
                         });
                     }
                 }
+                CatalogPayload::StudioBspMaps(maps)=>{
+                    self.render_studio.bsp_maps=Some(maps);
+                }
                 CatalogPayload::ProfileBackgroundMaps(maps)=>{
                     self.profile_background_maps=Some(maps);
                 }

@@ -91,6 +91,27 @@ fn destination_blended_polygon_offset_decal_uses_authored_decal_sort() {
 }
 
 #[test]
+fn foliage_stages_share_motion_and_keep_conservative_visibility_bounds() {
+    let [_, stage] = legacy_lightmap_modulate_pair(false);
+    let material = SurfaceMaterial {
+        stages: vec![stage.clone()], foliage_wind: true, ..Default::default()
+    };
+    let batch = stage_batch(&material, &stage, true, false, 0..1,
+        None, None, None, &[], [0; 4], [0.0; 4], false);
+    let sibling = stage_batch(&material, &stage, false, false, 0..1,
+        None, None, None, &[], [0; 4], [0.0; 4], false);
+    assert!(batch.foliage_wind && sibling.foliage_wind);
+    let mut vertex: GpuVertex = bytemuck::Zeroable::zeroed();
+    vertex.position = [10.0, 20.0, 30.0];
+    let (minimum, maximum) = super::visibility::auto4_source_bounds(&batch, &[vertex]);
+    assert_eq!(minimum, [2.0, 12.0, 22.0]);
+    assert_eq!(maximum, [18.0, 28.0, 38.0]);
+    let mut still = batch.clone();
+    still.foliage_wind = false;
+    assert!(!super::visibility::draw_batches_share_state(&batch, &still));
+}
+
+#[test]
 fn piece_ordering_matches_the_reference() {
     let mut state = 0x1234_5678_u32;
     let mut next = move || {
@@ -1277,9 +1298,23 @@ fn prepared_restart_images_are_shared_and_lighting_edits_preserve_the_cache() {
     let root = std::env::temp_dir().join(format!("jka-map-scene-test-{}", std::process::id()));
     let mut prepared = prepare_map_document(&root, None, Path::new("fixture.map"), document).unwrap();
     let mut lightmap = materials::missing_texture_data();
-    lightmap.rgba16f = Some(vec![0; lightmap.rgba.len()]);
+    lightmap.rgba16f = Some(vec![0; lightmap.rgba.len()].into());
     prepared.lightmaps = Arc::new(vec![lightmap.clone()]);
     prepared.deluxemaps = Arc::new(vec![lightmap]);
+    // Separate demo preparations decode into distinct allocations, then intern
+    // identical collections. Changed FP16 pixels must never be aliased away.
+    let mut independent = prepared.clone();
+    independent.textures = Arc::new(prepared.textures.as_ref().clone());
+    independent.lightmaps = Arc::new(prepared.lightmaps.as_ref().clone());
+    independent.deluxemaps = Arc::new(prepared.deluxemaps.as_ref().clone());
+    independent.share_immutable_images_from(&prepared);
+    assert!(Arc::ptr_eq(&prepared.textures, &independent.textures));
+    assert!(Arc::ptr_eq(&prepared.lightmaps, &independent.lightmaps));
+    assert!(Arc::ptr_eq(&prepared.deluxemaps, &independent.deluxemaps));
+    Arc::make_mut(&mut independent.lightmaps)[0].rgba16f.as_mut().unwrap()[0] = 42;
+    independent.share_immutable_images_from(&prepared);
+    assert!(!Arc::ptr_eq(&prepared.lightmaps, &independent.lightmaps));
+    assert_eq!(independent.lightmaps[0].rgba16f.as_ref().unwrap()[0], 42);
     let mut upload = prepared.clone();
     assert!(Arc::ptr_eq(&prepared.textures, &upload.textures));
     assert!(Arc::ptr_eq(&prepared.lightmaps, &upload.lightmaps));

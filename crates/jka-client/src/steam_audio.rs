@@ -119,7 +119,7 @@ pub fn cache_info(
     SteamAudioBakeCacheInfo {
         directory: game
             .unwrap_or(root)
-            .join("jka-rust-cache")
+            .join("cache")
             .join("steam-audio")
             .join(format!(
                 "{safe_name}-{map_hash:016x}-v{CACHE_SCHEMA_VERSION}-p{BAKE_PROFILE_VERSION}"

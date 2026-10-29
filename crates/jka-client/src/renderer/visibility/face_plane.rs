@@ -20,7 +20,7 @@ pub(in crate::renderer) fn packed_face_plane(
     surfaces: &[scene::LegacyDlightSurface],
     vertices: &[GpuVertex],
 ) -> [f32; 4] {
-    if source.pipeline.cull == CullMode::None || source.pipeline.offset || source.water_deformed
+    if source.pipeline.cull == CullMode::None || source.pipeline.offset || source.water_deformed || source.foliage_wind
         || source.pipeline.class == crate::renderer::DrawClass::Sky
         || source.water_primary || runs.is_empty()
     {
@@ -87,7 +87,7 @@ pub(in crate::renderer) fn authored_face_runs(
 ) -> Vec<FacePlaneRun> {
     // Runs also carry per-surface bounds for the water cull, so cull-none and
     // transparent surfaces get them too (with no plane, they are never face-culled).
-    if runs.is_empty() || source.pipeline.offset || source.water_deformed || source.water_primary
+    if runs.is_empty() || source.pipeline.offset || source.water_deformed || source.water_primary || source.foliage_wind
         || source.pipeline.class == DrawClass::Sky
     { return Vec::new(); }
     let planar = source.pipeline.cull != CullMode::None && source.pipeline.class != DrawClass::Transparent;

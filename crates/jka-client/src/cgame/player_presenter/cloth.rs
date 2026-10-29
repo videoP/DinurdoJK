@@ -146,7 +146,7 @@ impl PlayerPresenter {
                     .into_iter()
                     .zip(output.positions)
                     .zip(output.normals)
-                    .map(|((vertex, position), normal)| DynamicModelVertex {
+                    .map(|((vertex, position), normal)| DynamicModelVertex { foliage_wind: 0.0,
                         position: transform_model_point(position, axis, origin),
                         normal: transform_model_normal(normal, axis),
                         uv: vertex.uv,
@@ -161,7 +161,7 @@ impl PlayerPresenter {
         skinned
             .vertices
             .into_iter()
-            .map(|vertex| DynamicModelVertex {
+            .map(|vertex| DynamicModelVertex { foliage_wind: 0.0,
                 position: transform_model_point(vertex.position, axis, origin),
                 normal: transform_model_normal(vertex.normal, axis),
                 uv: vertex.uv,

@@ -170,7 +170,7 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     /// Set only by the Source/UE import path, NOT by native body shaping.
     /// Affects the secondary saber's attachment frame, never the player pose.
     pub(in crate::cgame::player_presenter) source_imported: bool,
-    /// Extra procedural bones appended after GLA matrices for Source players.
+    /// Authored Source or synthesized hair* spring bones appended after GLA matrices.
     pub(in crate::cgame::player_presenter) source_jiggles: Option<Arc<Vec<jka_assets::source1_rig::SourceJiggleBinding>>>,
     pub(in crate::cgame::player_presenter) source_jiggles_enabled: bool,
     pub(in crate::cgame::player_presenter) emote_contacts: std::sync::OnceLock<Vec<GroundMarker>>,
@@ -205,6 +205,13 @@ pub(in crate::cgame::player_presenter) struct IdleEffect {
 }
 
 impl PlayerModelAsset {
+    /// Source/UE model jigglebones are authored, while native GLM jiggle
+    /// bindings are the hair* springs synthesized during model registration.
+    /// No per-frame surface-name scan or mesh rebuild is necessary.
+    pub(in crate::cgame::player_presenter) fn procedural_jiggles_enabled(&self, mode: u8) -> bool {
+        self.source_jiggles_enabled
+            && if self.source_imported { mode >= 1 } else { mode >= 2 }
+    }
     /// Never fails the frame: a correction that cannot be computed or is out
     /// of range leaves the pose as authored and is reported once per emote.
     pub(in crate::cgame::player_presenter) fn correct_emote_ground(&self,active:&crate::emotes::Preview,pose:&mut [crate::cgame::player_presenter::Matrix3x4])->Result<(),String>{
@@ -283,18 +290,18 @@ impl PlayerModelAsset {
         } else {
             pose
         };
-        // An ordinary Source/GLM animation never has its own jiggle palette.
+        // A regular animation never has its own procedural jiggle palette.
         // Copy each extra bone's mapped-parent skin matrix as the neutral
         // fallback for previews, offscreen models, and physics-disabled mode.
         // The per-entity animator later replaces these entries in place.
         if let Some(bindings) = &self.source_jiggles {
             let gla_bones = self.gla.skeleton.len();
             if pose.len() != gla_bones {
-                return Err(format!("Source pose has {} bones, expected {gla_bones}", pose.len()));
+                return Err(format!("Player pose has {} bones, expected {gla_bones}", pose.len()));
             }
             for binding in bindings.iter() {
                 let matrix = *pose.get(binding.parent_gla)
-                    .ok_or("Source jiggle parent outside GLA")?;
+                    .ok_or("Hair/Source jiggle parent outside GLA")?;
                 pose.push(matrix);
             }
         }

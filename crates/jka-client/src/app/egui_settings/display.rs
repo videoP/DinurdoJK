@@ -19,6 +19,7 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::Display => "Display & graphics",
         VideoSection::Geometry => "Geometry",
         VideoSection::Lighting => "Lighting",
+        VideoSection::Relighting => "Relighting",
         VideoSection::Materials => "Material rendering",
         VideoSection::Effects => "Effects",
 
@@ -59,6 +60,7 @@ impl App {
                 "World visibility, curved surfaces and model rendering.",
             ),
             VideoSection::Lighting => ("LIGHTING", "Ambient, local lights, sun and entity shadows."),
+            VideoSection::Relighting => ("RELIGHTING", "Reshape authored map lighting at runtime. Settings are retained while disabled."),
             VideoSection::Materials => ("MATERIAL RENDERING", "Physically based material shading and texture sources."),
             VideoSection::Effects => (
                 "EFFECTS",
@@ -83,7 +85,7 @@ impl App {
             ),
             VideoSection::Sun => (
                 "SKY",
-                "Sky renderer, sun, baked lighting, moon and atmosphere.",
+                "Sky renderer, sun and moon position, and atmosphere. Map illumination is controlled in Relighting.",
             ),
             VideoSection::BlueWater => (
                 "OCEAN",
@@ -130,7 +132,13 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.video_section {
                 VideoSection::Display => {
-                    self.egui_display_settings(ui);
+                    // Studio profiles never rewrite the monitor, backend,
+                    // window or swapchain configuration.
+                    if self.render_studio.graphics_gameplay.is_some() {
+                        theme::hint(ui, "Render Studio profile: window, backend and frame pacing stay your gameplay settings.", theme::TEXT_FAINT);
+                    } else {
+                        self.egui_display_settings(ui);
+                    }
                     self.egui_image_quality(ui);
                 }
                 VideoSection::Geometry => {
@@ -139,6 +147,7 @@ impl App {
                     self.egui_models(ui);
                 }
                 VideoSection::Lighting => self.egui_lighting(ui),
+                VideoSection::Relighting => self.egui_relighting(ui),
                 VideoSection::Materials => self.egui_material_rendering(ui),
                 VideoSection::Effects => {
                     self.egui_effects(ui);

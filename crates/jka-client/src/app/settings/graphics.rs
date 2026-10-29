@@ -19,7 +19,7 @@ impl App {
         self.video.gamma = gamma.clamp(0.5, 3.0);
         self.video.sync_linked_brightness();
         self.render_command(RenderCommand::SetGamma(self.video.gamma));
-        if self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
+        if self.video.gamma_method.is_hardware() {
             self.gamma_slider_changed();
         }
         // Unlocked sliders are expressed relative to the master, so their
@@ -355,6 +355,14 @@ impl App {
             self.sun_custom_initialized = true;
         }
         self.video.sun_override = enabled;
+        if !enabled {
+            self.baked_sun_debug_view = 0;
+            self.sun_ray_until = None;
+        }
+        self.sync_sun_ray();
+        self.sync_added_map_lights();
+        self.sync_map_light_simulation();
+        self.sync_cascaded_shadows();
         self.sync_post_effects();
         self.mark_config_dirty();
         self.publish_ui();
@@ -631,11 +639,9 @@ impl App {
             .world_effects
             .wind_override()
             .unwrap_or(self.video.weather_wind);
-        // Sun source "Map shader" leaves the runtime sun authored by the map.
-        // Baked-light controls are independent and operate on BSP baked data.
-        let sun_defaults = crate::app::VideoSettings::default();
-        let custom_sun = self.video.sun_override;
+        let effective = self.video.effective_relighting();
         let effects = PostEffects {
+            thermal_vision: self.video.thermal_vision,
             hdr: self.video.hdr,
             hdr_paper_white: self.video.hdr_paper_white,
             hdr_peak: self.video.hdr_peak,
@@ -663,22 +669,22 @@ impl App {
             sun_pitch: self.video.sun_pitch,
             sun_intensity: self.video.sun_intensity,
             sun_shadow_strength: self.video.sun_shadow_strength,
-            sun_lighting: self.video.sun_lighting,
+            sun_lighting: effective.sun_lighting,
             sun_color: self.video.sun_color,
             sun_visibility: self.video.sun_visibility,
-            entity_sun_lighting: if custom_sun { self.video.entity_sun_lighting } else { sun_defaults.entity_sun_lighting },
-            baked_sun_removal: self.video.baked_sun_removal,
+            entity_sun_lighting: effective.entity_sun_lighting,
+            baked_sun_removal: effective.baked_sun_removal,
             baked_sun_cache: self.video.baked_sun_cache,
             baked_sun_shadow_map: self.video.baked_sun_shadow_map,
             baked_sun_edge_softness: self.video.baked_sun_edge_softness,
             baked_sun_direct_limit: self.video.baked_sun_direct_limit,
-            baked_indirect_scale: self.video.baked_indirect_scale,
-            baked_indirect_saturation: self.video.baked_indirect_saturation,
-            baked_indirect_power: self.video.baked_indirect_power,
-            baked_indirect_highlight_preserve: self.video.baked_indirect_highlight_preserve,
+            baked_indirect_scale: effective.baked_indirect_scale,
+            baked_indirect_saturation: effective.baked_indirect_saturation,
+            baked_indirect_power: effective.baked_indirect_power,
+            baked_indirect_highlight_preserve: effective.baked_indirect_highlight_preserve,
             sky_fractal_override: self.video.sky_fractal_override,
             sky_backend: self.video.sky_backend,
-        blue_water_environment: self.video.blue_water_environment,
+        blue_water_environment: effective.blue_water_environment,
             cloud_backend: self.video.cloud_backend,
             cloud_portal_depth: self.video.cloud_portal_depth,
             clouds: self.video.clouds,
@@ -787,7 +793,7 @@ impl App {
 
     pub(in crate::app) fn sync_map_light_simulation(&self) {
         self.render_command(RenderCommand::SetMapLightSimulation(
-            self.video.map_light_simulation,
+            self.video.effective_relighting().map_light_simulation,
         ));
     }
 
@@ -797,31 +803,14 @@ impl App {
         ));
     }
 
-    pub(in crate::app) fn sync_emissive_area_lights(&self) {
-        self.render_command(RenderCommand::SetEmissiveAreaLights(
-            self.video.emissive_area_lights,
+    pub(in crate::app) fn sync_added_map_lights(&self) {
+        self.render_command(RenderCommand::SetAddedMapLightSources(
+            self.video.added_map_light_sources(),
         ));
     }
 
-    pub(in crate::app) fn sync_baked_local_lights(&self) {
-        self.render_command(RenderCommand::SetBakedLocalLights { enabled: self.video.baked_local_lights, sources: self.video.baked_local_sources });
-    }
-
-    pub(in crate::app) fn sync_shader_light_promotion(&self) {
-        let mut mask = 0_u32;
-        if self.video.promote_shader_glow {
-            mask |= crate::materials::SHADER_LIGHT_GLOW;
-        }
-        if self.video.promote_shader_additive {
-            mask |= crate::materials::SHADER_LIGHT_ADDITIVE;
-        }
-        if self.video.promote_shader_emissive {
-            mask |= crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION;
-        }
-        self.render_command(RenderCommand::SetShaderLightPromotion {
-            enabled: self.video.promote_shader_lights,
-            mask,
-        });
+    pub(in crate::app) fn sync_lamp_shadow_sources(&self) {
+        self.render_command(RenderCommand::SetLampShadowSources(self.video.baked_local_sources));
     }
 
     pub(in crate::app) fn sync_voxel_probe_gi(&self) {
@@ -858,7 +847,7 @@ impl App {
 
     pub(in crate::app) fn sync_cascaded_shadows(&self) {
         self.render_command(RenderCommand::SetCascadedShadows(
-            self.video.dynamic_shadows,
+            self.video.effective_shadow_mode(),
         ));
     }
 
@@ -1066,34 +1055,24 @@ impl App {
                     match self.video.promote_fx_lights { 0 => "OFF", 1 => "CONSERVATIVE", _ => "AGGRESSIVE" }
                 );
             }
-            ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS => { self.video.baked_local_lights = !self.video.baked_local_lights; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources ^= 1; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources ^= 2; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources ^= 4; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources ^= 8; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources ^= 16; self.sync_baked_local_lights(); self.mark_config_dirty(); }
-            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
-                self.video.promote_shader_lights = !self.video.promote_shader_lights;
-                self.sync_shader_light_promotion();
-                self.mark_config_dirty();
-                self.console_status = format!(
-                    "SHADER LIGHT PROMOTION: {}",
-                    if self.video.promote_shader_lights { "ON" } else { "OFF" }
-                );
-            }
+            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources ^= 1; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources ^= 2; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources ^= 4; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources ^= 8; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources ^= 16; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
                 self.video.promote_shader_glow = !self.video.promote_shader_glow;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE => {
                 self.video.promote_shader_additive = !self.video.promote_shader_additive;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE => {
                 self.video.promote_shader_emissive = !self.video.promote_shader_emissive;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
@@ -1175,7 +1154,7 @@ impl App {
             }
             ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS => {
                 self.video.emissive_area_lights = !self.video.emissive_area_lights;
-                self.sync_emissive_area_lights();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_AMBIENT_OCCLUSION => {
@@ -1224,7 +1203,7 @@ impl App {
                     (current + direction).rem_euclid(DynamicShadowsMode::ALL.len() as i32) as usize;
                 self.video.dynamic_shadows = DynamicShadowsMode::ALL[next];
                 self.video.cascaded_shadows =
-                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                    self.video.dynamic_shadows.is_csm();
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
                 if self.video.dynamic_shadows == DynamicShadowsMode::Blob {

@@ -16,6 +16,7 @@ commands! {
         } else {
             self.push_console_line("MEMORY CPU: no prepared map cache".to_owned());
         }
+        for line in self.studio_memory_report_lines() { self.push_console_line(line); }
         if self.render.is_some() {
             self.render_command(RenderCommand::MemoryInfo);
         } else {
@@ -752,7 +753,8 @@ commands! {
                     .game_session
                     .as_ref()
                     .and_then(|playback| playback.sound_presenter.as_ref())
-                    .and_then(|sound| sound.info().map(|info| (info, sound.source_rate_summary())));
+                    .and_then(|sound| sound.info().map(|info| (info, sound.source_rate_summary())))
+                    .or_else(|| self.menu_ambience.info().map(|info| (info, "menu rain (SFX volume)".to_owned())));
                 if let Some((info, source_rates)) = sound_state {
                     self.push_console_line(format!(
                         "^3AUDIO OUTPUT:^7 {} ch | {} Hz | {} | buffer {}",

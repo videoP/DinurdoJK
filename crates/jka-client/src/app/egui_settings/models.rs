@@ -26,6 +26,18 @@ impl App {
             self.video.draw_map_models,
         );
 
+        theme::row(
+            ui,
+            "Static MD3 PVS bounds fallback (A/B)",
+            "OpenJK #1358: Only BSP/map misc_model_static props. 0 = legacy origin PVS; 1 = also test the cached rotated/scaled model bounds center to recover wall props. Changes immediately, both with and without the static MD3 BVH; no server entity/mover changes.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.static_md3_pvs_fallback) {
+                    let _ = self.set_console_cvar("r_staticMd3PvsFallback", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
         theme::row(ui, "Inline BSP models",
             "Render-only A/B switch for server-controlled BSP brush movers (fish, doors, platforms, rotating objects). Does not change collision, server gameplay or BSP static world geometry.",
             theme::Reset::None,

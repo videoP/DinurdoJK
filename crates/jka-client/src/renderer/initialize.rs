@@ -45,6 +45,7 @@ use crate::renderer::{
 use crate::ui::GlowMode;
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
+use super::textures::upload_cached_texture;
 
 impl Renderer {
     pub(in crate::renderer) async fn new(
@@ -58,7 +59,37 @@ impl Renderer {
         _detail_texture_path: &str,
         gpu_adapter_mode: u8,
     ) -> Result<Self, String> {
-        let size = window.inner_size();
+        Box::pin(Self::new_inner(window, instance, Arc::new(surface), base, game,
+            desired_maximum_frame_latency, hdr_output_mode, _detail_texture_path,
+            gpu_adapter_mode, None)).await
+    }
+
+    pub(in crate::renderer) fn new_scene(
+        primary: &Renderer, game: Option<&Path>, size: winit::dpi::PhysicalSize<u32>,
+    ) -> impl std::future::Future<Output = Result<Self, String>> + Send + 'static {
+        let mut config = primary.config.clone();
+        config.width = size.width.max(1);
+        config.height = size.height.max(1);
+        let window = primary.window.clone();
+        let surface = primary.surface.clone();
+        let base = primary.base.clone();
+        let game = game.map(Path::to_path_buf);
+        let shared = (primary.adapter.clone(), primary.device.clone(), primary.queue.clone(), config);
+        async move {
+            Box::pin(Self::new_inner(window, wgpu::Instance::default(), surface,
+                &base, game.as_deref(), 1, 0, "", 0, Some(shared))).await
+        }
+    }
+
+    async fn new_inner(
+        window: Arc<Window>, instance: wgpu::Instance, surface: Arc<wgpu::Surface<'static>>,
+        base: &Path, game: Option<&Path>, desired_maximum_frame_latency: u32,
+        hdr_output_mode: u32, _detail_texture_path: &str, gpu_adapter_mode: u8,
+        shared: Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue, wgpu::SurfaceConfiguration)>,
+    ) -> Result<Self, String> {
+        let offscreen = shared.is_some();
+        let size = shared.as_ref().map_or_else(|| window.inner_size(), |(_,_,_,c)|
+            winit::dpi::PhysicalSize::new(c.width, c.height));
         // Per-phase wall times for the "[RENDER INIT] phases" line, so startup
         // regressions show which section grew instead of one opaque total.
         let mut init_phase = Instant::now();
@@ -70,7 +101,8 @@ impl Renderer {
             }};
         }
         let adapter_started = Instant::now();
-        let adapter = crate::renderer::gpu_adapter::select(&instance, &surface, gpu_adapter_mode).await?;
+        let adapter = if let Some((adapter,_,_,_)) = &shared { adapter.clone() }
+            else { crate::renderer::gpu_adapter::select(&instance, &surface, gpu_adapter_mode).await? };
         rverbose!(
             1,
             "[RENDER INIT] adapter request {:.1} ms",
@@ -136,6 +168,10 @@ impl Renderer {
         let timestamp_inside_passes =
             timestamp_supported && adapter_features.contains(timestamp_pass_feature);
         let mut required_features = wgpu::Features::empty();
+        // Niagara river water/velocity grids are R32f and use hardware bilinear
+        // sampling. Request advertised support; river creation rejects devices
+        // without it instead of substituting lower-precision/manual filtering.
+        required_features |= adapter_features & wgpu::Features::FLOAT32_FILTERABLE;
         // Directional shadow casters must not be clipped by the cascade's depth
         // range (Bevy's UNCLIPPED_DEPTH_ORTHO): occluders between the sun and the
         // cascade would otherwise vanish from the map.
@@ -169,6 +205,13 @@ impl Renderer {
         // Query support is optional and only used while the FPS diagnostic graph
         // is enabled. Requesting the capability does not execute queries.
         required_features |= adapter_features & wgpu::Features::PIPELINE_STATISTICS_QUERY;
+        // Permit D3D11 KMT external-memory import for the optional Vulkan Spout2
+        // stream sender. This requests only an adapter-advertised capability;
+        // it does not create shared resources or affect non-streaming frames.
+        #[cfg(windows)]
+        if adapter.get_info().backend == wgpu::Backend::Vulkan {
+            required_features |= adapter_features & wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+        }
         rverbose!(
             1,
             "Wireframe polygon mode: {}",
@@ -235,7 +278,7 @@ impl Renderer {
             wgpu::MemoryHints::Performance
         };
         println!("GPU memory allocator policy: {memory_hints:?}");
-        let (device, queue) = adapter
+        let (device, queue) = if let Some((_,device,queue,_)) = &shared { (device.clone(), queue.clone()) } else { adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("DinurdoJK renderer"),
                 required_features,
@@ -251,13 +294,13 @@ impl Renderer {
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(|e| format!("GPU device creation failed: {e}"))?;
+            .map_err(|e| format!("GPU device creation failed: {e}"))? };
         rverbose!(
             1,
             "[RENDER INIT] device request {:.1} ms",
             device_started.elapsed().as_secs_f64() * 1000.0
         );
-        crate::pipeline_cache::install(&device, &info, base);
+        if !offscreen { crate::pipeline_cache::install(&device, &info, base); }
         init_mark!("adapter+device");
 
         // A lost device (TDR, driver reset, removed adapter) otherwise shows up
@@ -266,6 +309,7 @@ impl Renderer {
         // else is latched in `DEVICE_LOST` so the render loop stops on this
         // frame instead of submitting into a dead device until some third-party
         // assertion fires with an unrelated message.
+        if !offscreen {
         super::clear_device_lost();
         device.set_device_lost_callback(|reason, message| match reason {
             wgpu::DeviceLostReason::Destroyed => {
@@ -286,6 +330,7 @@ impl Renderer {
             }));
         }
 
+        }
         let caps = surface.get_capabilities(&adapter);
         let display_info = surface.display_hdr_info(&adapter);
         let output_selection = super::hdr_output::select(&caps, hdr_output_mode, Some(&display_info))
@@ -312,7 +357,7 @@ impl Renderer {
         let surface_linear_present = caps.formats.contains(&surface_format.remove_srgb_suffix());
         config.present_mode = no_vsync_mode(&caps.present_modes);
         config.desired_maximum_frame_latency = desired_maximum_frame_latency.clamp(1, 3);
-        let native_hdr_selected = super::hdr_output::requires_compositor(output_selection);
+        let native_hdr_selected = !offscreen && super::hdr_output::requires_compositor(output_selection);
         let screenshot_supported = native_hdr_selected || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
@@ -327,12 +372,15 @@ impl Renderer {
         // especially important during backend restarts: the app can immediately
         // roll back to the last known-good renderer instead of waiting on the
         // video confirmation timeout with a dead screen.
+        if let Some((_,_,_,scene_config)) = &shared { config = scene_config.clone(); }
+        if !offscreen {
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let present_config = super::context::presentation_config(&config, surface_linear_present);
         rverbose!(1, "Swapchain: {:?} view {:?} alpha {:?}", present_config.format, config.format, present_config.alpha_mode);
         surface.configure(&device, &present_config);
         if let Some(error) = error_scope.pop().await {
             return Err(format!("Surface configuration failed: {error}"));
+        }
         }
         let surface_configured_at = Instant::now();
         let hdr_output = if native_hdr_selected {
@@ -446,6 +494,7 @@ impl Renderer {
                 unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                 previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                 jump_shade: [0.0; 4],
+                foliage_wind: [0.0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -462,6 +511,7 @@ impl Renderer {
                         unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                         previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                         jump_shade: [0.0; 4],
+                        foliage_wind: [0.0; 4],
                     }),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 })
@@ -470,21 +520,7 @@ impl Renderer {
         let surface_deformation = SurfaceDeformationGpu::new(&device);
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                // The BSP fragment shader uses camera position for clustered
-                // lighting and sky direction, so this binding must be visible
-                // to all stages that share the camera bind group.
-                visibility: wgpu::ShaderStages::VERTEX
-                    | wgpu::ShaderStages::FRAGMENT
-                    | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &crate::foliage::camera_layout_entries(),
         });
         let surface_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("BSP surface layout"),
@@ -539,25 +575,14 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             ],
         });
-        // Exact descriptor layouts used by the known-fast renderer. Advanced
-        // bindings must not leak into the maximum-FPS path merely because they
-        // exist elsewhere in the renderer. These are selected once when render
-        // settings change through FramePlan::world_path.
+        // FastBaseline retains its lightweight draw loop and surface interface.
+        // Its camera shares the grass wind image with the other world/model
+        // paths, so enabling foliage never needs an extra pass or texture.
+        // FramePlan::world_path selects these layouts when settings change.
         let fast_camera_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA fast camera layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    // The fast fragment stage reads camera time for wave rgbGen/
-                    // alphaGen and sky-cloud tcMods, so FRAGMENT must be visible.
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
+                entries: &crate::foliage::camera_layout_entries(),
             });
         let fast_surface_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -601,37 +626,6 @@ impl Renderer {
                     ),
                 ],
             });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bind group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-        let entity_shadow = EntityShadowState::new(&device, &camera_layout);
-        let fast_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA fast camera bind group"),
-            layout: &fast_camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-        let planar_camera_bind_groups: Vec<wgpu::BindGroup> = planar_camera_buffers
-            .iter()
-            .enumerate()
-            .map(|(slot, buffer)| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("JKA planar reflection camera bind group {slot}")),
-                    layout: &camera_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                })
-            })
-            .collect();
         let sky_portal_camera_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("JKA sky portal camera uniform"),
@@ -644,17 +638,10 @@ impl Renderer {
                     unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                     previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                     jump_shade: [0.0; 4],
+                    foliage_wind: [0.0; 4],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-        let sky_portal_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA sky portal camera bind group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: sky_portal_camera_buffer.as_entire_binding(),
-            }],
-        });
         let planar_reflection_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA planar reflection layout"),
@@ -672,7 +659,7 @@ impl Renderer {
             1,
             false,
         );
-        init_mark!("camera/bind groups/planar reflection");
+        init_mark!("camera layouts/buffers/planar reflection");
         let planar_debug_shader = create_shader_module_timed(
             &device,
             wgpu::ShaderModuleDescriptor {
@@ -892,6 +879,38 @@ impl Renderer {
             msaa_samples,
             grass_renderer.wind_noise_texture(),
         );
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &camera_layout,
+            entries: &crate::foliage::camera_entries(&camera_buffer,
+                        &weather.rain.gpu.wind_noise_view, &weather.rain.gpu.wind_noise_sampler),
+        });
+        let entity_shadow = EntityShadowState::new(&device, &camera_layout,
+            &weather.rain.gpu.wind_noise_view, &weather.rain.gpu.wind_noise_sampler);
+        let fast_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA fast camera bind group"),
+            layout: &fast_camera_layout,
+            entries: &crate::foliage::camera_entries(&camera_buffer,
+                        &weather.rain.gpu.wind_noise_view, &weather.rain.gpu.wind_noise_sampler),
+        });
+        let planar_camera_bind_groups: Vec<wgpu::BindGroup> = planar_camera_buffers
+            .iter()
+            .enumerate()
+            .map(|(slot, buffer)| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("JKA planar reflection camera bind group {slot}")),
+                    layout: &camera_layout,
+                    entries: &crate::foliage::camera_entries(&buffer,
+                        &weather.rain.gpu.wind_noise_view, &weather.rain.gpu.wind_noise_sampler),
+                })
+            })
+            .collect();
+        let sky_portal_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("JKA sky portal camera bind group"),
+            layout: &camera_layout,
+            entries: &crate::foliage::camera_entries(&sky_portal_camera_buffer,
+                        &weather.rain.gpu.wind_noise_view, &weather.rain.gpu.wind_noise_sampler),
+        });
         init_mark!("sprites+weather");
         let shadow_resources = create_shadow_resources(
             &device,
@@ -988,7 +1007,7 @@ impl Renderer {
                     format!(
                         "{}\n{}\n{}",
                         include_str!("../bsp_fast.wgsl"),
-                        include_str!("../surface_deformation.wgsl"),
+                        crate::foliage::surface_shader(),
                         include_str!("../sky_fractal.wgsl")
                     )
                     .into(),
@@ -1018,6 +1037,19 @@ impl Renderer {
             &missing_texture_data,
         );
         let ocean_spray_albedo = upload_texture(&device, &queue, &ocean_spray_albedo_data);
+        let lake_normal_data = super::textures::try_load_texture_asset(
+            base, game, "textures/japro/water_normal", false, false, false, "Lake normal map",
+        );
+        let lake_normal = if let Some(data) = lake_normal_data {
+            blue_water_gpu::lakes::LakePipeline::normal_map(
+                &device, &queue, &data.rgba, data.width, data.height,
+            )
+        } else {
+            eprintln!("Lake normal map: missing textures/japro/water_normal; using flat normal");
+            blue_water_gpu::lakes::LakePipeline::normal_map(
+                &device, &queue, &[128, 128, 255, 255], 1, 1,
+            )
+        };
         init_mark!("ocean optics+spray");
         // Detail textures are permanently AUTO and intentionally lazy. Renderer
         // startup must not scan/decode the DT_* library before a BSP even exists.
@@ -1029,7 +1061,7 @@ impl Renderer {
             source: None,
             width: 1,
             height: 1,
-            rgba: vec![128, 128, 128, 255],
+            rgba: (vec![128, 128, 128, 255]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: false,
@@ -1169,12 +1201,12 @@ impl Renderer {
         });
         init_mark!("detail/wireframe/UI pipelines");
         let ui_font_data = load_ui_font_texture(base, game);
-        let ui_font = upload_texture(&device, &queue, &ui_font_data);
+        let ui_font = upload_cached_texture(&device, &queue, &ui_font_data);
         let (ui_small_font_data, ui_small_font_metrics) =
             load_ui_proportional_font(base, game, "ocr_a");
-        let ui_small_font = upload_texture(&device, &queue, &ui_small_font_data);
+        let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
-        let ui_splash = upload_texture(&device, &queue, &ui_splash_data);
+        let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
         // on; set_ui loads it the first time that happens.
         let ui_keys = upload_texture(
@@ -1202,7 +1234,7 @@ impl Renderer {
         // can bind this immediately, present it once, and only then resolve the
         // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
         let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game);
-        let ui_unknown_map = upload_texture(&device, &queue, &ui_unknown_map_data);
+        let ui_unknown_map = upload_cached_texture(&device, &queue, &ui_unknown_map_data);
         init_mark!("UI textures");
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA UI font sampler"),
@@ -1327,7 +1359,7 @@ impl Renderer {
                 source: None,
                 width: 1,
                 height: 1,
-                rgba: vec![255, 255, 255, 255],
+                rgba: (vec![255, 255, 255, 255]).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -1377,7 +1409,7 @@ impl Renderer {
                 source: None,
                 width: 1,
                 height: 1,
-                rgba: vec![128, 128, 255, 255],
+                rgba: (vec![128, 128, 255, 255]).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -2087,11 +2119,12 @@ impl Renderer {
                 immediate_size: 0,
             });
         let depth_prepass_pipeline =
-            create_depth_prepass_pipeline(&device, &depth_prepass_layout, &depth_prepass_shader);
+            create_depth_prepass_pipeline(&device, &depth_prepass_layout, &depth_prepass_shader, false);
         let depth_prepass_mask_pipeline = create_depth_prepass_mask_pipeline(
             &device,
             &depth_prepass_mask_layout,
             &depth_prepass_shader,
+            false,
         );
         let rain_depth_prepass_pipeline = create_rain_depth_prepass_pipeline(
             &device,
@@ -2345,7 +2378,7 @@ impl Renderer {
                 .collect::<Vec<_>>()
                 .join(" | ")
         );
-        Ok(Self {
+        let mut renderer = Self {
             model_frame_log: crate::model_frame_log::ModelFrameLog::new(
                 jka_assets::pk3::active_game_directory(base, game).join("hitch"),
             ),
@@ -2353,6 +2386,15 @@ impl Renderer {
             adapter,
             window,
             surface,
+            offscreen_output: None,
+            studio_scenes: HashMap::new(),
+            studio_last_scene: None,
+            studio_last_depth: false,
+            studio_entity_mask: None,
+            studio_revision: 0,
+            scene_time: None,
+            studio_settings_signature: String::new(),
+            scene_depth_capture: false,
             device,
             queue,
             pipeline_jobs,
@@ -2405,6 +2447,7 @@ impl Renderer {
             glass_world: None,
             ocean_inert_bind_group,
             ocean_spray_albedo,
+            lake_normal,
             detail_texture,
             detail_texture_auto,
             detail_texture_game: game.map(Path::to_path_buf),
@@ -2477,6 +2520,7 @@ impl Renderer {
             ui_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
+            studio_race_font: None,
             _ui_splash: ui_splash,
             _ui_keys: ui_keys,
             ui_keys_loaded: false,
@@ -2509,6 +2553,7 @@ impl Renderer {
             player_names: None,
             ui_trace: env_flag("JKA_UI_TRACE"),
             ui_state: UiSnapshot::default(),
+            stream_output: super::stream_output::StreamOutput::default(),
             egui_renderer,
             egui_paint_jobs: Vec::new(),
             egui_pixels_per_point: 1.0,
@@ -2517,10 +2562,27 @@ impl Renderer {
             egui_pending_free: Vec::new(),
             asset_preview_mode: false,
             asset_preview_viewport: None,
+            studio_world_viewport: None,
+            studio_transition_gpu: None,
+            studio_export_size: None,
+            studio_export_target: None,
+            studio_export_preview_at: None,
+            studio_export_shown: None,
+            studio_capture_queue: std::collections::VecDeque::new(),
+            studio_readback_slots: Vec::new(),
+            studio_readbacks: std::collections::VecDeque::new(),
+            studio_capture_results: std::collections::VecDeque::new(),
+            studio_unpacker: None,
+            studio_unpacking: Vec::new(),
+            studio_readback_generation: 0,
+            studio_lens: None,
+            studio_lens_gpu: None,
             asset_preview_background: None,
             menu_backdrop: None,
             neon_menu: Default::default(),
             world: None,
+            studio_active_world: None,
+            studio_cached_worlds: Vec::new(),
             world_videos: Vec::new(),
             dynamic_model_renderer,
             encoder_finish_threads: 0,
@@ -2548,6 +2610,9 @@ impl Renderer {
             gamma,
             baked_brightness: crate::renderer::brightness::BakedBrightness::default(),
             gamma_method: crate::gamma::GammaMethod::Shader,
+            hardware_gamma_active: false,
+            ui_gamma_native: None,
+            ui_gamma_egui: None,
             hdr_enabled: false,
             tone_mapping_enabled: false,
             tone_mapping_strength: 0.0,
@@ -2574,7 +2639,7 @@ impl Renderer {
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,
-            sun_shadow_strength: 0.3,
+            sun_shadow_strength: 0.6,
             sun_lighting: false,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
@@ -2673,6 +2738,7 @@ impl Renderer {
             cloud_noise_fallback,
             frame_plan: FramePlan::default(),
             force_unified_world: false,
+            foliage_wind_enabled: true,
             indirect_supported,
             gpu_compaction_supported,
             world_compact_min_draws: 1,
@@ -2727,15 +2793,13 @@ impl Renderer {
             transient_lights: Vec::new(),
             cloud_foreground: Vec::new(),
             dynamic_light_brightness: 1.0,
-            emissive_area_lights_enabled: false,
-            shader_light_promotion_enabled: false,
-            baked_local_lights: false,
+            added_map_light_sources_mask: 0,
             baked_local_sources: crate::renderer::lighting::lightmap_local::DEFAULT_SOURCES,
+            entity_fixture_lighting_ab: false,
             baked_local_shadows: false,
             baked_local_had_casters: false,
             lamp_shadow_ab: 0,
             csm_coverage_ab: false,
-            shader_light_promotion_mask: crate::materials::SHADER_LIGHT_ALL,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
             local_light_shadows_enabled: false,
@@ -2807,12 +2871,17 @@ impl Renderer {
             post_shader,
             post_pipeline_layout,
             post_pipeline: None,
+            thermal_post_pipeline: None,
+            thermal_depth_pipeline: None,
+            thermal_depth_mask_pipeline: None,
+            thermal_taa_pipeline: None,
             post_specialize: true,
             post_specialized: HashMap::new(),
             cloud_shadow_opaque_pipeline: None,
             cloud_shadow_opaque_bind_group,
             rain_post_pipeline: None,
             taa_post_pipeline,
+            thermal_vision: 0,
             rt_taa_resources: None,
             cloud_march_pipeline,
             cloud_resolve_pipeline,
@@ -2865,6 +2934,8 @@ impl Renderer {
             screenshot_worker_tx,
             screenshot_worker_rx,
             started: Instant::now(),
-        })
+        };
+        if offscreen { renderer.offscreen_output = Some(renderer.make_offscreen_output()); }
+        Ok(renderer)
     }
 }

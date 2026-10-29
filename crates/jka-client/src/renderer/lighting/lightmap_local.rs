@@ -2,7 +2,7 @@
 //! The sunlight worker owns geometry, cancellation and the shared compositor.
 use crate::renderer::{scene, Vec3};
 
-pub(crate) const AUTHORED: u32 = 1 << 3;
+pub(crate) const AUTHORED: u32 = crate::materials::ADDED_MAP_LIGHT_AUTHORED;
 pub(crate) const FX: u32 = 1 << 4;
 pub(crate) const ALL: u32 = crate::materials::SHADER_LIGHT_ALL | AUTHORED | FX;
 pub(crate) const DEFAULT_SOURCES: u32 =
@@ -10,7 +10,7 @@ pub(crate) const DEFAULT_SOURCES: u32 =
 // Reserve three array layers for the RGB sum used by moving sun shadows.
 pub(super) const MAX_SOURCES: usize = 253;
 
-pub(super) fn source_enabled(light: &scene::DynamicLight, mask: u32) -> bool {
+pub(in crate::renderer) fn source_enabled(light: &scene::DynamicLight, mask: u32) -> bool {
     let reason = if light.shader_promotion_mask == 0 {
         if light.emitter_normal.iter().any(|v| v.abs() > 1e-6) {
             AUTHORED
@@ -96,8 +96,7 @@ pub(super) fn inferred_lamp_shadows_allowed(
     mode: crate::renderer::DynamicShadowsMode,
 ) -> bool {
     sources & ALL != 0
-        && matches!(mode,
-            crate::renderer::DynamicShadowsMode::CascadedShadowMaps)
+        && mode.is_csm()
 }
 
 #[cfg(test)]
@@ -108,25 +107,27 @@ mod lamp_shadow_gate_tests {
     fn lamp_shadows_require_a_source_and_csm() {
         for mode in DynamicShadowsMode::ALL {
             assert!(!inferred_lamp_shadows_allowed(0, mode));
-            assert_eq!(inferred_lamp_shadows_allowed(AUTHORED, mode), matches!(
-                mode, DynamicShadowsMode::CascadedShadowMaps));
+            assert_eq!(inferred_lamp_shadows_allowed(AUTHORED, mode), mode.is_csm());
         }
         assert!(inferred_lamp_shadows_allowed(FX | AUTHORED, DynamicShadowsMode::CascadedShadowMaps));
     }
 }
 
 impl crate::renderer::Renderer {
-    pub(in crate::renderer) fn set_baked_local_lights(
-        &mut self,
-        enabled: bool,
-        sources: u32,
-    ) {
-        // Inferred lamp shadows are *derived* from source selection and the
-        // actual sun/entity shadow mode. There is no independent master gate.
+    /// The same source selection drives runtime map illumination and optional
+    /// lightmap-space reconstruction. Lamp-shadow permissions are independent.
+    pub(in crate::renderer) fn added_map_light_sources(&self) -> u32 {
+        self.added_map_light_sources_mask
+    }
+
+    pub(in crate::renderer) fn set_lamp_shadow_sources(&mut self, sources: u32) {
+        let sources = sources & ALL;
         let moving_shadows = inferred_lamp_shadows_allowed(sources, self.cascaded_shadow_mode);
         let caster_policy_changed = self.baked_local_shadows != moving_shadows;
-        self.baked_local_lights = enabled;
-        self.baked_local_sources = sources & ALL;
+        if self.baked_local_sources == sources && !caster_policy_changed {
+            return;
+        }
+        self.baked_local_sources = sources;
         self.baked_local_shadows = moving_shadows;
         if let Some(world) = self.world.as_mut() {
             world.local_shadows.selection_position = None;
@@ -147,37 +148,10 @@ impl crate::renderer::Renderer {
         self.history_valid = false;
     }
     pub(in crate::renderer) fn baked_local_lightmap_active(&self) -> bool {
-        self.baked_local_lights
+        self.added_map_light_sources() != 0
             && self.world.as_ref().is_some_and(|w| {
                 w.static_sun.local_ready() && w.baked_sun_cache.as_ref().is_some_and(|c| c.active)
             })
-    }
-}
-
-impl crate::renderer::Renderer {
-    pub(in crate::renderer) fn baked_fx_duplicate(
-        &self,
-        light: &crate::renderer::TransientLight,
-    ) -> bool {
-        if !self.baked_local_lightmap_active()
-            || !matches!(
-                light.kind,
-                crate::fx::system::FxLightKind::AuthoredEffect
-                    | crate::fx::system::FxLightKind::PromotedEffect
-            )
-            || light.spot.is_some()
-            || light.segment.is_some()
-        {
-            return false;
-        }
-        self.world.as_ref().is_some_and(|world| {
-            world.static_sun.local_lights.iter().any(|(_, baked)| {
-                baked.shader_promotion_mask & FX != 0
-                    && Vec3::from_array(baked.position)
-                        .distance_squared(Vec3::from_array(light.position))
-                        < 0.01
-            })
-        })
     }
 }
 

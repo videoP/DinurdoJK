@@ -96,8 +96,8 @@ fn rt_local_rate_gpu_counts_rays_and_rejects_invalid_history() {
         };
         let size = [8, 8];
         let eye = Vec3::new(0.0, 0.0, 4.0);
-        let vp = Mat4::perspective_rh(60_f32.to_radians(), 1.0, 0.1, 100.0)
-            * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        let vp = glam::camera::rh::proj::directx::perspective(60_f32.to_radians(), 1.0, 0.1, 100.0)
+            * glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
         let mut camera = CameraUniform::zeroed();
         camera.camera_pos_time = eye.extend(0.0).to_array();
         camera.render_flags[3] = 7;

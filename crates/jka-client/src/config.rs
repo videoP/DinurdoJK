@@ -86,6 +86,12 @@ pub struct ClientPresentationSettings {
     pub score_spectator_guess: bool,
     /// TaystJK cg_drawScores: 0 off, 1 classic, 2 coloured classic, 3 centred boxes.
     pub draw_scores: i32,
+    /// TaystJK cg_drawScore (singular): score beside the player HUD.
+    pub draw_score: i32,
+    pub draw_score_x: f32,
+    pub draw_score_y: f32,
+    /// TaystJK cg_drawEnemyInfo: top-right opponent / leader panel.
+    pub draw_enemy_info: bool,
     pub mouse: MouseInputSettings,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
     pub fov: f32,
@@ -120,6 +126,8 @@ pub struct ClientPresentationSettings {
     /// Public race archive root; `/index/...` is derived from this value.
     pub race_ghost_demo_base_url: String,
     pub console_timestamps: bool,
+    /// TaystJK con_scale: archived console character scale (0.2..10).
+    pub console_scale: f32,
     /// TaystJK con_notifylines: recent console rows considered by Con_DrawNotify.
     pub console_notify_lines: i32,
     /// TaystJK con_notifywords: up to eight space-separated chat alert terms; -1 alerts every chat.
@@ -356,6 +364,10 @@ impl Default for ClientPresentationSettings {
             score_deaths: 1,
             score_spectator_guess: true,
             draw_scores: 1,
+            draw_score: 2,
+            draw_score_x: 0.0,
+            draw_score_y: 0.0,
+            draw_enemy_info: true,
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
             zoom_fov: 30.0,
@@ -378,6 +390,7 @@ impl Default for ClientPresentationSettings {
             race_ghost_distance_delta: false,
             race_ghost_demo_base_url: "http://s.playja.pro/races".to_owned(),
             console_timestamps: true,
+            console_scale: 1.0,
             console_notify_lines: 3,
             console_notify_words: "0".to_owned(),
             console_notify_connect: false,
@@ -481,14 +494,23 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     settings.sync_linked_brightness();
     // r_dynamicLights is the source of truth for all runtime-light techniques.
     if context.dynamic_shadows_mode_seen {
-        settings.cascaded_shadows =
-            matches!(settings.dynamic_shadows, DynamicShadowsMode::CascadedShadowMaps);
+        settings.cascaded_shadows = settings.dynamic_shadows.is_csm();
     } else {
         settings.dynamic_shadows = if settings.cascaded_shadows {
+            // Older boolean-only configs implied the full-scene CSM mode.
             DynamicShadowsMode::CascadedShadowMaps
         } else {
             DynamicShadowsMode::Off
         };
+    }
+    if settings.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps {
+        settings.dynamic_shadows = DynamicShadowsMode::CascadedShadowMapsEntities;
+        // Legacy full-scene behavior is retained by the new Relighting switch.
+        // r_staticWorldCsm is archived after r_dynamicShadows in newly saved configs.
+        // A separate flag below overrides this migration when present.
+        if !context.static_world_csm_seen {
+            settings.static_world_csm = true;
+        }
     }
 
     settings.ocean_settings.wind = settings.weather_wind;
@@ -603,12 +625,27 @@ fn format_archived_config(
     let mut definitions: Vec<_> = crate::app::cvar_definitions().iter()
         .filter(|def| def.runtime.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE))
         .collect();
-    // Preserve the existing declaration order within each section, including
-    // dependent values such as r_novis/r_pvsMode and video dimensions.
-    definitions.sort_by_key(|def| def.config.archive.expect("archived cvar needs a config binding").0);
+    // A newly registered cvar may accidentally claim ARCHIVE without providing
+    // a snapshot getter. Do not panic on the background config writer: omit it
+    // and report the registry error once, rather than spamming full backtraces.
+    let unbound: Vec<_> = definitions.iter()
+        .filter(|def| def.config.archive.is_none())
+        .map(|def| def.runtime.entry.name)
+        .collect();
+    if !unbound.is_empty() {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| eprintln!(
+            "[CONFIG] Skipping archived cvar(s) without a config binding: {}. Fix the cvar registry.",
+            unbound.join(", ")
+        ));
+        definitions.retain(|def| def.config.archive.is_some());
+    }
+    // Preserve declaration order for dependent values like r_novis/r_pvsMode.
+    definitions.sort_by_key(|def| def.config.archive.map(|(order, _)| order).unwrap_or(usize::MAX));
     for def in definitions {
-        let (_, get) = def.config.archive.expect("archived cvar needs a config binding");
-        sections[config_section(def.runtime.entry.name)].push((def.runtime.entry.name, get(&state)));
+        if let Some((_, get)) = def.config.archive {
+            sections[config_section(def.runtime.entry.name)].push((def.runtime.entry.name, get(&state)));
+        }
     }
     let mut text = String::from("// DinurdoJK configuration - archived settings and bindings.\n");
     let _ = writeln!(text, "\n// ===== {} =====", CONFIG_SECTIONS[0]);
@@ -930,6 +967,17 @@ mod tests {
     }
 
     #[test]
+    fn cg_remaps_ignores_old_archived_config_on_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "jka-remaps-session-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        // Existing configs may still contain cg_remaps from when it was archived.
+        fs::write(&path, "seta cg_remaps \"0\"\n").expect("write legacy remaps config");
+        assert_eq!(load_client_presentation_settings(&path).japro.remaps, 1);
+        fs::remove_file(&path).expect("remove remaps test config");
+    }
+
+    #[test]
     fn config_comments_preserve_quoted_slashes_and_multiline_block_comments() {
         let input = concat!(
             "// heading\n",
@@ -1044,6 +1092,7 @@ mod tests {
             ("seta r_gammaMethod \"invalid\"\n", GammaMethod::Shader),
             ("seta r_bakedBrightness \"1\"\n", GammaMethod::Shader),
             ("seta r_gammaMethod \"2\"\n", GammaMethod::Hardware),
+            ("seta r_gammaMethod \"3\"\n", GammaMethod::HardwareSceneOnly),
             (
                 "seta r_bakedBrightness \"1\"\nseta r_gammaMethod \"hardware\"\n",
                 GammaMethod::Hardware,
@@ -1114,6 +1163,46 @@ mod tests {
         let loaded = load_video_settings(&path);
         assert_eq!(loaded.split_toning, VideoSettings::default().split_toning);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn static_csm_relighting_setting_and_legacy_csm_migrate() {
+        use crate::ui::DynamicShadowsMode;
+        let path = std::env::temp_dir().join(format!(
+            "jka-static-world-csm-{}-{:?}.cfg",
+            std::process::id(), std::thread::current().id()
+        ));
+        // The former full-scene CSM should retain its static caster setting.
+        std::fs::write(&path, "seta r_dynamicShadows \"csm\"\nseta r_relightMap \"1\"\n").unwrap();
+        let legacy = load_video_settings(&path);
+        assert_eq!(legacy.dynamic_shadows, DynamicShadowsMode::CascadedShadowMapsEntities);
+        assert!(legacy.static_world_csm);
+        assert_eq!(legacy.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+
+        // New independent switch overrides legacy full-scene configs.
+        std::fs::write(&path, "seta r_dynamicShadows \"csm\"\nseta r_staticWorldCsm \"0\"\nseta r_relightMap \"1\"\n").unwrap();
+        let override_off = load_video_settings(&path);
+        assert!(!override_off.static_world_csm);
+        assert_eq!(override_off.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMapsEntities);
+
+        // New entity-only CSM remains entity-only by default.
+        std::fs::write(&path, "seta r_dynamicShadows \"csm_entities\"\nseta r_relightMap \"1\"\n").unwrap();
+        assert!(!load_video_settings(&path).static_world_csm);
+
+        // Save and reload two independent controls.
+        let mut saved = VideoSettings::default();
+        saved.sun_override = true;
+        saved.dynamic_shadows = DynamicShadowsMode::CascadedShadowMapsEntities;
+        saved.static_world_csm = true;
+        save_video_settings(
+            &path, saved, &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(), &AudioSettings::default(),
+        ).unwrap();
+        let round_trip = load_video_settings(&path);
+        assert!(round_trip.static_world_csm);
+        assert_eq!(round_trip.dynamic_shadows, DynamicShadowsMode::CascadedShadowMapsEntities);
+        assert_eq!(round_trip.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

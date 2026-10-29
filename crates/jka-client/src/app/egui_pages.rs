@@ -732,22 +732,6 @@ impl App {
                 .show_ui(ui, |ui| { for (id,label) in choices { ui.selectable_value(&mut value,id,label); } });
             if value != self.japro_cg.lagometer.mode { let _ = self.set_console_cvar("cg_lagometer", &value.to_string()); }
         });
-        theme::row(
-            ui,
-            "Warning delay (commands)",
-            "cl_commandsize. The connection-interrupted warning looks this many usercmds back: smaller warns sooner. 64 is jaPRO's default.",
-            theme::Reset::None,
-            |ui| {
-                let mut value = self.japro_cg.lagometer.command_size;
-                if ui
-                    .add(egui::DragValue::new(&mut value).range(4..=512).speed(1.0).update_while_editing(false))
-                    .changed()
-                {
-                    let _ = self.set_console_cvar("cl_commandsize", &value.to_string());
-                }
-            },
-        );
-
     }
 
     // ------------------------------------------------------- game options --

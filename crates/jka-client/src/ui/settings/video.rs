@@ -9,6 +9,12 @@ use crate::ui::{
 };
 
 #[derive(Debug, Clone, Copy)]
+pub struct PlayerBlobShadowSettings {
+    pub opacity: f32,
+    pub contact: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct VideoSettings {
     pub patch_subdivisions: f32,
     pub patch_stitching: bool,
@@ -153,6 +159,9 @@ pub struct VideoSettings {
     pub static_md3_instances: bool,
     /// Live, session-only A/B: 0 original static MD3 scan; 1 conservative BVH broad phase.
     pub static_md3_bvh: bool,
+    /// Live, session-only toggle for BSP misc_model_static PVS fallback.
+    /// 0 = original R_inPVS static-prop behavior, 1 = cached bounds-center fallback.
+    pub static_md3_pvs_fallback: bool,
     /// Live, session-only A/B: 0 ordinary FX raster; 1 stationary map-runner rear-plane culling.
     /// GPU Hi-Z mode 2 is not available until the renderer dispatches queries.
     pub fx_occlusion: u8,
@@ -165,6 +174,8 @@ pub struct VideoSettings {
     pub surface_sprites_gpu: bool,
     /// r_surfaceSprites: draw the map's native JKA surfaceSprites at all.
     pub surface_sprites: bool,
+    /// Shared-wind sway for automatically promoted world foliage cards.
+    pub foliage_wind: bool,
     /// Use authored MD3 variants (always); optionally generate missing LODs in background.
     pub md3_auto_lod: bool,
     /// Developer A/B override for baked models. The shared r_md3AutoLod gate
@@ -204,6 +215,8 @@ pub struct VideoSettings {
     /// Profile-driven post-Ghoul2 soft-tissue secondary motion.
     /// 0 off, 1 female, 2 male, 3 both (reported player sex).
     pub jiggle_physics: u8,
+    /// 0 = off; 1 = authored Source jigglebones only; 2 = authored plus native GLM hair* springs.
+    pub hair_physics: u8,
     /// 0 = KawaiiPhysics-derived point solver, 1 = naelstrof/JigglePhysics Verlet solver.
     pub jiggle_solver: u8,
     pub jiggle_strength: f32,
@@ -326,7 +339,8 @@ pub struct VideoSettings {
     pub contact_shadows: bool,
     pub fog_mode: FogMode,
     pub fog_strength: f32,
-    /// When false, use the strongest q3map-authored sky sun from the current map.
+    /// Master Relight map gate (r_relightMap; legacy alias r_sunOverride).
+    /// False preserves authored illumination and retains saved relighting edits.
     pub sun_override: bool,
     /// q3map azimuth in degrees: 0=east, 90=north.
     pub sun_yaw: f32,
@@ -335,6 +349,9 @@ pub struct VideoSettings {
     pub sun_intensity: f32,
     pub sun_shadow_strength: f32,
     pub sun_lighting: bool,
+    /// Include static BSP geometry in sun CSM when Relighting and entity CSM are enabled.
+    /// Off keeps entity-only cascades and baked static shadows (cheaper default).
+    pub static_world_csm: bool,
     /// Unnormalized RGB chosen by the user; renderer normalizes it like q3map.
     pub sun_color: [f32; 3],
     /// Controls whether direct shader-sun light requires an authored sky portal.
@@ -444,6 +461,8 @@ pub struct VideoSettings {
     pub chromatic_aberration: f32,
     pub vignette: bool,
     pub film_grain_strength: f32,
+    /// 0 off, 1 Geeks3D Predator, 2 white-hot, 3 black-hot, 4 ironbow, 5 heat diagnostics.
+    pub thermal_vision: u8,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
     pub dof_mode: DofMode,
@@ -473,14 +492,12 @@ pub struct VideoSettings {
     pub dynamic_light_debug: bool,
     /// Infer transient lights from emissive legacy EFX that omit Light{} stages.
     pub promote_fx_lights: u8,
-    /// Master for BSP shader-driven area-light promotion. q3map_surfacelight is
-    /// intentionally separate and remains controlled by emissive_area_lights.
-    pub promote_shader_lights: bool,
-    pub baked_local_lights: bool,
     pub baked_local_sources: u32,
     /// Session-only experiment: 0 baseline, 1 octant receiver, 2 caster prefilter,
     /// 3 combined, 4 conservative receiver early-rejection (all work at frame rate).
     pub lamp_shadow_ab: u8,
+    /// Session-only model fixture accent; disabled in the control configuration.
+    pub entity_fixture_lighting_ab: bool,
     pub csm_coverage_ab: bool,
     pub promote_shader_glow: bool,
     pub promote_shader_additive: bool,
@@ -534,7 +551,7 @@ pub struct VideoSettings {
     pub voxel_probe_gi: bool,
     pub dynamic_shadows: DynamicShadowsMode,
     /// Ground-contact approximation, independent of directional/lamp shadows.
-    pub player_contact_shadows: bool,
+    pub player_contact_shadows: f32,
     pub entity_shadow_light: EntityShadowLight,
     pub local_light_shadows: bool,
     /// Experimental RGB glass throughput for hardware RT local lights. Default OFF.
@@ -722,11 +739,13 @@ impl Default for VideoSettings {
             md3_geometry_cache: true,
             static_md3_instances: false,
             static_md3_bvh: false,
+            static_md3_pvs_fallback: true,
             fx_occlusion: 0,
             md3_occlusion: 0,
             occlusion_stats: false,
             surface_sprites_gpu: true,
             surface_sprites: true,
+            foliage_wind: true,
             md3_auto_lod: true,
             bsp_model_lod: true,
             md3_lod_debug: false,
@@ -749,6 +768,7 @@ impl Default for VideoSettings {
             ragdoll_lifetime: 20.0,
             ragdoll_self_collision: false,
             jiggle_physics: 0,
+            hair_physics: 2,
             jiggle_solver: 0,
             jiggle_strength: 1.0,
             jiggle_breast_strength: 1.0,
@@ -847,8 +867,9 @@ impl Default for VideoSettings {
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,
-            sun_shadow_strength: 0.3,
+            sun_shadow_strength: 0.6,
             sun_lighting: false,
+            static_world_csm: false,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
@@ -932,6 +953,7 @@ impl Default for VideoSettings {
             chromatic_aberration: 0.0,
             vignette: false,
             film_grain_strength: 0.0,
+            thermal_vision: 0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
             dof_mode: DofMode::Off,
@@ -957,19 +979,18 @@ impl Default for VideoSettings {
             dynamic_lights: DynamicLightsMode::Off,
             dynamic_light_debug: false,
             promote_fx_lights: 0,
-            promote_shader_lights: false,
-            baked_local_lights: false,
             // No inferred lamp shadows until a source is explicitly selected.
             baked_local_sources: 0,
             lamp_shadow_ab: 0,
+            entity_fixture_lighting_ab: false,
             csm_coverage_ab: false,
-            promote_shader_glow: true,
-            promote_shader_additive: true,
-            promote_shader_emissive: true,
+            promote_shader_glow: false,
+            promote_shader_additive: false,
+            promote_shader_emissive: false,
             rt_samples: 2,
             dynamic_light_falloff: 0,
             rt_trace_rate: 2,
-            map_light_simulation: false,
+            map_light_simulation: true,
             world_lighting: true,
             vertex_lighting: false,
             lightmap_only: false,
@@ -989,7 +1010,7 @@ impl Default for VideoSettings {
             emissive_area_lights: false,
             voxel_probe_gi: false,
             dynamic_shadows: DynamicShadowsMode::Off,
-            player_contact_shadows: true,
+            player_contact_shadows: 3.0,
             entity_shadow_light: EntityShadowLight::Lightgrid,
             local_light_shadows: false,
             tinted_glass: false,
@@ -1044,11 +1065,124 @@ mod hdr_mode_tests {
 }
 
 impl VideoSettings {
-    /// Reuse the classic mark projector for a smaller, weaker ambient-contact
-    /// approximation. No sun or inferred lamp is needed for this contribution.
-    pub fn player_blob_shadow_opacity(&self) -> f32 {
-        if self.dynamic_shadows == DynamicShadowsMode::Blob { 1.0 }
-        else if self.player_contact_shadows { 0.5 }
-        else { 0.0 }
+    /// Reuse the classic mark projector for a smaller ambient-contact shadow.
+    /// Keep the contact footprint separate from opacity so multipliers above
+    /// one retain the short airborne fade instead of selecting classic Blob mode.
+    /// No sun or inferred lamp is needed for this contribution.
+    pub fn player_blob_shadow_settings(&self) -> PlayerBlobShadowSettings {
+        if self.dynamic_shadows == DynamicShadowsMode::Blob {
+            PlayerBlobShadowSettings { opacity: 1.0, contact: false }
+        } else {
+            PlayerBlobShadowSettings {
+                opacity: self.player_contact_shadows * self.sun_shadow_strength,
+                contact: true,
+            }
+        }
+    }
+}
+
+impl VideoSettings {
+    /// The full-world cascade renderer is selected only by the additional
+    /// Relighting option; main shadow method remains entity-only CSM.
+    pub fn effective_shadow_mode(&self) -> DynamicShadowsMode {
+        if self.dynamic_shadows == DynamicShadowsMode::CascadedShadowMapsEntities
+            && self.sun_override && self.static_world_csm
+        {
+            DynamicShadowsMode::CascadedShadowMaps
+        } else {
+            self.dynamic_shadows
+        }
+    }
+
+    /// Which exact map surface types may add light. The shadow-source mask is
+    /// intentionally NOT consulted here: it only selects moving lamp shadows.
+    pub fn added_map_light_sources(&self) -> u32 {
+        if !self.sun_override { return 0; }
+        let mut mask = 0_u32;
+        if self.promote_shader_glow { mask |= crate::materials::SHADER_LIGHT_GLOW; }
+        if self.promote_shader_additive { mask |= crate::materials::SHADER_LIGHT_ADDITIVE; }
+        if self.promote_shader_emissive { mask |= crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION; }
+        if self.emissive_area_lights { mask |= crate::materials::ADDED_MAP_LIGHT_AUTHORED; }
+        mask
+    }
+
+    /// Rendering-facing copy: disabling relighting preserves saved edits and
+    /// leaves shadow quality, inferred lamp shadow sources and ordinary FX alone.
+    pub fn effective_relighting(&self) -> Self {
+        let mut effective = *self;
+        if !self.sun_override {
+            effective.sun_lighting = false;
+            effective.entity_sun_lighting = false;
+            effective.baked_sun_removal = 0.0;
+            effective.baked_indirect_scale = 1.0;
+            effective.baked_indirect_saturation = 1.0;
+            effective.baked_indirect_power = 1.0;
+            effective.baked_indirect_highlight_preserve = 0.0;
+            effective.blue_water_environment.world_lighting = 0.0;
+            effective.emissive_area_lights = false;
+        }
+        effective
+    }
+}
+
+#[cfg(test)]
+mod relighting_tests {
+    use super::*;
+
+    #[test]
+    fn sources_are_independent_of_lamp_shadow_selection() {
+        let mut video = VideoSettings::default();
+        video.sun_override = true;
+        video.baked_local_sources = 31; // Lamp-shadow sources cannot add illumination.
+        assert_eq!(video.added_map_light_sources(), 0);
+        video.promote_shader_glow = true;
+        assert_eq!(video.added_map_light_sources(), crate::materials::SHADER_LIGHT_GLOW);
+        video.promote_shader_glow = false;
+        video.emissive_area_lights = true;
+        assert_eq!(video.added_map_light_sources(), crate::materials::ADDED_MAP_LIGHT_AUTHORED);
+        video.sun_override = false;
+        assert_eq!(video.added_map_light_sources(), 0);
+        assert!(video.effective_relighting().map_light_simulation);
+    }
+
+    #[test]
+    fn relighting_gate_preserves_edits_and_original_shadow_sources() {
+        let mut saved = VideoSettings::default();
+        saved.sun_lighting = true;
+        saved.entity_sun_lighting = true;
+        saved.baked_sun_removal = 0.8;
+        saved.baked_indirect_scale = 0.4;
+        saved.baked_indirect_saturation = 0.3;
+        saved.baked_indirect_power = 2.5;
+        saved.baked_indirect_highlight_preserve = 0.7;
+        saved.blue_water_environment.world_lighting = 0.9;
+        saved.promote_shader_glow = true;
+        saved.emissive_area_lights = true;
+        saved.map_light_simulation = true;
+        saved.baked_local_sources = 31;
+        saved.dynamic_shadows = DynamicShadowsMode::CascadedShadowMapsEntities;
+        saved.static_world_csm = true;
+        assert_eq!(saved.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMapsEntities);
+        let off = saved.effective_relighting();
+        assert!(!off.sun_lighting && !off.entity_sun_lighting);
+        assert_eq!(off.baked_sun_removal, 0.0);
+        assert_eq!((off.baked_indirect_scale, off.baked_indirect_saturation, off.baked_indirect_power), (1.0, 1.0, 1.0));
+        assert_eq!(off.baked_indirect_highlight_preserve, 0.0);
+        assert_eq!(off.blue_water_environment.world_lighting, 0.0);
+        assert!(!off.emissive_area_lights);
+        assert_eq!(off.added_map_light_sources(), 0);
+        assert!(off.map_light_simulation, "source .map previews must not depend on relighting");
+        assert_eq!(off.baked_local_sources, 31);
+        assert_eq!(off.dynamic_shadows, saved.dynamic_shadows);
+        assert_eq!(off.promote_fx_lights, saved.promote_fx_lights);
+        saved.sun_override = true;
+        assert_eq!(saved.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        let on = saved.effective_relighting();
+        assert!(on.sun_lighting && on.entity_sun_lighting && on.emissive_area_lights && on.map_light_simulation);
+        assert_eq!(on.added_map_light_sources(), crate::materials::SHADER_LIGHT_GLOW | crate::materials::ADDED_MAP_LIGHT_AUTHORED);
+        assert_eq!(on.baked_sun_removal, 0.8);
+        assert_eq!((on.baked_indirect_scale, on.baked_indirect_saturation, on.baked_indirect_power), (0.4, 0.3, 2.5));
+        assert_eq!(on.baked_indirect_highlight_preserve, 0.7);
+        assert_eq!(on.blue_water_environment.world_lighting, 0.9);
     }
 }

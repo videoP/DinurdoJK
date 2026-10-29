@@ -816,6 +816,9 @@ void *jka_player_new(const float *origin, float yaw, int spectator) {
     ps->gravity = DEFAULT_GRAVITY;
     ps->speed = ps->basespeed = spectator ? 400 : 250;
     ps->groundEntityNum = ENTITYNUM_NONE;
+    /* OpenJK g_client.c ClientSpawn: no seeker drone exists at spawn.
+     * Zero means client/entity 0 is being targeted, not the disabled state. */
+    ps->genericEnemyIndex = -1;
     ps->stats[STAT_HEALTH] = ps->stats[STAT_MAX_HEALTH] = 100;
     ps->stats[STAT_WEAPONS] = spectator ? 0 : (1 << WP_SABER);
     /* Stock local FFA starts with a saber; ownership metadata is attached by

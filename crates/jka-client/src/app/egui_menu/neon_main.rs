@@ -10,18 +10,27 @@ const ACTIVATE_DELAY: Duration = Duration::from_millis(170);
 
 #[derive(Default)]
 pub(in crate::app) struct NeonMenuState {
-    selected: u8,
-    active: Option<u8>,
-    pressed: u8,
-    press_serial: u32,
+    pub(super) selected: u8,
+    pub(super) active: Option<u8>,
+    pub(super) pressed: u8,
+    pub(super) press_serial: u32,
+    pub(super) submenu_page: Option<crate::neon_menu::MenuPage>,
+    pub(super) submenu_pending: Option<(crate::neon_menu::MenuPage, usize, Instant)>,
     pending: Option<(Item, Instant)>,
     pub(in crate::app) renderer_ready: bool,
-    sent: Option<MenuFrame>,
+    pub(in crate::app) shown_at: Option<Instant>,
+    pub(super) sent: Option<MenuFrame>,
 }
 
 impl App {
     pub(in crate::app::egui_menu) fn draw_neon_main_menu(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
+        if self.neon_menu.submenu_page.take().is_some() {
+            self.neon_menu.selected = 0;
+            self.neon_menu.active = None;
+            self.neon_menu.submenu_pending = None;
+            self.neon_menu.shown_at = None;
+        }
         let screen = ui.max_rect();
         let Some(page) = layout::compute(screen.width(), screen.height()) else { return };
         let to_rect = |r: [f32; 4]| {
@@ -73,7 +82,7 @@ impl App {
         }
         self.neon_menu.selected = selected as u8;
         self.neon_menu.active = active.map(|index| index as u8);
-        if let Some(index) = activate.filter(|_| self.neon_menu.pending.is_none()) {
+        if let Some(index) = activate.filter(|_| !self.frontend_quit_confirmation && self.neon_menu.pending.is_none()) {
             self.neon_menu.pressed = index as u8;
             self.neon_menu.press_serial = self.neon_menu.press_serial.wrapping_add(1);
             self.neon_menu.pending = Some((ITEMS[index].item, now));
@@ -81,7 +90,9 @@ impl App {
 
         // The page is interactive and its power-on animation starts immediately.
         // Only the background crossfade follows the live scene's readiness.
+        self.neon_menu.shown_at.get_or_insert(now);
         let frame = MenuFrame {
+            page: crate::neon_menu::MenuPage::Main,
             layout: page,
             selected: self.neon_menu.selected,
             active: self.neon_menu.active,
@@ -112,7 +123,10 @@ impl App {
     /// Leaving Main (or opening Settings over it): stop the renderer page so
     /// the next visit powers the signs on again.
     pub(in crate::app::egui_menu) fn release_neon_main_menu(&mut self) {
+        self.neon_menu.shown_at = None;
         self.neon_menu.pending = None;
+        self.neon_menu.submenu_page = None;
+        self.neon_menu.submenu_pending = None;
         if self.neon_menu.sent.take().is_some() {
             self.render_command(RenderCommand::SetNeonMenu(None));
         }
@@ -151,7 +165,6 @@ impl App {
                 self.frontend_page = FrontendPage::DeveloperTools;
                 self.egui_repaint_requested = true;
             }
-            Item::Quit => self.request_quit(),
         }
     }
 }

@@ -2,7 +2,7 @@
 //! drawing, so the two can never disagree. Results are normalised to the view:
 //! x by width, y and cap heights by height, so the renderer can map them onto
 //! physical pixels without knowing the UI scale.
-use super::{font, Group, ITEMS, ITEM_COUNT, TITLE};
+use super::{font, Group, ITEMS, ITEM_COUNT};
 use taffy::prelude::{
     auto, length, AvailableSpace, FlexDirection, NodeId, Position, Rect, Size, Style, TaffyTree,
 };
@@ -17,7 +17,6 @@ pub(crate) struct TextLine {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct MenuLayout {
-    pub title: TextLine,
     pub items: [TextLine; ITEM_COUNT],
     /// Pointer targets, [x0, y0, x1, y1].
     pub hit: [[f32; 4]; ITEM_COUNT],
@@ -34,7 +33,7 @@ fn metrics(group: Group, s: f32) -> Metrics {
     let (cap, row) = match group {
         Group::Hero => (80.0, 1.55),
         Group::Primary => (34.0, 1.95),
-        Group::Utility | Group::Exit => (21.0, 2.15),
+        Group::Utility => (21.0, 2.15),
     };
     Metrics { cap: cap * s, row: cap * s * row }
 }
@@ -64,16 +63,12 @@ pub(crate) fn compute(w: f32, h: f32) -> Option<MenuLayout> {
     let h = h.max(1.0);
     // 1080p reference. Narrow windows shrink by width instead of overflowing.
     let s = (h / 1080.0).min(w / 1500.0).max(0.35);
-    let title_cap = 20.0 * s;
-    let title_row = title_cap + 64.0 * s;
     let gap = 30.0 * s;
     let pad = 0.6;
 
     let mut tree = TaffyTree::new();
     let mut children = Vec::new();
     let mut rows = [None; ITEM_COUNT];
-    let title = leaf(&mut tree, font::measure(TITLE) * title_cap, title_row)?;
-    children.push(title);
     let mut previous = None;
     for (index, info) in ITEMS.iter().enumerate() {
         if previous.is_some_and(|group| group != info.group) {
@@ -132,11 +127,7 @@ pub(crate) fn compute(w: f32, h: f32) -> Option<MenuLayout> {
         cap: cap / h,
     };
 
-    let title_rect = row_rect(title)?;
-    let mut layout = MenuLayout {
-        title: TextLine { x: (left + pad * title_cap) / w, baseline: (title_rect[1] + title_cap) / h, cap: title_cap / h },
-        ..Default::default()
-    };
+    let mut layout = MenuLayout::default();
     for (index, info) in ITEMS.iter().enumerate() {
         let r = row_rect(rows[index]?)?;
         let m = metrics(info.group, s);

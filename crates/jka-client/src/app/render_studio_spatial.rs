@@ -39,30 +39,34 @@ enum PathSampleError { Pending, Asset(String) }
 /// The caller caches pose queries independently of these editable transforms.
 fn motion_path<E>(clip:&StudioAnimationClip,smooth:bool,zoom:f32,yaw:f32,
     mut pose:impl FnMut(f64)->Result<[f32;3],E>)->Result<StudioMotionPath,E> {
-    let offset=(clip.first_frame-clip.source_first) as f64/clip.source_fps.max(1.);
     let mut times=vec![clip.start,clip.end()];
     // Dense sampling follows curved skeletal movement and rotation. Bound the
     // density for exceptionally long clips; whole-second ticks remain exact.
     let steps=(clip.duration()*30.).ceil().clamp(1.,12000.) as usize;
     times.extend((1..steps).map(|i|clip.start+clip.duration()*i as f64/steps as f64));
-    times.extend(clip.motion.iter().map(|k|clip.start+k.time-offset)
+    times.extend(clip.motion.iter().map(|k|clip.timeline_at_source(k.time))
         .filter(|&t|t>clip.start && t<clip.end()));
     times.extend((clip.start.ceil() as i64..=clip.end().floor() as i64).map(|s|s as f64));
     if clip.playback==StudioClipPlayback::Loop {
         let duration=clip.source_duration();
-        for i in 1..=(clip.duration()/duration).floor() as usize {
-            let time=clip.start+i as f64*duration;
+        for i in 1..=((clip.source_out_seconds()-clip.source_in_seconds())/duration).floor() as usize {
+            let time=clip.timeline_at_source(clip.source_in_seconds()+i as f64*duration);
             times.extend([(time-0.001).max(clip.start),time.min(clip.end())]);
         }
     }
     times.sort_by(f64::total_cmp);times.dedup_by(|a,b|(*a-*b).abs()<1e-8);
     let mut points=Vec::with_capacity(times.len());let mut breaks=Vec::new();let mut previous_ms=None;
     for &time in &times {
-        let motion=clip.motion_at(time,smooth);
+        // Clip OUT is exclusive. Depict the last visible pose rather than
+        // adding another loop reset at the end of the displayed path.
+        let sample_time=if clip.playback==StudioClipPlayback::Loop && time>=clip.end() {
+            (clip.end()-0.001).max(clip.start)
+        } else {time};
+        let motion=clip.motion_at(sample_time,smooth);
         let rotation=glam::Quat::from_rotation_y((yaw+motion.yaw).to_radians());
-        let animated=rotation*Vec3::from_array(pose(time)?);
+        let animated=rotation*Vec3::from_array(pose(sample_time)?);
         points.push((Vec3::from_array(motion_world(motion.position,clip.lane,zoom))+animated).to_array());
-        let ms=clip.pose_time_ms(time);
+        let ms=clip.pose_time_ms(sample_time);
         if previous_ms.is_some_and(|previous|ms<previous) {breaks.push(points.len()-1);}
         previous_ms=Some(ms);
     }
@@ -116,7 +120,7 @@ mod tests {
         timeline.clips.push(StudioAnimationClip {name:"BOTH_STAND1".into(),emote:None,start:2.,
             first_frame:10,end_frame:50,source_fps:20.,lane:1,source_first:0,source_end:50,
             motion:vec![StudioMotionKey {time:0.25,..Default::default()},
-                StudioMotionKey {time:0.5,position:[2.,3.,4.],yaw:30.}],tail_frames:0,playback:Default::default()});
+                StudioMotionKey {time:0.5,position:[2.,3.,4.],yaw:30.}],tail_frames:0,playback:Default::default(),speed_keys:vec![], blend:Default::default()});
         timeline.lanes=2;timeline
     }
     #[test]
@@ -217,7 +221,7 @@ mod tests {
         presenter.set_ghoul2_anim_smooth(0.);presenter.set_skinning_mode(crate::ui::Ghoul2SkinningMode::Cpu);
         let mut clip=StudioAnimationClip {name:source.source.animation.clone(),emote:Some(source.emote().unwrap()),start:0.25,
             first_frame:source.first_frame,end_frame:source.end_frame(),source_fps:f64::from(source.fps),lane:0,
-            source_first:source.first_frame,source_end:source.end_frame(),motion:vec![Default::default()],tail_frames:0,playback:StudioClipPlayback::Hold};
+            source_first:source.first_frame,source_end:source.end_frame(),motion:vec![Default::default()],tail_frames:0,playback:StudioClipPlayback::Hold,speed_keys:vec![], blend:Default::default()};
         let identity=[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]];
         for model in ["luke/default","kyle/default","jan/default"] {
             let info=ClientInfo::solo_model(model);
@@ -404,6 +408,7 @@ pub(in crate::app) struct StudioSpatialEditor {
     pub scene_camera: Option<StudioCameraKey>,
     pub pivot: [f32;3],
     pub drag: Option<StudioSpatialDrag>,
+    pub camera_handle_drag: Option<super::egui_menu::render_studio_camera_handles::StudioCameraHandleDrag>,
     pub markers: Vec<StudioSpatialMarker>,
     pub motion_paths: Vec<StudioMotionPath>,
     pub camera_path: Option<StudioMotionPath>,
@@ -419,7 +424,7 @@ pub(in crate::app) struct StudioSpatialEditor {
     retry: bool,
 }
 impl Default for StudioSpatialEditor {
-    fn default()->Self {Self {show_keys:true,show_paths:true,scene_camera:None,pivot:[88.,0.,0.],drag:None,
+    fn default()->Self {Self {show_keys:true,show_paths:true,scene_camera:None,pivot:[88.,0.,0.],drag:None,camera_handle_drag:None,
         markers:Vec::new(),motion_paths:Vec::new(),camera_path:None,paths_pending:false,path_message:None,frame_when_ready:None,
         path_poses:Default::default(),camera_samples:Default::default(),path_camera_runtime:Default::default(),
         signature:String::new(),pose_signature:String::new(),camera_offsets:Default::default(),retry:false}}
@@ -427,7 +432,7 @@ impl Default for StudioSpatialEditor {
 
 pub(in crate::app) fn camera_from_key(key:StudioCameraKey)->Camera {
     let mut camera=Camera::new_with_fov(key.position,key.yaw.to_radians(),key.fov);
-    camera.pitch=key.pitch.to_radians();camera
+    camera.pitch=key.pitch.to_radians();key.lens_for_camera(&mut camera);camera
 }
 pub(in crate::app) fn key_from_camera(camera:Camera)->StudioCameraKey {
     StudioCameraKey {position:camera.position.to_array(),yaw:camera.yaw.to_degrees(),
@@ -443,7 +448,8 @@ pub(in crate::app) fn stored_position(timeline:&StudioTimeline,item:StudioItem)-
 pub(in crate::app) fn translate_item(timeline:&mut StudioTimeline,item:StudioItem,initial:[f32;3],delta:Vec3)->bool {
     if !delta.is_finite() {return false;}
     let (position,delta)=match item {
-        StudioItem::Camera(i)=>match timeline.camera.get_mut(i) {Some(k)=>(&mut k.position,delta.to_array()),None=>return false},
+        StudioItem::Camera(i)=>match timeline.camera.get_mut(i) {Some(k)=>{let target=k.focus_point();k.position=(Vec3::from_array(initial)+delta).clamp(Vec3::splat(-50000.0),Vec3::splat(50000.0)).to_array();
+            k.focus_target=Some(target);k.resolve_focus_target();return true},None=>return false},
         StudioItem::Motion(i,k)=>match timeline.clips.get_mut(i).and_then(|c|c.motion.get_mut(k)) {
             Some(k)=>(&mut k.position,crate::scene::jka_position(delta.to_array())),None=>return false},
         _=>return false,
@@ -452,8 +458,8 @@ pub(in crate::app) fn translate_item(timeline:&mut StudioTimeline,item:StudioIte
 }
 pub(in crate::app) fn visible_motion_keys(timeline:&StudioTimeline)->Vec<(usize,usize,f64)> {
     timeline.clips.iter().enumerate().flat_map(|(i,c)|c.motion.iter().enumerate().filter_map(move |(k,key)| {
-        let local=key.time-(c.first_frame-c.source_first) as f64/c.source_fps;
-        (local>=-0.00001 && local<=c.duration()+0.00001).then_some((i,k,c.start+local))
+        (key.time>=c.source_in_seconds()-0.00001 && key.time<=c.source_out_seconds()+0.00001)
+            .then_some((i,k,c.timeline_at_source(key.time)))
     })).collect()
 }
 

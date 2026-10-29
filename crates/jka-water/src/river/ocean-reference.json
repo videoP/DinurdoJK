@@ -1,0 +1,2085 @@
+{
+  "ocean": {
+    "asset_sha1": "82df8569b33f3cf1ae1e275c9b4e245a38b6cf82",
+    "cached_shader_sha256": "827160355dd1eb9e5b5be51c6681e31066155df1afc3683350fc9bfb49ee73d2",
+    "cached_shader_offset": 2470725,
+    "output_function": "void ScratchModule005_Emitter_Func_(inout FSimulationContext Context)\n{\n\tfloat Constant24 = 150;\n\tbool Constant25 = true;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY;\n\tExecutionIndexToGridIndex_Emitter_Grid2D(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY);\n\tfloat GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tGetPreviousFloatValue_Emitter_Grid2D_AttributeRealPart(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value);\n\tfloat3 Constant26 = float3(0,0,0);\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsY2;\n\tGetNumCells_Emitter_Grid2D(GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2);\n\tfloat Result11 = Constant24 / GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tfloat3 CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal;\n\tCustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_(GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Constant26, Result11, GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2, CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal);\n\tfloat4 Output14;\n\tOutput14.r = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.x;\n\tOutput14.g = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.y;\n\tOutput14.b = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.z;\n\tOutput14.a = GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tSetRenderTargetValue_Emitter_NormalRT_UEImpureCall(Constant25, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Output14);\n}",
+    "cached_rt": {
+      "MipMapGeneration": "ENiagaraMipMapGeneration::PostSimulate",
+      "OverrideRenderTargetFormat": "RTF_RGBA16f",
+      "bOverrideFormat": true,
+      "RenderTargetUserParameter": {
+        "Parameter": {
+          "variable": "User.OceanNormalRT",
+          "data_hex": ""
+        }
+      },
+      "MergeId": [
+        225600399,
+        1081174795,
+        3789046404,
+        23469505
+      ]
+    }
+  },
+  "parameters": {
+    "gravity": 980.0,
+    "PhillipsAmplitude": 3.0,
+    "TimeScale": 2.5,
+    "OceanLengthScale": 250.0,
+    "windSpeed": 55.0,
+    "windAngle": 180.0,
+    "windAlignement": 0,
+    "Slosh": 1.0
+  },
+  "size": [
+    512,
+    512
+  ],
+  "threads": 256,
+  "data_interfaces": [
+    {
+      "index": 119,
+      "path": "Grid2D_OceanPatch.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollection_2",
+      "properties": {
+        "ClearBeforeNonIterationStage": false,
+        "MergeId": [
+          4168532123,
+          1326447534,
+          4158610875,
+          1774378591
+        ]
+      }
+    },
+    {
+      "index": 126,
+      "path": "Grid2D_OceanPatch.SystemSpawnScript.NiagaraDataInterfaceRenderTarget2D_2",
+      "properties": {
+        "MipMapGeneration": "ENiagaraMipMapGeneration::PostSimulate",
+        "OverrideRenderTargetFormat": "RTF_RGBA16f",
+        "bOverrideFormat": true,
+        "RenderTargetUserParameter": {
+          "Parameter": {
+            "variable": "User.OceanNormalRT",
+            "data_hex": ""
+          }
+        },
+        "MergeId": [
+          225600399,
+          1081174795,
+          3789046404,
+          23469505
+        ]
+      }
+    },
+    {
+      "index": 127,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.GPUComputeScript_7.NiagaraDataInterfaceTexture_2",
+      "properties": {
+        "Texture": {
+          "object": -123,
+          "path": "/Engine/EngineMaterials/Good64x64TilingNoiseHighFreq.Good64x64TilingNoiseHighFreq"
+        },
+        "MergeId": [
+          574219680,
+          1103981778,
+          4267342237,
+          1403015959
+        ]
+      }
+    }
+  ],
+  "stages": [
+    {
+      "index": 2263,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_0",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::NotOnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "bOverrideGpuDispatchNumThreads": true,
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            0,
+            1,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.StaticHalfNumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticHalfNumGridCellsX"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchElementType": "ENiagaraDirectDispatchElementType::NumGroups",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            2,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.StaticNumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticNumGridCellsY"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1643,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_0.SimulationStage_0"
+        },
+        "SimulationStageName": "Waves Pt1",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          4064122765,
+          1337073039,
+          4268648329,
+          3374469255
+        ]
+      }
+    },
+    {
+      "index": 2264,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_1",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DataInterface",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1644,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_1.SimulationStage_0"
+        },
+        "SimulationStageName": "Init Grid Channels",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          1363601662,
+          1278345262,
+          3851564474,
+          1433862905
+        ]
+      }
+    },
+    {
+      "index": 2265,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_2",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DataInterface",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.NormalRT",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1645,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_2.SimulationStage_0"
+        },
+        "SimulationStageName": "Set RenderTarget",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          259558702,
+          1313120902,
+          4253168817,
+          2741865033
+        ]
+      }
+    },
+    {
+      "index": 2266,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_3",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::NotOnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "bOverrideGpuDispatchNumThreads": true,
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            0,
+            1,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.StaticHalfNumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticHalfNumGridCellsY"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchElementType": "ENiagaraDirectDispatchElementType::NumGroups",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.StaticNumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticNumGridCellsX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1646,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_3.SimulationStage_0"
+        },
+        "SimulationStageName": "Waves Pt2",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          3652939681,
+          1268042567,
+          615176351,
+          1601668663
+        ]
+      }
+    },
+    {
+      "index": 2267,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_4",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "RenderDisplacedPatch",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "OceanSurface_Emitter.RenderDisplacedPatch"
+          },
+          "DataSetName": "RenderDisplacedPatch",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Emitter.RenderDisplacedPatch",
+          "bBindingExistsOnSource": true,
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.NumVerticesX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumVerticesX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.NumVerticesY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumVerticesY"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1647,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_4.SimulationStage_0"
+        },
+        "SimulationStageName": "Create Verticies",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          2269578164,
+          1321555273,
+          3557663391,
+          2792359315
+        ]
+      }
+    },
+    {
+      "index": 2268,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_5",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "RenderDisplacedPatch",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "OceanSurface_Emitter.RenderDisplacedPatch"
+          },
+          "DataSetName": "RenderDisplacedPatch",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Emitter.RenderDisplacedPatch",
+          "bBindingExistsOnSource": true,
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.NumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumGridCellsX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurface_Emitter.NumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumGridCellsY"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1648,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraEmitter_7.NiagaraSimulationStageGeneric_5.SimulationStage_0"
+        },
+        "SimulationStageName": "Create  Triangles",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          1351941677,
+          1226932146,
+          1099509903,
+          3260544439
+        ]
+      }
+    },
+    {
+      "index": 2269,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_42",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "RenderDisplacedPatch",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "OceanSurface_Emitter.RenderDisplacedPatch"
+          },
+          "DataSetName": "RenderDisplacedPatch",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Emitter.RenderDisplacedPatch",
+          "bBindingExistsOnSource": true,
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.NumVerticesX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumVerticesX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.NumVerticesY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumVerticesY"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1677,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_42.SimulationStage_0"
+        },
+        "SimulationStageName": "Create Verticies",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          2269578164,
+          1321555273,
+          3557663391,
+          2792359315
+        ]
+      }
+    },
+    {
+      "index": 2270,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_43",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "RenderDisplacedPatch",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "OceanSurface_Emitter.RenderDisplacedPatch"
+          },
+          "DataSetName": "RenderDisplacedPatch",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Emitter.RenderDisplacedPatch",
+          "bBindingExistsOnSource": true,
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.NumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumGridCellsX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.NumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.NumGridCellsY"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1678,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_43.SimulationStage_0"
+        },
+        "SimulationStageName": "Create  Triangles",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          1351941677,
+          1226932146,
+          1099509903,
+          3260544439
+        ]
+      }
+    },
+    {
+      "index": 2271,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_44",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DataInterface",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1679,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_44.SimulationStage_0"
+        },
+        "SimulationStageName": "Init Grid Channels",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          1363601662,
+          1278345262,
+          3851564474,
+          1433862905
+        ]
+      }
+    },
+    {
+      "index": 2272,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_45",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::NotOnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "bOverrideGpuDispatchNumThreads": true,
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            0,
+            1,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.StaticHalfNumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticHalfNumGridCellsX"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchElementType": "ENiagaraDirectDispatchElementType::NumGroups",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            2,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.StaticNumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticNumGridCellsY"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1680,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_45.SimulationStage_0"
+        },
+        "SimulationStageName": "Waves Pt1",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          4064122765,
+          1337073039,
+          4268648329,
+          3374469255
+        ]
+      }
+    },
+    {
+      "index": 2273,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_46",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DirectSet",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::NotOnSimulationReset",
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.Grid2D",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "bOverrideGpuDispatchNumThreads": true,
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            0,
+            1,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.StaticHalfNumGridCellsY"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticHalfNumGridCellsY"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DirectDispatchElementType": "ENiagaraDirectDispatchElementType::NumGroups",
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "OceanSurfaceEmitter.StaticNumGridCellsX"
+          },
+          "AliasedParameter": {
+            "variable": "Emitter.StaticNumGridCellsX"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1681,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_46.SimulationStage_0"
+        },
+        "SimulationStageName": "Waves Pt2",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          3652939681,
+          1268042567,
+          615176351,
+          1601668663
+        ]
+      }
+    },
+    {
+      "index": 2274,
+      "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_47",
+      "properties": {
+        "EnabledBinding": {
+          "RootVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "None"
+          },
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "bIsCachedParticleValue": false
+        },
+        "IterationSource": "ENiagaraIterationSource::DataInterface",
+        "NumIterations": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "DataInterface": {
+          "BoundVariable": {
+            "variable": "Emitter.NormalRT",
+            "data_hex": ""
+          }
+        },
+        "ParticleIterationStateBinding": {
+          "RootVariable": {
+            "variable": "StateIndex",
+            "data_hex": ""
+          },
+          "ParamMapVariable": {
+            "variable": "Particles.StateIndex"
+          },
+          "DataSetName": "StateIndex",
+          "BoundVariable": {
+            "variable": "None",
+            "data_hex": ""
+          },
+          "CachedDisplayName": "Particles.StateIndex"
+        },
+        "OverrideGpuDispatchNumThreadsX": {
+          "DefaultValue": [
+            64,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsY": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "OverrideGpuDispatchNumThreadsZ": {
+          "DefaultValue": [
+            1,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountX": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountY": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "ElementCountZ": {
+          "DefaultValue": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "ResolvedParameter": {
+            "variable": "None"
+          },
+          "AliasedParameter": {
+            "variable": "None"
+          }
+        },
+        "Script": {
+          "object": 1682,
+          "path": "Grid2D_OceanPatch.OceanSurfaceEmitter_2.NiagaraSimulationStageGeneric_47.SimulationStage_0"
+        },
+        "SimulationStageName": "Set RenderTarget",
+        "OuterEmitterVersion": [
+          2008580518,
+          3817941891,
+          3606670378,
+          359244262
+        ],
+        "MergeId": [
+          259558702,
+          1313120902,
+          4253168817,
+          2741865033
+        ]
+      }
+    }
+  ],
+  "native_functions": {
+    "CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_": "void CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_(int In_NumCellsX, int In_NumCellsY, int In_kx, int In_ky, out float2 Out_UVpnt1, out float2 Out_UVpnt2, out float2 Out_UVpnt1_back, out float2 Out_UVpnt2_back)\n{\n\n// Need two points where the noise will be evaluated \n\t\n\tint2 waveNumberPnt1 = int2(In_kx, In_ky);\n\tint2 waveNumberPnt2 = waveNumberPnt1 + int2(In_NumCellsX / 2, 0);\n\t\n\t\n\tint kxp = In_kx;\n\tif (waveNumberPnt1.x > In_NumCellsX / 2)\n\t{\n\t    waveNumberPnt1.x = (In_NumCellsX - waveNumberPnt1.x);\n\t}\n\tif (waveNumberPnt1.y > In_NumCellsY / 2)\n\t{\n\t    waveNumberPnt1.y = (In_NumCellsY - waveNumberPnt1.y);\n\t}\n\t\n\t\n\tif (waveNumberPnt2.x > In_NumCellsX / 2)\n\t{\n\t    waveNumberPnt2.x = (In_NumCellsX - waveNumberPnt2.x);\n\t}\n\t\n\tif (waveNumberPnt2.y > In_NumCellsY / 2)\n\t{\n\t    waveNumberPnt2.y = (In_NumCellsY - waveNumberPnt2.y);\n\t}\n\t\n\tOut_UVpnt1 = float2(waveNumberPnt1.x / float(In_NumCellsX/2), waveNumberPnt1.y / float(In_NumCellsY/2) );\n\tOut_UVpnt2 = float2(waveNumberPnt2.x / float(In_NumCellsX/2), waveNumberPnt2.y / float(In_NumCellsY/2) );\n\t\n\tOut_UVpnt1_back = float2(waveNumberPnt1.x / float(In_NumCellsX/2), waveNumberPnt1.y / float(In_NumCellsY/2) ) + .25;\n\tOut_UVpnt2_back = float2(waveNumberPnt2.x / float(In_NumCellsX/2), waveNumberPnt2.y / float(In_NumCellsY/2) ) + .25;\n}",
+    "WavesInSpectralSpaceAndFFTInXBC86C598505D4E5062E7F46F9F6FF55C422344ACEmitter_Grid2D_Func_": "void WavesInSpectralSpaceAndFFTInXBC86C598505D4E5062E7F46F9F6FF55C422344ACEmitter_Grid2D_Func_(int In_ScanlineIdx, int In_ThreadIdx, int In_NumCellsInScanline, int In_NumScanlines, float In_Time, float In_gravity, float In_PhillipsAmplitude, float In_TimeScale, float In_OceanScale, float4 In_noisePt1, float4 In_noisePt2, float In_windSpeed, float In_windAngle, int In_windAlignment, float In_Slosh, float4 In_noisePt1_back, float4 In_noisePt2_back, inout FSimulationContext Context)\n{\n\n// This module does two things.  It sets up the waves in spectral space and does the first directional transform\n\t// Explicitly it  \n\t// First:  Computes complex coefficents for each wave.\n\t//         these coefficients determine the amplitude and time-dependent phase of each wave.\n\t// Second: Performs FFT in X\n\t//\n\t//\n\t//  The complex coefficies A_{k1, k2} need to satisfy certains conjugate relations\n\t//  A_{-k1, -k2} = ComplexConjugate( A_{k1, k2} )\n\t//\n\t//  due to FFT layout and periodicity the negative wave numbers are alliased to positive ones..\n\t//    if k1 >= N/2 then k1 = -(N-k1)\n\t//       k2 >= M/2 then k2 = -(M-k2)\n\t//                                                where N = num cells in X, M = num cells in y\n\t//\n\t// for traveling waves and k1, k2 < [N/2, M/2]\n\t// A(k1, k2) = exp(i w(k) t) Sqrt( S(|k|) ) k.dot.windir  with w(|k|) = sqrt(2 pi g / L) sqrt(|k|) \n\t\n\t\n\t\n\t#define RADIX 2\n\t\n\t\n\tint Nx =  In_NumCellsInScanline;\n\tint NumCols = Nx / RADIX; // requires a dispatch such that NumCols = THREADGROUP_SIZE\n\tint Ny = In_NumScanlines;\n\t\n\t// note: both Nx and Ny are powers of 2.\n\tint NxOn2 = Nx / 2;\n\tint NyOn2 = Ny / 2;\n\t\n\t\n\t\n\t// constants.\n\tfloat Pi = 3.14159265358979323846;\n\tfloat TwoPi = 2.0 * Pi;\n\tfloat Lcm = In_OceanScale; // domain size in cm.\n\tfloat TwoPiOnL = TwoPi / Lcm;\n\tfloat speedScale = sqrt( TwoPiOnL * In_gravity);\n\tfloat scaledTime = In_TimeScale * In_Time;\n\t\n\t// --Phillips Spectrum const\n\tfloat windAngleDegrees = In_windAngle % 360;\n\tif (windAngleDegrees < 0) \n\t{\n\t    windAngleDegrees += 360;\n\t}\n\t\n\tfloat windAngleRadians = - (Pi / 180.) * windAngleDegrees; // the minus sign is a hack because in a 2d buffer the origin is at top left corner (y measues down)\n\tfloat2 windDir;\n\tsincos(windAngleRadians, windDir.y, windDir.x);\n\tfloat principalWaveL = 1.f;     // length of wave traveling at the wind speed. \n\tif (abs(In_windSpeed) > 0.001) \n\t{\n\t    principalWaveL = In_windSpeed * In_windSpeed * TwoPi / In_gravity;\n\t}\n\tint alignmentPow = min(max(In_windAlignment,1), 20);\n\t// phase offset so the waves don't all start in sync on the first frame. \n\tfloat2 noiseSamples = frac(20* float2(length(In_noisePt1), length(In_noisePt2))); // random phase two waves \n\tfloat2 noiseSamples2 = frac(20* float2(length(In_noisePt1_back), length(In_noisePt2_back))); // random phase two waves \n\t\n\t// local scratch of complex numbers. ( V.x+ I V.y is a complex number)\n\tfloat2 V[RADIX];\n\t\n\t// create the waves in fourier space by computing the complex amplitudes.\n\t// this are computed for each point in 2d wave number space [0, Nx] x [0, Ny]\n\t// each thread actually computes points on the same scaneline\n\t//    (threadIdx, Scanline) and (threadIdx + NumCols, scanline) \n\t// and stores the results in the local scratch. This is used to kick off the fft.\n\t{\n\t    float sgn = 1; // used to account for complex conjugates that keep the output real\n\t    if (In_windAngle >= 180)\n\t    {\n\t        sgn *= -1;\n\t    }      \n\t    if (In_windSpeed < 0 )\n\t    {\n\t        sgn *= -1;\n\t    }    \n\t\n\t    float mask = 1; // zero at k = N/2 ( Nyquest freq) - simplifies make real result \n\t    int k2 = In_ScanlineIdx;\n\t    \n\t    if (k2 == NyOn2)\n\t    {\n\t        mask = 0;\n\t    } \n\t    else if (k2 > NyOn2)\n\t    { \n\t        k2 = -(Ny - k2);\n\t        sgn *= -1;\n\t    }\n\t\n\t    UNROLL for (int r = 0, j = In_ThreadIdx ; r < RADIX; ++r, j+= NxOn2)\n\t    {\n\t        int k1 =  j;\n\t        \n\t        if ( k1 == NxOn2)\n\t        {\n\t            mask = 0;\n\t        }\n\t        if(k1 > NxOn2)\n\t        {\n\t            k1 =  -(Nx - k1);\n\t            if (k2 == 0)\n\t            {\n\t                sgn *= -1;\n\t            }\n\t        }\n\t\n\t        int2 kIndex2 = int2(k1, k2);\n\t        \n\t        float2 kVec = float2(k1 * TwoPiOnL, k2 * TwoPiOnL);\n\t        \n\t        float kMag = length(kVec);\n\t        \n\t        // wave amplitude by computing phillips spectra evaluation for this wave-number kMag       \n\t        float waveAmp = 0.f; \n\t\n\t        if (!(k1 ==0 && k2 ==0) )\n\t        {\n\t            \n\t            float kMagL = kMag * principalWaveL;\n\t            {\n\t                float2 kDir = kVec / kMag;\n\t                float  windCos = dot(kDir, windDir);\n\t                float  windCosPow = pow(windCos * windCos, alignmentPow);\n\t                \n\t                // scale the amplitude so that it is indep of domain size\n\t                float ksqr = k1 * k1 + k2 * k2;\n\t                float kTo4 = ksqr * ksqr;\n\t               \n\t                float phillipsSpectra = abs(In_PhillipsAmplitude) * (windCosPow) / ( exp(1./( kMagL * kMagL))  * kTo4);\n\t                waveAmp = sqrt(phillipsSpectra);\n\t\n\t                    \n\t           }\n\t        }\n\t        \n\t       \n\t        \n\t\n\t        // update the phase of each wave using the dispersion relation. \n\t        // independant of whatever model produced the wave amplitues. \n\t        float dispersion = sgn * speedScale * sqrt(kMag) * scaledTime + TwoPi*noiseSamples[r];\n\t        float2 cs;\n\t        sincos(dispersion, cs.y, cs.x); \n\t\n\t        // opposite direction wave\n\t        float WaveAmp2 = waveAmp;   \n\t        float dispersion2 = sgn * speedScale * sqrt(kMag) * scaledTime + TwoPi*noiseSamples2[r];\n\t        float2 cs2;\n\t        sincos(dispersion2, cs2.y, cs2.x); \n\t        \n\t\n\t        WaveAmp2 *= In_Slosh;\n\t        cs2.y *= -1.f;\n\t\n\t        V[r] = mask * (WaveAmp2 * cs2 + waveAmp * cs);\n\t    }  \n\t}\n\t\n\t// do FFT in X, writing the result in the grid\n\t\n\t// compute FFT\n\t// This is a sequence of Radix-2 FFTs and data exchanges.\n\t{\n\t    float FFTsgn = 1.f;\n\t    int IdxS = In_ThreadIdx;\n\t \n\t      \n\t    for (int Ns = 1 ; Ns < NumCols; Ns *= RADIX)\n\t    {\n\t        //IdxD = Expand(ThreadIdx, Ns, RADIX);\n\t        int IdxD = (In_ThreadIdx / Ns) * Ns * RADIX + (In_ThreadIdx % Ns);\n\t    \n\t        // Apply the Twiddle\n\t        float Theta = FFTsgn * TwoPi * float( In_ThreadIdx % Ns) / float(Ns * RADIX);\n\t        {\n\t            float2 Twiddle;\n\t            sincos(Theta, Twiddle.y, Twiddle.x); \n\t        \n\t     \n\t            float RealPart = V[1].x * Twiddle.x - V[1].y * Twiddle.y;\n\t            float ImagPart = V[1].x * Twiddle.y + V[1].y * Twiddle.x;\n\t        \n\t            V[1] = float2(RealPart, ImagPart);\n\t        }\n\t  \n\t        // Radix(2) FFT\n\t        {\n\t            float2 Vo = V[0];\n\t            V[0] = Vo + V[1];\n\t            V[1] = Vo - V[1];\n\t        }\n\t\n\t        \n\t        // Exchange data with other threads\n\t        {\n\t            GroupMemoryBarrierWithGroupSync();\n\t            // write to group shared\n\t            for (int r = 0, j = IdxD; r < RADIX; ++r, j += Ns)\n\t            {\n\t\n\t                FFTGroupShared[j] = V[r];\n\t            }\n\t           GroupMemoryBarrierWithGroupSync();\n\t    \n\t            // read from group shared\n\t            for (int r = 0, j = IdxS; r < RADIX; ++r, j += NumCols)\n\t            {\n\t                  V[r] = FFTGroupShared[j];            \n\t            }\n\t           \n\t        }\n\t       \n\t    } // end loop\n\t\n\t    // last interation.  would be the same as NS = NumCols in the above loop,\n\t    // but this skips a non-op data exchange.\n\t    {\n\t         // Apply the Twiddle\n\t        float Theta = FFTsgn * TwoPi * float( In_ThreadIdx % NumCols) / float(Nx);\n\t        {\n\t            float2 Twiddle;\n\t            sincos(Theta, Twiddle.y, Twiddle.x); \n\t        \n\t     \n\t            float RealPart = V[1].x * Twiddle.x - V[1].y * Twiddle.y;\n\t            float ImagPart = V[1].x * Twiddle.y + V[1].y * Twiddle.x;\n\t        \n\t            V[1] = float2(RealPart, ImagPart);\n\t        }\n\t        {\n\t            float2 Vo = V[0];\n\t            V[0] = Vo + V[1];\n\t            V[1] = Vo - V[1];\n\t        }\n\t\n\t    }\n\t\n\t} // end FFT\n\t\n\t// Copy the results to the output buffer\n\tUNROLL for (int r = 0, j = In_ThreadIdx; r < RADIX; ++r, j += NumCols)\n\t{\n\t   \n\t    int2 GridIdx = int2(j, In_ScanlineIdx);\n\t    \n\t    SetFloatValue_Emitter_Grid2D_UEImpureCall_AttributeRealPart(GridIdx.x, GridIdx.y,      V[r].x);\n\t    SetFloatValue_Emitter_Grid2D_UEImpureCall_AttributeImaginaryPart(GridIdx.x, GridIdx.y, V[r].y);\n\t\n\t}   \n\t\n\t\n\t\n}",
+    "YASC45FFT13CCA0B8690275014F684D889501BF47F957A134Emitter_Grid2D_Func_": "void YASC45FFT13CCA0B8690275014F684D889501BF47F957A134Emitter_Grid2D_Func_(int In_ScanlineIdx, int In_ThreadIdx, int In_NumCellsX, int In_NumCellsY, inout FSimulationContext Context)\n{\n\n#define RADIX 2\n\t\n\tint Ny =  In_NumCellsY;\n\tint NumCols = Ny / RADIX; // requires a dispatch such that NumCols = THREADGROUP_SIZE\n\t\n\t\n\t\n\t// constants.\n\tfloat Pi = 3.14159265358979323846;\n\tfloat TwoPi = 2.0 * Pi;\n\tfloat Sgn = -1.;\n\t\n\t\n\t\n\t// local scratch of complex numbers. ( V.x+ I V.y is a complex number)\n\tfloat2 V[RADIX];\n\t\n\t// load Real and Imaginary parts of the scanline into scratch\n\t{\n\t    // read data from Grid\n\t    UNROLL for (int r = 0, j = In_ThreadIdx ; r < RADIX; ++r, j+= NumCols)\n\t    {\n\t        int2 GridIdx = int2(In_ScanlineIdx, j);\n\t       \n\t        // get real and imaginary parts from grid\n\t        GetFloatValue_Emitter_Grid2D_AttributeRealPart(GridIdx.x, GridIdx.y,      V[r].x);\n\t        GetFloatValue_Emitter_Grid2D_AttributeImaginaryPart(GridIdx.x, GridIdx.y, V[r].y);\n\t\n\t    }  \n\t}\n\t\n\t// do FFT \n\t\n\t// compute FFT\n\t// This is a sequence of Radix-2 FFTs and data exchanges.\n\t{\n\t    float FFTsgn = 1.;\n\t    int IdxS = In_ThreadIdx;\n\t \n\t      \n\t    for (int Ns = 1 ; Ns < NumCols; Ns *= RADIX)\n\t    {\n\t        //IdxD = Expand(ThreadIdx, Ns, RADIX);\n\t        int IdxD = (In_ThreadIdx / Ns) * Ns * RADIX + (In_ThreadIdx % Ns);\n\t    \n\t        // Apply the Twiddle\n\t        float Theta = FFTsgn * TwoPi * float( In_ThreadIdx % Ns) / float(Ns * RADIX);\n\t        {\n\t            float2 Twiddle;\n\t            sincos(Theta, Twiddle.y, Twiddle.x); \n\t        \n\t     \n\t            float RealPart = V[1].x * Twiddle.x - V[1].y * Twiddle.y;\n\t            float ImagPart = V[1].x * Twiddle.y + V[1].y * Twiddle.x;\n\t        \n\t            V[1] = float2(RealPart, ImagPart);\n\t        }\n\t  \n\t        // Radix(2) FFT\n\t        {\n\t            float2 Vo = V[0];\n\t            V[0] = Vo + V[1];\n\t            V[1] = Vo - V[1];\n\t        }\n\t\n\t        \n\t        // Exchange data with other threads\n\t        {\n\t            GroupMemoryBarrierWithGroupSync();\n\t            // write to group shared\n\t            for (int r = 0, j = IdxD; r < RADIX; ++r, j += Ns)\n\t            {\n\t\n\t                FFTGroupShared[j] = V[r];\n\t            }\n\t           GroupMemoryBarrierWithGroupSync();\n\t    \n\t            // read from group shared\n\t            for (int r = 0, j = IdxS; r < RADIX; ++r, j += NumCols)\n\t            {\n\t                  V[r] = FFTGroupShared[j];            \n\t            }\n\t           \n\t        }\n\t       \n\t    } // end loop\n\t    \n\t\n\t    // last interation.  would be the same as NS = NumCols in the above loop,\n\t    // but this skips a non-op data exchange.\n\t    {\n\t         // Apply the Twiddle\n\t        float Theta = FFTsgn * TwoPi * float( In_ThreadIdx % NumCols) / float(Ny);\n\t        {\n\t            float2 Twiddle;\n\t            sincos(Theta, Twiddle.y, Twiddle.x); \n\t        \n\t     \n\t            float RealPart = V[1].x * Twiddle.x - V[1].y * Twiddle.y;\n\t            float ImagPart = V[1].x * Twiddle.y + V[1].y * Twiddle.x;\n\t        \n\t            V[1] = float2(RealPart, ImagPart);\n\t        }\n\t        {\n\t            float2 Vo = V[0];\n\t            V[0] = Vo + V[1];\n\t            V[1] = Vo - V[1];\n\t        }\n\t\n\t    }\n\t\n\t} // end FFT\n\t\n\t// write result back to grid\n\t\n\t// Copy the results to the output buffer\n\tUNROLL for (int r = 0, j = In_ThreadIdx; r < RADIX; ++r, j += NumCols)\n\t{\n\t   \n\t    int2 GridIdx = int2(In_ScanlineIdx, j);\n\t    \n\t    SetFloatValue_Emitter_Grid2D_UEImpureCall_AttributeRealPart(GridIdx.x, GridIdx.y,      V[r].x);\n\t    SetFloatValue_Emitter_Grid2D_UEImpureCall_AttributeImaginaryPart(GridIdx.x, GridIdx.y, V[r].y);\n\t\n\t}   \n\t\n}",
+    "CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_": "void CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_(float In_h, int In_IndexX, int In_IndexY, float3 In_SimPos, float In_dx, int In_NumCellsX, int In_NumCellsY, out float3 Out_Normal)\n{\n\n    float h_right;\n\t    float h_up;   \n\t\n\t    int XQuery = In_IndexX + 1;\n\t    int YQuery = In_IndexY + 1;\n\t\n\t    if (In_IndexX == In_NumCellsX - 1)\n\t    {\n\t        XQuery = 0;\n\t    }\n\t\n\t    if (In_IndexY == In_NumCellsY - 1)\n\t    {\n\t        YQuery = 0;\n\t    }\n\t\n\t    GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPart(XQuery, In_IndexY, h_right);\n\t    GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPart(In_IndexX, YQuery, h_up);\n\t\n\t    float3 WorldPos  = In_SimPos;\n\t    WorldPos.z = In_h;\n\t\n\t    float3 WorldPosRight = In_SimPos;\n\t    WorldPosRight.x = In_dx;\n\t    WorldPosRight.z = h_right;\n\t\n\t    float3 WorldPosUp = In_SimPos;\n\t    WorldPosUp.y = In_dx;\n\t    WorldPosUp.z = h_up;\n\t\n\t    float3 CrossProd = cross(WorldPosRight - WorldPos, WorldPosUp - WorldPos);\n\t    float CrossProdLength = length(CrossProd);\n\t\n\t    // default to upward facing normal\n\t    if (CrossProdLength < 1e-10)\n\t    {\n\t        Out_Normal = float3(0,0,1);\n\t    }\n\t    else\n\t    {\n\t        Out_Normal = CrossProd / CrossProdLength;\n\t    }\n\t\n}",
+    "ScratchModule_09_Emitter_Func_": "void ScratchModule_09_Emitter_Func_(inout FSimulationContext Context)\n{\n\tint ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupID;\n\tint ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupThreadID;\n\tThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_(ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupID, ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupThreadID);\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsX;\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsY;\n\tGetNumCells_Emitter_Grid2D(GetNumCells_Emitter_Grid2DOutput_NumCellsX, GetNumCells_Emitter_Grid2DOutput_NumCellsY);\n\tfloat2 CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1;\n\tfloat2 CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2;\n\tfloat2 CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1_back;\n\tfloat2 CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2_back;\n\tCustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_(GetNumCells_Emitter_Grid2DOutput_NumCellsX, GetNumCells_Emitter_Grid2DOutput_NumCellsY, ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupID, ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupThreadID, CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1, CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2, CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1_back, CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2_back);\n\tfloat Constant19 = 0;\n\tfloat4 SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value;\n\tSampleTexture2D_Emitter_ScratchModule_NoiseTexture(CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1, Constant19, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value);\n\tfloat Constant20 = 0;\n\tfloat4 SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value1;\n\tSampleTexture2D_Emitter_ScratchModule_NoiseTexture(CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2, Constant20, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value1);\n\tfloat Constant21 = 0;\n\tfloat4 SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value2;\n\tSampleTexture2D_Emitter_ScratchModule_NoiseTexture(CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt1_back, Constant21, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value2);\n\tfloat Constant22 = 0;\n\tfloat4 SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value3;\n\tSampleTexture2D_Emitter_ScratchModule_NoiseTexture(CustomHlsl1AE17FFE7B9A419321E45CAFC754F25446DD2A31_Func_Output_UVpnt2_back, Constant22, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value3);\n\tWavesInSpectralSpaceAndFFTInXBC86C598505D4E5062E7F46F9F6FF55C422344ACEmitter_Grid2D_Func_(ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupID, ThreadGroupInfo0591BCA3C0F0AF2FEAC3E71AC50D6C596A512575_Func_Output_GroupThreadID, GetNumCells_Emitter_Grid2DOutput_NumCellsX, GetNumCells_Emitter_Grid2DOutput_NumCellsY, Context.MapSimStage4_WavesPt1.Engine.System.Age, Context.MapSimStage4_WavesPt1.ScratchModule_09.gravity, Context.MapSimStage4_WavesPt1.ScratchModule_09.PhillipsAmplitude, Context.MapSimStage4_WavesPt1.ScratchModule_09.TimeScale, Context.MapSimStage4_WavesPt1.ScratchModule_09.OceanScale, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value1, Context.MapSimStage4_WavesPt1.ScratchModule_09.windSpeed, Context.MapSimStage4_WavesPt1.ScratchModule_09.windAngle, Context.MapSimStage4_WavesPt1.ScratchModule_09.windAlignment, Context.MapSimStage4_WavesPt1.ScratchModule_09.Slosh, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value2, SampleTexture2D_Emitter_ScratchModule_NoiseTextureOutput_Value3, Context);\n}",
+    "ScratchModule005_Emitter_Func_": "void ScratchModule005_Emitter_Func_(inout FSimulationContext Context)\n{\n\tfloat Constant24 = 150;\n\tbool Constant25 = true;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY;\n\tExecutionIndexToGridIndex_Emitter_Grid2D(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY);\n\tfloat GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tGetPreviousFloatValue_Emitter_Grid2D_AttributeRealPart(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value);\n\tfloat3 Constant26 = float3(0,0,0);\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsY2;\n\tGetNumCells_Emitter_Grid2D(GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2);\n\tfloat Result11 = Constant24 / GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tfloat3 CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal;\n\tCustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_(GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Constant26, Result11, GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2, CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal);\n\tfloat4 Output14;\n\tOutput14.r = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.x;\n\tOutput14.g = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.y;\n\tOutput14.b = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.z;\n\tOutput14.a = GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tSetRenderTargetValue_Emitter_NormalRT_UEImpureCall(Constant25, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Output14);\n}"
+  },
+  "noise": {
+    "asset_sha256": "884b42980b4d74df58ba1fa73bfc2e9e28498c5a43ae14cda247ea4db26e65f5",
+    "properties": {
+      "ImportedSize": {
+        "unsupported": "invalid FName at 0: 64/64",
+        "raw_hex": "4000000040000000"
+      },
+      "Source": {
+        "Id": [
+          472601847,
+          1321059266,
+          991562629,
+          3579647388
+        ],
+        "SizeX": 64,
+        "SizeY": 64,
+        "NumSlices": 1,
+        "NumMips": 1,
+        "bPNGCompressed": true,
+        "CompressionFormat": "TSCF_PNG",
+        "Format": "TSF_BGRA8",
+        "BlockDataOffsets": [
+          0
+        ]
+      },
+      "LightingGuid": [
+        813127649,
+        1166958940,
+        2107089822,
+        841062151
+      ],
+      "AssetImportData": {
+        "object": 1,
+        "path": "Good64x64TilingNoiseHighFreq.AssetImportData"
+      },
+      "MipGenSettings": "TMGS_NoMipmaps",
+      "CompressionSettings": "TC_Grayscale",
+      "LODGroup": "TEXTUREGROUP_UI",
+      "SRGB": false,
+      "bUseLegacyGamma": true
+    },
+    "png_offset": 6343,
+    "png_size": 13807,
+    "png_sha256": "65b3fd9d0e8eea9ca52fc4e367c2b853822b1056db15e17b0a68c2b8101e0e1a",
+    "red_sha256": "ba782f6c6102773ba965126689d05dbedb89a86d4e962a68f74daee05f8139bb",
+    "format": "G8 / R8Unorm, raw Niagara sample R001, no sRGB/mips, wrap linear SampleLevel"
+  },
+  "sources": {
+    "Plugins/FX/NiagaraFluids/Shaders/NiagaraFFT.ush": "940a991e34b9775b75fbd6c5111801f184b13f6003c816a3d71dfd1de9b365ce",
+    "Plugins/FX/Niagara/Source/Niagara/Public/NiagaraSettings.h": "1fb34499addf3f2f52712b667829c79856e0fa2f3a0a8a4dd6d9349a7e9d296a",
+    "Source/Runtime/Engine/Private/Texture.cpp": "42bdacf2e4be96cd23508be307f86ef171e924b38878f0642c6c27f8284c796b",
+    "Source/Runtime/Engine/Private/TextureDerivedData.cpp": "d65604f64e6b3308fc18d26f114d2825c47344162c0416d44f884f724cbca523",
+    "Source/Runtime/ImageCore/Private/ImageCore.cpp": "cc6cf30d03620ec0a3d700787a3b88b614b799d425a399bc340e8c7031b2ff10",
+    "Source/Developer/TextureFormatUncompressed/Private/TextureFormatUncompressed.cpp": "af40f08d54026f39e47da19e563b788bfdca388cc6245dbbb3002462bb251648",
+    "Source/Runtime/D3D12RHI/Private/D3D12Texture.cpp": "be358854a0cf9f9bde2ccbed77743652761c8ef337de377569278d3bbab39eb1",
+    "Source/Runtime/VulkanRHI/Private/VulkanDevice.cpp": "181390bd551ef771f6dbab2f4bf6100185158de00742b00524731c05651421e6",
+    "Config/BaseDeviceProfiles.ini": "282781854a1b6e636e89ca0a74e1d998c302ddfd8320eaf9ceb0970250a596e4"
+  },
+  "notes": [
+    "Default grid format is HalfFloat, no explicit override in cached SystemSpawn DI; real/imaginary values quantize after each axis, not within shared-memory butterflies",
+    "Native UV seed helper receives group/scanline before thread, even though its pins are named kx/ky; preserve the call order",
+    "Native mask and sign carry across the two local coefficients; do not independently repair Nyquist/conjugate symmetry",
+    "Both transform axes use positive twiddle sign without normalization; output normals use dx=150/NumCellsX despite ocean length parameter 250",
+    "Evidence is uncooked source plus cached compilation; no executing Unreal/cooked-resource comparison"
+  ]
+}

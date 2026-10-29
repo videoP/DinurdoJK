@@ -6,6 +6,8 @@ pub(super) struct AirComposite {
     uniforms: wgpu::Buffer,
     group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    roof: wgpu::TextureView,
 }
 impl AirComposite {
     pub fn new(
@@ -16,7 +18,7 @@ impl AirComposite {
         let copy = SceneCopy::new(device, key.0, key.1, key.2);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Blue Water opaque air camera"),
-            size: 96,
+            size: 112,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -53,6 +55,7 @@ impl AirComposite {
                     wgpu::TextureSampleType::Depth,
                     wgpu::TextureViewDimension::D2,
                 ),
+                tex(5, wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2),
                 tex(
                     3,
                     wgpu::TextureSampleType::Float { filterable: true },
@@ -70,6 +73,12 @@ impl AirComposite {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
         };
+        let roof_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("no roof field"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        });
+        let roof = roof_texture.create_view(&Default::default());
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water opaque air"),
             layout: &layout,
@@ -81,6 +90,7 @@ impl AirComposite {
                 texture(1, &copy.color),
                 texture(2, &copy.depth),
                 texture(3, &air.volume_view),
+                texture(5, &roof),
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&air.sampler),
@@ -135,10 +145,12 @@ impl AirComposite {
             uniforms,
             group,
             pipeline,
+            layout,
+            roof,
         }
     }
     pub fn draw(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -146,11 +158,30 @@ impl AirComposite {
         color: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
+        air: &blue_water_render::AerialVolume,
+        roof: &(wgpu::TextureView, [f32; 4]),
+        map_height: f32,
     ) {
-        let mut values = [0.0f32; 24];
+        if self.roof != roof.0 {
+            self.roof = roof.0.clone();
+            self.group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shared BSP roof admission for aerial"), layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.copy.color) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.copy.depth) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&air.volume_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&air.sampler) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.roof) },
+                ],
+            });
+        }
+        let mut values = [0.0f32; 28];
         values[..16].copy_from_slice(&camera.inverse_view_projection);
         values[16..19].copy_from_slice(&camera.position);
-        values[20..].copy_from_slice(&camera.viewport);
+        values[19] = map_height;
+        values[20..24].copy_from_slice(&camera.viewport);
+        values[24..28].copy_from_slice(&roof.1);
         queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&values));
         self.copy.capture(device, encoder, color, depth);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

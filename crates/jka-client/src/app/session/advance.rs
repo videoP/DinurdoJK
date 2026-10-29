@@ -20,7 +20,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadow_opacity: f32,
+        blob_shadow_settings: crate::ui::PlayerBlobShadowSettings,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         if self.phase != SessionPhase::Playing {
             return Err("DEMO PLAYBACK ADVANCED BEFORE MAP LOAD".to_owned());
@@ -40,7 +40,7 @@ impl GameSession {
             event_workers_enabled,
             ghoul2_view,
             rt_rigid_casters_enabled,
-            blob_shadow_opacity,
+            blob_shadow_settings,
             false,
             None,
             None,
@@ -58,7 +58,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadow_opacity: f32,
+        blob_shadow_settings: crate::ui::PlayerBlobShadowSettings,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.advance_to_with_prediction(
             target_server_time,
@@ -70,7 +70,7 @@ impl GameSession {
             event_workers_enabled,
             ghoul2_view,
             rt_rigid_casters_enabled,
-            blob_shadow_opacity,
+            blob_shadow_settings,
             false,
             None,
             Some(PlayerPresentationInput::Local(view_angles)),
@@ -90,7 +90,7 @@ impl GameSession {
         event_workers_enabled: bool,
         ghoul2_view: Option<Ghoul2PresentationView>,
         rt_rigid_casters_enabled: bool,
-        blob_shadow_opacity: f32,
+        blob_shadow_settings: crate::ui::PlayerBlobShadowSettings,
         no_predict: bool,
         predict: Option<
             &mut dyn FnMut(
@@ -106,7 +106,7 @@ impl GameSession {
         self.player_presenter
             .set_rt_shadow_casters_enabled(rt_rigid_casters_enabled);
         self.player_presenter
-            .begin_blob_shadow_frame(blob_shadow_opacity);
+            .begin_blob_shadow_frame(blob_shadow_settings);
         self.client_perf.ghoul2_skinning_mode = self.player_presenter.skinning_mode();
         let snapshot_started = Instant::now();
         let current_time = self
@@ -224,6 +224,12 @@ impl GameSession {
         // start at cg.time.
         self.weapon_fx.begin_frame(target_server_time);
         self.presented_entities = self.client_game.present_entities_at(presentation_time_ms)?;
+        // Studio "Hide other players": drop other clients before any
+        // presentation, so their bodies, sabers, shadows and sounds all go.
+        if let Some(keep) = self.studio_visible_players.as_ref() {
+            self.presented_entities.retain(|e| e.entity_type != crate::cgame::ET_PLAYER
+                || usize::from(e.number) >= crate::strafe_trail::MAX_CLIENTS || keep.contains(&e.number));
+        }
         let predicted = match (predict, self.current_snapshot.as_ref()) {
             (Some(predict), Some(current)) => predict(
                 current,
@@ -646,6 +652,31 @@ impl GameSession {
         self.player_presenter
             .begin_physics_frame(target_server_time);
 
+        // TaystJK CG_General uses cg.refdef.viewangles for the local E-Web
+        // gunner only in first person; snapshot owner angles for everybody else.
+        self.entity_presenter.set_emplaced_first_person_view(
+            if sample_owns_camera && !sample_third_person {
+                followed_entity.as_ref().map(|owner| (owner.number, sample.view_angles))
+            } else { None },
+        );
+        // CG_PlayerState emplacedIndex explicitly names the mounted gun.
+        // We suppress the local ET_PLAYER snapshot and some servers omit the
+        // occupied-gun marker, so CG_General's reverse owner lookup alone
+        // cannot reliably drive Bone02 for the locally controlled E-Web.
+        let local_emplaced_gunner = if sample_owns_camera {
+            self.presented_player_state().and_then(|ps| {
+                if ps.field_i32("weapon") != Some(17) { return None; }
+                let gun_num = u16::try_from(ps.field_i32("emplacedIndex")?).ok()?;
+                if gun_num == 0 || gun_num >= 1023 { return None; }
+                let angles = if sample_third_person {
+                    followed_entity.as_ref()?.angles
+                } else {
+                    sample.view_angles
+                };
+                Some((gun_num, angles))
+            })
+        } else { None };
+        self.entity_presenter.set_local_emplaced_gunner(local_emplaced_gunner);
         let entity_present_started = Instant::now();
         let (mut dynamic_models, inline_models, dispatch_summary) =
             self.entity_presenter.present_snapshot_entities(
@@ -674,8 +705,10 @@ impl GameSession {
             );
             self.logged_dispatch_summary = true;
         }
-        self.player_presenter
-            .set_external_live_entities(self.race_ghosts.iter().map(|ghost| ghost.entity_num));
+        self.player_presenter.set_external_live_entities(
+            self.race_ghosts.iter().map(|ghost| ghost.entity_num)
+                .chain(self.studio_external_player_entities.iter().copied()),
+        );
         // TaystJK CG_BreathPuffs queries S_GetVoiceVolume each frame, and
         // switches 3-second breathing to 300 ms during a spoken voice line.
         // Only the small set of players (plus a synthesized local player) is
@@ -701,14 +734,20 @@ impl GameSession {
                 self.forced_player_models.as_ref(),
             ),
         );
-        // TaystJK CG_Player: spawn protection is an authoritative eFlags bit
-        // and the shell is a separate MD3 refEntity, not a tint on Ghoul2.
+        // TaystJK CG_Player: seeker drones are independent orbiting MD3s;
+        // playerState can synthesize a local owner absent from the snapshot.
+        dynamic_models.extend(self.entity_presenter.present_seeker_drones(
+            &self.presented_entities, followed_entity.as_ref(), target_server_time,
+            self.client_game.rendering_intermission(),
+        ));
+        // TaystJK CG_Player: boon/enlightenment/ysalamiri and spawn
+        // protection are separate MD3 refEntities, not Ghoul2 body tints.
         // Use the same presentation view that selected player LODs; in first
         // person it was replaced above with this frame's exact sampled eye.
         let sphere_view_origin = ghoul2_view
             .map(crate::cgame::player_presenter::Ghoul2PresentationView::jka_position)
             .unwrap_or_else(|| scene::jka_position(sample.eye_position));
-        dynamic_models.extend(self.entity_presenter.present_invulnerability_bubbles(
+        dynamic_models.extend(self.entity_presenter.present_player_spheres(
             &self.presented_entities,
             followed_entity.as_ref(),
             &self.client_game,
@@ -909,6 +948,7 @@ impl GameSession {
                             self.race_ghost_alpha,
                             force_reset,
                             ghoul2_view,
+                            false, false,
                         ) {
                             Ok(mut draws) => dynamic_models.append(&mut draws),
                             Err(error) => ghost_errors.push(format!(
@@ -1028,6 +1068,14 @@ impl GameSession {
                 &fx_frame.auto_light_candidates, &mut resolve, target_server_time, self.promote_fx_lights,
             );
             fx_frame.lights.extend(promoted);
+        }
+        if crate::fx::diagnostics::enabled() {
+            use crate::fx::diagnostics as diag;
+            diag::set(diag::PROMOTION_LEVEL, self.promote_fx_lights as u64);
+            diag::add(diag::FX_DRAW_TOTAL, fx_frame.draws.len() as u64);
+            diag::add(diag::FX_DRAW_LINES, fx_frame.draws.iter()
+                .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Line { .. })).count() as u64);
+            diag::report_if_due();
         }
         self.gpu_commands = fx_frame.gpu_sparks.take();
         self.gpu_draw_indices = std::mem::take(&mut fx_frame.gpu_sprite_draw_indices);

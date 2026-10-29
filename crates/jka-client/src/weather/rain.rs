@@ -326,6 +326,20 @@ pub(crate) struct RainSystem {
 }
 
 impl RainSystem {
+    /// Share the existing map roof field with atmosphere/water; no second bake.
+    pub(crate) fn sky_admission(&self) -> (wgpu::TextureView, [f32; 4]) {
+        let mut uv = match &self.occlusion {
+            WeatherOcclusionCache::Ready(info) => [info.min_xz[0], info.min_xz[1], info.inv_extent_xz[0], info.inv_extent_xz[1]],
+            _ => [0.0; 4],
+        };
+        // Same-executable performance comparison. Keep the field built/bound in
+        // both runs; only the shader's admission lookups and lighting gates differ.
+        static TEST_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TEST_OFF.get_or_init(|| std::env::var("JKA_SKY_ADMISSION_TEST_OFF").as_deref() == Ok("1")) {
+            uv = [0.0; 4];
+        }
+        (self.gpu.collision_view.clone(), uv)
+    }
     pub(crate) fn native_sheltered(&self,position:[f32;3])->bool {
         self.cpu_field.as_ref().is_some_and(|field|field.exposure_at(position)<0.15)
     }

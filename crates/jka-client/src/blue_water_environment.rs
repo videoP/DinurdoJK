@@ -3,6 +3,17 @@ use blue_water_sky::{CloudGenus, HighCloudGenus, HighClouds, SkyQuality, SkyScen
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub quality: u8,
+    /// 0..3 select a cloud tier independently; 4 preserves the shared sky tier.
+    pub cloud_quality: u8,
+    /// Live experiments; deliberately not archived in the player's configuration.
+    pub cloud_debug: u8,
+    pub cloud_freeze: bool,
+    pub cloud_shadow_mode: u8,
+    pub cloud_shadow_far: f32,
+    pub cloud_far_step_scale: f32,
+    pub cloud_sun_steps: i32,
+    pub cloud_composite: bool,
+    pub cloud_altitude_rebase: bool,
     pub genus: u8,
     pub altitude: f32,
     pub thickness: f32,
@@ -43,6 +54,15 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             quality: 2,
+            cloud_quality: 4,
+            cloud_debug: 0,
+            cloud_freeze: false,
+            cloud_shadow_mode: 0,
+            cloud_shadow_far: 0.0,
+            cloud_far_step_scale: 1.0,
+            cloud_sun_steps: -1,
+            cloud_composite: true,
+            cloud_altitude_rebase: false,
             genus: 0,
             altitude: 1700.0,
             thickness: 2400.0,
@@ -87,6 +107,12 @@ impl Settings {
             };
         }
         self.quality = self.quality.min(3);
+        self.cloud_quality = self.cloud_quality.min(4);
+        self.cloud_debug = self.cloud_debug.min(5);
+        self.cloud_shadow_mode = self.cloud_shadow_mode.min(1);
+        self.cloud_sun_steps = self.cloud_sun_steps.clamp(-1, 8);
+        limit!(cloud_shadow_far, 0.0, 200000.0);
+        limit!(cloud_far_step_scale, 1.0, 4.0);
         self.genus = self.genus.min(7);
         self.high_genus = self.high_genus.min(3);
         self.weather_backend = self.weather_backend.min(2);
@@ -121,6 +147,12 @@ impl Settings {
             3 => SkyQuality::Ultra,
             _ => SkyQuality::High,
         }
+    }
+    pub fn cloud_quality(self) -> SkyQuality {
+        Self {
+            quality: if self.cloud_quality < 4 { self.cloud_quality } else { self.quality },
+            ..self
+        }.quality()
     }
     pub fn scene(
         self,
@@ -193,5 +225,22 @@ impl Settings {
             scene.clouds.fog = 0.0;
         }
         scene
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_quality_override_preserves_legacy_sky_tiers() {
+        for (value, tier) in [SkyQuality::Low, SkyQuality::Medium, SkyQuality::High, SkyQuality::Ultra].into_iter().enumerate() {
+            let settings = Settings { quality: value as u8, ..Default::default() };
+            assert_eq!(settings.cloud_quality(), tier);
+            let override_settings = Settings { cloud_quality: 0, ..settings };
+            assert_eq!(override_settings.cloud_quality(), SkyQuality::Low);
+            assert_eq!(override_settings.quality(), tier);
+        }
+        assert_eq!(Settings { cloud_quality: 255, ..Default::default() }.sanitize().cloud_quality(), SkyQuality::High);
     }
 }

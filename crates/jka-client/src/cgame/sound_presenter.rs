@@ -760,6 +760,32 @@ impl SoundPresenter {
         }
     }
 
+    pub(crate) fn recorded_player_frame(&mut self, listener:Listener, ghost_entity:u16, entity:&PresentedEntity, game:&ClientGameState, audible:bool) {
+        let mut recorded=entity.clone();
+        recorded.number=listener.entity;recorded.state.number=listener.entity;
+        let mut requests=Vec::new();
+        if audible {
+            saber_hum_loops(&recorded,game,&[],&self.prep.saber_definitions,listener.entity,&mut requests);
+            jetpack_loops(&recorded,game,listener.entity,&mut requests);
+        }
+        let mut resolved=Vec::new();
+        for request in requests {
+            match self.assets.register(&request.qpath) {
+                Ok(sound)=>resolved.push((request,sound)),
+                Err(error)=>self.warn_once(&request.qpath,&error),
+            }
+        }
+        if let Some(backend)=&mut self.backend {
+            backend.set_loops(resolved);
+            backend.frame(listener,[(listener.entity,entity.origin),(ghost_entity,entity.origin)].into_iter());
+        }
+    }
+
+    pub(crate) fn play_recorded_player_event(&mut self, event:&PresentationEvent, game:&ClientGameState, siege_classes:&[SiegeClassVisual]) {
+        let prepared=prepare_sound_event(event,game,siege_classes,&self.prep);
+        self.dispatch_prepared(event,game,siege_classes,event.server_time,prepared);
+    }
+
     pub fn frame(
         &mut self,
         listener: Listener,

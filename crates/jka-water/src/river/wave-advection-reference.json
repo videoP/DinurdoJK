@@ -1,0 +1,4019 @@
+{
+  "material_sha256": {
+    "river": "b6bd65173ab4079a3c15cd99d43e3cc54d637731f10dc2052096dc2cb0cf4d6b",
+    "advection": "a252dd09e766ffd4e23368b7b26a68922304307704bbb635ecdfa59b2288642b",
+    "parent": "6b36cf205664b25d57a8c60dc089b10d2635539c5efa6dee3c485c882ca18fba"
+  },
+  "effective_parameters": {
+    "LowVelocityWPOWaveScale": 0.10000000149011612,
+    "WaveSpeed": 1.0,
+    "WPOWaveAttenMin": 0.0,
+    "PulseLength": 2.0,
+    "WPOWaveScale": 0.0005000000237487257,
+    "BracketAngleDelta": 20.0,
+    "BracketMagnitudeDelta": 70.0,
+    "AdvectedWPOWaveCameraFalloff": 200.0,
+    "WPOWaveMIPBias": 2.0,
+    "WPOWaveAttenMax": 400.0,
+    "WPOWaveHeightMult": 5.0,
+    "LowVelocityWPOWaveAttenuationPower": 3.0
+  },
+  "selected_switches": {
+    "Bracketing": true,
+    "ThreePhase": true,
+    "AdvectWaveHeight": true
+  },
+  "river_wiring": {
+    "6": {
+      "class_path": "/Script/Engine.MaterialExpressionAdd",
+      "properties": {
+        "A": {
+          "expression": 288,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_38",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ConstB": 50.0,
+        "MaterialExpressionEditorX": -6496,
+        "MaterialExpressionEditorY": 2800,
+        "MaterialExpressionGuid": [
+          1804600878,
+          1298962006,
+          1724945842,
+          2497305675
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "9": {
+      "class_path": "/Script/Engine.MaterialExpressionCameraPositionWS",
+      "properties": {
+        "MaterialExpressionEditorX": -7072,
+        "MaterialExpressionEditorY": 3072,
+        "MaterialExpressionGuid": [
+          3508618645,
+          1189577575,
+          2932442808,
+          3296671297
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "38": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 238,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_38",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "A": true,
+        "MaterialExpressionEditorX": -7440,
+        "MaterialExpressionEditorY": 2544,
+        "MaterialExpressionGuid": [
+          1683488241,
+          1096093116,
+          2270495124,
+          3060526179
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "65": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "lerp(1, smoothstep(WaveAttenuationMin, WaveAttenuationMax, vmag), 1. - saturate(lvws));",
+        "OutputType": "CMOT_Float1",
+        "Inputs": [
+          {
+            "InputName": "vmag",
+            "Input": {
+              "expression": 167,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "lvws",
+            "Input": {
+              "expression": 257,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_1",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveAttenuationMin",
+            "Input": {
+              "expression": 268,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_2",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveAttenuationMax",
+            "Input": {
+              "expression": 311,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_65",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveScale",
+            "Input": {
+              "expression": 313,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_67",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 5456,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          3301039155,
+          1251124701,
+          594439352,
+          3075094391
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "74": {
+      "class_path": "/Script/Engine.MaterialExpressionDistance",
+      "properties": {
+        "A": {
+          "expression": 387,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionWorldPosition_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "B": {
+          "expression": 9,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCameraPositionWS_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -6864,
+        "MaterialExpressionEditorY": 2944,
+        "MaterialExpressionGuid": [
+          4215117722,
+          1195207725,
+          4255534215,
+          775521709
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "108": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -57,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_TextureAdvection.MF_TextureAdvection"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              129596669,
+              1195490174,
+              2879285182,
+              933705972
+            ],
+            "Input": {
+              "expression": 306,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_60",
+              "output": 0,
+              "input_name": "PulseLength",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2023138506,
+              1310608292,
+              134516142,
+              1254462422
+            ],
+            "Input": {
+              "expression": 233,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_32",
+              "output": 0,
+              "input_name": "AdvectedTextureScale",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3935971754,
+              1336653545,
+              2178251682,
+              1017516357
+            ],
+            "Input": {
+              "expression": 232,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_31",
+              "output": 0,
+              "input_name": "WorldGridSize",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2867738414,
+              1137494900,
+              3897374392,
+              1866681111
+            ],
+            "Input": {
+              "expression": 237,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_37",
+              "output": 0,
+              "input_name": "DeltaTime",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              22084167,
+              1212051484,
+              3807599550,
+              2411163702
+            ],
+            "Input": {
+              "expression": 235,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_35",
+              "output": 0,
+              "input_name": "dx",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              860842521,
+              1156118085,
+              2392684216,
+              57659877
+            ],
+            "Input": {
+              "expression": 236,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_36",
+              "output": 0,
+              "input_name": "AdvectionSpeed",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1888683231,
+              1135869337,
+              1418033303,
+              1655103131
+            ],
+            "Input": {
+              "expression": 234,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_34",
+              "output": 0,
+              "input_name": "AdvectedTexture",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3390882149,
+              1291667118,
+              3736808097,
+              957144359
+            ],
+            "Input": {
+              "expression": 308,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_62",
+              "output": 0,
+              "input_name": "BracketAngleDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1250257690,
+              1324047183,
+              1419912123,
+              4126842484
+            ],
+            "Input": {
+              "expression": 307,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_61",
+              "output": 0,
+              "input_name": "BracketMagnitudeDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              479437262,
+              1102614801,
+              3579897756,
+              516925703
+            ],
+            "Input": {
+              "expression": 168,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_15",
+              "output": 0,
+              "input_name": "Sim Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3481336904,
+              1240856046,
+              4142793639,
+              3755806786
+            ],
+            "Input": {
+              "expression": 310,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_64",
+              "output": 0,
+              "input_name": "MipLevelBias",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2181166340,
+              1093134053,
+              1674736288,
+              994808452
+            ],
+            "Input": {
+              "expression": 189,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_34",
+              "output": 0,
+              "input_name": "SimVelocity",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              313683522,
+              1275218451,
+              2403250611,
+              4092083882
+            ],
+            "Output": {
+              "OutputName": "Result",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": -8144,
+        "MaterialExpressionEditorY": 2736,
+        "MaterialExpressionGuid": [
+          1577415438,
+          1102091778,
+          1264894906,
+          2149164396
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Result",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "118": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 122,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_15",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 322,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionSmoothStep_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -6112,
+        "MaterialExpressionEditorY": 2544,
+        "MaterialExpressionGuid": [
+          1604519487,
+          1125232853,
+          2198982328,
+          4241717598
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "122": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 38,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionComponentMask_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 171,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_18",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -6928,
+        "MaterialExpressionEditorY": 2544,
+        "MaterialExpressionGuid": [
+          2544428198,
+          1270088748,
+          78258873,
+          1480558026
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "137": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 207,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionPower_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 313,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_67",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 6496,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          2102086304,
+          1206693580,
+          262266814,
+          1457344916
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "149": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 343,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_AdvectedWPOWaveHeight",
+        "NodeColor": [
+          0.4765619933605194,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2326063844,
+          1111324459,
+          3479111597,
+          2324754115
+        ],
+        "MaterialExpressionEditorX": -5472,
+        "MaterialExpressionEditorY": 2544,
+        "MaterialExpressionGuid": [
+          1856995419,
+          1217614169,
+          1051182720,
+          2725091796
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "167": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 141,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_1"
+        },
+        "DeclarationGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": 5088,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          1677880882,
+          1280812591,
+          560683442,
+          2754575388
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "171": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 142,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_10"
+        },
+        "DeclarationGuid": [
+          817955186,
+          1341511493,
+          159515061,
+          1132499815
+        ],
+        "MaterialExpressionEditorX": -7264,
+        "MaterialExpressionEditorY": 2688,
+        "MaterialExpressionGuid": [
+          3005279299,
+          1183861434,
+          1628696746,
+          649978563
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "182": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 149,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_17"
+        },
+        "DeclarationGuid": [
+          2326063844,
+          1111324459,
+          3479111597,
+          2324754115
+        ],
+        "MaterialExpressionEditorX": -8208,
+        "MaterialExpressionEditorY": 160,
+        "MaterialExpressionGuid": [
+          2826439062,
+          1130090970,
+          2447671695,
+          2000681052
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "207": {
+      "class_path": "/Script/Engine.MaterialExpressionPower",
+      "properties": {
+        "Base": {
+          "expression": 65,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Exponent": {
+          "expression": 314,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_68",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 6288,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          3171616930,
+          1239780969,
+          3640207034,
+          2248419362
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "233": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 274,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_25",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8352,
+        "MaterialExpressionEditorY": 2656,
+        "MaterialExpressionGuid": [
+          516684953,
+          1153608841,
+          1315255939,
+          1545211307
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "234": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 367,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionTextureObjectParameter_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8480,
+        "MaterialExpressionEditorY": 2976,
+        "MaterialExpressionGuid": [
+          2738746544,
+          1270651537,
+          298272938,
+          599279517
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "238": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 108,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -7728,
+        "MaterialExpressionEditorY": 2768,
+        "MaterialExpressionGuid": [
+          3241854870,
+          1171305971,
+          2839142830,
+          1788414177
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "257": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 0.9599999785423279,
+        "ParameterName": "LowVelocityWPOWaveScale",
+        "ExpressionGUID": [
+          62140010,
+          1172891713,
+          1356967565,
+          883034376
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": 5072,
+        "MaterialExpressionEditorY": 176,
+        "MaterialExpressionGuid": [
+          2783067296,
+          1098083691,
+          219013762,
+          1930981901
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "268": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 150.0,
+        "ParameterName": "WPOWaveAttenMin",
+        "ExpressionGUID": [
+          3053789211,
+          1197351368,
+          2749612183,
+          3850001584
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": 5088,
+        "MaterialExpressionEditorY": 304,
+        "MaterialExpressionGuid": [
+          2546442655,
+          1209052051,
+          3099690151,
+          2174173716
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "274": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "WPOWaveScale",
+        "ExpressionGUID": [
+          1717584855,
+          1210779060,
+          2464501651,
+          81878695
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": -8576,
+        "MaterialExpressionEditorY": 2608,
+        "MaterialExpressionGuid": [
+          246171537,
+          1158925212,
+          3751011978,
+          388170147
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "278": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "WaveSpeed",
+        "ExpressionGUID": [
+          1566502589,
+          1253452148,
+          2439312534,
+          2610485998
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": -8576,
+        "MaterialExpressionEditorY": 2416,
+        "MaterialExpressionGuid": [
+          3562998505,
+          1237689806,
+          1139640466,
+          690591595
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "288": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 200.0,
+        "ParameterName": "AdvectedWPOWaveCameraFalloff",
+        "ExpressionGUID": [
+          3908632362,
+          1339520858,
+          3170155154,
+          3291786574
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": -6752,
+        "MaterialExpressionEditorY": 2672,
+        "MaterialExpressionGuid": [
+          2578092518,
+          1227144710,
+          3423170717,
+          3662357146
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "306": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "PulseLength",
+        "ExpressionGUID": [
+          1680790498,
+          1300726434,
+          858376125,
+          3344327499
+        ],
+        "Group": "Advection",
+        "MaterialExpressionEditorX": -8496,
+        "MaterialExpressionEditorY": 3024,
+        "MaterialExpressionGuid": [
+          659070072,
+          1224398636,
+          1599818120,
+          2004695640
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "307": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 50.0,
+        "ParameterName": "BracketMagnitudeDelta",
+        "ExpressionGUID": [
+          1971852301,
+          1285274061,
+          1013559429,
+          496850598
+        ],
+        "Group": "Advection",
+        "MaterialExpressionEditorX": -8528,
+        "MaterialExpressionEditorY": 3216,
+        "MaterialExpressionGuid": [
+          4026894326,
+          1229268954,
+          1290014865,
+          3393456274
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "308": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 5.0,
+        "ParameterName": "BracketAngleDelta",
+        "ExpressionGUID": [
+          4250923424,
+          1238551139,
+          3490926006,
+          2914606810
+        ],
+        "Group": "Advection",
+        "MaterialExpressionEditorX": -8496,
+        "MaterialExpressionEditorY": 3120,
+        "MaterialExpressionGuid": [
+          1772665564,
+          1270686805,
+          3850673083,
+          4230780592
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "310": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 2.0,
+        "ParameterName": "WPOWaveMIPBias",
+        "ExpressionGUID": [
+          3238135088,
+          1301040645,
+          2215964048,
+          3312557665
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": -8448,
+        "MaterialExpressionEditorY": 3584,
+        "MaterialExpressionGuid": [
+          4123530435,
+          1339509529,
+          837804734,
+          2749016748
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "311": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 800.0,
+        "ParameterName": "WPOWaveAttenMax",
+        "ExpressionGUID": [
+          3002784444,
+          1165764949,
+          3059913381,
+          3306138680
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": 5088,
+        "MaterialExpressionEditorY": 400,
+        "MaterialExpressionGuid": [
+          1801088274,
+          1149646766,
+          488536218,
+          968270194
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "313": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "WPOWaveHeightMult",
+        "ExpressionGUID": [
+          3891424265,
+          1101533168,
+          763808409,
+          4243277625
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": 5088,
+        "MaterialExpressionEditorY": 528,
+        "MaterialExpressionGuid": [
+          1312150523,
+          1142831297,
+          3589822619,
+          760288421
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "314": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "LowVelocityWPOWaveAttenuationPower",
+        "ExpressionGUID": [
+          2817012823,
+          1153047041,
+          1864050061,
+          1479134320
+        ],
+        "Group": "Waves",
+        "MaterialExpressionEditorX": 5824,
+        "MaterialExpressionEditorY": 480,
+        "MaterialExpressionGuid": [
+          927642432,
+          1259680439,
+          2050978997,
+          1726836176
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "322": {
+      "class_path": "/Script/Engine.MaterialExpressionSmoothStep",
+      "properties": {
+        "Min": {
+          "expression": 288,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_38",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Max": {
+          "expression": 6,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionAdd_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Value": {
+          "expression": 74,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionDistance_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ConstMin": 200.0,
+        "ConstMax": 300.0,
+        "MaterialExpressionEditorX": -6288,
+        "MaterialExpressionEditorY": 2752,
+        "MaterialExpressionGuid": [
+          1802590169,
+          1215276131,
+          3770671791,
+          2314679263
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "343": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 118,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_10",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 51,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ParameterName": "AdvectWaveHeight",
+        "ExpressionGUID": [
+          3037152658,
+          1230808490,
+          680973955,
+          325915166
+        ],
+        "MaterialExpressionEditorX": -5792,
+        "MaterialExpressionEditorY": 2528,
+        "MaterialExpressionGuid": [
+          3816753626,
+          1235226582,
+          2520166837,
+          1453817285
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "367": {
+      "class_path": "/Script/Engine.MaterialExpressionTextureObjectParameter",
+      "properties": {
+        "ParameterName": "NormalDetailTex",
+        "ExpressionGUID": [
+          3518119712,
+          1311487670,
+          3213151113,
+          1291003843
+        ],
+        "Group": "Set From Niagara",
+        "MaterialExpressionEditorX": -8864,
+        "MaterialExpressionEditorY": 2928,
+        "MaterialExpressionGuid": [
+          3857506431,
+          1164665407,
+          1084059832,
+          3591800782
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "387": {
+      "class_path": "/Script/Engine.MaterialExpressionWorldPosition",
+      "properties": {
+        "MaterialExpressionEditorX": -7376,
+        "MaterialExpressionEditorY": 2928,
+        "MaterialExpressionGuid": [
+          832066174,
+          1092215025,
+          1957670822,
+          2572489548
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    }
+  },
+  "advection_graph": {
+    "1": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": 224,
+        "MaterialExpressionEditorY": -4448,
+        "MaterialExpressionGuid": [
+          3008901984,
+          1307226823,
+          68366243,
+          3301628810
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "2": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": 512,
+        "MaterialExpressionEditorY": -2704,
+        "MaterialExpressionGuid": [
+          2381598903,
+          1188653490,
+          3546866101,
+          1842853590
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "3": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": 544,
+        "MaterialExpressionEditorY": -528,
+        "MaterialExpressionGuid": [
+          2660796918,
+          1337730941,
+          3556982926,
+          3228160882
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "4": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": 576,
+        "MaterialExpressionEditorY": 192,
+        "MaterialExpressionGuid": [
+          3176097126,
+          1178867898,
+          2270072980,
+          10581048
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "5": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "const float2 UV = WorldPosition.xy;\r\n\r\n// includes the advection speed scale, which can be spatially varying and is split out for mip calculation\r\nfloat2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nconst float3 FullScaledVelocity3D = float3(FullScaledVelocity, 0);\r\nconst float3 VelocityInPlane = FullScaledVelocity3D - dot(FullScaledVelocity3D, SimNormal) * SimNormal;\r\n\r\n//const float3 PlaneAxisU = -normalize(cross(SimNormal, normalize(float3(0,1,0))));\r\n//const float3 PlaneAxisV = normalize(cross(SimNormal, PlaneAxisU));\r\n//const float2 ProjectedVelocity = float2(dot(VelocityInPlane, PlaneAxisU), dot(VelocityInPlane, PlaneAxisV));\r\n\r\nFullScaledVelocity = VelocityInPlane.xy;\r\n\r\n// bracket velocity based on angle\r\nfloat2 VelocityDir0;\r\nfloat2 VelocityDir1;\r\nfloat VelocityBlendAlpha;\r\nBracketAngle(FullScaledVelocity, BracketAngleDelta, VelocityDir0, VelocityDir1, VelocityBlendAlpha);\r\n\r\n// bracket velocity based on magnitude\r\nfloat VelocityMagnitude = length(FullScaledVelocity);\r\nfloat VelocityMagnitude0;\r\nfloat VelocityMagnitude1;\r\nfloat VelocityMagnitudeBlendAlpha;\r\nBracketValue(VelocityMagnitude, BracketMagnitudeDelta, VelocityMagnitude0, VelocityMagnitude1, VelocityMagnitudeBlendAlpha);\r\n\r\n// store all combinations of bracketed velocity dir and magnitude\r\nfloat2 Velocities[4];\r\nVelocities[0] = VelocityDir0 * VelocityMagnitude0;\r\nVelocities[1] = VelocityDir0 * VelocityMagnitude1; \r\nVelocities[2] = VelocityDir1 * VelocityMagnitude0; \r\nVelocities[3] = VelocityDir1 * VelocityMagnitude1;\r\n\r\n// compute phases\r\nfloat lerp0, lerp1, lerp2, t0, t1, t2;\r\nfloat3 CycleCount;\r\nCompute3Phases(PulseLength, Time, lerp0, lerp1, lerp2, t0, t1, t2, CycleCount);\r\n\r\n// compute advected uv based for two phases based on original velocity\r\nfloat2 AdvectedUV0 = UV - Velocity.xy * t0;\r\nfloat2 AdvectedUV1 = UV - Velocity.xy * t1;\r\nfloat2 AdvectedUV2 = UV - Velocity.xy * t2;\r\n\r\n// scale advected uvs\r\nfloat2 uv0 = AdvectedUV0 * AdvectedTextureScale;\r\nfloat2 uv1 = AdvectedUV1 * AdvectedTextureScale;\r\nfloat2 uv2 = AdvectedUV2 * AdvectedTextureScale;\r\n\r\n// compute mip levels based on the uv from advecting the original velocity\r\n// this avoids seams when mip mapping because of disncontinuities in the bracketed velocities\r\nfloat2 TexDims;\r\nfloat Levels;\r\nTex.GetDimensions(0, TexDims.x, TexDims.y, Levels);\r\n\r\nfloat3 MipLevels;\r\n\r\n#if VERTEXSHADER\r\n    MipLevels = TheMipBias;\r\n#else\r\n    MipLevels.x = ComputeMipLevel(uv0, TexDims);\r\n    MipLevels.y = ComputeMipLevel(uv1, TexDims);\r\n    MipLevels.z = ComputeMipLevel(uv2, TexDims);\r\n    MipLevels = clamp(MipLevels + TheMipBias, 0, Levels);\r\n#endif\r\n\r\n// perform two phase advection for each of the bracketed velocities and interpolate\r\nfloat4 TextureSamples[4];\r\nfor (int i = 0; i < 4; ++i)\r\n{\r\n    TextureSamples[i] = AdvectionInterpolation3(UV, Velocities[i], t0, t1, t2, lerp0, lerp1, lerp2, AdvectedTextureScale, MipLevels, Tex, TexSampler, CycleCount);\r\n}\r\n\r\n// interpolate samples based on bracketing\r\nfloat4 Sample0 = lerp(TextureSamples[0], TextureSamples[1], VelocityMagnitudeBlendAlpha);\r\nfloat4 Sample1 = lerp(TextureSamples[2], TextureSamples[3], VelocityMagnitudeBlendAlpha);\r\n\r\nreturn lerp(Sample0, Sample1, VelocityBlendAlpha);",
+        "OutputType": "CMOT_Float4",
+        "Inputs": [
+          {
+            "InputName": "Tex",
+            "Input": {
+              "expression": 25,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_12",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WorldPosition",
+            "Input": {
+              "expression": 26,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_13",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Time",
+            "Input": {
+              "expression": 28,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_15",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Speed",
+            "Input": {
+              "expression": 29,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_16",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Velocity",
+            "Input": {
+              "expression": 13,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE",
+            "Input": {
+              "expression": 1,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dt",
+            "Input": {
+              "expression": 30,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_19",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dx",
+            "Input": {
+              "expression": 32,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_20",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WorldGridSize",
+            "Input": {
+              "expression": 38,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_27",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "AdvectedTextureScale",
+            "Input": {
+              "expression": 33,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_21",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "PulseLength",
+            "Input": {
+              "expression": 34,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_22",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "TheMipBias",
+            "Input": {
+              "expression": 27,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "BracketAngleDelta",
+            "Input": {
+              "expression": 43,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_6",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "BracketMagnitudeDelta",
+            "Input": {
+              "expression": 44,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_7",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE2",
+            "Input": {
+              "expression": 1,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "SimNormal",
+            "Input": {
+              "expression": 11,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_12",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "IncludeFilePaths": [
+          "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 704,
+        "MaterialExpressionEditorY": -4624,
+        "MaterialExpressionGuid": [
+          437161222,
+          1223250583,
+          2470398631,
+          340895332
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        },
+        "bCollapsed": true
+      }
+    },
+    "6": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "const float2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nfloat lerp0, t0, t1;\r\nfloat2 CycleCount;\r\nCompute2Phases(PulseLength, Time, lerp0, t0, t1, CycleCount);\r\n\r\nreturn AdvectionInterpolation2(UV, FullScaledVelocity, t0, t1, lerp0, AdvectedTextureScale, 0, Tex, TexSampler, CycleCount);",
+        "OutputType": "CMOT_Float4",
+        "Inputs": [
+          {
+            "InputName": "Tex",
+            "Input": {
+              "expression": 42,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_5",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "UV",
+            "Input": {
+              "expression": 41,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_4",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Time",
+            "Input": {
+              "expression": 40,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_3",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Speed",
+            "Input": {
+              "expression": 31,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_2",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Velocity",
+            "Input": {
+              "expression": 13,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE",
+            "Input": {
+              "expression": 4,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_3",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dt",
+            "Input": {
+              "expression": 45,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_9",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dx",
+            "Input": {
+              "expression": 23,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_10",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "AdvectedTextureScale",
+            "Input": {
+              "expression": 24,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_11",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "PulseLength",
+            "Input": {
+              "expression": 22,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "TheMipLevel",
+            "Input": {
+              "expression": 27,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "IncludeFilePaths": [
+          "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 848,
+        "MaterialExpressionEditorY": -192,
+        "MaterialExpressionGuid": [
+          878651343,
+          1092091576,
+          2234392999,
+          98548629
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "7": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "const float2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nfloat lerp0, lerp1, lerp2, t0, t1, t2;\r\nfloat3 CycleCount;\r\nCompute3Phases(PulseLength, Time, lerp0, lerp1, lerp2, t0, t1, t2, CycleCount);\r\n\r\n\r\n\r\nreturn AdvectionInterpolation3(UV, FullScaledVelocity, t0, t1, t2, lerp0, lerp1, lerp2, AdvectedTextureScale, 0, Tex, TexSampler, CycleCount);",
+        "OutputType": "CMOT_Float4",
+        "Inputs": [
+          {
+            "InputName": "Tex",
+            "Input": {
+              "expression": 42,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_5",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "UV",
+            "Input": {
+              "expression": 41,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_4",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Time",
+            "Input": {
+              "expression": 40,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_3",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Speed",
+            "Input": {
+              "expression": 31,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_2",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Velocity",
+            "Input": {
+              "expression": 13,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE",
+            "Input": {
+              "expression": 3,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_2",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dt",
+            "Input": {
+              "expression": 45,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_9",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dx",
+            "Input": {
+              "expression": 23,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_10",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WorldGridSize",
+            "Input": {
+              "expression": 15,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_4",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "AdvectedTextureScale",
+            "Input": {
+              "expression": 24,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_11",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "PulseLength",
+            "Input": {
+              "expression": 22,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "TheMipLevel",
+            "Input": {
+              "expression": 27,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "IncludeFilePaths": [
+          "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 816,
+        "MaterialExpressionEditorY": -832,
+        "MaterialExpressionGuid": [
+          1238167151,
+          1269369929,
+          909475254,
+          3451112317
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "8": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "const float2 UV = WorldPosition.xy;\r\n\r\n// includes the advection speed scale, which can be spatially varying and is split out for mip calculation\r\nfloat2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nconst float3 FullScaledVelocity3D = float3(FullScaledVelocity, 0);\r\nconst float3 VelocityInPlane = FullScaledVelocity3D - dot(FullScaledVelocity3D, SimNormal) * SimNormal;\r\n\r\n//const float3 PlaneAxisU = -normalize(cross(SimNormal, normalize(float3(0,1,0))));\r\n//const float3 PlaneAxisV = normalize(cross(SimNormal, PlaneAxisU));\r\n//const float2 ProjectedVelocity = float2(dot(VelocityInPlane, PlaneAxisU), dot(VelocityInPlane, PlaneAxisV));\r\n\r\nFullScaledVelocity = VelocityInPlane.xy;\r\n\r\n// bracket velocity based on angle\r\nfloat2 VelocityDir0;\r\nfloat2 VelocityDir1;\r\nfloat VelocityBlendAlpha;\r\nBracketAngle(FullScaledVelocity, BracketAngleDelta, VelocityDir0, VelocityDir1, VelocityBlendAlpha);\r\n\r\n// bracket velocity based on magnitude\r\nfloat VelocityMagnitude = length(FullScaledVelocity);\r\nfloat VelocityMagnitude0;\r\nfloat VelocityMagnitude1;\r\nfloat VelocityMagnitudeBlendAlpha;\r\nBracketValue(VelocityMagnitude, BracketMagnitudeDelta, VelocityMagnitude0, VelocityMagnitude1, VelocityMagnitudeBlendAlpha);\r\n\r\n// store all combinations of bracketed velocity dir and magnitude\r\nfloat2 Velocities[4];\r\nVelocities[0] = VelocityDir0 * VelocityMagnitude0;\r\nVelocities[1] = VelocityDir0 * VelocityMagnitude1; \r\nVelocities[2] = VelocityDir1 * VelocityMagnitude0; \r\nVelocities[3] = VelocityDir1 * VelocityMagnitude1;\r\n\r\n// two phase flow\r\nfloat lerpV, t0, t1;\r\nfloat2 CycleCount;\r\nCompute2Phases(PulseLength, Time, lerpV, t0, t1, CycleCount);\r\n\r\n// compute advected uv based for two phases based on original velocity\r\nfloat2 AdvectedUV0 = UV - Velocity.xy * t0;\r\nfloat2 AdvectedUV1 = UV - Velocity.xy * t1;\r\n\r\n// scale advected uvs\r\nfloat2 uv0 = AdvectedUV0 * AdvectedTextureScale;\r\nfloat2 uv1 = AdvectedUV1 * AdvectedTextureScale;\r\n\r\n// compute mip levels based on the uv from advecting the original velocity\r\n// this avoids seams when mip mapping because of disncontinuities in the bracketed velocities\r\nfloat2 TexDims;\r\nfloat Levels;\r\nTex.GetDimensions(0, TexDims.x, TexDims.y, Levels);\r\n\r\nfloat2 MipLevels;\r\n\r\n#if VERTEXSHADER\r\n    MipLevels = 0;\r\n#else\r\n    MipLevels.x = ComputeMipLevel(uv0, TexDims);\r\n    MipLevels.y = ComputeMipLevel(uv1, TexDims);\r\n    MipLevels = clamp(MipLevels + TheMipBias, 0, Levels);\r\n#endif\r\n\r\n// perform two phase advection for each of the bracketed velocities and interpolate\r\nfloat4 TextureSamples[4];\r\nfor (int i = 0; i < 4; ++i)\r\n{\r\n    TextureSamples[i] = AdvectionInterpolation2(UV, Velocities[i], t0, t1, lerpV, AdvectedTextureScale, MipLevels, Tex, TexSampler, CycleCount);\r\n}\r\n\r\n// interpolate samples based on bracketing\r\nfloat4 Sample0 = lerp(TextureSamples[0], TextureSamples[1], VelocityMagnitudeBlendAlpha);\r\nfloat4 Sample1 = lerp(TextureSamples[2], TextureSamples[3], VelocityMagnitudeBlendAlpha);\r\n\r\nreturn lerp(Sample0, Sample1, VelocityBlendAlpha);",
+        "OutputType": "CMOT_Float4",
+        "Inputs": [
+          {
+            "InputName": "Tex",
+            "Input": {
+              "expression": 25,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_12",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WorldPosition",
+            "Input": {
+              "expression": 26,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_13",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Time",
+            "Input": {
+              "expression": 28,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_15",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Speed",
+            "Input": {
+              "expression": 29,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_16",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Velocity",
+            "Input": {
+              "expression": 13,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_14",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE",
+            "Input": {
+              "expression": 2,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_1",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dt",
+            "Input": {
+              "expression": 30,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_19",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "dx",
+            "Input": {
+              "expression": 32,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_20",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WorldGridSize",
+            "Input": {
+              "expression": 38,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_27",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "AdvectedTextureScale",
+            "Input": {
+              "expression": 33,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_21",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "PulseLength",
+            "Input": {
+              "expression": 34,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_22",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "TheMipBias",
+            "Input": {
+              "expression": 39,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_28",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "BracketAngleDelta",
+            "Input": {
+              "expression": 43,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_6",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "BracketMagnitudeDelta",
+            "Input": {
+              "expression": 44,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_7",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "IGNORE2",
+            "Input": {
+              "expression": 2,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionConstant_1",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "SimNormal",
+            "Input": {
+              "expression": 35,
+              "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_23",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "IncludeFilePaths": [
+          "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 880,
+        "MaterialExpressionEditorY": -2688,
+        "MaterialExpressionGuid": [
+          1777634542,
+          1105078028,
+          698712735,
+          2688450180
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        },
+        "bCollapsed": true
+      }
+    },
+    "9": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "Preview": {
+          "expression": 49,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionTextureObject_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "InputName": "AdvectedTexture",
+        "Id": [
+          1888683231,
+          1135869337,
+          1418033303,
+          1655103131
+        ],
+        "InputType": "FunctionInput_Texture2D",
+        "MaterialExpressionEditorX": -1744,
+        "MaterialExpressionEditorY": -1536,
+        "MaterialExpressionGuid": [
+          3248097462,
+          1109702978,
+          2610348198,
+          2933495057
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "10": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "BracketMagnitudeDelta",
+        "Id": [
+          1250257690,
+          1324047183,
+          1419912123,
+          4126842484
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1168,
+        "MaterialExpressionEditorY": -1936,
+        "MaterialExpressionGuid": [
+          330098244,
+          1165194003,
+          3828170913,
+          3571532026
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "11": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "Sim Normal",
+        "Id": [
+          479437262,
+          1102614801,
+          3579897756,
+          516925703
+        ],
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -1520,
+        "MaterialExpressionGuid": [
+          2407704585,
+          1261741538,
+          33772452,
+          1901198495
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "12": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "MipLevelBias",
+        "Id": [
+          3481336904,
+          1240856046,
+          4142793639,
+          3755806786
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1680,
+        "MaterialExpressionEditorY": -640,
+        "MaterialExpressionGuid": [
+          2548860622,
+          1075203919,
+          1746216875,
+          3287901041
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "13": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "SimVelocity",
+        "Id": [
+          2181166340,
+          1093134053,
+          1674736288,
+          994808452
+        ],
+        "MaterialExpressionEditorX": -1040,
+        "MaterialExpressionEditorY": -1328,
+        "MaterialExpressionGuid": [
+          1081909087,
+          1254124434,
+          3700886931,
+          996372116
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "14": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "AdvectedTextureScale",
+        "Id": [
+          2023138506,
+          1310608292,
+          134516142,
+          1254462422
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1840,
+        "MaterialExpressionEditorY": 288,
+        "MaterialExpressionGuid": [
+          3179364063,
+          1309106413,
+          2306566039,
+          3999689385
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "15": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "WorldGridSize",
+        "Id": [
+          3935971754,
+          1336653545,
+          2178251682,
+          1017516357
+        ],
+        "MaterialExpressionEditorX": -1808,
+        "MaterialExpressionEditorY": 688,
+        "MaterialExpressionGuid": [
+          3318623796,
+          1260091858,
+          421288860,
+          1012768091
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "16": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "DeltaTime",
+        "Id": [
+          2867738414,
+          1137494900,
+          3897374392,
+          1866681111
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1776,
+        "MaterialExpressionEditorY": -80,
+        "MaterialExpressionGuid": [
+          3216559114,
+          1091758852,
+          918253463,
+          340966979
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "17": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "dx",
+        "Id": [
+          22084167,
+          1212051484,
+          3807599550,
+          2411163702
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1728,
+        "MaterialExpressionEditorY": 112,
+        "MaterialExpressionGuid": [
+          1220088659,
+          1173824753,
+          1503308200,
+          676203035
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "18": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "AdvectionSpeed",
+        "Id": [
+          860842521,
+          1156118085,
+          2392684216,
+          57659877
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1712,
+        "MaterialExpressionEditorY": -1040,
+        "MaterialExpressionGuid": [
+          2826660475,
+          1151430301,
+          1709617568,
+          413697645
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "19": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "PulseLength",
+        "Id": [
+          129596669,
+          1195490174,
+          2879285182,
+          933705972
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1792,
+        "MaterialExpressionEditorY": 496,
+        "MaterialExpressionGuid": [
+          1114516179,
+          1123032904,
+          2572435112,
+          597555035
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "20": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "BracketAngleDelta",
+        "Id": [
+          3390882149,
+          1291667118,
+          3736808097,
+          957144359
+        ],
+        "InputType": "FunctionInput_Scalar",
+        "MaterialExpressionEditorX": -1136,
+        "MaterialExpressionEditorY": -2144,
+        "MaterialExpressionGuid": [
+          1508380671,
+          1238936797,
+          733820321,
+          3490288830
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "21": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionOutput",
+      "properties": {
+        "A": {
+          "expression": 46,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "bLastPreviewed": true,
+        "Id": [
+          313683522,
+          1275218451,
+          2403250611,
+          4092083882
+        ],
+        "MaterialExpressionEditorX": 4112,
+        "MaterialExpressionEditorY": -1584,
+        "MaterialExpressionGuid": [
+          1883302389,
+          1252572310,
+          3244714421,
+          489263723
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "22": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 19,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -784,
+        "MaterialExpressionGuid": [
+          930272018,
+          1186440270,
+          2682420368,
+          3166983125
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "23": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 17,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -880,
+        "MaterialExpressionGuid": [
+          3452952660,
+          1093215787,
+          2449360559,
+          793083154
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "24": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 14,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -832,
+        "MaterialExpressionGuid": [
+          1192715596,
+          1142534800,
+          3828928943,
+          3420929273
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "25": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 42,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 114,
+        "MaterialExpressionEditorY": -2437,
+        "MaterialExpressionGuid": [
+          2914806528,
+          1277778877,
+          529847733,
+          206440402
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "26": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 52,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionWorldPosition_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -2412,
+        "MaterialExpressionGuid": [
+          2025001351,
+          1183570612,
+          2328331914,
+          1992001715
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "27": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 12,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -736,
+        "MaterialExpressionGuid": [
+          1413148403,
+          1313306539,
+          1827291536,
+          3708551732
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "28": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 40,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 110,
+        "MaterialExpressionEditorY": -2380,
+        "MaterialExpressionGuid": [
+          4035736156,
+          1252798405,
+          1464838063,
+          1594924011
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "29": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 31,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 108,
+        "MaterialExpressionEditorY": -2352,
+        "MaterialExpressionGuid": [
+          729300036,
+          1306445196,
+          785449123,
+          702948872
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "30": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 23,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_10",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 110,
+        "MaterialExpressionEditorY": -2264,
+        "MaterialExpressionGuid": [
+          1862761683,
+          1300315960,
+          2951270018,
+          2473537542
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "31": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 18,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -1056,
+        "MaterialExpressionGuid": [
+          3365172441,
+          1268739338,
+          1159820178,
+          2316878294
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "32": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 23,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_10",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -2236,
+        "MaterialExpressionGuid": [
+          3945250585,
+          1172455613,
+          3276457619,
+          2123527801
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "33": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 24,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_11",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 110,
+        "MaterialExpressionEditorY": -2198,
+        "MaterialExpressionGuid": [
+          366397886,
+          1181473782,
+          703354501,
+          2063497102
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "34": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 22,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -2176,
+        "MaterialExpressionGuid": [
+          1170145649,
+          1303287045,
+          1807659399,
+          3936970862
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "35": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 11,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_12",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -1888,
+        "MaterialExpressionGuid": [
+          4011707566,
+          1298933426,
+          3521793417,
+          1632214745
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "36": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 20,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_9",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -748,
+        "MaterialExpressionEditorY": -1996,
+        "MaterialExpressionGuid": [
+          3724383914,
+          1082036194,
+          2392252039,
+          1956375079
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "37": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 10,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_10",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -736,
+        "MaterialExpressionEditorY": -1776,
+        "MaterialExpressionGuid": [
+          54993706,
+          1195681409,
+          712576401,
+          3575691610
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "38": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 15,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -2128,
+        "MaterialExpressionGuid": [
+          2980921885,
+          1302200428,
+          816732079,
+          2474008122
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "39": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 27,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_14",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 112,
+        "MaterialExpressionEditorY": -2096,
+        "MaterialExpressionGuid": [
+          412635150,
+          1191458384,
+          3912622486,
+          1749664843
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "40": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 50,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionTime_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -1104,
+        "MaterialExpressionGuid": [
+          1456710380,
+          1314709811,
+          74751153,
+          1269809382
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "41": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 51,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionWorldPosition_0",
+          "output": 1,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -1152,
+        "MaterialExpressionGuid": [
+          2718305266,
+          1261830034,
+          2506796703,
+          3624499954
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "42": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 9,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -1200,
+        "MaterialExpressionGuid": [
+          3469636712,
+          1307801844,
+          1405714313,
+          2573332571
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "43": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 36,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_24",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 111,
+        "MaterialExpressionEditorY": -2060,
+        "MaterialExpressionGuid": [
+          2310152195,
+          1247135881,
+          2697456829,
+          2992587754
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "44": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 37,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionReroute_25",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 111,
+        "MaterialExpressionEditorY": -1988,
+        "MaterialExpressionGuid": [
+          241586827,
+          1215931370,
+          2632140428,
+          3822495083
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "45": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 16,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionFunctionInput_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1056,
+        "MaterialExpressionEditorY": -912,
+        "MaterialExpressionGuid": [
+          2001698390,
+          1115294511,
+          3668258459,
+          2705628237
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "46": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 47,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 48,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ParameterName": "Bracketing",
+        "ExpressionGUID": [
+          3426892999,
+          1289474671,
+          1715769497,
+          1010764510
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": 3744,
+        "MaterialExpressionEditorY": -1584,
+        "MaterialExpressionGuid": [
+          2628769870,
+          1241686397,
+          4111675015,
+          401022702
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "47": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 5,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionCustom_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 8,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionCustom_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "ThreePhase",
+        "ExpressionGUID": [
+          541171792,
+          1340296331,
+          2750264204,
+          870267551
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": 2400,
+        "MaterialExpressionEditorY": -3568,
+        "MaterialExpressionGuid": [
+          7368421,
+          1088873662,
+          128457141,
+          3618789017
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "48": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 7,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionCustom_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 6,
+          "expression_path": "MF_TextureAdvection.MaterialExpressionCustom_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "ThreePhase",
+        "ExpressionGUID": [
+          2830244728,
+          1213209829,
+          3906776247,
+          1512273506
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": 2416,
+        "MaterialExpressionEditorY": -528,
+        "MaterialExpressionGuid": [
+          2533202119,
+          1133889264,
+          4136681123,
+          3568530687
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "49": {
+      "class_path": "/Script/Engine.MaterialExpressionTextureObject",
+      "properties": {
+        "MaterialExpressionEditorX": -2016,
+        "MaterialExpressionEditorY": -1536,
+        "MaterialExpressionGuid": [
+          3181099922,
+          1312121309,
+          1903176368,
+          2848253106
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "50": {
+      "class_path": "/Script/Engine.MaterialExpressionTime",
+      "properties": {
+        "MaterialExpressionEditorX": -1568,
+        "MaterialExpressionEditorY": -1152,
+        "MaterialExpressionGuid": [
+          209016562,
+          1340829653,
+          2189817768,
+          2068431010
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "51": {
+      "class_path": "/Script/Engine.MaterialExpressionWorldPosition",
+      "properties": {
+        "MaterialExpressionEditorX": -1664,
+        "MaterialExpressionEditorY": -1328,
+        "MaterialExpressionGuid": [
+          4131491909,
+          1286106363,
+          2344527016,
+          2104639679
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "52": {
+      "class_path": "/Script/Engine.MaterialExpressionWorldPosition",
+      "properties": {
+        "MaterialExpressionEditorX": -624,
+        "MaterialExpressionEditorY": -2432,
+        "MaterialExpressionGuid": [
+          1151907549,
+          1258385343,
+          613310116,
+          152104778
+        ],
+        "Function": {
+          "object": 53,
+          "path": "MF_TextureAdvection"
+        }
+      }
+    },
+    "53": {
+      "class_path": "/Script/Engine.MaterialFunction",
+      "properties": {
+        "EditorOnlyData": {
+          "object": 54,
+          "path": "MF_TextureAdvection.MF_TextureAdvectionEditorOnlyData"
+        },
+        "StateId": [
+          1650523939,
+          1322093979,
+          2827315376,
+          3142797517
+        ],
+        "CombinedInputTypes": 31
+      }
+    },
+    "54": {
+      "class_path": "/Script/Engine.MaterialFunctionEditorOnlyData",
+      "properties": {
+        "ExpressionCollection": {
+          "Expressions": [
+            {
+              "object": 21,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionOutput_0"
+            },
+            {
+              "object": 48,
+              "path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_3"
+            },
+            {
+              "object": 6,
+              "path": "MF_TextureAdvection.MaterialExpressionCustom_1"
+            },
+            {
+              "object": 50,
+              "path": "MF_TextureAdvection.MaterialExpressionTime_0"
+            },
+            {
+              "object": 7,
+              "path": "MF_TextureAdvection.MaterialExpressionCustom_2"
+            },
+            {
+              "object": 31,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_2"
+            },
+            {
+              "object": 40,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_3"
+            },
+            {
+              "object": 41,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_4"
+            },
+            {
+              "object": 42,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_5"
+            },
+            {
+              "object": 51,
+              "path": "MF_TextureAdvection.MaterialExpressionWorldPosition_0"
+            },
+            {
+              "object": 9,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_0"
+            },
+            {
+              "object": 14,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_2"
+            },
+            {
+              "object": 15,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_4"
+            },
+            {
+              "object": 16,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_5"
+            },
+            {
+              "object": 17,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_6"
+            },
+            {
+              "object": 18,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_7"
+            },
+            {
+              "object": 19,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_8"
+            },
+            {
+              "object": 22,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_0"
+            },
+            {
+              "object": 46,
+              "path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_0"
+            },
+            {
+              "object": 45,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_9"
+            },
+            {
+              "object": 23,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_10"
+            },
+            {
+              "object": 24,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_11"
+            },
+            {
+              "object": 27,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_14"
+            },
+            {
+              "object": 8,
+              "path": "MF_TextureAdvection.MaterialExpressionCustom_4"
+            },
+            {
+              "object": 25,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_12"
+            },
+            {
+              "object": 26,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_13"
+            },
+            {
+              "object": 28,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_15"
+            },
+            {
+              "object": 29,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_16"
+            },
+            {
+              "object": 30,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_19"
+            },
+            {
+              "object": 32,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_20"
+            },
+            {
+              "object": 33,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_21"
+            },
+            {
+              "object": 34,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_22"
+            },
+            {
+              "object": 20,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_9"
+            },
+            {
+              "object": 10,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_10"
+            },
+            {
+              "object": 36,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_24"
+            },
+            {
+              "object": 37,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_25"
+            },
+            {
+              "object": 47,
+              "path": "MF_TextureAdvection.MaterialExpressionStaticSwitchParameter_1"
+            },
+            {
+              "object": 5,
+              "path": "MF_TextureAdvection.MaterialExpressionCustom_0"
+            },
+            {
+              "object": 43,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_6"
+            },
+            {
+              "object": 44,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_7"
+            },
+            {
+              "object": 38,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_27"
+            },
+            {
+              "object": 39,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_28"
+            },
+            {
+              "object": 11,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_12"
+            },
+            {
+              "object": 35,
+              "path": "MF_TextureAdvection.MaterialExpressionReroute_23"
+            },
+            {
+              "object": 52,
+              "path": "MF_TextureAdvection.MaterialExpressionWorldPosition_1"
+            },
+            {
+              "object": 12,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_13"
+            },
+            {
+              "object": 49,
+              "path": "MF_TextureAdvection.MaterialExpressionTextureObject_1"
+            },
+            {
+              "object": 13,
+              "path": "MF_TextureAdvection.MaterialExpressionFunctionInput_14"
+            },
+            {
+              "object": 1,
+              "path": "MF_TextureAdvection.MaterialExpressionConstant_0"
+            },
+            {
+              "object": 2,
+              "path": "MF_TextureAdvection.MaterialExpressionConstant_1"
+            },
+            {
+              "object": 3,
+              "path": "MF_TextureAdvection.MaterialExpressionConstant_2"
+            },
+            {
+              "object": 4,
+              "path": "MF_TextureAdvection.MaterialExpressionConstant_3"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "native_helpers": {
+    "BracketAngle": "void BracketAngle(float2 Velocity, float BracketAngleDelta, out float2 VelocityDir0, out float2 VelocityDir1, out float BlendAlpha)\n{\n\tif (BracketAngleDelta > 1e-5)\n\t{\n\t\tconst float AngleDelta = BracketAngleDelta * PI / 180.0;\n\t\tconst float2x2 RotateByAngleDelta = float2x2(cos(AngleDelta), sin(AngleDelta), -sin(AngleDelta), cos(AngleDelta));\n\n\t\t// direction of input velocity\t\t\n\t\tfloat Angle = atan2(Velocity.y, Velocity.x);\n\t\tAngle = Angle < 0.0 ? Angle + 2.0 * PI : Angle;\n\n\t\t// Snap to min bracketed angle\n\t\tconst float Fractional = fmod(Angle, AngleDelta);\n\t\tconst float Angle0 = Angle - Fractional;\n    \n\t\t// Compute velocity direction snapped to the bracketed angle\n\t\tVelocityDir0 = float2(cos(Angle0), sin(Angle0));\n\n\t\t// second bracketed direction is just rotated by the angle delta\n\t\tVelocityDir1 = mul(VelocityDir0, RotateByAngleDelta);\n\n\t\t// blend is the distance the velocity heading is to the first bracketed angle\n\t\tBlendAlpha = Fractional / AngleDelta;\n\t}\n\telse\n\t{\n\t\t// edge case where angle delta is 0, this turns off bracketing\n\t\tVelocityDir0 = normalize(Velocity);\n\t\tVelocityDir1 = VelocityDir0;\t\t\n\t\tBlendAlpha = 0.0;\n\t}\n}",
+    "BracketValue": "void BracketValue(float Value, float BracketMagnitudeDelta, out float Value0, out float Value1, out float BlendAlpha)\n{\t\n\tif (BracketMagnitudeDelta > 1e-5)\n\t{\n\t\tconst float Fractional = fmod(Value, BracketMagnitudeDelta);\n\t\tValue0 = Value - Fractional;\n\t\tValue1 = Value0 + BracketMagnitudeDelta;\n\t\tBlendAlpha = Fractional / BracketMagnitudeDelta;\n\t}\n\telse\n\t{\n\t\t// edge case where magnitude delta is 0, this turns off bracketing\n\t\tValue0 = Value;\n\t\tValue1 = Value;\n\t\tBlendAlpha = 0.;\n\t}\n}",
+    "ComputeMipLevel": "float ComputeMipLevel(float2 uv, int2 sz)\n{\t\n\tconst float2 dxval = ddx(uv) * sz;\n\tconst float2 dyval = ddy(uv) * sz;\n\n\tconst float DDXLengthSquared = dot(dxval, dxval);\n\tconst float DDYLengthSquared = dot(dyval, dyval);\n\tconst float MaxLengthSquared = max(DDXLengthSquared, DDYLengthSquared);\n\t\n\treturn 0.5f * log2(max(MaxLengthSquared, 1e-8f));\n}",
+    "Compute3Phases": "void Compute3Phases(const float PulseLength, const float Time, \n\tout float lerp0, out float lerp1, out float lerp2,\n\tout float t0, out float t1, out float t2, out float3 CycleCount)\n{\t\n\tconst float TimeScale = TWOPI / PulseLength;\n\n\tconst int NumPhases = 3;\n\n\tconst float lerp_t0 = TimeScale * Time + 0. * TWOPI / NumPhases;\n\tconst float lerp_t1 = TimeScale * Time + 1. * TWOPI / NumPhases;\n\tconst float lerp_t2 = TimeScale * Time + 2. * TWOPI / NumPhases;\n\n\tlerp0 = (.5 - .5 * cos(lerp_t0)) / 1.5;\n\tlerp1 = (.5 - .5 * cos(lerp_t1)) / 1.5;\n\tlerp2 = (.5 - .5 * cos(lerp_t2)) / 1.5;\n\n\tt0 = (Time + PulseLength * 0. / NumPhases) % PulseLength;\n\tt1 = (Time + PulseLength * 1. / NumPhases) % PulseLength;\n\tt2 = (Time + PulseLength * 2. / NumPhases) % PulseLength;\n\n\tCycleCount = float3(\n\t\tfloor((Time + PulseLength * 0. / NumPhases) / PulseLength), \n\t\tfloor((Time + PulseLength * 1. / NumPhases) / PulseLength),\n\t\tfloor((Time + PulseLength * 2. / NumPhases) / PulseLength));\n}",
+    "AdvectionInterpolation3": "float4 AdvectionInterpolation3(float2 UV, float2 Velocity, float t0, float t1, float t2, float lerp0, float lerp1, float lerp2,\n  float AdvectedTextureScale, float3 TexMipLevel, Texture2D<float4> Tex, SamplerState TexSampler, float3 CycleCount)\n{\n\t// advect uvs\n\tfloat OffsetRandX = PseudoRandom(float2(CycleCount.x, 0))*1024.;\n\tfloat OffsetRandY = PseudoRandom(float2(CycleCount.y, 0))*1024.;\n\tfloat OffsetRandZ = PseudoRandom(float2(CycleCount.z, 0))*1024.;\n\n\tconst float2 AdvectedUV0 = UV - Velocity * t0 + OffsetRandX;\n\tconst float2 AdvectedUV1 = UV - Velocity * t1 + OffsetRandY;\n\tconst float2 AdvectedUV2 = UV - Velocity * t2 + OffsetRandZ;\n\n\t// scale uvs\n\tconst float2 uv0 = AdvectedUV0 * AdvectedTextureScale;\n\tconst float2 uv1 = AdvectedUV1 * AdvectedTextureScale;\n\tconst float2 uv2 = AdvectedUV2 * AdvectedTextureScale;\n\t\t\n\t// sample texture for each phase\n\tconst float4 TextureSample0 = Tex.SampleLevel(TexSampler, uv0, TexMipLevel.x);\n\tconst float4 TextureSample1 = Tex.SampleLevel(TexSampler, uv1, TexMipLevel.y);\n\tconst float4 TextureSample2 = Tex.SampleLevel(TexSampler, uv2, TexMipLevel.z);\n\t\n\t// blend according to phase\n\treturn TextureSample0 * lerp0 + TextureSample1 * lerp1 + TextureSample2 * lerp2;\n}"
+  },
+  "pseudo_random": "float PseudoRandom(float2 xy)\n{\n\tfloat2 pos = frac(xy / 128.0f) * 128.0f + float2(-64.340622f, -72.465622f);\n\t\n\t// found by experimentation\n\treturn frac(dot(pos.xyx * pos.xyy, float3(20.390625f, 60.703125f, 2.4281209f)));\n}",
+  "power": "MaterialFloat PositiveClampedPow(MaterialFloat Base, MaterialFloat Exponent)\n{\n\treturn (Base <= 2.980233e-8) ? 0.0f : pow(Base, Exponent);\n}",
+  "sources": {
+    "Engine/Plugins/Experimental/WaterAdvanced/Shaders/WaterAdvanced.ush": "63df230f4861e5be175f00b51e8fd9cadaecb33ff89b73a1d69018eb82eabdd5",
+    "Engine/Shaders/Private/Random.ush": "174dc7ac559d1b0c1bf51b4948e936084272d5e612eef5ba6b116c6d3b353189",
+    "Engine/Shaders/Private/Common.ush": "d6d43d5200e269bc38136cf644054e5c0ae372a61dce21d3a97ef6e9450ec8e5",
+    "Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp": "b498e70f32b6bba08f19a934ef5d8233a000f4c1edd312b50dc9e07a5c3a26e9",
+    "Engine/Plugins/Experimental/WaterAdvanced/Source/WaterAdvanced/Private/FFTOceanPatchSubsystem.cpp": "883a83942311945e705c0a725fead02fa267ed684d0226a5d8e98c912557e051",
+    "Engine/Plugins/Experimental/WaterAdvanced/Source/WaterAdvanced/Private/ShallowWaterSettings.cpp": "0ed56a4cee7c608bf5e11438c52bf104cd2b0336c2d49db27bbd023e96d3882c"
+  },
+  "ocean": {
+    "asset_sha1": "82df8569b33f3cf1ae1e275c9b4e245a38b6cf82",
+    "cached_shader_sha256": "827160355dd1eb9e5b5be51c6681e31066155df1afc3683350fc9bfb49ee73d2",
+    "cached_shader_offset": 2470725,
+    "output_function": "void ScratchModule005_Emitter_Func_(inout FSimulationContext Context)\n{\n\tfloat Constant24 = 150;\n\tbool Constant25 = true;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX;\n\tint ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY;\n\tExecutionIndexToGridIndex_Emitter_Grid2D(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY);\n\tfloat GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tGetPreviousFloatValue_Emitter_Grid2D_AttributeRealPart(ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value);\n\tfloat3 Constant26 = float3(0,0,0);\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tint GetNumCells_Emitter_Grid2DOutput_NumCellsY2;\n\tGetNumCells_Emitter_Grid2D(GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2);\n\tfloat Result11 = Constant24 / GetNumCells_Emitter_Grid2DOutput_NumCellsX2;\n\tfloat3 CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal;\n\tCustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_(GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Constant26, Result11, GetNumCells_Emitter_Grid2DOutput_NumCellsX2, GetNumCells_Emitter_Grid2DOutput_NumCellsY2, CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal);\n\tfloat4 Output14;\n\tOutput14.r = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.x;\n\tOutput14.g = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.y;\n\tOutput14.b = CustomHlslB657D280B174DC3F332FED5A4F96FBF5ED5E2089Emitter_Grid2D_Func_Output_Normal.z;\n\tOutput14.a = GetPreviousFloatValue_Emitter_Grid2D_AttributeRealPartOutput_Value;\n\tSetRenderTargetValue_Emitter_NormalRT_UEImpureCall(Constant25, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexX, ExecutionIndexToGridIndex_Emitter_Grid2DOutput_IndexY, Output14);\n}",
+    "cached_rt": {
+      "MipMapGeneration": "ENiagaraMipMapGeneration::PostSimulate",
+      "OverrideRenderTargetFormat": "RTF_RGBA16f",
+      "bOverrideFormat": true,
+      "RenderTargetUserParameter": {
+        "Parameter": {
+          "variable": "User.OceanNormalRT",
+          "data_hex": ""
+        }
+      },
+      "MergeId": [
+        225600399,
+        1081174795,
+        3789046404,
+        23469505
+      ]
+    }
+  },
+  "caveat": "Port boundary requires the actual shared FFT detail texture; its producer is not ported here. CPU ideal f32 transcendental/hash results can differ from GPU contraction; tests use independent device math/sample oracles. Full optical shading, foam/masking, cached VT and map integration remain."
+}

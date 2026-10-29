@@ -58,7 +58,7 @@ pub(in crate::ui) fn build_crosshair_name(
     let Some(name) = &ui.crosshair_target.name else {
         return;
     };
-    if ui.crosshair.style == 0 || name.alpha <= 0.001 {
+    if (ui.crosshair.style == 0 && !ui.studio_crosshair_name) || name.alpha <= 0.001 {
         return;
     }
     let color = [
@@ -251,11 +251,13 @@ pub fn build_crosshair_vertices(
     if !gameplay_hud_visible(ui, w, h) {
         return;
     }
+    if ui.studio_hud_virtual_layout && ui.crosshair.style == 0 { return; }
     let mut crosshair = ui.crosshair;
     if ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0 {
         crosshair.style = CROSSHAIR_STYLE_LINE;
         crosshair.image = 0;
     }
+    let start=out.len();
     build_crosshair_impl(
         out,
         crosshair,
@@ -266,6 +268,20 @@ pub fn build_crosshair_vertices(
         h,
         Some(&ui.icon_atlas_uvs),
     );
+    // The Studio reuses its otherwise-unused CrosshairName layout slot to
+    // position the *actual* crosshair. This transform only runs in Studio:
+    // cg_hudCrosshairName and normal gameplay remain unchanged.
+    if ui.studio_hud_virtual_layout && out.len()>start && w>0 && h>0 {
+        let layout=ui.hud_layout.crosshair_name;
+        let center=screen_position.unwrap_or([w as f32*0.5,h as f32*0.5]);
+        for v in &mut out[start..] {
+            let x=(v.position[0]+1.0)*0.5*w as f32;
+            let y=(1.0-v.position[1])*0.5*h as f32;
+            let x=center[0]+(x-center[0])*layout.scale+layout.offset[0];
+            let y=center[1]+(y-center[1])*layout.scale+layout.offset[1];
+            v.position=[x*2.0/w as f32-1.0,1.0-y*2.0/h as f32];
+        }
+    }
 }
 
 pub(in crate::ui) fn build_crosshair(

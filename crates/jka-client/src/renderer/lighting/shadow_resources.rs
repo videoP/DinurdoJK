@@ -138,6 +138,36 @@ pub(in crate::renderer) struct ShadowResources {
 }
 
 impl ShadowResources {
+    pub(in crate::renderer) fn parked(&self) -> bool {
+        self._texture.width() < SHADOW_MAP_SIZE
+    }
+
+    /// Swap between full-size and 1x1 arrays. Returns true when the views
+    /// changed, so the caller must rebuild every bind group that samples them.
+    /// All cached depth is invalidated; the next drawn frame recaptures it.
+    pub(in crate::renderer) fn set_parked(&mut self, device: &wgpu::Device, parked: bool) -> bool {
+        if self.parked() == parked {
+            return false;
+        }
+        let (texture, array_view, layer_views, sky_texture, sky_array_view, sky_layer_views) =
+            create_shadow_arrays(device, if parked { 1 } else { SHADOW_MAP_SIZE });
+        self._texture = texture;
+        self._array_view = array_view;
+        self.layer_views = layer_views;
+        self._sky_texture = sky_texture;
+        self.sky_array_view = sky_array_view;
+        self.sky_layer_views = sky_layer_views;
+        self.sky_snapshot = None;
+        self.static_cascades = [None; SHADOW_CASCADES];
+        self.rendered_generations = [0; SHADOW_CASCADES];
+        self.last_csm_mode = None;
+        self.dynamic_sky_layers = 0;
+        self.live_layers_initialized = 0;
+        self.live_layers_occupied = 0;
+        self.original_sun_cache = None;
+        true
+    }
+
     pub(in crate::renderer) fn ensure_sky_snapshot(&mut self, device: &wgpu::Device) {
         if self.sky_snapshot.is_none() {
             self.sky_snapshot = Some(StaticSkySnapshot::new(device));
@@ -394,23 +424,19 @@ pub(in crate::renderer) fn create_shadow_mask_pipeline(
     })
 }
 
-pub(in crate::renderer) fn create_shadow_resources(
-    device: &wgpu::Device,
-    receiver_layout: &wgpu::BindGroupLayout,
-    caster_layout: &wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
-    mask_pipeline: wgpu::RenderPipeline,
-    bevy_pipeline: wgpu::RenderPipeline,
-    bevy_mask_pipeline: wgpu::RenderPipeline,
-    bevy_translucent_pipeline: wgpu::RenderPipeline,
-    bevy_sky_pipeline: wgpu::RenderPipeline,
-    fog_control_buffer: &wgpu::Buffer,
-) -> ShadowResources {
+/// Cascaded receiver depth and shader-sun sky admission arrays. A parked
+/// Studio scene keeps 1x1 arrays (same layers/format, so every binding stays
+/// valid) instead of ~224 MiB it cannot use until it is drawn again.
+#[allow(clippy::type_complexity)]
+fn create_shadow_arrays(device: &wgpu::Device, size: u32) -> (
+    wgpu::Texture, wgpu::TextureView, Vec<wgpu::TextureView>,
+    wgpu::Texture, wgpu::TextureView, Vec<wgpu::TextureView>,
+) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA cascaded sun shadow array"),
         size: wgpu::Extent3d {
-            width: SHADOW_MAP_SIZE,
-            height: SHADOW_MAP_SIZE,
+            width: size,
+            height: size,
             depth_or_array_layers: (SHADOW_CASCADES * 2 + 1) as u32,
         },
         mip_level_count: 1,
@@ -450,8 +476,8 @@ pub(in crate::renderer) fn create_shadow_resources(
     let sky_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA cascaded shader-sun sky admission array"),
         size: wgpu::Extent3d {
-            width: SHADOW_MAP_SIZE,
-            height: SHADOW_MAP_SIZE,
+            width: size,
+            height: size,
             depth_or_array_layers: (SHADOW_CASCADES + 1) as u32,
         },
         mip_level_count: 1,
@@ -488,6 +514,23 @@ pub(in crate::renderer) fn create_shadow_resources(
             })
         })
         .collect::<Vec<_>>();
+    (texture, array_view, layer_views, sky_texture, sky_array_view, sky_layer_views)
+}
+
+pub(in crate::renderer) fn create_shadow_resources(
+    device: &wgpu::Device,
+    receiver_layout: &wgpu::BindGroupLayout,
+    caster_layout: &wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    mask_pipeline: wgpu::RenderPipeline,
+    bevy_pipeline: wgpu::RenderPipeline,
+    bevy_mask_pipeline: wgpu::RenderPipeline,
+    bevy_translucent_pipeline: wgpu::RenderPipeline,
+    bevy_sky_pipeline: wgpu::RenderPipeline,
+    fog_control_buffer: &wgpu::Buffer,
+) -> ShadowResources {
+    let (texture, array_view, layer_views, sky_texture, sky_array_view, sky_layer_views) =
+        create_shadow_arrays(device, SHADOW_MAP_SIZE);
 
     let legacy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("JKA cascaded sun shadow legacy comparison sampler"),
@@ -550,7 +593,7 @@ pub(in crate::renderer) fn create_shadow_resources(
             FALLBACK_SUN_DIRECTION[2],
             0.0,
         ],
-        params: [SHADOW_MAP_SIZE as f32, 0.00035, 0.30, 0.0],
+        params: [SHADOW_MAP_SIZE as f32, 0.00035, 0.6, 0.0],
         camera_forward: [0.0, 0.0, -1.0, 0.0],
         cascade_texel_sizes: [0.0; 4],
         bevy_params: [

@@ -1,13 +1,13 @@
 //! Reset.
 use crate::app::egui_settings::{
-    theme, ui, App, DynamicShadowsMode, QualityPreset, RenderCommand, VideoSettings,
+    theme, ui, App, QualityPreset, RenderCommand, VideoSettings,
     OCEAN_FOAM_COLOR, OCEAN_MAP_SIZE, OCEAN_MESH_QUALITY, OCEAN_NORMAL_STRENGTH, OCEAN_ROUGHNESS,
     OCEAN_SEA_SPRAY, OCEAN_UPDATES, OCEAN_WATER_COLOR, OCEAN_WIND_FOAM, PHYS_CCD,
     PHYS_CLIENT_ENABLED, PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION,
     PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS,
     PHYS_DEBRIS_LIFETIME, PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT,
     PHYS_DISMEMBER_LIFETIME, PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES,
-    PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z,
+    PHYS_HAIR, PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z,
     PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE,
     PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z, PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, PHYS_JIGGLE_GLUTE_LIFT,
     PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z, PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG,
@@ -37,6 +37,9 @@ impl App {
     pub(in crate::app) fn apply_setting_reset(&mut self, reset: theme::Reset) {
         match reset {
             theme::Reset::None => {}
+            theme::Reset::FoliageWind => {
+                let _ = self.set_console_cvar("r_foliageWind", "1");
+            }
             theme::Reset::Glass(name) => self.reset_glass_control(name),
             theme::Reset::Color(name) => {
                 // Both controls are immediate UI state; route through their
@@ -89,6 +92,7 @@ impl App {
 
             theme::Reset::Video(row) => self.reset_video_row(row),
             theme::Reset::MovementCommandRate => self.set_player_movement_rate(125),
+            theme::Reset::MovementCommandSize => { let _ = self.set_console_cvar("cl_commandsize", "auto"); },
             theme::Reset::Environment(row) => self.reset_environment_row(row),
             theme::Reset::CloudTuning(row) => self.reset_cloud_tuning_row(row),
             theme::Reset::Physics(field) => self.reset_physics_field(field),
@@ -278,30 +282,24 @@ impl App {
                 }
                 self.mark_config_dirty();
             }
-            ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS => { self.video.baked_local_lights = defaults.baked_local_lights; self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources = (self.video.baked_local_sources & !1) | (defaults.baked_local_sources & 1); self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !2) | (defaults.baked_local_sources & 2); self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !4) | (defaults.baked_local_sources & 4); self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources = (self.video.baked_local_sources & !8) | (defaults.baked_local_sources & 8); self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources = (self.video.baked_local_sources & !16) | (defaults.baked_local_sources & 16); self.sync_baked_local_lights(); }
-            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
-                self.video.promote_shader_lights = defaults.promote_shader_lights;
-                self.sync_shader_light_promotion();
-                self.mark_config_dirty();
-            }
+            ui::VIDEO_ROW_BAKED_LOCAL_GLOW => { self.video.baked_local_sources = (self.video.baked_local_sources & !1) | (defaults.baked_local_sources & 1); self.sync_lamp_shadow_sources(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !2) | (defaults.baked_local_sources & 2); self.sync_lamp_shadow_sources(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !4) | (defaults.baked_local_sources & 4); self.sync_lamp_shadow_sources(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources = (self.video.baked_local_sources & !8) | (defaults.baked_local_sources & 8); self.sync_lamp_shadow_sources(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources = (self.video.baked_local_sources & !16) | (defaults.baked_local_sources & 16); self.sync_lamp_shadow_sources(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
                 self.video.promote_shader_glow = defaults.promote_shader_glow;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE => {
                 self.video.promote_shader_additive = defaults.promote_shader_additive;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE => {
                 self.video.promote_shader_emissive = defaults.promote_shader_emissive;
-                self.sync_shader_light_promotion();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
@@ -380,7 +378,7 @@ impl App {
             }
             ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS => {
                 self.video.emissive_area_lights = defaults.emissive_area_lights;
-                self.sync_emissive_area_lights();
+                self.sync_added_map_lights();
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_AMBIENT_OCCLUSION => {
@@ -398,7 +396,7 @@ impl App {
             ui::VIDEO_ROW_DYNAMIC_SHADOWS => {
                 self.video.dynamic_shadows = defaults.dynamic_shadows;
                 self.video.cascaded_shadows =
-                    self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                    self.video.dynamic_shadows.is_csm();
                 self.sync_cascaded_shadows();
                 self.mark_config_dirty();
             }
@@ -613,6 +611,7 @@ impl App {
                 self.video.ragdoll_self_collision = defaults.ragdoll_self_collision
             }
             PHYS_JIGGLE => self.video.jiggle_physics = defaults.jiggle_physics,
+            PHYS_HAIR => self.video.hair_physics = defaults.hair_physics,
             PHYS_JIGGLE_STRENGTH => self.video.jiggle_strength = defaults.jiggle_strength,
             PHYS_JIGGLE_BREAST => {
                 self.video.jiggle_breast_strength = defaults.jiggle_breast_strength

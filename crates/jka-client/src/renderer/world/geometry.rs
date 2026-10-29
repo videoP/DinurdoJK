@@ -93,6 +93,12 @@ pub(in crate::renderer) fn make_cull_record(
         minimum = [0.0; 3];
         maximum = [0.0; 3];
     }
+    if source.foliage_wind {
+        for axis in 0..3 {
+            minimum[axis] -= crate::foliage::BOUNDS_PADDING;
+            maximum[axis] += crate::foliage::BOUNDS_PADDING;
+        }
+    }
     GpuCullRecord {
         minimum: [minimum[0], minimum[1], minimum[2], 0.0],
         maximum: [maximum[0], maximum[1], maximum[2], 0.0],

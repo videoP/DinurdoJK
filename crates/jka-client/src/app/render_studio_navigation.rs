@@ -104,7 +104,7 @@ impl App {
 
     pub(in crate::app) fn studio_navigation_available(&self) -> bool {
         self.frontend_page == FrontendPage::RenderStudio
-            && self.profile_preview_active
+            && (self.profile_preview_active || self.render_studio.spatial.scene_camera.is_some())
             && self.window_focused
             && matches!(self.overlay, super::OverlayMode::None | super::OverlayMode::Game)
             && (self.front_end || self.overlay == super::OverlayMode::Game)
@@ -133,8 +133,28 @@ impl App {
     }
 
     pub(in crate::app) fn capture_studio_preview_camera(&mut self, time: f64) {
-        let mut key = super::render_studio_spatial::key_from_camera(self.asset_preview_camera());
-        if self.render_studio.timeline.camera_rig.position.enabled {
+        let is_demo=self.render_studio.timeline.demo_at(time).is_some();
+        let preview_camera=if is_demo {
+            self.render_studio.scene_frame.as_ref().map(|scene|
+                if scene.progress>=0.5 {scene.incoming.as_ref().unwrap_or(&scene.outgoing).camera}
+                else {scene.outgoing.camera})
+                .unwrap_or_else(||self.asset_preview_camera())
+        } else {self.asset_preview_camera()};
+        let mut key = super::render_studio_spatial::key_from_camera(preview_camera);
+        let previous=self.render_studio.timeline.camera_at(time);
+        let inherited=previous.source;
+        // A new camera key inherits the current per-shot demo rig as well as
+        // its source, otherwise capturing a shot silently resets distance/FOV.
+        key.demo_follow=previous.demo_follow;
+        key.lens=previous.lens;
+        key.focus_target=previous.focus_target.map(|_|(preview_camera.position+preview_camera.forward()*previous.lens.focus_distance).to_array());
+        key.lens.aperture=key.lens.aperture.map(|n|n.min(128.0));
+        key.source=inherited;
+        if is_demo && !matches!(inherited,super::render_studio_timeline::StudioCameraSource::Demo{..}) {
+            Self::studio_default_demo_camera(&mut key);
+            key.fov=self.studio_default_fov();
+        }
+        if !is_demo && self.render_studio.timeline.camera_rig.position.enabled {
             let mut captured_orbit=false;
             if let Some(frame)=self.studio_orbit_edit_frame(self.render_studio.timeline_time()) {
                 let mut binding=self.render_studio.timeline.camera_rig.position.clone();
@@ -211,6 +231,12 @@ mod tests {
         assert!((captured.yaw - view.yaw).abs() < 0.0001);
         assert!((captured.pitch - view.pitch).abs() < 0.0001);
         assert!((captured.fov - view.fov).abs() < 0.0001);
+        // Demo worlds disable the isolated-asset preview flag. The independent
+        // Scene observer must still supply its camera and accept navigation.
+        app.profile_preview_active=false;app.window_focused=true;
+        app.overlay=super::super::OverlayMode::None;
+        assert!(app.studio_navigation_available());
+        assert_eq!(app.asset_preview_camera().position.to_array(),view.position);
     }
     #[test]
     fn studio_free_flight_uses_jka_axes_normalizes_motion_and_requires_selection() {

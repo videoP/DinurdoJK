@@ -40,8 +40,9 @@ pub(in crate::scene) fn authored_environment_composite(
     {
         return true;
     }
-    // Share the exact classification with parsed-shader preparation. Off must
-    // not delete a stage that the Ultra guard considers part of the material.
+    // Share the authored-composite classification with shader parsing. Off may
+    // intentionally strip an opaque environment base if a diffuse replacement
+    // survives, even when Ultra would keep the authored composite intact.
     materials::authored_environment_composite_stage(
         &material.stages,
         stage,
@@ -421,6 +422,11 @@ pub(in crate::scene) fn stage_batch(
         bsp_shader_index: bsp_shader_index.map_or(u32::MAX, |index| index as u32),
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
+        thermal_lava: material.thermal_lava,
+        thermal_emission: material.thermal_emission,
+        thermal_source_stage: !material.water && !material.light_filter
+            && !material_is_authored_environment_composite(material)
+            && materials::thermal_emission_stage(stage) != 0 && !stage.glow,
         glass_primary: material.glass_promotion && first,
         glass_tint: material.glass_tint,
         glass_reflectance: material.glass_reflectance,
@@ -494,6 +500,7 @@ pub(in crate::scene) fn stage_batch(
         water: material.water,
         water_amplitude: material.water_amplitude,
         water_deformed: material.water_deformed,
+        foliage_wind: material.foliage_wind,
         alpha_shadow: material.alpha_shadow,
         baked_shadow_texture: material.baked_shadow_texture,
         light_filter: material.light_filter,

@@ -4,6 +4,10 @@ struct Camera {
     clip_plane: vec4<f32>,
     render_flags: vec4<u32>,
     camera_forward: vec4<f32>,
+    unjittered_view_proj: mat4x4<f32>,
+    previous_unjittered_view_proj: mat4x4<f32>,
+    jump_shade: vec4<f32>,
+    foliage_wind: vec4<f32>,
 };
 
 // Pipeline-specialized: false compiles the self-applied Legacy fog out entirely.
@@ -41,6 +45,10 @@ struct EntityLightingSettings {
     // rgb = linear sun colour, w = model wetness 0..1, already faded by rain
     // intensity and by the camera's own exposure to the rain.
     weather_sun_radiance: vec4<f32>,
+    studio_lights: array<vec4<f32>, 128>,
+    studio_ambient: vec4<f32>,
+    studio_sun: vec4<f32>,
+    studio_sun_direction: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 
@@ -51,6 +59,7 @@ struct VertexIn {
     @location(3) color: vec4<f32>,
     @location(4) depth_hack: f32,
     @location(5) water_wetness: f32,
+    @location(6) foliage_wind: f32,
 };
 
 struct VertexOut {
@@ -60,12 +69,21 @@ struct VertexOut {
     @location(2) color: vec4<f32>,
     @location(3) world_position: vec3<f32>,
     @location(4) water_wetness: f32,
+    @location(5) @interpolate(flat) legacy_blob: f32,
+    @location(6) predator_local: vec3<f32>,
+    @location(7) @interpolate(flat) predator_grid: vec2<f32>,
 };
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
     var output: VertexOut;
-    output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    // Cloak's CPU-skinned Ghoul2 uses the otherwise unused three per-vertex
+    // channels to transmit positionLocal without changing shared vertex ABI.
+    let is_predator = input.color.a <= -3.0;
+    let world_position = select(
+        foliage_model_position(input.position, input.foliage_wind, camera.foliage_wind),
+        input.position, is_predator);
+    output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     if (SPEC_ERASE_DEPTH_TOLERANCE > 0.0) {
         let toward_eye = camera.camera_pos_time.xyz - input.position;
         let eye_distance = length(toward_eye);
@@ -78,14 +96,18 @@ fn vs_main(input: VertexIn) -> VertexOut {
     // OpenJK RF_DEPTHHACK uses glDepthRange(0, 0.3) for view weapons.
     // The main camera is reverse-Z (near=1, far=0), so the equivalent range
     // is [0.7, 1.0]: d' = 0.7 + 0.3*d. Apply it in homogeneous clip space.
-    if (input.depth_hack > 0.5) {
+    if (input.depth_hack > 0.5 && !is_predator) {
         output.clip_position.z = output.clip_position.z * 0.3 + output.clip_position.w * 0.7;
     }
     output.uv = input.uv;
     output.normal = normalize(input.normal);
     output.color = input.color;
-    output.world_position = input.position;
+    output.world_position = world_position;
     output.water_wetness = input.water_wetness;
+    output.legacy_blob = select(0.0, 1.0, input.depth_hack < 0.0);
+    output.predator_local = select(input.position,
+        vec3<f32>(input.depth_hack, input.water_wetness, input.foliage_wind), is_predator);
+    output.predator_grid = select(vec2<f32>(60.0, 65.0), input.color.rg, input.color.a <= -3.0);
     return output;
 }
 
@@ -151,6 +173,20 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.color.a <= -3.0) {
+        return predator_shade(input.clip_position, input.uv, input.normal, input.world_position,
+            input.predator_local, predator_position_view(input.world_position),
+            max(input.predator_grid, vec2<f32>(1.0)), -input.color.a - 3.0,
+            input.color.b,
+            camera.camera_pos_time.w, textureSampleLevel(base_texture, base_sampler, input.uv, 0.0).rgb);
+    }
+    if (input.color.a < -1.5) {
+        return force_refraction_shade(input.clip_position, input.uv, input.color.rgb,
+            camera.view_proj, camera.camera_pos_time.xyz, -input.color.a - 2.0);
+    }
+    if (input.color.a < 0.0) {
+        return cloak_shade(input.clip_position, camera.camera_pos_time.w);
+    }
     let last_mip = f32(max(textureNumLevels(base_texture), 1u) - 1u);
     let tint = textureSampleLevel(base_texture, base_sampler, vec2<f32>(0.5), last_mip).rgb;
     let brightness = dot(tint, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -164,7 +200,7 @@ fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     let color = fogged(
-        model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
+        model_wet_color_with_water(studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
@@ -178,7 +214,7 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     let color = fogged(
-        model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
+        model_wet_color_with_water(studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
@@ -188,13 +224,25 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_unlit(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
-    return fogged(tex * input.color, input.world_position, false);
+    if input.legacy_blob > 0.5 {
+        // Classic JKA darkened encoded display RGB. Alpha blending in our
+        // linear scene otherwise makes its ~50%-alpha black blob much fainter.
+        // A power-law compatibility transfer approximates that legacy contrast
+        // without sampling the framebuffer or changing other alpha materials.
+        let alpha = legacy_blob_alpha(tex.a * input.color.a);
+        return fogged(vec4<f32>(tex.rgb * input.color.rgb, alpha), input.world_position, false);
+    }
+    return legacy_effect_output(fogged(legacy_effect_source(tex, input.color), input.world_position, false));
+}
+
+fn legacy_blob_alpha(alpha: f32) -> f32 {
+    return 1.0 - pow(1.0 - clamp(alpha, 0.0, 1.0), 2.2);
 }
 
 @fragment
 fn fs_unlit_fog_black(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
-    return fogged(tex * input.color, input.world_position, true);
+    return legacy_effect_output(fogged(legacy_effect_source(tex, input.color), input.world_position, true));
 }
 
 // Scene depth prepass. Opaque/alpha-tested entities join the BSP prepass so
@@ -206,6 +254,9 @@ struct PrepassVertexOut {
     @location(0) uv: vec2<f32>,
     @location(1) world_position: vec3<f32>,
     @location(2) normal: vec3<f32>,
+    // Thermal heat-source distance carried by RT compute-skinned Ghoul2
+    // (ghoul2_skin_compute.wgsl), < 0 for an ordinary MD3 / cold model.
+    @location(3) heat_alpha: f32,
 };
 
 struct PrepassOut {
@@ -236,27 +287,41 @@ fn cloud_shadow_facing_code(normal: vec3<f32>) -> f32 {
     return (26.0 + 100.0 * facing) / 255.0;
 }
 
-fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>) -> PrepassOut {
+// Thermal class in policy B, same encoding as ghoul2_skin.wgsl prepass_output:
+// 0.81 = cold model (MD3 props, weapons), 0.83..1.0 = warm body.
+fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>, heat_alpha: f32) -> PrepassOut {
     var out: PrepassOut;
     out.linear_depth = distance(world_position, camera.camera_pos_time.xyz);
     out.motion_vector = vec2<f32>(0.0);
-    out.reflection_policy = vec4<f32>(0.0, cloud_shadow_facing_code(normal), 1.0, 2.0 / 3.0);
+    let thermal = select(0.81, 0.83 + 0.17 * (1.0 - clamp(heat_alpha, 0.0, 1.0)), heat_alpha >= 0.0);
+    out.reflection_policy = vec4<f32>(0.0, cloud_shadow_facing_code(normal), thermal, 2.0 / 3.0);
     return out;
 }
 
 @vertex
 fn vs_prepass(input: VertexIn) -> PrepassVertexOut {
     var output: PrepassVertexOut;
-    output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    // Cloak's CPU-skinned Ghoul2 uses the otherwise unused three per-vertex
+    // channels to transmit positionLocal without changing shared vertex ABI.
+    let is_predator = input.color.a <= -3.0;
+    let world_position = select(
+        foliage_model_position(input.position, input.foliage_wind, camera.foliage_wind),
+        input.position, is_predator);
+    output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     output.uv = input.uv;
-    output.world_position = input.position;
+    output.world_position = world_position;
     output.normal = input.normal;
+    // RT compute skinning stores a warm body's heat in depth_hack's (0, 0.5]
+    // range, which no view weapon (1) or legacy blob (< 0) uses; the cloak's
+    // depth_hack holds positionLocal instead.
+    let warm = !is_predator && input.depth_hack > 0.0 && input.depth_hack <= 0.5;
+    output.heat_alpha = select(-1.0, 1.0 - (input.depth_hack - 0.01) / 0.48, warm);
     return output;
 }
 
 @fragment
 fn fs_prepass(input: PrepassVertexOut) -> PrepassOut {
-    return prepass_output(input.world_position, input.normal);
+    return prepass_output(input.world_position, input.normal, input.heat_alpha);
 }
 
 @fragment
@@ -264,7 +329,7 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
-    return prepass_output(input.world_position, input.normal);
+    return prepass_output(input.world_position, input.normal, input.heat_alpha);
 }
 
 @fragment
@@ -300,5 +365,15 @@ fn fs_spec_mask_blue() -> @location(0) vec4<f32> { return vec4<f32>(0.035, 0.22,
 fn fs_spec_mask_yellow() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.62, 0.025, 1.0); }
 @fragment
 fn fs_spec_mask_clear() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
+
+// Render Studio's visible-entity identity channels. A separate color-write
+// mask selects red for players, green for all dynamic entities.
+@fragment
+fn fs_studio_identity() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+@fragment
+fn fs_studio_identity_alpha(input: VertexOut) -> @location(0) vec4<f32> {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 { discard; }
+    return vec4<f32>(1.0);
+}
 
 @fragment fn fs_glass_mask(input: VertexOut) -> @location(0) vec4<f32> { return glass_mask_value(input.world_position,input.normal,camera.camera_pos_time.xyz,camera.camera_forward.xyz); }

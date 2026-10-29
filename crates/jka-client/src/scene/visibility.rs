@@ -118,6 +118,12 @@ pub(in crate::scene) fn auto4_source_bounds(
             maximum[axis] = maximum[axis].max(vertex.position[axis]);
         }
     }
+    if source.foliage_wind {
+        for axis in 0..3 {
+            minimum[axis] -= crate::foliage::BOUNDS_PADDING;
+            maximum[axis] += crate::foliage::BOUNDS_PADDING;
+        }
+    }
     (minimum, maximum)
 }
 
@@ -149,6 +155,7 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
     }
     a.authored_sort_priority == b.authored_sort_priority
         && a.pipeline == b.pipeline
+        && a.foliage_wind == b.foliage_wind
         && a.texture == b.texture
         && a.legacy_srgb_overlay == b.legacy_srgb_overlay
         && a.animation == b.animation

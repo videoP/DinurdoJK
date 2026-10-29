@@ -39,7 +39,7 @@ app_cvars! {
                 fn cvar_set_cg_logstrafetrail(&mut self, _name: &str, value: &str) -> Result<(), String> {
                     {
                         let active_dir =
-                            jka_assets::pk3::active_game_directory(&self.base, self.game.as_deref());
+                            jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref());
                         self.strafe_trails.set_log_name(&active_dir, value)?;
                         self.strafe_trail_log_input = self.strafe_trails.settings.log_name.clone();
                         self.mark_config_dirty();

@@ -512,6 +512,8 @@ pub(in crate::renderer) struct WorldGpu {
     /// Any batch carries a promoted glass primary stage. Fixed at upload so the
     /// frame path does not scan every batch to decide whether post is needed.
     pub(in crate::renderer) has_glass_primary: bool,
+    /// Static compiled CONTENTS_WATER/LAVA volumes, for thermal camera medium.
+    pub(in crate::renderer) thermal_liquids: Vec<scene::ThermalLiquidVolume>,
     /// Batches whose material has an animMap. Sources and batch sets never
     /// change after upload; filled on first use so the per-frame animation tick
     /// does not walk every batch.

@@ -202,6 +202,93 @@ mod profile_animation_clock_tests {
 }
 
 impl App {
+    fn append_profile_saber_preview(&mut self, draws: &mut Vec<DynamicModelSurface>,
+        fx_requests: &[PlayerFxRequest], current_time: i32) {
+        // Actual saber FX bolt positions/colours, after animated
+        // skeleton evaluation. Only the preview's CPU vertices are
+        // affected. No world dlight pollution or map-lightgrid lookup.
+        for request in fx_requests {
+            if !crate::cgame::weapon_fx::profile_saber_light_allowed(request) {
+                continue;
+            }
+            if let PlayerFxRequest::SaberBlade {origin, direction, length, color, ..} = request {
+                let rgb = crate::cgame::custom_saber_rgb(*color)
+                    .map(|rgb| rgb.map(|c| f32::from(c) / 255.0))
+                    .unwrap_or_else(|| match *color {
+                        0 => [1.0, 0.2, 0.2], 1 => [1.0, 0.5, 0.1],
+                        2 => [1.0, 1.0, 0.2], 3 => [0.2, 1.0, 0.2],
+                        4 => [0.2, 0.4, 1.0], 5 => [0.9, 0.2, 1.0],
+                        _ => [0.45, 0.55, 0.95],
+                    });
+                for surface in draws.iter_mut() {
+                    let vertices = Arc::make_mut(&mut surface.vertices);
+                    for vertex in vertices {
+                        let dx = [vertex.position[0] - origin[0],
+                            vertex.position[1] - origin[1],
+                            vertex.position[2] - origin[2]];
+                        let projection = (dx[0]*direction[0]+dx[1]*direction[1]
+                            +dx[2]*direction[2]).clamp(0.0,*length);
+                        let to_light = [
+                            origin[0]+direction[0]*projection-vertex.position[0],
+                            origin[1]+direction[1]*projection-vertex.position[1],
+                            origin[2]+direction[2]*projection-vertex.position[2],
+                        ];
+                        let dist_sq = to_light.iter().map(|v|v*v).sum::<f32>();
+                        // Profile-only saber light. Brighten the existing
+                        // diffuse/char_color_* channels rather than adding
+                        // bare saber RGB (which washes out player tint).
+                        // A 48u radius with linear-distance squared fade
+                        // was effectively invisible beyond the saber hand.
+                        const RADIUS: f32 = 112.0;
+                        const INTENSITY: f32 = 1.55;
+                        const MAX_VERTEX_LIGHT: f32 = 1.45;
+                        const RADIUS_SQ: f32 = RADIUS * RADIUS;
+                        if dist_sq >= RADIUS_SQ { continue; }
+                        let distance = dist_sq.sqrt().max(0.5);
+                        let facing = (vertex.normal[0]*to_light[0]
+                            +vertex.normal[1]*to_light[1]
+                            +vertex.normal[2]*to_light[2]) / distance;
+                        // Soft local bounce lets the near side of a limb
+                        // catch light even if its normal faces sideways;
+                        // quadratic radius attenuation confines the glow.
+                        let radial = 1.0 - dist_sq / RADIUS_SQ;
+                        let strength = radial * radial
+                            * (0.25 + 0.75 * facing.max(0.0)) * INTENSITY;
+                        for channel in 0..3 {
+                            vertex.color[channel] = (vertex.color[channel]
+                                * (1.0 + rgb[channel] * strength))
+                                .clamp(0.0, MAX_VERTEX_LIGHT);
+                        }
+                    }
+                }
+            }
+        }
+        let mut blade_draws = Vec::new();
+        // Re-seeded per frame so the preview blade flickers like in game.
+        let mut flicker_rng = crate::fx::template::Rng::new(
+            (current_time as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        for request in fx_requests {
+            blade_draws.extend(crate::cgame::weapon_fx::profile_saber_blade_draws_for_request(
+                request,
+                self.video.modern_sabers,
+                &mut flicker_rng,
+            ));
+        }
+        if !blade_draws.is_empty() {
+            let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
+            let presenter = self
+                .asset_preview_entity_presenter
+                .as_mut()
+                .expect("profile FX presenter initialized");
+            let mut blade_surfaces =
+                crate::fx::draw::tessellate(&blade_draws, &view, &mut |shader| {
+                    presenter.fx_material_stages(shader)
+                });
+            draws.append(&mut blade_surfaces);
+        }
+    }
+
     pub(in crate::app) fn ensure_local_player_presenter(&mut self) -> Result<(), String> {
         if self.local_player_presenter.is_some() {
             return Ok(());
@@ -221,7 +308,8 @@ impl App {
         if let Some(camera) = self.emote_gallery_camera() {
             return camera;
         }
-        if self.profile_preview_active && self.frontend_page == FrontendPage::RenderStudio {
+        if self.frontend_page == FrontendPage::RenderStudio &&
+            (self.profile_preview_active || self.render_studio.spatial.scene_camera.is_some()) {
             if self.render_studio.export.is_none() && self.render_studio.still.is_none() {
                 if let Some(preview)=self.render_studio.cinematic_preview.as_ref() {
                     return super::render_studio_spatial::camera_from_key(preview.camera);
@@ -245,7 +333,7 @@ impl App {
 
     pub(in crate::app) fn studio_shot_camera(&self)->Camera {
         let key=self.render_studio.camera_rig_runtime.camera.filter(|_|self.render_studio.timeline.camera_rig.active())
-            .unwrap_or_else(||self.render_studio.timeline.camera_at(self.render_studio.timeline_time()));
+            .unwrap_or_else(||self.studio_camera_key_at(self.render_studio.timeline_time()));
         super::render_studio_spatial::camera_from_key(key)
     }
 
@@ -322,6 +410,7 @@ impl App {
                             model: fallback.model,
                             custom_skin: fallback.custom_skin,
                             num_blades: fallback.num_blades,
+                            ready_anim: fallback.ready_anim,
                         });
                     }
                 }
@@ -362,9 +451,15 @@ impl App {
         if self.game_session.is_none() {
             let (effects,voice,separation) = self.effective_audio_mix();
             let emote_music=self.effective_emote_music_volume();
+            // Studio's source monitor and character clips follow the same
+            // preview-only volume as native demos and imported audio.
+            let monitor_volume=if self.frontend_page==FrontendPage::RenderStudio
+                && self.render_studio.export.is_none() && self.render_studio.still.is_none() {
+                self.render_studio.preview_volume
+            } else { 1.0 };
             if let Some(sound) = self.menu_emote_sound.as_mut() {
-                sound.set_mix(effects,voice,separation);
-                sound.set_emote_music_volume(emote_music);
+                sound.set_mix(effects*monitor_volume,voice*monitor_volume,separation);
+                sound.set_emote_music_volume(emote_music*monitor_volume);
                 sound.frame(crate::audio::Listener {
                     entity:1023,origin:[0.0;3],ahead:[1.0,0.0,0.0],up:[0.0,0.0,1.0],left:[0.0,1.0,0.0],
                 }, &[], None);
@@ -379,7 +474,7 @@ impl App {
         let force_page = self.profile_selected_section == 2;
         // Show blades is presentation-only: no network or config changes.
         let studio_saber = if self.frontend_page == FrontendPage::RenderStudio {
-            self.render_studio.with_sabers
+            self.render_studio.actor_with_sabers(self.render_studio.cinematic_preview.as_ref().map_or(0,|p|p.lane))
         } else {
             self.profile_studio_show_saber
         };
@@ -458,10 +553,21 @@ impl App {
         // &mut App and must not overlap a borrowed field of RenderStudio.
         let studio_eval = (self.frontend_page == FrontendPage::RenderStudio)
             .then(|| self.render_studio.active_animation());
+        // TaystJK bg_pmove.c::PM_GetSaberStance: a saber with readyAnim
+        // replaces the stock idle stance, not active walking, attacks, emotes
+        // or an explicitly selected Studio timeline clip. The profile's
+        // passive showcase is an idle preview when such an override exists.
+        let profile_ready_name = if studio_eval.is_none() && force_animation.is_none() && studio_saber {
+            [&self.network.saber1, &self.network.saber2].into_iter().find_map(|saber_name| {
+                self.profile_sabers.iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(saber_name))
+                    .and_then(|entry| jka_assets::animation::AnimationSet::name(entry.ready_anim))
+            })
+        } else { None };
         let animation_name = if let Some((name, _, _, _)) = studio_eval.as_ref() {
             name.as_str()
         } else {
-            force_animation.unwrap_or(walk_animation)
+            force_animation.or(profile_ready_name).unwrap_or(walk_animation)
         };
         let with_sabers = (studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17)))
             && (self.frontend_page == FrontendPage::RenderStudio || crate::emotes::active_preview().is_none());
@@ -500,10 +606,12 @@ impl App {
                 (clip.lane,clip.name.as_str(),clip.pose_time_ms(time),
                     clip.first_frame,clip.end_frame,clip.tail_frames,clip.playback,
                     self.render_studio.timeline.lane_models.get(clip.lane),
+                    self.render_studio.timeline.lane_sabers.get(clip.lane),
+                    self.render_studio.timeline.lane_char_colors.get(clip.lane),
                     clip.motion_at(time,self.render_studio.timeline.interpolation !=
                         super::render_studio_timeline::StudioInterpolation::Linear)))
-                    .collect::<Vec<_>>(),self.render_studio.camera_rig_runtime.camera
-                        .map(|k|(k.position,k.yaw,k.pitch,k.fov)))
+                    .collect::<Vec<_>>(),(&self.render_studio.timeline.lane_sabers,&self.render_studio.timeline.lane_char_colors,self.render_studio.camera_rig_runtime.camera
+                        .map(|k|(k.position,k.yaw,k.pitch,k.fov))))
         } else { String::new() };
         let key = (
             format!(
@@ -536,11 +644,10 @@ impl App {
         // Only Render Studio applies authored character motion. Normal Profile
         // previews remain unchanged and continue to use the global model turntable.
         let studio_motion = (self.frontend_page == FrontendPage::RenderStudio && self.render_studio.cinematic_preview.is_none())
-            .then(|| self.render_studio.timeline.clip_at_lane(self.render_studio.timeline_time(),0)
-                .map(|clip| clip.motion_at(self.render_studio.timeline_time(),
-                    self.render_studio.timeline.interpolation !=
-                        super::render_studio_timeline::StudioInterpolation::Linear)))
+            .then(|| self.render_studio.lane_motion(0,self.render_studio.timeline_time()))
             .flatten().unwrap_or_default();
+        let lead_blend = (self.frontend_page == FrontendPage::RenderStudio)
+            .then(|| self.render_studio.pose_blend_request(0)).flatten();
         let yaw = (self.profile_preview_yaw + studio_motion.yaw).to_radians();
         let (s, c) = yaw.sin_cos();
         let axis = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
@@ -569,11 +676,18 @@ impl App {
             true,
         );
         info.plugin_disable = self.network.plugin_disable;
+        let preview_char_color=if self.frontend_page == FrontendPage::RenderStudio {
+            self.render_studio.actor_char_color(self.render_studio.cinematic_preview.as_ref().map_or(0,|p|p.lane),self.network.char_color)
+        } else {self.network.char_color};
+        if self.frontend_page == FrontendPage::RenderStudio {
+            self.render_studio.apply_actor_sabers(self.render_studio.cinematic_preview.as_ref().map_or(0,|p|p.lane),&mut info);
+        }
 
         let result = (|| -> Result<Vec<DynamicModelSurface>, String> {
             self.ensure_asset_preview_player_presenter()?;
             let cosmetics = self.network.cosmetics;
-            if with_sabers || cosmetics != 0 {
+            if with_sabers || cosmetics != 0 || (self.frontend_page == FrontendPage::RenderStudio &&
+                (0..self.render_studio.timeline.lanes).any(|lane|self.render_studio.actor_with_sabers(lane))) {
                 self.ensure_asset_preview_entity_presenter()?;
             }
             let origin = [88.0 * zoom + studio_motion.position[0],
@@ -591,6 +705,7 @@ impl App {
                 // Profile and Render Studio have their own presenter, but use
                 // the same jiggle enablement, sex filter and tuning as gameplay.
                 // Their animation clocks never advance the live player's state.
+                presenter.set_hair_physics_mode(self.video.hair_physics);
                 presenter.set_jiggle_config(
                     self.video.client_physics && self.video.jiggle_physics != 0,
                     self.video.jiggle_physics,
@@ -639,6 +754,7 @@ impl App {
                 // the current isolated saber preview.
                 let _ = presenter.drain_fx_requests();
                 presenter.set_profile_body_highlight(self.profile_body_highlight.as_deref());
+                presenter.studio_pose_blend = lead_blend.clone();
                 let (draws, anchors) = presenter.present_profile_player_preview(
                     &info,
                     origin,
@@ -646,9 +762,7 @@ impl App {
                     current_time,
                     animation_name,
                     with_sabers,
-                    self.network
-                        .char_color
-                        .map(|channel| f32::from(channel) / 255.0),
+                    preview_char_color.map(|channel| f32::from(channel) / 255.0),
                     cosmetics,
                     self.profile_studio_head_look,
                     true,
@@ -702,107 +816,7 @@ impl App {
             }
 
             if with_sabers {
-                // Actual saber FX bolt positions/colours, after animated
-                // skeleton evaluation. Only the preview's CPU vertices are
-                // affected. No world dlight pollution or map-lightgrid lookup.
-                for request in &fx_requests {
-                    if let PlayerFxRequest::SaberBlade {origin, direction, length, color, ..} = request {
-                        let rgb = crate::cgame::custom_saber_rgb(*color)
-                            .map(|rgb| rgb.map(|c| f32::from(c) / 255.0))
-                            .unwrap_or_else(|| match *color {
-                                0 => [1.0, 0.2, 0.2], 1 => [1.0, 0.5, 0.1],
-                                2 => [1.0, 1.0, 0.2], 3 => [0.2, 1.0, 0.2],
-                                4 => [0.2, 0.4, 1.0], 5 => [0.9, 0.2, 1.0],
-                                _ => [0.45, 0.55, 0.95],
-                            });
-                        for surface in &mut draws {
-                            let vertices = Arc::make_mut(&mut surface.vertices);
-                            for vertex in vertices {
-                                let dx = [vertex.position[0] - origin[0],
-                                    vertex.position[1] - origin[1],
-                                    vertex.position[2] - origin[2]];
-                                let projection = (dx[0]*direction[0]+dx[1]*direction[1]
-                                    +dx[2]*direction[2]).clamp(0.0,*length);
-                                let to_light = [
-                                    origin[0]+direction[0]*projection-vertex.position[0],
-                                    origin[1]+direction[1]*projection-vertex.position[1],
-                                    origin[2]+direction[2]*projection-vertex.position[2],
-                                ];
-                                let dist_sq = to_light.iter().map(|v|v*v).sum::<f32>();
-                                // Profile-only saber light. Brighten the existing
-                                // diffuse/char_color_* channels rather than adding
-                                // bare saber RGB (which washes out player tint).
-                                // A 48u radius with linear-distance squared fade
-                                // was effectively invisible beyond the saber hand.
-                                const RADIUS: f32 = 112.0;
-                                const INTENSITY: f32 = 1.55;
-                                const MAX_VERTEX_LIGHT: f32 = 1.45;
-                                const RADIUS_SQ: f32 = RADIUS * RADIUS;
-                                if dist_sq >= RADIUS_SQ { continue; }
-                                let distance = dist_sq.sqrt().max(0.5);
-                                let facing = (vertex.normal[0]*to_light[0]
-                                    +vertex.normal[1]*to_light[1]
-                                    +vertex.normal[2]*to_light[2]) / distance;
-                                // Soft local bounce lets the near side of a limb
-                                // catch light even if its normal faces sideways;
-                                // quadratic radius attenuation confines the glow.
-                                let radial = 1.0 - dist_sq / RADIUS_SQ;
-                                let strength = radial * radial
-                                    * (0.25 + 0.75 * facing.max(0.0)) * INTENSITY;
-                                for channel in 0..3 {
-                                    vertex.color[channel] = (vertex.color[channel]
-                                        * (1.0 + rgb[channel] * strength))
-                                        .clamp(0.0, MAX_VERTEX_LIGHT);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if with_sabers {
-                let mut blade_draws = Vec::new();
-                // Re-seeded per frame so the preview blade flickers like in game.
-                let mut flicker_rng = crate::fx::template::Rng::new(
-                    (current_time as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                );
-                for request in fx_requests {
-                    if let PlayerFxRequest::SaberBlade {
-                        origin,
-                        direction,
-                        length,
-                        length_max,
-                        radius,
-                        color,
-                        entity_alpha,
-                        ..
-                    } = request
-                    {
-                        blade_draws.extend(crate::cgame::weapon_fx::profile_saber_blade_draws(
-                            origin,
-                            direction,
-                            length,
-                            length_max,
-                            radius,
-                            color,
-                            entity_alpha,
-                            self.video.modern_sabers,
-                            &mut flicker_rng,
-                        ));
-                    }
-                }
-                if !blade_draws.is_empty() {
-                    let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
-                    let presenter = self
-                        .asset_preview_entity_presenter
-                        .as_mut()
-                        .expect("profile FX presenter initialized");
-                    let mut blade_surfaces =
-                        crate::fx::draw::tessellate(&blade_draws, &view, &mut |shader| {
-                            presenter.fx_material_stages(shader)
-                        });
-                    draws.append(&mut blade_surfaces);
-                }
+                self.append_profile_saber_preview(&mut draws,&fx_requests,current_time);
             }
             if self.frontend_page == FrontendPage::RenderStudio {
                 let t=self.render_studio.timeline_time();
@@ -815,18 +829,21 @@ impl App {
                 // keys still control each actor's local XYZ/yaw independently.
                 let actors:Vec<_>=self.render_studio.timeline.active_actors(t).into_iter()
                     .filter(|c|c.lane>0 && self.render_studio.cinematic_preview.is_none()).map(|c|{
-                        let motion=c.motion_at(t,self.render_studio.timeline.interpolation !=
-                            super::render_studio_timeline::StudioInterpolation::Linear);
+                        let motion=self.render_studio.lane_motion(c.lane,t).unwrap_or_else(||c.motion_at(t,
+                            self.render_studio.timeline.interpolation!=super::render_studio_timeline::StudioInterpolation::Linear));
                         let model=self.render_studio.actor_model(c.lane).to_owned();
                         (c.lane,c.name.clone(),c.pose_time_ms(t),c.preview(t),
-                            (c.first_frame,c.end_frame),motion,model)
+                            (c.first_frame,c.end_frame),motion,model,self.render_studio.pose_blend_request(c.lane))
                     }).collect();
-                for (lane,name,time_ms,emote,frame_range,motion,model) in actors {
+                for (lane,name,time_ms,emote,frame_range,motion,model,blend) in actors {
                     // Keep each character independent. A missing skin, unsupported
                     // external pose, or bad emote must not discard the successful
                     // draw surfaces of the other characters in this frame.
                     let actor_result = (|| -> Result<Vec<DynamicModelSurface>, String> {
                         let mut actor_info=info.clone();
+                        // Each track starts from the profile, not the lead actor's overrides.
+                        self.studio_profile_sabers().apply(&mut actor_info);
+                        self.render_studio.apply_actor_sabers(lane,&mut actor_info);
                         let staged=ClientInfo::solo_model(&model);
                         actor_info.model_name=staged.model_name;
                         actor_info.skin_name=staged.skin_name;
@@ -839,13 +856,15 @@ impl App {
                             motion.position[1],-22.0+lane as f32*26.0+motion.position[2]];
                         let presenter=self.asset_preview_player_presenter.as_mut()
                             .ok_or("Studio player presenter unavailable")?;
+                        presenter.studio_pose_blend=blend.clone();
                         let (mut actor_draws,_) = presenter.present_profile_player_preview(
                             &actor_info,actor_origin,actor_axis,time_ms,&name,
-                            with_sabers,self.network.char_color.map(|channel|f32::from(channel)/255.0),
+                            self.render_studio.actor_with_sabers(lane),self.render_studio.actor_char_color(lane,self.network.char_color)
+                                .map(|channel|f32::from(channel)/255.0),
                             0,self.profile_studio_head_look,true,emote,Some(frame_range))?;
                         // Additional actors use the same attachment presenter as
                         // the primary; no network or game session entities needed.
-                        let _=presenter.drain_fx_requests();
+                        let saber_fx=presenter.drain_fx_requests();
                         let worn=presenter.drain_cosmetic_draws();
                         let _=presenter.drain_emote_fx();
                         if !worn.is_empty() {
@@ -853,6 +872,9 @@ impl App {
                             let mut attachments=self.asset_preview_entity_presenter.as_mut()
                                 .ok_or("Studio attachment presenter unavailable")?.present_cosmetics(worn);
                             actor_draws.append(&mut attachments);
+                        }
+                        if self.render_studio.actor_with_sabers(lane) {
+                            self.append_profile_saber_preview(&mut actor_draws,&saber_fx,time_ms);
                         }
                         Ok(actor_draws)
                     })();
@@ -1253,7 +1275,12 @@ impl App {
             return;
         }
         cinematic.fade_started = Some(now);
-        if let Some(path) = self.frontend_scene_cache_path.as_ref().filter(|path| !path.exists()) {
+        // Pages with a renderer-owned viewport (e.g. `uipage renderstudio` at
+        // launch) replace the menu scene; capturing then would cache that page
+        // as the next launch's menu backdrop.
+        let scene_page = !matches!(self.frontend_page, FrontendPage::RenderStudio | FrontendPage::Profile
+            | FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::Screenshots);
+        if let Some(path) = self.frontend_scene_cache_path.as_ref().filter(|path| scene_page && !path.exists()) {
             self.render_command(RenderCommand::CaptureFrontendScene {
                 path: path.clone(),
                 neutral_gamma: super::frontend_scene_cache::shader_gamma_reusable(&self.video),
@@ -1300,6 +1327,7 @@ impl App {
             presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             presenter.set_static_md3_instances(self.video.static_md3_instances);
             presenter.set_static_md3_bvh(self.video.static_md3_bvh);
+            presenter.set_static_md3_pvs_fallback(self.video.static_md3_pvs_fallback);
             presenter.set_static_models(Arc::clone(&statics));
 
             let mut fx_assets =

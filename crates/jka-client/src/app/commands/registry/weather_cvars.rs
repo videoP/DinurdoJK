@@ -812,9 +812,9 @@ app_cvars! {
                 "r_sunOverride",
                 "",
                 "0..1",
-                "Use a runtime custom q3 shader sun instead of the map-authored sky sun.",
+                "Legacy alias for r_relightMap: enables runtime map relighting, including the editable sun.",
                 CvarType::String,
-                CvarFlags::ARCHIVE,
+                CvarFlags::NONE,
                 LatchScope::None,
                 |app| CvarValue::String(App::cvar_get_r_sunoverride(app)),
                 |app, value| {
@@ -828,10 +828,6 @@ app_cvars! {
                         settings.sun_override = parse_bool(value).unwrap_or(settings.sun_override)
                     }
                 }),
-                archive: Some((56, |state| {
-                    let settings = state.video;
-                    format!("{}", u8::from(settings.sun_override))
-                })),
                 ..CvarBinding::NONE
             },
         implementations: [

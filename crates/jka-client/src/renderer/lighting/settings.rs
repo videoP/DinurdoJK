@@ -183,25 +183,14 @@ impl Renderer {
         );
     }
 
-    pub(in crate::renderer) fn set_emissive_area_lights(&mut self, enabled: bool) {
-        self.emissive_area_lights_enabled = enabled;
-        if let Some(world) = &mut self.world {
-            // Force the local-shadow cache to drop/reconsider area emitters.
-            world.local_shadows.selection_position = None;
-        }
-        self.upload_light_buffer();
-        self.rebuild_frame_plan();
-        self.update_lighting_settings();
-        self.activate_world_pipeline_variant();
-    }
-
-    pub(in crate::renderer) fn set_shader_light_promotion(&mut self, enabled: bool, mask: u32) {
-        let mask = mask & crate::materials::SHADER_LIGHT_ALL;
-        if self.shader_light_promotion_enabled == enabled && self.shader_light_promotion_mask == mask {
+    /// One authoritative mask; neither shadow sources nor legacy masters may
+    /// activate illumination. Skip expensive GPU/PSO work for unchanged state.
+    pub(in crate::renderer) fn set_added_map_light_sources(&mut self, sources: u32) {
+        let sources = sources & crate::materials::ADDED_MAP_LIGHT_ALL;
+        if self.added_map_light_sources_mask == sources {
             return;
         }
-        self.shader_light_promotion_enabled = enabled;
-        self.shader_light_promotion_mask = mask;
+        self.added_map_light_sources_mask = sources;
         if let Some(world) = &mut self.world {
             world.local_shadows.selection_position = None;
         }
@@ -362,8 +351,8 @@ impl Renderer {
     /// OpenJK marks blob shadows onto the *rendered* surfaces (CG_ImpactMark ->
     /// R_MarkFragments): the shadow polygon is clipped against every nearby facing
     /// markable triangle, so it follows slopes, steps and floor detail that sits
-    /// off the collision floor, and skips nomarks/noimpact/fog shaders and model
-    /// triangle soup. This is the same projector the saber marks use; only the
+    /// off the collision floor, and skips nomarks/noimpact/fog shaders. Compiled
+    /// model triangles are admitted for blobs. This is the same clipper saber marks use; only the
     /// quad set-up and the dynamic-mesh output are blob specific. One small
     /// query per blob, batched into one mesh. Costs nothing without blobs.
     pub(in crate::renderer) fn build_blob_shadow_marks(
@@ -395,6 +384,7 @@ impl Renderer {
                         Vec3::new(request.left[0], request.left[1], request.left[2]),
                         Vec3::new(request.up[0], request.up[1], request.up[2]),
                         request.origin[3],
+                        request.up[3] > 0.5,
                         &mut vertices,
                         &mut indices,
                     );

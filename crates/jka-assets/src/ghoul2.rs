@@ -196,7 +196,7 @@ fn add_relative(base: usize, relative: i32, limit: usize, what: &str) -> Result<
         .ok_or_else(|| format!("Ghoul2 {what} offset outside file"))
 }
 
-/// Read only the GLM animation-skeleton reference from the MDXM header.
+/// Read the GLM animation-skeleton reference as a package-relative qpath.
 pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
     if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
         return Err("expected Ghoul2 GLM/MDXM file".into());
@@ -204,7 +204,12 @@ pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
     if i32_at(data, 4, "GLM version")? != MDXM_VERSION {
         return Err(format!("expected GLM version {MDXM_VERSION}"));
     }
-    Ok(cstr(bytes_at(data, 72, 64, "GLM animation name")?))
+    let name = cstr(bytes_at(data, 72, 64, "GLM animation name")?);
+    // TaystJK/OpenJK FS_FOpenFileRead tolerates one leading slash (or
+    // backslash, already normalized by cstr). Custom GLMs such as Midgar's
+    // Chocobo author their GLA reference this way. Normalize at this boundary
+    // so GLA and sibling animation.cfg lookups use our strict VFS qpaths.
+    Ok(name.strip_prefix('/').unwrap_or(&name).to_owned())
 }
 
 /// Parse a Ghoul2 GLM/MDXM version 6 mesh, remapping legacy Jedi Outcast
@@ -2335,6 +2340,60 @@ mod tests {
         let file_size = data.len();
         put_i32(&mut data, 160, file_size as i32);
         data
+    }
+
+    #[test]
+    fn glm_animation_reference_accepts_taystjk_leading_separator() {
+        let expected = "models/players/midgarv3chocobo/midgarv3chocobo";
+        for authored in [
+            expected.to_owned(),
+            format!("/{expected}"),
+            format!("\\{}", expected.replace('/', "\\")),
+        ] {
+            let bytes = humanoid_glm_fixture(41, &authored, &[0, 40]);
+            assert_eq!(glm_animation_name(&bytes).unwrap(), expected);
+            assert_eq!(parse_glm_native(&bytes).unwrap().anim_name, expected);
+            assert_eq!(parse_glm(&bytes).unwrap().anim_name, expected);
+        }
+        let bytes = humanoid_glm_fixture(1, "*default", &[0]);
+        assert_eq!(glm_animation_name(&bytes).unwrap(), "*default");
+    }
+
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with Midgar v3.0.pk3"]
+    fn midgar_chocobo_animation_reference_loads_and_skins() {
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut assets = crate::pk3::AssetSearchPath::open(std::path::Path::new(&base)).unwrap();
+        let bytes = assets
+            .read("models/players/midgarv3chocobo/model.glm", 16 * 1024 * 1024)
+            .unwrap().expect("Midgar Chocobo GLM").bytes;
+        // The installed asset must exercise the original leading-slash failure.
+        assert_eq!(bytes[72], b'/');
+        let model = parse_glm_native(&bytes).unwrap();
+        let gla_qpath = format!("{}.gla", model.anim_name);
+        let gla_bytes = assets.read(&gla_qpath, 128 * 1024 * 1024)
+            .unwrap().expect("Midgar Chocobo GLA").bytes;
+        let gla = parse_gla(&gla_bytes).unwrap();
+        assert_eq!(model.num_bones, gla.num_bones());
+        let cfg = format!("{}/animation.cfg", model.anim_name.rsplit_once('/').unwrap().0);
+        let cfg_bytes = assets.read(&cfg, 1024 * 1024)
+            .unwrap().expect("Midgar Chocobo animation.cfg").bytes;
+        crate::animation::parse_animation_cfg(&cfg_bytes).unwrap();
+        let mut vertex_count = 0;
+        for frame in [0, gla.num_frames / 2, gla.num_frames - 1] {
+            let pose = gla.compose_frame(frame).unwrap();
+            for lod in &model.lods {
+                for surface in &lod.surfaces {
+                    let skinned = skin_glm_surface(surface, &pose).unwrap();
+                    assert!(skinned.vertices.iter().all(|v| v.position.iter()
+                        .chain(&v.normal).all(|value| value.is_finite())));
+                    vertex_count += skinned.vertices.len();
+                }
+            }
+        }
+        assert!(vertex_count > 0);
+        println!("Midgar Chocobo: {} bones, {} frames, {} LODs; GLA, animation.cfg and skinning succeeded",
+            gla.num_bones(), gla.num_frames, model.lods.len());
     }
 
     #[test]

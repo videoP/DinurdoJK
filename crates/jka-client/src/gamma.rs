@@ -5,14 +5,19 @@ pub enum GammaMethod {
     Shader,
     Baked,
     Hardware,
+    HardwareSceneOnly,
 }
 impl GammaMethod {
-    pub const ALL: [Self; 3] = [Self::Shader, Self::Baked, Self::Hardware];
+    pub const ALL: [Self; 4] = [Self::Shader, Self::Baked, Self::Hardware, Self::HardwareSceneOnly];
+    pub fn is_hardware(self) -> bool {
+        matches!(self, Self::Hardware | Self::HardwareSceneOnly)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Shader => "Shader",
             Self::Baked => "Baked textures",
             Self::Hardware => "Hardware",
+            Self::HardwareSceneOnly => "Hardware (scene only)",
         }
     }
     pub fn config_value(self) -> &'static str {
@@ -20,6 +25,7 @@ impl GammaMethod {
             Self::Shader => "shader",
             Self::Baked => "baked",
             Self::Hardware => "hardware",
+            Self::HardwareSceneOnly => "hardware_scene",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -27,6 +33,7 @@ impl GammaMethod {
             "0" | "shader" | "software" => Some(Self::Shader),
             "1" | "baked" | "textures" => Some(Self::Baked),
             "2" | "hardware" => Some(Self::Hardware),
+            "3" | "hardware_scene" | "hardware-scene" | "hw_scene" => Some(Self::HardwareSceneOnly),
             _ => None,
         }
     }
@@ -41,6 +48,10 @@ mod tests {
             assert_eq!(GammaMethod::parse(&index.to_string()), Some(method));
         }
         assert_eq!(GammaMethod::parse(" SOFTWARE "), Some(GammaMethod::Shader));
+        assert_eq!(GammaMethod::parse("HW_SCENE"), Some(GammaMethod::HardwareSceneOnly));
+        assert!(GammaMethod::HardwareSceneOnly.is_hardware());
+        assert!(GammaMethod::Hardware.is_hardware());
+        assert!(!GammaMethod::Shader.is_hardware());
         assert_eq!(GammaMethod::parse("nope"), None);
     }
 }

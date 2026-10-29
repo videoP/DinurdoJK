@@ -229,7 +229,7 @@ impl FxMaterial {
         self.float_vertex_color_at_time(rgba, 0.0)
     }
 
-    fn float_vertex_color_at_time(&self, rgba: [f32; 4], seconds: f32) -> [f32; 4] {
+    pub(crate) fn float_vertex_color_at_time(&self, rgba: [f32; 4], seconds: f32) -> [f32; 4] {
         let seconds = self.shader_time(seconds);
         let mut rgb = if self.rgb_vertex {
             if self.rgb_one_minus_vertex {
@@ -275,7 +275,7 @@ struct Batch {
 impl Batch {
     fn vertex(&mut self, jka: [f32; 3], uv: [f32; 2], color: [f32; 4]) -> u32 {
         let index = self.vertices.len() as u32;
-        self.vertices.push(DynamicModelVertex {
+        self.vertices.push(DynamicModelVertex { foliage_wind: 0.0,
             position: scene::render_position(jka),
             normal: [0.0, 1.0, 0.0],
             uv,
@@ -847,7 +847,7 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
         .iter()
         .zip(normals)
         .zip(rgba)
-        .map(|((position, normal), color)| DynamicModelVertex {
+        .map(|((position, normal), color)| DynamicModelVertex { foliage_wind: 0.0,
             position: scene::render_position(*position),
             normal: scene::render_position(*normal),
             uv: [0.0, 0.0],

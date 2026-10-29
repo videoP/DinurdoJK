@@ -79,6 +79,8 @@ impl App {
     }
 
     pub(in crate::app) fn tick(&mut self) {
+        self.studio_cfg_check_exit();
+        self.restore_frontend_world_after_studio();
         if self.extensions.poll() {
             self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, self.extensions.hud_images.clone()));
             if self.overlay == OverlayMode::HudEdit {
@@ -179,6 +181,14 @@ impl App {
         self.tick_network(dt);
         self.tick_japro_userinfo_updates();
         self.tick_demo_scrub_preview(now);
+        let studio_scene_started = Instant::now();
+        self.tick_render_studio_demo_preview(now);
+        if let Some(export) = self.render_studio.export.as_mut() {
+            export.app_cost(super::render_studio_profile::StudioAppCost::Scene,
+                studio_scene_started.elapsed().as_secs_f64() * 1000.0);
+        }
+        self.tick_render_studio_audio();
+        self.tick_menu_ambience();
 
         // `/map`/`/devmap` now runs a tiny authoritative one-client server.
         // Advance that authority first, publish a decoded snapshot, then let
@@ -284,6 +294,19 @@ impl App {
                     self.publish_ui();
                 }
             }
+            // TaystJK reads player state from each CG_Draw2D frame. Our
+            // renderer owns a separate thread, so publish only the compact
+            // state. No command at all when idle, except the one transition
+            // that clears previously active artwork.
+            let (zoom_scope, rocket_lock) = self.combat_overlay_state();
+            let active = zoom_scope.is_some() || rocket_lock.is_some();
+            if active || self.combat_ui_was_active {
+                self.render_command(RenderCommand::SetCombatUi {
+                    zoom_scope,
+                    rocket_lock,
+                });
+            }
+            self.combat_ui_was_active = active;
             self.drain_cgame_notices();
             self.drain_siege_server_actions();
             // jaPRO calls CG_DoAsync at the end of each CGame frame, after
@@ -304,6 +327,13 @@ impl App {
                 // through the server's shared flood-protection interval.
                 self.refresh_demo_scoreboard(now);
             }
+        } else if self.combat_ui_was_active {
+            // Demo stopped/paused, or the live session ended: clear once.
+            self.render_command(RenderCommand::SetCombatUi {
+                zoom_scope: None,
+                rocket_lock: None,
+            });
+            self.combat_ui_was_active = false;
         }
 
         if self.force_select_until.is_some_and(|until| now >= until) {
@@ -312,6 +342,10 @@ impl App {
         }
         if self.weapon_select_until.is_some_and(|until| now >= until) {
             self.weapon_select_until = None;
+            self.publish_transient_ui();
+        }
+        if self.inventory_select_until.is_some_and(|until| now >= until) {
+            self.inventory_select_until = None;
             self.publish_transient_ui();
         }
 
@@ -386,13 +420,20 @@ impl App {
         }
         self.update_player_name_visibility(now);
         self.ensure_inline_instance_capacity();
+        let snapshot_started = Instant::now();
         self.publish_snapshot();
+        if let Some(export) = self.render_studio.export.as_mut() {
+            export.app_cost(super::render_studio_profile::StudioAppCost::Snapshot,
+                snapshot_started.elapsed().as_secs_f64() * 1000.0);
+        }
         self.queue_demo_video_capture();
         self.tick_render_studio_export();
 
         let follow_name = self.current_follow_name();
         let game_timer = self.game_timer_text();
         let mini_scores = self.mini_scores_ui();
+        let hud_score = self.hud_score_ui();
+        let enemy_info = self.enemy_info_ui();
         let race_timer = self
             .game_session
             .as_ref()
@@ -405,6 +446,8 @@ impl App {
         if follow_name != self.follow_name_shown
             || game_timer != self.game_timer_shown
             || mini_scores != self.mini_scores_shown
+            || hud_score != self.hud_score_shown
+            || enemy_info != self.enemy_info_shown
             || race_timer != self.race_timer_shown
             || vote_line != self.vote_line_shown
             || team_overlay != self.team_overlay_shown
@@ -414,6 +457,8 @@ impl App {
             self.follow_name_shown = follow_name;
             self.game_timer_shown = game_timer;
             self.mini_scores_shown = mini_scores;
+            self.hud_score_shown = hud_score;
+            self.enemy_info_shown = enemy_info;
             self.race_timer_shown = race_timer;
             self.vote_line_shown = vote_line;
             self.team_overlay_shown = team_overlay;

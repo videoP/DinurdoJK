@@ -3126,8 +3126,7 @@ fn post_feature(bit: u32) -> bool {
     return (POST_FEATURES & bit) != 0u;
 }
 
-@fragment
-fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+fn full_post_common(input: VertexOut) -> vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
@@ -3237,6 +3236,19 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return full_post_common(input);
+}
+
+// Thermal replaces the whole display grade: none of the visible-light post
+// stack (SSR, fog, clouds, bloom, LUT, grain) means anything in long-wave IR,
+// and skipping it keeps the textures and lighting from leaking through.
+@fragment
+fn fs_main_thermal(input: VertexOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(thermal_post_color(input.uv, input.position.xy), 1.0);
+}
+
 // Specialized A/B path for frames where rain is the only spatial post effect.
 // It deliberately preserves rain's depth haze/froxel composite, final puddle film,
 // wet-weather grade and compact display grading while avoiding unrelated post work.
@@ -3289,8 +3301,7 @@ struct TaaFragmentOut {
     @location(1) history: vec4<f32>,
 };
 
-@fragment
-fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
+fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
     let gamma = max(settings.color.x, 0.05);
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
@@ -3396,6 +3407,26 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     return out;
 }
 
+@fragment
+fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
+    return taa_post_common(input);
+}
+
+// The camera is not jittered while thermal is on (draw.rs), so the heat field
+// is already stable. History just tracks the raw scene so switching thermal
+// off resumes TAA from a current frame instead of a stale one.
+@fragment
+fn fs_main_taa_thermal(input: VertexOut) -> TaaFragmentOut {
+    var current = textureLoad(scene_texture, taa_pixel_from_uv(input.uv, textureDimensions(scene_texture)), 0).rgb;
+    if (settings.taa_params.x > 0.5) {
+        current = taa_tonemap(current);
+    }
+    var out: TaaFragmentOut;
+    out.display = vec4<f32>(thermal_post_color(input.uv, input.position.xy), 1.0);
+    out.history = vec4<f32>(current, 1.0);
+    return out;
+}
+
 // Drawn during the world scene render pass, after depth-writing models and
 // before the transparent BSP queue/ocean and foreground model FX. Never read
 // the scene color target: fixed-function blending multiplies opaque RGB by
@@ -3418,4 +3449,315 @@ fn fs_cloud_shadow_opaque(input: VertexOut) -> @location(0) vec4<f32> {
     let normal = surface_normal(pixel);
     let factor = projected_cloud_shadow_factor(world, normal, pixel);
     return vec4<f32>(vec3<f32>(factor), 1.0);
+}
+
+
+// THERMAL_VISION_LIBRARY
+// Stylised long-wave IR view (r_thermalVision). Heat is a smooth scalar built
+// from what the prepass knows about each pixel, never from its visible color:
+//   world    - q3map material baseline (thermal BSP prepass, policy.b <= 0.8),
+//              warmed by sun-facing orientation and a depth-aware low-pass of
+//              the received light, plus slow world-anchored soak blotches;
+//   props    - models without heat sources (policy.b 0.81): a little above
+//              ambient;
+//   bodies   - Ghoul2 skeletons with a chest/head (policy.b 0.83..1.0): AvP
+//              (1999) heat-source distance, see thermal_body_heat;
+//   emitters - lit saber blades (CPU screen capsules, thermal_saber_heat),
+//              authored JKA `glow` stages (thermal_glow_heat), and as a
+//              fallback any very bright HDR pixel (muzzle flash, explosions).
+// Air between camera and surface pulls heat toward ambient, warm things bloom
+// a halo into their surroundings, and the result goes through a sensor stage
+// (softness, 30 Hz noise, column pattern) and a palette. Palettes are display
+// (sRGB) colors decoded for the sRGB output target.
+
+const THERMAL_SKY_HEAT: f32 = 0.03;
+const THERMAL_AIR_HEAT: f32 = 0.11;
+const THERMAL_PROP_HEAT: f32 = 0.19; // align generic props with BSP metal
+const THERMAL_CLASS_WORLD: u32 = 0u;
+const THERMAL_CLASS_PROP: u32 = 1u;
+const THERMAL_CLASS_BODY: u32 = 2u;
+
+struct ThermalTap {
+    depth: f32,
+    lum: f32,
+    heat: f32,
+    // 0..1: how strongly this pixel radiates a halo (bodies, emitters).
+    warm: f32,
+    class_id: u32,
+};
+
+fn thermal_class(policy: vec4<f32>) -> u32 {
+    // Entities never set R (SSR eligible); the thermal BSP prepass caps B at
+    // 0.8 (byte 204), cold models write 0.81 (207), bodies 0.83+ (212+).
+    if (policy.r < 0.5 && policy.b > 0.822) { return THERMAL_CLASS_BODY; }
+    if (policy.r < 0.5 && policy.b > 0.804) { return THERMAL_CLASS_PROP; }
+    return THERMAL_CLASS_WORLD;
+}
+
+// AvP (1999) kshape.c PredatorThermalVisionPolygon_Construct. The model
+// prepass stores alpha, the distance to the nearest heat source (chest, head)
+// normalised to 1024 mm, as B = 0.83 + 0.17 * (1 - alpha). AvP adds
+// GetSin(CloakingPhase) >> 3 (a +-1/8 pulse, 2 s period) and colours by
+// alpha^2 over five bands: red, yellow, green, cyan, blue. Those bands land on
+// the Predator palette's 0.875 (red) .. 0.25 (blue) stops.
+fn thermal_body_heat(policy_b: f32) -> f32 {
+    let distance = 1.0 - clamp((policy_b - 0.83) / 0.17, 0.0, 1.0);
+    let alpha = min(distance + 0.125 * sin(settings.camera_pos_time.w * 3.14159265), 1.0);
+    return 0.875 - 0.625 * alpha * alpha;
+}
+
+// Fraction of a surface's heat contrast lost to the air in front of it.
+fn thermal_air_fade(depth: f32) -> f32 {
+    return 0.78 * (1.0 - exp(-depth / 2600.0));
+}
+
+fn thermal_emitter(lum: f32) -> f32 {
+    return smoothstep(2.2, 7.0, lum);
+}
+
+fn thermal_tap(pixel: vec2<i32>) -> ThermalTap {
+    let dims = vec2<i32>(textureDimensions(linear_depth_texture));
+    let p = clamp(pixel, vec2<i32>(0), dims - vec2<i32>(1));
+    var out: ThermalTap;
+    out.depth = textureLoad(linear_depth_texture, p, 0).x;
+    let uv = (vec2<f32>(p) + vec2<f32>(0.5)) / vec2<f32>(dims);
+    out.lum = luminance(max(textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb, vec3<f32>(0.0)));
+    let emitter = thermal_emitter(out.lum);
+    if (!valid_depth(out.depth)) {
+        // Sky is the coldest thing in view; the sun or an explosion against it
+        // still radiates.
+        out.heat = mix(THERMAL_SKY_HEAT, 1.0, emitter);
+        out.warm = emitter;
+        out.class_id = THERMAL_CLASS_WORLD;
+        return out;
+    }
+    let policy = textureLoad(reflection_policy_texture, p, 0);
+    out.class_id = thermal_class(policy);
+    var heat = clamp(policy.b, 0.0, 0.8);
+    var fade = thermal_air_fade(out.depth);
+    var warm = 0.0;
+    if (out.class_id == THERMAL_CLASS_BODY) {
+        heat = thermal_body_heat(policy.b);
+        // Far hotter than the air, so a body keeps its contrast much further.
+        fade *= 0.5;
+        // The chest and head glow; limbs out at AvP's blue band barely do.
+        warm = (1.0 - fade) * clamp((heat - 0.25) / 0.625, 0.0, 1.0);
+    } else if (out.class_id == THERMAL_CLASS_PROP) {
+        heat = THERMAL_PROP_HEAT;
+    }
+    heat = mix(heat, THERMAL_AIR_HEAT, fade);
+    out.heat = mix(heat, 1.0, emitter);
+    out.warm = max(warm, emitter);
+    return out;
+}
+
+// Lit saber blades are additive FX with no depth, and an idle blade is not
+// bright enough for the HDR fallback (only a swing's stacked trail was). The
+// CPU projects every lit blade to a screen capsule for the clouds
+// (cloud_foreground_uniform; packed while thermal is on too). A blade is
+// plasma: a white-hot core and a hot glow out to its drawn glow radius.
+fn thermal_saber_heat(uv: vec2<f32>, depth: f32) -> f32 {
+    let count = u32(settings.cloud_foreground.x);
+    let pixel = uv * max(settings.aa.yz, vec2<f32>(1.0));
+    var heat = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let segment = settings.cloud_blades[i * 2u];
+        let extent = settings.cloud_blades[i * 2u + 1u];
+        // Geometry in front of the blade's nearest point hides it.
+        if (valid_depth(depth) && depth < extent.y - 4.0) {
+            continue;
+        }
+        let along = segment.zw - segment.xy;
+        let h = clamp(dot(pixel - segment.xy, along) / max(dot(along, along), 1.0e-4), 0.0, 1.0);
+        let distance_px = length(pixel - (segment.xy + along * h));
+        let core = 1.0 - smoothstep(extent.x * 0.22, extent.x * 0.45, distance_px);
+        let glow = 1.0 - smoothstep(extent.x * 0.3, extent.x * 1.8, distance_px);
+        heat = max(heat, max(core, glow * glow * 0.75));
+    }
+    return heat;
+}
+
+// Authored JKA Dynamic Glow: stages with the `glow` keyword (lamps, screens,
+// saber and flame FX that carry it) are JKA's own emissive marker. Thermal
+// forces the authored-only glow pyramid on (post/settings.rs), so the bloom
+// levels hold just those stages: the half level is the source, the coarser
+// levels its heat halo.
+fn thermal_glow_heat(uv: vec2<f32>) -> vec2<f32> {
+    if (settings.color.z < 0.5) {
+        return vec2<f32>(0.0);
+    }
+    let half = luminance(textureSampleLevel(bloom_half_texture, scene_sampler, uv, 0.0).rgb);
+    let wide = luminance(textureSampleLevel(bloom_quarter_texture, scene_sampler, uv, 0.0).rgb * 0.6
+        + textureSampleLevel(bloom_eighth_texture, scene_sampler, uv, 0.0).rgb * 0.4);
+    // Small additive bulbs are diluted at half resolution; strengthen the
+    // heat core without making the ordinary gameplay glow pyramid brighter.
+    return vec2<f32>(smoothstep(0.015, 0.22, half), smoothstep(0.008, 0.22, wide));
+}
+
+fn thermal_lattice(c: vec3<i32>) -> f32 {
+    let h = pcg_hash(u32(c.x) * 73856093u ^ u32(c.y) * 19349663u ^ u32(c.z) * 83492791u);
+    return f32(h) * (1.0 / 4294967295.0);
+}
+
+fn thermal_value_noise(p: vec3<f32>) -> f32 {
+    let cell = floor(p);
+    let f = p - cell;
+    let u = f * f * (vec3<f32>(3.0) - 2.0 * f);
+    let c = vec3<i32>(cell);
+    let x00 = mix(thermal_lattice(c), thermal_lattice(c + vec3<i32>(1, 0, 0)), u.x);
+    let x10 = mix(thermal_lattice(c + vec3<i32>(0, 1, 0)), thermal_lattice(c + vec3<i32>(1, 1, 0)), u.x);
+    let x01 = mix(thermal_lattice(c + vec3<i32>(0, 0, 1)), thermal_lattice(c + vec3<i32>(1, 0, 1)), u.x);
+    let x11 = mix(thermal_lattice(c + vec3<i32>(0, 1, 1)), thermal_lattice(c + vec3<i32>(1, 1, 1)), u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+fn thermal_heat(uv: vec2<f32>, pixel: vec2<i32>) -> f32 {
+    let scale = max(settings.aa.z / 1080.0, 0.5);
+    let centre = thermal_tap(pixel);
+
+    // Sensor softness: a tent over the four diagonals at about one 1080p
+    // pixel. Thermal imagers are soft, and it keeps thin geometry from
+    // sparkling.
+    let r = i32(max(round(scale), 1.0));
+    var heat = (centre.heat * 2.0
+        + thermal_tap(pixel + vec2<i32>(-r, -r)).heat
+        + thermal_tap(pixel + vec2<i32>(r, -r)).heat
+        + thermal_tap(pixel + vec2<i32>(-r, r)).heat
+        + thermal_tap(pixel + vec2<i32>(r, r)).heat) / 6.0;
+
+    // Two staggered six-tap rings (about 5 and 12 1080p pixels) feed the heat
+    // halo and a depth-aware low-pass of the lighting.
+    var ring_weight = 0.0;
+    var warm_weight = 0.0;
+    var warm_heat = 0.0;
+    var light_sum = centre.lum;
+    var light_weight = 1.0;
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        let outer = i >= 6u;
+        let angle = f32(i) * 1.0471976 + select(0.0, 0.5235988, outer);
+        let radius = select(5.0, 12.0, outer) * scale;
+        let offset = vec2<i32>(round(vec2<f32>(cos(angle), sin(angle)) * radius));
+        let tap = thermal_tap(pixel + offset);
+        let w = select(1.0, 0.6, outer);
+        ring_weight += w;
+        warm_weight += tap.warm * w;
+        warm_heat += tap.warm * tap.heat * w;
+        if (tap.class_id == THERMAL_CLASS_WORLD && valid_depth(tap.depth)
+            && abs(tap.depth - centre.depth) < centre.depth * 0.06 + 4.0) {
+            light_sum += tap.lum;
+            light_weight += 1.0;
+        }
+    }
+
+    // Bodies carry their whole gradient from the prepass; only the world gets
+    // screen-space detail.
+    if (valid_depth(centre.depth) && centre.class_id == THERMAL_CLASS_WORLD) {
+        let contrast = 1.0 - thermal_air_fade(centre.depth);
+        let normal = surface_normal(pixel);
+        let toward_sun = -normalize(settings.cloud_sun_direction.xyz);
+        let sun = clamp(settings.cloud_sun_direction.w / 250.0, 0.0, 1.0)
+            * clamp(dot(normal, toward_sun), 0.0, 1.0)
+            * step(0.02, toward_sun.y);
+        // Received light, low-passed so it is lighting, not texture.
+        let lighting = light_sum / light_weight;
+        let world = world_position(uv, centre.depth);
+        let soak = thermal_value_noise(world / 220.0) * 0.7
+            + thermal_value_noise(world / 60.0) * 0.3 - 0.5;
+        let detail = 0.07 * sun
+            + 0.11 * (lighting / (lighting + 0.6))
+            + 0.025 * normal.y
+            + 0.09 * soak;
+        heat += detail * contrast;
+    }
+
+    // Heat bloom: warm neighbours lift their surroundings toward their own
+    // heat, never pull a hotter pixel down. A body keeps its own gradient.
+    if (warm_weight > 0.0 && centre.class_id != THERMAL_CLASS_BODY) {
+        let halo_heat = warm_heat / warm_weight * 0.85;
+        let coverage = warm_weight / ring_weight;
+        heat = max(heat, mix(heat, halo_heat, pow(coverage, 0.75) * 0.85));
+    }
+
+    // Emitters sit on top of everything else (their halos included).
+    let glow = thermal_glow_heat(uv);
+    heat = max(heat, mix(heat, 0.78, glow.y * 0.8));
+    heat = max(heat, mix(heat, 1.0, glow.x));
+    heat = max(heat, mix(heat, 1.0, thermal_saber_heat(uv, centre.depth)));
+
+    // Camera collision-medium classification: lava wins over water for
+    // overlapping volumes. Native BSP water is cold even when enhanced ocean
+    // rendering is disabled; lava makes the entire view white-hot.
+    if (settings.exposure_controls.w > 1.5) {
+        heat = 0.96 + 0.04 * heat;
+    } else if (settings.exposure_controls.w > 0.5) {
+        heat = 0.045 + heat * 0.15;
+    }
+    return clamp(heat, 0.0, 1.0);
+}
+
+// Uniformly spaced display-space color stops.
+fn thermal_ramp9(t: f32, stops: array<vec3<f32>, 9>) -> vec3<f32> {
+    var s = stops;
+    let x = clamp(t, 0.0, 1.0) * 8.0;
+    let i = min(u32(x), 7u);
+    return mix(s[i], s[i + 1u], x - f32(i));
+}
+
+fn thermal_palette(heat: f32, mode: u32) -> vec3<f32> {
+    let t = clamp(heat, 0.0, 1.0);
+    if (mode == 2u) { return vec3<f32>(pow(t, 0.85)); } // white hot
+    if (mode == 3u) { return vec3<f32>(1.0 - pow(t, 0.85)); } // black hot
+    if (mode == 4u) { // ironbow
+        return thermal_ramp9(t, array<vec3<f32>, 9>(
+            vec3<f32>(0.00, 0.00, 0.04), vec3<f32>(0.10, 0.02, 0.28),
+            vec3<f32>(0.33, 0.02, 0.50), vec3<f32>(0.60, 0.04, 0.50),
+            vec3<f32>(0.84, 0.18, 0.30), vec3<f32>(0.96, 0.42, 0.08),
+            vec3<f32>(1.00, 0.66, 0.06), vec3<f32>(1.00, 0.86, 0.36),
+            vec3<f32>(1.00, 1.00, 0.92)));
+    }
+    // Predator: indigo/blue cold world, cyan-green halo, yellow-orange-red
+    // bodies, white-hot emitters.
+    return thermal_ramp9(t, array<vec3<f32>, 9>(
+        vec3<f32>(0.02, 0.00, 0.10), vec3<f32>(0.05, 0.03, 0.38),
+        vec3<f32>(0.05, 0.20, 0.80), vec3<f32>(0.00, 0.55, 0.90),
+        vec3<f32>(0.05, 0.80, 0.45), vec3<f32>(0.70, 0.92, 0.10),
+        vec3<f32>(1.00, 0.75, 0.00), vec3<f32>(1.00, 0.25, 0.02),
+        vec3<f32>(1.00, 0.95, 0.85)));
+}
+
+fn thermal_srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    let v = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return select(pow((v + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), v / 12.92, v <= vec3<f32>(0.04045));
+}
+
+fn thermal_post_color(uv: vec2<f32>, position: vec2<f32>) -> vec3<f32> {
+    let mode = u32(round(settings.exposure_controls.z));
+    let viewport = max(settings.aa.yz, vec2<f32>(1.0));
+    let scale = max(viewport.y / 1080.0, 0.5);
+    let dims = vec2<i32>(textureDimensions(linear_depth_texture));
+    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+    var heat = thermal_heat(uv, pixel);
+    let gamma = max(settings.color.x, 0.05);
+    if (mode == 5u) {
+        return pow(thermal_srgb_decode(vec3<f32>(heat)), vec3<f32>(1.0 / gamma));
+    }
+
+    // Microbolometer noise: temporal at a 30 Hz sensor rate (per rendered
+    // frame it reads as shimmer at high FPS) plus a fixed column pattern.
+    let cell = vec2<u32>(position / max(round(scale), 1.0));
+    let sensor_frame = u32(floor(max(settings.camera_pos_time.w, 0.0) * 30.0));
+    heat += (grain_hash(cell, sensor_frame, 0x5bd1e995u) - 0.5) * 0.022;
+    heat += (grain_hash(vec2<u32>(cell.x, 0u), 0u, 0x27d4eb2fu) - 0.5) * 0.010;
+    var rgb = thermal_palette(heat, mode);
+
+    if (mode == 1u || mode == 4u) {
+        // Alternate sensor rows slightly darker, and a slow refresh band.
+        let row = u32(position.y) / u32(max(round(scale), 1.0));
+        rgb *= select(1.0, 0.9, (row & 1u) == 1u);
+        let band = fract(uv.y - settings.camera_pos_time.w * 0.11) - 0.5;
+        rgb *= 1.0 + 0.07 * exp(-band * band * 180.0);
+    }
+    let from_centre = (uv - vec2<f32>(0.5)) * vec2<f32>(viewport.x / viewport.y, 1.0);
+    rgb *= 1.0 - 0.5 * smoothstep(0.55, 1.05, length(from_centre));
+    return pow(thermal_srgb_decode(rgb), vec3<f32>(1.0 / gamma));
 }

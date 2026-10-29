@@ -4,6 +4,41 @@ use crate::renderer::{
     Renderer, TextureFilter, VsyncMode, DEPTH_FORMAT,
 };
 
+pub(in crate::renderer) struct RenderFrame {
+    pub texture: wgpu::Texture,
+    surface: Option<wgpu::SurfaceTexture>,
+}
+
+impl Renderer {
+    pub(in crate::renderer) fn acquire_render_frame(&mut self, info: &mut crate::renderer::FrameInfo)
+        -> Result<RenderFrame, crate::renderer::RenderError> {
+        if let Some(texture) = &self.offscreen_output {
+            return Ok(RenderFrame { texture: texture.clone(), surface: None });
+        }
+        let surface = self.acquire_surface_frame(info)?;
+        Ok(RenderFrame { texture: surface.texture.clone(), surface: Some(surface) })
+    }
+
+    pub(in crate::renderer) fn present_render_frame(&self, frame: RenderFrame) {
+        if let Some(surface) = frame.surface {
+            self.window.pre_present_notify();
+            self.queue.present(surface);
+        }
+    }
+
+    pub(in crate::renderer) fn make_offscreen_output(&self) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Independent Studio scene output"),
+            size: wgpu::Extent3d { width: self.config.width.max(1), height: self.config.height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    }
+}
+
 /// The configuration actually handed to `Surface::configure`.
 ///
 /// DXGI flip-model swapchains do not accept sRGB formats, and Intel's Windows
@@ -61,7 +96,7 @@ impl Renderer {
     /// be an sRGB view of a UNORM swapchain (see `presentation_config`). Native
     /// HDR output instead uses the selected native HDR surface format,
     /// never the internal Rgba16Float compositor format.
-    pub(in crate::renderer) fn surface_texture_view(&self, frame: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+    pub(in crate::renderer) fn surface_texture_view(&self, frame: &RenderFrame) -> wgpu::TextureView {
         let format = surface_view_format(
             self.config.format,
             self.hdr_output.as_ref().map(|output| output.selection.format),
@@ -80,12 +115,18 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn resize(&mut self, size: PhysicalSize<u32>) {
+        // Windows can repeat a resize notification without changing dimensions.
+        // Reallocating every target then briefly retains two full target sets.
+        if self.size == size { return; }
         self.size = size;
         if size.width == 0 || size.height == 0 {
             return;
         }
         self.config.width = size.width;
         self.config.height = size.height;
+        if self.offscreen_output.is_some() {
+            self.offscreen_output = Some(self.make_offscreen_output());
+        }
         self.configure_surface();
         self.note_surface_configured("resize");
         self.resize_hdr_output();

@@ -141,25 +141,8 @@ impl App {
                 .hint_text("Search emotes")
                 .desired_width(f32::INFINITY),
         );
-        ui.horizontal(|ui| {
-            let title = self
-                .emote_wheel
-                .categories
-                .iter()
-                .find(|c| c.id == filter)
-                .map(|c| c.name.as_str())
-                .unwrap_or("All categories");
-            egui::ComboBox::from_id_salt("emote_category_filter")
-                .truncate()
-                .selected_text(title)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut filter, String::new(), "All categories");
-                    for c in &self.emote_wheel.categories {
-                        ui.selectable_value(&mut filter, c.id.clone(), &c.name);
-                    }
-                });
-            ui.checkbox(&mut favorites_only, "★ Favorites");
-        });
+        crate::app::egui_emote_radial::emote_category_tabs(
+            ui, &self.emote_wheel.categories, &mut filter, &mut favorites_only);
         ui.ctx().data_mut(|d| {
             d.insert_temp(search_id, search.clone());
             d.insert_temp(filter_id, filter.clone());
@@ -250,7 +233,7 @@ impl App {
                 for row in range {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for (index, emote) in rows.iter().skip(row * columns).take(columns) {
+                        for (_, emote) in rows.iter().skip(row * columns).take(columns) {
                             ui.push_id(&emote.id, |ui| {
                                 let selected = active.as_deref() == Some(&emote.id)
                                     || emote
@@ -285,13 +268,22 @@ impl App {
                                                 crate::emotes::default_variant_index(emote)
                                             });
                                         let v = emote.variants.get(variant).unwrap_or(emote);
+                                        // The number beside an emote is its *permanent* taunt
+                                        // wire ID, NOT its ordinal in this filtered/sorted grid.
+                                        // The same value is accepted by /djk_emote <number>.
+                                        let wire_id = crate::emotes::network::wire_id(v);
+                                        let id_label = wire_id.map_or_else(
+                                            || "LOCAL".to_owned(), |id| format!("#{id}"));
+                                        let command = wire_id.map_or_else(
+                                            || format!("djk_emote {}", v.id),
+                                            |id| format!("djk_emote {id}"));
                                         if ui
                                             .add_sized(
                                                 [ui.available_width(), 44.0],
                                                 egui::Button::new(
                                                     egui::RichText::new(format!(
                                                         "{}  {}",
-                                                        index + 1,
+                                                        id_label,
                                                         crate::emotes::display_title(emote)
                                                     ))
                                                     .size(11.0),
@@ -299,6 +291,7 @@ impl App {
                                                 .wrap()
                                                 .frame(false),
                                             )
+                                            .on_hover_text(format!("{}\nVariation: {}\n{}", v.id, v.variant_name, command))
                                             .clicked()
                                         {
                                             crate::emotes::play(v.clone());

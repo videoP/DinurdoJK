@@ -789,30 +789,33 @@ impl BrowserIndexEntry {
 /// render thread. Individual corrupt/foreign HTML files are skipped while valid
 /// DinurdoJK logs continue to appear.
 pub(crate) fn scan_browser_index(base: &Path) -> Result<Vec<BrowserIndexEntry>, String> {
-    let game_root = base.parent().unwrap_or(base);
-    let dirs = fs::read_dir(game_root)
-        .map_err(|error| format!("could not scan {}: {error}", game_root.display()))?;
+    let roots = jka_assets::pk3::configured_filesystem_roots(base);
+    let mut game_roots = Vec::new();
+    if let Some(home) = roots.homepath { game_roots.push(home); }
+    let local_root = base.parent().unwrap_or(base).to_path_buf();
+    if !game_roots.contains(&local_root) { game_roots.push(local_root); }
     let mut logs = Vec::new();
-
-    for game_dir in dirs.flatten() {
-        let game_path = game_dir.path();
-        if !game_path.is_dir() {
-            continue;
-        }
-        let chatlogs = game_path.join("chatlogs");
-        if !chatlogs.is_dir() {
-            continue;
-        }
-        let mod_name = game_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "base".to_owned());
-        let mut files = Vec::new();
-        collect_html_files(&chatlogs, &mut files, 0);
-        for path in files {
-            match parse_browser_detail(&path, Some(&mod_name)) {
-                Ok(detail) => logs.push(index_from_detail(detail)),
-                Err(error) => devprintln!(2, "Chat log browser skipped {}: {error}", path.display()),
+    for game_root in game_roots {
+        let dirs = match fs::read_dir(&game_root) {
+            Ok(dirs) => dirs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("could not scan {}: {error}", game_root.display())),
+        };
+        for game_dir in dirs.flatten() {
+            let game_path = game_dir.path();
+            if !game_path.is_dir() { continue; }
+            let chatlogs = game_path.join("chatlogs");
+            if !chatlogs.is_dir() { continue; }
+            let mod_name = game_path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "base".to_owned());
+            let mut files = Vec::new();
+            collect_html_files(&chatlogs, &mut files, 0);
+            for path in files {
+                match parse_browser_detail(&path, Some(&mod_name)) {
+                    Ok(detail) => logs.push(index_from_detail(detail)),
+                    Err(error) => devprintln!(2, "Chat log browser skipped {}: {error}", path.display()),
+                }
             }
         }
     }

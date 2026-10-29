@@ -240,6 +240,8 @@ pub struct JaproCgame {
     /// `mp/drain(wide)_japro.efx`. Only the Force-drain hand effect
     /// (`activeForcePass > FORCE_LEVEL_3`); force lightning is unaffected.
     pub drain_fx: u8,
+    /// TaystJK screen-copy effects: refractive cloak and Force push/pull.
+    pub render_to_texture_fx: u8,
     /// jaPRO cg_thirdPersonFlagAlpha: opacity of the viewer's carried flag.
     pub third_person_flag_alpha: f32,
 }
@@ -263,6 +265,7 @@ impl Default for JaproCgame {
             speedometer: crate::speedometer::Settings::default(),
             lagometer: crate::lagometer::Settings::default(),
             drain_fx: 2,
+            render_to_texture_fx: 1,
             third_person_flag_alpha: 1.0,
         }
     }
@@ -985,7 +988,17 @@ mod tests {
         assert_eq!(settings.lagometer.mode, 2);
         assert_eq!(settings.cvar_value("cg_lagometerX").as_deref(), Some("60"));
         assert_eq!(settings.cvar_value("cg_lagometerY").as_deref(), Some("144"));
+        assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("auto"));
+        settings.set_cvar("cl_commandsize", "128").unwrap().unwrap();
+        assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("128"));
+        settings.set_cvar("cl_commandsize", "100").unwrap().unwrap();
+        assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("128"));
+        settings.set_cvar("cl_commandsize", "300").unwrap().unwrap();
+        assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("512"));
+        settings.set_cvar("cl_commandsize", "12").unwrap().unwrap();
         assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("64"));
+        settings.set_cvar("cl_commandsize", "AUTO").unwrap().unwrap();
+        assert_eq!(settings.cvar_value("cl_commandsize").as_deref(), Some("auto"));
         settings.set_cvar("cg_lagometer", "4").unwrap().unwrap();
         assert_eq!(settings.lagometer.mode, 4);
         assert_eq!(settings.drain_fx, 2, "jaPRO's default is the JaPRO drain effect, not stock");
@@ -999,6 +1012,31 @@ mod tests {
         assert!(text.contains("seta cg_stylePlayer \"260\""));
         assert!(text.contains("seta cg_lagometer \"4\"") && text.contains("seta cg_lagometerX \"60\""));
         assert!(text.contains("seta cg_drainFX \"2\""));
+    }
+
+    #[test]
+    fn render_to_texture_fx_preserves_taystjk_modes_and_new_predator_mode() {
+        let mut settings = JaproCgame::default();
+        assert_eq!(settings.render_to_texture_fx, 1);
+        settings.set_cvar("cg_renderToTextureFX", "0").unwrap().unwrap();
+        assert_eq!(settings.render_to_texture_fx, 0);
+        assert_eq!(settings.cvar_value("CG_RENDERTOTEXTUREFX").as_deref(), Some("0"));
+        let mut text = String::new();
+        settings.write_cfg(&mut text);
+        assert!(text.contains("seta cg_renderToTextureFX \"0\""));
+        settings.set_cvar("cg_renderToTextureFX", "2").unwrap().unwrap();
+        assert_eq!(settings.render_to_texture_fx, 2);
+        assert_eq!(settings.cvar_value("cg_renderToTextureFX").as_deref(), Some("2"));
+        settings.set_cvar("cg_renderToTextureFX", "-1").unwrap().unwrap();
+        assert_eq!(settings.render_to_texture_fx, 1);
+        for (value, expected) in [("3", 3u8), ("4", 4), ("5", 5)] {
+            settings.set_cvar("cg_renderToTextureFX", value).unwrap().unwrap();
+            assert_eq!(settings.render_to_texture_fx, expected);
+            assert_eq!(settings.cvar_value("cg_renderToTextureFX").as_deref(), Some(value));
+        }
+        assert!(settings.set_cvar("cg_renderToTextureFX", "6").unwrap().is_err());
+        assert!(settings.set_cvar("cg_renderToTextureFX", "oops").unwrap().is_err());
+        assert_eq!(settings.render_to_texture_fx, 5);
     }
 
     #[test]

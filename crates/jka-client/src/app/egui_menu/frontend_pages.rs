@@ -14,10 +14,41 @@ impl App {
         // its input. Settings opens over it with the regular chrome.
         if self.frontend_page == FrontendPage::Main && self.egui_display_overlay() != OverlayMode::Video {
             self.draw_neon_main_menu(ui);
+            self.egui_frontend_neon_footer(ui);
             self.egui_disconnect_notice(ui);
+            self.egui_frontend_quit_confirmation(ui);
             return;
         }
+        // Play and Developer Tools share Main's actual HDR tubes, ignition,
+        // CRT TV content, perspective projection and bloom. No egui body/header.
+        if self.egui_display_overlay() != OverlayMode::Video {
+            let submenu = match self.frontend_page {
+                FrontendPage::Play => Some(crate::neon_menu::MenuPage::Play),
+                FrontendPage::DeveloperTools => Some(crate::neon_menu::MenuPage::DeveloperTools),
+                _ => None,
+            };
+            if let Some(kind) = submenu {
+                self.draw_neon_frontend_submenu(ui, kind);
+                self.egui_frontend_neon_footer(ui);
+                self.egui_disconnect_notice(ui);
+                self.egui_frontend_quit_confirmation(ui);
+                return;
+            }
+        }
         self.release_neon_main_menu();
+        // Render Studio is a full-height editor, not a frontend menu page.
+        // It owns its header and workspace: no reserved footer strip, and no
+        // GPU neon footer over the preview or timeline. This also clears any
+        // chrome left by the Developer Tools page on entry.
+        if self.frontend_page == FrontendPage::RenderStudio
+            && self.egui_display_overlay() != OverlayMode::Video {
+            self.release_neon_chrome();
+            self.egui_frontend_header(ui);
+            self.egui_frontend_body(ui);
+            self.egui_disconnect_notice(ui);
+            self.egui_frontend_2d_fade(ui);
+            return;
+        }
         self.egui_frontend_header(ui);
         if self.egui_display_overlay() == OverlayMode::Video {
             self.egui_setup_tabs(ui);
@@ -27,8 +58,10 @@ impl App {
             self.egui_frontend_footer(ui);
             self.egui_frontend_body(ui);
         }
+        self.egui_frontend_neon_footer(ui);
         self.egui_disconnect_notice(ui);
         self.egui_frontend_2d_fade(ui);
+        self.egui_frontend_quit_confirmation(ui);
     }
 
     /// Fade the 2D chrome in on the shared stage clock (see `FrontendStage`).
@@ -39,7 +72,7 @@ impl App {
         // Background decoding/preparation stays asynchronous. A preferred-page
         // launch must never wait behind the scene's presentation clock, even
         // when navigating back to Main before the scene is ready.
-        if self.frontend_skip_chrome_fade || self.frontend_page == FrontendPage::Main {
+        if self.frontend_skip_chrome_fade || matches!(self.frontend_page, FrontendPage::Main | FrontendPage::Play | FrontendPage::DeveloperTools) {
             return;
         }
         let ctx = ui.ctx();
@@ -104,7 +137,7 @@ impl App {
     pub(in crate::app::egui_menu) fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
         if matches!(
             self.frontend_page,
-            FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::RenderStudio | FrontendPage::Screenshots
+            FrontendPage::DeveloperTools | FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::RenderStudio | FrontendPage::Screenshots
         ) {
             return;
         }
@@ -114,7 +147,7 @@ impl App {
             self.frontend_scene_texture.is_some() || self.frontend_stage.cache_pending;
         // Main displays the art-directed scene without artificial darkening.
         // Retain the cached still -> live-3D handoff, not the old black scrim.
-        let darkness = if self.frontend_page == FrontendPage::Main {
+        let darkness = if matches!(self.frontend_page, FrontendPage::Main | FrontendPage::Play | FrontendPage::DeveloperTools) {
             0.0
         } else if image_expected {
             1.0 - self.frontend_stage.brightness(now, FRONTEND_STAGE_FADE_IN_SECS)
@@ -122,13 +155,18 @@ impl App {
             1.0 - handoff
         };
         let image_alpha = 1.0 - handoff;
-        let rect = root.max_rect();
+        let full = root.max_rect();
+        // Scene-stage photographs and scrims must never cover the GPU footer,
+        // which is drawn underneath egui in the shared UI composite.
+        let rect = egui::Rect::from_min_max(full.min, egui::pos2(full.right(),
+            (full.bottom()-crate::neon_menu::footer::HEIGHT).max(full.top())));
+        let painter = root.painter().with_clip_rect(rect);
         let mut painted_image = false;
         // Before the WGPU compositor is ready, keep showing the existing egui
         // still as a safe fallback. Once ready, only WGPU blends the still
         // *under* the neon, rain, glass and CRT passes.
         // Settings over Main suspends the compositor, so egui keeps the still.
-        let egui_owns_image = self.frontend_page != FrontendPage::Main
+        let egui_owns_image = !matches!(self.frontend_page, FrontendPage::Main | FrontendPage::Play | FrontendPage::DeveloperTools)
             || !self.neon_menu.renderer_ready
             || self.egui_display_overlay() == OverlayMode::Video;
         if let Some(image) = &self.frontend_scene_texture {
@@ -142,7 +180,7 @@ impl App {
                     rect.height() / (size.y * cover),
                 );
                 let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), visible);
-                root.painter().image(
+                painter.image(
                     image.id(), rect, uv,
                     crate::renderer::egui_alpha_tint(image_alpha),
                 );
@@ -150,7 +188,7 @@ impl App {
             }
         }
         if darkness > 0.001 {
-            root.painter().rect_filled(
+            painter.rect_filled(
                 rect, egui::CornerRadius::ZERO,
                 egui::Color32::from_black_alpha((darkness * 255.0).round() as u8),
             );
@@ -188,12 +226,20 @@ impl App {
                             FrontendPage::ChatLogs => "CHAT LOGS",
                             FrontendPage::DeveloperTools => "DEVELOPER TOOLS",
                             FrontendPage::AssetViewer => "ASSET VIEWER",
+                            FrontendPage::Pk3Manager => "PK3 MANAGER",
                             FrontendPage::Screenshots => "SCREENSHOTS",
                             FrontendPage::MapViewer => "MAP VIEWER",
                             FrontendPage::RenderStudio => "RENDER STUDIO",
                         }
                     };
                     theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
+                    // Submenus use the persistent footer for BACK / QUIT.
+                    // Render Studio's dedicated header tools stay here.
+                    if self.frontend_page == FrontendPage::RenderStudio
+                        && self.egui_display_overlay() != OverlayMode::Video {
+                        ui.add_space(12.0);
+                        self.egui_render_studio_header_controls(ui);
+                    }
                     if self.egui_display_overlay() == OverlayMode::Video
                         || self.frontend_page != FrontendPage::Main
                     {
@@ -201,8 +247,15 @@ impl App {
                             // Keep clear of the FPS counter pinned to the
                             // top-right corner of the window.
                             ui.add_space(96.0);
-                            if theme::ghost_button(ui, "BACK").clicked() {
-                                self.frontend_back();
+                            if self.frontend_page == FrontendPage::RenderStudio
+                                && self.egui_display_overlay() != OverlayMode::Video {
+                                // Preserve the editor's original top-bar BACK,
+                                // instead of relying on the frontend footer.
+                                if theme::ghost_button(ui, "BACK").clicked() {
+                                    self.frontend_back();
+                                }
+                                ui.add_space(10.0);
+                                self.egui_render_studio_header_actions(ui);
                             }
                         });
                     }
@@ -210,41 +263,119 @@ impl App {
             });
     }
 
-    pub(in crate::app::egui_menu) fn egui_frontend_footer(&mut self, root: &mut egui::Ui) {
-        egui::Panel::bottom("jka_frontend_footer")
-            .exact_size(theme::FOOTER_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin::symmetric(0, 0)),
-            )
-            .show(root, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
-                    egui::CornerRadius::ZERO,
-                    theme::LINE,
-                );
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(GUTTER);
-                    let hint = match self.frontend_page {
-                        FrontendPage::Main => "Select an option.  ` opens the console.",
-                        FrontendPage::Play => "ESC returns to the main menu.",
-                        FrontendPage::ServerBrowser
-                        | FrontendPage::SoloGame
-                        | FrontendPage::PlayDemo => "ESC returns to Play.",
-                        FrontendPage::Profile | FrontendPage::Controls | FrontendPage::ChatLogs => {
-                            "ESC returns to the main menu."
-                        }
-                        FrontendPage::DeveloperTools => "ESC returns to the main menu.",
-                        FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::RenderStudio => {
-                            "ESC returns to Developer Tools."
-                        }
-                        FrontendPage::Screenshots => "ESC returns to the main menu.",
-                    };
-                    theme::label(ui, theme::plain(hint, 11.5, theme::TEXT_FAINT));
+    /// GPU/Taffy footer shared by Main, Developer Tools, and all other
+    /// frontend pages. egui provides hit testing only; no default buttons or
+    /// frames are drawn in this footer.
+    fn egui_frontend_neon_footer(&mut self, ui: &mut egui::Ui) {
+        use crate::neon_menu::{ChromeFrame, ChromeLine, footer};
+        let area = ui.max_rect();
+        let (w,h) = (area.width(),area.height());
+        let back = self.frontend_page != FrontendPage::Main
+            || self.egui_display_overlay() == OverlayMode::Video;
+        let pending_video_changes = if self.egui_display_overlay() == OverlayMode::Video
+            && self.setup_selected == SETUP_TAB_VIDEO && self.video_restart_required() {
+            self.pending_video_changes()
+        } else { Vec::new() };
+        let action = (!pending_video_changes.is_empty())
+            .then(|| format!("APPLY ({})",pending_video_changes.len()));
+        let Some(footer) = footer::compute_with_action(w,h,back,action.as_deref()) else { return; };
+        let rect = |r: [f32;4]| egui::Rect::from_min_max(
+            area.min + egui::vec2(r[0]*w,r[1]*h),
+            area.min + egui::vec2(r[2]*w,r[3]*h));
+        let mut back_hovered=false;
+        let mut quit_hovered=false;
+        let mut apply_hovered=false;
+        let mut activate_back=false;
+        let mut activate_quit=false;
+        let mut activate_apply=false;
+        if let Some((_,r))=footer.apply {
+            let response=ui.interact(rect(r),ui.make_persistent_id("neon_footer_apply"),egui::Sense::click())
+                .on_hover_ui(|ui| {
+                    ui.set_max_width(420.0);
+                    theme::glow_label(ui,&format!("{} pending video changes",pending_video_changes.len()),
+                        12.5,theme::WARNING);
+                    for change in &pending_video_changes {
+                        theme::glow_label(ui,&format!("{} - {}",change.label,change.detail),
+                            11.5,theme::TEXT_DIM);
+                    }
+                });
+            apply_hovered=response.hovered(); activate_apply=response.clicked();
+        }
+        if let Some((_,r))=footer.back {
+            let response=ui.interact(rect(r),ui.make_persistent_id("neon_footer_back"),egui::Sense::click());
+            back_hovered=response.hovered(); activate_back=response.clicked();
+        }
+        let response=ui.interact(rect(footer.quit.1),ui.make_persistent_id("neon_footer_quit"),egui::Sense::click());
+        quit_hovered=response.hovered(); activate_quit=response.clicked();
+        if back_hovered || quit_hovered || apply_hovered { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+        let mut lines=Vec::new();
+        let mut add=|text: &str, position: crate::neon_menu::layout::TextLine,
+                     gas: [f32;3], power: f32, tube_scale: f32| {
+            lines.push(ChromeLine {text:text.into(),position,gas,power,tube_scale});
+        };
+        // The persistent footer owns the original main-menu wordmark.
+        // The exact saber geometry and matching colors are appended by WGPU.
+        add(crate::neon_menu::TITLE,footer.brand,[0.80,0.88,1.0],0.85,1.15);
+        if let Some((line,_))=footer.apply {
+            add(action.as_deref().unwrap_or("APPLY"),line,[1.0,0.57,0.11],
+                if apply_hovered {1.55} else {0.85},1.10);
+        }
+        if let Some((line,_))=footer.back {
+            add("BACK",line,[0.12,0.78,1.0],if back_hovered {1.45} else {0.72},1.05);
+        }
+        add("QUIT",footer.quit.0,[0.94,0.22,0.37],if quit_hovered {1.45} else {0.72},1.05);
+        let frame=ChromeFrame {lines,footer,back_hovered,quit_hovered,apply_hovered,
+            dimmed:false};
+        if self.neon_chrome_sent.as_ref()!=Some(&frame) {
+            self.render_command(RenderCommand::SetNeonChrome(Some(frame.clone())));
+            self.neon_chrome_sent=Some(frame);
+        }
+        if !self.frontend_quit_confirmation {
+            if activate_apply { self.egui_apply_video_requested=true; }
+            if activate_back { self.frontend_back(); }
+            if activate_quit { self.frontend_quit_confirmation=true; }
+        }
+    }
+
+    pub(in crate::app::egui_menu) fn release_neon_chrome(&mut self) {
+        if self.neon_chrome_sent.take().is_some() {
+            self.render_command(RenderCommand::SetNeonChrome(None));
+        }
+    }
+
+    fn egui_frontend_quit_confirmation(&mut self, root: &mut egui::Ui) {
+        if !self.frontend_quit_confirmation { return; }
+        let mut decision=0;
+        let response=egui::Modal::new(egui::Id::new("frontend_quit_confirmation"))
+            .backdrop_color(egui::Color32::from_black_alpha(175))
+            .frame(egui::Frame::new().fill(theme::CHROME)
+                .stroke(egui::Stroke::new(1.0,theme::ACCENT_DEEP))
+                .inner_margin(egui::Margin::same(22)))
+            .show(root.ctx(), |ui| {
+                ui.set_width(380.0);
+                theme::glow_label(ui,"QUIT DINURDOJK?",22.0,theme::TEXT);
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Are you sure you want to exit to desktop?").color(theme::TEXT_DIM));
+                ui.add_space(22.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui,"QUIT GAME").clicked() { decision=1; }
+                    ui.add_space(12.0);
+                    if theme::ghost_button(ui,"CANCEL").clicked() { decision=2; }
                 });
             });
+        if response.should_close() || decision==2 { self.frontend_quit_confirmation=false; }
+        if decision==1 {
+            self.frontend_quit_confirmation=false;
+            self.request_quit();
+        }
+    }
+
+    pub(in crate::app::egui_menu) fn egui_frontend_footer(&mut self, root: &mut egui::Ui) {
+        // Reserve workspace space; the footer itself is WGPU signage.
+        egui::Panel::bottom("jka_frontend_footer")
+            .exact_size(crate::neon_menu::footer::HEIGHT)
+            .frame(egui::Frame::NONE)
+            .show(root, |_ui| {});
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_body(&mut self, root: &mut egui::Ui) {
@@ -265,6 +396,7 @@ impl App {
                     FrontendPage::Profile
                         | FrontendPage::ChatLogs
                         | FrontendPage::AssetViewer
+                        | FrontendPage::Pk3Manager
                         | FrontendPage::Screenshots
                         | FrontendPage::MapViewer
                         | FrontendPage::RenderStudio
@@ -305,13 +437,14 @@ impl App {
                                 )
                                 .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
                         };
-                        frame
-                            .inner_margin(egui::Margin::symmetric(GUTTER as i8, 18))
-                            .show(ui, |ui| {
-                                ui.set_width(content_w - GUTTER * 2.0);
-                                ui.set_min_height(ui.available_height());
-                                self.egui_frontend_page(ui);
-                            });
+                        let studio = self.frontend_page == FrontendPage::RenderStudio;
+                        let margin = if studio { egui::Margin::ZERO }
+                            else { egui::Margin::symmetric(GUTTER as i8, 18) };
+                        frame.inner_margin(margin).show(ui, |ui| {
+                            ui.set_width(if studio { content_w } else { content_w - GUTTER * 2.0 });
+                            ui.set_min_height(ui.available_height());
+                            self.egui_frontend_page(ui);
+                        });
                     },
                 );
             });
@@ -320,15 +453,16 @@ impl App {
     pub(in crate::app::egui_menu) fn egui_frontend_page(&mut self, ui: &mut egui::Ui) {
         match self.frontend_page {
             FrontendPage::Main => self.egui_frontend_main_page(ui),
-            FrontendPage::Play => self.egui_frontend_play_page(ui),
+            FrontendPage::Play => self.draw_neon_frontend_submenu(ui, crate::neon_menu::MenuPage::Play),
             FrontendPage::ServerBrowser => self.egui_server_browser_page(ui),
             FrontendPage::SoloGame => self.egui_solo_game_page(ui),
             FrontendPage::PlayDemo => self.egui_play_demo_page(ui),
             FrontendPage::Profile => self.egui_profile_studio(ui),
             FrontendPage::Controls => self.egui_controls_page(ui),
             FrontendPage::ChatLogs => self.egui_chat_log_browser_page(ui),
-            FrontendPage::DeveloperTools => self.egui_developer_tools_page(ui),
+            FrontendPage::DeveloperTools => self.draw_neon_frontend_submenu(ui, crate::neon_menu::MenuPage::DeveloperTools),
             FrontendPage::AssetViewer => self.egui_asset_viewer_page(ui),
+            FrontendPage::Pk3Manager => self.egui_pk3_manager_page(ui),
             FrontendPage::Screenshots => self.egui_screenshot_browser_page(ui),
             FrontendPage::MapViewer => self.egui_map_viewer_page(ui),
             FrontendPage::RenderStudio => self.egui_render_studio_page(ui),
@@ -406,95 +540,9 @@ impl App {
             self.egui_repaint_requested = true;
             return;
         }
-        if menu_action(
-            ui,
-            "Quit",
-            "Exit DinurdoJK and return to the desktop.",
-            true,
-        ) {
-            self.request_quit();
-        }
     }
 
-    pub(in crate::app::egui_menu) fn egui_frontend_play_page(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(ui, "PLAY", "Choose a game source.");
-        theme::section(ui, "PLAY", "");
-        if menu_action(
-            ui,
-            "Join a game",
-            "Browse Internet, LAN, favorites, and recent servers.",
-            true,
-        ) {
-            // The front-end browser uses its own page-navigation path.
-            // Default to recent visits only when entering; column clicks remain sticky.
-            self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
-            self.server_browser.sort_ascending = false;
-            self.frontend_page = FrontendPage::ServerBrowser;
-            self.egui_repaint_requested = true;
-            return;
-        }
-        if menu_action(
-            ui,
-            "Solo Game",
-            "Browse every compiled map on the active JKA asset path.",
-            true,
-        ) {
-            self.frontend_page = FrontendPage::SoloGame;
-            self.egui_repaint_requested = true;
-            return;
-        }
-        if menu_action(
-            ui,
-            "Play Demo",
-            "Browse Jedi Academy demo recordings.",
-            true,
-        ) {
-            self.frontend_page = FrontendPage::PlayDemo;
-            self.egui_repaint_requested = true;
-            return;
-        }
-    }
+    // Developer Tools is now a full-bleed Taffy/neon page, routed directly
+    // from build_egui_frontend_menu rather than through the old body panel.
 
-    pub(in crate::app::egui_menu) fn egui_developer_tools_page(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(
-            ui,
-            "DEVELOPER TOOLS",
-            "Inspect the active JKA virtual filesystem without leaving the client.",
-        );
-        theme::section(ui, "TOOLS", "");
-        if menu_action(
-            ui,
-            "Asset Viewer",
-            "Browse MD3, GLM, EFX and .shader assets with search, folder typeahead, preview controls, and inspection stats.",
-            true,
-        ) {
-            self.frontend_page = FrontendPage::AssetViewer;
-            self.render_command(RenderCommand::SetAssetPreviewBackground(None));
-            self.profile_background_requested=None;
-            self.render_command(RenderCommand::SetAssetPreviewMode(true));
-            self.render_command(RenderCommand::SetAssetPreviewViewport(None));
-            self.asset_preview_viewport_key = None;
-            self.clear_asset_preview_runtime();
-            self.egui_repaint_requested = true;
-            return;
-        }
-        if menu_action(
-            ui,
-            "Render Studio",
-            "Animate a character or Fortnite emote, trim frames and export clean videos for editing.",
-            true,
-        ) {
-            self.open_render_studio();
-            return;
-        }
-        if menu_action(
-            ui,
-            "Map Viewer",
-            "Browse source maps (*.map) from loose files and mounted PK3s, then launch them directly.",
-            true,
-        ) {
-            self.frontend_page = FrontendPage::MapViewer;
-            self.egui_repaint_requested = true;
-        }
-    }
 }

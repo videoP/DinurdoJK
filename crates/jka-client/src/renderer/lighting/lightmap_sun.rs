@@ -58,7 +58,6 @@ struct Key {
     sizes: Vec<[u32; 2]>,
     bake_sun: bool,
     local_sources: u32,
-    authored_enabled: bool,
     local_sizes: Vec<[u32; 2]>,
     locals: Vec<(usize, scene::DynamicLight)>,
 }
@@ -419,8 +418,9 @@ impl Renderer {
         let sun = self.active_sun();
         let bake_sun = self.baked_sun_cache
             && self.baked_sun_debug_mode == 0
-            && self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMaps;
-        let bake_local = self.baked_local_lights && self.baked_sun_debug_mode == 0;
+            && self.cascaded_shadow_mode.is_csm();
+        let light_sources = self.added_map_light_sources();
+        let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
         let Some(world) = self.world.as_mut() else {
             return;
         };
@@ -453,11 +453,10 @@ impl Renderer {
                     && k.bake_sun == bake_sun
                     && k.local_sources
                         == if bake_local {
-                            self.baked_local_sources
+                            light_sources
                         } else {
                             0
                         }
-                    && k.authored_enabled == self.emissive_area_lights_enabled
                     && k.visibility == self.sun_visibility
                     && k.models == self.draw_bsp_model_surfaces
                     && k.tinted == self.tinted_glass_enabled
@@ -481,14 +480,7 @@ impl Renderer {
                 .static_bake_sources
                 .iter()
                 .copied()
-                .filter(|(_, light)| {
-                    super::lightmap_local::source_enabled(light, self.baked_local_sources)
-                        && !(self.emissive_area_lights_enabled
-                            && self.baked_local_sources & super::lightmap_local::AUTHORED == 0
-                            && light.shader_promotion_mask
-                                & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP
-                                != 0)
-                })
+                .filter(|(_, light)| super::lightmap_local::source_enabled(light, light_sources))
                 .take(super::lightmap_local::MAX_SOURCES.min(self.device.limits().max_texture_array_layers.saturating_sub(3) as usize))
                 .collect()
         } else {
@@ -511,11 +503,10 @@ impl Renderer {
             },
             bake_sun,
             local_sources: if bake_local {
-                self.baked_local_sources
+                light_sources
             } else {
                 0
             },
-            authored_enabled: self.emissive_area_lights_enabled,
             local_sizes: super::lightmap_local::output_sizes(
                 &base,
                 locals.len(),
@@ -574,10 +565,7 @@ impl Renderer {
                                 bytemuck::cast_slice(pixels),
                             );
                             let view = texture.create_view(&Default::default());
-                            GpuImage {
-                                _texture: texture,
-                                view,
-                            }
+                            GpuImage::new(texture, view)
                         })
                         .collect();
                     state.local_flux = pages
@@ -610,10 +598,7 @@ impl Renderer {
                                 dimension: Some(wgpu::TextureViewDimension::D2Array),
                                 ..Default::default()
                             });
-                            GpuImage {
-                                _texture: texture,
-                                view,
-                            }
+                            GpuImage::new(texture, view)
                         })
                         .collect();
                     state.local_lights = key.locals.clone();
@@ -775,7 +760,6 @@ mod tests {
             sizes: vec![[32, 32]],
             bake_sun: true,
             local_sources: 0,
-            authored_enabled: false,
             local_sizes: Vec::new(),
             locals: Vec::new(),
         };

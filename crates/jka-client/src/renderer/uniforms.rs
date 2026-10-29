@@ -24,6 +24,8 @@ pub(in crate::renderer) struct CameraUniform {
     // Jump-height helper (jump_shade.rs): jump-line floor Y, reachable apex Y, gradient
     // range, strength. Zero strength disables the tint; only the main world camera sets it.
     pub(in crate::renderer) jump_shade: [f32; 4],
+    // Shared foliage wind: current XZ velocity (grass inheritance), noise transport XZ.
+    pub(in crate::renderer) foliage_wind: [f32; 4],
 }
 
 #[repr(C)]

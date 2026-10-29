@@ -3,6 +3,104 @@ use crate::cvar_compatibility::{assert_snapshot, digest, Fixture, INPUTS};
 use std::fs;
 
 #[test]
+fn entity_fixture_ab_is_live_opt_in_and_never_archived() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    assert_eq!(app.console_cvar_value("r_entityFixtureLightingAB").as_deref(),Some("0"));
+    let original_sources = app.video.added_map_light_sources();
+    app.set_console_cvar("r_entityFixtureLightingAB","1").unwrap();
+    assert!(app.video.entity_fixture_lighting_ab);
+    assert_eq!(app.video.added_map_light_sources(),original_sources,"entity accents must not enable world accents");
+    for invalid in ["2","-1","NaN"] { assert!(app.set_console_cvar("r_entityFixtureLightingAB",invalid).is_err()); }
+    app.flush_config();
+    assert!(!fs::read_to_string(path).unwrap().contains("r_entityFixtureLightingAB"));
+    app.set_console_cvar("r_entityFixtureLightingAB","0").unwrap();
+    assert!(!app.video.entity_fixture_lighting_ab);
+}
+
+#[test]
+fn cg_remaps_sets_immediately_without_latching_or_archiving() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    assert_eq!(app.console_cvar_value("cg_remaps").as_deref(), Some("1"));
+    app.config_dirty = false;
+    assert!(matches!(
+        app.set_console_cvar_from_console("cg_remaps", "0").unwrap(),
+        crate::app::ConsoleCvarSetResult::Applied
+    ));
+    assert_eq!(app.console_cvar_value("cg_remaps").as_deref(), Some("0"));
+    assert!(app.latched_console_cvars.is_empty());
+    assert!(!app.config_dirty);
+    app.set_console_cvar_from_console("cg_remaps", "2").unwrap();
+    assert_eq!(app.japro_cg.remaps, 2);
+    app.set_console_cvar_from_console("cg_remaps", "1").unwrap();
+    assert_eq!(app.japro_cg.remaps, 1);
+    app.flush_config();
+    assert!(!fs::read_to_string(path).unwrap().contains("cg_remaps"));
+}
+
+#[test]
+fn blue_cloud_experiments_apply_live_validate_and_stay_out_of_archives() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    let controls = [
+        ("r_blueCloudDebug", "0", "4"),
+        ("r_blueCloudFreeze", "0", "1"),
+        ("r_blueCloudShadowMode", "0", "1"),
+        ("r_blueCloudShadowFar", "0", "60000"),
+        ("r_blueCloudFarStepScale", "1", "1.5"),
+        ("r_blueCloudSunSteps", "-1", "0"),
+        ("r_blueCloudComposite", "1", "0"),
+        ("r_blueCloudAltitudeRebase", "0", "1"),
+    ];
+    for (name, default, experiment) in controls {
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some(default));
+        assert_eq!(crate::app::cvar_registry().find(name).unwrap().entry.latch, crate::console::LatchScope::None);
+        app.set_console_cvar(name, experiment).unwrap();
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some(experiment));
+    }
+    let settings = app.video.blue_water_environment;
+    assert_eq!(settings.cloud_debug, 4);
+    assert!(settings.cloud_freeze && settings.cloud_altitude_rebase);
+    assert_eq!(settings.cloud_shadow_mode, 1);
+    assert_eq!(settings.cloud_shadow_far, 60000.0);
+    assert_eq!(settings.cloud_far_step_scale, 1.5);
+    assert_eq!(settings.cloud_sun_steps, 0);
+    assert!(!settings.cloud_composite);
+    for (name, value) in [("r_blueCloudDebug", "6"), ("r_blueCloudFreeze", "2"),
+        ("r_blueCloudSunSteps", "-2"), ("r_blueCloudShadowFar", "NaN"),
+        ("r_blueCloudFarStepScale", "inf")] {
+        assert!(app.set_console_cvar(name, value).is_err(), "{name} accepted {value}");
+    }
+    app.flush_config();
+    let saved = fs::read_to_string(path).unwrap();
+    for (name, _, _) in controls {
+        assert!(!saved.contains(name), "diagnostic {name} was archived");
+    }
+    for (name, default, _) in controls {
+        app.set_console_cvar(name, default).unwrap();
+    }
+}
+
+#[test]
 #[ignore = "requires default audio device, EAL_TEST_MAP and EAL_TEST_OPENAL_DLL"]
 fn local_game_loads_eal_before_live_toggles_and_sound_restart() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -428,6 +526,7 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         ("r_md3GeometryCache", "1", "0"),
         ("r_staticMd3Instances", "0", "1"),
         ("r_staticMd3Bvh", "0", "1"),
+        ("r_staticMd3PvsFallback", "1", "0"),
         ("r_occlusionStats", "0", "1"),
         ("r_fxOcclusion", "0", "1"),
         ("r_modelRenderBundles", "0", "1"),
@@ -519,6 +618,7 @@ fn occlusion_ab_cvars_fail_closed_on_unwired_gpu_modes() {
     let mut app = App::new(fixture.0.clone(), None,
         crate::scene::MapSource::Bsp("mp/ffa3".into()), false,
         event_loop.create_proxy()).unwrap();
+    assert_eq!(app.console_cvar_value("r_staticMd3PvsFallback").as_deref(), Some("1"));
     for name in ["r_staticMd3Bvh", "r_fxOcclusion", "r_md3Occlusion", "r_occlusionStats"] {
         let definition = crate::app::cvar_registry().find(name).unwrap();
         assert!(!definition.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE));
@@ -526,6 +626,12 @@ fn occlusion_ab_cvars_fail_closed_on_unwired_gpu_modes() {
         assert_eq!(app.console_cvar_value(name).as_deref(), Some("0"));
     }
     app.config_dirty = false;
+    app.set_console_cvar("r_staticMd3PvsFallback", "0").unwrap();
+    assert!(!app.video.static_md3_pvs_fallback);
+    app.set_console_cvar("r_staticMd3PvsFallback", "1").unwrap();
+    assert!(app.video.static_md3_pvs_fallback);
+    assert!(!app.config_dirty);
+    assert!(app.set_console_cvar("r_staticMd3PvsFallback", "2").is_err());
     for name in ["r_staticMd3Bvh", "r_fxOcclusion", "r_occlusionStats"] {
         app.set_console_cvar(name, "1").unwrap();
         assert_eq!(app.console_cvar_value(name).as_deref(), Some("1"));
@@ -551,23 +657,81 @@ fn baked_local_controls_apply_live_and_round_trip_independently() {
     let event_loop=winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event().with_any_thread(true).build().unwrap();
     let fixture=Fixture::new();let path=fixture.0.join("DinurdoJK.cfg");fs::write(&path,"").unwrap();
     let mut app=App::new(fixture.0.clone(),None,crate::scene::MapSource::Bsp("mp/ffa3".into()),false,event_loop.create_proxy()).unwrap();
-    let runtime_promotion=(app.video.promote_shader_lights,app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights);
+    let runtime_promotion=(app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights);
     for (name,value) in [("r_bakedLocalLights","1"),("r_bakedLocalGlow","0"),("r_bakedLocalEmissive","0"),("r_bakedLocalAdditive","1"),("r_bakedLocalSurfacelight","1"),("r_bakedLocalFx","1")] {
         assert_eq!(crate::app::cvar_registry().find(name).unwrap().entry.latch,crate::console::LatchScope::None);
         app.set_console_cvar(name,value).unwrap();
     }
-    assert!(app.video.baked_local_lights);assert_eq!(app.video.baked_local_sources,2|8|16);
+    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
+    app.set_console_cvar("r_dynamicShadows","csm_entities").unwrap();
+    app.set_console_cvar("r_sunShadowStrength","0.75").unwrap();
+    app.set_console_cvar("r_playerContactShadows","1").unwrap();
+    app.set_console_cvar("r_playerContactShadows","2.5").unwrap();
+    assert_eq!(app.video.player_blob_shadow_settings().opacity, 1.875);
     app.set_console_cvar("r_playerContactShadows","0").unwrap();
-    assert!(!app.video.player_contact_shadows);
+    assert!(app.video.cascaded_shadows);
+    assert_eq!(app.video.player_contact_shadows, 0.0);
     assert!(crate::app::cvar_registry().find("r_bakedLocalShadows").is_none(), "master cvar was removed");
-    assert_eq!(runtime_promotion,(app.video.promote_shader_lights,app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights));
+    assert_eq!(runtime_promotion,(app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights));
     app.flush_config();let restored=crate::config::load_video_settings(&path);
-    assert!(restored.baked_local_lights);assert_eq!(restored.baked_local_sources,2|8|16);
-    assert!(!restored.player_contact_shadows);
+    assert_eq!(restored.added_map_light_sources(), 0);assert_eq!(restored.baked_local_sources,2|8|16);
+    assert_eq!(restored.player_contact_shadows, 0.0);
+    assert_eq!(restored.dynamic_shadows, crate::ui::DynamicShadowsMode::CascadedShadowMapsEntities);
+    assert!(restored.cascaded_shadows);
+    assert_eq!(restored.sun_shadow_strength, 0.75);
     assert!(app.set_console_cvar("r_bakedLocalLights","banana").is_err());
-    app.set_console_cvar("r_bakedLocalLights","0").unwrap();assert!(!app.video.baked_local_lights);assert_eq!(app.video.baked_local_sources,2|8|16);
+    app.set_console_cvar("r_bakedLocalLights","0").unwrap();assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
     // Selecting a lamp source does not turn on experimental illumination.
-    assert!(!app.video.baked_local_lights && app.video.baked_local_sources == 2|8|16);
+    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
     app.flush_config();let shadows_only=crate::config::load_video_settings(&path);
-    assert!(!shadows_only.baked_local_lights && shadows_only.baked_local_sources == 2|8|16);
+    assert_eq!(shadows_only.added_map_light_sources(), 0);assert_eq!(shadows_only.baked_local_sources,2|8|16);
+}
+
+#[test]
+fn relighting_master_preserves_edits_and_round_trips_through_canonical_cvar() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    assert!(!app.video.sun_override);
+    app.map_authored_sun = Some(crate::scene::DirectionalSun::from_q3_angles([1.0, 0.5, 0.25], 650.0, 42.0, 30.0));
+    app.set_console_cvar("r_relightMap", "1").unwrap();
+    assert!((app.video.sun_yaw - 42.0).abs() < 0.001);
+    assert!((app.video.sun_pitch - 30.0).abs() < 0.001);
+    assert_eq!(app.video.sun_intensity, 650.0);
+    app.set_console_cvar("r_relightMap", "0").unwrap();
+    for (name, value) in [("r_sunYaw", "123"), ("r_sunLighting", "1"), ("r_bakedSunRemoval", "0.75"), ("r_bakedLocalLights", "1"), ("r_bakedLocalGlow", "1")] {
+        app.set_console_cvar(name, value).unwrap();
+    }
+    assert!(!app.video.effective_relighting().sun_lighting);
+    app.set_console_cvar("r_relightMap", "1").unwrap();
+    assert_eq!(app.video.sun_yaw, 123.0);
+    assert!(app.video.effective_relighting().sun_lighting);
+    app.set_console_cvar("r_relightMap", "0").unwrap();
+    let off = app.video.effective_relighting();
+    assert!(!off.sun_lighting && off.added_map_light_sources() == 0);
+    assert_eq!(off.baked_sun_removal, 0.0);
+    assert_eq!(off.baked_local_sources & 1, 1);
+    app.flush_config();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("seta r_relightMap \"0\""));
+    assert!(!text.contains("seta r_sunOverride "));
+    let restored = crate::config::load_video_settings(&path);
+    assert!(!restored.sun_override);
+    assert!(restored.sun_lighting);
+    assert_eq!(restored.baked_sun_removal, 0.75);
+    assert_eq!(restored.sun_yaw, 123.0);
+    // Existing scripts and configs retain the old spelling as an alias.
+    app.set_console_cvar("r_sunOverride", "1").unwrap();
+    assert_eq!(app.console_cvar_value("r_relightMap").as_deref(), Some("1"));
+    app.set_console_cvar("r_relightMap", "invalid").unwrap_err();
+    for preset in crate::app::quality::QualityPreset::ALL {
+        for (name, _) in preset.settings() {
+            assert!(!matches!(name, "r_relightMap" | "r_sunOverride" | "r_bakedSunRemoval" | "r_sunLighting" | "r_bakedLocalLights" | "r_promoteShaderLights" | "r_emissiveAreaLights"));
+        }
+    }
 }

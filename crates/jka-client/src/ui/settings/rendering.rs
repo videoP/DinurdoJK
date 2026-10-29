@@ -522,16 +522,19 @@ pub enum DynamicShadowsMode {
     Blob,
     /// Entity-only sun shadow map aimed by the baked lightgrid (players, NPCs, models).
     EntityMap,
-    /// Bevy-style directional-light cascades (the only CSM implementation).
+    /// Internal full-world CSM path, activated through Relighting's static-world switch.
     CascadedShadowMaps,
+    /// Directional cascades for live entities; BSP lighting supplies static shadows.
+    CascadedShadowMapsEntities,
 }
 
 impl DynamicShadowsMode {
+    /// Main Lighting menu modes; full-scene CSM is a Relighting add-on.
     pub const ALL: [Self; 4] = [
         Self::Off,
         Self::Blob,
         Self::EntityMap,
-        Self::CascadedShadowMaps,
+        Self::CascadedShadowMapsEntities,
     ];
 
     pub fn config_value(self) -> &'static str {
@@ -540,7 +543,12 @@ impl DynamicShadowsMode {
             Self::Blob => "blob",
             Self::EntityMap => "entity",
             Self::CascadedShadowMaps => "csm",
+            Self::CascadedShadowMapsEntities => "csm_entities",
         }
+    }
+
+    pub fn is_csm(self) -> bool {
+        matches!(self, Self::CascadedShadowMaps | Self::CascadedShadowMapsEntities)
     }
 
     pub fn from_config(value: &str) -> Option<Self> {
@@ -552,6 +560,7 @@ impl DynamicShadowsMode {
             // `stencil` was a never-implemented placeholder for this slot; keep old
             // configs on the nearest functional entity-shadow technique.
             "entity" | "entity_map" | "stencil" | "stencil_legacy" => Some(Self::EntityMap),
+            "csm_entities" | "csm_moving" => Some(Self::CascadedShadowMapsEntities),
             // Keep the old numeric aliases stable so archived configs do not
             // silently shift when EntityMap gets its own menu slot.
             // The old non-Bevy CSM was removed; its aliases land on the Bevy CSM.
@@ -1028,7 +1037,6 @@ pub const VIDEO_ROW_CRT_CURVATURE: usize = 93;
 pub const VIDEO_ROW_CRT_CORNER: usize = 94;
 pub const VIDEO_ROW_PROMOTE_FX_LIGHTS: usize = 96;
 pub const VIDEO_ROW_DYNAMIC_LIGHT_DEBUG: usize = 97;
-pub const VIDEO_ROW_PROMOTE_SHADER_LIGHTS: usize = 98;
 pub const VIDEO_ROW_PROMOTE_SHADER_GLOW: usize = 99;
 pub const VIDEO_ROW_PROMOTE_SHADER_ADDITIVE: usize = 100;
 pub const VIDEO_ROW_PROMOTE_SHADER_EMISSIVE: usize = 101;
@@ -1074,7 +1082,7 @@ pub const ENV_ROW_WEATHER_GUST_STRENGTH: usize = 27;
 pub const ENV_ROW_WEATHER_DIRECTION_VARIATION: usize = 28;
 
 pub const ENV_ROW_ENTITY_SUN_LIGHTING: usize = 32;
-pub const ENV_ROW_BAKED_SUN_REMOVAL: usize = 33;
+pub const ENV_ROW_BAKED_SUN_REMOVAL: usize = 43;
 
 pub const SUN_INTENSITY_MAX: f32 = 4000.0;
 
@@ -1304,7 +1312,6 @@ impl FullscreenMode {
     }
 }
 
-pub const VIDEO_ROW_BAKED_LOCAL_LIGHTS: usize = 112;
 pub const VIDEO_ROW_BAKED_LOCAL_SHADOWS: usize = 113;
 pub const VIDEO_ROW_BAKED_LOCAL_GLOW: usize = 114;
 pub const VIDEO_ROW_BAKED_LOCAL_ADDITIVE: usize = 115;

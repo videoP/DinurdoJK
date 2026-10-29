@@ -10,6 +10,7 @@ use crate::renderer::{
 };
 use crate::renderer::{GrassDrawStats, ViewSampleMeasurement};
 use crate::ui::GlowMode;
+use crate::renderer::StudioLens;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DynamicModelAlphaMode {
@@ -42,10 +43,13 @@ pub enum DynamicModelAlphaMode {
     Darken,
     /// Promoted `q3map_material Glass`, sampled from the opaque scene capture.
     Glass,
+    /// TaystJK RF_NODEPTH for Force Seeing level 2+. An additive overlay
+    /// that passes regardless of world/player depth, without writing depth.
+    SightShellNoDepth,
 }
 
 impl DynamicModelAlphaMode {
-    pub(in crate::renderer) const COUNT: usize = 14;
+    pub(in crate::renderer) const COUNT: usize = 15;
 
     /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
     pub(crate) const fn index(self) -> usize {
@@ -64,11 +68,12 @@ impl DynamicModelAlphaMode {
             Self::BlendDepthWrite => 11,
             Self::BlendUnlitDepthWrite => 12,
             Self::Glass => 13,
+            Self::SightShellNoDepth => 14,
         }
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 14] = [
+pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 15] = [
     DynamicModelAlphaMode::Opaque,
     DynamicModelAlphaMode::Mask,
     DynamicModelAlphaMode::BlendDepthWrite,
@@ -83,6 +88,7 @@ pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode;
     DynamicModelAlphaMode::BlendUnlit,
     DynamicModelAlphaMode::AdditiveOne,
     DynamicModelAlphaMode::Additive,
+    DynamicModelAlphaMode::SightShellNoDepth,
 ];
 
 /// Dynamic surfaces come from two geometry backends: transient CPU meshes
@@ -113,16 +119,19 @@ pub struct DynamicModelVertex {
     pub color: [f32; 4],
     /// OpenJK RF_DEPTHHACK: apply the legacy weapon depth-range semantics.
     /// `md3.wgsl` performs the reverse-Z equivalent clip-space remap.
+    /// Positive: RF_DEPTHHACK. Negative: classic blob blend compatibility tag.
     pub depth_hack: f32,
     /// CPU/RT skinned per-vertex immersion, interpolated per fragment.
     pub water_wetness: f32,
+    /// Zero disables foliage; [1,2) is the stable per-model wind variation tag.
+    pub foliage_wind: f32,
 }
 
 /// `ghoul2_skin_compute.wgsl` materializes this vertex through a raw `array<u32>`
 /// and so hard-codes the stride. Keep the two in step: a desync silently writes
 /// every skinned vertex at the wrong offset and leaves the tail of each range
 /// zeroed, i.e. collapsed onto the world origin.
-pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_WORDS: usize = 14;
+pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_WORDS: usize = 15;
 const _: () = assert!(
     std::mem::size_of::<DynamicModelVertex>() == DYNAMIC_MODEL_VERTEX_WORDS * 4,
     "DynamicModelVertex changed size; update write_vertex in ghoul2_skin_compute.wgsl"
@@ -227,12 +236,17 @@ pub struct SourceMaterialParams {
 
 #[derive(Clone, Debug)]
 pub struct Ghoul2GpuSkinning {
+    /// Also used by rigid MD3 instances routed through the GPU model path.
+    pub foliage_wind: bool,
     /// Stable geometry cache key, e.g. `models/players/kyle/model.glm#lod0#surface3`.
     pub mesh_key: Arc<str>,
     pub vertices: Arc<Vec<Ghoul2GpuVertex>>,
     pub indices: Arc<Vec<u32>>,
     /// Shared across all surfaces belonging to one evaluated pose.
     pub bones: Arc<Vec<Ghoul2GpuBone>>,
+    /// Index in `bones` of thermal vision's heat-source matrix (chest/head
+    /// pivots; see `gpu_bones_with_heat_sources`). 0 = not a warm body.
+    pub heat_bone: u32,
     /// JKA entity/model axis and origin. The shader converts the result to the
     /// renderer's [x,z,-y] coordinate convention after skinning.
     pub axis: [[f32; 3]; 3],
@@ -240,7 +254,8 @@ pub struct Ghoul2GpuSkinning {
     pub color: [f32; 4],
     /// Texture-coordinate transform `uv * xy + zw`; [1, 1, 0, 0] is identity.
     pub uv_xform: [f32; 4],
-    /// Off-diagonal UV coefficients; zero on the ordinary fast path.
+    /// XY: off-diagonal UV coefficients. ZW: turbulence amplitude/phase.
+    /// All zero on the ordinary fast path.
     pub uv_cross: [f32; 4],
     /// `alphaGen lightingSpecular`: JKA world-space (light, viewer) points. The
     /// shader multiplies the draw alpha by q3's `(R.V)^4` specular term.
@@ -691,6 +706,15 @@ pub enum SpectatorHighlightTeam {
     Yellow,
 }
 
+/// GPU-ready global illumination for Render Studio's isolated character stage.
+/// None means the normal legacy/gameplay shading path, not zero lighting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StudioSceneLighting {
+    pub ambient: [f32;4], // rgb, intensity
+    pub sun: [f32;4],     // rgb, intensity
+    pub sun_direction: [f32;4], // vector toward sun in render coordinates
+}
+
 /// One player entity to outline for spectator/demo viewing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpectatorHighlight {
@@ -700,6 +724,10 @@ pub struct SpectatorHighlight {
 
 #[derive(Clone)]
 pub struct RenderSnapshot {
+    pub studio_lens: Option<StudioLens>,
+    pub studio_environment: Option<StudioSceneLighting>,
+    /// Independent Studio scenes. Never references the gameplay session/world.
+    pub studio_scene: Option<Arc<StudioSceneFrame>>,
     pub model_frame_source: Option<crate::model_frame_log::FrameSource>,
     pub camera: Camera,
     /// Mapping from latest local-player input orientation to this render camera.
@@ -752,6 +780,37 @@ pub struct RenderSnapshot {
     /// Active `EV_SCREENSHAKE`/`CGCam_Shake`; the render thread rolls a fresh
     /// offset each frame so it composes with the late-latched view.
     pub camera_shake: Option<crate::camera::CameraShake>,
+}
+
+#[derive(Clone)]
+pub struct StudioSourceFrame {
+    pub shot_camera: Camera,
+    pub lens: StudioLens,
+    pub environment: Option<StudioSceneLighting>,
+    pub id: u64,
+    pub revision: u64,
+    pub camera: Camera,
+    pub time: f32,
+    pub player_position: Option<Vec3>,
+    pub area_mask: Option<[u8;32]>,
+    pub dynamic_models: Arc<Vec<DynamicModelSurface>>,
+    pub inline_models: Arc<Vec<InlineModelInstance>>,
+    pub lights: Arc<Vec<TransientLight>>,
+    pub screen_fx: Arc<Vec<crate::fx::draw::ScreenFxDraw>>,
+    pub cloud_foreground: Arc<Vec<CloudForegroundBlade>>,
+    pub ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    /// Source-owned native HUD; rendered into source color before transitions.
+    pub hud: Option<Arc<crate::ui::UiSnapshot>>,
+}
+
+#[derive(Clone)]
+pub struct StudioSceneFrame {
+    pub outgoing: StudioSourceFrame,
+    pub incoming: Option<StudioSourceFrame>,
+    pub effect: u32,
+    pub progress: f32,
+    pub video: crate::ui::VideoSettings,
+    pub offline_capture: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -857,6 +916,7 @@ pub struct PostEffects {
     pub chromatic_aberration: f32,
     pub vignette: bool,
     pub film_grain_strength: f32,
+    pub thermal_vision: u8,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
     pub dof_mode: DofMode,
@@ -1009,6 +1069,9 @@ pub enum TileCostCommand {
 }
 
 pub enum RenderCommand {
+    LoadStudioSource { id: u64, game: Option<PathBuf>, map: Box<PreparedMap>, video: crate::ui::VideoSettings, progress: Arc<crate::runtime::LoadProgress> },
+    ReleaseStudioSources,
+    RemoveStudioSource(u64),
     /// On-demand accounting; no polling or resource walking in ordinary frames.
     MemoryInfo,
     /// Arm a bounded, off-by-default per-frame command-encoding capture.
@@ -1075,6 +1138,7 @@ pub enum RenderCommand {
     SetFpsCap(u32),
     SetGamma(f32),
     SetGammaMethod(crate::gamma::GammaMethod),
+    SetHardwareGammaActive(bool),
     PrepareGammaMethod(u64),
     /// Effective extra multiplier for lit dynamic-model colour (1.0 = neutral).
     SetModelBrightness(f32),
@@ -1110,6 +1174,7 @@ pub enum RenderCommand {
     SetOceanTime(f32),
     SetPerfTrace(bool),
     SetForceUnifiedWorld(bool),
+    SetFoliageWind(bool),
     SetPom(bool),
     SetGpuTimings(bool),
     /// Native top-of-screen frame-interval graph, updated at 30Hz.
@@ -1147,10 +1212,10 @@ pub enum RenderCommand {
         vertex_light: bool,
         lightmap_only: bool,
     },
-    SetEmissiveAreaLights(bool),
-    SetShaderLightPromotion { enabled: bool, mask: u32 },
-    SetBakedLocalLights { enabled: bool, sources: u32 },
+    SetAddedMapLightSources(u32),
+    SetLampShadowSources(u32),
     SetLampShadowAB(u8),
+    SetEntityFixtureLightingAB(bool),
     SetCsmCoverageAB(bool),
     SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
@@ -1196,8 +1261,16 @@ pub enum RenderCommand {
     CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
     CaptureVideoFrame { frame_index: u64, depth: bool, alpha: bool },
     SetUi(UiSnapshot),
+    SetStreamerSettings(crate::streamer::StreamerSettings),
+    /// One small update per gameplay tick; Disruptor/zoom state is not a
+    /// settings-change or a scoreboard/chat transient.
+    SetCombatUi {
+        zoom_scope: Option<ui::UiZoomScope>,
+        rocket_lock: Option<ui::UiRocketLock>,
+    },
     /// The renderer-drawn main page; `None` when it is not showing.
     SetNeonMenu(Option<crate::neon_menu::MenuFrame>),
+    SetNeonChrome(Option<crate::neon_menu::ChromeFrame>),
     /// Decoded scene still; uploaded on render thread and composited beneath neon.
     SetNeonMenuCache(Option<egui::ColorImage>),
     /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
@@ -1211,9 +1284,12 @@ pub enum RenderCommand {
         crosshair_target: ui::UiCrosshairTarget,
         force_select: Option<ui::UiForceSelect>,
         weapon_select: Option<ui::UiWeaponSelect>,
+        inventory_select: Option<ui::UiInventorySelect>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
+        hud_score: Option<ui::UiHudScore>,
+        enemy_info: Option<ui::UiEnemyInfo>,
         race_timer: Option<crate::japro_cg::RaceTimerUi>,
         vote_line: Option<String>,
         scoreboard: Option<ui::UiScoreboard>,
@@ -1253,6 +1329,15 @@ pub enum RenderCommand {
     /// 3D rendering inside this rectangle prevents models/FX/materials from
     /// being drawn underneath translucent browser panes.
     SetAssetPreviewViewport(Option<[u32; 4]>),
+    /// Studio world footage is composited from a separate render texture into
+    /// this editor-owned pixel rectangle, with no world outside the pane.
+    SetStudioWorldViewport(Option<[u32; 4]>),
+    /// Render Studio export/still at a fixed output size (offscreen, window
+    /// independent); `None` returns sources to the preview viewport size.
+    SetStudioExportSize(Option<[u32; 2]>),
+    /// Offscreen export/still frame of exactly this scene (requires an export
+    /// size). Queued: the app may publish later scenes before it renders.
+    CaptureStudioFrame { frame_index: u64, depth: bool, scene: Arc<StudioSceneFrame> },
     /// Decoded installed-map levelshot, uploaded once when selected.
     SetAssetPreviewBackground(Option<([u32;2],Vec<u8>)>),
     /// Preview-only transparency indicator; excluded from clean captures.
@@ -1266,6 +1351,9 @@ pub enum RenderCommand {
         started: Instant,
         name: String,
         map: Box<PreparedMap>,
+        /// Studio-only resident world identity and material state. Ordinary map
+        /// loads clear the Studio cache; request_id still governs completion.
+        studio_world: Option<(u64, crate::scene::ShaderRemapState)>,
     },
     /// Same prepared-world pipeline as LoadMap, but reuse safe immutable GPU
     /// images/PSOs from the current map when their cache keys match. Remap only.
@@ -1275,6 +1363,7 @@ pub enum RenderCommand {
         name: String,
         plan: Box<crate::scene::PreparedRemapPlan>,
         base_texture_count: usize,
+        studio_world: Option<(u64, crate::scene::ShaderRemapState)>,
     },
     /// Open a settings batch (quality preset): world pipeline-variant
     /// activation is deferred and per-setting render-thread cost is recorded.
@@ -1516,3 +1605,5 @@ pub(in crate::renderer) enum RenderError {
     /// can be rendered on this device again.
     DeviceLost,
 }
+
+

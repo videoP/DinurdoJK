@@ -1,5 +1,6 @@
 //! app::egui_menu module facade. Implementations are grouped by responsibility.
 mod assets;
+mod pk3_manager;
 mod audio;
 mod catalogs;
 mod chat_logs;
@@ -11,16 +12,22 @@ mod frontend_pages;
 mod maps;
 mod movement;
 mod neon_main;
+mod neon_submenu;
 mod profile;
 mod profile_studio;
 mod profile_emotes;
 mod resume;
 mod render_studio;
+mod render_studio_audio;
 mod render_studio_camera;
+pub(in crate::app) mod render_studio_camera_handles;
+mod render_studio_lights;
+mod render_studio_director;
 mod render_studio_navigation;
 mod render_studio_cinematics;
 mod render_studio_spatial;
 mod render_studio_layout;
+mod render_studio_ui;
 mod screenshots;
 mod servers;
 pub(in crate::app) mod settings_search;
@@ -45,8 +52,8 @@ use super::*;
 pub(in crate::app) use neon_main::NeonMenuState;
 
 const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
-const SETUP_TABS: [&str; 9] = [
-    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE",
+const SETUP_TABS: [&str; 10] = [
+    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE", "PK3 MANAGER",
 ];
 
 const TOP_RESUME: usize = 0;
@@ -64,7 +71,8 @@ const SETUP_TAB_NETWORK: usize = 5;
 const SETUP_TAB_INTERFACE: usize = 6;
 const SETUP_TAB_EXTENSIONS: usize = 7;
 const SETUP_TAB_STREAMER: usize = 8;
-const SETUP_TAB_MOD: usize = 9;
+const SETUP_TAB_PK3: usize = 9;
+const SETUP_TAB_MOD: usize = 10;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
 /// label, a full-width meter and its readout: on the Video page the world
@@ -83,7 +91,6 @@ pub(in crate::app) const FRONTEND_SCENE_FADE_IN_SECS: f32 = 0.55;
 // The Studio nav retains these indices for Force-preview behavior.
 const PROFILE_MODEL: usize = 1;
 const PROFILE_FORCE: usize = 2;
-const PROFILE_COSMETICS: usize = 4;
 const PROFILE_EMOTES: usize = 5;
 // OpenJK bg_misc.c / TaystJK ui_force.c. Keep Profile force editing on the
 // protocol-26 rank-side-18digits representation rather than inventing a new
@@ -324,6 +331,7 @@ pub(super) enum VideoSection {
     Display,
     Geometry,
     Lighting,
+    Relighting,
     Materials,
     Effects,
     PostProcessing,
@@ -341,11 +349,12 @@ pub(super) enum VideoSection {
 }
 
 impl VideoSection {
-    const RENDERING: [(Self, &'static str); 8] = [
+    const RENDERING: [(Self, &'static str); 9] = [
         (Self::Display, "Display & graphics"),
         (Self::Color, "Color & HDR"),
         (Self::Geometry, "Geometry"),
         (Self::Lighting, "Lighting"),
+        (Self::Relighting, "Relighting"),
         (Self::Materials, "Material rendering"),
         (Self::Effects, "Effects"),
         (Self::PostProcessing, "Post processing"),
@@ -461,11 +470,11 @@ fn chat_log_duration_label(start_ms: u64, end_ms: u64) -> String {
     }
 }
 
-/// Compact affordance for the existing `fs_refresh` path. Asset Viewer,
+/// Compact affordance for the existing `fs_restart` path. Asset Viewer,
 /// source .map browsing, and Solo Game all use the same VFS invalidation and
 /// retry behavior rather than maintaining separate partial refresh routines.
 fn filesystem_refresh_icon(ui: &mut egui::Ui) -> bool {
-    refresh_icon(ui, "Refresh filesystem (fs_refresh)")
+    refresh_icon(ui, "Refresh filesystem (fs_restart)")
 }
 
 fn jka_ui_color(code: char, fallback: egui::Color32) -> egui::Color32 {

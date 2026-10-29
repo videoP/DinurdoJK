@@ -809,6 +809,40 @@ app_cvars! {
         ]
     }
 
+    APP_CG_HAIRPHYSICS {
+        runtime: CvarDef::new(
+            "cg_hairPhysics", "", "0|1|2",
+            "Procedural hair: 0 Off; 1 authored Source jigglebones; 2 authored + auto hair* on native GLMs.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.hair_physics.to_string()),
+            |app, value| App::cvar_set_cg_hairphysics(app, APP_CG_HAIRPHYSICS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_hairphysics, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(mode) = value.trim().parse::<u8>().ok().filter(|&mode| mode <= 2) {
+                    settings.hair_physics = mode;
+                }
+            }),
+            archive: Some((28100, |state| state.video.hair_physics.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_hairphysics(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .ok().filter(|&mode| mode <= 2)
+                        .ok_or_else(|| format!("{name}: expected 0 Off, 1 Authored, or 2 Authored + GLM Hair"))?;
+                    if self.video.hair_physics != mode {
+                        self.video.hair_physics = mode;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_JIGGLESOLVER {
         runtime: CvarDef::new("r_jiggleSolver", "", "0|1", "Soft-tissue solver: 0 KawaiiPhysics-derived point solve, 1 naelstrof/JigglePhysics Verlet/constraint solve.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_jigglesolver(app)), |app, value| App::cvar_set_r_jigglesolver(app, APP_R_JIGGLESOLVER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_jigglesolver, None),
         config: CvarBinding {

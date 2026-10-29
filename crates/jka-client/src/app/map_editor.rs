@@ -96,7 +96,7 @@ pub(super) struct MapEditor {
     preview_visible: bool,
     /// Disk identity that `source_text` was read from. We watch only the one
     /// loose source file backing this editor; package/VFS changes belong to
-    /// `fs_refresh`, not this hot-reload path.
+    /// `fs_restart`, not this hot-reload path.
     disk_stamp: DiskStamp,
     last_disk_poll: Instant,
     pending_disk_stamp: Option<DiskStamp>,
@@ -652,7 +652,7 @@ impl MapEditor {
             };
             let base = u32::try_from(vertices.len()).ok()?;
             for point in &polygon.vertices {
-                vertices.push(DynamicModelVertex {
+                vertices.push(DynamicModelVertex { foliage_wind: 0.0,
                     position: scene::render_position(point.to_array().map(|value| value as f32)),
                     normal,
                     uv: [0.0, 0.0],

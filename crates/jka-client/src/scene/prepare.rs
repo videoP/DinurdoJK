@@ -154,6 +154,9 @@ pub(in crate::scene) fn prepare_internal(
         ..Default::default()
     };
     let asset_name = map_asset_name(name, "bsp")?;
+    if jobs.is_some_and(MapJobPool::is_superseded) {
+        return Err("superseded map preparation".into());
+    }
     let archive_opens_before = jka_assets::pk3::archive_open_stats();
 
     let stage = Instant::now();
@@ -326,6 +329,9 @@ pub(in crate::scene) fn prepare_internal(
         (bsp, mesh, (collision, movement, library, library_debug))
     };
     let (collision, movement, library, library_debug) = collision;
+    if jobs.is_some_and(MapJobPool::is_superseded) {
+        return Err("superseded map preparation".into());
+    }
     // Rapier/weather keep their original subdivision-4, unstitched geometry.
     // Tessellate it on a worker while the loader queues textures; it is needed
     // whenever collision loads, which is nearly always.
@@ -653,7 +659,7 @@ pub(in crate::scene) fn prepare_internal(
                     shader_name = swap.to_owned();
                 }
             }
-            materials::describe(
+            let mut material = materials::describe(
                 &shader_name,
                 shader.surface_flags,
                 library.get(&shader_name),
@@ -662,7 +668,11 @@ pub(in crate::scene) fn prepare_internal(
                 &mut textures,
                 options.gen_normal_maps,
                 options.omit_environment_stages,
-            )
+            );
+            // A compiled BSP may preserve lava contents when the runtime
+            // shader was remapped or its script is unavailable.
+            material.thermal_lava |= shader.contents & 0x0000_0002 != 0;
+            material
         })
         .collect();
     if let Some(marks) = mark_surfaces.as_mut() {
@@ -759,6 +769,9 @@ pub(in crate::scene) fn prepare_internal(
         jobs.mark_done(Task::MapMaterials);
     }
     phase_lap(&mut load_timings, 5, &mut phase_clock);
+    if jobs.is_some_and(MapJobPool::is_superseded) {
+        return Err("superseded map preparation".into());
+    }
 
     // Nothing grows below the synthesized menu water. Render-space height and
     // JKA z are the same number, so one floor serves both bakers.
@@ -1606,7 +1619,7 @@ pub(in crate::scene) fn prepare_internal(
                 source: None,
                 width: atlas.width,
                 height: atlas.height,
-                rgba: atlas.rgba,
+                rgba: (atlas.rgba).into(),
                 rgba16f: None,
                 mip_level_count: 1,
                 clamp: true,
@@ -1826,6 +1839,9 @@ pub(in crate::scene) fn prepare_internal(
     }
 
     phase_lap(&mut load_timings, 12, &mut phase_clock);
+    if jobs.is_some_and(MapJobPool::is_superseded) {
+        return Err("superseded map preparation".into());
+    }
     let (footprint_mark_textures, footprint_mark_blend_modes) =
         load_legacy_footprint_marks(&library, &mut assets, &mut textures);
 
@@ -1975,6 +1991,19 @@ pub(in crate::scene) fn prepare_internal(
         debug_volumes,
         authored_oceans,
         water_brush_bounds: crate::ocean::volume::from_bsp(&bsp),
+        thermal_liquids: bsp.models.first().map_or_else(Vec::new, |world| {
+            world.brushes.clone().filter_map(|id| {
+                let brush = bsp.brushes.get(id)?;
+                let contents = bsp.shaders.get(brush.shader)?.contents;
+                let kind = if contents & 0x0000_0002 != 0 { 2 }
+                    else if contents & 0x0000_0004 != 0 { 1 } else { return None };
+                let planes = bsp.brush_sides[brush.sides.clone()].iter()
+                    .filter_map(|side| bsp.planes.get(side.plane))
+                    .map(|plane| (plane.normal, plane.distance))
+                    .collect::<Vec<_>>();
+                (planes.len() >= 4).then_some(crate::scene::ThermalLiquidVolume { kind, planes })
+            }).collect()
+        }),
         movement,
         collision,
         mark_surfaces,

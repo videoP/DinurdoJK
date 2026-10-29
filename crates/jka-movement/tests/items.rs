@@ -31,3 +31,13 @@ fn q_math_event_helpers_match_openjk() {
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     assert!(dot(axis[0], axis[1]).abs() < 1e-5 && dot(axis[0], axis[2]).abs() < 1e-5);
 }
+
+#[test]
+fn solo_spawn_does_not_advertise_a_seeker_drone() {
+    let state = jka_movement::PlayerState::spawn([0.0; 3], 90.0, jka_movement::JoinMode::Player)
+        .expect("solo player spawn");
+    let network = state.network();
+    let mut ps = jka_protocol::server::PlayerState::default();
+    ps.fields = network.fields;
+    assert_eq!(ps.field_i32("genericEnemyIndex"), Some(-1));
+}

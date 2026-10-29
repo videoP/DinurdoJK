@@ -688,18 +688,14 @@ impl Renderer {
         let camera_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA companion camera bind group"),
             layout: &self.camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &crate::foliage::camera_entries(&camera_buffer,
+                &self.weather.rain.gpu.wind_noise_view, &self.weather.rain.gpu.wind_noise_sampler),
         });
         let fast_camera_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA companion fast camera bind group"),
             layout: &self.fast_camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &crate::foliage::camera_entries(&camera_buffer,
+                &self.weather.rain.gpu.wind_noise_view, &self.weather.rain.gpu.wind_noise_sampler),
         });
 
         let mut slots = Vec::with_capacity(COMPANION_SCENE_RING_SIZE);
@@ -815,7 +811,7 @@ impl Renderer {
         let clear_color = self.weather.fog.clear_color();
         let static_bsp_ao = self.static_bsp_ao_enabled;
         let classic_flags = self.classic_world_render_flags();
-        let time = self.started.elapsed().as_secs_f32();
+        let time = self.frame_time();
 
         // A mapped world requires its known-fast PSO set. If it is still being
         // compiled in the background, skip this secondary frame rather than
@@ -855,6 +851,7 @@ impl Renderer {
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),
             jump_shade: [0.0; 4],
+            foliage_wind: crate::foliage::wind_uniform(self.weather_wind, time, self.foliage_wind_enabled),
         };
         self.queue
             .write_buffer(&target.camera_buffer, 0, bytemuck::bytes_of(&uniform));

@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn studio_crosshair_is_opt_in_even_with_an_inherited_helper_crosshair() {
+    let mut ui=UiSnapshot::default();
+    ui.mode=OverlayMode::None;ui.video.draw_2d=true;ui.video.skip_ui=false;
+    ui.studio_hud_virtual_layout=true;
+    ui.crosshair.style=0;
+    ui.strafe_helper.flags=SHELPER_CROSSHAIR;
+    let mut vertices=Vec::new();
+    build_crosshair_vertices(&mut vertices,&ui,None,1280,720);
+    assert!(vertices.is_empty());
+    ui.crosshair.style=1;
+    build_crosshair_vertices(&mut vertices,&ui,None,1280,720);
+    assert!(!vertices.is_empty(),"an explicit Studio crosshair remains available");
+    vertices.clear();ui.studio_hud_virtual_layout=false;ui.crosshair.style=0;
+    build_crosshair_vertices(&mut vertices,&ui,None,1280,720);
+    assert!(!vertices.is_empty(),"gameplay retains the legacy helper crosshair");
+}
+
+#[test]
 fn dot_crosshair_is_circular_and_exactly_centered() {
     for (width, height) in [(1280_u32, 720_u32), (1279_u32, 799_u32)] {
         let mut vertices = Vec::new();

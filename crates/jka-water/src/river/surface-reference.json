@@ -1,0 +1,5944 @@
+{
+  "material_sha256": {
+    "river": "b6bd65173ab4079a3c15cd99d43e3cc54d637731f10dc2052096dc2cb0cf4d6b",
+    "blend": "7431d34bce204a888ab96f97da005583d9c3c5e09c8fe6f7cd5abc4cd03898ba",
+    "parent": "6b36cf205664b25d57a8c60dc089b10d2635539c5efa6dee3c485c882ca18fba",
+    "live": "8a493b7ff9b846f2bfd9b13741961672687188950f5858336a3e50d89a5bc296",
+    "safe_normalize": "a42108b4959b5d30250555283beb596f1ee21208ab36d779b736e76a7d1e4cf3"
+  },
+  "effective_parameters": {
+    "LowVelocityWPOWaveScale": 0.10000000149011612,
+    "LowVelocityWaveScale": 0.10000000149011612,
+    "WaveAttenMin": 0.0,
+    "WaveAttenMax": 200.0,
+    "WaveSpeed": 1.0,
+    "WaveAmount": 1.0,
+    "WPOWaveAttenMin": 0.0,
+    "WPOWaveScale": 0.0005000000237487257,
+    "Opacity": 1.0,
+    "WPOWaveMIPBias": 2.0,
+    "WPOWaveAttenMax": 400.0,
+    "WPOWaveHeightMult": 5.0,
+    "LowVelocityWPOWaveAttenuationPower": 3.0,
+    "FoamOpacity": 1.0,
+    "NormalTextureScale": 0.0005000000237487257
+  },
+  "selected_switches": {
+    "AdvectWaveHeight": true,
+    "UseVT": false,
+    "SupportFoam": true,
+    "Use Shallow Water": true,
+    "Use Custom Depth Culling": true,
+    "BakedSimNormalsOverrideUpstreamMaterialNormals": true
+  },
+  "river_wiring": {
+    "3": {
+      "class_path": "/Script/Engine.MaterialExpressionAdd",
+      "properties": {
+        "A": {
+          "expression": 8,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionBreakMaterialAttributes_0",
+          "output": 8,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "B": {
+          "expression": 219,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5504,
+        "MaterialExpressionEditorY": -3984,
+        "MaterialExpressionGuid": [
+          2714448631,
+          1244576209,
+          1937523638,
+          2504950500
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "8": {
+      "class_path": "/Script/Engine.MaterialExpressionBreakMaterialAttributes",
+      "properties": {
+        "MaterialAttributes": {
+          "expression": 80,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 4704,
+        "MaterialExpressionEditorY": -4176,
+        "MaterialExpressionGuid": [
+          4017226877,
+          1130083021,
+          1126585265,
+          243968204
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "28": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 238,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_38",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "R": true,
+        "G": true,
+        "B": true,
+        "MaterialExpressionEditorX": -7440,
+        "MaterialExpressionEditorY": 3184,
+        "MaterialExpressionGuid": [
+          1573695100,
+          1097127538,
+          2436171396,
+          3877473516
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "29": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 111,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "R": true,
+        "G": true,
+        "B": true,
+        "MaterialExpressionEditorX": 4352,
+        "MaterialExpressionEditorY": -1104,
+        "MaterialExpressionGuid": [
+          4030559743,
+          1335865709,
+          3235529630,
+          2276027904
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "41": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 154,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "R": true,
+        "G": true,
+        "MaterialExpressionEditorX": -6448,
+        "MaterialExpressionEditorY": 1632,
+        "MaterialExpressionGuid": [
+          2556467416,
+          1300183652,
+          4113240232,
+          1193919693
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "43": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 95,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "A": true,
+        "MaterialExpressionEditorX": -1664,
+        "MaterialExpressionEditorY": -1024,
+        "MaterialExpressionGuid": [
+          3432734876,
+          1146097118,
+          1964822145,
+          3379259276
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "44": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": 7104,
+        "MaterialExpressionEditorY": -2720,
+        "MaterialExpressionGuid": [
+          3674326470,
+          1087533136,
+          8076187,
+          1094950510
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "48": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "R": 1.0,
+        "MaterialExpressionEditorX": 4832,
+        "MaterialExpressionEditorY": -2832,
+        "MaterialExpressionGuid": [
+          3700261394,
+          1147879416,
+          1721876124,
+          1534966604
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "52": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "R": 1.0,
+        "MaterialExpressionEditorX": 7152,
+        "MaterialExpressionEditorY": -2592,
+        "MaterialExpressionGuid": [
+          418585958,
+          1193854001,
+          115082403,
+          2839488650
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "57": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant3Vector",
+      "properties": {
+        "Constant": [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        "MaterialExpressionEditorX": 5808,
+        "MaterialExpressionEditorY": -4032,
+        "MaterialExpressionGuid": [
+          2837918535,
+          1226568472,
+          1940441238,
+          235369659
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "60": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "lerp(1, smoothstep(WaveAttenuationMin, WaveAttenuationMax, vmag), 1. - saturate(lvws)) * WaveScale;",
+        "OutputType": "CMOT_Float1",
+        "Inputs": [
+          {
+            "InputName": "vmag",
+            "Input": {
+              "expression": 194,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_4",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "lvws",
+            "Input": {
+              "expression": 258,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_10",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveAttenuationMin",
+            "Input": {
+              "expression": 259,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_11",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveAttenuationMax",
+            "Input": {
+              "expression": 260,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_12",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "WaveScale",
+            "Input": {
+              "expression": 267,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_19",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 5664,
+        "MaterialExpressionEditorY": -1296,
+        "MaterialExpressionGuid": [
+          2527243962,
+          1219567308,
+          1574963128,
+          2843215103
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "63": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "float2 UnitDx = 1./sz;\r\n\r\nif (uv.x < UnitDx.x || uv.x > 1.-UnitDx.x || uv.y < UnitDx.y || uv.y > 1.-UnitDx.y)\r\n{\r\n  return 0.;\r\n}\r\nreturn OpacityMask;",
+        "OutputType": "CMOT_Float1",
+        "Inputs": [
+          {
+            "InputName": "OpacityMask",
+            "Input": {
+              "expression": 67,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_5",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "uv",
+            "Input": {
+              "expression": 184,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_3",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "sz",
+            "Input": {
+              "expression": 372,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionTextureProperty_1",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": -3968,
+        "MaterialExpressionEditorY": 1008,
+        "MaterialExpressionGuid": [
+          3929831113,
+          1157506852,
+          2386723729,
+          1776709360
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "67": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "a > 1e-8",
+        "OutputType": "CMOT_Float1",
+        "Description": "Mask Opacity",
+        "Inputs": [
+          {
+            "InputName": "a",
+            "Input": {
+              "expression": 126,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_2",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": -4400,
+        "MaterialExpressionEditorY": 928,
+        "MaterialExpressionGuid": [
+          386005663,
+          1283362341,
+          296119681,
+          697263228
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "68": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "a > 1e-8;",
+        "OutputType": "CMOT_Float1",
+        "Inputs": [
+          {
+            "InputName": "a",
+            "Input": {
+              "expression": 209,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": -4896,
+        "MaterialExpressionEditorY": 832,
+        "MaterialExpressionGuid": [
+          4063909285,
+          1081662880,
+          3742433433,
+          726926888
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "70": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "if (OpacityMask < 1e-8)\r\n{\r\n    return float3(0,0,0);\r\n}\r\nelse\r\n{\r\n    return Normal;\r\n}",
+        "Inputs": [
+          {
+            "InputName": "OpacityMask",
+            "Input": {
+              "expression": 174,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_20",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "Normal",
+            "Input": {
+              "expression": 92,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_7",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "ShowCode": true,
+        "MaterialExpressionEditorX": 3712,
+        "MaterialExpressionEditorY": -2784,
+        "MaterialExpressionGuid": [
+          415144176,
+          1256247852,
+          4262327435,
+          307765211
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "85": {
+      "class_path": "/Script/Engine.MaterialExpressionIf",
+      "properties": {
+        "A": {
+          "expression": 202,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionPixelDepth_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 33,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionComponentMask_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "AGreaterThanB": {
+          "expression": 44,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "AEqualsB": {
+          "expression": 44,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ALessThanB": {
+          "expression": 52,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 7344,
+        "MaterialExpressionEditorY": -2992,
+        "MaterialExpressionGuid": [
+          3968334878,
+          1132746216,
+          3772995759,
+          4018154477
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "86": {
+      "class_path": "/Script/Engine.MaterialExpressionLinearInterpolate",
+      "properties": {
+        "A": {
+          "expression": 145,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 98,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_12",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Alpha": {
+          "expression": 251,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionSaturate_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 560,
+        "MaterialExpressionEditorY": -2752,
+        "MaterialExpressionGuid": [
+          2943845044,
+          1199910053,
+          1485337748,
+          1902896437
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "87": {
+      "class_path": "/Script/Engine.MaterialExpressionLinearInterpolate",
+      "properties": {
+        "A": {
+          "expression": 153,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_20",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 96,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_10",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Alpha": {
+          "expression": 255,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionSaturate_9",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 2224,
+        "MaterialExpressionEditorY": -2752,
+        "MaterialExpressionGuid": [
+          628469937,
+          1102877784,
+          2089840536,
+          2710683972
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "92": {
+      "class_path": "/Script/Engine.MaterialExpressionLinearInterpolate",
+      "properties": {
+        "A": {
+          "expression": 87,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 134,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Alpha": {
+          "expression": 191,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_36",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3408,
+        "MaterialExpressionEditorY": -2752,
+        "MaterialExpressionGuid": [
+          833599351,
+          1329987483,
+          3801203090,
+          3799974449
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "94": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -51,
+          "path": "/Engine/Functions/Engine_MaterialFunctions02/Utility/VectorLength.VectorLength"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              524360788,
+              1256499628,
+              3321231522,
+              2694427401
+            ],
+            "Input": {
+              "expression": 0,
+              "expression_path": null,
+              "output": 0,
+              "input_name": "Vector 3",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3764421037,
+              1112929916,
+              1832487049,
+              3821958074
+            ],
+            "Input": {
+              "expression": 41,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionComponentMask_7",
+              "output": 0,
+              "input_name": "Vector 2",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              4052153396,
+              1173309200,
+              1289113762,
+              1121889998
+            ],
+            "Output": {
+              "OutputName": "V3 Length",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          },
+          {
+            "ExpressionOutputId": [
+              1012134613,
+              1340146323,
+              1913986690,
+              3361699669
+            ],
+            "Output": {
+              "OutputName": "V2 Length",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": -6144,
+        "MaterialExpressionEditorY": 1376,
+        "MaterialExpressionGuid": [
+          4079843486,
+          1291010075,
+          211691662,
+          1826057727
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "V3 Length",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          },
+          {
+            "OutputName": "V2 Length",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "96": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -54,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_BlendNormals.MF_BlendNormals"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              4246157143,
+              1167669154,
+              2270223542,
+              3497937426
+            ],
+            "Input": {
+              "expression": 153,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_20",
+              "output": 0,
+              "input_name": "Base Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3403141503,
+              1163395685,
+              4043600003,
+              4226166070
+            ],
+            "Input": {
+              "expression": 169,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_16",
+              "output": 0,
+              "input_name": "Detail Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              79810230,
+              1204923521,
+              3037006487,
+              193135403
+            ],
+            "Output": {
+              "OutputName": "Custom",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": 1648,
+        "MaterialExpressionEditorY": -2544,
+        "MaterialExpressionGuid": [
+          1731820729,
+          1321860159,
+          3692312246,
+          1134675511
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Custom",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "98": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -54,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_BlendNormals.MF_BlendNormals"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              4246157143,
+              1167669154,
+              2270223542,
+              3497937426
+            ],
+            "Input": {
+              "expression": 145,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13",
+              "output": 0,
+              "input_name": "Base Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3403141503,
+              1163395685,
+              4043600003,
+              4226166070
+            ],
+            "Input": {
+              "expression": 186,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_31",
+              "output": 0,
+              "input_name": "Detail Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              79810230,
+              1204923521,
+              3037006487,
+              193135403
+            ],
+            "Output": {
+              "OutputName": "Custom",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": 304,
+        "MaterialExpressionEditorY": -2720,
+        "MaterialExpressionGuid": [
+          3118788232,
+          1201170589,
+          2560141472,
+          624562893
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Custom",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "101": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -48,
+          "path": "/Engine/Functions/Engine_MaterialFunctions02/SafeNormalize.SafeNormalize"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              1608800207,
+              1306421569,
+              732968348,
+              4199183921
+            ],
+            "Input": {
+              "expression": 331,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_1",
+              "output": 0,
+              "input_name": "Vector",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2999454780,
+              1083207095,
+              2028461755,
+              906881649
+            ],
+            "Input": {
+              "expression": 57,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant3Vector_4",
+              "output": 0,
+              "input_name": "Default",
+              "mask": 1,
+              "channels": [
+                1,
+                1,
+                1,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              1663752916,
+              1216808489,
+              1497852334,
+              1490770818
+            ],
+            "Output": {
+              "OutputName": "Result",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          },
+          {
+            "ExpressionOutputId": [
+              2945866052,
+              1273812910,
+              3696160938,
+              3698860112
+            ],
+            "Output": {
+              "OutputName": "Length==0",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": 6096,
+        "MaterialExpressionEditorY": -4176,
+        "MaterialExpressionGuid": [
+          3748050729,
+          1241462785,
+          3678853305,
+          1697524107
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Result",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          },
+          {
+            "OutputName": "Length==0",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "103": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -54,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_BlendNormals.MF_BlendNormals"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              4246157143,
+              1167669154,
+              2270223542,
+              3497937426
+            ],
+            "Input": {
+              "expression": 192,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_37",
+              "output": 0,
+              "input_name": "Base Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3403141503,
+              1163395685,
+              4043600003,
+              4226166070
+            ],
+            "Input": {
+              "expression": 190,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_35",
+              "output": 0,
+              "input_name": "Detail Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              79810230,
+              1204923521,
+              3037006487,
+              193135403
+            ],
+            "Output": {
+              "OutputName": "Custom",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": 2880,
+        "MaterialExpressionEditorY": -2624,
+        "MaterialExpressionGuid": [
+          1487463618,
+          1168508582,
+          77833088,
+          1483255533
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Custom",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "108": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -57,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_TextureAdvection.MF_TextureAdvection"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              129596669,
+              1195490174,
+              2879285182,
+              933705972
+            ],
+            "Input": {
+              "expression": 306,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_60",
+              "output": 0,
+              "input_name": "PulseLength",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2023138506,
+              1310608292,
+              134516142,
+              1254462422
+            ],
+            "Input": {
+              "expression": 233,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_32",
+              "output": 0,
+              "input_name": "AdvectedTextureScale",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3935971754,
+              1336653545,
+              2178251682,
+              1017516357
+            ],
+            "Input": {
+              "expression": 232,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_31",
+              "output": 0,
+              "input_name": "WorldGridSize",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2867738414,
+              1137494900,
+              3897374392,
+              1866681111
+            ],
+            "Input": {
+              "expression": 237,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_37",
+              "output": 0,
+              "input_name": "DeltaTime",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              22084167,
+              1212051484,
+              3807599550,
+              2411163702
+            ],
+            "Input": {
+              "expression": 235,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_35",
+              "output": 0,
+              "input_name": "dx",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              860842521,
+              1156118085,
+              2392684216,
+              57659877
+            ],
+            "Input": {
+              "expression": 236,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_36",
+              "output": 0,
+              "input_name": "AdvectionSpeed",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1888683231,
+              1135869337,
+              1418033303,
+              1655103131
+            ],
+            "Input": {
+              "expression": 234,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_34",
+              "output": 0,
+              "input_name": "AdvectedTexture",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3390882149,
+              1291667118,
+              3736808097,
+              957144359
+            ],
+            "Input": {
+              "expression": 308,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_62",
+              "output": 0,
+              "input_name": "BracketAngleDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1250257690,
+              1324047183,
+              1419912123,
+              4126842484
+            ],
+            "Input": {
+              "expression": 307,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_61",
+              "output": 0,
+              "input_name": "BracketMagnitudeDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              479437262,
+              1102614801,
+              3579897756,
+              516925703
+            ],
+            "Input": {
+              "expression": 168,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_15",
+              "output": 0,
+              "input_name": "Sim Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3481336904,
+              1240856046,
+              4142793639,
+              3755806786
+            ],
+            "Input": {
+              "expression": 310,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_64",
+              "output": 0,
+              "input_name": "MipLevelBias",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2181166340,
+              1093134053,
+              1674736288,
+              994808452
+            ],
+            "Input": {
+              "expression": 189,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_34",
+              "output": 0,
+              "input_name": "SimVelocity",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              313683522,
+              1275218451,
+              2403250611,
+              4092083882
+            ],
+            "Output": {
+              "OutputName": "Result",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": -8144,
+        "MaterialExpressionEditorY": 2736,
+        "MaterialExpressionGuid": [
+          1577415438,
+          1102091778,
+          1264894906,
+          2149164396
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Result",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "111": {
+      "class_path": "/Script/Engine.MaterialExpressionMaterialFunctionCall",
+      "properties": {
+        "MaterialFunction": {
+          "object": -57,
+          "path": "/WaterAdvanced/Niagara/Materials/Function/MF_TextureAdvection.MF_TextureAdvection"
+        },
+        "FunctionInputs": [
+          {
+            "ExpressionInputId": [
+              129596669,
+              1195490174,
+              2879285182,
+              933705972
+            ],
+            "Input": {
+              "expression": 283,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_33",
+              "output": 0,
+              "input_name": "PulseLength",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2023138506,
+              1310608292,
+              134516142,
+              1254462422
+            ],
+            "Input": {
+              "expression": 230,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_3",
+              "output": 0,
+              "input_name": "AdvectedTextureScale",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3935971754,
+              1336653545,
+              2178251682,
+              1017516357
+            ],
+            "Input": {
+              "expression": 210,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_1",
+              "output": 0,
+              "input_name": "WorldGridSize",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2867738414,
+              1137494900,
+              3897374392,
+              1866681111
+            ],
+            "Input": {
+              "expression": 231,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_30",
+              "output": 0,
+              "input_name": "DeltaTime",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              22084167,
+              1212051484,
+              3807599550,
+              2411163702
+            ],
+            "Input": {
+              "expression": 243,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_7",
+              "output": 0,
+              "input_name": "dx",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              860842521,
+              1156118085,
+              2392684216,
+              57659877
+            ],
+            "Input": {
+              "expression": 229,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_29",
+              "output": 0,
+              "input_name": "AdvectionSpeed",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1888683231,
+              1135869337,
+              1418033303,
+              1655103131
+            ],
+            "Input": {
+              "expression": 241,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_5",
+              "output": 0,
+              "input_name": "AdvectedTexture",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3390882149,
+              1291667118,
+              3736808097,
+              957144359
+            ],
+            "Input": {
+              "expression": 285,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_35",
+              "output": 0,
+              "input_name": "BracketAngleDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              1250257690,
+              1324047183,
+              1419912123,
+              4126842484
+            ],
+            "Input": {
+              "expression": 284,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_34",
+              "output": 0,
+              "input_name": "BracketMagnitudeDelta",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              479437262,
+              1102614801,
+              3579897756,
+              516925703
+            ],
+            "Input": {
+              "expression": 179,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_25",
+              "output": 0,
+              "input_name": "Sim Normal",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              3481336904,
+              1240856046,
+              4142793639,
+              3755806786
+            ],
+            "Input": {
+              "expression": 49,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant_4",
+              "output": 0,
+              "input_name": "MipLevelBias",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "ExpressionInputId": [
+              2181166340,
+              1093134053,
+              1674736288,
+              994808452
+            ],
+            "Input": {
+              "expression": 162,
+              "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_1",
+              "output": 0,
+              "input_name": "SimVelocity",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "FunctionOutputs": [
+          {
+            "ExpressionOutputId": [
+              313683522,
+              1275218451,
+              2403250611,
+              4092083882
+            ],
+            "Output": {
+              "OutputName": "Result",
+              "Mask": 0,
+              "MaskR": 0,
+              "MaskG": 0,
+              "MaskB": 0,
+              "MaskA": 0
+            }
+          }
+        ],
+        "MaterialExpressionEditorX": 4048,
+        "MaterialExpressionEditorY": -1104,
+        "MaterialExpressionGuid": [
+          3636384010,
+          1206035416,
+          1826845349,
+          3428831883
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        },
+        "Outputs": [
+          {
+            "OutputName": "Result",
+            "Mask": 0,
+            "MaskR": 0,
+            "MaskG": 0,
+            "MaskB": 0,
+            "MaskA": 0
+          }
+        ]
+      }
+    },
+    "126": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 68,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 290,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ConstA": 1.0,
+        "MaterialExpressionEditorX": -4656,
+        "MaterialExpressionEditorY": 832,
+        "MaterialExpressionGuid": [
+          2933094081,
+          1119206982,
+          2708932514,
+          1332573485
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "134": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 103,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_17",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 318,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_9",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3152,
+        "MaterialExpressionEditorY": -2624,
+        "MaterialExpressionGuid": [
+          3562425749,
+          1209282951,
+          2724976018,
+          1869295563
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "136": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 215,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_14",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 69,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5920,
+        "MaterialExpressionEditorY": -2912,
+        "MaterialExpressionGuid": [
+          2333374111,
+          1229269589,
+          4093823163,
+          3263588637
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "138": {
+      "class_path": "/Script/Engine.MaterialExpressionMultiply",
+      "properties": {
+        "A": {
+          "expression": 136,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 85,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionIf_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 7488,
+        "MaterialExpressionEditorY": -3088,
+        "MaterialExpressionGuid": [
+          1290267929,
+          1145361146,
+          3290928788,
+          2009325608
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "141": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 94,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_0",
+          "output": 1,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_VelocityMagnitude",
+        "NodeColor": [
+          1.0,
+          0.1875,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": -5840,
+        "MaterialExpressionEditorY": 1408,
+        "MaterialExpressionGuid": [
+          2027114342,
+          1310917135,
+          3538269353,
+          3840727465
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "142": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 137,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "LowVelocityWPOWaveAttenuation",
+        "NodeColor": [
+          0.21875,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          817955186,
+          1341511493,
+          159515061,
+          1132499815
+        ],
+        "MaterialExpressionEditorX": 6704,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          669487239,
+          1136921566,
+          3504563855,
+          1577967548
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "143": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 60,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "LowVelocityWaveAttenuation",
+        "NodeColor": [
+          0.21874988079071045,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2049634404,
+          1223241919,
+          1636278680,
+          1967007422
+        ],
+        "MaterialExpressionEditorX": 6560,
+        "MaterialExpressionEditorY": -1296,
+        "MaterialExpressionGuid": [
+          2192293972,
+          1278095346,
+          761327525,
+          1065714662
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "145": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 375,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionTextureSample_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "Name": "SW_SimNormal",
+        "NodeColor": [
+          1.0,
+          0.0234375,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": -16,
+        "MaterialExpressionEditorY": -3040,
+        "MaterialExpressionGuid": [
+          583949576,
+          1276354366,
+          3572071559,
+          3355717933
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "147": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 333,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_11",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_TotalFoamAmount",
+        "NodeColor": [
+          0.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "VariableGuid": [
+          316047164,
+          1331004616,
+          2862136494,
+          1262260018
+        ],
+        "MaterialExpressionEditorX": 2304,
+        "MaterialExpressionEditorY": -1216,
+        "MaterialExpressionGuid": [
+          1707285014,
+          1310710547,
+          3319629502,
+          29266375
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "148": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 199,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNormalize_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_FoamNormal",
+        "NodeColor": [
+          0.96875,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2924692053,
+          1119577502,
+          3913723038,
+          2325304702
+        ],
+        "MaterialExpressionEditorX": -112,
+        "MaterialExpressionEditorY": -1504,
+        "MaterialExpressionGuid": [
+          1939413755,
+          1319313816,
+          4025821107,
+          2763281904
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "151": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 128,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_21",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_FoamOpacity",
+        "NodeColor": [
+          1.0,
+          0.0,
+          0.7968745231628418,
+          1.0
+        ],
+        "VariableGuid": [
+          3822903228,
+          1236756030,
+          2140196011,
+          572219093
+        ],
+        "MaterialExpressionEditorX": 2400,
+        "MaterialExpressionEditorY": -1040,
+        "MaterialExpressionGuid": [
+          2445494964,
+          1081138334,
+          3562019216,
+          192849238
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "153": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 347,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_SimWithWPONormal",
+        "NodeColor": [
+          0.6874998807907104,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2372633188,
+          1089670235,
+          1629401262,
+          2484564557
+        ],
+        "MaterialExpressionEditorX": 1248,
+        "MaterialExpressionEditorY": -2752,
+        "MaterialExpressionGuid": [
+          2053907189,
+          1207223665,
+          3874675106,
+          3204728037
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "154": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 113,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_9",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "FluidVelocity",
+        "NodeColor": [
+          0.6875,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          1552353676,
+          1246857987,
+          1090343354,
+          3569685908
+        ],
+        "MaterialExpressionEditorX": -6640,
+        "MaterialExpressionEditorY": 1632,
+        "MaterialExpressionGuid": [
+          3983256152,
+          1195601061,
+          249582253,
+          3850054070
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "155": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 126,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_WaterOpacity",
+        "NodeColor": [
+          0.0,
+          1.0,
+          0.90625,
+          1.0
+        ],
+        "VariableGuid": [
+          2413636625,
+          1124610538,
+          1454740147,
+          3326857620
+        ],
+        "MaterialExpressionEditorX": -4320,
+        "MaterialExpressionEditorY": 832,
+        "MaterialExpressionGuid": [
+          1520258826,
+          1237309550,
+          1580055945,
+          1723433603
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "157": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 344,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_AdvectedWPOWaveNormal",
+        "NodeColor": [
+          0.8984375,
+          1.0,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2572374100,
+          1086800052,
+          411637420,
+          3240031982
+        ],
+        "MaterialExpressionEditorX": -6592,
+        "MaterialExpressionEditorY": 3184,
+        "MaterialExpressionGuid": [
+          792807839,
+          1319343580,
+          171048582,
+          1290059530
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "158": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 29,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionComponentMask_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_AdvectedWaveNormal",
+        "NodeColor": [
+          1.0,
+          0.328125,
+          0.0,
+          1.0
+        ],
+        "VariableGuid": [
+          2095797636,
+          1259600078,
+          1968592539,
+          1348418255
+        ],
+        "MaterialExpressionEditorX": 4528,
+        "MaterialExpressionEditorY": -1104,
+        "MaterialExpressionGuid": [
+          174113318,
+          1126846303,
+          1923830663,
+          2701216139
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "160": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteDeclaration",
+      "properties": {
+        "Input": {
+          "expression": 63,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_11",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Name": "SW_OpacityMask",
+        "NodeColor": [
+          0.0,
+          0.71875,
+          1.0,
+          1.0
+        ],
+        "VariableGuid": [
+          3149831900,
+          1271406342,
+          2670464170,
+          1166942589
+        ],
+        "MaterialExpressionEditorX": -3136,
+        "MaterialExpressionEditorY": 1008,
+        "MaterialExpressionGuid": [
+          1355726847,
+          1123152507,
+          4188692645,
+          626449570
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "164": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 160,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_9"
+        },
+        "DeclarationGuid": [
+          3149831900,
+          1271406342,
+          2670464170,
+          1166942589
+        ],
+        "MaterialExpressionEditorX": 4976,
+        "MaterialExpressionEditorY": -2880,
+        "MaterialExpressionGuid": [
+          1971254489,
+          1130851923,
+          4079356075,
+          241219183
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "165": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 160,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_9"
+        },
+        "DeclarationGuid": [
+          3149831900,
+          1271406342,
+          2670464170,
+          1166942589
+        ],
+        "MaterialExpressionEditorX": 5216,
+        "MaterialExpressionEditorY": -2144,
+        "MaterialExpressionGuid": [
+          2878128537,
+          1083046185,
+          654092185,
+          293671211
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "166": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 143,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_11"
+        },
+        "DeclarationGuid": [
+          2049634404,
+          1223241919,
+          1636278680,
+          1967007422
+        ],
+        "MaterialExpressionEditorX": 1776,
+        "MaterialExpressionEditorY": -2400,
+        "MaterialExpressionGuid": [
+          187885999,
+          1219052456,
+          3931120014,
+          3438318724
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "167": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 141,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_1"
+        },
+        "DeclarationGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": 5088,
+        "MaterialExpressionEditorY": 48,
+        "MaterialExpressionGuid": [
+          1677880882,
+          1280812591,
+          560683442,
+          2754575388
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "168": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 145,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13"
+        },
+        "DeclarationGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": -8480,
+        "MaterialExpressionEditorY": 3392,
+        "MaterialExpressionGuid": [
+          673383752,
+          1115189532,
+          2725464507,
+          3536453095
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "169": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 158,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_7"
+        },
+        "DeclarationGuid": [
+          2095797636,
+          1259600078,
+          1968592539,
+          1348418255
+        ],
+        "MaterialExpressionEditorX": 1328,
+        "MaterialExpressionEditorY": -2352,
+        "MaterialExpressionGuid": [
+          613952182,
+          1195632593,
+          3533643432,
+          275277103
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "170": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 159,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_8"
+        },
+        "DeclarationGuid": [
+          398526706,
+          1247132937,
+          2379836833,
+          3499137721
+        ],
+        "MaterialExpressionEditorX": 5171,
+        "MaterialExpressionEditorY": -2339,
+        "MaterialExpressionGuid": [
+          3610576811,
+          1298112841,
+          2355901334,
+          252711027
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "171": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 142,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_10"
+        },
+        "DeclarationGuid": [
+          817955186,
+          1341511493,
+          159515061,
+          1132499815
+        ],
+        "MaterialExpressionEditorX": -7264,
+        "MaterialExpressionEditorY": 2688,
+        "MaterialExpressionGuid": [
+          3005279299,
+          1183861434,
+          1628696746,
+          649978563
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "172": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 141,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_1"
+        },
+        "DeclarationGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": 7696,
+        "MaterialExpressionEditorY": -704,
+        "MaterialExpressionGuid": [
+          4209126388,
+          1274149893,
+          3756915878,
+          1554452041
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "173": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 156,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_5"
+        },
+        "DeclarationGuid": [
+          2101385906,
+          1338981486,
+          2207228803,
+          1143306629
+        ],
+        "MaterialExpressionEditorX": -496,
+        "MaterialExpressionEditorY": -2224,
+        "MaterialExpressionGuid": [
+          2038914745,
+          1122162504,
+          3890311094,
+          3410387476
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "174": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 160,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_9"
+        },
+        "DeclarationGuid": [
+          3149831900,
+          1271406342,
+          2670464170,
+          1166942589
+        ],
+        "MaterialExpressionEditorX": 3472,
+        "MaterialExpressionEditorY": -2864,
+        "MaterialExpressionGuid": [
+          799480328,
+          1240930718,
+          3730565291,
+          613423494
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "175": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 143,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_11"
+        },
+        "DeclarationGuid": [
+          2049634404,
+          1223241919,
+          1636278680,
+          1967007422
+        ],
+        "MaterialExpressionEditorX": -5744,
+        "MaterialExpressionEditorY": 416,
+        "MaterialExpressionGuid": [
+          4000386653,
+          1098851357,
+          4235996550,
+          839897879
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "176": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 145,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13"
+        },
+        "DeclarationGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": 7456,
+        "MaterialExpressionEditorY": -4272,
+        "MaterialExpressionGuid": [
+          3900938040,
+          1328880737,
+          407651750,
+          865391662
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "177": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 142,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_10"
+        },
+        "DeclarationGuid": [
+          817955186,
+          1341511493,
+          159515061,
+          1132499815
+        ],
+        "MaterialExpressionEditorX": 48,
+        "MaterialExpressionEditorY": -2512,
+        "MaterialExpressionGuid": [
+          316431163,
+          1297528874,
+          2548251316,
+          580245767
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "178": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 145,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13"
+        },
+        "DeclarationGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": -2544,
+        "MaterialExpressionEditorY": -640,
+        "MaterialExpressionGuid": [
+          643329176,
+          1327228924,
+          3987554218,
+          3108962068
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "179": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 145,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13"
+        },
+        "DeclarationGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": 3712,
+        "MaterialExpressionEditorY": -448,
+        "MaterialExpressionGuid": [
+          1109825333,
+          1234296378,
+          248602018,
+          884589658
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "180": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 145,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13"
+        },
+        "DeclarationGuid": [
+          2918540961,
+          1084588656,
+          3188946864,
+          1012067302
+        ],
+        "MaterialExpressionEditorX": -4896,
+        "MaterialExpressionEditorY": 288,
+        "MaterialExpressionGuid": [
+          2489320719,
+          1326657722,
+          3556962458,
+          713275647
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "181": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 141,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_1"
+        },
+        "DeclarationGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": 5296,
+        "MaterialExpressionEditorY": -576,
+        "MaterialExpressionGuid": [
+          3253411484,
+          1304146739,
+          3089423245,
+          38282414
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "182": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 149,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_17"
+        },
+        "DeclarationGuid": [
+          2326063844,
+          1111324459,
+          3479111597,
+          2324754115
+        ],
+        "MaterialExpressionEditorX": -8208,
+        "MaterialExpressionEditorY": 160,
+        "MaterialExpressionGuid": [
+          2826439062,
+          1130090970,
+          2447671695,
+          2000681052
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "183": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 144,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_12"
+        },
+        "DeclarationGuid": [
+          37043074,
+          1328597845,
+          3197015195,
+          2119524009
+        ],
+        "MaterialExpressionEditorX": -1680,
+        "MaterialExpressionEditorY": -1120,
+        "MaterialExpressionGuid": [
+          2158698531,
+          1084139026,
+          789743523,
+          1679039124
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "184": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 152,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_2"
+        },
+        "DeclarationGuid": [
+          1631664478,
+          1196596520,
+          1648649114,
+          3537794549
+        ],
+        "MaterialExpressionEditorX": -4224,
+        "MaterialExpressionEditorY": 1040,
+        "MaterialExpressionGuid": [
+          2827712008,
+          1310057995,
+          2911000213,
+          505159793
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "185": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 144,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_12"
+        },
+        "DeclarationGuid": [
+          37043074,
+          1328597845,
+          3197015195,
+          2119524009
+        ],
+        "MaterialExpressionEditorX": 1408,
+        "MaterialExpressionEditorY": -1312,
+        "MaterialExpressionGuid": [
+          1507828566,
+          1143251097,
+          192743555,
+          3229790057
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "186": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 157,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_6"
+        },
+        "DeclarationGuid": [
+          2572374100,
+          1086800052,
+          411637420,
+          3240031982
+        ],
+        "MaterialExpressionEditorX": -32,
+        "MaterialExpressionEditorY": -2624,
+        "MaterialExpressionGuid": [
+          2593897472,
+          1292622257,
+          3305469838,
+          3231538716
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "187": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 144,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_12"
+        },
+        "DeclarationGuid": [
+          37043074,
+          1328597845,
+          3197015195,
+          2119524009
+        ],
+        "MaterialExpressionEditorX": -1664,
+        "MaterialExpressionEditorY": -672,
+        "MaterialExpressionGuid": [
+          4016903721,
+          1175732456,
+          603749294,
+          399295522
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "188": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 154,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_3"
+        },
+        "DeclarationGuid": [
+          1552353676,
+          1246857987,
+          1090343354,
+          3569685908
+        ],
+        "MaterialExpressionEditorX": -2528,
+        "MaterialExpressionEditorY": -560,
+        "MaterialExpressionGuid": [
+          3705217079,
+          1117458149,
+          3780243347,
+          36342171
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "189": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 154,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_3"
+        },
+        "DeclarationGuid": [
+          1552353676,
+          1246857987,
+          1090343354,
+          3569685908
+        ],
+        "MaterialExpressionEditorX": -8432,
+        "MaterialExpressionEditorY": 3664,
+        "MaterialExpressionGuid": [
+          2290771361,
+          1185634727,
+          1887478666,
+          4194569764
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "190": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 148,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_16"
+        },
+        "DeclarationGuid": [
+          2924692053,
+          1119577502,
+          3913723038,
+          2325304702
+        ],
+        "MaterialExpressionEditorX": 2624,
+        "MaterialExpressionEditorY": -2496,
+        "MaterialExpressionGuid": [
+          1300921194,
+          1135092355,
+          2971359152,
+          2684679965
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "191": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 147,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_15"
+        },
+        "DeclarationGuid": [
+          316047164,
+          1331004616,
+          2862136494,
+          1262260018
+        ],
+        "MaterialExpressionEditorX": 2992,
+        "MaterialExpressionEditorY": -2352,
+        "MaterialExpressionGuid": [
+          2296783106,
+          1284103941,
+          139641004,
+          3912803993
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "192": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 153,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_20"
+        },
+        "DeclarationGuid": [
+          2372633188,
+          1089670235,
+          1629401262,
+          2484564557
+        ],
+        "MaterialExpressionEditorX": 2576,
+        "MaterialExpressionEditorY": -2624,
+        "MaterialExpressionGuid": [
+          1468769931,
+          1274363958,
+          3410189457,
+          2221946331
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "193": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 146,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_14"
+        },
+        "DeclarationGuid": [
+          480195874,
+          1187561470,
+          2705628072,
+          3418409235
+        ],
+        "MaterialExpressionEditorX": -1520,
+        "MaterialExpressionEditorY": 2304,
+        "MaterialExpressionGuid": [
+          170781142,
+          1247366959,
+          1399701915,
+          1370585841
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "194": {
+      "class_path": "/Script/Engine.MaterialExpressionNamedRerouteUsage",
+      "properties": {
+        "Declaration": {
+          "object": 141,
+          "path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_1"
+        },
+        "DeclarationGuid": [
+          383776393,
+          1167593254,
+          847552188,
+          1305771777
+        ],
+        "MaterialExpressionEditorX": 5296,
+        "MaterialExpressionEditorY": -1296,
+        "MaterialExpressionGuid": [
+          1469068513,
+          1214000120,
+          1159004344,
+          1736154788
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "210": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 381,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionVectorParameter_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3696,
+        "MaterialExpressionEditorY": -1024,
+        "MaterialExpressionGuid": [
+          1981235091,
+          1079919049,
+          2026675344,
+          1246184042
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "211": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 80,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5120,
+        "MaterialExpressionEditorY": -4752,
+        "MaterialExpressionGuid": [
+          895235859,
+          1099356366,
+          3992200105,
+          588803369
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "212": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 8,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionBreakMaterialAttributes_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5216,
+        "MaterialExpressionEditorY": -4144,
+        "MaterialExpressionGuid": [
+          398154868,
+          1291520000,
+          4267137429,
+          2268575368
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "213": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 8,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionBreakMaterialAttributes_0",
+          "output": 10,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5920,
+        "MaterialExpressionEditorY": -3840,
+        "MaterialExpressionGuid": [
+          3541456293,
+          1151056645,
+          1821707191,
+          1440080126
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "214": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 70,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 4112,
+        "MaterialExpressionEditorY": -3072,
+        "MaterialExpressionGuid": [
+          1447909200,
+          1241938859,
+          2624637354,
+          2399042355
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "215": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 8,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionBreakMaterialAttributes_0",
+          "output": 7,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5312,
+        "MaterialExpressionEditorY": -2880,
+        "MaterialExpressionGuid": [
+          1235834268,
+          1282950342,
+          2547104185,
+          3971757489
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "216": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 8,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionBreakMaterialAttributes_0",
+          "output": 6,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5216,
+        "MaterialExpressionEditorY": -3728,
+        "MaterialExpressionGuid": [
+          1497421903,
+          1272276183,
+          3766092162,
+          3034482865
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "217": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 378,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionVectorParameter_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2752,
+        "MaterialExpressionEditorY": -848,
+        "MaterialExpressionGuid": [
+          2079524310,
+          1147473230,
+          1866963338,
+          1451819793
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "218": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 262,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_14",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2736,
+        "MaterialExpressionEditorY": -1184,
+        "MaterialExpressionGuid": [
+          2509240434,
+          1114594093,
+          984978049,
+          3651187421
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "219": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 214,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 5328,
+        "MaterialExpressionEditorY": -3920,
+        "MaterialExpressionGuid": [
+          1871838579,
+          1284141744,
+          520285624,
+          1717176123
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "220": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 256,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1744,
+        "MaterialExpressionEditorY": 2384,
+        "MaterialExpressionGuid": [
+          2518558011,
+          1087800595,
+          3916798364,
+          993653158
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "221": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 264,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_16",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2736,
+        "MaterialExpressionEditorY": -1376,
+        "MaterialExpressionGuid": [
+          1240734565,
+          1099330564,
+          1719893405,
+          640363814
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "222": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 279,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_3",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2768,
+        "MaterialExpressionEditorY": -448,
+        "MaterialExpressionGuid": [
+          1741252935,
+          1252024342,
+          2700542863,
+          1537011966
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "223": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 261,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2784,
+        "MaterialExpressionEditorY": -320,
+        "MaterialExpressionGuid": [
+          4137309358,
+          1230196525,
+          4035978404,
+          728722644
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "224": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 270,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_21",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -1744,
+        "MaterialExpressionEditorY": 2672,
+        "MaterialExpressionGuid": [
+          3362664714,
+          1160045212,
+          144666499,
+          3559247960
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "225": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 64,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionCustom_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -5056,
+        "MaterialExpressionEditorY": 32,
+        "MaterialExpressionGuid": [
+          4098980038,
+          1181008415,
+          1584679581,
+          3060562564
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "226": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 225,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_25",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -4128,
+        "MaterialExpressionEditorY": 128,
+        "MaterialExpressionGuid": [
+          3332343490,
+          1285243871,
+          834121877,
+          4140267450
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "227": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 276,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_27",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2784,
+        "MaterialExpressionEditorY": -112,
+        "MaterialExpressionGuid": [
+          3624987076,
+          1223490052,
+          1813377191,
+          202887080
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "228": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 277,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_28",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2784,
+        "MaterialExpressionGuid": [
+          1286523735,
+          1205103695,
+          1685809058,
+          3807218130
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "229": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 266,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_18",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3696,
+        "MaterialExpressionEditorY": -864,
+        "MaterialExpressionGuid": [
+          2340240846,
+          1205834822,
+          1658871219,
+          4204463243
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "230": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 316,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_7",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3696,
+        "MaterialExpressionEditorY": -1088,
+        "MaterialExpressionGuid": [
+          2801236530,
+          1117248218,
+          3833053624,
+          2131009427
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "231": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 282,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_32",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3696,
+        "MaterialExpressionEditorY": -960,
+        "MaterialExpressionGuid": [
+          3781799344,
+          1201593955,
+          859796408,
+          1379067264
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "232": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 382,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionVectorParameter_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8352,
+        "MaterialExpressionEditorY": 2752,
+        "MaterialExpressionGuid": [
+          3037034693,
+          1200561756,
+          64298909,
+          3917762360
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "233": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 274,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_25",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8352,
+        "MaterialExpressionEditorY": 2656,
+        "MaterialExpressionGuid": [
+          516684953,
+          1153608841,
+          1315255939,
+          1545211307
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "234": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 367,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionTextureObjectParameter_5",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8480,
+        "MaterialExpressionEditorY": 2976,
+        "MaterialExpressionGuid": [
+          2738746544,
+          1270651537,
+          298272938,
+          599279517
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "235": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 309,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_63",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8352,
+        "MaterialExpressionEditorY": 2912,
+        "MaterialExpressionGuid": [
+          1356352848,
+          1331105057,
+          2119380627,
+          3318278338
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "236": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 278,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_29",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8304,
+        "MaterialExpressionEditorY": 2464,
+        "MaterialExpressionGuid": [
+          324655551,
+          1148026995,
+          1234909869,
+          2159750431
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "237": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 304,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_59",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -8352,
+        "MaterialExpressionEditorY": 2816,
+        "MaterialExpressionGuid": [
+          3759725144,
+          1126806580,
+          2171418785,
+          3917822539
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "238": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 108,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -7728,
+        "MaterialExpressionEditorY": 2768,
+        "MaterialExpressionGuid": [
+          3241854870,
+          1171305971,
+          2839142830,
+          1788414177
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "239": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 93,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -720,
+        "MaterialExpressionEditorY": -1088,
+        "MaterialExpressionGuid": [
+          34299022,
+          1244909835,
+          3555964569,
+          1525335301
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "240": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 269,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_20",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -2784,
+        "MaterialExpressionEditorY": -224,
+        "MaterialExpressionGuid": [
+          2468347004,
+          1187711617,
+          3402933385,
+          242093606
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "241": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 366,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionTextureObjectParameter_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3696,
+        "MaterialExpressionEditorY": -928,
+        "MaterialExpressionGuid": [
+          3510401134,
+          1267035545,
+          3643977610,
+          2813814430
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "242": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 244,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 7216,
+        "MaterialExpressionEditorY": -4816,
+        "MaterialExpressionGuid": [
+          920266313,
+          1237994411,
+          3502740122,
+          1413919602
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "243": {
+      "class_path": "/Script/Engine.MaterialExpressionReroute",
+      "properties": {
+        "Input": {
+          "expression": 286,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionScalarParameter_36",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 3680,
+        "MaterialExpressionEditorY": -1312,
+        "MaterialExpressionGuid": [
+          1217319436,
+          1302140467,
+          4006161821,
+          807352886
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "251": {
+      "class_path": "/Script/Engine.MaterialExpressionSaturate",
+      "properties": {
+        "Input": {
+          "expression": 177,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_23",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 400,
+        "MaterialExpressionEditorY": -2512,
+        "MaterialExpressionGuid": [
+          2116921736,
+          1086587946,
+          2013516472,
+          1677508667
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "255": {
+      "class_path": "/Script/Engine.MaterialExpressionSaturate",
+      "properties": {
+        "Input": {
+          "expression": 166,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": 2096,
+        "MaterialExpressionEditorY": -2400,
+        "MaterialExpressionGuid": [
+          1696099413,
+          1308625641,
+          2752932499,
+          273843583
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "290": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "Opacity",
+        "ExpressionGUID": [
+          3535570447,
+          1154652770,
+          3993279165,
+          531166426
+        ],
+        "Group": "Water Surface Shading",
+        "MaterialExpressionEditorX": -4944,
+        "MaterialExpressionEditorY": 1072,
+        "MaterialExpressionGuid": [
+          2263097691,
+          1342033580,
+          2662871467,
+          3501080706
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "318": {
+      "class_path": "/Script/Engine.MaterialExpressionScalarParameter",
+      "properties": {
+        "DefaultValue": 1.0,
+        "ParameterName": "FoamOpacity",
+        "ExpressionGUID": [
+          1227913986,
+          1224627473,
+          2428349335,
+          2227740780
+        ],
+        "Group": "Foam Shading",
+        "MaterialExpressionEditorX": 2912,
+        "MaterialExpressionEditorY": -2480,
+        "MaterialExpressionGuid": [
+          1769338008,
+          1153467985,
+          4269642625,
+          444102164
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "319": {
+      "class_path": "/Script/Engine.MaterialExpressionSceneTexture",
+      "properties": {
+        "SceneTextureId": "PPI_CustomDepth",
+        "MaterialExpressionEditorX": 6720,
+        "MaterialExpressionEditorY": -2864,
+        "MaterialExpressionGuid": [
+          1063584953,
+          1257575535,
+          673711005,
+          150257373
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "320": {
+      "class_path": "/Script/Engine.MaterialExpressionSetMaterialAttributes",
+      "properties": {
+        "Inputs": [
+          {
+            "expression": 245,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_9",
+            "output": 0,
+            "input_name": "None",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 88,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_2",
+            "output": 0,
+            "input_name": "Base Color",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 91,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_6",
+            "output": 0,
+            "input_name": "Specular",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 90,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_5",
+            "output": 0,
+            "input_name": "Roughness",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 101,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMaterialFunctionCall_15",
+            "output": 0,
+            "input_name": "Normal",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 4,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionAdd_3",
+            "output": 0,
+            "input_name": "World Position Offset",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 5,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionAdd_4",
+            "output": 0,
+            "input_name": "Opacity",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "expression": 335,
+            "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_13",
+            "output": 0,
+            "input_name": "Opacity Mask",
+            "mask": 0,
+            "channels": [
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        ],
+        "AttributeSetTypes": [
+          [
+            1773720374,
+            384650569,
+            2594477865,
+            788860794
+          ],
+          [
+            2681910169,
+            626412745,
+            2362627442,
+            3240923117
+          ],
+          [
+            3520960124,
+            1286424531,
+            2657306363,
+            149746192
+          ],
+          [
+            262308378,
+            537872970,
+            3071915913,
+            3240467556
+          ],
+          [
+            4177918101,
+            3582018324,
+            2439849012,
+            2353057438
+          ],
+          [
+            3103068090,
+            712330945,
+            2666951375,
+            3945250641
+          ],
+          [
+            1738537751,
+            733299244,
+            2907833475,
+            376310901
+          ]
+        ],
+        "MaterialExpressionEditorX": 7104,
+        "MaterialExpressionEditorY": -4464,
+        "MaterialExpressionGuid": [
+          747403729,
+          1326203115,
+          4279476866,
+          205692433
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "331": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 219,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 3,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionAdd_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "BakedSimNormalsOverrideUpstreamMaterialNormals",
+        "ExpressionGUID": [
+          238172122,
+          1188466835,
+          2903441813,
+          2103516722
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": 5648,
+        "MaterialExpressionEditorY": -4192,
+        "MaterialExpressionGuid": [
+          268483427,
+          1254782008,
+          2006661506,
+          4107033015
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "335": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 138,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_8",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 136,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionMultiply_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "Use Custom Depth Culling",
+        "ExpressionGUID": [
+          1295922524,
+          1117811801,
+          3323685548,
+          2735734552
+        ],
+        "MaterialExpressionEditorX": 7632,
+        "MaterialExpressionEditorY": -2928,
+        "MaterialExpressionGuid": [
+          2722815520,
+          1165856355,
+          3719895688,
+          1488336974
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "344": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 28,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionComponentMask_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 59,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionConstant3Vector_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 1,
+          "channels": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "AdvectWaveHeight",
+        "ExpressionGUID": [
+          4110238171,
+          1106179491,
+          3910972321,
+          2401149532
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": -6848,
+        "MaterialExpressionEditorY": 3168,
+        "MaterialExpressionGuid": [
+          16134696,
+          1136606458,
+          357085881,
+          1079428511
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "345": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 320,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionSetMaterialAttributes_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 242,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionReroute_6",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "Use Shallow Water",
+        "ExpressionGUID": [
+          879435056,
+          1104087794,
+          1303224961,
+          1267568264
+        ],
+        "Group": "Advanced",
+        "MaterialExpressionEditorX": 7440,
+        "MaterialExpressionEditorY": -4464,
+        "MaterialExpressionGuid": [
+          3113186368,
+          1169366356,
+          2732422795,
+          3698633620
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "347": {
+      "class_path": "/Script/Engine.MaterialExpressionStaticSwitchParameter",
+      "properties": {
+        "A": {
+          "expression": 86,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionLinearInterpolate_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 145,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteDeclaration_13",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "DefaultValue": true,
+        "ParameterName": "AdvectWaveHeight",
+        "ExpressionGUID": [
+          310024920,
+          1289029330,
+          613346234,
+          4180074260
+        ],
+        "MaterialExpressionEditorX": 944,
+        "MaterialExpressionEditorY": -2768,
+        "MaterialExpressionGuid": [
+          3030621955,
+          1131479835,
+          2758630019,
+          2873366736
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    },
+    "375": {
+      "class_path": "/Script/Engine.MaterialExpressionTextureSample",
+      "properties": {
+        "Coordinates": {
+          "expression": 198,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionNamedRerouteUsage_9",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "TextureObject": {
+          "expression": 338,
+          "expression_path": "MF_ShallowWaterRiver.MaterialExpressionStaticSwitchParameter_18",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MipValueMode": "TMVM_MipLevel",
+        "MaterialExpressionEditorX": -368,
+        "MaterialExpressionEditorY": -3040,
+        "MaterialExpressionGuid": [
+          584822041,
+          1322868694,
+          3930825622,
+          1774448040
+        ],
+        "Function": {
+          "object": 389,
+          "path": "MF_ShallowWaterRiver"
+        }
+      }
+    }
+  },
+  "blend_graph": {
+    "1": {
+      "class_path": "/Script/Engine.MaterialExpressionCustom",
+      "properties": {
+        "Code": "// https://blog.selfshadow.com/publications/blending-in-detail/\r\n\r\nfloat a = 1/(1 + n1.z);\r\nfloat b = -n1.x*n1.y*a;\r\n\r\n// Form a basis\r\nfloat3 b1 = float3(1 - n1.x*n1.x*a, b, -n1.x);\r\nfloat3 b2 = float3(b, 1 - n1.y*n1.y*a, -n1.y);\r\nfloat3 b3 = n1;\r\n\r\nif (n1.z < -0.9999999) // Handle the singularity\r\n{\r\n    b1 = float3( 0, -1, 0);\r\n    b2 = float3(-1,  0, 0);\r\n}\r\n\r\n// Rotate n2 via the basis\r\nreturn n2.x*b1 + n2.y*b2 + n2.z*b3;",
+        "Inputs": [
+          {
+            "InputName": "n1",
+            "Input": {
+              "expression": 2,
+              "expression_path": "MF_BlendNormals.MaterialExpressionFunctionInput_0",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "InputName": "n2",
+            "Input": {
+              "expression": 3,
+              "expression_path": "MF_BlendNormals.MaterialExpressionFunctionInput_1",
+              "output": 0,
+              "input_name": "None",
+              "mask": 0,
+              "channels": [
+                0,
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ],
+        "ShowCode": true,
+        "MaterialExpressionGuid": [
+          173867269,
+          1168500213,
+          1990827922,
+          4288270864
+        ],
+        "Function": {
+          "object": 5,
+          "path": "MF_BlendNormals"
+        }
+      }
+    },
+    "2": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "Base Normal",
+        "Id": [
+          4246157143,
+          1167669154,
+          2270223542,
+          3497937426
+        ],
+        "MaterialExpressionEditorX": -576,
+        "MaterialExpressionEditorY": -112,
+        "MaterialExpressionGuid": [
+          3963714215,
+          1103943941,
+          3716246686,
+          4276732761
+        ],
+        "Function": {
+          "object": 5,
+          "path": "MF_BlendNormals"
+        },
+        "bCollapsed": true
+      }
+    },
+    "3": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "Detail Normal",
+        "Id": [
+          3403141503,
+          1163395685,
+          4043600003,
+          4226166070
+        ],
+        "SortPriority": 10,
+        "MaterialExpressionEditorX": -576,
+        "MaterialExpressionGuid": [
+          2399419822,
+          1282787206,
+          1342464392,
+          523096506
+        ],
+        "Function": {
+          "object": 5,
+          "path": "MF_BlendNormals"
+        },
+        "bCollapsed": true
+      }
+    },
+    "4": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionOutput",
+      "properties": {
+        "OutputName": "Custom",
+        "A": {
+          "expression": 1,
+          "expression_path": "MF_BlendNormals.MaterialExpressionCustom_11",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "Id": [
+          79810230,
+          1204923521,
+          3037006487,
+          193135403
+        ],
+        "MaterialExpressionEditorX": 576,
+        "MaterialExpressionGuid": [
+          999247096,
+          1265729872,
+          2445519532,
+          1599541666
+        ],
+        "Function": {
+          "object": 5,
+          "path": "MF_BlendNormals"
+        },
+        "bCollapsed": true
+      }
+    },
+    "5": {
+      "class_path": "/Script/Engine.MaterialFunction",
+      "properties": {
+        "EditorOnlyData": {
+          "object": 6,
+          "path": "MF_BlendNormals.MF_BlendNormalsEditorOnlyData"
+        },
+        "StateId": [
+          3364699064,
+          1103719801,
+          1158375840,
+          256130023
+        ],
+        "CombinedInputTypes": 4,
+        "CombinedOutputTypes": 15
+      }
+    },
+    "6": {
+      "class_path": "/Script/Engine.MaterialFunctionEditorOnlyData",
+      "properties": {
+        "ExpressionCollection": {
+          "Expressions": [
+            {
+              "object": 1,
+              "path": "MF_BlendNormals.MaterialExpressionCustom_11"
+            },
+            {
+              "object": 2,
+              "path": "MF_BlendNormals.MaterialExpressionFunctionInput_0"
+            },
+            {
+              "object": 3,
+              "path": "MF_BlendNormals.MaterialExpressionFunctionInput_1"
+            },
+            {
+              "object": 4,
+              "path": "MF_BlendNormals.MaterialExpressionFunctionOutput_1"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "safe_normalize_graph": {
+    "1": {
+      "class_path": "/Script/Engine.MaterialExpressionAppendVector",
+      "properties": {
+        "A": {
+          "expression": 14,
+          "expression_path": "SafeNormalize.MaterialExpressionNormalize_4",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 5,
+          "expression_path": "SafeNormalize.MaterialExpressionConstant_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -656,
+        "MaterialExpressionEditorY": 416,
+        "MaterialExpressionGuid": [
+          2374843919,
+          1113752363,
+          3661422780,
+          139558049
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "2": {
+      "class_path": "/Script/Engine.MaterialExpressionAppendVector",
+      "properties": {
+        "A": {
+          "expression": 10,
+          "expression_path": "SafeNormalize.MaterialExpressionFunctionInput_41",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 6,
+          "expression_path": "SafeNormalize.MaterialExpressionConstant_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -682,
+        "MaterialExpressionEditorY": 609,
+        "MaterialExpressionGuid": [
+          1424092714,
+          1253434181,
+          328548237,
+          1485494892
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "3": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 13,
+          "expression_path": "SafeNormalize.MaterialExpressionIf_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "R": true,
+        "G": true,
+        "B": true,
+        "MaterialExpressionEditorX": -272,
+        "MaterialExpressionEditorY": 336,
+        "MaterialExpressionGuid": [
+          2929304824,
+          1095340868,
+          1756253845,
+          729499263
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "4": {
+      "class_path": "/Script/Engine.MaterialExpressionComponentMask",
+      "properties": {
+        "Input": {
+          "expression": 13,
+          "expression_path": "SafeNormalize.MaterialExpressionIf_2",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "A": true,
+        "MaterialExpressionEditorX": -256,
+        "MaterialExpressionEditorY": 512,
+        "MaterialExpressionGuid": [
+          709530972,
+          1228974740,
+          3549023157,
+          3425399733
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "5": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "MaterialExpressionEditorX": -816,
+        "MaterialExpressionEditorY": 496,
+        "MaterialExpressionGuid": [
+          1845314540,
+          1155483901,
+          1179437995,
+          906256279
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "6": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "R": 1.0,
+        "MaterialExpressionEditorX": -848,
+        "MaterialExpressionEditorY": 784,
+        "MaterialExpressionGuid": [
+          1545077118,
+          1260540125,
+          61103524,
+          1602185010
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "7": {
+      "class_path": "/Script/Engine.MaterialExpressionConstant",
+      "properties": {
+        "R": 9.999999974752427e-07,
+        "MaterialExpressionEditorX": -864,
+        "MaterialExpressionEditorY": 336,
+        "MaterialExpressionGuid": [
+          793337986,
+          1128979753,
+          3718949006,
+          3226527271
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "8": {
+      "class_path": "/Script/Engine.MaterialExpressionDotProduct",
+      "properties": {
+        "A": {
+          "expression": 9,
+          "expression_path": "SafeNormalize.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 9,
+          "expression_path": "SafeNormalize.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -875,
+        "MaterialExpressionEditorY": 244,
+        "MaterialExpressionGuid": [
+          1370785852,
+          1319933818,
+          117673866,
+          3470630654
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "9": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "Vector",
+        "Id": [
+          1608800207,
+          1306421569,
+          732968348,
+          4199183921
+        ],
+        "PreviewValue": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "bUsePreviewValueAsDefault": true,
+        "MaterialExpressionEditorX": -1104,
+        "MaterialExpressionEditorY": 336,
+        "MaterialExpressionGuid": [
+          626917464,
+          1102632155,
+          2250348689,
+          280880315
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "10": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionInput",
+      "properties": {
+        "InputName": "Default",
+        "Description": "Vector to be used when the normalized vector reaches 0 in length.",
+        "Id": [
+          2999454780,
+          1083207095,
+          2028461755,
+          906881649
+        ],
+        "bUsePreviewValueAsDefault": true,
+        "SortPriority": 1,
+        "MaterialExpressionEditorX": -944,
+        "MaterialExpressionEditorY": 576,
+        "MaterialExpressionGuid": [
+          1494318346,
+          1157711995,
+          691284096,
+          3304976959
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "11": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionOutput",
+      "properties": {
+        "A": {
+          "expression": 3,
+          "expression_path": "SafeNormalize.MaterialExpressionComponentMask_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "bLastPreviewed": true,
+        "Id": [
+          1663752916,
+          1216808489,
+          1497852334,
+          1490770818
+        ],
+        "MaterialExpressionEditorX": -128,
+        "MaterialExpressionEditorY": 304,
+        "MaterialExpressionGuid": [
+          1689137175,
+          1201145230,
+          3085975995,
+          748524657
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "12": {
+      "class_path": "/Script/Engine.MaterialExpressionFunctionOutput",
+      "properties": {
+        "OutputName": "Length==0",
+        "Description": "Returns 1 if the vector's length was 0. Otherwise, this output returns 0.",
+        "SortPriority": 1,
+        "A": {
+          "expression": 4,
+          "expression_path": "SafeNormalize.MaterialExpressionComponentMask_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "bLastPreviewed": true,
+        "Id": [
+          2945866052,
+          1273812910,
+          3696160938,
+          3698860112
+        ],
+        "MaterialExpressionEditorX": -128,
+        "MaterialExpressionEditorY": 512,
+        "MaterialExpressionGuid": [
+          1689137175,
+          1201145230,
+          3085975995,
+          748524657
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "13": {
+      "class_path": "/Script/Engine.MaterialExpressionIf",
+      "properties": {
+        "A": {
+          "expression": 8,
+          "expression_path": "SafeNormalize.MaterialExpressionDotProduct_23",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "B": {
+          "expression": 7,
+          "expression_path": "SafeNormalize.MaterialExpressionConstant_59",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "AGreaterThanB": {
+          "expression": 1,
+          "expression_path": "SafeNormalize.MaterialExpressionAppendVector_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "AEqualsB": {
+          "expression": 2,
+          "expression_path": "SafeNormalize.MaterialExpressionAppendVector_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "ALessThanB": {
+          "expression": 2,
+          "expression_path": "SafeNormalize.MaterialExpressionAppendVector_1",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -400,
+        "MaterialExpressionEditorY": 336,
+        "MaterialExpressionGuid": [
+          1549608221,
+          1308844664,
+          1852999833,
+          1616157758
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "14": {
+      "class_path": "/Script/Engine.MaterialExpressionNormalize",
+      "properties": {
+        "VectorInput": {
+          "expression": 9,
+          "expression_path": "SafeNormalize.MaterialExpressionFunctionInput_0",
+          "output": 0,
+          "input_name": "None",
+          "mask": 0,
+          "channels": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "MaterialExpressionEditorX": -880,
+        "MaterialExpressionEditorY": 417,
+        "MaterialExpressionGuid": [
+          1582180895,
+          1331194705,
+          2455002279,
+          814573324
+        ],
+        "Function": {
+          "object": 15,
+          "path": "SafeNormalize"
+        }
+      }
+    },
+    "15": {
+      "class_path": "/Script/Engine.MaterialFunction",
+      "properties": {
+        "Description": "If the input vectors length == 0 then return 0 else return the normalized vector by default. This avoids returning NAN or NULL. Optionally, one can pass in a default vector that should be used when the vector ",
+        "FunctionExpressions": [
+          {
+            "object": 11,
+            "path": "SafeNormalize.MaterialExpressionFunctionOutput_0"
+          },
+          {
+            "object": 8,
+            "path": "SafeNormalize.MaterialExpressionDotProduct_23"
+          },
+          {
+            "object": 13,
+            "path": "SafeNormalize.MaterialExpressionIf_2"
+          },
+          {
+            "object": 7,
+            "path": "SafeNormalize.MaterialExpressionConstant_59"
+          },
+          {
+            "object": 14,
+            "path": "SafeNormalize.MaterialExpressionNormalize_4"
+          },
+          {
+            "object": 9,
+            "path": "SafeNormalize.MaterialExpressionFunctionInput_0"
+          },
+          {
+            "object": 10,
+            "path": "SafeNormalize.MaterialExpressionFunctionInput_41"
+          },
+          {
+            "object": 12,
+            "path": "SafeNormalize.MaterialExpressionFunctionOutput_1"
+          },
+          {
+            "object": 3,
+            "path": "SafeNormalize.MaterialExpressionComponentMask_0"
+          },
+          {
+            "object": 4,
+            "path": "SafeNormalize.MaterialExpressionComponentMask_1"
+          },
+          {
+            "object": 1,
+            "path": "SafeNormalize.MaterialExpressionAppendVector_0"
+          },
+          {
+            "object": 5,
+            "path": "SafeNormalize.MaterialExpressionConstant_1"
+          },
+          {
+            "object": 2,
+            "path": "SafeNormalize.MaterialExpressionAppendVector_1"
+          },
+          {
+            "object": 6,
+            "path": "SafeNormalize.MaterialExpressionConstant_2"
+          }
+        ],
+        "bExposeToLibrary": true,
+        "LibraryCategoriesText": {
+          "unsupported": "property TextProperty not decoded",
+          "raw_hex": "020000000800000000130000004d6174657269616c45787072657373696f6e00050000004d69736300050000004d697363000000000000010000000021000000463338373430423934353945304433414642414644444235444439453033423700050000004d61746800"
+        },
+        "StateId": [
+          2536438442,
+          1276914454,
+          1271039906,
+          2971423194
+        ],
+        "CombinedInputTypes": 4,
+        "CombinedOutputTypes": 15,
+        "ThumbnailInfo": {
+          "object": 17,
+          "path": "SafeNormalize.SceneThumbnailInfoWithPrimitive_21"
+        }
+      }
+    },
+    "16": {
+      "class_path": "/Script/CoreUObject.MetaData",
+      "properties": {}
+    },
+    "17": {
+      "class_path": "/Script/UnrealEd.SceneThumbnailInfoWithPrimitive",
+      "properties": {}
+    }
+  },
+  "if_equals_threshold": 1e-05,
+  "compiler_if": "int32 FHLSLMaterialTranslator::If(int32 A,int32 B,int32 AGreaterThanB,int32 AEqualsB,int32 ALessThanB,int32 ThresholdArg)\n{\n\tif (A == INDEX_NONE || B == INDEX_NONE || AGreaterThanB == INDEX_NONE || ALessThanB == INDEX_NONE)\n\t{\n\t\treturn INDEX_NONE;\n\t}\n\n\tif (AreEqualExpressions(AGreaterThanB, ALessThanB, *CurrentScopeChunks, *Material))\n\t{\n\t\tif (AEqualsB == INDEX_NONE || AreEqualExpressions(AGreaterThanB, AEqualsB, *CurrentScopeChunks, *Material))\n\t\t{\n\t\t\t// All inputs are considered equal. So simply return one of them.\n\t\t\treturn AGreaterThanB;\n\t\t}\n\t}\n\n\tif (IsAnalyticDerivEnabled())\n\t{\n\t\treturn DerivativeAutogen.GenerateIfFunc(*this, A, B, AGreaterThanB, AEqualsB, ALessThanB, ThresholdArg);\n\t}\n\t\n\tif (AEqualsB != INDEX_NONE)\n\t{\n\t\tif (ThresholdArg == INDEX_NONE)\n\t\t{\n\t\t\treturn INDEX_NONE;\n\t\t}\n\n\t\tEMaterialValueType ResultType = GetArithmeticResultType(GetParameterType(AGreaterThanB),GetArithmeticResultType(AEqualsB,ALessThanB));\n\n\t\tint32 CoercedAGreaterThanB = ForceCast(AGreaterThanB,ResultType);\n\t\tint32 CoercedAEqualsB = ForceCast(AEqualsB,ResultType);\n\t\tint32 CoercedALessThanB = ForceCast(ALessThanB,ResultType);\n\n\t\tif(CoercedAGreaterThanB == INDEX_NONE || CoercedAEqualsB == INDEX_NONE || CoercedALessThanB == INDEX_NONE)\n\t\t{\n\t\t\treturn INDEX_NONE;\n\t\t}\n\n\t\treturn AddCodeChunk(\n\t\t\tResultType,\n\t\t\tTEXT(\"select(abs(%s - %s) > %s, select(%s >= %s, %s, %s), %s)\"),\n\t\t\t*GetParameterCode(A),\n\t\t\t*GetParameterCode(B),\n\t\t\t*GetParameterCode(ThresholdArg),\n\t\t\t*GetParameterCode(A),\n\t\t\t*GetParameterCode(B),\n\t\t\t*GetParameterCode(CoercedAGreaterThanB),\n\t\t\t*GetParameterCode(CoercedALessThanB),\n\t\t\t*GetParameterCode(CoercedAEqualsB)\n\t\t\t);\n\t}\n\telse\n\t{\n\t\tEMaterialValueType ResultType = GetArithmeticResultType(AGreaterThanB,ALessThanB);\n\n\t\tint32 CoercedAGreaterThanB = ForceCast(AGreaterThanB,ResultType);\n\t\tint32 CoercedALessThanB = ForceCast(ALessThanB,ResultType);\n\n\t\tif(CoercedAGreaterThanB == INDEX_NONE || CoercedALessThanB == INDEX_NONE)\n\t\t{\n\t\t\treturn INDEX_NONE;\n\t\t}\n\n\t\treturn AddCodeChunk(\n\t\t\tResultType,\n\t\t\tTEXT(\"select(%s >= %s, %s, %s)\"),\n\t\t\t*GetParameterCode(A),\n\t\t\t*GetParameterCode(B),\n\t\t\t*GetParameterCode(CoercedAGreaterThanB),\n\t\t\t*GetParameterCode(CoercedALessThanB)\n\t\t\t);\n\t}\n}",
+  "sources": {
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionIf.h": "7de65463ef8a6fa6163041389ebd637832c87c4635bf455495fa7e03fff97651",
+    "Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp": "b498e70f32b6bba08f19a934ef5d8233a000f4c1edd312b50dc9e07a5c3a26e9",
+    "Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialDerivativeAutogen.cpp": "416cd048871bd61ca03af28f3a10ea381856ace408736e24ceed603663fcf1a3"
+  },
+  "caveat": "Selected live normal/mask graph only. Foam normal/amount remain required upstream pins; their producer and presentation, Single Layer Water shading, scene depth binding and game integration are not supplied here. Native zero-flow advection remains undefined on FXC."
+}

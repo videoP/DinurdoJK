@@ -157,10 +157,17 @@ impl Anatomy {
             Region::LeftLeg|Region::RightLeg => {
                 let i=usize::from(r==Region::RightLeg);
                 let origin=self.hips[i];
-                let base=self.core(p);
-                // Preserve knees/feet alignment under proportion/height morph.
-                let lateral=0.025*(self.params.proportions-0.5)*2.0;
-                [base[0]+(p[0]-origin[0])*lateral,base[1],base[2]]
+                let first=nearest_radial(p,origin,self.knees[i]);
+                let second=nearest_radial(p,self.knees[i],self.ankles[i]);
+                let radial=if dot(first,first)<=dot(second,second) {first}else{second};
+                // Lengthen the rest centerline along its authored directions.
+                // A Z-only stretch changes the bind splay angle while keeping
+                // the stock inward walking rotations, making the feet cross.
+                // Preserve the radial offset so height does not inflate legs
+                // or feet; beyond the ankle, the whole foot follows its pivot.
+                let center=sub(p,radial);
+                let shift=sub(self.core(origin),origin);
+                add(p,add(shift,mul(sub(center,origin),self.scales()[0]-1.0)))
             }
             Region::Head => {
                 let skull=self.head;
@@ -341,6 +348,52 @@ mod tests {
         assert!((pivots[13][2]-pivots[1][2]-old).abs()>0.05);
         assert!(pivots.iter().flatten().all(|x|x.is_finite()));
     }    #[test]
+    fn leg_length_changes_preserve_bind_directions_on_both_rigs() {
+        for rig in [HumanoidRig::Jka53,HumanoidRig::Jk2_72] {
+            let gla=humanoid_reference(rig);
+            let mut glm=model();glm.num_bones=gla.skeleton.len();
+            for (height,proportions,age) in [
+                (1.,0.5,0.5),(0.,0.5,0.5),(0.5,1.,0.5),(0.5,0.,0.5),
+                (0.5,0.5,0.),(0.5,0.5,1.),(1.,1.,1.),(0.,0.,0.),
+            ] {
+                let params=BodyShapeParams{height,proportions,age,..Default::default()};
+                let shape=Anatomy::build(&glm,&gla,None,params).unwrap();
+                let mut shaped=glm.clone();
+                let pivots=apply(&mut shaped,&gla,params,None).unwrap().unwrap();
+                for side in ["l","r"] {
+                    let ids=[format!("{side}femuryz"),format!("{side}tibia"),format!("{side}talus")]
+                        .map(|name|landmark(&gla,&[&name]).unwrap());
+                    for pair in ids.windows(2) {
+                        let old=sub(shape.original[pair[1]],shape.original[pair[0]]);
+                        let new=sub(pivots[pair[1]],pivots[pair[0]]);
+                        let expected=mul(old,shape.scales()[0]);
+                        assert!(dist(new,expected)<2e-5,"{rig:?} {params:?} {side}: {new:?} vs {expected:?}");
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn height_preserves_leg_cross_sections_and_foot_size() {
+        let gla=humanoid_reference(HumanoidRig::Jka53);let glm=model();
+        for height in [0.,1.] {
+            let shape=Anatomy::build(&glm,&gla,None,BodyShapeParams{height,..Default::default()}).unwrap();
+            for (i,region) in [(0,Region::LeftLeg),(1,Region::RightLeg)] {
+                for (a,b) in [(shape.hips[i],shape.knees[i]),(shape.knees[i],shape.ankles[i])] {
+                    let center=add(a,mul(sub(b,a),0.5));
+                    let radial=mul(normalize(cross(sub(b,a),[0.,1.,0.])),1.5);
+                    let mapped=shape.map(center,region);
+                    for offset in [radial,mul(radial,-1.)] {
+                        assert!(dist(sub(shape.map(add(center,offset),region),mapped),offset)<2e-5);
+                    }
+                }
+                let ankle=shape.ankles[i];
+                let foot_offset=add(mul(normalize(sub(ankle,shape.knees[i])),2.),[0.,-2.,0.]);
+                assert!(dist(sub(shape.map(add(ankle,foot_offset),region),shape.map(ankle,region)),foot_offset)<2e-5);
+            }
+        }
+    }
+    #[test]
     fn jk2_and_converted_source_native_pivots_are_eligible() {
         let gla=humanoid_reference(HumanoidRig::Jk2_72);
         let mut glm=model();

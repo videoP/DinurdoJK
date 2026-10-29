@@ -73,7 +73,7 @@ struct InputVertex {
 @group(1) @binding(0) var<storage, read> bones: array<BoneMatrix>;
 @group(1) @binding(1) var<storage, read> skin_draws: array<SkinDraw>;
 // Packed DynamicModelVertex words: position3, normal3, uv2, color4, depth_hack1, water_wetness1
-// = 14 words. DYNAMIC_MODEL_VERTEX_WORDS in api.rs static-asserts the match;
+// + foliage flag = 15 words. DYNAMIC_MODEL_VERTEX_WORDS in api.rs static-asserts the match;
 // a new DynamicModelVertex field must be added to write_vertex below as well.
 @group(1) @binding(2) var<storage, read_write> output_words: array<u32>;
 
@@ -157,6 +157,17 @@ fn jka_to_render(world: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(world.x, world.z, -world.y);
 }
 
+// Same as ghoul2_skin.wgsl heat_source_alpha (AvP 1999 heat-source distance).
+fn heat_source_alpha(draw: SkinDraw, model_position: vec3<f32>) -> f32 {
+    let index = u32(draw.origin.w);
+    if (index == 0u) {
+        return -1.0;
+    }
+    let sources = bones[draw.params.x + index];
+    let nearest = min(distance(model_position, sources.row0.xyz), distance(model_position, sources.row1.xyz));
+    return min(nearest * length(draw.axis0.xyz) / 36.0, 1.0);
+}
+
 fn write_f32(word: u32, value: f32) {
     output_words[word] = bitcast<u32>(value);
 }
@@ -168,8 +179,10 @@ fn write_vertex(
     uv: vec2<f32>,
     color: vec4<f32>,
     wetness: f32,
+    foliage_wind: f32,
+    depth_hack: f32,
 ) {
-    let base = output_vertex * 14u;
+    let base = output_vertex * 15u;
     write_f32(base + 0u, position.x);
     write_f32(base + 1u, position.y);
     write_f32(base + 2u, position.z);
@@ -184,9 +197,12 @@ fn write_vertex(
     write_f32(base + 11u, color.w);
     // RF_DEPTHHACK never applies to a skinned Ghoul2 surface, but the slot is
     // part of the stride and the reserved range is only zero-filled on the CPU,
-    // so write it rather than leaving the previous frame's value behind.
-    write_f32(base + 12u, 0.0);
+    // so write it rather than leaving the previous frame's value behind. A warm
+    // body puts its thermal heat in (0, 0.5], which both md3.wgsl depth-hack
+    // tests ignore (> 0.5 view weapon, < 0 legacy blob).
+    write_f32(base + 12u, depth_hack);
     write_f32(base + 13u, wetness);
+    write_f32(base + 14u, foliage_wind);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -268,5 +284,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let lo = u32(band);
         wetness = mix(levels[lo], levels[min(lo + 1u, 7u)], fract(band));
     }
-    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color, wetness);
+    let heat_alpha = heat_source_alpha(draw, model_position);
+    let thermal = select(0.0, 0.01 + 0.48 * (1.0 - heat_alpha), heat_alpha >= 0.0);
+    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color, wetness, draw.axis0.w, thermal);
 }

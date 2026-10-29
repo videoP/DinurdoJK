@@ -8,6 +8,7 @@ use ::blue_water_sky::{Sky, SkyScene, SkyTargets, SkyView, math};
 struct AtmosphereConfig {
     target: (u32, u32, u32, wgpu::TextureFormat),
     quality: u8,
+    cloud_quality: u8,
     clouds: bool,
     weather: bool,
     aerial: bool,
@@ -30,6 +31,7 @@ impl crate::renderer::Renderer {
         let config = AtmosphereConfig {
             target: (self.config.width, self.config.height, self.msaa_samples, self.scene_format()),
             quality: settings.quality,
+            cloud_quality: settings.cloud_quality,
             clouds: self.cloud_backend == 1 && self.clouds_enabled,
             weather: settings.weather_backend == 1,
             aerial: self.sky_backend == 1 && self.fast_sky == 0,
@@ -61,6 +63,7 @@ impl crate::renderer::Renderer {
                 (s.maximum[0] - s.minimum[0]) * (s.maximum[1] - s.minimum[1]);
             area(a).total_cmp(&area(b))
         })).map_or(0.0, |surface| surface.plane_height);
+        let render_scale = self.cloud_render_resolution.scale();
         let (device, queue, camera, coverage, wind) = (
             self.device.clone(), self.queue.clone(), *camera, self.cloud_coverage,
             [self.weather_wind.speed, self.weather_wind.direction],
@@ -77,7 +80,7 @@ impl crate::renderer::Renderer {
             });
             atmosphere.prepare(&device, &queue, &mut encoder, config.target, &camera, [0.0; 2],
                 0.0, sun.direction.map(|value| -value), sea_plane, config.aerial, config.clouds, coverage,
-                wind, settings, sun.intensity, 0.0, false);
+                wind, settings, render_scale, sun.intensity, 0.0, false);
             atmosphere.render_image(&device, &mut encoder, None);
             queue.submit([encoder.finish()]);
             // The view may have moved while compilation ran. First use must
@@ -102,10 +105,12 @@ pub(in crate::renderer) struct AtmosphereRenderer {
     scene: super::blue_water_scene::Scene,
     settings: crate::blue_water_environment::Settings,
     last_time: f32,
+    frozen_time: Option<f32>,
     pub aerial: ::blue_water_render::AerialVolume,
     air_composite: super::blue_water_air::AirComposite,
     aerial_pass: ::blue_water_clouds::aerial::AerialPerspective,
     frame_camera: Option<::blue_water_render::CameraUniforms>,
+    map_height: f32,
     last_view: Option<(math::Vec3, math::Vec3, f32)>,
     last_scene: Option<SkyScene>,
     probe: Option<wgpu::TextureView>,
@@ -149,7 +154,7 @@ impl AtmosphereRenderer {
             device,
             queue,
             &sky,
-            quality,
+            settings.cloud_quality(),
             ::blue_water_clouds::Targets {
                 color: wgpu::TextureFormat::Rgba16Float,
                 depth: None,
@@ -216,10 +221,12 @@ impl AtmosphereRenderer {
             scene,
             settings,
             last_time: 0.0,
+            frozen_time: None,
             aerial,
             air_composite,
             aerial_pass,
             frame_camera: None,
+            map_height: 0.0,
             last_view: None,
             last_scene: None,
             probe: None,
@@ -418,6 +425,7 @@ impl AtmosphereRenderer {
         coverage: f32,
         wind: [f32; 2],
         settings: crate::blue_water_environment::Settings,
+        cloud_render_scale: f32,
         sun_intensity: f32,
         frame_dt: f32,
         sheltered: bool,
@@ -431,8 +439,24 @@ impl AtmosphereRenderer {
         self.show_atmosphere = show_atmosphere;
         self.clouds_active = clouds_enabled;
         let settings = settings.sanitize();
+        let rebase_changed = self.settings.cloud_altitude_rebase != settings.cloud_altitude_rebase;
+        let (time, frame_dt) = if settings.cloud_freeze {
+            (*self.frozen_time.get_or_insert(if self.last_time == 0.0 { time } else { self.last_time }), 0.0)
+        } else {
+            self.frozen_time = None;
+            (time, frame_dt)
+        };
         debug_assert_eq!(self.config.quality, settings.quality);
+        debug_assert_eq!(self.config.cloud_quality, settings.cloud_quality);
         self.settings = settings;
+        self.clouds.set_render_scale(cloud_render_scale);
+        self.clouds.set_tuning(::blue_water_clouds::layer::CloudTuning {
+            debug: settings.cloud_debug,
+            shadow_mode: settings.cloud_shadow_mode,
+            shadow_far: settings.cloud_shadow_far,
+            far_step_scale: settings.cloud_far_step_scale,
+            sun_steps: settings.cloud_sun_steps,
+        });
         let scene = settings.scene(
             elevation,
             azimuth,
@@ -441,9 +465,15 @@ impl AtmosphereRenderer {
             wind,
             clouds_enabled,
         );
-        if self.last_scene != Some(scene) {
+        if self.last_scene != Some(scene) || rebase_changed {
             self.sky.apply(&scene);
             self.clouds.apply(queue, &mut self.sky, &scene);
+            if settings.cloud_altitude_rebase {
+                // A/B only: rebase *resolved* layers, including automatic high cloud, rain shafts and fog.
+                // Keep sky haze / weather particles unchanged to isolate the cloud-placement hypothesis.
+                self.clouds.set_layers(rebased_cloud_layers(&scene, self.clouds.tier().rain_shafts,
+                    (-settings.altitude).max(0.0)));
+            }
             self.weather.apply(&scene);
             self.last_scene = Some(scene);
         }
@@ -455,6 +485,7 @@ impl AtmosphereRenderer {
         // and the cloud deck with it) below the sea plane by that many metres,
         // so clouds can stand at the level of a map that lies under the sea plane.
         let reference_drop = (-settings.altitude).max(0.0);
+        self.map_height = sea_plane - reference_drop * crate::ocean::OCEAN_UNITS_PER_METER;
         let mut settings = settings;
         settings.altitude = settings.altitude.max(0.0);
         self.clouds.set_still(frame_dt <= 0.0);
@@ -469,13 +500,13 @@ impl AtmosphereRenderer {
         let position = (camera.position - glam::Vec3::Y * sea_plane)
             / crate::ocean::OCEAN_UNITS_PER_METER
             + glam::Vec3::Y * reference_drop;
-        let view = glam::Mat4::look_to_rh(position, camera.forward(), glam::Vec3::Y);
+        let view = glam::camera::rh::view::look_to_mat4(position, camera.forward(), glam::Vec3::Y);
         let fov = camera.fov_y_for_viewport(key.0, key.1);
         let projection = glam::Mat4::from_translation(glam::Vec3::new(
             2.0 * jitter[0] / key.0.max(1) as f32,
             -2.0 * jitter[1] / key.1.max(1) as f32,
             0.0,
-        )) * glam::Mat4::perspective_rh(
+        )) * glam::camera::rh::proj::directx::perspective(
             fov,
             key.0 as f32 / key.1.max(1) as f32,
             camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
@@ -490,7 +521,7 @@ impl AtmosphereRenderer {
 
         // Cloud temporal reconstruction owns its subpixel pattern, so its view is unjittered.
         let cloud_projection = math::Mat4::from_cols_array_2d(
-            &glam::Mat4::perspective_rh(
+            &glam::camera::rh::proj::directx::perspective(
                 fov,
                 key.0 as f32 / key.1.max(1) as f32,
                 camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
@@ -712,8 +743,10 @@ impl AtmosphereRenderer {
                 crate::renderer::tile_probe_scissor_surface(&mut pass);
                 self.clouds.draw_composite(&mut pass);
             }
-            self.scene
-                .blit(device, encoder, &self.scene.overlay, color, resolve, true);
+            if self.settings.cloud_composite {
+                self.scene
+                    .blit(device, encoder, &self.scene.overlay, color, resolve, true);
+            }
         }
     }
     /// Lightning's current flash (a multiple of the sky's light), 0 without native weather.
@@ -813,18 +846,19 @@ impl AtmosphereRenderer {
         }
     }
     pub fn apply_opaque_air(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         color: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
+        roof: &(wgpu::TextureView, [f32; 4]),
     ) {
         if self.show_atmosphere {
             if let Some(camera) = &self.frame_camera {
                 self.air_composite
-                    .draw(device, queue, encoder, camera, color, resolve, depth);
+                    .draw(device, queue, encoder, camera, color, resolve, depth, &self.aerial, roof, self.map_height);
             }
         }
     }
@@ -834,9 +868,48 @@ impl AtmosphereRenderer {
     }
 }
 
+/// Translate final vendor layers, rather than rebasing authored inputs and leaving implicit layers behind.
+fn rebased_cloud_layers(scene: &SkyScene, rain_shafts: bool, reference_drop: f32) -> ::blue_water_clouds::layers::Layers {
+    let mut layers = ::blue_water_clouds::weathers::layers(scene, rain_shafts);
+    for layer in &mut layers.0 {
+        layer.altitude += reference_drop;
+    }
+    layers
+}
+
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    #[test]
+    fn cloud_altitude_experiment_preserves_world_heights_for_all_generated_layers() {
+        for altitude in [200.0f32, 0.0, -200.0, -1000.0] {
+            for high_genus in [0, 1, 2, 3] {
+                for fog in [0.0, 1.0] {
+                    let settings = crate::blue_water_environment::Settings {
+                        altitude, high_genus, weather_backend: 1, rain: 1.0, fog,
+                        ..Default::default()
+                    };
+                    let scene = settings.scene(40.0, 0.0, 255.0, 0.5, [0.0; 2], true);
+                    let drop = (-altitude).max(0.0);
+                    let authored = ::blue_water_clouds::weathers::layers(&scene, true);
+                    let native = rebased_cloud_layers(&scene, true, drop);
+                    for (original, converted) in authored.0.iter().zip(native.0.iter()) {
+                        assert!((converted.altitude - drop - original.altitude).abs() < 0.001);
+                        assert_eq!(converted.height, original.height);
+                        assert_eq!(converted.coverage, original.coverage);
+                    }
+                    if high_genus != 0 {
+                        assert_eq!(native.0[2].altitude - drop, settings.high_altitude);
+                    }
+                    if fog == 0.0 {
+                        assert!((native.0[0].altitude - drop - altitude).abs() < 0.001);
+                        assert!((native.0[3].altitude + native.0[3].height - native.0[0].altitude).abs() < 0.001);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_atmosphere_depth_msaa_weather_and_history() {
         futures_lite::future::block_on(async {
@@ -855,14 +928,15 @@ mod native_tests {
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             for samples in [1, 4] {
               for (clouds, weather, aerial) in [(false, false, true), (true, false, false), (true, true, true)] {
-                let key = (64, 32, samples, wgpu::TextureFormat::Rgba16Float);
+                // Odd dimensions catch aspect and rounded-up cloud/depth coordinates.
+                let key = (65, 33, samples, wgpu::TextureFormat::Rgba16Float);
                 let texture = |format, samples| {
                     device
                         .create_texture(&wgpu::TextureDescriptor {
                             label: Some("native scene fixture"),
                             size: wgpu::Extent3d {
-                                width: 64,
-                                height: 32,
+                                width: key.0,
+                                height: key.1,
                                 depth_or_array_layers: 1,
                             },
                             mip_level_count: 1,
@@ -878,22 +952,32 @@ mod native_tests {
                 let color = texture(key.3, samples);
                 let depth = texture(wgpu::TextureFormat::Depth32Float, samples);
                 let motion = texture(wgpu::TextureFormat::Rg16Float, 1);
+                let roof = (device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("native air no-roof fixture"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+                }).create_view(&Default::default()), [0.0; 4]);
                 let resolved = texture(key.3, 1);
                 let resolve = (samples > 1).then_some(&resolved);
                 let camera = Camera::new([0., 800., 0.], 0.);
                 let settings = crate::blue_water_environment::Settings {
                     quality: 0,
+                    cloud_quality: 0,
                     weather_backend: u8::from(weather),
                     rain: 1.,
                     rain_speed: 2.,
                     world_lighting: 1.0,
                     ..Default::default()
                 };
-                let config = AtmosphereConfig { target: key, quality: settings.quality,
+                let config = AtmosphereConfig { target: key, quality: settings.quality, cloud_quality: settings.cloud_quality,
                     clouds, weather, aerial };
                 let mut atmosphere = AtmosphereRenderer::build(&device, &queue, config, settings);
                 assert_eq!(atmosphere.weather_reactive.is_some(), weather);
-                for frame in 0..2 {
+                for frame in 0..8 {
+                    let scale = [1.0, 0.75, 0.5, 0.25][frame / 2];
                     let mut encoder = device.create_command_encoder(&Default::default());
                     if frame == 1 && weather {
                         // Exercise the shaped bolt draw beyond JKA's map far
@@ -923,11 +1007,19 @@ mod native_tests {
                         0.5,
                         [100., 45.],
                         settings,
+                        scale,
                         255.,
                         1. / 60.,
                         false,
                     );
-                    if frame == 1 && clouds {
+                    if clouds {
+                        let expected = [key.0, key.1].map(|v| (v as f32 * scale).ceil());
+                        assert_eq!(&atmosphere.clouds.uniforms().screen[..2], &expected);
+                        assert_eq!(&atmosphere.clouds.uniforms().viewport[..2], &[key.0 as f32, key.1 as f32]);
+                        assert_eq!(atmosphere.clouds.uniforms().frame[3], (frame % 2) as f32,
+                            "resizing drops cloud history once; unchanged sizes keep it");
+                    }
+                    if frame % 2 == 1 && clouds {
                         assert_eq!(
                             atmosphere.clouds.uniforms().frame[3],
                             1.,
@@ -985,6 +1077,7 @@ mod native_tests {
                         &color,
                         resolve,
                         &depth,
+                        &roof,
                     );
                     atmosphere.draw_weather(&device, &queue, &mut encoder, &color, resolve, &depth, Some(&motion));
                     queue.submit(Some(encoder.finish()));
@@ -994,6 +1087,31 @@ mod native_tests {
                             timeout: None,
                         })
                         .unwrap();
+                }
+                if clouds {
+                    for debug in 0..=5 {
+                        let settings = crate::blue_water_environment::Settings {
+                            cloud_debug: debug, cloud_freeze: true, cloud_shadow_mode: debug % 2,
+                            cloud_shadow_far: 60_000.0, cloud_far_step_scale: 2.0, cloud_sun_steps: 0,
+                            cloud_composite: debug != 1, cloud_altitude_rebase: true, altitude: -200.0,
+                            ..settings
+                        };
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        atmosphere.prepare(&device, &queue, &mut encoder, key, &camera, [0.0; 2],
+                            100.0 + f32::from(debug), [0.3, 0.8, 0.2], 0.0, aerial, true, 0.5,
+                            [100.0, 45.0], settings, 0.5, 255.0, 1.0 / 60.0, false);
+                        let uniforms = atmosphere.clouds.uniforms();
+                        assert_eq!(uniforms.experiments, [f32::from(debug), f32::from(debug % 2), 2.0, 1.0]);
+                        assert_eq!(uniforms.planes[1], camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER);
+                        assert_eq!(uniforms.planes[2], 60_000.0);
+                        assert_eq!(uniforms.frame[3], 0.0, "each new diagnostic drops its history");
+                        assert_eq!(atmosphere.clouds.layers().0[0].altitude, 0.0);
+                        assert_eq!(Some(atmosphere.last_time), atmosphere.frozen_time);
+                        atmosphere.render_image(&device, &mut encoder, None);
+                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None);
+                        queue.submit(Some(encoder.finish()));
+                        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                    }
                 }
               }
             }

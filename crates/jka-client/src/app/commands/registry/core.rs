@@ -56,6 +56,16 @@ commands! {
         CommandResult::Status
     }
 
+    // TaystJK's Sys_Init registers this as a local, no-argument input reset.
+    cmd_in_restart ["in_restart", ] ("in_restart", "Restart input state and reacquire native mouse capture without restarting the renderer or connection.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("^3usage:^7 in_restart".to_owned());
+        } else {
+            self.restart_input_subsystem();
+        }
+        CommandResult::Handled
+    }
+
     cmd_snd_restart ["snd_restart", ] ("snd_restart", "Restart the sound subsystem and apply current audio settings.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -272,19 +282,81 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_fs_refresh ["fs_refresh", ] ("fs_refresh", "Re-scan the active base/fs_game VFS and retry assets that previously failed without restarting CGame.", CommandScope::Always) |self, command| {
-        let words: Vec<_> = command.split_whitespace().collect();
-        match words.as_slice() {
-            [_verb] => {
-                self.refresh_filesystem();
-                CommandResult::Handled
-            }
-            [_verb, ..] => {
-                self.push_console_line("^3usage:^7 fs_refresh".to_owned());
-                CommandResult::Handled
-            }
-            _ => return CommandResult::Unhandled,
+    cmd_path ["path", "fs_path"] ("path", "Show the active VFS mount priority, writable location, and configured filesystem roots.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("^3usage:^7 path");
+            return CommandResult::Handled;
         }
+        let effective = jka_assets::pk3::configured_filesystem_roots(&self.base);
+        self.push_console_line(format!("^2FS:^7 basepath = {}", self.base.parent().unwrap_or(&self.base).display()));
+        self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(portable)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 cdpath = {}", effective.cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
+        self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));
+        for (i, dir) in jka_assets::pk3::filesystem_search_dirs(&self.base, self.game.as_deref(), &effective).iter().enumerate() {
+            self.push_console_line(format!("^5FS:^7 {:>2}. {}", i + 1, dir.display()));
+        }
+        if self.fs_roots != effective {
+            self.push_console_line("^3FS:^7 pending path changes; restart to apply");
+        }
+        CommandResult::Handled
+    }
+
+    cmd_which ["which", ] ("which <qpath> [all]", "Locate the winning file in an active PK3 or loose directory (TaystJK /which). Optional all lists shadowed files too.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let args = match words.as_slice() {
+            [_, path] => Some((*path, false)),
+            [_, path, all] if all.eq_ignore_ascii_case("all") => Some((*path, true)),
+            _ => None,
+        };
+        let Some((path, show_all)) = args else {
+            self.push_console_line("^3usage:^7 which <qpath> [all]");
+            return CommandResult::Handled;
+        };
+        let path = path.trim_start_matches(|c| c == '/' || c == '\\').replace('\\', "/");
+        match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+            Ok(mut assets) => {
+                // Match the actual game's asset-override setting, rather
+                // than always claiming the highest-priority PK3 won.
+                assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+                let providers = assets.indexed_providers(&path);
+                if providers.is_empty() {
+                    self.push_console_line(format!("^3File not found:^7 \"{path}\""));
+                } else {
+                    for provider in providers.iter().filter(|info| show_all || info.selected) {
+                        let label = if provider.selected { "^2active" } else { "^3shadowed" };
+                        if provider.archive {
+                            self.push_console_line(format!("^7File \"{path}\" found in \"{}\" ({label}^7)", provider.source.display()));
+                        } else {
+                            self.push_console_line(format!("^7File \"{path}\" found at \"{}\" ({label}^7, loose)", provider.source.display()));
+                        }
+                    }
+                    if show_all { self.push_console_line(format!("^7{} provider(s) found", providers.len())); }
+                }
+            }
+            Err(error) => self.push_console_error(format!("^1which:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_fs_restart ["fs_restart", ] ("fs_restart", "Re-scan the active base/fs_game VFS and retry previously failed assets without clearing successful registrations.", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => self.restart_filesystem(),
+            _ => self.push_console_line("^3usage:^7 fs_restart".to_owned()),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_fs_rebuild ["fs_rebuild", ] ("fs_rebuild", "Full PK3/filesystem rebuild: discard CGame asset caches and restart the renderer/world without disconnecting.", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => {
+                if let Err(error) = self.rebuild_filesystem() {
+                    self.push_console_line(format!("^1FS_REBUILD:^7 {error}"));
+                }
+            }
+            _ => self.push_console_line("^3usage:^7 fs_rebuild".to_owned()),
+        }
+        CommandResult::Handled
     }
 
     cmd_exec ["exec", "execq"] ("exec <filename>", "Execute a .cfg script through the active fs_game/base VFS.", CommandScope::Always) |self, command| {

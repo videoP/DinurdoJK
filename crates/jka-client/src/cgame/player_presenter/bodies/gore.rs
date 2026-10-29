@@ -219,11 +219,12 @@ impl PlayerPresenter {
                     lighting_origin: body.lighting_origin,
                     rt_rigid: None,
                     rt_skinned_key: None,
-                    ghoul2_gpu: Some(Ghoul2GpuSkinning {
+                    ghoul2_gpu: Some(Ghoul2GpuSkinning { foliage_wind: false,
                         mesh_key: Arc::clone(&surface.key),
                         vertices: Arc::clone(&surface.vertices),
                         indices: Arc::clone(&surface.indices),
                         bones: Arc::clone(&skin.bones),
+                        heat_bone: skin.heat_bone,
                         axis: skin.axis,
                         origin: skin.origin,
                         color,

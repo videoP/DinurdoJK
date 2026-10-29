@@ -48,7 +48,7 @@ impl App {
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
                 if filesystem_refresh_icon(ui) {
-                    self.refresh_filesystem();
+                    self.restart_filesystem();
                     self.egui_repaint_requested = true;
                 }
             },

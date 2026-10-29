@@ -40,7 +40,9 @@ impl VoteUi {
 /// Turn a `voteString` into the label and argument `CG_DrawVote` shows.
 pub fn describe(vote_string: &str) -> (String, Option<String>) {
     let starts = |prefix: &str| {
-        vote_string.len() >= prefix.len() && vote_string[..prefix.len()].eq_ignore_ascii_case(prefix)
+        vote_string
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     };
     if starts("map_restart") {
         ("Restart Map".into(), None)
@@ -166,6 +168,33 @@ mod tests {
         assert_eq!(describe("vstr nextmap"), ("Next Map".into(), None));
         assert_eq!(describe("g_doWarmup 1"), ("Warmup".into(), None));
         assert_eq!(describe("poll Best map?"), ("poll Best map?".into(), None));
+    }
+
+    #[test]
+    fn descriptions_preserve_unicode_arguments() {
+        assert_eq!(describe("KiCk Padawän"), ("Kick Player".into(), Some("Padawän".into())));
+        assert_eq!(describe("MaP mp/ärena"), ("New Map".into(), Some("mp/ärena".into())));
+        assert_eq!(describe("G_GAMETYPE Duël"), ("Game Type".into(), Some("Duël".into())));
+    }
+
+    #[test]
+    fn custom_votes_allow_unicode_at_every_prefix_boundary() {
+        // Command checks must not slice through two-, three-, or four-byte characters.
+        for character in ['ä', '界', '😀'] {
+            for offset in 0..=11 {
+                let text = format!("{}{character} vote?", "x".repeat(offset));
+                assert_eq!(describe(&text), (text.clone(), None), "vote: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_votes_reach_the_hud() {
+        let vote = read(strings(&[(8, "1000"), (9, "kick Padawän"), (10, "2"), (11, "1")]), 2000).unwrap();
+        assert_eq!(vote.hud_line(), "^7Vote(29):<Kick Player Padawän^7> Yes:2 No:1");
+
+        let vote = read(strings(&[(8, "1000"), (9, "poll Ist ä gut?")]), 2000).unwrap();
+        assert_eq!(vote.hud_line(), "^7Vote(29):<poll Ist ä gut?^7> Yes:0 No:0");
     }
 
     #[test]

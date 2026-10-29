@@ -81,9 +81,13 @@ impl PlayerPresenter {
         self.team_power.clear();
         self.body_fade.clear();
         self.mind_trick_fades.clear();
+        self.cloak_states.clear();
+        self.force_refractions.clear();
         self.gore.clear();
         self.pending_gore.clear();
         self.last_gpu.clear();
+        self.studio_bones.clear();
+        self.studio_saber_tips.clear();
         self.vehicle_snaps.clear();
         self.vehicle_animations.clear();
         self.profile_bone_smooth_history = None;
@@ -221,8 +225,16 @@ impl PlayerPresenter {
             perf: Ghoul2PerfStats::default(),
             viewer_client: -1,
             viewer_foot_bolts: None,
+            studio_bone_masks:HashMap::new(),studio_bones:HashMap::new(),
+            studio_saber_clients:Vec::new(),studio_saber_tips:HashMap::new(),studio_fpls:false,
             viewer_anim_debug: None,
             viewer_dueling: false,
+            viewer_force_see: false,
+            cloak_states: HashMap::new(),
+            force_refractions: HashMap::new(),
+            force_sight_level: 0,
+            force_sight_team: 0,
+            force_sight_gametype: 0,
             japro: crate::japro_cg::JaproCgame::default(),
             viewer_style: crate::japro_cg::StyleViewer::default(),
             mind_trick_fades: HashMap::new(),
@@ -259,6 +271,7 @@ impl PlayerPresenter {
             jiggle: super::AsyncJiggleSystem::default(),
             preview_source_jiggles: HashMap::new(),
             jiggle_sex_filter: 0,
+            hair_physics_mode: 2,
             jiggle_remesh: JiggleRemeshTuning::default(),
             cloth: super::AsyncClothSystem::default(),
             cloth_weather_wind: None,
@@ -292,6 +305,7 @@ impl PlayerPresenter {
             rt_shadow_casters_enabled: false,
             collision_world: None,
             blob_shadow_opacity: 0.0,
+            blob_shadow_contact: false,
             blob_shadow_instances: Vec::new(),
             blob_shadow_texture: None,
             blob_shadow_alpha_mode: DynamicModelAlphaMode::BlendUnlit,
@@ -301,6 +315,7 @@ impl PlayerPresenter {
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             ghoul2_anim_smooth: 0.3,
             profile_bone_smooth_history: None,
+            studio_pose_blend: None,
             view_weapon_frame: 0,
             view_weapon_frame_time: 0,
             skinning_pool,

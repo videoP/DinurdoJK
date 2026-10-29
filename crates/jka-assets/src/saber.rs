@@ -11,7 +11,7 @@ use crate::{animation::animation_index, pk3::AssetSearchPath};
 
 const SABER_DIRECTORY: &str = "ext_data/sabers/";
 const SABER_EXTENSION: &str = ".sab";
-const MAX_SABER_DATA_SIZE: usize = 0x80000;
+const MAX_SABER_DATA_SIZE: usize = 1024 * 1024; // TaystJK bg_saberLoad.c
 const MAX_SABER_BLADES: usize = 8;
 const DEFAULT_SABER_MODEL: &str = "models/weapons2/saber_reborn/saber_w.glm";
 /// OpenJK DEFAULT_SABER (bg_public.h).
@@ -150,6 +150,11 @@ pub struct SaberDefinition {
     pub no_wall_marks2: bool,
     /// OpenJK SFL2_NO_DLIGHT equivalent (`noDlight` in .sab files).
     pub no_dlight: bool,
+    /// TaystJK bg_saberLoad.c: SFL2_NO_DLIGHT2 / SFL2_NO_BLADE[2].
+    /// Style 2 applies from bladeStyle2Start (nonzero) in UI_SaberShouldDrawBlade.
+    pub no_dlight2: bool,
+    pub no_blade: bool,
+    pub no_blade2: bool,
     /// OpenJK saberInfo_t gameplay fields consumed by shared BG/Pmove.
     pub move_speed_scale: f32,
     pub anim_speed_scale: f32,
@@ -159,6 +164,13 @@ pub struct SaberDefinition {
     pub ready_anim: i32,
     pub draw_anim: i32,
     pub putaway_anim: i32,
+    /// Saber-specific emotes, interpreted by TaystJK's game module when the
+    /// player issues the corresponding emote command. -1 means no override.
+    pub taunt_anim: i32,
+    pub bow_anim: i32,
+    pub meditate_anim: i32,
+    pub flourish_anim: i32,
+    pub gloat_anim: i32,
     /// `singleBladeStyle`: the stance used while only the first blade is lit
     /// (`SS_NONE` when the saber does not override it).
     pub single_blade_style: i32,
@@ -213,6 +225,9 @@ impl SaberDefinition {
             no_wall_marks: false,
             no_wall_marks2: false,
             no_dlight: false,
+            no_dlight2: false,
+            no_blade: false,
+            no_blade2: false,
             move_speed_scale: 1.0,
             anim_speed_scale: 1.0,
             styles_learned: 0,
@@ -221,6 +236,11 @@ impl SaberDefinition {
             ready_anim: -1,
             draw_anim: -1,
             putaway_anim: -1,
+            taunt_anim: -1,
+            bow_anim: -1,
+            meditate_anim: -1,
+            flourish_anim: -1,
+            gloat_anim: -1,
             single_blade_style: SS_NONE,
             no_manual_deactivate: false,
             no_manual_deactivate2: false,
@@ -244,6 +264,19 @@ impl SaberDefinition {
             no_clash_flare: false,
             no_clash_flare2: false,
         }
+    }
+
+    /// TaystJK UI_SaberShouldDrawBlade / WP_SaberBladeUseSecondBladeStyle.
+    pub fn blade_uses_second_style(&self, index: usize) -> bool {
+        self.blade_style2_start != 0 && index >= self.blade_style2_start
+    }
+
+    pub fn blade_hidden(&self, index: usize) -> bool {
+        if self.blade_uses_second_style(index) { self.no_blade2 } else { self.no_blade }
+    }
+
+    pub fn blade_no_dlight(&self, index: usize) -> bool {
+        if self.blade_uses_second_style(index) { self.no_dlight2 } else { self.no_dlight }
     }
 
     pub fn blade(&self, index: usize) -> SaberBladeDefinition {
@@ -411,10 +444,11 @@ fn parse_saber_file(
 
         let mut anim_speed_scale = 1.0f32;
         let mut definition = SaberDefinition::openjk_default(name.clone());
-        let mut common_length: Option<f32> = None;
-        let mut common_radius: Option<f32> = None;
-        let mut indexed_lengths: [Option<f32>; MAX_SABER_BLADES] = [None; MAX_SABER_BLADES];
-        let mut indexed_radii: [Option<f32>; MAX_SABER_BLADES] = [None; MAX_SABER_BLADES];
+        // TaystJK applies the common and indexed keys immediately, in file
+        // order. An unnumbered key overwrites all MAX_BLADES, including those
+        // whose indexed key appeared earlier.
+        let mut lengths = [SaberBladeDefinition::default().length; MAX_SABER_BLADES];
+        let mut radii = [SaberBladeDefinition::default().radius; MAX_SABER_BLADES];
         // Saber_ParseSaberColor* apply in file order: the plain key sets every
         // blade, saberColorN one blade.
         let mut colors = [SABER_RED; MAX_SABER_BLADES];
@@ -447,7 +481,7 @@ fn parse_saber_file(
                         }
                     }
                 }
-                "readyanim" | "drawanim" | "putawayanim" => {
+                "readyanim" | "drawanim" | "putawayanim" | "tauntanim" | "bowanim" | "meditateanim" | "flourishanim" | "gloatanim" => {
                     if let Some(value) = parser.token(false)? {
                         if let Some(index) = animation_index(&value) {
                             let index = index as i32;
@@ -455,6 +489,11 @@ fn parse_saber_file(
                                 "readyanim" => definition.ready_anim = index,
                                 "drawanim" => definition.draw_anim = index,
                                 "putawayanim" => definition.putaway_anim = index,
+                                "tauntanim" => definition.taunt_anim = index,
+                                "bowanim" => definition.bow_anim = index,
+                                "meditateanim" => definition.meditate_anim = index,
+                                "flourishanim" => definition.flourish_anim = index,
+                                "gloatanim" => definition.gloat_anim = index,
                                 _ => unreachable!(),
                             }
                         }
@@ -604,9 +643,19 @@ fn parse_saber_file(
                         }
                     }
                 }
-                "nodlight" => {
+                "nodlight" | "nodlight2" | "noblade" | "noblade2" => {
                     if let Some(value) = parser.token(false)? {
-                        definition.no_dlight = matches!(value.parse::<i32>(), Ok(value) if value != 0);
+                        // TaystJK Saber_ParseNoBlade/NoDLight set flag bits
+                        // on nonzero; subsequent zeroes do NOT clear them.
+                        if matches!(value.parse::<i32>(), Ok(value) if value != 0) {
+                            match lower.as_str() {
+                                "nodlight" => definition.no_dlight = true,
+                                "nodlight2" => definition.no_dlight2 = true,
+                                "noblade" => definition.no_blade = true,
+                                "noblade2" => definition.no_blade2 = true,
+                                _ => unreachable!(),
+                            }
+                        }
                     }
                 }
                 "soundon" | "soundoff" => {
@@ -713,18 +762,18 @@ fn parse_saber_file(
                     }
                 }
                 "saberlength" => {
-                    common_length = parser
-                        .token(false)?
+                    if let Some(length) = parser.token(false)?
                         .and_then(|value| value.parse::<f32>().ok())
-                        .filter(|value| value.is_finite())
-                        .map(|value| value.max(4.0));
+                        .filter(|value| value.is_finite()) {
+                        lengths.fill(length.max(4.0));
+                    }
                 }
                 "saberradius" => {
-                    common_radius = parser
-                        .token(false)?
+                    if let Some(radius) = parser.token(false)?
                         .and_then(|value| value.parse::<f32>().ok())
-                        .filter(|value| value.is_finite())
-                        .map(|value| value.max(0.25));
+                        .filter(|value| value.is_finite()) {
+                        radii.fill(radius.max(0.25));
+                    }
                 }
                 "sabercolor" => {
                     if let Some(value) = parser.token(false)? {
@@ -745,11 +794,11 @@ fn parse_saber_file(
                 _ if lower.starts_with("saberlength") => {
                     if let Ok(index) = lower["saberlength".len()..].parse::<usize>() {
                         if (1..=MAX_SABER_BLADES).contains(&index) {
-                            indexed_lengths[index - 1] = parser
-                                .token(false)?
+                            if let Some(length) = parser.token(false)?
                                 .and_then(|value| value.parse::<f32>().ok())
-                                .filter(|value| value.is_finite())
-                                .map(|value| value.max(4.0));
+                                .filter(|value| value.is_finite()) {
+                                lengths[index - 1] = length.max(4.0);
+                            }
                             continue;
                         }
                     }
@@ -758,11 +807,11 @@ fn parse_saber_file(
                 _ if lower.starts_with("saberradius") => {
                     if let Ok(index) = lower["saberradius".len()..].parse::<usize>() {
                         if (1..=MAX_SABER_BLADES).contains(&index) {
-                            indexed_radii[index - 1] = parser
-                                .token(false)?
+                            if let Some(radius) = parser.token(false)?
                                 .and_then(|value| value.parse::<f32>().ok())
-                                .filter(|value| value.is_finite())
-                                .map(|value| value.max(0.25));
+                                .filter(|value| value.is_finite()) {
+                                radii[index - 1] = radius.max(0.25);
+                            }
                             continue;
                         }
                     }
@@ -774,12 +823,8 @@ fn parse_saber_file(
 
         definition.blades = (0..definition.num_blades)
             .map(|index| SaberBladeDefinition {
-                length: indexed_lengths[index]
-                    .or(common_length)
-                    .unwrap_or_else(|| SaberBladeDefinition::default().length),
-                radius: indexed_radii[index]
-                    .or(common_radius)
-                    .unwrap_or_else(|| SaberBladeDefinition::default().radius),
+                length: lengths[index],
+                radius: radii[index],
                 color: colors[index],
             })
             .collect();
@@ -940,6 +985,59 @@ mod tests {
         let plain = &defs["plain_1"];
         assert_eq!(plain.single_blade_style, SS_NONE);
         assert!(!plain.no_manual_deactivate && !plain.no_manual_deactivate2);
+    }
+
+    #[test]
+    fn taystjk_blade_style_visibility_lighting_and_all_forced_animations() {
+        let mut scales = BTreeMap::new();
+        let mut defs = BTreeMap::new();
+        parse_saber_file(br#"
+            staff_fx {
+                numBlades 3
+                bladeStyle2Start 1
+                noBlade 1
+                noDlight 1
+                noBlade 0 // TaystJK uses flag OR, zero never clears
+                noBlade2 0
+                noDlight2 1
+                tauntAnim BOTH_STAND2
+                bowAnim BOTH_STAND1
+                meditateAnim BOTH_SABERFAST_STANCE
+                flourishAnim BOTH_STAND2
+                gloatAnim BOTH_STAND1
+                saberLength2 41
+                saberLength 39 // overrides the earlier indexed key
+                saberRadius 3
+                saberRadius2 4
+            }
+            secondary_only {
+                numBlades 2
+                bladeStyle2Start 1
+                noBlade2 1
+                noDlight2 1
+            }
+        "#, &mut scales, &mut defs).unwrap();
+        let staff = &defs["staff_fx"];
+        assert!(staff.blade_hidden(0));
+        assert!(!staff.blade_hidden(1));
+        assert!(staff.blade_no_dlight(0));
+        assert!(staff.blade_no_dlight(1));
+        assert_eq!(staff.blade(1).length, 39.0);
+        assert_eq!(staff.blade(1).radius, 4.0);
+        for (actual, expected) in [
+            (staff.taunt_anim, "BOTH_STAND2"),
+            (staff.bow_anim, "BOTH_STAND1"),
+            (staff.meditate_anim, "BOTH_SABERFAST_STANCE"),
+            (staff.flourish_anim, "BOTH_STAND2"),
+            (staff.gloat_anim, "BOTH_STAND1"),
+        ] {
+            assert_eq!(actual, animation_index(expected).unwrap() as i32);
+        }
+        let secondary = &defs["secondary_only"];
+        assert!(!secondary.blade_hidden(0));
+        assert!(secondary.blade_hidden(1));
+        assert!(!secondary.blade_no_dlight(0));
+        assert!(secondary.blade_no_dlight(1));
     }
 
     #[test]

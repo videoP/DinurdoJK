@@ -3,7 +3,7 @@ use crate::renderer::{
     auto_detail_fallback_index, create_fast_world_wireframe_pipeline, create_wireframe_pipeline,
     create_world_pipeline_variant_from_plan, create_world_wireframe_pipeline, pipeline_hash,
     required_auto_detail_indices, try_load_texture_asset_from_search_path, ui, upload_texture,
-    wireframe_cull_slot, AssetSearchPath, CullDebugMode, CullMode, DrawClass, DynamicLightsMode, DynamicShadowsMode, FootprintMode,
+    wireframe_cull_slot, AssetSearchPath, CullDebugMode, CullMode, DrawClass, DynamicLightsMode, FootprintMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
     WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldPipelineVariant,
@@ -511,7 +511,7 @@ impl Renderer {
             self.baked_brightness
                 .set_target(self.baked_brightness.enabled, gamma);
         }
-        if (self.gamma_method != crate::gamma::GammaMethod::Hardware && !self.baked_brightness.enabled)
+        if (!self.gamma_method.is_hardware() && !self.baked_brightness.enabled)
             || self.output_gamma() != output_gamma {
             self.refresh_output_gamma();
         }
@@ -628,8 +628,8 @@ impl Renderer {
     /// cannot apply these controls, even when every other effect is disabled.
     pub(in crate::renderer) fn baked_lighting_shader_needed(&self) -> bool {
         // Worker readiness is a uniform/binding change, never a shader variant.
-        (self.baked_sun_cache && self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMaps)
-            || self.baked_local_lights || self.baked_local_shadows ||
+        (self.baked_sun_cache && self.cascaded_shadow_mode.is_csm())
+            || self.added_map_light_sources() != 0 || self.baked_local_shadows ||
         (self.baked_indirect_scale - 1.0).abs() > 0.0001
             || (self.baked_indirect_saturation - 1.0).abs() > 0.0001
             || (self.baked_indirect_power - 1.0).abs() > 0.0001

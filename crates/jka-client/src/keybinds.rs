@@ -113,6 +113,7 @@ pub const JAPRO_CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "THROW FLAG", command: "throwflag", group: "jaPRO" },
     ControlAction { label: "FULL FORCE CHALLENGE", command: "engage_fullforceduel", group: "jaPRO" },
     ControlAction { label: "GUN CHALLENGE", command: "engage_gunduel", group: "jaPRO" },
+    ControlAction { label: "TELEMARK GUI", command: "amtelegui", group: "jaPRO" },
     ControlAction { label: "TELEPORT MARK", command: "amTeleMark", group: "jaPRO" },
     ControlAction { label: "TELEPORT", command: "amTele", group: "jaPRO" },
     ControlAction { label: "FLIPKICK", command: "flipkick", group: "jaPRO" },

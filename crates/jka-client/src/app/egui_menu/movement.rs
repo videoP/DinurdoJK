@@ -39,6 +39,47 @@ impl App {
                         }
                     },
                 );
+                theme::row(
+                    ui,
+                    "Command window",
+                    "cl_commandsize. TaystJK-compatible command history for prediction, packet selection and CONNECTION INTERRUPTED. AUTO considers movement rate and ping (at least 64). Manual values: 64, 128, 256 or 512. Does not change packet cadence.",
+                    theme::Reset::MovementCommandSize,
+                    |ui| {
+                        let configured = self.japro_cg.lagometer.command_size;
+                        let ping = self.net.as_ref().map(|net| net.session().ping());
+                        let effective = self.japro_cg.lagometer.effective_command_backup(
+                            self.network.command_rate, ping,
+                        );
+                        let mut automatic = configured == crate::lagometer::AUTO_COMMAND_SIZE;
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(automatic, "AUTO").clicked() && !automatic {
+                                let _ = self.set_console_cvar("cl_commandsize", "auto");
+                                automatic = true;
+                            }
+                            if ui.selectable_label(!automatic, "Manual").clicked() && automatic {
+                                // Switching to manual starts at the current effective value.
+                                let _ = self.set_console_cvar("cl_commandsize", &effective.to_string());
+                                automatic = false;
+                            }
+                            if automatic {
+                                let window_ms = effective as f32 * 1000.0 / self.network.command_rate.max(15) as f32;
+                                ui.label(format!("{effective} cmds (~{window_ms:.0} ms)"));
+                            } else {
+                                let size = if configured == crate::lagometer::AUTO_COMMAND_SIZE {
+                                    effective
+                                } else {
+                                    configured
+                                };
+                                let mut notch = (size as u32).ilog2().clamp(6, 9);
+                                if ui.add(egui::Slider::new(&mut notch, 6..=9).show_value(false)).changed() {
+                                    let value = 1_u32 << notch;
+                                    let _ = self.set_console_cvar("cl_commandsize", &value.to_string());
+                                }
+                                ui.label(format!("{} cmds", 1_u32 << notch));
+                            }
+                        });
+                    },
+                );
 
                 self.egui_mod_movement_settings(ui);
             });

@@ -256,6 +256,53 @@ fn radial_depth(world_position: vec3<f32>) -> f32 {
     return distance(world_position, camera.camera_pos_time.xyz);
 }
 
+// Only the thermal-specific prepass PSOs call this classifier.  The regular
+// prepass retains roughness in policy.b for SSR and does no thermal work.
+fn thermal_world_material() -> f32 {
+    let kind = (material.header.w >> 8u) & 31u;
+    var heat = 0.15; // unknown concrete/stone
+    switch (kind) {
+        case 1u, 2u: { heat = 0.24; }  // wood
+        case 3u, 4u: { heat = 0.19; }  // metal: variable with heating, not automatically hot
+        case 5u, 6u: { heat = 0.11; }  // grass / vegetation
+        case 7u: { heat = 0.22; }      // dirt
+        case 8u: { heat = 0.30; }      // sand
+        case 9u: { heat = 0.20; }      // gravel
+        case 10u: { heat = 0.07; }     // glass
+        case 14u: { heat = 0.025; }   // snow
+        case 17u: { heat = 0.13; }    // mud
+        case 21u, 22u: { heat = 0.22; } // fabric/canvas
+        case 24u, 25u: { heat = 0.23; } // rubber/plastic
+        case 27u: { heat = 0.18; }    // carpet
+        default: {}
+    }
+    if ((material.header.w & (1u << 17u)) != 0u) {
+        heat = 0.065; // JKA glass material override
+    }
+    if ((material.header.z & 65536u) != 0u) {
+        heat = 0.055; // promoted JKA water stage
+    }
+    // An additive or glow stage does NOT heat its entire parent material:
+    // landing pads, consoles and similar shaders have a cool opaque base and
+    // small animated emissive overlays. Those stages are replayed at their
+    // authored UVs/rgbGen/blend into the thermal-only glow capture and sampled
+    // per pixel in thermal_glow_heat (post.wgsl). Giving the base draw a heat
+    // floor here would falsely heat the entire surface.
+    // q3map_surfacelight is an explicit authored whole-surface emitter.
+    if ((material.header.w & (1u << 5u)) != 0u) {
+        heat = max(heat, 0.76);
+    }
+    // Authored surfaceparm lava and compiled CONTENTS_LAVA take priority over
+    // generic water, glass and material hints, including emissive stage flags.
+    if ((material.header.w & (1u << 3u)) != 0u) { return 0.80; }
+    // BSP shader emission and stage glow are explicit hints; only the
+    // active-only depth variant reads them. This is not a true heat source.
+    if ((material.header.z & 256u) != 0u) {
+        heat = max(heat, 0.72);
+    }
+    return heat;
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> FragmentOut {
     var out: FragmentOut;
@@ -269,6 +316,23 @@ fn fs_main(input: VertexOut) -> FragmentOut {
         out.motion_vector = bevy_motion_vector(input.world_position);
     }
     out.reflection_policy = reflection_policy(input.world_position);
+    return out;
+}
+
+@fragment
+fn fs_thermal(input: VertexOut) -> FragmentOut {
+    var out: FragmentOut;
+    out.linear_depth = radial_depth(input.world_position);
+    // SSR, fog, AO and depth consumers do not need Bevy motion vectors.
+    // Only TAA samples this attachment. Avoid two extra 4x4 matrix transforms
+    // per BSP pixel when TAA is off (the attachment remains bound for the
+    // other prepass consumers; full MRT specialization can follow separately).
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
+    out.reflection_policy = reflection_policy(input.world_position);
+    out.reflection_policy.b = thermal_world_material();
     return out;
 }
 
@@ -289,6 +353,27 @@ fn fs_mask(input: MaskVertexOut) -> FragmentOut {
         out.motion_vector = bevy_motion_vector(input.world_position);
     }
     out.reflection_policy = reflection_policy(input.world_position);
+    return out;
+}
+
+@fragment
+fn fs_thermal_mask(input: MaskVertexOut) -> FragmentOut {
+    let alpha = textureSample(base_texture, base_sampler, input.uv).a * input.alpha_multiplier;
+    if ((material.params.x > 0.0 && alpha < material.params.x || material.params.x < 0.0 && alpha >= -material.params.x)) {
+        discard;
+    }
+    var out: FragmentOut;
+    out.linear_depth = radial_depth(input.world_position);
+    // SSR, fog, AO and depth consumers do not need Bevy motion vectors.
+    // Only TAA samples this attachment. Avoid two extra 4x4 matrix transforms
+    // per BSP pixel when TAA is off (the attachment remains bound for the
+    // other prepass consumers; full MRT specialization can follow separately).
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
+    out.reflection_policy = reflection_policy(input.world_position);
+    out.reflection_policy.b = thermal_world_material();
     return out;
 }
 

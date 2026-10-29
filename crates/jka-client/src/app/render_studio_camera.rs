@@ -107,7 +107,10 @@ impl StudioCameraRig {
                 }
             }
         }
-        base
+        if base.focus_target.is_none() && self.target.enabled {
+            if let Some(target)=target {base.lens.focus_distance=glam::Vec3::from_array(base.position).distance(glam::Vec3::from_array(target)).clamp(1.0,65536.0);}
+        }
+        base.resolve_focus_target();base
     }
     pub fn position_point(&self,base:StudioCameraKey,frame:ProfileAttachmentFrame)->[f32;3] {
         let mut binding=self.position.clone();
@@ -224,15 +227,34 @@ impl App {
         info.model_name=staged.model_name;info.skin_name=staged.skin_name;
         info.female=self.network.sex.as_bytes().first().is_some_and(|b|b.eq_ignore_ascii_case(&b'f'));
         info.saber_name=self.network.saber1.clone();info.saber2_name=self.network.saber2.clone();
+        self.render_studio.apply_actor_sabers(lane,&mut info);
         info
+    }
+
+    pub(in crate::app) fn studio_profile_sabers(&self) -> super::render_studio_timeline::StudioSabers {
+        super::render_studio_timeline::StudioSabers {
+            enabled: self.render_studio.with_sabers,
+            names: [self.network.saber1.clone(), self.network.saber2.clone()],
+            colors: [crate::cgame::resolve_saber_color(i32::from(self.network.color1),self.network.sb_rgb1 as i32,true),
+                crate::cgame::resolve_saber_color(i32::from(self.network.color2),self.network.sb_rgb2 as i32,true)],
+        }
+    }
+
+    pub(in crate::app) fn set_studio_actor_sabers_enabled(&mut self,lane:usize,enabled:bool) {
+        let mut sabers=self.render_studio.timeline.lane_sabers.get(lane).and_then(Option::as_ref)
+            .cloned().unwrap_or_else(||self.studio_profile_sabers());
+        sabers.enabled=enabled;
+        self.render_studio.timeline.lane_sabers.resize(self.render_studio.timeline.lanes,None);
+        if let Some(slot)=self.render_studio.timeline.lane_sabers.get_mut(lane) {*slot=Some(sabers);}
+        self.profile_preview_key=None;
     }
 
     pub(in crate::app) fn studio_attachment_frame(&mut self,binding:&StudioCameraAttachment,time:f64)
         ->Result<ProfileAttachmentFrame,String> {
         let clip=self.render_studio.timeline.clip_at_lane(time,binding.lane)
             .ok_or_else(||"No active clip on this character layer".to_owned())?;
-        if binding.part.saber().is_some() && !self.render_studio.with_sabers {
-            return Err("Enable Attach selected sabers on a character clip".into());
+        if binding.part.saber().is_some() && !self.render_studio.actor_with_sabers(binding.lane) {
+            return Err("Enable Sabers on this character track".into());
         }
         let motion=clip.motion_at(time,self.render_studio.timeline.interpolation!=StudioInterpolation::Linear);
         let name=clip.name.clone();let emote=clip.preview(time);

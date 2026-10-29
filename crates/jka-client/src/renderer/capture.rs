@@ -21,7 +21,7 @@ pub(in crate::renderer) enum ScreenshotDestination {
     FrontendScene { path: PathBuf, neutral_gamma: f32, captured_gamma: f32, is_neutral: bool, surface_is_srgb: bool },
     // None: HDR compositor already resolved straight sRGB. Some: resolve on
     // readback, with the bool indicating whether the source surface is sRGB.
-    VideoFrame { frame_index: u64, depth: bool, alpha: bool, sdr_unpremultiply: Option<bool> },
+    VideoFrame { frame_index: u64, depth: bool, alpha: bool, sdr_unpremultiply: Option<bool>, received: Instant },
 }
 
 pub(in crate::renderer) struct ScreenshotReadback {
@@ -46,6 +46,22 @@ pub(in crate::renderer) enum ScreenshotPixelFormat {
     Rgba,
 }
 
+/// Drop row padding (and swizzle RGBA) into a tight BGRA8 / 4-byte-texel image.
+pub(in crate::renderer) fn tight_bgra(src: &[u8], row_bytes: usize, padded: usize, height: usize,
+    format: ScreenshotPixelFormat) -> Vec<u8> {
+    let mut out = crate::runtime::take_video_frame_buffer(row_bytes * height);
+    for y in 0..height {
+        let row = &src[y * padded..y * padded + row_bytes];
+        match format {
+            ScreenshotPixelFormat::Bgra => out.extend_from_slice(row),
+            ScreenshotPixelFormat::Rgba => for px in row.chunks_exact(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            },
+        }
+    }
+    out
+}
+
 pub(in crate::renderer) struct ScreenshotEncodeJob {
     pub(in crate::renderer) pixels: Vec<u8>,
     pub(in crate::renderer) depth_pixels: Option<Vec<u8>>,
@@ -62,6 +78,10 @@ pub(in crate::renderer) struct ScreenshotEncodeJob {
     pub(in crate::renderer) inline_copy: bool,
     pub(in crate::renderer) reused_buffer: bool,
     pub(in crate::renderer) started: Instant,
+    /// Frame presented / readback mapping requested.
+    pub(in crate::renderer) presented: Instant,
+    /// Sent to the encode worker.
+    pub(in crate::renderer) queued: Instant,
 }
 
 #[cfg(windows)]
@@ -359,7 +379,8 @@ pub(in crate::renderer) fn encode_screenshot_job(
             std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
             Ok(ScreenshotOutput::FrontendSceneSaved(path))
         }
-        ScreenshotDestination::VideoFrame { frame_index, alpha, sdr_unpremultiply, .. } => {
+        ScreenshotDestination::VideoFrame { frame_index, alpha, sdr_unpremultiply, received, .. } => {
+            let worker_started = Instant::now();
             let row_bytes = job.width as usize * 4;
             let padded = job.padded_bytes_per_row as usize;
             let mut bgra = Vec::with_capacity(row_bytes * job.height as usize);
@@ -384,12 +405,18 @@ pub(in crate::renderer) fn encode_screenshot_job(
                 }
                 depth
             });
+            let timing = crate::runtime::VideoFrameTiming {
+                received, frame_started: job.started, presented: job.presented,
+                gpu_wait_ms: job.gpu_wait_ms, readback_copy_ms: job.readback_copy_ms,
+                queued: job.queued, worker_started, worker_done: Instant::now(),
+            };
             Ok(ScreenshotOutput::VideoFrame {
                 frame_index,
                 width: job.width,
                 height: job.height,
                 bgra,
                 depth_f32le,
+                timing,
             })
         }
         ScreenshotDestination::Clipboard => {
@@ -488,12 +515,12 @@ impl Renderer {
     pub(in crate::renderer) fn request_video_frame_capture(&mut self, frame_index: u64, depth: bool, alpha: bool) {
         let sdr_unpremultiply = self.hdr_output.is_none().then_some(self.config.format.is_srgb());
         self.request_screenshot_capture(ScreenshotDestination::VideoFrame {
-            frame_index, depth, alpha, sdr_unpremultiply,
+            frame_index, depth, alpha, sdr_unpremultiply, received: Instant::now(),
         });
     }
 
     pub(in crate::renderer) fn video_depth_capture_requested(&self) -> bool {
-        matches!(
+        self.scene_depth_capture || matches!(
             self.screenshot_requested.as_ref(),
             Some(ScreenshotDestination::VideoFrame { depth: true, .. })
         )
@@ -515,23 +542,46 @@ impl Renderer {
     pub(in crate::renderer) fn take_screenshot_result(
         &mut self,
     ) -> Option<Result<ScreenshotOutput, String>> {
-        self.screenshot_result
-            .take()
+        // Export frames first: they are queued in frame order.
+        self.studio_capture_results.pop_front()
+            .or_else(|| self.screenshot_result.take())
             .or_else(|| self.screenshot_worker_rx.try_recv().ok())
     }
 
     pub(in crate::renderer) fn prepare_screenshot_readback(
         &mut self,
     ) -> Option<ScreenshotReadback> {
+        let format = self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb);
+        self.prepare_screenshot_readback_at(self.config.width.max(1), self.config.height.max(1), format)
+    }
+
+    /// Readback of an arbitrary `width`x`height` source texture (the offscreen
+    /// Render Studio export composite), rather than the swapchain.
+    pub(in crate::renderer) fn prepare_screenshot_readback_at(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Option<ScreenshotReadback> {
         let destination = self.screenshot_requested.take()?;
+        self.prepare_readback_for(destination, width, height, format)
+    }
+
+    /// Readback buffers for an explicit destination (queued Studio captures
+    /// carry theirs instead of using the single `screenshot_requested` slot).
+    pub(in crate::renderer) fn prepare_readback_for(
+        &mut self,
+        destination: ScreenshotDestination,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Option<ScreenshotReadback> {
         let depth_requested = matches!(
             &destination,
             ScreenshotDestination::VideoFrame { depth: true, .. }
         );
 
         let started = Instant::now();
-        let width = self.config.width.max(1);
-        let height = self.config.height.max(1);
         if matches!(
             &destination,
             ScreenshotDestination::File {
@@ -546,7 +596,7 @@ impl Renderer {
             return None;
         }
         let supported_format = matches!(
-            self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb),
+            format,
             wgpu::TextureFormat::Bgra8Unorm
                 | wgpu::TextureFormat::Bgra8UnormSrgb
                 | wgpu::TextureFormat::Rgba8Unorm
@@ -554,8 +604,7 @@ impl Renderer {
         );
         if !supported_format {
             self.screenshot_result = Some(Err(format!(
-                "unsupported screenshot surface format {:?}",
-                self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb)
+                "unsupported screenshot surface format {format:?}"
             )));
             return None;
         }
@@ -602,7 +651,7 @@ impl Renderer {
             height,
             padded_bytes_per_row,
             buffer_size,
-            format: self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb),
+            format,
             submission_index: None,
             copy_record_ms: 0.0,
             copy_submit_ms: 0.0,
@@ -679,15 +728,19 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn finish_screenshot_readback(&mut self, readback: ScreenshotReadback) {
-        if let Err(error) = self.queue_screenshot_encode(readback) {
-            self.screenshot_result = Some(Err(error));
+        match self.queue_screenshot_encode(readback) {
+            Ok(Some(output)) => self.screenshot_result = Some(Ok(output)),
+            Ok(None) => {}
+            Err(error) => self.screenshot_result = Some(Err(error)),
         }
     }
 
+    /// Video frames come back as `Some` (repacked here, delivered this render
+    /// loop); everything else goes to the encode worker and returns `None`.
     pub(in crate::renderer) fn queue_screenshot_encode(
         &self,
         readback: ScreenshotReadback,
-    ) -> Result<(), String> {
+    ) -> Result<Option<ScreenshotOutput>, String> {
         let staging = self
             .screenshot_readback_buffer
             .as_ref()
@@ -739,7 +792,57 @@ impl Renderer {
                 .map_err(|error| format!("GPU depth mapping failed: {error}"))?;
         }
 
+        let pixel_format = if matches!(
+            readback.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            ScreenshotPixelFormat::Bgra
+        } else {
+            ScreenshotPixelFormat::Rgba
+        };
         let copy_started = Instant::now();
+        if let ScreenshotDestination::VideoFrame { frame_index, alpha, sdr_unpremultiply, received, .. } = readback.destination {
+            // Exports are serial: repack straight out of the mapped buffer on
+            // this thread. A worker hop only delays delivery, because its result
+            // is polled after the render loop's following frame.
+            let row_bytes = readback.width as usize * 4;
+            let padded = readback.padded_bytes_per_row as usize;
+            let height = readback.height as usize;
+            let mapped = slice.get_mapped_range().map_err(|error| {
+                staging.buffer.unmap();
+                if let Some(depth_staging) = depth_staging {
+                    depth_staging.buffer.unmap();
+                }
+                format!("GPU screenshot readback range failed: {error}")
+            })?;
+            let mut bgra = tight_bgra(&mapped, row_bytes, padded, height, pixel_format);
+            drop(mapped);
+            staging.buffer.unmap();
+            let depth_f32le = if let (Some(depth_staging), Some(depth_slice)) = (depth_staging, depth_slice) {
+                let mapped = depth_slice.get_mapped_range().map_err(|error| {
+                    depth_staging.buffer.unmap();
+                    format!("GPU depth readback range failed: {error}")
+                })?;
+                let depth = tight_bgra(&mapped, row_bytes, padded, height, ScreenshotPixelFormat::Bgra);
+                drop(mapped);
+                depth_staging.buffer.unmap();
+                Some(depth)
+            } else {
+                None
+            };
+            if alpha {
+                if let Some(srgb_surface) = sdr_unpremultiply { alpha::resolve_bgra(&mut bgra, srgb_surface); }
+            }
+            let now = Instant::now();
+            let timing = crate::runtime::VideoFrameTiming {
+                received, frame_started: readback.started, presented: map_request_started,
+                gpu_wait_ms, readback_copy_ms: copy_started.elapsed().as_secs_f64() * 1000.0,
+                queued: now, worker_started: now, worker_done: now,
+            };
+            return Ok(Some(ScreenshotOutput::VideoFrame {
+                frame_index, width: readback.width, height: readback.height, bgra, depth_f32le, timing,
+            }));
+        }
         let mapped = slice.get_mapped_range().map_err(|error| {
             staging.buffer.unmap();
             if let Some(depth_staging) = depth_staging {
@@ -764,14 +867,6 @@ impl Renderer {
         };
         let readback_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
 
-        let pixel_format = if matches!(
-            readback.format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-        ) {
-            ScreenshotPixelFormat::Bgra
-        } else {
-            ScreenshotPixelFormat::Rgba
-        };
         self.screenshot_worker_tx
             .send(ScreenshotEncodeJob {
                 pixels,
@@ -789,7 +884,10 @@ impl Renderer {
                 inline_copy: readback.inline_copy,
                 reused_buffer: readback.reused_buffer,
                 started: readback.started,
+                presented: map_request_started,
+                queued: Instant::now(),
             })
-            .map_err(|_| "screenshot encoding worker stopped".to_owned())
+            .map_err(|_| "screenshot encoding worker stopped".to_owned())?;
+        Ok(None)
     }
 }

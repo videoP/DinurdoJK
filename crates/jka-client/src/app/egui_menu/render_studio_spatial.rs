@@ -1,8 +1,8 @@
 //! Editor-only projected keyframe markers and translation handles.
 use super::App;
+use super::render_studio_ui::palette as theme;
 use crate::app::render_studio_spatial::{StudioSpatialDrag,StudioSpatialMarker,StudioMotionPath,
     key_from_camera,stored_position,translate_item};
-use crate::app::render_studio_timeline::StudioItem;
 use glam::Vec3;
 
 fn project(camera:&crate::camera::Camera,viewport:egui::Rect,point:[f32;3])->Option<egui::Pos2> {
@@ -101,33 +101,9 @@ impl App {
     /// Returns whether keyframe controls own pointer input this frame.
     pub(super) fn egui_studio_spatial_overlay(&mut self,ui:&mut egui::Ui,viewport:egui::Rect,locked:bool)->bool {
         if locked {self.render_studio.spatial.drag=None;return true;}
-        if self.render_studio.cinematic_preview.is_some() {return self.egui_studio_cinematic_preview_toolbar(ui,viewport);}
-        let toolbar=egui::Rect::from_min_size(viewport.min+egui::vec2(8.,7.),egui::vec2((viewport.width()-16.).max(1.),27.));
+        if self.render_studio.cinematic_preview.is_some() {return false;}
         let pointer=ui.ctx().input(|i|i.pointer.interact_pos());
-        let mut busy=pointer.is_some_and(|p|toolbar.contains(p));
-        ui.scope_builder(egui::UiBuilder::new().id_salt("studio_scene_toolbar").max_rect(toolbar),|ui| {
-            ui.set_clip_rect(toolbar);
-            egui::Frame::new().fill(egui::Color32::from_black_alpha(190)).corner_radius(4.)
-                .inner_margin(egui::Margin::symmetric(5,2)).show(ui,|ui|ui.horizontal(|ui| {
-                    let scene=self.render_studio.spatial.scene_camera.is_some();
-                    if ui.selectable_label(!scene,"Shot view").on_hover_text("Look through the exported camera").clicked() {
-                        self.render_studio.spatial.scene_camera=None;self.render_studio.spatial.drag=None;self.profile_preview_key=None;
-                    }
-                    if ui.selectable_label(scene,"Scene view").on_hover_text("Navigate without changing the shot camera or its keyframes").clicked() && !scene {
-                        self.frame_studio_spatial_keys(viewport);
-                    }
-                    if ui.button("Frame keys").on_hover_text("Fit the camera, motion keyframes and actor paths in Scene view").clicked() {
-                        self.render_studio.spatial.show_keys=true;self.frame_studio_spatial_keys(viewport);
-                    }
-                    ui.checkbox(&mut self.render_studio.spatial.show_keys,"Keys");
-                    let paths=ui.checkbox(&mut self.render_studio.spatial.show_paths,"Paths")
-                        .on_hover_text("Yellow: camera path. Actor paths match their layer's motion-key color, including movement within cinematic clips. Ticks show whole timeline seconds. Editor only; excluded from exports.");
-                    if let Some(message)=&self.render_studio.spatial.path_message {paths.on_hover_text(message);}
-                    if self.render_studio.spatial.paths_pending {
-                        ui.add(egui::Spinner::new().size(12.)).on_hover_text("Tracing animated actor paths...");
-                    }
-                }));
-        });
+        let mut busy=false;
         if !self.render_studio.spatial.show_keys && !self.render_studio.spatial.show_paths {return busy;}
         self.refresh_studio_spatial_markers();
         if self.render_studio.spatial.paths_pending {ui.ctx().request_repaint();}
@@ -168,6 +144,7 @@ impl App {
         // The active key owns a single world-space translation gizmo. Other
         // selected keys move by the same world delta, across camera/motion tracks.
         let active=self.render_studio.timeline.selected_items().into_iter().rev()
+            .filter(|item| !matches!(item,crate::app::render_studio_timeline::StudioItem::Camera(_)))
             .find_map(|item|markers.iter().find(|m|m.item==item));
         if let Some(marker)=active {
             if let Some(anchor)=project(&camera,viewport,marker.position).filter(|p|viewport.shrink(10.).contains(*p)) {
@@ -238,4 +215,93 @@ impl App {
         }
     }
 
+}
+
+impl App {
+    /// Program viewer header: Shot / Scene view, key and path overlays.
+    /// Toggles live in the pane header so nothing covers the 3D image.
+    pub(super) fn egui_studio_viewer_tools(&mut self,ui:&mut egui::Ui,viewport:egui::Rect,locked:bool,demo:bool) {
+        use super::render_studio_ui::{self as sui,ButtonKind,Icon};
+        ui.spacing_mut().item_spacing.x=4.0;
+        if let Some(preview)=self.render_studio.cinematic_preview.as_ref() {
+            ui.add(egui::Label::new(egui::RichText::new(&preview.clip.label).size(12.5).color(theme::TEXT)).truncate());
+            ui.label(egui::RichText::new(format!("frames {}–{} · {:.2} fps",preview.clip.first_frame,
+                preview.clip.end_frame()-1,preview.clip.fps)).size(11.5).color(theme::TEXT_FAINT));
+            return;
+        }
+        if demo {
+            if sui::button(ui,None,if self.render_studio.hud_editing {"Done HUD"}else{"Edit HUD"},
+                if self.render_studio.hud_editing {ButtonKind::Primary}else{ButtonKind::Normal},!locked).clicked() {
+                self.render_studio.hud_editing=!self.render_studio.hud_editing;
+                if self.render_studio.hud_editing { self.align_studio_defaults_for_editor(); }
+                self.render_studio.hud_drag_origin=None;
+                self.render_studio.hud_scale_origin=None;
+                self.set_studio_mouse_look(false);
+            }
+            if self.render_studio.hud_editing {return;}
+            let scene=self.render_studio.spatial.scene_camera.is_some();
+            if sui::button(ui,None,if scene {"Shot view"}else{"Scene view"},ButtonKind::Normal,!locked).clicked() {
+                if scene {self.render_studio.spatial.scene_camera=None;} else if let Some(frame)=self.render_studio.scene_frame.as_ref() {
+                    let shot=frame.outgoing.shot_camera;
+                    let target=shot.position+shot.forward()*128.0;
+                    let eye=shot.position-shot.forward()*180.0+glam::Vec3::Y*80.0;
+                    let mut camera=key_from_camera(shot);camera.position=eye.to_array();camera.focus_target=Some(target.to_array());camera.resolve_focus_target();
+                    camera.focus_target=None;self.render_studio.spatial.scene_camera=Some(camera);
+                    self.render_studio.spatial.show_keys=true;
+                }
+                self.profile_preview_key=None;
+            }
+            let time=self.render_studio.timeline_time();
+            if let Some(shot)=self.render_studio.timeline.director_at(time) {
+                ui.label(egui::RichText::new(format!("Director · {}",shot.preset.label())).size(12.0).color(sui::CAMERA))
+                    .on_hover_text("A live Director shot drives the camera here (see the Camera track)");
+            } else {
+                use crate::app::render_studio_timeline::{StudioCameraSource,StudioDemoPov,StudioFollowPerspective};
+                let key=self.render_studio.timeline.camera_at(time);
+                let text=match key.source {
+                    StudioCameraSource::Demo{pov:StudioDemoPov::Follow,client} => format!("{} · {}",
+                        match key.demo_follow.perspective {
+                            StudioFollowPerspective::FirstPerson=>"Eyes",
+                            StudioFollowPerspective::ThirdPerson=>"Third person",
+                            StudioFollowPerspective::Orbit=>"Orbit",
+                        },
+                        if client<0 {"recorded player".to_owned()} else {format!("client {client}")}),
+                    StudioCameraSource::Demo{pov:StudioDemoPov::Free,..} => "Free camera".to_owned(),
+                    _ => "Recorded POV".to_owned(),
+                };
+                ui.label(egui::RichText::new(text).size(12.0).color(sui::DEMO));
+            }
+            return;
+        }
+        ui.add_enabled_ui(!locked,|ui| {
+            let scene=self.render_studio.spatial.scene_camera.is_some();
+            let mut mode=scene;
+            let changed=ui.allocate_ui(egui::vec2(132.0,24.0),|ui| sui::segmented(ui,&mut mode,&[(false,"Shot"),(true,"Scene")]))
+                .response.on_hover_text("Shot: look through the exported camera.
+Scene: navigate freely without changing the shot camera or its keys.");
+            let _=changed;
+            if mode!=scene {
+                if mode {self.frame_studio_spatial_keys(viewport);}
+                else {self.render_studio.spatial.scene_camera=None;self.render_studio.spatial.drag=None;self.profile_preview_key=None;}
+            }
+            ui.add_space(6.0);
+            if sui::icon_button(ui,Icon::Keys,true,self.render_studio.spatial.show_keys,"Show keyframe markers in the view").clicked() {
+                self.render_studio.spatial.show_keys=!self.render_studio.spatial.show_keys;
+            }
+            let paths=sui::icon_button(ui,Icon::Path,true,self.render_studio.spatial.show_paths,
+                "Motion paths. Yellow: camera path; actor paths match their track color, including movement within cinematic clips. Ticks mark whole seconds. Editor only, never exported.");
+            if paths.clicked() {self.render_studio.spatial.show_paths=!self.render_studio.spatial.show_paths;}
+            if let Some(message)=&self.render_studio.spatial.path_message {paths.on_hover_text(message);}
+            let fit=if ui.available_width()<100.0 {
+                sui::icon_button(ui,Icon::Frame,true,false,"Fit keys")
+            } else {sui::button(ui,None,"Fit keys",ButtonKind::Ghost,true)};
+            if fit
+                .on_hover_text("Fit the camera, motion keys and actor paths in Scene view").clicked() {
+                self.render_studio.spatial.show_keys=true;self.frame_studio_spatial_keys(viewport);
+            }
+            if self.render_studio.spatial.paths_pending {
+                ui.add(egui::Spinner::new().size(12.)).on_hover_text("Tracing animated actor paths...");
+            }
+        });
+    }
 }

@@ -27,6 +27,7 @@ pub(in crate::renderer) fn live_csm_region(
     include_models: bool,
     include_inline: bool,
     include_grass: bool,
+    include_animated_static: bool,
 ) -> [f32; 4] {
     if include_grass { return [-1.0,-1.0,1.0,1.0]; }
     let mut low=Vec3::splat(f32::INFINITY); let mut high=Vec3::splat(f32::NEG_INFINITY);
@@ -37,7 +38,7 @@ pub(in crate::renderer) fn live_csm_region(
     };
     if include_inline {
         for batch in &world.coarse_batches {
-            if (batch.is_inline_entity || crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered)) && !crate::renderer::hidden_inline_batch(batch,&world.inline_models)
+            if (batch.is_inline_entity || (include_animated_static && crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered))) && !crate::renderer::hidden_inline_batch(batch,&world.inline_models)
                 && crate::renderer::aabb_intersects_shadow_frustum(batch.bounds_min,batch.bounds_max,matrix,true) {
                 add_box(batch.bounds_min,batch.bounds_max);
             }
@@ -70,6 +71,7 @@ pub(in crate::renderer) fn live_csm_coverage(
     include_models: bool,
     include_inline: bool,
     include_grass: bool,
+    include_animated_static: bool,
 ) -> [u32; 4] {
     use super::shadow_coverage::{add_caster, FULL_COVERAGE};
     if include_grass { return FULL_COVERAGE; }
@@ -77,7 +79,7 @@ pub(in crate::renderer) fn live_csm_coverage(
     let mut add_box = |min, max| add_caster(&mut mask, matrix, min, max, 0.02);
     if include_inline {
         for batch in &world.coarse_batches {
-            if (batch.is_inline_entity || super::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered))
+            if (batch.is_inline_entity || (include_animated_static && super::lightmap_sun::moving_static_material(&batch.source, crate::renderer::SunVisibilityMode::Filtered)))
                 && !crate::renderer::hidden_inline_batch(batch, &world.inline_models)
                 && crate::renderer::aabb_intersects_shadow_frustum(batch.bounds_min, batch.bounds_max, matrix, true) {
                 add_box(batch.bounds_min, batch.bounds_max);
@@ -119,10 +121,12 @@ impl EntityShadowState {
     pub(in crate::renderer) fn new(
         device: &wgpu::Device,
         camera_layout: &wgpu::BindGroupLayout,
+        wind_noise: &wgpu::TextureView,
+        wind_sampler: &wgpu::Sampler,
     ) -> Self {
-        Self::with_count(device,camera_layout,ENTITY_SHADOW_CAMERAS)
+        Self::with_count(device,camera_layout,ENTITY_SHADOW_CAMERAS,wind_noise,wind_sampler)
     }
-    pub(in crate::renderer) fn with_count(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, count: usize) -> Self {
+    pub(in crate::renderer) fn with_count(device: &wgpu::Device, camera_layout: &wgpu::BindGroupLayout, count: usize, wind_noise: &wgpu::TextureView, wind_sampler: &wgpu::Sampler) -> Self {
         let cameras = (0..count)
             .map(|_| {
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -134,10 +138,7 @@ impl EntityShadowState {
                 let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("JKA entity shadow light camera bind group"),
                     layout: camera_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
+                    entries: &crate::foliage::camera_entries(&buffer, wind_noise, wind_sampler),
                 });
                 (buffer, bind_group)
             })
@@ -166,6 +167,7 @@ impl EntityShadowState {
             unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             previous_unjittered_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             jump_shade: [0.0; 4],
+            foliage_wind: [0.0; 4],
         };
         queue.write_buffer(&self.cameras[index].0, 0, bytemuck::bytes_of(&light_camera));
     }
@@ -336,8 +338,8 @@ impl Renderer {
             + right * ((centre_right / texel_size).round() * texel_size - centre_right)
             + light_up * ((centre_up / texel_size).round() * texel_size - centre_up);
         let eye = snapped_centre - direction * (radius * 2.0);
-        let view = Mat4::look_at_rh(eye, snapped_centre, reference_up);
-        let projection = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 4.0);
+        let view = glam::camera::rh::view::look_at_mat4(eye, snapped_centre, reference_up);
+        let projection = glam::camera::rh::proj::directx::orthographic(-radius, radius, -radius, radius, 0.1, radius * 4.0);
         EntityShadowFrame {
             view_proj: projection * view,
             active: state.strength > 0.02,
@@ -484,7 +486,6 @@ impl Renderer {
     ) {
         let sun = self.active_sun();
         let light_direction = Vec3::from_array(sun.direction).normalize_or_zero();
-        let intensity_scale = (sun.intensity / 250.0).max(0.0).sqrt().clamp(0.0, 1.5);
         let receiver = ShadowReceiverUniform {
             dynamic_coverage: [[0;4]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),
@@ -498,8 +499,10 @@ impl Renderer {
             params: [
                 SHADOW_MAP_SIZE as f32,
                 0.00035,
-                (self.sun_shadow_strength * intensity_scale).min(1.0),
-                if bevy_mode { 1.0 } else { 0.0 },
+                self.sun_shadow_strength,
+                if !bevy_mode { 0.0 }
+                else if self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMapsEntities { 2.0 }
+                else { 1.0 },
             ],
             camera_forward: [
                 camera_forward.x,

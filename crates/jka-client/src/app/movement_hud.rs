@@ -146,6 +146,10 @@ impl App {
     /// jaPRO `CG_DrawLagometer` (graph and the connection warning) for this frame.
     pub(in crate::app) fn update_lagometer(&mut self) {
         let settings = self.japro_cg.lagometer;
+        let command_backup = settings.effective_command_backup(
+            self.network.command_rate,
+            self.net.as_ref().map(|net| net.session().ping()),
+        );
         let state = self
             .game_session
             .as_ref()
@@ -164,7 +168,7 @@ impl App {
                     // buffered command, which a healthy link has long since acknowledged.
                     let cmd_server_time = self.net.as_ref().map_or(0, |net| {
                         let net_session = net.session();
-                        let oldest = net_session.cmd_number() - settings.real_command_backup() + 1;
+                        let oldest = net_session.cmd_number() - command_backup + 1;
                         net_session.command(oldest).map_or(0, |cmd| cmd.server_time)
                     });
                     let snapshot_command_time = session

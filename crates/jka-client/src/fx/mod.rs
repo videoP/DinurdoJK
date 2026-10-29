@@ -97,6 +97,7 @@ pub mod draw;
 pub mod gpu_sparks;
 pub mod gp2;
 pub mod light_promotion;
+pub mod diagnostics;
 pub mod system;
 pub mod template;
 

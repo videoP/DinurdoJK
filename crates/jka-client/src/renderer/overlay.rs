@@ -41,6 +41,18 @@ impl Renderer {
         self.rebuild_ui();
     }
 
+    /// Set rapidly changing scope/binocular/rocket state independently of
+    /// SetUi and SetTransientUi. Vertices are late-latched at render time.
+    pub(in crate::renderer) fn set_combat_ui(
+        &mut self,
+        zoom_scope: Option<ui::UiZoomScope>,
+        rocket_lock: Option<ui::UiRocketLock>,
+    ) {
+        self.ui_state.zoom_scope = zoom_scope;
+        self.ui_state.rocket_lock = rocket_lock;
+        self.load_ui_icons_if_needed();
+    }
+
     pub(in crate::renderer) fn set_extension_hud(
         &mut self,
         widgets: Vec<crate::extensions::PlacedHudWidget>,
@@ -168,7 +180,10 @@ impl Renderer {
                 .is_some_and(|ui| !ui.graph_pics.is_empty())
             || self.ui_state.crosshair.image != 0
             || self.ui_state.force_select.is_some()
-            || self.ui_state.weapon_select.is_some();
+            || self.ui_state.weapon_select.is_some()
+            || self.ui_state.inventory_select.is_some()
+            || self.ui_state.zoom_scope.is_some()
+            || self.ui_state.rocket_lock.is_some();
         if !wanted {
             return;
         }
@@ -546,9 +561,12 @@ impl Renderer {
         crosshair_target: ui::UiCrosshairTarget,
         force_select: Option<ui::UiForceSelect>,
         weapon_select: Option<ui::UiWeaponSelect>,
+        inventory_select: Option<ui::UiInventorySelect>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
+        hud_score: Option<ui::UiHudScore>,
+        enemy_info: Option<ui::UiEnemyInfo>,
         race_timer: Option<crate::japro_cg::RaceTimerUi>,
         vote_line: Option<String>,
         scoreboard: Option<ui::UiScoreboard>,
@@ -565,9 +583,12 @@ impl Renderer {
         self.ui_state.crosshair_target = crosshair_target;
         self.ui_state.force_select = force_select;
         self.ui_state.weapon_select = weapon_select;
+        self.ui_state.inventory_select = inventory_select;
         self.ui_state.follow_name = follow_name;
         self.ui_state.game_timer = game_timer;
         self.ui_state.mini_scores = mini_scores;
+        self.ui_state.hud_score = hud_score;
+        self.ui_state.enemy_info = enemy_info;
         self.ui_state.race_timer = race_timer;
         self.ui_state.vote_line = vote_line;
         let scoreboard_changed = self.ui_state.scoreboard != scoreboard
@@ -628,10 +649,15 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn submit_egui(&mut self, frame_view: &wgpu::TextureView) {
-        if !self.egui_active || self.egui_paint_jobs.is_empty() {
+        if !self.egui_active || (self.egui_paint_jobs.is_empty() && !self.neon_chrome_wanted()) {
             return;
         }
 
+        // This allocation and extra overlay pass are never used during normal
+        // gameplay. Unlike CPU texture baking, this also handles text and
+        // egui user textures, including material preview thumbnails.
+        let compensate_ui = self.ui_gamma_active() && self.hdr_output.is_none();
+        if compensate_ui { self.ensure_egui_ui_gamma(); }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width.max(1), self.config.height.max(1)],
             pixels_per_point: self.egui_pixels_per_point,
@@ -648,15 +674,31 @@ impl Renderer {
             &self.egui_paint_jobs,
             &screen,
         );
+        // The footer and submenu typography are actual WGPU neon tubes.
+        // Composite into egui's UI target *before* widgets. For the gamma/HDR
+        // intermediates both passes must share the same transparent layer.
+        let chrome_target = if compensate_ui {
+            &self.ui_gamma_egui.as_ref().expect("egui gamma target").view
+        } else {
+            self.hdr_output.as_ref().map_or(frame_view, |output| &output.ui_view)
+        }.clone();
+        let chrome_format = if self.hdr_output.is_some() { wgpu::TextureFormat::Rgba8Unorm }
+            else { self.config.format };
+        let chrome_drawn = self.encode_neon_chrome(&mut encoder, &chrome_target,
+            chrome_format, compensate_ui || self.hdr_output.is_some());
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA egui overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.hdr_output.as_ref().map_or(frame_view, |output| &output.ui_view),
+                    view: if compensate_ui {
+                        &self.ui_gamma_egui.as_ref().expect("egui gamma target").view
+                    } else {
+                        self.hdr_output.as_ref().map_or(frame_view, |output| &output.ui_view)
+                    },
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if self.hdr_output.is_some() { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load },
+                        load: if (self.hdr_output.is_some() || compensate_ui) && !chrome_drawn { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -668,6 +710,23 @@ impl Renderer {
             let mut pass = pass.forget_lifetime();
             self.egui_renderer
                 .render(&mut pass, &self.egui_paint_jobs, &screen);
+        }
+        if compensate_ui {
+            let resources = self.ui_gamma_egui.as_ref().expect("egui gamma compositor");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("HW scene-only egui overlay composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&resources.pipeline);
+            pass.set_bind_group(0, &resources.group, &[]);
+            pass.draw(0..3, 0..1);
         }
         if let Some(output) = &self.hdr_output {
             output.composite_ui(&mut encoder, frame_view);
@@ -685,6 +744,9 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn menu_backdrop_requested(&self) -> bool {
+        // In Studio the recorded world is composited separately; blurring its
+        // fullscreen backing image would defeat viewport isolation.
+        if self.studio_world_viewport.is_some() { return false; }
         // The frontend Main scene is artwork, not a page that needs a blurred
         // and desaturated background. Avoid both the grading and its extra pass.
         // It does use the same lazily allocated scene capture as the source of
@@ -874,9 +936,15 @@ impl Renderer {
                 &self.screen_fx_white_bind_group,
             );
 
+            // No extra scene pass: only the native UI pixels are counter-adjusted.
+            let ui_gamma = if self.ui_gamma_active() { self.ui_gamma_native.as_ref() } else { None };
+            let ui_pipeline = ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline);
+            if let Some(resources) = ui_gamma {
+                pass.set_bind_group(1, &resources.group, &[]);
+            }
             Self::draw_ui_batches(
                 &mut pass,
-                &self.ui_pipeline,
+                ui_pipeline,
                 &self.ui_bind_group,
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
@@ -886,7 +954,7 @@ impl Renderer {
                 self.ui_vertex_count,
             );
             if !self.egui_active {
-                self.frame_time_graph.draw(&mut pass, &self.ui_pipeline, &self.ui_bind_group);
+                self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -1099,6 +1167,20 @@ impl Renderer {
         // CG_Draw2D, even though their vertices are appended after HUD publishing.
         // Check the snapshot boolean once; no cvar lookup in the render loop.
         if self.ui_state.video.draw_2d {
+            // Both effects are cg_draw.c 2D output; the rocket target must be
+            // projected with the final late-latched view, not an earlier pose.
+            let rocket_screen = self.ui_state.rocket_lock.and_then(|lock| {
+                let clip = view_proj * Vec3::from_array(crate::scene::render_position(lock.target)).extend(1.0);
+                if clip.w <= 0.001 { return None; }
+                let ndc = clip.truncate() / clip.w;
+                ((0.0..=1.0).contains(&ndc.z) && ndc.x.abs() <= 1.15 && ndc.y.abs() <= 1.15)
+                    .then(|| [(ndc.x * 0.5 + 0.5) * self.config.width.max(1) as f32,
+                              (0.5 - ndc.y * 0.5) * self.config.height.max(1) as f32])
+            });
+            ui::build_combat_hud_vertices(
+                &mut self.ui_transient_vertices, &self.ui_state, rocket_screen,
+                self.config.width, self.config.height,
+            );
             if ui::gameplay_hud_visible(&self.ui_state, self.config.width, self.config.height) {
                 if let Some(anchor) = dynamic_crosshair_world {
                     let clip = view_proj * Vec3::from_array(anchor).extend(1.0);
@@ -1296,7 +1378,7 @@ fn assemble_native_icon_atlas(
         width, height, images.iter().flatten().count(), reductions);
     (TextureData {
         label: "JKA UI native-resolution icon atlas".into(),
-        source: None, width, height, rgba, rgba16f: None,
+        source: None, width, height, rgba: (rgba).into(), rgba16f: None,
         mip_level_count: 1, clamp: true, srgb: true,
     }, uvs)
 }
@@ -1319,7 +1401,7 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
                 let mut image = try_load_texture_asset_from_search_path(
                     &mut assets, &requested, true, false, true, "UI icon",
                 );
-                if image.is_none() && index >= ui::ICON_WEAPON_NO_AMMO_BASE {
+                if image.is_none() && (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE).contains(&index) {
                     let fallback = if index >= ui::ICON_WEAPON_STAFF {
                         "gfx/hud/w_icon_lightsaber"
                     } else { name };
@@ -1331,7 +1413,7 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
                     eprintln!("UI icon {requested}: not found");
                     continue;
                 };
-                images[index] = image::RgbaImage::from_raw(image.width, image.height, image.rgba);
+                images[index] = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec());
                 if images[index].is_none() {
                     eprintln!("UI icon {requested}: unexpected pixel format");
                 }
@@ -1402,7 +1484,7 @@ pub(in crate::renderer) fn blank_ui_extension_atlas() -> TextureData {
         source: None,
         width,
         height,
-        rgba: vec![0u8; (width * height * 4) as usize],
+        rgba: (vec![0u8; (width * height * 4) as usize]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1441,7 +1523,7 @@ pub(in crate::renderer) fn load_ui_extension_images(
                 return None;
             };
             let (source_w, source_h) = (image.width, image.height);
-            let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba) else {
+            let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba.into_vec()) else {
                 eprintln!("Extension HUD image {name}: unexpected pixel format");
                 return None;
             };
@@ -1510,9 +1592,28 @@ pub(in crate::renderer) fn load_ui_team_icon_atlas(
                                 |candidate| assets.contains_qpath(candidate),
                             );
                         }
-                        let icon_skin = final_skin.split('|').next().unwrap_or("default");
-                        resolved = format!("models/players/{model}/icon_{icon_skin}");
-                        resolved.as_str()
+                        // TaystJK CG_LoadClientInfo registers the exact skin icon
+                        // first. Only a composite (head|torso|legs) skin gets a
+                        // second chance with the head icon. Do not invent a
+                        // placeholder for CG_DrawEnemyInfo when neither exists.
+                        let full_icon = format!("models/players/{model}/icon_{final_skin}");
+                        if let Some(image) = try_load_texture_asset_from_search_path(
+                            &mut assets,
+                            &full_icon,
+                            true,
+                            false,
+                            true,
+                            "team overlay icon",
+                        ) {
+                            loaded = Some(image);
+                            break;
+                        }
+                        if let Some((head, _)) = final_skin.split_once('|') {
+                            resolved = format!("models/players/{model}/icon_{head}");
+                            resolved.as_str()
+                        } else {
+                            continue;
+                        }
                     } else {
                         name
                     };
@@ -1530,7 +1631,7 @@ pub(in crate::renderer) fn load_ui_team_icon_atlas(
                 }
                 let Some(image) = loaded else { continue };
                 let (source_w, source_h) = (image.width, image.height);
-                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba)
+                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba.into_vec())
                 else {
                     continue;
                 };
@@ -1562,7 +1663,7 @@ pub(in crate::renderer) fn load_ui_team_icon_atlas(
         source: None,
         width,
         height,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1590,7 +1691,7 @@ pub(in crate::renderer) fn load_ui_font_texture(base: &Path, game: Option<&Path>
         source: None,
         width,
         height,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1650,7 +1751,7 @@ pub(in crate::renderer) fn load_ui_loading_texture(
             source: None,
             width: 1,
             height: 1,
-            rgba: vec![0, 0, 0, 255],
+            rgba: (vec![0, 0, 0, 255]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: true,
@@ -1697,7 +1798,7 @@ pub(in crate::renderer) fn load_ui_unknown_map_texture(
             source: None,
             width: 1,
             height: 1,
-            rgba: vec![0, 0, 0, 255],
+            rgba: (vec![0, 0, 0, 255]).into(),
             rgba16f: None,
             mip_level_count: 1,
             clamp: true,
@@ -1713,7 +1814,7 @@ pub(in crate::renderer) fn empty_ui_font_texture(label: &str) -> TextureData {
         source: None,
         width: 1,
         height: 1,
-        rgba: vec![255, 255, 255, 0],
+        rgba: (vec![255, 255, 255, 0]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -1773,6 +1874,54 @@ pub(in crate::renderer) fn load_ui_proportional_font(
     };
 
     (texture, metrics)
+}
+
+/// Studio overlay font for `choice`: `ui::STUDIO_FONT_CLASSIC` is JKA's
+/// ergoec; a path is a font file on disk or in the game filesystem; empty
+/// picks a packaged `fonts/studio_overlay.ttf`, else a system UI font. Any
+/// failure falls back down that chain to ergoec.
+pub(in crate::renderer) fn load_studio_overlay_font(
+    base: &Path,
+    game: Option<&Path>,
+    choice: &str,
+) -> (TextureData, Option<ui::ProportionalFont>) {
+    const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+    if choice == ui::STUDIO_FONT_CLASSIC {
+        return load_ui_proportional_font(base, game, "ergoec");
+    }
+    let mut assets = AssetSearchPath::open_game(base, game).ok();
+    let mut read_game = |path: &str| {
+        assets.as_mut()?.read(path, MAX_FONT_BYTES).ok().flatten().map(|a| a.bytes)
+    };
+    // (label, read from the game filesystem rather than disk)
+    let mut sources: Vec<(String, bool)> = Vec::new();
+    if !choice.is_empty() {
+        sources.push((choice.to_owned(), !Path::new(choice).is_absolute()));
+    }
+    sources.extend(ui::STUDIO_PACKAGED_FONTS.iter().map(|p| ((*p).to_owned(), true)));
+    sources.extend(ui::studio_default_system_fonts().into_iter().map(|p| (p.display().to_string(), false)));
+    for (label, in_game) in sources {
+        let bytes = if in_game { read_game(&label) } else { std::fs::read(&label).ok() };
+        let Some(bytes) = bytes else { continue };
+        match ui::rasterize_ttf_font(&bytes) {
+            Ok(font) => {
+                let texture = TextureData {
+                    label: format!("Studio overlay font {label}"),
+                    source: None,
+                    width: font.width,
+                    height: font.height,
+                    rgba: font.rgba.into(),
+                    rgba16f: None,
+                    mip_level_count: font.mip_level_count,
+                    clamp: true,
+                    srgb: false,
+                };
+                return (texture, Some(font.font));
+            }
+            Err(error) => eprintln!("Studio overlay font {label}: {error}"),
+        }
+    }
+    load_ui_proportional_font(base, game, "ergoec")
 }
 
 #[derive(Clone)]

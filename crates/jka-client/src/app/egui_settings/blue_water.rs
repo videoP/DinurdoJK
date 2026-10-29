@@ -64,6 +64,16 @@ impl App {
         let mut ocean = self.video.ocean_settings;
         let d = crate::ocean::OceanSettings::default();
         let mut changed = false;
+        if hybrid && !gerstner {
+            theme::row(ui, "Ocean quality", "Optimized uses lighter shading with the same waves and reflection setting. Original adds finer foam shading and sun glints at a higher GPU cost. Changes apply live.", theme::Reset::None, |ui| {
+                for (mode, label) in [(0, "Original"), (1, "Optimized")] {
+                    if theme::chip(ui, label, ocean.hybrid_material == mode).clicked() {
+                        ocean.hybrid_material = mode;
+                        changed = true;
+                    }
+                }
+            });
+        }
         if gerstner {
             theme::section(ui, "WAVES & FOAM", "The original's five fixed Gerstner waves and its foam. Changes apply live.");
             super::ocean_slider_d(ui, "Wave scale", "The original sea this many times larger: 1 is its 0.4 m, 6 m waves. Lengths scale by it and time by its square root, so larger seas keep their shape and roll slower, as real swell does.", &mut ocean.gerstner_wave_scale, d.gerstner_wave_scale, 0.1..=20.0, &mut changed);

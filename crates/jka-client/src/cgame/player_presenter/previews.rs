@@ -230,6 +230,43 @@ impl PlayerPresenter {
         custom_shader: Option<&str>,
         current_time: i32,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        self.present_static_glm_with_emplaced_angles(
+            entity_num, model_qpath, origin, axis, rgba, custom_shader,
+            current_time, None,
+        )
+    }
+
+    /// TaystJK cg_ents.c CG_General: an occupied E-Web (activeForcePass ==
+    /// NUM_FORCE_POWERS + 1) rotates Bone02 each frame. This is a Ghoul2 bone
+    /// orientation, NOT an entity/root rotation: the tripod stays stationary.
+    pub fn present_emplaced_glm(
+        &mut self,
+        entity_num: u16,
+        model_qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        current_time: i32,
+        gun_angles: [f32; 3],
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        self.present_static_glm_with_emplaced_angles(
+            entity_num, model_qpath, origin, axis, rgba, None,
+            current_time, Some(gun_angles),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_static_glm_with_emplaced_angles(
+        &mut self,
+        entity_num: u16,
+        model_qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        custom_shader: Option<&str>,
+        current_time: i32,
+        emplaced_angles: Option<[f32; 3]>,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
         let mut model = self.load_static_glm(model_qpath, None, model_qpath)?;
         // TaystJK/OpenJK CG_General initializes the Ghoul2 model first, then
         // checks G2API_SkinlessModel and, when needed, applies the sibling
@@ -248,8 +285,21 @@ impl PlayerPresenter {
             }
         }
         let pose_started = Instant::now();
-        let pose =
-            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
+        let mut animator = Ghoul2Animator::new(&model.animation_gla);
+        if let Some(angles) = emplaced_angles {
+            // TaystJK: BONE_ANGLES_REPLACE, NEGATIVE_Y, NEGATIVE_X,
+            // POSITIVE_Z, applied to "Bone02" at cg.time. Like G2API,
+            // missing optional model bones do not suppress the model.
+            let _ = animator.set_bone_angles_replace(
+                &model.animation_gla, "Bone02", angles,
+                jka_movement::G2_NEGATIVE_Y,
+                jka_movement::G2_NEGATIVE_X,
+                jka_movement::G2_POSITIVE_Z,
+            );
+        }
+        let pose = model.bind_animation_pose(
+            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time)?,
+        )?;
         record_pose_eval(&mut self.perf, pose_started);
         let custom = custom_shader.map(|shader| self.custom_shader_material(shader));
         let draws = self.render_glm_surfaces(
@@ -465,7 +515,7 @@ impl PlayerPresenter {
         } else {
             model.bind_animation_pose(animation_pose)?
         };
-        if presentation && model.source_jiggles_enabled {
+        if presentation && model.procedural_jiggles_enabled(self.hair_physics_mode) {
             if let Some(bindings) = model.source_jiggles.as_deref() {
                 self.preview_source_jiggles
                     .entry(model.key.clone())
@@ -475,6 +525,18 @@ impl PlayerPresenter {
             }
         }
         if let Some(active)=emote_preview.as_ref(){model.correct_emote_ground(active,&mut pose)?;}
+        // Smoothed Studio transition: cross-fade with the touching clip's
+        // pose, using the same renormalized blend as jaPRO pose smoothing.
+        if presentation {
+            if let Some(blend) = self.studio_pose_blend.take().filter(|b| b.weight > 0.001) {
+                if let Ok(other) = self.profile_preview_pose(model, origin, axis, blend.time_ms, &blend.animation_name,
+                    head_look, blend.emote.as_ref(), blend.frame_range, false) {
+                    if other.len() == pose.len() && pose.len() == model.gla.skeleton.len() {
+                        pose = super::smooth_ghoul2_pose(&model.gla, &other, &pose, blend.weight.min(1.0));
+                    }
+                }
+            }
+        }
         Ok(pose)
     }
 
@@ -744,7 +806,8 @@ impl PlayerPresenter {
                         false,
                         trail_style,
                         definition.num_blades as u8,
-                        definition.no_dlight,
+                        definition.blade_no_dlight(blade_index),
+                        definition.blade_hidden(blade_index),
                         no_wall_marks,
                     ) {
                         self.fx_requests.push(request);

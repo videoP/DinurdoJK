@@ -676,6 +676,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         sub_bsp_names: Vec::new(),
         authored_oceans: Vec::new(),
         water_brush_bounds,
+        thermal_liquids: Vec::new(),
         vertices,
         legacy_dlight_triangle_surfaces: Vec::new(),
         bsp_compiled_model_surfaces: Vec::new(),

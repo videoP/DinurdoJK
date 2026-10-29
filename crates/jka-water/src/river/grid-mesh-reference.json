@@ -1,0 +1,533 @@
+{
+  "asset_sha1": "ef7c1d07a697489503a4a5819e5a5074711e09a1",
+  "selected_script": {
+    "object": 4987,
+    "path": "Grid2D_SW_River.ShallowWaterRiverEmitter_1.NiagaraScratchPadContainer_2.ScratchModule_04_0"
+  },
+  "selected_version": {
+    "MajorVersion": 1,
+    "MinorVersion": 0,
+    "VersionGuid": [
+      167900881,
+      1092969892,
+      1391022735,
+      1978300355
+    ],
+    "bIsVisibleInVersionSelector": true
+  },
+  "mesh_resolution_multiplier": 1.0,
+  "count_expressions": {
+    "Emitter.VertexCount": {
+      "Numeric::Mul": [
+        {
+          "Numeric::Add": [
+            "Module.NumCellsX",
+            1
+          ]
+        },
+        {
+          "Numeric::Add": [
+            "Module.NumCellsY",
+            1
+          ]
+        }
+      ]
+    },
+    "Emitter.TriangleCount": {
+      "Numeric::Mul": [
+        {
+          "Numeric::Mul": [
+            "Module.NumCellsX",
+            "Module.NumCellsY"
+          ]
+        },
+        2
+      ]
+    },
+    "Emitter.NumCellsX": "Module.NumCellsX",
+    "Emitter.NumCellsY": "Module.NumCellsY",
+    "Emitter.NumVerticesX": {
+      "Numeric::Add": [
+        "Module.NumCellsX",
+        1
+      ]
+    },
+    "Emitter.NumVerticesY": {
+      "Numeric::Add": [
+        "Module.NumCellsY",
+        1
+      ]
+    }
+  },
+  "vertex_inputs": {
+    "ScratchModule_05.Mesh": "Emitter.GridMesh",
+    "ScratchModule_05.NumCellsX": "Emitter.NumCellsX",
+    "ScratchModule_05.NumCellsY": "Emitter.NumCellsY",
+    "ScratchModule_05.World Grid Size": "Emitter.Grid2D_SetResolution.WorldGridExtents"
+  },
+  "mesh_properties": {
+    "SetMeshProperties": {
+      "NumVertices": {
+        "Numeric::Mul": [
+          {
+            "Numeric::Add": [
+              "Module.NumCellsX",
+              1
+            ]
+          },
+          {
+            "Numeric::Add": [
+              "Module.NumCellsY",
+              1
+            ]
+          }
+        ]
+      },
+      "NumTexCoords": "1",
+      "HasColors": "true",
+      "HasTangentBasis": "true"
+    },
+    "SetSectionCount": {
+      "SectionCount": "1"
+    },
+    "SetSectionData": {
+      "SectionIndex": "0",
+      "NumTriangles": {
+        "Numeric::Mul": [
+          {
+            "Numeric::Mul": [
+              "Module.NumCellsX",
+              "Module.NumCellsY"
+            ]
+          },
+          2
+        ]
+      },
+      "MaterialIndex": "0"
+    }
+  },
+  "reset_dispatch": [
+    {
+      "SimulationStageName": "Create Vertices",
+      "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+      "IterationSource": "ENiagaraIterationSource::DirectSet",
+      "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+      "ElementCountX": {
+        "DefaultValue": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.NumVerticesX"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.NumVerticesX"
+        }
+      },
+      "ElementCountY": {
+        "DefaultValue": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.NumVerticesY"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.NumVerticesY"
+        }
+      }
+    },
+    {
+      "SimulationStageName": "Create Triangles",
+      "ExecuteBehavior": "ENiagaraSimStageExecuteBehavior::OnSimulationReset",
+      "IterationSource": "ENiagaraIterationSource::DirectSet",
+      "DirectDispatchType": "ENiagaraGpuDispatchType::TwoD",
+      "ElementCountX": {
+        "DefaultValue": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.NumCellsX"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.NumCellsX"
+        }
+      },
+      "ElementCountY": {
+        "DefaultValue": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.NumCellsY"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.NumCellsY"
+        }
+      }
+    }
+  ],
+  "renderers": [
+    {
+      "path": "Grid2D_SW_River.ShallowWaterRiverEmitter_1.NiagaraMeshRendererProperties_0",
+      "material": "/WaterAdvanced/Niagara/Materials/SW_Water_Material_River_Niagara_Cached.SW_Water_Material_River_Niagara_Cached",
+      "mesh_binding": {
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.GridMesh"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.GridMesh"
+        }
+      },
+      "enabled": {
+        "RootName": "RenderCached",
+        "ParamMapVariable": {
+          "variable": "ShallowWaterRiverEmitter.RenderCached"
+        },
+        "DataSetName": "RenderCached",
+        "CachedDisplayName": "Emitter.RenderCached",
+        "bBindingExistsOnSource": true
+      },
+      "parameters": {
+        "AttributeBindings": [
+          {
+            "MaterialParameterName": "BakedWaterSimTex",
+            "NiagaraVariable": {
+              "variable": "User.BakedSimTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedSimTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimNormalTex",
+            "NiagaraVariable": {
+              "variable": "User.BakedWaterSurfaceNormalTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedWaterSurfaceNormalTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "NormalDetailTex",
+            "NiagaraVariable": {
+              "variable": "User.OceanNormalRT"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.OceanNormalRT"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "FoamTex",
+            "NiagaraVariable": {
+              "variable": "User.BakedFoamTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedFoamTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimDx",
+            "NiagaraVariable": {
+              "variable": "Emitter.dx"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.dx"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimSize",
+            "NiagaraVariable": {
+              "variable": "Emitter.GridSize"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.GridSize"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimLocationDouble",
+            "NiagaraVariable": {
+              "variable": "Emitter.Pos"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.Pos"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "SimRes",
+            "NiagaraVariable": {
+              "variable": "Emitter.SimResVector"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.SimResVector"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimTexVT",
+            "NiagaraVariable": {
+              "variable": "User.BakedSimTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedSimTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimNormalTexVT",
+            "NiagaraVariable": {
+              "variable": "User.BakedWaterSurfaceNormalTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedWaterSurfaceNormalTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "FoamTexVT",
+            "NiagaraVariable": {
+              "variable": "User.BakedFoamTexture"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.BakedFoamTexture"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "Grid2D_SW_River.ShallowWaterRiverEmitter_1.NiagaraMeshRendererProperties_4",
+      "material": "/WaterAdvanced/Niagara/Materials/SW_Water_Material_River_Niagara.SW_Water_Material_River_Niagara",
+      "mesh_binding": {
+        "ResolvedParameter": {
+          "variable": "ShallowWaterRiverEmitter.GridMesh"
+        },
+        "AliasedParameter": {
+          "variable": "Emitter.GridMesh"
+        }
+      },
+      "enabled": {
+        "RootName": "RenderLive",
+        "ParamMapVariable": {
+          "variable": "ShallowWaterRiverEmitter.RenderLive"
+        },
+        "DataSetName": "RenderLive",
+        "CachedDisplayName": "Emitter.RenderLive",
+        "bBindingExistsOnSource": true
+      },
+      "parameters": {
+        "AttributeBindings": [
+          {
+            "MaterialParameterName": "BakedWaterSimTex",
+            "NiagaraVariable": {
+              "variable": "Emitter.SimGridRT"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.SimGridRT"
+            },
+            "NiagaraChildVariable": {
+              "variable": "RenderTarget"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimNormalTex",
+            "NiagaraVariable": {
+              "variable": "Emitter.NormalsRT"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.NormalsRT"
+            },
+            "NiagaraChildVariable": {
+              "variable": "RenderTarget"
+            }
+          },
+          {
+            "MaterialParameterName": "NormalDetailTex",
+            "NiagaraVariable": {
+              "variable": "User.OceanNormalRT"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "User.OceanNormalRT"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "FoamTex",
+            "NiagaraVariable": {
+              "variable": "Emitter.FoamRT"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.FoamRT"
+            },
+            "NiagaraChildVariable": {
+              "variable": "RenderTarget"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimDx",
+            "NiagaraVariable": {
+              "variable": "Emitter.dx"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.dx"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimSize",
+            "NiagaraVariable": {
+              "variable": "Emitter.GridSize"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.GridSize"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "BakedWaterSimLocationDouble",
+            "NiagaraVariable": {
+              "variable": "Emitter.Pos"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.Pos"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          },
+          {
+            "MaterialParameterName": "SimRes",
+            "NiagaraVariable": {
+              "variable": "Emitter.SimResVector"
+            },
+            "ResolvedNiagaraVariable": {
+              "variable": "ShallowWaterRiverEmitter.SimResVector"
+            },
+            "NiagaraChildVariable": {
+              "variable": "None"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "sources": {
+    "Engine/Plugins/FX/Niagara/Shaders/Private/NiagaraDataInterfaceDynamicMeshTemplate.ush": "157a14efe732bf5fa8bad34d088b0d85b7b8bb8da1abdf134155bd5a5fa72a2f",
+    "Engine/Plugins/FX/Niagara/Source/Niagara/Private/DataInterface/NiagaraDataInterfaceDynamicMesh.cpp": "8cc9f99075459e6272b705267494ea5dd76f75535ccd642435f3422a229a94b5",
+    "Engine/Plugins/Experimental/WaterAdvanced/Source/WaterAdvanced/Private/ShallowWaterRiverActor.cpp": "e413ba4cf55f7d51e4ed18aece852d28a42792a3166bb8c5489d5031d7df30b2"
+  },
+  "shader_functions": {
+    "ScratchModule_05_Emitter_Func": {
+      "code": "void ScratchModule_05_Emitter_Func(inout FSimulationContext Context)\n{\n\tbool Constant = true;\n\tint CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexX;\n\tint CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexY;\n\tint CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_LinearIndex;\n\tCustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_Func(CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexX, CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexY, CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_LinearIndex);\n\tfloat Result = ((float)CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexX) / ((float)Context.MapSimStage1_CreateVertices.ScratchModule_05.NumCellsX);\n\tfloat Constant1 = 0.5;\n\tfloat Result1 = Result - Constant1;\n\tfloat Result2 = ((float)CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_IndexY) / ((float)Context.MapSimStage1_CreateVertices.ScratchModule_05.NumCellsY);\n\tfloat Constant2 = 0.5;\n\tfloat Result3 = Result2 - Constant2;\n\tfloat2 Output1;\n\tOutput1.x = Result1;\n\tOutput1.y = Result3;\n\tfloat2 Result4 = Output1 * Context.MapSimStage1_CreateVertices.ScratchModule_05.WorldGridSize;\n\tfloat Constant3 = 0;\n\tfloat3 Output11;\n\tOutput11.x = Result4.x;\n\tOutput11.y = Result4.y;\n\tOutput11.z = Constant3;\n\tfloat3 Constant4 = float3(1,0,0);\n\tfloat3 Constant5 = float3(0,1,0);\n\tfloat3 Constant6 = float3(0,0,1);\n\tfloat2 Output12;\n\tOutput12.x = Result;\n\tOutput12.y = Result2;\n\tfloat4 Constant7 = float4(1,1,1,1);\n\tSetVertexData_Emitter_GridMesh_UEImpureCall(Constant, CustomHlsl2630619CE12DB001BF37F7F57BD52A15241A9990_FuncOutput_LinearIndex, Output11, Constant4, Constant5, Constant6, Output12, Constant7);\n}\n",
+      "sha256": "5d425bfc56533a9e962edcb15a57cc7aeeb155e1c7e174df71bb4d0aba7e04cd"
+    },
+    "ScratchModule_06_Emitter_Func": {
+      "code": "void ScratchModule_06_Emitter_Func(inout FSimulationContext Context)\n{\n\tint Constant8 = 0;\n\tbool Constant9 = true;\n\tint Result5 = ExecIndex();\n\tint Constant10 = 2;\n\tint Result6 = Result5 * Constant10;\n\tint CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexX;\n\tint CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexY;\n\tint CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_LinearIndex;\n\tCustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_Func(CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexX, CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexY, CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_LinearIndex);\n\tint Constant11 = 1;\n\tint Result7 = CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexX + Constant11;\n\tint Constant12 = 1;\n\tint Result8 = CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexY + Constant12;\n\tint CustomHlsl0017D7166C28D9D07A987BBFD24789C46726E8F9B7A_FuncOutput_LinearIndex;\n\tCustomHlsl0017D7166C28D9D07A987BBFD24789C46726E8F9B7A_Func(Result7, Result8, Context.MapSimStage2_CreateTriangles.ScratchModule_06.NumVerticesX, CustomHlsl0017D7166C28D9D07A987BBFD24789C46726E8F9B7A_FuncOutput_LinearIndex);\n\tint CustomHlsl001D76F703A2D630AD6CC758F8778DD55C2303140EC_FuncOutput_LinearIndex;\n\tCustomHlsl001D76F703A2D630AD6CC758F8778DD55C2303140EC_Func(Result7, CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexY, Context.MapSimStage2_CreateTriangles.ScratchModule_06.NumVerticesX, CustomHlsl001D76F703A2D630AD6CC758F8778DD55C2303140EC_FuncOutput_LinearIndex);\n\tint CustomHlsl001C357FC6500FC33E1A91D1DF8908A4E9DCF52003D_FuncOutput_LinearIndex;\n\tCustomHlsl001C357FC6500FC33E1A91D1DF8908A4E9DCF52003D_Func(CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexX, CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexY, Context.MapSimStage2_CreateTriangles.ScratchModule_06.NumVerticesX, CustomHlsl001C357FC6500FC33E1A91D1DF8908A4E9DCF52003D_FuncOutput_LinearIndex);\n\tSetTriangleVertices_Emitter_GridMesh_UEImpureCall(Constant9, Result6, CustomHlsl0017D7166C28D9D07A987BBFD24789C46726E8F9B7A_FuncOutput_LinearIndex, CustomHlsl001D76F703A2D630AD6CC758F8778DD55C2303140EC_FuncOutput_LinearIndex, CustomHlsl001C357FC6500FC33E1A91D1DF8908A4E9DCF52003D_FuncOutput_LinearIndex);\n\tbool Constant13 = true;\n\tint Constant14 = 1;\n\tint Result9 = Result6 + Constant14;\n\tint CustomHlsl001F8AA8223F3C3A900A36F3E5878B5B6CED5DEF29C_FuncOutput_LinearIndex;\n\tCustomHlsl001F8AA8223F3C3A900A36F3E5878B5B6CED5DEF29C_Func(CustomHlslB7064B13A3D94B8CC572DEC38D8216475FE3AD2C_FuncOutput_IndexX, Result8, Context.MapSimStage2_CreateTriangles.ScratchModule_06.NumVerticesX, CustomHlsl001F8AA8223F3C3A900A36F3E5878B5B6CED5DEF29C_FuncOutput_LinearIndex);\n\tSetTriangleVertices_Emitter_GridMesh_UEImpureCall(Constant13, Result9, CustomHlsl001C357FC6500FC33E1A91D1DF8908A4E9DCF52003D_FuncOutput_LinearIndex, CustomHlsl001F8AA8223F3C3A900A36F3E5878B5B6CED5DEF29C_FuncOutput_LinearIndex, CustomHlsl0017D7166C28D9D07A987BBFD24789C46726E8F9B7A_FuncOutput_LinearIndex);\n}\n",
+      "sha256": "c7bc93fe035ca29c854c44f1967d7cb380cba337200b53a9d25647831af538f5"
+    }
+  },
+  "vectors": [
+    {
+      "dimensions": [
+        1,
+        1
+      ],
+      "outputs": {
+        "Emitter.VertexCount": 4,
+        "Emitter.TriangleCount": 2,
+        "Emitter.NumCellsX": 1,
+        "Emitter.NumCellsY": 1,
+        "Emitter.NumVerticesX": 2,
+        "Emitter.NumVerticesY": 2
+      }
+    },
+    {
+      "dimensions": [
+        7,
+        3
+      ],
+      "outputs": {
+        "Emitter.VertexCount": 32,
+        "Emitter.TriangleCount": 42,
+        "Emitter.NumCellsX": 7,
+        "Emitter.NumCellsY": 3,
+        "Emitter.NumVerticesX": 8,
+        "Emitter.NumVerticesY": 4
+      }
+    },
+    {
+      "dimensions": [
+        3,
+        7
+      ],
+      "outputs": {
+        "Emitter.VertexCount": 32,
+        "Emitter.TriangleCount": 42,
+        "Emitter.NumCellsX": 3,
+        "Emitter.NumCellsY": 7,
+        "Emitter.NumVerticesX": 4,
+        "Emitter.NumVerticesY": 8
+      }
+    },
+    {
+      "dimensions": [
+        512,
+        241
+      ],
+      "outputs": {
+        "Emitter.VertexCount": 124146,
+        "Emitter.TriangleCount": 246784,
+        "Emitter.NumCellsX": 512,
+        "Emitter.NumCellsY": 241,
+        "Emitter.NumVerticesX": 513,
+        "Emitter.NumVerticesY": 242
+      }
+    }
+  ],
+  "caveat": "Serialized source graph and cached shader evidence; no executing Unreal comparison. Packed attribute values/types are retained with an interleaved WGPU layout. Surface displacement, foam and water shading remain separate ports."
+}

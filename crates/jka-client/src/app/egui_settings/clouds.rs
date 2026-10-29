@@ -32,6 +32,27 @@ impl App {
         });
         if self.video.cloud_backend == 1 { self.egui_native_clouds(ui); }
 
+        ui.add_enabled_ui(self.video.clouds, |ui| {
+            theme::section(ui, "RENDER COST", "Resolution applies to either cloud renderer.");
+            const CLOUD_RES: [(CloudRenderResolution, &str); 4] = [
+                (CloudRenderResolution::Quarter, "25%"),
+                (CloudRenderResolution::Half, "50%"),
+                (CloudRenderResolution::ThreeQuarter, "75%"),
+                (CloudRenderResolution::Full, "100%"),
+            ];
+            if let Some(target) = quality_table_row(
+                ui,
+                "Render resolution",
+                "Cloud buffer size on each axis before upscaling. 50% processes one quarter as many cloud pixels; 25% processes one sixteenth. Lower values soften fine detail. Blue Water retains its 4×4 temporal reconstruction at this resolution; its shadow maps and sky bake use the quality preset.",
+                theme::Reset::Environment(ui::ENV_ROW_CLOUD_RENDER_RESOLUTION),
+                self.video.cloud_render_resolution,
+                &CLOUD_RES,
+                1,
+            ) {
+                self.set_environment_quality_segment(ui::ENV_ROW_CLOUD_RENDER_RESOLUTION, target);
+            }
+        });
+
         ui.add_enabled_ui(self.video.clouds && self.video.cloud_backend == 0, |ui| {
             const TYPES: [(CloudType, &str); 3] = [
                 (CloudType::Cumulus, "Cumulus"),
@@ -56,8 +77,7 @@ impl App {
             theme::row(
                 ui,
                 "Raymarch quality",
-                "Steps taken through the cloud volume. The single biggest cost in \
-             this section: lower it first if clouds are expensive.",
+                "JKA steps through the cloud volume, shadow samples and detailed distance. Independent of render resolution: lower quality does less work per ray; lower resolution traces fewer rays.",
                 theme::Reset::Environment(ui::ENV_ROW_CLOUD_QUALITY),
                 |ui| {
                     let mut value = self.video.cloud_quality;
@@ -105,25 +125,6 @@ impl App {
                 },
             );
 
-            theme::section(ui, "RENDER COST", "");
-            const CLOUD_RES: [(CloudRenderResolution, &str); 4] = [
-                (CloudRenderResolution::Quarter, "25%"),
-                (CloudRenderResolution::Half, "50%"),
-                (CloudRenderResolution::ThreeQuarter, "75%"),
-                (CloudRenderResolution::Full, "100%"),
-            ];
-            if let Some(target) = quality_table_row(
-                ui,
-                "Render resolution",
-                "Fraction of the screen resolution the clouds are marched at before \
-             being upscaled. 50% is roughly four times cheaper than full.",
-                theme::Reset::Environment(ui::ENV_ROW_CLOUD_RENDER_RESOLUTION),
-                self.video.cloud_render_resolution,
-                &CLOUD_RES,
-                1,
-            ) {
-                self.set_environment_quality_segment(ui::ENV_ROW_CLOUD_RENDER_RESOLUTION, target);
-            }
             self.egui_environment_toggle(
                 ui,
                 "Temporal interleave",

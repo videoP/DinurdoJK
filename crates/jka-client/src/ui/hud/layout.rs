@@ -10,6 +10,9 @@ pub enum HudElementId {
     Shield,
     Ammo,
     Force,
+    Score,
+    MiniScores,
+    EnemyInfo,
     MovementKeys,
     Fps,
     Chat,
@@ -39,11 +42,14 @@ impl HudElementId {
     // position is now the clickable `OverlayMode::Trace` egui menu, which
     // isn't a draggable HUD element. The variant, its cvar prefix and its
     // offset field stay (see `element`/`element_mut`) so old configs still load.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::Health,
         Self::Shield,
         Self::Ammo,
         Self::Force,
+        Self::Score,
+        Self::MiniScores,
+        Self::EnemyInfo,
         Self::MovementKeys,
         Self::Fps,
         Self::Chat,
@@ -73,6 +79,9 @@ impl HudElementId {
             Self::Shield => "SHIELD",
             Self::Ammo => "AMMO / STYLE",
             Self::Force => "FORCE",
+            Self::Score => "HUD SCORE",
+            Self::MiniScores => "TEAM / DUEL SCORES",
+            Self::EnemyInfo => "ENEMY INFO",
             Self::MovementKeys => "MOVEMENT KEYS",
             Self::Fps => "FPS / PERF",
             Self::Chat => "CHAT",
@@ -105,6 +114,9 @@ impl HudElementId {
             Self::Shield => "cg_hudShield",
             Self::Ammo => "cg_hudAmmo",
             Self::Force => "cg_hudForce",
+            Self::Score => "cg_hudScore",
+            Self::MiniScores => "cg_hudMiniScores",
+            Self::EnemyInfo => "cg_hudEnemyInfo",
             Self::MovementKeys => "cg_hudMovementKeys",
             Self::Fps => "cg_hudFps",
             Self::Chat => "cg_hudChat",
@@ -274,6 +286,9 @@ pub struct HudLayout {
     pub shield: HudElementLayout,
     pub ammo: HudElementLayout,
     pub force: HudElementLayout,
+    pub score: HudElementLayout,
+    pub mini_scores: HudElementLayout,
+    pub enemy_info: HudElementLayout,
     pub movement_keys: HudElementLayout,
     pub fps: HudElementLayout,
     pub chat: HudElementLayout,
@@ -312,6 +327,9 @@ pub(in crate::ui) const HUD_UNMOVED: HudElementLayout = HudElementLayout {
 impl Default for HudLayout {
     fn default() -> Self {
         Self {
+            score: HUD_UNMOVED,
+            mini_scores: HUD_UNMOVED,
+            enemy_info: HUD_UNMOVED,
             movement_keys: HUD_UNMOVED,
             fps: HUD_UNMOVED,
             chat: HUD_UNMOVED,
@@ -338,25 +356,25 @@ impl Default for HudLayout {
             // These resolve to the exact pre-editor positions at scale 1.0.
             health: HudElementLayout {
                 anchor: HudAnchor::BottomLeft,
-                offset: [24.0, -58.0],
+                offset: [24.0, -56.0],
                 scale: 1.0,
                 extent: [1.0, 1.0],
             },
             shield: HudElementLayout {
                 anchor: HudAnchor::BottomLeft,
-                offset: [24.0, -28.0],
+                offset: [24.0, -24.0],
                 scale: 1.0,
                 extent: [1.0, 1.0],
             },
             ammo: HudElementLayout {
                 anchor: HudAnchor::BottomRight,
-                offset: [-24.0, -58.0],
+                offset: [-24.0, -56.0],
                 scale: 1.0,
                 extent: [1.0, 1.0],
             },
             force: HudElementLayout {
                 anchor: HudAnchor::BottomRight,
-                offset: [-24.0, -28.0],
+                offset: [-24.0, -24.0],
                 scale: 1.0,
                 extent: [1.0, 1.0],
             },
@@ -373,6 +391,9 @@ impl HudLayout {
             HudElementId::Shield => self.shield,
             HudElementId::Ammo => self.ammo,
             HudElementId::Force => self.force,
+            HudElementId::Score => self.score,
+            HudElementId::MiniScores => self.mini_scores,
+            HudElementId::EnemyInfo => self.enemy_info,
             HudElementId::MovementKeys => self.movement_keys,
             HudElementId::Fps => self.fps,
             HudElementId::Chat => self.chat,
@@ -405,6 +426,9 @@ impl HudLayout {
             HudElementId::Shield => &mut self.shield,
             HudElementId::Ammo => &mut self.ammo,
             HudElementId::Force => &mut self.force,
+            HudElementId::Score => &mut self.score,
+            HudElementId::MiniScores => &mut self.mini_scores,
+            HudElementId::EnemyInfo => &mut self.enemy_info,
             HudElementId::MovementKeys => &mut self.movement_keys,
             HudElementId::Fps => &mut self.fps,
             HudElementId::Chat => &mut self.chat,
@@ -434,6 +458,35 @@ impl HudLayout {
     pub fn reset_element(&mut self, id: HudElementId) {
         *self.element_mut(id) = HudLayout::default().element(id);
     }
+
+    /// Render Studio stores positional offsets in a stable 1280x720 reference
+    /// frame. Apply the conversion at the actual offscreen target resolution,
+    /// not at the editor size, so preview and rendered output remain aligned.
+    pub fn studio_for_frame(self, width:u32, height:u32)->Self {
+        let mut scaled=self;
+        let sx=width.max(1) as f32/1280.0;
+        let sy=height.max(1) as f32/720.0;
+        for id in HudElementId::ALL {
+            let element=scaled.element_mut(id);
+            element.offset[0]*=sx;
+            element.offset[1]*=sy;
+        }
+        scaled
+    }
+
+    /// Convert existing gameplay pixel offsets into Studio reference offsets
+    /// when the user explicitly chooses Copy gameplay.
+    pub fn studio_from_frame(self,width:u32,height:u32)->Self {
+        let mut virtual_layout=self;
+        let sx=width.max(1) as f32/1280.0;
+        let sy=height.max(1) as f32/720.0;
+        for id in HudElementId::ALL {
+            let element=virtual_layout.element_mut(id);
+            element.offset[0]/=sx;
+            element.offset[1]/=sy;
+        }
+        virtual_layout
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -450,6 +503,10 @@ pub struct HudRect {
 pub struct HudRectContext {
     pub movement_keys: MovementKeysSettings,
     pub draw_fps: u8,
+    pub draw_timer: bool,
+    /// The independently placed cg_drawScores display (Tayst mode 1/2 vs 3).
+    pub mini_scores_mode: i32,
+    pub score_offset: [f32; 2],
     pub gpu_enabled: bool,
     pub cull_debug: bool,
     pub thread_count: usize,
@@ -470,10 +527,16 @@ impl HudRectContext {
         thread_count: usize,
         race: &crate::japro_cg::JaproCgame,
         strafe_helper: crate::ui::StrafeHelperSettings,
+        draw_timer: bool,
+        score_offset: [f32; 2],
+        mini_scores_mode: i32,
     ) -> Self {
         Self {
             movement_keys,
             draw_fps: video.draw_fps,
+            draw_timer,
+            mini_scores_mode,
+            score_offset,
             gpu_enabled: perf.gpu_ms.is_some(),
             cull_debug: video.cull_debug != CullDebugMode::Off,
             thread_count,
@@ -503,13 +566,20 @@ impl HudRectContext {
             ui.threads.len(),
             &race,
             ui.strafe_helper,
+            ui.game_timer.is_some(),
+            ui.hud_score.as_ref().map_or([0.0; 2], |score| score.offset),
+            match ui.mini_scores.as_ref() {
+                Some(crate::ui::UiMiniScores::Team { mode, .. }) => *mode,
+                Some(crate::ui::UiMiniScores::Duel { .. }) => 3,
+                None => 1,
+            },
         )
     }
 }
 
 /// Stock (untransformed) rectangle of an element that is not anchored. These are
 /// the bounds the editor outlines; text elements are sized for typical content.
-pub(in crate::ui) fn hud_stock_rect(
+pub(crate) fn hud_stock_rect(
     id: HudElementId,
     ctx: &HudRectContext,
     w: u32,
@@ -563,6 +633,42 @@ pub(in crate::ui) fn hud_stock_rect(
                 height: 13.0,
             }
         }
+        HudElementId::Score => {
+            // TaystJK's score is right-aligned to the left side of the right
+            // player HUD. Keep this stock location separate from the editable
+            // Force panel so either HUD element can move independently.
+            let force = hud_element_rect(HudElementId::Force, HudLayout::default().force, ctx, w, h);
+            let ratio = crate::lagometer::width_ratio_coef(w, h);
+            let right = force.x - 8.0 * sy + ctx.score_offset[0] * sy * ratio;
+            let bottom = force.y + force.height - (7.0 + ctx.score_offset[1]) * sy;
+            HudRect { x: right - 122.0*sy, y: bottom - 38.0*sy,
+                      width: 122.0*sy, height: 38.0*sy }
+        }
+        HudElementId::MiniScores => {
+            // Match the actual cg_drawScores drawing origin in hud/scores.rs.
+            // A separate layout leaves cg_drawScore's Force-adjacent readout alone.
+            if ctx.mini_scores_mode == 3 {
+                // The centred 2-box and duel layouts are symmetric about x=320.
+                virtual_rect(265.0, 8.0, 110.0, 30.0)
+            } else {
+                let rows = (ctx.draw_fps != 0) as u8 as f32 + ctx.draw_timer as u8 as f32;
+                // The upper-right stack uses square HUD glyphs, not a stretched
+                // full-screen width. This is the selectable label's typical width.
+                let width = 150.0 * sy;
+                HudRect {
+                    x: (w as f32 - 10.0 - width).max(8.0),
+                    y: (12.0 + rows * 22.0) * sy,
+                    width,
+                    height: 12.0 * sy,
+                }
+            }
+        }
+        HudElementId::EnemyInfo => {
+            let rows = (ctx.draw_fps != 0) as u8 + ctx.draw_timer as u8;
+            // Matches CG_DrawUpperRight stacking. An editor-sized rectangle
+            // includes the icon, name, title, optional duel score and bar.
+            virtual_rect(500.0, 17.0 + 22.0*rows as f32, 135.0, 112.0)
+        }
         HudElementId::Chat => virtual_rect(30.0, 373.0, CHATBOX_CUTOFF, 52.0),
         HudElementId::CenterPrint => virtual_rect(170.0, 126.0, 300.0, 36.0),
         HudElementId::CrosshairName => virtual_rect(220.0, 168.0, 200.0, 22.0),
@@ -585,7 +691,16 @@ pub(in crate::ui) fn hud_stock_rect(
             virtual_rect(x - coef, y, 49.0 * coef, height)
         }
         HudElementId::Speedometer => {
-            HudRect { x:320.0*sx-62.0*sy, y:200.0*sy, width:124.0*sy, height:30.0*sy }
+            // The actual speedometer configuration is authored in 640x480
+            // coordinates (jaPRO defaults: x=132, y=459). Do not force the
+            // HUD editor and both render providers into the screen center.
+            let speed = ctx.speedometer;
+            HudRect {
+                x: speed.x * sx,
+                y: (speed.y - 24.0) * sy,
+                width: 124.0 * sy,
+                height: 24.0 * sy,
+            }
         }
         HudElementId::SpeedometerJumps => {
             let s = &ctx.speedometer;
@@ -636,6 +751,205 @@ pub(in crate::ui) fn hud_stock_rect(
             }
         }
     }
+}
+
+
+/// Convert a freeform scale to a scale that makes the displayed rectangle's
+/// width OR height an exact grid multiple. These HUD elements use uniform scale
+/// (nonuniform scaling would distort fonts/icons), so both dimensions cannot
+/// always be multiples simultaneously. Pick the closest achievable scale.
+pub fn snap_hud_scale_to_grid(
+    id: HudElementId, mut layout: HudElementLayout, requested: f32,
+    ctx: &HudRectContext, w: u32, h: u32, grid: f32,
+) -> f32 {
+    layout.scale = 1.0;
+    let base = hud_element_rect(id, layout, ctx, w, h);
+    snap_hud_dimensions_scale([base.width, base.height], requested, grid)
+}
+
+/// The scale quantizer shared by gameplay and Studio (whose grid is expressed
+/// in its 1280x720 reference coordinates rather than the output framebuffer).
+pub fn snap_hud_dimensions_scale(dimensions: [f32; 2], requested: f32, grid: f32) -> f32 {
+    let mut best = requested.clamp(0.5, 2.0);
+    let mut error = f32::INFINITY;
+    for dimension in dimensions {
+        if dimension < 1.0 || !dimension.is_finite() { continue; }
+        let candidate = ((dimension * requested / grid).round().max(1.0) * grid
+            / dimension).clamp(0.5, 2.0);
+        let candidate_error = (candidate - requested).abs();
+        if candidate_error < error {
+            error = candidate_error;
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// Snap the *actual screen rectangle*, not the stored offset. Offsets are
+/// relative to different stock positions/anchors and cannot be snapped to a
+/// screen-wide grid directly. Neighbor candidates include aligned near edges,
+/// matched opposite edges, and touching edges, with each axis independent.
+/// Position is returned in the same coordinates as `moving`.
+pub fn snap_hud_rect_position(
+    moving: HudRect, neighbors: impl IntoIterator<Item = HudRect>,
+    grid: f32, threshold: f32, nearby: f32,
+) -> ([f32; 2], [bool; 2]) {
+    let mut position = [
+        (moving.x / grid).round() * grid,
+        (moving.y / grid).round() * grid,
+    ];
+    let mut distances = [threshold, threshold];
+    let mut matched = [false, false];
+    for neighbor in neighbors {
+        if neighbor.width <= 0.0 || neighbor.height <= 0.0 { continue; }
+        let gap_x = (neighbor.x - (moving.x + moving.width))
+            .max(moving.x - (neighbor.x + neighbor.width)).max(0.0);
+        let gap_y = (neighbor.y - (moving.y + moving.height))
+            .max(moving.y - (neighbor.y + neighbor.height)).max(0.0);
+        // Compare X edges for horizontally adjacent or stacked panels, and Y
+        // edges for vertically adjacent or side-by-side panels.
+        if gap_y <= nearby {
+            for x in [neighbor.x, neighbor.x + neighbor.width - moving.width,
+                      neighbor.x - moving.width, neighbor.x + neighbor.width] {
+                let diff = (moving.x - x).abs();
+                if diff < distances[0] { distances[0] = diff; position[0] = x; matched[0] = true; }
+            }
+        }
+        if gap_x <= nearby {
+            for y in [neighbor.y, neighbor.y + neighbor.height - moving.height,
+                      neighbor.y - moving.height, neighbor.y + neighbor.height] {
+                let diff = (moving.y - y).abs();
+                if diff < distances[1] { distances[1] = diff; position[1] = y; matched[1] = true; }
+            }
+        }
+    }
+    (position, matched)
+}
+
+/// Quantize default scales and position all HUD rectangles on editor entry
+/// or reset. Keep custom scales while normalizing their visible screen edges;
+/// old archived offsets can otherwise leave the default grid misaligned.
+/// The grid is in real screen pixels, not 640x480 stock coordinates.
+impl HudLayout {
+    pub fn align_default_elements_to_grid(
+        &mut self, ctx: &HudRectContext, w: u32, h: u32,
+    ) -> bool {
+        if !self.snap_to_grid || w == 0 || h == 0 { return false; }
+        let defaults = Self::default();
+        let grid = self.grid_size.clamp(1.0, 64.0);
+        let mut changed = false;
+        for id in HudElementId::ALL {
+            let original = self.element(id);
+            // The preceding release used -58 / -28 for the core bars.
+            // Treat those untouched archived offsets as defaults as well.
+            let legacy_core = if id.is_anchored() && original.scale == 1.0
+                && original.extent == [1.0, 1.0] {
+                let old_offset = match id {
+                    HudElementId::Health => Some([24.0, -58.0]),
+                    HudElementId::Shield => Some([24.0, -28.0]),
+                    HudElementId::Ammo => Some([-24.0, -58.0]),
+                    HudElementId::Force => Some([-24.0, -28.0]),
+                    _ => None,
+                };
+                old_offset == Some(original.offset) && original.anchor == defaults.element(id).anchor
+            } else { false };
+            if original != defaults.element(id) && !legacy_core { continue; }
+            let mut layout = original;
+            layout.scale = snap_hud_scale_to_grid(id, layout, layout.scale, ctx, w, h, grid);
+            let rect = hud_element_rect(id, layout, ctx, w, h);
+            let (position, _) = snap_hud_rect_position(rect, [], grid, 0.0, 0.0);
+            layout.offset[0] += position[0] - rect.x;
+            layout.offset[1] += position[1] - rect.y;
+            if layout != original {
+                *self.element_mut(id) = layout;
+                changed = true;
+            }
+        }
+        changed |= self.align_all_positions_to_grid(ctx, w, h);
+        changed
+    }
+
+    /// Explicit editor reset and entry always normalize every displayed
+    /// rectangle's actual position, even when old archived HUD offsets are
+    /// present. Snapping only layouts equal to `Default` left existing configs
+    /// visibly off-grid after opening HUD Edit. Keep customized scale/size;
+    /// RESET ALL starts from defaults so those will be quantized separately.
+    pub fn align_all_positions_to_grid(
+        &mut self, ctx: &HudRectContext, w: u32, h: u32,
+    ) -> bool {
+        if !self.snap_to_grid || w == 0 || h == 0 { return false; }
+        let grid = self.grid_size.clamp(1.0, 64.0);
+        let mut changed = false;
+        for id in HudElementId::ALL {
+            let original = self.element(id);
+            let rect = hud_element_rect(id, original, ctx, w, h);
+            if rect.width <= 0.0 || rect.height <= 0.0 { continue; }
+            // The grid is screen-origin anchored. Match the upper-left edge,
+            // not the anchor-relative offset (which differs per HUD element).
+            let dx = (rect.x / grid).round() * grid - rect.x;
+            let dy = (rect.y / grid).round() * grid - rect.y;
+            if dx.abs() > 0.0001 || dy.abs() > 0.0001 {
+                let target = self.element_mut(id);
+                target.offset[0] += dx;
+                target.offset[1] += dy;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn align_reset_element_to_grid(
+        &mut self, id: HudElementId, ctx: &HudRectContext, w: u32, h: u32,
+    ) {
+        if !self.snap_to_grid { return; }
+        let grid = self.grid_size.clamp(1.0, 64.0);
+        let mut layout = self.element(id);
+        layout.scale = snap_hud_scale_to_grid(id, layout, layout.scale, ctx, w, h, grid);
+        let rect = hud_element_rect(id, layout, ctx, w, h);
+        let (position, _) = snap_hud_rect_position(rect, [], grid, 0.0, 0.0);
+        layout.offset[0] += position[0] - rect.x;
+        layout.offset[1] += position[1] - rect.y;
+        *self.element_mut(id) = layout;
+    }
+}
+
+/// Snaps a resize to the dimensions of nearby, currently visible HUD items.
+/// Operates in *screen pixels* (or preview points when passed preview bounds),
+/// never grid coordinates, so it also works with non-grid-sized neighbors.
+/// Axes are independent: e.g. a chat box can match the width of one adjacent
+/// item and the height of another. The caller keeps the opposite drag edges fixed.
+/// Returns the snapped width/height and whether each axis matched.
+pub fn snap_hud_neighbor_size(
+    moving: HudRect,
+    neighbors: impl IntoIterator<Item = HudRect>,
+    threshold: f32,
+    nearby: f32,
+) -> ([f32; 2], [bool; 2]) {
+    let mut result = [moving.width, moving.height];
+    let mut distances = [threshold, threshold];
+    let mut matched = [false, false];
+    for neighbor in neighbors {
+        if neighbor.width <= 0.0 || neighbor.height <= 0.0 { continue; }
+        // Gaps are zero when the two screen intervals overlap. Only compare
+        // sizes of actual neighbors, not arbitrary HUD items far across screen.
+        let gap_x = (neighbor.x - moving.x - moving.width)
+            .max(moving.x - neighbor.x - neighbor.width).max(0.0);
+        let gap_y = (neighbor.y - moving.y - moving.height)
+            .max(moving.y - neighbor.y - neighbor.height).max(0.0);
+        if gap_x > nearby || gap_y > nearby { continue; }
+        for (axis, target) in [neighbor.width, neighbor.height].into_iter().enumerate() {
+            // Compare against the unmodified proposed size, so iteration order
+            // never determines which of several nearby items wins.
+            let proposed = if axis == 0 { moving.width } else { moving.height };
+            let diff = (proposed - target).abs();
+            if diff < distances[axis] {
+                result[axis] = target;
+                distances[axis] = diff;
+                matched[axis] = true;
+            }
+        }
+    }
+    (result, matched)
 }
 
 /// Scale a drawn element about the centre of its stock rectangle, then shift it.
@@ -722,7 +1036,7 @@ pub fn hud_element_rect(
             height,
         };
     }
-    let base_panel_w = 218.0_f32.min((w as f32 * 0.30).max(160.0));
+    let base_panel_w = 216.0_f32.min((w as f32 * 0.30).max(160.0));
     let base_size = [base_panel_w, 24.0];
     let width = base_size[0] * scale;
     let height = base_size[1] * scale;
@@ -735,5 +1049,61 @@ pub fn hud_element_rect(
         y: anchor_y - align[1] * height,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod neighbor_resize_tests {
+    use super::{snap_hud_neighbor_size, snap_hud_rect_position, HudRect};
+
+
+    #[test]
+    fn snaps_real_edges_to_grid_not_a_stock_relative_offset() {
+        let moving=HudRect{x:237.0,y:49.0,width:233.0,height:41.0};
+        let (position,matched)=snap_hud_rect_position(moving,[],8.0,12.0,32.0);
+        assert_eq!(position,[240.0,48.0]);
+        assert_eq!(matched,[false,false]);
+    }
+
+    #[test]
+    fn touching_neighbors_override_grid_and_align_independent_axes() {
+        let moving=HudRect{x:238.0,y:55.0,width:220.0,height:24.0};
+        let neighbor=HudRect{x:20.0,y:56.0,width:216.0,height:24.0};
+        let (position,matched)=snap_hud_rect_position(moving,[neighbor],8.0,12.0,32.0);
+        assert_eq!(position,[236.0,56.0]);
+        assert_eq!(matched,[true,true]);
+    }
+
+    #[test]
+    fn distant_neighbors_cannot_pull_placement_off_grid() {
+        let moving=HudRect{x:238.0,y:55.0,width:220.0,height:24.0};
+        let neighbor=HudRect{x:20.0,y:480.0,width:216.0,height:24.0};
+        assert_eq!(snap_hud_rect_position(moving,[neighbor],8.0,12.0,32.0).0,
+                   [240.0,56.0]);
+    }
+
+    #[test]
+    fn matches_both_dimensions_of_touching_neighbors() {
+        let moving=HudRect{x:100.0,y:100.0,width:197.0,height:49.0};
+        let matching=HudRect{x:300.0,y:95.0,width:200.0,height:50.0};
+        assert_eq!(snap_hud_neighbor_size(moving,[matching],8.0,32.0),
+            ([200.0,50.0],[true,true]));
+    }
+
+    #[test]
+    fn does_not_snap_to_distant_matching_panel() {
+        let moving=HudRect{x:100.0,y:100.0,width:197.0,height:49.0};
+        let far=HudRect{x:1000.0,y:700.0,width:200.0,height:50.0};
+        assert_eq!(snap_hud_neighbor_size(moving,[far],8.0,32.0),
+            ([197.0,49.0],[false,false]));
+    }
+
+    #[test]
+    fn each_axis_chooses_closest_eligible_size_independently() {
+        let moving=HudRect{x:100.0,y:100.0,width:197.0,height:49.0};
+        let a=HudRect{x:298.0,y:100.0,width:200.0,height:55.0};
+        let b=HudRect{x:99.0,y:151.0,width:210.0,height:50.0};
+        assert_eq!(snap_hud_neighbor_size(moving,[a,b],12.0,32.0),
+            ([200.0,50.0],[true,true]));
     }
 }

@@ -281,6 +281,26 @@ fn glass_primary_stages_keep_the_specialized_fs_main_program() {
 }
 
 #[test]
+fn foliage_material_flag_survives_world_program_specialization() {
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Mask;
+    let flag = crate::foliage::MATERIAL_FLAG;
+    let foliage = MaterialFragmentKey::from_material([0, 0, 1, flag], 0.5);
+    let ordinary = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.5);
+    for mode in [WorldProgramMode::Specialized, WorldProgramMode::Generated] {
+        let variant = WorldShaderVariantKey {
+            material_specialization: true, program_mode: mode, ..Default::default()
+        };
+        let promoted = program_key(variant, pipeline, foliage);
+        let still = program_key(variant, pipeline, ordinary);
+        assert_eq!(promoted.flags_w & flag, flag);
+        assert_eq!(promoted.flags_w_mask & flag, flag);
+        assert_eq!(still.flags_w & flag, 0);
+        assert_eq!(still.flags_w_mask & flag, flag);
+    }
+}
+
+#[test]
 fn generated_stage_matrix_validates_and_specializes() {
     use wgpu::naga::{self, ShaderStage};
     let minimal = WorldShaderVariantKey {

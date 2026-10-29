@@ -1,7 +1,7 @@
 //! Lighting.
 use crate::app::egui_settings::{
     mode_index, mode_row, quality_row, segmented_row, theme, ui, App, DynamicLightsMode,
-    EntityAmbientLightingMode, DynamicShadowsMode,
+    EntityAmbientLightingMode,
 };
 
 impl App {
@@ -108,7 +108,18 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
-        theme::section(ui, "SUN & ENTITY SHADOWS", "Sun shadows use raster maps, with CSM as the highest setting. Inferred original-lighting lamp shadows are available only in CSM.");
+        // A source-.map editor preview, not a BSP relighting feature. This
+        // remains available even when "Relight map" is disabled.
+        theme::section(ui, "SOURCE .MAP PREVIEW", "Lighting entities from an editable .map file; never adds lamps to compiled BSP maps.");
+        self.egui_toggle_row(
+            ui,
+            ".map light simulation",
+            "When viewing a source .map, approximate authored light and lightJunior entities with clustered lighting. Ignored on compiled BSP worlds; independent of Relight map.",
+            ui::VIDEO_ROW_MAP_LIGHT_SIMULATION,
+            self.video.map_light_simulation,
+        );
+
+        theme::section(ui, "SUN & ENTITY SHADOWS", "Cascaded Shadow Maps is the highest setting for entity sun shadows. Static BSP caster shadows can optionally be enabled in Relighting.");
         self.egui_shadows(ui);
 
         self.egui_toggle_row(
@@ -120,8 +131,7 @@ impl App {
         );
 
         theme::section(ui, "LAMP SHADOWS", "No master switch: inferred moving-object shadows follow the individual lamp-source toggles. Only CSM uses them; original map lightmaps remain intact.");
-        let lamp_shadow_mode = matches!(self.video.dynamic_shadows,
-            DynamicShadowsMode::CascadedShadowMaps);
+        let lamp_shadow_mode = self.video.dynamic_shadows.is_csm();
         ui.add_enabled_ui(lamp_shadow_mode, |ui| {
             self.egui_toggle_row(ui, "Source: glow stages", "Use static shader glow emitters as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_GLOW, self.video.baked_local_sources & 1 != 0);
             self.egui_toggle_row(ui, "Source: additive stages", "Infer lamps from additive stages; broad inference, disabled by default.", ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE, self.video.baked_local_sources & 2 != 0);
@@ -130,7 +140,7 @@ impl App {
             self.egui_toggle_row(ui, "Source: fixed continuous EFX", "Use fixed continuously active EFX lamps. Moving, triggered and intermittent effects are excluded.", ui::VIDEO_ROW_BAKED_LOCAL_FX, self.video.baked_local_sources & 16 != 0);
         });
         if !lamp_shadow_mode {
-            ui.small("Select Cascaded maps (CSM) to use these lamp shadows.");
+            ui.small("Select Cascaded Shadow Maps to use these lamp shadows.");
         }
         const LAMP_SHADOW_AB: [(u8, &str, &str); 5] = [
             (0, "A: Cubes", "Original six-face cubemap generation and sampling (reference)."),
@@ -146,9 +156,6 @@ impl App {
                 let _ = self.set_console_cvar("r_lampShadowAB", &LAMP_SHADOW_AB[target].0.to_string());
             }
         });
-        theme::section(ui, "EXPERIMENTAL ADDED LAMP LIGHTING", "Separate work in progress. Adds inferred illumination over the original lightmap baseline and may duplicate existing baked lamps. Leave off for shadows only.");
-        self.egui_toggle_row(ui, "Add lamp lighting to lightmap (experimental)", "Separate from lamp shadows. Adds illumination over the original baseline; not required for player shadows.", ui::VIDEO_ROW_BAKED_LOCAL_LIGHTS, self.video.baked_local_lights);
-
         const FX_OPTIONS: [(u8, &str, &str); 3] = [
             (0, "Off", "Authored FX lights and faithful missile/entity lights still work."),
             (1, "Conservative", "Existing EFX semantic/material classifier; no additional live projectile lights."),
@@ -166,51 +173,6 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_PROMOTE_FX_LIGHTS;
             self.change_video_setting(target as i32 - current as i32);
         }
-
-        self.egui_toggle_row(
-            ui,
-            "Promote emissive shaders to lights",
-            "Master switch for runtime area-light promotion from visible BSP shader semantics. Glow/additive/emissive evidence is still classified on materials that also have q3map_surfacelight, so you can A/B test either interpretation live. If authored area lights are also enabled, the authored emitter takes priority to prevent double lighting.",
-            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS,
-            self.video.promote_shader_lights,
-        );
-        self.egui_toggle_row(
-            ui,
-            "  Shader source: glow stages",
-            "Promote surfaces with the authored JKA shader-stage `glow` marker. Texture colour/energy and actual BSP surface geometry determine the emitted light.",
-            ui::VIDEO_ROW_PROMOTE_SHADER_GLOW,
-            self.video.promote_shader_glow,
-        );
-        self.egui_toggle_row(
-            ui,
-            "  Shader source: additive stages",
-            "Promote visible additive emission stages (GL_ONE GL_ONE or SRC_ALPHA ONE). This is broader than `glow` and is useful for finding legacy emissive materials that were never tagged for Dynamic Glow.",
-            ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE,
-            self.video.promote_shader_additive,
-        );
-        self.egui_toggle_row(
-            ui,
-            "  Shader source: emissive maps",
-            "Promote modern _emissive/_emission/_emit/_glow companion textures. Mostly-black masks are energy/coverage weighted so the entire surface does not behave like a full-white emitter.",
-            ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
-            self.video.promote_shader_emissive,
-        );
-
-        self.egui_toggle_row(
-            ui,
-            ".map light simulation",
-            "Source .map preview only. Approximates a compiled light stage from authored light/lightJunior entities, including color, strength and q3map-style falloff. It uses the modern clustered renderer and leaves compiled BSP lighting unchanged.",
-            ui::VIDEO_ROW_MAP_LIGHT_SIMULATION,
-            self.video.map_light_simulation,
-        );
-
-        self.egui_toggle_row(
-            ui,
-            "Authored surface / area lights",
-            "Runtime area emitters from mapper-authored q3map_surfacelight metadata. Shader-driven glow/additive/emissive promotion is controlled separately above, so the same surface is never emitted twice.",
-            ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS,
-            self.video.emissive_area_lights,
-        );
 
         let ao_mode = if self.video.ssao {
             1usize

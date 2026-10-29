@@ -66,7 +66,7 @@ mod tests {
         } }
         let image = TextureData {
             label: "test".into(), source: None, width: 64, height: 64,
-            rgba, rgba16f: None, mip_level_count: 1, clamp: false, srgb: true,
+            rgba: (rgba).into(), rgba16f: None, mip_level_count: 1, clamp: false, srgb: true,
         };
         let t = mark_color_thumbnail(&image, [1.0; 3]).unwrap();
         assert!(t.pixels[8 * 32 + 4][2] > t.pixels[8 * 32 + 4][0]);

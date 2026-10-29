@@ -17,7 +17,9 @@ impl App {
     pub(in crate::app) fn queue_config_save(&mut self) {
         // Offline captures may override video/game settings for a comparison;
         // never persist them over the interactive user's configuration.
-        if super::lifecycle::headless() { return; }
+        // Inside Render Studio the renderer runs a Studio graphics profile;
+        // gameplay values were flushed on entry and are restored on exit.
+        if super::lifecycle::headless() || self.render_studio.graphics_gameplay.is_some() { return; }
         if !self.config_dirty {
             return;
         }
@@ -74,6 +76,10 @@ impl App {
             score_deaths: self.score_deaths,
             score_spectator_guess: self.score_spectator_guess,
             draw_scores: self.draw_scores,
+            draw_score: self.draw_score,
+            draw_score_x: self.draw_score_x,
+            draw_score_y: self.draw_score_y,
+            draw_enemy_info: self.draw_enemy_info,
             mouse: self.mouse_input,
             fov: self.camera.cg_fov(),
             model: self.solo_client_info.model_cvar(),
@@ -91,6 +97,7 @@ impl App {
             race_ghost_distance_delta: self.race_ghost_distance_delta,
             race_ghost_demo_base_url: self.race_ghost_demo_base_url.clone(),
             console_timestamps: self.console_timestamps,
+            console_scale: self.console_scale,
             console_notify_lines: self.console_notify_lines,
             console_notify_words: self.console_notify_words.clone(),
             console_notify_connect: self.console_notify_connect,
@@ -119,6 +126,7 @@ impl App {
             server_filters: self.server_browser.filters_string(),
         };
         let path = self.config_path.clone();
+        let fs_roots = self.fs_roots.clone();
         let bindings = self.bindings.clone();
         let audio = self.audio.clone();
         let generation = self.config_save_generation.wrapping_add(1);
@@ -127,7 +135,24 @@ impl App {
             // Report serialization panics as a failed save instead of letting
             // the shared queue swallow the panic and silently lose settings.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                config::save_video_settings(&path, settings, &bindings, &presentation, &audio)
+                config::save_video_settings(&path, settings, &bindings, &presentation, &audio)?;
+                // Keep writeconfig faithful to the cvar console even though
+                // path discovery at startup uses the exe-local bootstrap file.
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true).open(&path).map_err(|e| e.to_string())?;
+                let value = |path: &Option<std::path::PathBuf>|
+                    path.as_ref().map_or(String::new(), |p| p.display().to_string());
+                writeln!(file, "\n// Filesystem paths (restart required; mirrored in DinurdoJK-paths.ini)")
+                    .map_err(|e| e.to_string())?;
+                for (name, value) in [
+                    ("fs_homepath", value(&fs_roots.homepath)),
+                    ("fs_cdpath", value(&fs_roots.cdpath)),
+                    ("fs_forcegame", fs_roots.forcegame.unwrap_or_default()),
+                ] {
+                    writeln!(file, "seta {name} \"{value}\"").map_err(|e| e.to_string())?;
+                }
+                Ok(())
             }))
             .unwrap_or_else(|_| Err("config serialization panicked".to_owned()));
             let _ = tx.send(super::background_jobs::JobResult::ConfigSaved { generation, result });

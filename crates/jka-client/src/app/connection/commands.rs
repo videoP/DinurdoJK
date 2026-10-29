@@ -296,6 +296,7 @@ impl App {
             Some(action @ (GameCommand::InventoryNext | GameCommand::InventoryPrev)) => {
                 if let Some(ps) = self.live_player_state().cloned() {
                     self.live_input.cycle_inventory(&ps, matches!(action, GameCommand::InventoryNext));
+                    self.show_inventory_selection(&ps);
                 }
                 return true;
             }
@@ -325,10 +326,12 @@ impl App {
                                 || !crate::net::LiveInput::has_selectable_force(&ps)
                             {
                                 self.live_input.cycle_inventory(&ps, forward);
+                                self.show_inventory_selection(&ps);
                             } else {
                                 self.live_input.cycle_force(&ps, forward);
                                 self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
                                 self.weapon_select_until = None;
+                                self.inventory_select_until = None;
                                 self.publish_transient_ui();
                             }
                         }
@@ -343,6 +346,7 @@ impl App {
                     {
                         self.weapon_select_until = Some(Instant::now() + Duration::from_millis(1400));
                         self.force_select_until = None;
+                        self.inventory_select_until = None;
                         self.publish_transient_ui();
                     }
                 }

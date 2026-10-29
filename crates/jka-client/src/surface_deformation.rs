@@ -401,7 +401,9 @@ pub struct SurfaceDeformationGpu {
     field_views: [wgpu::TextureView; 2],
     field_sampler: wgpu::Sampler,
     brush_texture: wgpu::Texture,
+    brush_view: wgpu::TextureView,
     sim_params_buffer: wgpu::Buffer,
+    sim_layout: wgpu::BindGroupLayout,
     sim_bind_groups: [wgpu::BindGroup; 2],
     sim_pipeline: wgpu::RenderPipeline,
     pending_brushes: Vec<SnowflowBrush>,
@@ -412,6 +414,38 @@ pub struct SurfaceDeformationGpu {
     focus: Vec2,
     relax_owed: f32,
     last_update: Instant,
+}
+
+fn create_fields(device: &wgpu::Device, resolution: u32) -> ([wgpu::Texture; 2], [wgpu::TextureView; 2]) {
+    let field_desc = wgpu::TextureDescriptor {
+        label: Some("Snowflow persistent deformation field"),
+        size: wgpu::Extent3d { width: resolution, height: resolution, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    let textures = [device.create_texture(&field_desc), device.create_texture(&field_desc)];
+    let views = [
+        textures[0].create_view(&wgpu::TextureViewDescriptor::default()),
+        textures[1].create_view(&wgpu::TextureViewDescriptor::default()),
+    ];
+    (textures, views)
+}
+
+fn create_sim_bind_groups(
+    device: &wgpu::Device, layout: &wgpu::BindGroupLayout, field_views: &[wgpu::TextureView; 2],
+    field_sampler: &wgpu::Sampler, brush_view: &wgpu::TextureView, sim_params_buffer: &wgpu::Buffer,
+) -> [wgpu::BindGroup; 2] {
+    [0usize, 1usize].map(|prev| device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Snowflow simulation bind group"), layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&field_views[prev]) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(field_sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(brush_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: sim_params_buffer.as_entire_binding() },
+        ],
+    }))
 }
 
 impl SurfaceDeformationGpu {
@@ -429,19 +463,10 @@ impl SurfaceDeformationGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let field_desc = wgpu::TextureDescriptor {
-            label: Some("Snowflow persistent deformation field"),
-            size: wgpu::Extent3d { width: SNOWFLOW_FIELD_RES, height: SNOWFLOW_FIELD_RES, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        };
-        let field_textures = [device.create_texture(&field_desc), device.create_texture(&field_desc)];
-        let field_views = [
-            field_textures[0].create_view(&wgpu::TextureViewDescriptor::default()),
-            field_textures[1].create_view(&wgpu::TextureViewDescriptor::default()),
-        ];
+        // 1x1 zero fields sample exactly like an untouched full field. Maps
+        // with snow surfaces grow them (`set_field_enabled`) before the world
+        // bind groups are built; others never pay 2 x 32 MiB.
+        let (field_textures, field_views) = create_fields(device, 1);
         let field_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Snowflow deformation bilinear wrap sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -475,15 +500,8 @@ impl SurfaceDeformationGpu {
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
-        let sim_bind_groups = [0usize, 1usize].map(|prev| device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Snowflow simulation bind group"), layout: &sim_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&field_views[prev]) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&field_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&brush_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: sim_params_buffer.as_entire_binding() },
-            ],
-        }));
+        let sim_bind_groups = create_sim_bind_groups(device, &sim_layout, &field_views,
+            &field_sampler, &brush_view, &sim_params_buffer);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Snowflow deformation simulation"),
             source: wgpu::ShaderSource::Wgsl(include_str!("snowflow_deformation_sim.wgsl").into()),
@@ -506,14 +524,32 @@ impl SurfaceDeformationGpu {
         Self {
             buffer, legacy_stamps: Vec::with_capacity(MAX_VISUAL_STAMPS), mode: FootprintMode::ThreeD,
             legacy_mark_mask: 0, legacy_mark_blends: 0,
-            _field_textures: field_textures, field_views, field_sampler, brush_texture, sim_params_buffer,
-            sim_bind_groups, sim_pipeline, pending_brushes: Vec::with_capacity(SNOWFLOW_MAX_BRUSHES),
+            _field_textures: field_textures, field_views, field_sampler, brush_texture, brush_view,
+            sim_params_buffer, sim_layout, sim_bind_groups, sim_pipeline, pending_brushes: Vec::with_capacity(SNOWFLOW_MAX_BRUSHES),
             active_field: 0, field_valid: false, center: Vec2::ZERO, prev_center: Vec2::splat(1.0e6),
             focus: Vec2::ZERO, relax_owed: 0.0, last_update: Instant::now(),
         }
     }
 
     pub fn mode(&self) -> FootprintMode { self.mode }
+
+    /// Full-resolution persistent fields only for maps with snow surfaces.
+    /// Returns true when the views changed: the caller must rebuild the world
+    /// surface bind groups that sample them. Resizing discards the field.
+    pub fn set_field_enabled(&mut self, device: &wgpu::Device, enabled: bool) -> bool {
+        let resolution = if enabled { SNOWFLOW_FIELD_RES } else { 1 };
+        if self._field_textures[0].width() == resolution {
+            return false;
+        }
+        let (textures, views) = create_fields(device, resolution);
+        self.sim_bind_groups = create_sim_bind_groups(device, &self.sim_layout, &views,
+            &self.field_sampler, &self.brush_view, &self.sim_params_buffer);
+        self._field_textures = textures;
+        self.field_views = views;
+        self.active_field = 0;
+        self.field_valid = false;
+        true
+    }
 
     pub fn set_mode(&mut self, queue: &wgpu::Queue, mode: FootprintMode) {
         self.mode = mode;

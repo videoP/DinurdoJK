@@ -7,6 +7,49 @@ use crate::ui::InlineTransformMode;
 type CvarDef = crate::console::cvars::CvarDef<App>;
 
 app_cvars! {
+    APP_R_FOLIAGEWIND {
+        runtime: CvarDef::new("r_foliageWind", "", "0|1", "Wind sway for automatically detected tree, leaf, plant and grass cards. Updates live; procedural Godot grass keeps its own wind animation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.foliage_wind)),
+            |app, value| App::cvar_set_r_foliagewind(app, APP_R_FOLIAGEWIND.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_foliagewind, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.foliage_wind = parse_bool(value).unwrap_or(settings.foliage_wind);
+            }),
+            archive: Some((70, |state| bool_value(state.video.foliage_wind))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_foliagewind(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.foliage_wind = enabled;
+                self.render_command(RenderCommand::SetFoliageWind(enabled));
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_RELIGHTMAP {
+        runtime: CvarDef::new("r_relightMap", "", "0|1", "Master runtime map relighting gate. Off preserves authored lighting and retains saved edits. Sun and moon positions are on Sky. r_sunOverride is a legacy alias.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.sun_override)),
+            |app, value| App::cvar_set_r_relightmap(app, APP_R_RELIGHTMAP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_relightmap, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.sun_override = parse_bool(value).unwrap_or(settings.sun_override);
+            }),
+            archive: Some((56, |state| bool_value(state.video.sun_override))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_relightmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.set_sun_override(enabled, enabled);
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_DEBUGWORLDVERTEXALPHAONE {
         runtime: CvarDef::new("r_debugWorldVertexAlphaOne", "", "0..1", "A/B shader test: force BSP world vertex alpha to 1. Original vertex data is restored by setting 0. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_debugworldvertexalphaone(app)), |app, value| App::cvar_set_r_debugworldvertexalphaone(app, APP_R_DEBUGWORLDVERTEXALPHAONE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_debugworldvertexalphaone, None),
         config: CvarBinding::NONE,
@@ -327,7 +370,7 @@ app_cvars! {
                 "r_cascadedShadows",
                 "",
                 "0..1",
-                "Legacy boolean alias for Dynamic Shadows: Cascaded Shadow Maps.",
+                "Legacy boolean alias for entity Cascaded Shadow Maps (static world cascades are a separate Relighting switch).",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -362,7 +405,7 @@ app_cvars! {
                     {
                         self.video.cascaded_shadows = Self::parse_cvar_bool(name, value)?;
                         self.video.dynamic_shadows = if self.video.cascaded_shadows {
-                            DynamicShadowsMode::CascadedShadowMaps
+                            DynamicShadowsMode::CascadedShadowMapsEntities
                         } else {
                             DynamicShadowsMode::Off
                         };
@@ -1270,6 +1313,39 @@ app_cvars! {
         ]
     }
 
+    APP_R_FXLIGHTDIAG {
+        runtime: CvarDef::new(
+                "r_fxLightDiag",
+                "",
+                "0|1",
+                "Session-only FX / dynamic-light profiling. Prints [FX DIAG] and [FX DIAG GPU] once per second to console and latest.log; no restart needed.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_fxlightdiag(app)),
+                |app, value| App::cvar_set_r_fxlightdiag(app, APP_R_FXLIGHTDIAG.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_fxlightdiag, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_get_r_fxlightdiag(&self) -> String {
+                    bool_value(crate::fx::diagnostics::enabled())
+                }
+                fn cvar_set_r_fxlightdiag(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    let was_enabled = crate::fx::diagnostics::enabled();
+                    crate::fx::diagnostics::set_enabled(enabled);
+                    if was_enabled != enabled {
+                        println!("[FX DIAG] {} via {} (session-only; latest.log next to executable)",
+                            if enabled { "START" } else { "STOP" }, name);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_PROMOTEFXLIGHTS {
         runtime: CvarDef::new(
                 "r_promoteFxLights",
@@ -1316,22 +1392,24 @@ app_cvars! {
         ]
     }
 
+    // Legacy name still parses old configuration files. It is intentionally
+    // neither archived nor persisted and cannot enable any lighting source.
     APP_R_BAKEDLOCALLIGHTS {
-        runtime: CvarDef::new("r_bakedLocalLights", "", "0..1", "Experimental added lamp illumination over the original lightmap baseline. Leave off for shadows only; not required for inferred lamp shadows.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_bakedLocalLights", "", "0..1", "Deprecated no-op: choose individual Added Map Lights sources instead.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_r_bakedlocallights(app)),
             |app, value| App::cvar_set_r_bakedlocallights(app, APP_R_BAKEDLOCALLIGHTS.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_bakedlocallights, None),
         config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { settings.baked_local_lights = parse_bool(value).unwrap_or(settings.baked_local_lights); }),
-            archive: Some((14300, |state| format!("{}", u8::from(state.video.baked_local_lights)))),
+            load_video: Some(|_settings, _name, _value, _context| {}),
             ..CvarBinding::NONE
         },
         implementations: [ impl App {
-            fn cvar_get_r_bakedlocallights(&self) -> String { bool_value(self.video.baked_local_lights) }
+            fn cvar_get_r_bakedlocallights(&self) -> String { bool_value(self.video.added_map_light_sources() != 0) }
             fn cvar_set_r_bakedlocallights(&mut self, name: &str, value: &str) -> Result<(), String> {
-                let on = Self::parse_cvar_bool(name, value)?;
-                self.video.baked_local_lights = on;
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                Self::parse_cvar_bool(name, value)?;
+                self.console_status = "r_bakedLocalLights is obsolete; use the individual Added Map Lights source cvars".into();
+                self.publish_ui();
+                Ok(())
             }
         } ]
     }
@@ -1348,6 +1426,24 @@ app_cvars! {
                 self.video.csm_coverage_ab = enabled;
                 self.render_command(RenderCommand::SetCsmCoverageAB(enabled));
                 self.console_status = format!("CSM coverage A/B: {} (0=original; 1=tiles + empty-pass skipping). Wait for shader compilation before capture.", u8::from(enabled));
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_ENTITYFIXTURELIGHTINGAB {
+        runtime: CvarDef::new("r_entityFixtureLightingAB", "", "0..1", "Session-only: 0 existing entity lighting, 1 per-pixel authored fixture accents on models. Requires Relight map and CSM; independent of world accents. Raster experiment; hardware RT keeps its existing receiver.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.entity_fixture_lighting_ab)),
+            |app, value| App::cvar_set_r_entityfixturelightingab(app, APP_R_ENTITYFIXTURELIGHTINGAB.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_entityfixturelightingab, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_entityfixturelightingab(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.entity_fixture_lighting_ab = enabled;
+                self.render_command(RenderCommand::SetEntityFixtureLightingAB(enabled));
+                self.console_status = format!("Entity fixture A/B: {} (0=control, 1=per-pixel fixture accents; requires Relight map + CSM).", u8::from(enabled));
                 self.publish_ui();
                 Ok(())
             }
@@ -1374,7 +1470,7 @@ app_cvars! {
     }
 
     APP_R_BAKEDLOCALGLOW {
-        runtime: CvarDef::new("r_bakedLocalGlow", "", "0..1", "Use static shader glow emitters as lamp-shadow sources; also shared with experimental added lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_bakedLocalGlow", "", "0..1", "Use static shader glow emitters as lamp-shadow sources; does not authorize added illumination.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_r_bakedlocalglow(app)),
             |app, value| App::cvar_set_r_bakedlocalglow(app, APP_R_BAKEDLOCALGLOW.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_bakedlocalglow, None),
@@ -1388,7 +1484,7 @@ app_cvars! {
             fn cvar_set_r_bakedlocalglow(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 1; } else { self.video.baked_local_sources &= !1; }
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
     }
@@ -1408,7 +1504,7 @@ app_cvars! {
             fn cvar_set_r_bakedlocaladditive(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 2; } else { self.video.baked_local_sources &= !2; }
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
     }
@@ -1428,13 +1524,13 @@ app_cvars! {
             fn cvar_set_r_bakedlocalemissive(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 4; } else { self.video.baked_local_sources &= !4; }
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
     }
 
     APP_R_BAKEDLOCALSURFACELIGHT {
-        runtime: CvarDef::new("r_bakedLocalSurfacelight", "", "0..1", "Use authored q3map_surfacelight as an inferred shadow source. Adds light only if the separate experimental r_bakedLocalLights mode is enabled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_bakedLocalSurfacelight", "", "0..1", "Use authored q3map_surfacelight as an inferred lamp-shadow source; illumination uses the independent Added Map Lights authored switch.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_r_bakedlocalsurfacelight(app)),
             |app, value| App::cvar_set_r_bakedlocalsurfacelight(app, APP_R_BAKEDLOCALSURFACELIGHT.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_bakedlocalsurfacelight, None),
@@ -1448,7 +1544,7 @@ app_cvars! {
             fn cvar_set_r_bakedlocalsurfacelight(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 8; } else { self.video.baked_local_sources &= !8; }
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
     }
@@ -1468,43 +1564,44 @@ app_cvars! {
             fn cvar_set_r_bakedlocalfx(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 16; } else { self.video.baked_local_sources &= !16; }
-                self.sync_baked_local_lights(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
     }
 
+    // An explicit group *action* for console compatibility; never a second
+    // archived master. Component cvars are the canonical persisted state.
     APP_R_PROMOTESHADERLIGHTS {
-        runtime: CvarDef::new(
-                "r_promoteShaderLights",
-                "",
-                "0..1",
-                "Promote visible BSP shader emission into runtime area lights. Glow/additive/emissive evidence is classified even on q3map_surfacelight materials so it can be A/B tested; when authored area lights are enabled, the authored emitter wins to avoid double lighting.",
-                CvarType::String,
-                CvarFlags::ARCHIVE,
-                LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_r_promoteshaderlights(app)),
-                |app, value| App::cvar_set_r_promoteshaderlights(app, APP_R_PROMOTESHADERLIGHTS.entry.name, &value.to_string()),
-            )
+        runtime: CvarDef::new("r_promoteShaderLights", "", "0..1", "Compatibility group action: sets the three shader source switches together.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_promoteshaderlights(app)),
+            |app, value| App::cvar_set_r_promoteshaderlights(app, APP_R_PROMOTESHADERLIGHTS.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_promoteshaderlights, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    settings.promote_shader_lights = parse_bool(value).unwrap_or(settings.promote_shader_lights);
-                }),
-                archive: Some((10420, |state| format!("{}", u8::from(state.video.promote_shader_lights)))),
-                ..CvarBinding::NONE
-            },
-        implementations: [
-            impl App {
-                fn cvar_get_r_promoteshaderlights(&self) -> String { bool_value(self.video.promote_shader_lights) }
-                fn cvar_set_r_promoteshaderlights(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    self.video.promote_shader_lights = Self::parse_cvar_bool(name, value)?;
-                    self.sync_shader_light_promotion();
-                    self.mark_config_dirty();
-                    self.publish_ui();
-                    Ok(())
+            load_video: Some(|settings, _name, value, _context| {
+                // The individual archived component cvars have later precedence.
+                if let Some(on) = parse_bool(value) {
+                    settings.promote_shader_glow = on;
+                    settings.promote_shader_additive = on;
+                    settings.promote_shader_emissive = on;
                 }
+            }),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_promoteshaderlights(&self) -> String {
+                bool_value(self.video.promote_shader_glow || self.video.promote_shader_additive || self.video.promote_shader_emissive)
             }
-        ]
+            fn cvar_set_r_promoteshaderlights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                self.video.promote_shader_glow = on;
+                self.video.promote_shader_additive = on;
+                self.video.promote_shader_emissive = on;
+                self.sync_added_map_lights();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
     }
 
     APP_R_PROMOTESHADERGLOW {
@@ -1532,7 +1629,7 @@ app_cvars! {
                 fn cvar_get_r_promoteshaderglow(&self) -> String { bool_value(self.video.promote_shader_glow) }
                 fn cvar_set_r_promoteshaderglow(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.promote_shader_glow = Self::parse_cvar_bool(name, value)?;
-                    self.sync_shader_light_promotion();
+                    self.sync_added_map_lights();
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
@@ -1566,7 +1663,7 @@ app_cvars! {
                 fn cvar_get_r_promoteshaderadditive(&self) -> String { bool_value(self.video.promote_shader_additive) }
                 fn cvar_set_r_promoteshaderadditive(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.promote_shader_additive = Self::parse_cvar_bool(name, value)?;
-                    self.sync_shader_light_promotion();
+                    self.sync_added_map_lights();
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
@@ -1600,7 +1697,7 @@ app_cvars! {
                 fn cvar_get_r_promoteshaderemissive(&self) -> String { bool_value(self.video.promote_shader_emissive) }
                 fn cvar_set_r_promoteshaderemissive(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.promote_shader_emissive = Self::parse_cvar_bool(name, value)?;
-                    self.sync_shader_light_promotion();
+                    self.sync_added_map_lights();
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
@@ -1610,7 +1707,7 @@ app_cvars! {
     }
 
     APP_R_DYNAMICSHADOWS {
-        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm", "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
+        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|csm_entities", "Shadow method; csm and csm_entities both select entity cascades. For static BSP sun casters additionally enable r_staticWorldCsm in Relighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, context| {
                     if let Some(mode) = DynamicShadowsMode::from_config(value) {
@@ -1631,10 +1728,15 @@ app_cvars! {
                 }
                 fn cvar_set_r_dynamicshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
-                        self.video.dynamic_shadows = DynamicShadowsMode::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected off|blob|entity|csm"))?;
+                        self.video.dynamic_shadows = match DynamicShadowsMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|blob|entity|csm|csm_entities"))? {
+                            // The full-scene variant is no longer selected by the
+                            // primary shadow method; old configs migrate at load.
+                            DynamicShadowsMode::CascadedShadowMaps => DynamicShadowsMode::CascadedShadowMapsEntities,
+                            other => other,
+                        };
                         self.video.cascaded_shadows =
-                            self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                            self.video.dynamic_shadows.is_csm();
                         self.sync_cascaded_shadows();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -1650,7 +1752,7 @@ app_cvars! {
                 "r_emissiveAreaLights",
                 "",
                 "0..1",
-                "Enable mapper-authored q3map_surfacelight surfaces as runtime area lights. Shader promotion is controlled separately by r_promoteShaderLights.",
+                "Enable mapper-authored q3map_surfacelight surfaces as runtime area lights. Shader promotion is controlled independently by r_promoteShaderGlow/Additive/Emissive.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1685,7 +1787,7 @@ app_cvars! {
                 fn cvar_set_r_emissivearealights(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.emissive_area_lights = Self::parse_cvar_bool(name, value)?;
-                        self.sync_emissive_area_lights();
+                        self.sync_added_map_lights();
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
@@ -1798,6 +1900,37 @@ app_cvars! {
         ]
     }
 
+    APP_R_STATICWORLDCSM {
+        runtime: CvarDef::new(
+            "r_staticWorldCsm", "", "0|1",
+            "Relighting: include static BSP/map geometry in directional CSM. Requires Relight map and Cascaded Shadow Maps for entities. Off keeps baked static shadows and only redraws moving casters.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.static_world_csm)),
+            |app, value| App::cvar_set_r_staticworldcsm(app, APP_R_STATICWORLDCSM.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_staticworldcsm, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, context| {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.static_world_csm = enabled;
+                    context.static_world_csm_seen = true;
+                }
+            }),
+            archive: Some((26047, |state| bool_value(state.video.static_world_csm))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_staticworldcsm(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.static_world_csm = Self::parse_cvar_bool(name, value)?;
+                    self.sync_cascaded_shadows();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_SUNLIGHTING {
         runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM sun shadows for occlusion. Default 0 preserves legacy baked lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
         config: CvarBinding {
@@ -1821,7 +1954,7 @@ app_cvars! {
     }
 
     APP_R_SUNSHADOWSTRENGTH {
-        runtime: CvarDef::new("r_sunShadowStrength", "", "0..1", "Live sun shadow contrast before surface-facing attenuation. Default 0.3 preserves the existing response; 1 strengthens CSM sun shadows. Intensity scaling still applies, with final strength capped at 1. Does not change baked-sun removal.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(format!("{:.3}", app.video.sun_shadow_strength)), |app, value| App::cvar_set_r_sunshadowstrength(app, APP_R_SUNSHADOWSTRENGTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunshadowstrength, None),
+        runtime: CvarDef::new("r_sunShadowStrength", "", "0..1", "CSM shadow contrast and player foot-contact opacity: 0 disables their darkening, 1 gives full strength. Independent of map sun intensity. Preserves contact height fade and does not change baked-sun removal or classic Blob mode.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(format!("{:.3}", app.video.sun_shadow_strength)), |app, value| App::cvar_set_r_sunshadowstrength(app, APP_R_SUNSHADOWSTRENGTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunshadowstrength, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(v) = value.parse::<f32>() {
@@ -1845,20 +1978,24 @@ app_cvars! {
     }
 
     APP_R_PLAYERCONTACTSHADOWS {
-        runtime: CvarDef::new("r_playerContactShadows", "", "0|1", "Subtle projected foot-contact blobs under players/NPCs, independent of CSM, RT and lamp shadows. Fades with height. Classic Blob mode keeps its original drop shadow. Default 1.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app| CvarValue::String(bool_value(app.video.player_contact_shadows)),
+        runtime: CvarDef::new("r_playerContactShadows", "", "0..4", "Player foot-contact opacity multiplier: 0 off, 1 normal, 2 double strength. Multiplies r_sunShadowStrength and preserves the airborne fade. Classic Blob mode is unchanged. Default 3.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{:.3}", app.video.player_contact_shadows)),
             |app, value| App::cvar_set_r_playercontactshadows(app, APP_R_PLAYERCONTACTSHADOWS.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_playercontactshadows, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
-                if let Some(on) = parse_bool(value) { settings.player_contact_shadows = on; }
+                if let Ok(scale) = value.parse::<f32>() {
+                    if scale.is_finite() { settings.player_contact_shadows = scale.clamp(0.0, 4.0); }
+                } else if let Some(on) = parse_bool(value) {
+                    settings.player_contact_shadows = if on { 1.0 } else { 0.0 };
+                }
             }),
-            archive: Some((26047, |state| bool_value(state.video.player_contact_shadows))),
+            archive: Some((26047, |state| format!("{:.3}", state.video.player_contact_shadows))),
             ..CvarBinding::NONE
         },
         implementations: [ impl App {
             fn cvar_set_r_playercontactshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
-                self.video.player_contact_shadows = Self::parse_cvar_bool(name, value)?;
+                self.video.player_contact_shadows = Self::parse_cvar_finite(name, value)?.clamp(0.0, 4.0);
                 self.mark_config_dirty();
                 self.publish_ui();
                 Ok(())
@@ -3066,6 +3203,29 @@ app_cvars! {
                     presenter.set_static_md3_bvh(enabled);
                 }
                 self.console_status = format!("STATIC MD3 BVH: {} (0=baseline, 1=hierarchy)", u8::from(enabled));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_STATICMD3PVSFALLBACK {
+        runtime: CvarDef::new("r_staticMd3PvsFallback", "", "0..1", "Map-authored misc_model_static only: 0 original cull-origin PVS behavior, 1 cached transformed bounds-center PVS fallback (default). Live session-only A/B; affects neither misc_model_breakable nor snapshot/server entities.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.static_md3_pvs_fallback)),
+            |app, value| App::cvar_set_r_staticmd3pvsfallback(app, APP_R_STATICMD3PVSFALLBACK.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_staticmd3pvsfallback, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.static_md3_pvs_fallback)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_staticmd3pvsfallback(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.video.static_md3_pvs_fallback = enabled;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.entity_presenter.set_static_md3_pvs_fallback(enabled);
+                }
+                if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+                    presenter.set_static_md3_pvs_fallback(enabled);
+                }
+                self.console_status = format!("STATIC MD3 PVS FALLBACK: {} (0=legacy, 1=cached bounds-center)", u8::from(enabled));
                 self.publish_ui();
                 Ok(())
             }

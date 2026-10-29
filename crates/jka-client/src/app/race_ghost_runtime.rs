@@ -177,7 +177,7 @@ impl App {
         let display_name = demo.label.clone();
         let base_url = self.race_ghost_demo_base_url.clone();
         let tx = self.race_ghost_tx.clone();
-        let cache_root = self.base.join("cache").join("race_ghosts");
+        let cache_root = jka_assets::pk3::game_write_directory(&self.base, None).join("cache").join("race_ghosts");
         if let Err(error) = thread::Builder::new()
             .name("race-ghost-web".to_owned())
             .spawn(move || {

@@ -98,13 +98,28 @@ impl App {
             "BLUE WATER CLOUDS",
             "Native cloud controls. Heights use metres above the map's main sea plane.",
         );
-        changed |= choice(
-            ui,
-            "Native quality",
-            &mut s.quality,
-            d.quality,
-            &["Low", "Medium", "High", "Ultra"],
-        );
+        theme::row(ui, "Cloud quality", "Blue Water cloud detail and lighting budget, independent of render resolution. Low uses coarser steps and simpler shapes; Medium restores fine shapes; High adds turbulence, accurate lighting and light shafts; Ultra uses finer steps and larger shadow maps. Match sky preserves the previous shared quality setting (r_blueSkyQuality).", theme::Reset::None, |ui| {
+            let names = ["Low", "Medium", "High", "Ultra", "Match sky"];
+            let old = s.cloud_quality;
+            let response = egui::ComboBox::from_id_salt("blue_cloud_quality")
+                .selected_text(names[s.cloud_quality.min(4) as usize])
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        ui.selectable_value(&mut s.cloud_quality, i as u8, *name);
+                    }
+                });
+            if response.response.double_clicked() { s.cloud_quality = d.cloud_quality; }
+            changed |= old != s.cloud_quality;
+        });
+        theme::row(ui, "Sky quality", "Sky lookup tables, environment bake and native weather budget. Cloud quality can override this independently.", theme::Reset::None, |ui| {
+            for (i, name) in ["Low", "Medium", "High", "Ultra"].iter().enumerate() {
+                if theme::chip(ui, name, s.quality == i as u8).clicked() {
+                    changed |= s.quality != i as u8;
+                    s.quality = i as u8;
+                }
+            }
+        });
+        ui.label("Blue Water always reconstructs a 4×4 temporal pattern. Render resolution below scales both its cloud buffer and reconstruction.");
         changed |= choice(
             ui,
             "Native cloud type",
@@ -170,7 +185,7 @@ impl App {
         theme::section(
             ui,
             "MOON",
-            "Blue Water sky only. Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
+            "Blue Water sky only. Map illumination requires Relight map and Sky world illumination on Relighting. Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
         );
         changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. While position is locked, phase also moves the moon along its automatic sky arc. With manual position unlocked, phase changes illumination only.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
         let mut unlocked = s.moon_custom;
@@ -211,7 +226,6 @@ impl App {
         changed |= sky_slider(ui, "Mie directionality", "How tightly the aureole hugs the sun. Higher is a smaller, brighter halo.", &mut s.mie_g, d.mie_g, 0.0, 0.95);
         changed |= sky_slider(ui, "Multiple scattering", "Light scattered more than once; brightens the sky away from the sun.", &mut s.multiple, d.multiple, 0.0, 3.0);
         changed |= sky_slider(ui, "Night sky brightness", "Dims the dome's flat night glow only (1 is upstream). Stars, the Milky Way and the world's night light are unchanged.", &mut s.night_sky, d.night_sky, 0.0, 1.0);
-        changed |= sky_slider(ui, "World lighting", "How much of the Blue Water sky's ambient and sun/moon light is applied over the map's baked lighting. 0 leaves the baked lighting alone. The baked light cannot be separated exactly, so this scales it rather than relighting it; dark regions are preserved but it is no replacement for baked indoor/GI lighting. Cloud shadows are a separate toggle on the Clouds page.", &mut s.world_lighting, d.world_lighting, 0.0, 1.0);
         if changed {
             self.commit_sky_environment(s);
         }

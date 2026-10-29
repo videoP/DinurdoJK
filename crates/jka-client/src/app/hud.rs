@@ -7,6 +7,22 @@ use crate::app::{
 };
 
 impl App {
+    /// Snap only untouched/default HUD elements when opening the editor. This
+    /// changes layout coordinates, not the underlying JKA stock draw routines.
+    pub(in crate::app) fn align_hud_defaults_for_editor(&mut self) {
+        let Some(window) = self.window.as_ref() else { return; };
+        let size = window.inner_size();
+        let context = ui::HudRectContext::new(
+            self.movement_keys_hud, &self.video, &self.perf, self.threads.len(),
+            &self.japro_cg, self.strafe_helper, self.video.draw_timer,
+            [self.draw_score_x, self.draw_score_y], self.draw_scores,
+        );
+        if self.hud_layout.align_default_elements_to_grid(&context, size.width, size.height) {
+            self.mark_config_dirty();
+            self.publish_ui();
+        }
+    }
+
     /// Editor handles follow configuration, including transient components
     /// whose live data may currently be empty (for example jump measurements).
     pub(in crate::app) fn hud_edit_element_enabled(&self, id: ui::HudElementId) -> bool {
@@ -18,6 +34,9 @@ impl App {
         }
         match id {
             Health | Shield | Ammo | Force => self.video.draw_hud,
+            Score => self.video.draw_hud && self.draw_score != 0,
+            MiniScores => self.draw_scores != 0,
+            EnemyInfo => self.draw_enemy_info,
             MovementKeys => self.movement_keys_hud.mode != 0,
             Fps => self.video.draw_fps != 0,
             CrosshairName => self.crosshair.names != 0.0,
@@ -50,98 +69,91 @@ impl App {
         // Full-screen 4K needs far fewer than 384 atlas-text rows, so this leaves
         // ample scroll context without cloning the entire 10k-line ring every keypress.
         let console_scroll = self.console_scroll.min(self.console_max_scroll());
-        let console_end = self.console_lines.len().saturating_sub(console_scroll);
+        let layout = self.console_wrap_layout();
+        let total_rows = layout.rows.len();
+        let console_end = total_rows.saturating_sub(console_scroll);
         let console_start = console_end.saturating_sub(384);
-        let console_lines: Vec<String> = self
-            .console_lines
-            .iter()
-            .skip(console_start)
-            .take(console_end - console_start)
-            .cloned()
+        let visible_rows = &layout.rows[console_start..console_end];
+        let console_lines: Vec<String> = visible_rows.iter().map(|row| {
+            super::console_state::console_colored_fragment(
+                &self.console_lines[row.line], row.start_col, row.end_col,
+            )
+        }).collect();
+        let console_line_kinds: Vec<crate::logging::ConsoleLineKind> = visible_rows.iter()
+            .map(|row| self.console_line_kinds.get(row.line).copied().unwrap_or_default())
             .collect();
-        let console_line_kinds: Vec<crate::logging::ConsoleLineKind> = self
-            .console_line_kinds
-            .iter()
-            .skip(console_start)
-            .take(console_end - console_start)
-            .copied()
-            .collect();
-        let console_selection = match (self.console_selection_anchor, self.console_selection_focus)
-        {
-            (Some(mut start), Some(mut end)) if console_start < console_end => {
+
+        // Selection coordinates remain tied to original messages so a resize
+        // never changes what a drag, double-click, or Ctrl+C selects.
+        let console_selection = match (self.console_selection_anchor, self.console_selection_focus) {
+            (Some(mut start), Some(mut end)) if !visible_rows.is_empty() => {
                 if (start.line, start.col) > (end.line, end.col) {
                     std::mem::swap(&mut start, &mut end);
                 }
-                if end.line < console_start || start.line >= console_end {
+                let first_row = layout.row_for_point(start, false);
+                let last_row = layout.row_for_point(end, true);
+                if last_row < console_start || first_row >= console_end || first_row > last_row {
                     None
                 } else {
-                    if start.line < console_start {
-                        start = ConsolePoint {
-                            line: console_start,
-                            col: 0,
-                        };
-                    }
-                    if end.line >= console_end {
-                        let line = console_end - 1;
-                        let col = self
-                            .console_lines
-                            .get(line)
-                            .map(|raw| crate::logging::strip_jka_colors(raw).chars().count())
-                            .unwrap_or(0);
-                        end = ConsolePoint { line, col };
-                    }
+                    let begin_row = first_row.max(console_start);
+                    let finish_row = last_row.min(console_end - 1);
+                    let begin = layout.rows[begin_row];
+                    let finish = layout.rows[finish_row];
                     Some(ConsoleSelection {
-                        start_line: start.line - console_start,
-                        start_col: start.col,
-                        end_line: end.line - console_start,
-                        end_col: end.col,
+                        start_line: begin_row - console_start,
+                        start_col: if begin_row == first_row {
+                            start.col.saturating_sub(begin.start_col)
+                        } else { 0 },
+                        end_line: finish_row - console_start,
+                        end_col: if finish_row == last_row {
+                            end.col.saturating_sub(finish.start_col)
+                        } else { finish.end_col - finish.start_col },
                     })
                 }
             }
             _ => None,
         };
 
-        let console_search_matches: Vec<ConsoleSearchMatch> = self
-            .console_search_matches
-            .iter()
-            .filter(|hit| hit.line >= console_start && hit.line < console_end)
-            .map(|hit| ConsoleSearchMatch {
-                line: hit.line - console_start,
-                start_col: hit.start_col,
-                end_col: hit.end_col,
-            })
-            .collect();
-        let console_search_active = self
-            .console_search_index
-            .and_then(|index| self.console_search_matches.get(index).copied())
-            .and_then(|hit| {
-                (hit.line >= console_start && hit.line < console_end).then_some(
-                    ConsoleSearchMatch {
-                        line: hit.line - console_start,
-                        start_col: hit.start_col,
-                        end_col: hit.end_col,
-                    },
-                )
-            });
-        let console_path_links: Vec<ConsolePathLinkUi> = self
-            .console_path_links
-            .iter()
-            .enumerate()
-            .skip(console_start)
-            .take(console_end - console_start)
-            .flat_map(|(line, links)| {
-                links.iter().map(move |link| ConsolePathLinkUi {
-                    line: line - console_start,
-                    start_col: link.start_col,
-                    end_col: link.end_col,
-                })
-            })
-            .collect();
+        // Translate search/link ranges into physical row-local spans. Matches
+        // can straddle a wrap boundary without losing their highlight or link.
+        let mut console_search_matches = Vec::new();
+        let mut console_search_active_spans = Vec::new();
+        let mut console_path_links = Vec::new();
+        let active_search = self.console_search_index
+            .and_then(|index| self.console_search_matches.get(index).copied());
+        for (display_row, row) in visible_rows.iter().enumerate() {
+            let start = row.start_col;
+            let end = row.end_col;
+            for hit in self.console_search_matches.iter().filter(|hit| hit.line == row.line) {
+                let left = hit.start_col.max(start);
+                let right = hit.end_col.min(end);
+                if left < right {
+                    let segment = ConsoleSearchMatch {
+                        line: display_row, start_col: left - start, end_col: right - start,
+                    };
+                    console_search_matches.push(segment);
+                    if active_search == Some(*hit) { console_search_active_spans.push(segment); }
+                }
+            }
+            if let Some(links) = self.console_path_links.get(row.line) {
+                for link in links {
+                    let left = link.start_col.max(start);
+                    let right = link.end_col.min(end);
+                    if left < right {
+                        console_path_links.push(ConsolePathLinkUi {
+                            line: display_row, start_col: left - start, end_col: right - start,
+                        });
+                    }
+                }
+            }
+        }
+        let console_search_active = console_search_active_spans.first().copied();
 
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
         let console_notify_lines = self.console_notify_ui_snapshot();
         let hud = self.current_hud_state();
-        let mut follow_name = self.current_follow_name();
+        let in_studio = self.front_end && self.frontend_page == super::FrontendPage::RenderStudio;
+        let mut follow_name = if in_studio {None}else{self.current_follow_name()};
         let mut race_timer = self
             .game_session
             .as_ref()
@@ -190,9 +202,16 @@ impl App {
         let prediction_debug = self.prediction_debug_ui();
         let force_select = self.force_select_ui(Instant::now());
         let weapon_select = self.weapon_select_ui(Instant::now());
+        let inventory_select = self.inventory_select_ui(Instant::now());
+        // cg.predictedPlayerState, or the demo/follow equivalent. Never rely on
+        // a local key bind: these values are also supplied in DM26 playback.
+        let (zoom_scope, rocket_lock) = self.combat_overlay_state();
 
         let mut snapshot = UiSnapshot {
-            frontend_main_scene: self.front_end && self.frontend_page == crate::app::FrontendPage::Main,
+            studio_race: None,
+            frontend_main_scene: self.front_end && matches!(self.frontend_page,
+                crate::app::FrontendPage::Main | crate::app::FrontendPage::Play
+                | crate::app::FrontendPage::DeveloperTools),
             mode: self.overlay,
             setup_selected: self.setup_selected,
             console_input: self.console_input.clone(),
@@ -202,6 +221,7 @@ impl App {
             console_line_kinds,
             console_scroll: 0,
             console_size: self.console_size,
+            console_scale: self.console_scale,
             console_selection,
             console_search_open: self.console_search_open,
             console_search_query: self.console_search_input.clone(),
@@ -209,8 +229,9 @@ impl App {
             console_search_index: self.console_search_index,
             console_search_matches,
             console_search_active,
+            console_search_active_spans,
             console_path_links,
-            console_total_lines: self.console_lines.len(),
+            console_total_lines: total_rows,
             console_scrolled: console_scroll,
             console_suggest_enabled: self.console_suggest,
             console_suggestions,
@@ -226,6 +247,8 @@ impl App {
             follow_name,
             game_timer: self.game_timer_text(),
             mini_scores: self.mini_scores_ui(),
+            hud_score: self.hud_score_ui(),
+            enemy_info: self.enemy_info_ui(),
             siege_hud: self.siege_hud_ui(),
             race_timer,
             race_components: [self.japro_cg.race_timer != 0, self.japro_cg.race_start],
@@ -237,16 +260,28 @@ impl App {
             hud,
             team_overlay: self.team_overlay_ui(),
             hud_layout: self.hud_layout,
+            studio_hud_virtual_layout: false,
+            studio_world_labels: Vec::new(),
+            studio_crosshair_name: false,
             extension_hud: self.extensions.placed_widgets(),
             native_hidden: self.extensions.native_hidden,
             extension_images: self.extensions.hud_images.clone(),
-            crosshair: self.crosshair,
+            crosshair: if in_studio || (self.model_placement.active && self.overlay == OverlayMode::None) {
+                crate::ui::CrosshairSettings { style: 0, ..self.crosshair }
+            } else { self.crosshair },
             crosshair_target,
             force_select,
             weapon_select,
+            inventory_select,
+            zoom_scope,
+            rocket_lock,
             icon_atlas_uvs: Vec::new(),
             movement_keys: self.movement_keys_hud,
-            strafe_helper: self.strafe_helper,
+            strafe_helper: if in_studio {
+                let mut helper=self.strafe_helper;
+                helper.flags &= !crate::ui::SHELPER_CROSSHAIR;
+                helper
+            }else{self.strafe_helper},
             movement_hud: self.current_movement_hud_state(),
             speedometer,
             speedometer_settings: self.japro_cg.speedometer,
@@ -258,6 +293,8 @@ impl App {
             surface_inspector,
             startup_splash: !self.startup_first_frame_seen,
             startup_splash_art: !self.front_end,
+            // Studio draws its own progress modal; the native fullscreen
+            // loading HUD must never replace the editing canvas.
             loading: self.loading.as_ref().map(MapLoadingState::ui),
             shader_compile_progress: None, // Render thread owns worker progress.
             shader_compile_stage: None,
@@ -306,6 +343,7 @@ impl App {
             ]
             .map(|text| ui::UiChatLine {
                 text: text.to_owned(),
+                team: false,
                 alpha: 1.0,
             })
             .into();
@@ -674,6 +712,158 @@ impl App {
             .max(0);
         let seconds = elapsed_ms / 1000;
         Some(format!("{}:{:02}", seconds / 60, seconds % 60))
+    }
+
+
+    /// TaystJK CG_DrawHUD score string. The disabled FFA score-bias branch
+    /// (`else if (0 && gametype < GT_TEAM)`) is intentionally not reinstated.
+    pub(in crate::app) fn hud_score_ui(&self) -> Option<ui::UiHudScore> {
+        const GT_DUEL: i32 = 3;
+        const GT_POWERDUEL: i32 = 4;
+        const GT_TEAM: i32 = 6;
+        const GT_SIEGE: i32 = 7;
+        if self.overlay == OverlayMode::HudEdit && self.draw_score != 0 && self.video.draw_hud {
+            // The HUD editor needs something to drag when no score packet has
+            // arrived (or when the spectator/player cannot normally draw it).
+            // This placeholder is editor-only; it never escapes into gameplay.
+            return Some(ui::UiHudScore {
+                lines: vec!["Score: 0".into(), "Team: 0 (+0)".into()],
+                offset: [self.draw_score_x, self.draw_score_y],
+            });
+        }
+        const TEAM_RED: i32 = 1;
+        let session = self.game_session.as_ref()?;
+        let snap = session.current_snapshot.as_ref()?;
+        let ps = session.presented_player_state().unwrap_or(&snap.player_state);
+        if self.draw_score <= 0 || !self.video.draw_hud
+            || ps.field_i32("pm_type") == Some(2) // PM_SPECTATOR
+        { return None; }
+        let game = &session.client_game;
+        let gametype = game.gametype();
+        if gametype == GT_POWERDUEL || (self.active_server_mod() == crate::net::mod_support::ServerMod::Japro
+            && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0)
+        { return None; }
+        // Tayst uses the snapshot's PERS_SCORE even while following.
+        let score = snap.player_state.persistant[0];
+        let limits = game.match_limits();
+        let client = usize::try_from(snap.player_state.field_i32("clientNum")?).ok()?;
+        let mut lines = Vec::with_capacity(2);
+        if gametype == GT_DUEL && limits.fraglimit > 0 {
+            if limits.fraglimit > 1 {
+                lines.push(format!("Score: {score}/{}", limits.fraglimit));
+            } else {
+                let (wins, losses) = game.client_duel_record(client)?;
+                lines.push(format!("{wins}/{losses}"));
+            }
+        } else {
+            lines.push(format!("Score: {score}"));
+            if self.draw_score > 1 && gametype >= GT_TEAM && gametype != GT_SIEGE {
+                let team = game.client_info(client, &session.siege_classes)?.team;
+                let own = if team == TEAM_RED { limits.scores1 } else { limits.scores2 };
+                let other = if team == TEAM_RED { limits.scores2 } else { limits.scores1 };
+                let bias = own - other;
+                let formatted = if bias > 0 { format!("{own} ({bias:+})") }
+                    else if bias < 0 { format!("{own}  ({bias})") }
+                    else { format!("{own}      ") };
+                lines.push(format!("Team: {formatted}"));
+            }
+        }
+        Some(ui::UiHudScore {
+            lines,
+            offset: [self.draw_score_x, self.draw_score_y],
+        })
+    }
+
+    /// TaystJK CG_DrawEnemyInfo. This deliberately chooses the duel opponent,
+    /// explicit duelIndex, Jedi Master or protocol duelWinner rather than the
+    /// recently attacking player (disabled in TaystJK itself).
+    pub(in crate::app) fn enemy_info_ui(&self) -> Option<ui::UiEnemyInfo> {
+        if self.overlay == OverlayMode::HudEdit && self.draw_enemy_info {
+            return Some(ui::UiEnemyInfo {
+                icon_paths: vec!["models/players/kyle/icon_default".into()],
+                title: "Dueling".into(), name: Some("^7OPPONENT".into()),
+                detail: Some("Score: 0/10".into()), health: Some(100),
+            });
+        }
+        const GT_DUEL: i32 = 3;
+        const GT_POWERDUEL: i32 = 4;
+        const GT_JEDIMASTER: i32 = 2;
+        const TEAM_SPECTATOR: i32 = 3;
+        const PMF_FOLLOW: i32 = 4096;
+        let session = self.game_session.as_ref()?;
+        let snap = session.current_snapshot.as_ref()?;
+        let game = &session.client_game;
+        let ps = session.presented_player_state().unwrap_or(&snap.player_state);
+        let snapshot_ps = &snap.player_state;
+        let snapshot_client = usize::try_from(snapshot_ps.field_i32("clientNum")?).ok()?;
+        if !self.draw_enemy_info || ps.stats[0] <= 0 || game.gametype() == GT_POWERDUEL
+            || (self.active_server_mod() == crate::net::mod_support::ServerMod::Japro
+                && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0)
+        { return None; }
+        // CG_DrawEnemyInfo suppresses the stock panel while cg_specHud is
+        // active for a spectator/follow view. The native minimap isn't enabled
+        // by this client, so there is no additional cg_drawRadar override.
+        if self.japro_cg.spec_hud && (session.live && self.live_spec_hud_eligible()
+            || !session.live && (snapshot_ps.persistant[3] == TEAM_SPECTATOR
+                || snapshot_ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0))
+        { return None; }
+        let viewer = game.client_info(snapshot_client, &session.siege_classes)?;
+        let (target, title) = if game.gametype() == GT_JEDIMASTER {
+            let master = game.jedi_master();
+            if master < 0 {
+                return Some(ui::UiEnemyInfo {
+                    icon_paths: vec!["gfx/hud/w_icon_lightsaber".to_owned()],
+                    title: "Get Saber!".into(), name: None, detail: None, health: None,
+                });
+            }
+            (master, "Jedi Master".to_owned())
+        } else if snapshot_ps.field_i32("duelInProgress").unwrap_or(0) != 0 {
+            (snapshot_ps.field_i32("duelIndex")?, "Dueling".to_owned())
+        } else if game.gametype() == GT_DUEL && viewer.team != TEAM_SPECTATOR {
+            let duelists = game.duelists();
+            let target = if Some(duelists[0]) == snapshot_ps.field_i32("clientNum") { duelists[1] }
+                else if Some(duelists[1]) == snapshot_ps.field_i32("clientNum") { duelists[0] }
+                else if Some(duelists[2]) == snapshot_ps.field_i32("clientNum") { duelists[0] }
+                else { return None; };
+            (target, "Dueling".to_owned())
+        } else {
+            (game.duel_winner(), format!("Leader: {}", game.match_limits().scores1))
+        };
+        let client = usize::try_from(target).ok().filter(|&value| value < 32)?;
+        let info = game.client_info(client, &session.siege_classes)?;
+        let limits = game.match_limits();
+        let detail = if (game.gametype() == GT_DUEL || game.gametype() == GT_POWERDUEL)
+            && viewer.team != TEAM_SPECTATOR {
+            let score = self.scoreboard.as_ref()
+                .and_then(|board| board.entries.iter().find(|entry| entry.client == target))
+                .map(|entry| entry.score);
+            if limits.fraglimit > 1 {
+                score.map(|score| format!("Score: {score}/{}", limits.fraglimit))
+            } else if limits.fraglimit == 1 {
+                game.client_duel_record(client).map(|(wins, losses)| format!("Win/Loss: {wins}/{losses}"))
+            } else {
+                score.map(|score| format!("Score: {score}"))
+            }
+        } else { None };
+        let duelists = game.duelists();
+        let healths = game.duelist_healths();
+        // g_showDuelHealths=2 draws the small health bar under the upper-right
+        // enemy panel.  No value is invented when the wire field is absent.
+        let show_health = game.serverinfo_value(b"g_showDuelHealths")
+            .and_then(|value| value.parse::<i32>().ok()).unwrap_or(0) >= 2;
+        let health = if show_health && target == duelists[0] { (healths[0] >= 0).then_some(healths[0]) }
+            else if show_health && target == duelists[1] { (healths[1] >= 0).then_some(healths[1]) }
+            else { None };
+        Some(ui::UiEnemyInfo {
+            icon_paths: vec![format!(
+                "@team-model-icon\t{}\t{}\t{}\t{}\t{}",
+                info.model_name, info.skin_name, info.team, info.gametype, u8::from(info.jedi_v_merc)
+            )],
+            title,
+            name: Some(info.name),
+            detail,
+            health,
+        })
     }
 
     /// TaystJK `cg_drawScores`. Modes 1/2 are the stock/jaPRO upper-right
@@ -1045,6 +1235,54 @@ impl App {
         })
     }
 
+    pub(in crate::app) fn combat_overlay_state(&self) -> (Option<ui::UiZoomScope>, Option<ui::UiRocketLock>) {
+        let Some(session) = self.game_session.as_ref() else { return (None, None); };
+        let Some(snapshot) = session.current_snapshot.as_ref() else { return (None, None); };
+        if self.demo_view_mode == DemoViewMode::Free && !session.live { return (None, None); }
+        let ps = session.presented_player_state().unwrap_or(&snapshot.player_state);
+        let time = session.cgame_time;
+        // Zoom art belongs to the gun zoom (1) or binoculars (2), not
+        // cg_zoomFov's generic +zoom camera FOV mode.
+        let zoom_mode = ps.field_i32("zoomMode").unwrap_or(0);
+        let binoculars_allowed = !(zoom_mode == 2
+            && session.client_game.is_japro()
+            && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0);
+        let zoom_scope = (zoom_mode == 1 || (zoom_mode == 2 && binoculars_allowed)).then(|| ui::UiZoomScope {
+            mode: zoom_mode,
+            fov: ps.field_f32("zoomFov").unwrap_or(50.0),
+            time,
+            yaw_deg: ps.field_f32("viewangles[1]").unwrap_or(0.0),
+            // bg_weapons.h AMMO_POWERCELL=3; bg_weapons.c max=300.
+            ammo: ps.ammo[3].max(0),
+            double_ammo: ps.field_i32("eFlags").unwrap_or(0) & (1<<20) != 0,
+            charge_started: (ps.field_i32("weaponstate").unwrap_or(0) == 5)
+                .then(|| ps.field_i32("weaponChargeTime").unwrap_or(time)),
+        });
+        // Render the wheel only when the real server/predicted playerState
+        // reports a valid target and an active lock timer.
+        let index = ps.field_i32("rocketLockIndex").unwrap_or(1023);
+        let start = ps.field_i32("rocketLockTime").unwrap_or(0);
+        let rocket_lock = if (0..1023).contains(&index) && start > 0 && time > start
+            && ps.persistant[3] != 3 // PERS_TEAM != TEAM_SPECTATOR
+        {
+            session.presented_entities.iter().find(|e| i32::from(e.number) == index)
+                .map(|entity| {
+                    let origin = [0, 1, 2].map(|i| ps.field_f32(match i {
+                        0 => "origin[0]", 1 => "origin[1]", _ => "origin[2]"
+                    }).unwrap_or(0.0));
+                    let elapsed = time.saturating_sub(start);
+                    let interval = if session.client_game.gametype() == 7 { 150 } else { 75 };
+                    ui::UiRocketLock {
+                        target: [entity.origin[0], entity.origin[1], entity.origin[2] + 28.0],
+                        viewer: origin,
+                        wedges: (elapsed / interval).clamp(0, 8) as u8,
+                        time,
+                    }
+                })
+        } else { None };
+        (zoom_scope, rocket_lock)
+    }
+
     pub(in crate::app) fn current_hud_state(&self) -> Option<HudState> {
         if let Some(ps) = self.live_player_state() {
             return Some(self.hud_state_from_player_state(ps));
@@ -1336,18 +1574,8 @@ impl App {
     }
 
     pub(in crate::app) fn player_names_restricted(&self) -> bool {
-        const RESTRICT_PLAYERLABELS: i32 = 1 << 6;
-        self.game_session
-            .as_ref()
-            .and_then(|session| {
-                session
-                    .client_game
-                    .configstring(crate::cgame::CS_SERVERINFO)
-            })
-            .and_then(|serverinfo| jka_protocol::commands::info_value(serverinfo, b"restricts"))
-            .map_or(0, jka_protocol::commands::atoi)
-            & RESTRICT_PLAYERLABELS
-            != 0
+        self.server_restrictions()
+            .contains(super::restrictions::PLAYER_LABELS)
     }
 
     /// TaystJK `CG_PlayerLabels` visibility discovery. The original walks and

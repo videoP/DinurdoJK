@@ -61,6 +61,10 @@ pub fn referenced_downloads(
     let game_data = base_dir
         .parent()
         .ok_or_else(|| format!("base directory has no GameData parent: {}", base_dir.display()))?;
+    // PK3 autodownloads follow the writable root, but remain in their server
+    // game directory (NOT fs_forcegame). No download ever lands in fs_cdpath.
+    let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
+    let download_root = roots.homepath.as_deref().unwrap_or(game_data);
     let active_name = active_game_dir
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
@@ -92,7 +96,7 @@ pub fn referenced_downloads(
             continue;
         }
 
-        let game_dir = game_data.join(game);
+        let game_dir = download_root.join(game);
         let downloaded = game_dir.join(format!("dl_{pak}.pk3"));
         let local_path = if downloaded.exists() {
             game_dir.join(format!("dl_{pak}.{:08x}.pk3", checksum as u32))
@@ -111,15 +115,14 @@ pub fn referenced_downloads(
 
 
 fn local_pk3_checksums(base_dir: &Path, active_game_dir: Option<&Path>) -> Result<HashSet<i32>, String> {
-    let mut dirs = Vec::with_capacity(2);
-    if let Some(game) = active_game_dir.filter(|game| *game != base_dir) {
-        dirs.push(game);
-    }
-    dirs.push(base_dir);
+    // All currently mounted PK3s, including shared stock archives, count as
+    // locally available; avoid re-downloading packages already in fs_cdpath.
+    let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
+    let dirs = jka_assets::pk3::filesystem_search_dirs(base_dir, active_game_dir, &roots);
 
     let mut checksums = HashSet::new();
     for dir in dirs {
-        let entries = match fs::read_dir(dir) {
+        let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("scan {} for PK3s: {error}", dir.display())),
@@ -127,6 +130,7 @@ fn local_pk3_checksums(base_dir: &Path, active_game_dir: Option<&Path>) -> Resul
         for entry in entries.flatten() {
             let path = entry.path();
             if !entry.file_type().is_ok_and(|kind| kind.is_file())
+                || !jka_assets::pk3::package_enabled(&path)
                 || !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
             {
                 continue;

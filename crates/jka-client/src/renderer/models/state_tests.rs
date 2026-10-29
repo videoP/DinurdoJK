@@ -4,6 +4,113 @@ use crate::renderer::{
     FxGpuSprites, Ghoul2GpuBone, TextureData,
 };
 
+/// Rasterize the production vertex/fragment functions and actual alpha blend
+/// into both scene formats, then compare displayed RGB with legacy JKA blending.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn classic_blob_blending_matches_legacy_display_contrast_on_gpu() {
+    use wgpu::util::DeviceExt;
+    let md3 = include_str!("../../md3.wgsl");
+    let declaration = |name| crate::renderer::rt_models::declaration(md3, name).unwrap();
+    let source = format!(r#"
+{}
+{}
+{}
+var<private> camera: Camera;
+const SPEC_ERASE_DEPTH_TOLERANCE: f32 = 0.0;
+fn legacy_effect_source(tex:vec4<f32>, tint:vec4<f32>) -> vec4<f32> {{ return tex*tint; }}
+fn legacy_effect_output(color:vec4<f32>) -> vec4<f32> {{ return color; }}
+fn foliage_model_position(p: vec3<f32>, tag: f32, wind: vec4<f32>) -> vec3<f32> {{ return p; }}
+@group(0) @binding(0) var base_texture: texture_2d<f32>;
+@group(0) @binding(1) var base_sampler: sampler;
+fn fogged(color: vec4<f32>, world: vec3<f32>, black: bool) -> vec4<f32> {{ return color; }}
+{}
+{}
+@vertex fn test_vertex(input: VertexIn) -> VertexOut {{
+    camera.view_proj = mat4x4<f32>(vec4(1.0,0.0,0.0,0.0), vec4(0.0,1.0,0.0,0.0),
+        vec4(0.0,0.0,1.0,0.0), vec4(0.0,0.0,0.0,1.0));
+    return vs_main(input);
+}}
+@fragment {}
+"#, declaration("struct Camera"), declaration("struct VertexIn"), declaration("struct VertexOut"),
+        declaration("fn vs_main("), declaration("fn legacy_blob_alpha("), declaration("fn fs_unlit("));
+    let decode = |v: f64| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let encode = |v: f64| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("production classic blob blend fixture"),
+            source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let texture = device.create_texture(&wgpu::TextureDescriptor { label: None,
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1,
+            sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
+        let view = texture.create_view(&Default::default());
+        let sampler = device.create_sampler(&Default::default());
+        let attributes = crate::renderer::DYNAMIC_MODEL_VERTEX_ATTRIBUTES;
+        for format in [wgpu::TextureFormat::Rgba8UnormSrgb, wgpu::TextureFormat::Rgba16Float] {
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor { label: None, layout: None,
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("test_vertex"), compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<crate::renderer::DynamicModelVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex, attributes: &attributes })] },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_unlit"), compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+                primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) }] });
+            let target = device.create_texture(&wgpu::TextureDescriptor { label: None,
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1,
+                sample_count: 1, dimension: wgpu::TextureDimension::D2, format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
+            let target_view = target.create_view(&Default::default());
+            for legacy in [false, true] {
+                let opacity = if legacy { 1.0 } else { 0.5 };
+                let vertices = [[-1.0,-1.0,0.0],[3.0,-1.0,0.0],[-1.0,3.0,0.0]].map(|position| crate::renderer::DynamicModelVertex { foliage_wind: 0.0,
+                    position, normal: [0.0,1.0,0.0], uv: [0.5;2], color: [opacity;4],
+                    depth_hack: if legacy {-1.0} else {0.0}, water_wetness: 0.0 });
+                let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None,
+                    contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX });
+                for byte in [0u8,130,255] {
+                    queue.write_texture(texture.as_image_copy(), &[0,0,0,byte], wgpu::TexelCopyBufferLayout {
+                        offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+                    for background in [0.1f64,0.25,0.5,1.0] {
+                        let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256,
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        { let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: None,
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target_view, depth_slice: None, resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: decode(background),g: decode(background),b: decode(background),a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                            ..Default::default() });
+                          pass.set_pipeline(&pipeline); pass.set_bind_group(0,&group,&[]); pass.set_vertex_buffer(0,vertex.slice(..)); pass.draw(0..3,0..1); }
+                        encoder.copy_texture_to_buffer(target.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &read,
+                            layout: wgpu::TexelCopyBufferLayout { offset: 0,bytes_per_row: Some(256),rows_per_image: Some(1) } },
+                            wgpu::Extent3d { width: 1,height: 1,depth_or_array_layers: 1 });
+                        queue.submit([encoder.finish()]);
+                        read.slice(..).map_async(wgpu::MapMode::Read,|r|r.unwrap());
+                        device.poll(wgpu::PollType::Wait { submission_index: None,timeout: None }).unwrap();
+                        let data = read.slice(..).get_mapped_range().unwrap();
+                        let shown = if format.is_srgb() { f64::from(data[0])/255.0 } else {
+                            let bits=u16::from_le_bytes([data[0],data[1]]); let e=((bits>>10)&31) as i32;
+                            let linear=if e==0 {f64::from(bits&1023)*2.0f64.powi(-24)} else {(1.0+f64::from(bits&1023)/1024.0)*2.0f64.powi(e-15)};
+                            encode(linear)
+                        };
+                        let alpha=f64::from(byte)/255.0*f64::from(opacity);
+                        let expected=if legacy {background*(1.0-alpha)} else {encode(decode(background)*(1.0-alpha))};
+                        let tolerance=if legacy {0.026} else {0.006};
+                        assert!((shown-expected).abs()<tolerance,"{format:?} legacy={legacy} alpha={alpha} background={background}: {shown} vs {expected}");
+                    }
+                }
+            }
+        }
+        assert!(scope.pop().await.is_none());
+    });
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn rt_compute_reads_multiple_complete_draw_records() {
@@ -37,7 +144,7 @@ fn rt_compute_reads_multiple_complete_draw_records() {
             .enumerate()
             .map(|(i, p)| {
                 let mut draw = Ghoul2GpuDrawUniform::zeroed();
-                draw.axis0 = [1.0, 0.0, 0.0, 0.0];
+                draw.axis0 = [1.0, 0.0, 0.0, i as f32];
                 draw.axis1 = [0.0, 1.0, 0.0, 0.0];
                 draw.axis2 = [0.0, 0.0, 1.0, 0.0];
                 draw.origin = [p[0], p[1], p[2], 0.0];
@@ -127,6 +234,8 @@ fn rt_compute_reads_multiple_complete_draw_records() {
         assert_eq!(vertices[0].position, [11.0, 33.0, -22.0]);
         assert_eq!(vertices[1].position, [101.0, 303.0, -202.0]);
         assert_eq!(vertices[1].color, [1.0; 4]);
+        assert_eq!(vertices[0].foliage_wind, 0.0);
+        assert_eq!(vertices[1].foliage_wind, 1.0);
     });
 }
 
@@ -153,7 +262,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
             .unwrap();
         let camera = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+            entries: &crate::foliage::camera_layout_entries(),
         });
         let white = upload_texture(
             &device,
@@ -162,7 +271,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
                 label: "state-test-white".into(),
                 width: 1,
                 height: 1,
-                rgba: vec![255; 4],
+                rgba: (vec![255; 4]).into(),
                 source: None,
                 rgba16f: None,
                 mip_level_count: 1,

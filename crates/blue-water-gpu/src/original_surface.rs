@@ -54,6 +54,16 @@ pub(crate) fn sampled(
     }
 }
 
+pub(crate) fn roof_sampled(visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    let mut entry = sampled(22, visibility, wgpu::TextureViewDimension::D2, false);
+    entry.ty = wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+        view_dimension: wgpu::TextureViewDimension::D2,
+        multisampled: false,
+    };
+    entry
+}
+
 pub(crate) fn sampler(
     binding: u32,
     visibility: wgpu::ShaderStages,
@@ -828,6 +838,10 @@ pub struct SurfaceBoundary {
     pub sky: [[f32; 4]; 16],
     /// Eight 32-bit candidate masks per 8x8 tile; exact edge tests still decide coverage.
     pub candidates: [[u32; 4]; 128],
+    /// Shared weather roof texture transform in JKA units; zero extent disables it.
+    pub sky_uv: [f32; 4],
+    /// Water plane height in JKA units (the native material uses a local Y).
+    pub sky_plane: [f32; 4],
 }
 
 impl SurfaceBoundary {
@@ -998,6 +1012,7 @@ pub struct OriginalSurfaceBindings {
     pub(crate) probe_view: wgpu::TextureView,
     reflection_table: wgpu::Buffer,
     pub(crate) boundary: wgpu::Buffer,
+    sky_roof: wgpu::TextureView,
     pub surface_bytes: usize,
 }
 
@@ -1173,6 +1188,7 @@ impl OriginalSurfaceBindings {
             false,
         );
         let mut admission = SurfaceBoundary::zeroed();
+        // Standalone BlueWater has no BSP; preserve its original visible sky.
         admission.bounds = [-1e8, -1e8, 1e8, 1e8];
         admission.scale = [1.0, 0.75, 0.0, 0.0];
         queue.write_buffer(&boundary, 0, bytemuck::bytes_of(&admission));
@@ -1203,6 +1219,8 @@ impl OriginalSurfaceBindings {
             foam_near: blank_godot.clone(),
             foam_far: blank_godot,
         };
+        let sky_roof = placeholder(device, "no BSP roof", wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureViewDimension::D2, 1);
         let material_group = Self::make_material_group(
             device,
             &pipeline.surface_layout,
@@ -1223,6 +1241,7 @@ impl OriginalSurfaceBindings {
             &boundary,
             &hybrid_swell,
             &neutral_godot,
+            &sky_roof,
             &color,
             &depth,
         );
@@ -1334,6 +1353,7 @@ impl OriginalSurfaceBindings {
             probe_view,
             reflection_table,
             boundary,
+            sky_roof,
             surface_bytes,
         }
     }
@@ -1354,6 +1374,7 @@ impl OriginalSurfaceBindings {
         boundary: &wgpu::Buffer,
         hybrid_swell: &wgpu::Buffer,
         godot: &GodotWaterViews,
+        sky_roof: &wgpu::TextureView,
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
@@ -1383,6 +1404,7 @@ impl OriginalSurfaceBindings {
                 entry_sampler(19, &godot.repeat),
                 entry_texture(20, &godot.foam_near),
                 entry_texture(21, &godot.foam_far),
+                entry_texture(22, sky_roof),
             ],
         })
     }
@@ -1392,6 +1414,14 @@ impl OriginalSurfaceBindings {
     pub fn set_reflection_table(&mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline, table: &wgpu::Buffer) {
         if self.reflection_table == *table { return; }
         self.reflection_table = table.clone();
+        if let Some((color, depth)) = self.current_scene.take() {
+            self.set_scene(device, pipeline, &color, &depth);
+        }
+    }
+
+    pub fn set_sky_roof(&mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline, roof: &wgpu::TextureView) {
+        if self.sky_roof == *roof { return; }
+        self.sky_roof = roof.clone();
         if let Some((color, depth)) = self.current_scene.take() {
             self.set_scene(device, pipeline, &color, &depth);
         }
@@ -1421,6 +1451,7 @@ impl OriginalSurfaceBindings {
             &self.boundary,
             &self.hybrid_swell,
             &self.godot,
+            &self.sky_roof,
             color,
             depth,
         );
@@ -1625,8 +1656,9 @@ impl OriginalSurfaceBindings {
         queue.write_buffer(&self.hybrid_swell, 0, bytemuck::bytes_of(two_vec4));
     }
 
-    pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8) {
-        queue.write_buffer(&self.hybrid_swell, 32, bytemuck::bytes_of(&[f32::from(mode), 0.0, 0.0, 0.0]));
+    pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8, fast_foam: f32, fast_foam_detail: bool) {
+        queue.write_buffer(&self.hybrid_swell, 32, bytemuck::bytes_of(&[f32::from(mode), fast_foam,
+            if fast_foam_detail { 1.0 } else { 0.0 }, 0.0]));
     }
 
     /// `r_oceanType 5`: [1 on, wave scale, seconds, foam bits], the foam maps' centres [near x, z, far x, z] (m) and the
@@ -1744,6 +1776,7 @@ impl OriginalSurfacePipeline {
                 sampler(19, both, false),
                 sampled(20, fragment, t2, false),
                 sampled(21, fragment, t2, false),
+                roof_sampled(fragment),
             ],
         });
         let environment_layout =
@@ -1766,8 +1799,8 @@ impl OriginalSurfacePipeline {
             immediate_size: 0,
         });
         // Reduced modes shade at the full-resolution footprint (`full_resolution_footprint`), modules included.
-        let mut composer = shader_composer::composer_with_footprint(
-            (cost_probe & shader_composer::COST_PROBE_CHEAP_NOISE != 0).then_some(()),
+        let mut composer = shader_composer::composer_with_surface_probes(
+            cost_probe,
             shader_composer::pixel_scale(pixel_detail_mode)).expect("Blue Water shader modules");
         let source = shader_composer::jka_surface_module_with_probe(&mut composer, reflection_steps, pixel_detail_mode, cost_probe)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
@@ -2038,8 +2071,8 @@ impl OriginalSurfacePipeline {
             return self;
         }
         let variant = cost_probe | far_variant;
-        let mut composer = shader_composer::composer_with_footprint(
-            (variant & shader_composer::COST_PROBE_CHEAP_NOISE != 0).then_some(()),
+        let mut composer = shader_composer::composer_with_surface_probes(
+            variant,
             shader_composer::pixel_scale(pixel_detail_mode)).expect("Blue Water shader modules");
         let source = shader_composer::jka_surface_module_with_probe(&mut composer, reflection_steps, pixel_detail_mode, variant)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
@@ -2297,7 +2330,7 @@ mod tests {
                 @group(0) @binding(0) var<storage, read> points: array<vec2<f32>>;\n\
                 @group(0) @binding(1) var<storage, read_write> results: array<u32>;\n\
                 @compute @workgroup_size(64) fn test_boundary(@builtin(global_invocation_id) id: vec3<u32>) {{\n\
-                    if id.x < arrayLength(&points) {{ results[id.x] = u32(jka_water_contains(points[id.x])); }}\n\
+                    if id.x < arrayLength(&points) {{ results[id.x] = u32(jka_water_contains(points[id.x])) | (u32(jka_water_sky_admission(points[id.x])) << 1u) | (u32(jka_water_sun_admission(points[id.x])) << 2u); }}\n\
                 }}",
                 include_str!("surface_boundary.wgsl")
             );
@@ -2318,10 +2351,27 @@ mod tests {
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &[entry_buffer(0, &input), entry_buffer(1, &output)],
             });
-            for case in 0..5 {
+            // A narrow roof occupying half the texture. Test nonzero world origin,
+            // above-roof water, disabled/missing admission, and out-of-map samples.
+            let roof = device.create_texture_with_data(&queue, &wgpu::TextureDescriptor {
+                label: Some("BSP roof admission regression"),
+                size: wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            }, wgpu::util::TextureDataOrder::LayerMajor, bytemuck::cast_slice(&[
+                [-1e19f32, 0.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0],
+                [-1e19, 0.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0],
+            ]));
+            let roof = roof.create_view(&Default::default());
+            for case in 0..8 {
                 let mut boundary = SurfaceBoundary::zeroed();
                 boundary.bounds = [0.0, 0.0, 100.0, 100.0];
                 boundary.scale = [40.0, 0.75, 0.0, 0.0];
+                if case == 5 || case == 6 {
+                    boundary.sky_uv = [10.0, 10.0, 0.01, 0.01];
+                    boundary.sky_plane[0] = if case == 6 { 200.0 } else { 0.0 };
+                }
                 if case == 1 || case == 4 {
                     boundary.counts[0] = 4;
                     boundary.triangles[..8].copy_from_slice(&[
@@ -2354,7 +2404,7 @@ mod tests {
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &pipeline.get_bind_group_layout(1),
-                    entries: &[entry_buffer(16, &uniform)],
+                    entries: &[entry_buffer(16, &uniform), entry_texture(22, &roof)],
                 });
                 let mut encoder = device.create_command_encoder(&Default::default());
                 {
@@ -2384,7 +2434,10 @@ mod tests {
                             3 => x <= 100.0 && z <= 100.0,
                             _ => inside,
                         };
-                        assert_eq!(actual != 0, expected, "case {case}, point ({x}, {z})");
+                        assert_eq!(actual & 1 != 0, expected, "case {case}, point ({x}, {z})");
+                        let covered = case == 5 && x >= 60.0 && x < 110.0 && z >= 10.0 && z < 110.0;
+                        assert_eq!(actual >> 1, if covered { 0 } else { 3 },
+                            "sky/sun admission case {case}, point ({x}, {z})");
                     }
                 }
                 read.unmap();

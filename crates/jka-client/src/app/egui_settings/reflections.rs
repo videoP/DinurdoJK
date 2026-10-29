@@ -20,7 +20,8 @@ impl App {
             ui,
             "Reflection quality",
             "Master reflection policy. Off removes optional tcGen environment stages, but keeps \
-             integral authored multistage effects (such as custom glass). Legacy preserves \
+             genuinely translucent authored effects (such as custom glass), while stripping \
+             opaque environment bases that have a diffuse replacement. Legacy preserves \
              authored environment maps with no enhanced reflections; Low enables probes, \
              Medium adds screen-space reflections, and High adds one dynamically selected planar reflector; \
              Ultra raises SSR quality and allows up to four planar reflectors. Changes apply \

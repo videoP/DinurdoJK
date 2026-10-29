@@ -5,6 +5,25 @@ use crate::cgame::player_presenter::{
 };
 
 impl PlayerPresenter {
+    /// CPU-skinned custom shaders need the same generated coordinates and
+    /// static shell bulge as the GPU vertex stage, independently of skin UVs.
+    pub(super) fn custom_shell_cpu_geometry(&self, shell: &mut super::DynamicModelSurface,
+        base: &super::DynamicModelSurface, uv: [f32; 6], environment: bool, bulge: f32) {
+        if shell.ghoul2_gpu.is_some() { return; }
+        let eye = self.stage_view_position.unwrap_or([0.0; 3]);
+        let color = shell.vertices.first().map_or([1.0; 4], |v| v.color);
+        shell.vertices = Arc::new(base.vertices.iter().map(|original| {
+            let mut vertex = *original;
+            let normal = super::Vec3::from_array(vertex.normal).normalize_or_zero();
+            for i in 0..3 { vertex.position[i] += normal[i] * bulge; }
+            let st = if environment { super::environment_uv(vertex.position, vertex.normal, eye) } else { original.uv };
+            vertex.uv = [st[0]*uv[0] + st[1]*uv[2] + uv[4], st[0]*uv[1] + st[1]*uv[3] + uv[5]];
+            // Keep the refEntity tint already assigned by the shell clone.
+            vertex.color = color;
+            vertex
+        }).collect());
+    }
+
     /// A refEntity customShader: its first stage's texture with FX blending
     /// semantics (these shaders are unlit, vertex/entity colored).
     pub(in crate::cgame::player_presenter) fn custom_shader_material(
@@ -105,8 +124,8 @@ impl PlayerPresenter {
     /// it its swirling sheen on top of the base tint). `custom_shader_material`
     /// only reads stage 0, mirroring OpenJK's common single-xstage shells;
     /// this covers the few that layer a second additive pass on top.
-    /// Stages needing per-vertex features this path doesn't carry (`tcGen
-    /// environment`/vector, alpha test) are skipped. `force_alpha_blend`
+    /// Environment coordinates are generated independently for each stage;
+    /// vector coordinates and alpha-tested overlays are still skipped. `force_alpha_blend`
     /// carries the base layer's `RF_FORCE_ENT_ALPHA` override so a follow-on
     /// stage blends the same way instead of fighting it with its own additive
     /// `blendFunc`.
@@ -115,7 +134,7 @@ impl PlayerPresenter {
         shader_name: &str,
         seconds: f32,
         force_alpha_blend: bool,
-    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 6], bool)> {
+    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 6], bool, bool)> {
         use crate::fx::draw::FxBlend;
         let effective = self.shader_remaps.effective_name(shader_name);
         let Some(shader) = jka_assets::shader::find_shader(&self.shaders, effective.as_ref()) else {
@@ -133,9 +152,8 @@ impl PlayerPresenter {
             .filter(|stage| {
                 !stage.image.is_empty()
                     && !stage.image.starts_with('$')
-                    && !stage.entity_rgb
                     && stage.alpha_test.trim().is_empty()
-                    && matches!(stage.tc_gen, TcGen::Base)
+                    && matches!(stage.tc_gen, TcGen::Base | TcGen::Environment)
                     && matches!(
                         FxBlend::from_blend_func(&stage.blend),
                         FxBlend::Add | FxBlend::AddAlpha
@@ -165,7 +183,7 @@ impl PlayerPresenter {
                     FxBlend::from_blend_func(&stage.blend).custom_shader_alpha_mode()
                 };
                 let uv_xform = stage_uv_affine(&stage.tc_mods, seconds);
-                (texture, alpha_mode, uv_xform, stage.glow)
+                (texture, alpha_mode, uv_xform, stage.glow, stage.tc_gen == TcGen::Environment)
             })
             .collect()
     }

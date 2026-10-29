@@ -1,6 +1,6 @@
 //! Hud scores.
 use crate::ui::{
-    duel_icon_atlas_offset, fixed_charset_text, player_icon_atlas_cell, rect,
+    duel_icon_atlas_offset, enemy_icon_atlas_offset, fixed_charset_text, player_icon_atlas_cell, rect,
     shared_player_icon_count, text, visible_jka_chars, ProportionalFont, UiMiniScores, UiSnapshot,
     UiVertex,
 };
@@ -30,6 +30,85 @@ pub(in crate::ui) fn build_game_timer(out: &mut Vec<UiVertex>, ui: &UiSnapshot, 
         h,
     );
     text(out, label, x, y, scale, [1.0; 4], w, h);
+}
+
+
+/// TaystJK CG_DrawHUD score_line, independently draggable from the Force
+/// panel. X/Y retain TaystJK's (right/up) 640x480 offset convention.
+pub(in crate::ui) fn build_hud_score(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(score) = ui.hud_score.as_ref() else { return; };
+    if !ui.video.draw_hud { return; }
+    let ctx = crate::ui::HudRectContext::from_snapshot(ui);
+    let stock = crate::ui::hud_stock_rect(crate::ui::HudElementId::Score, &ctx, w, h);
+    let sy = h as f32 / 480.0;
+    let scale = sy;
+    let glyph_w = 6.0 * scale;
+    let right = stock.x + stock.width;
+    let bottom = stock.y + stock.height;
+    for (row, line) in score.lines.iter().enumerate() {
+        let x = (right - crate::ui::visible_jka_chars(line) as f32 * glyph_w).max(0.0);
+        let y = bottom - (score.lines.len() - row) as f32 * 14.0 * sy;
+        fixed_charset_text(out, line, x + sy, y + sy, glyph_w, 8.0 * scale,
+            glyph_w, [0.0, 0.0, 0.0, 0.72], false, w, h);
+        fixed_charset_text(out, line, x, y, glyph_w, 8.0 * scale,
+            glyph_w, [1.0; 4], false, w, h);
+    }
+}
+
+/// Size returned by TaystJK's CG_DrawEnemyInfo(y) before CG_DrawMiniScoreboard.
+/// In virtual (640x480) units to preserve its upper-right stack.
+fn enemy_info_extent(ui: &UiSnapshot) -> f32 {
+    ui.enemy_info.as_ref().map_or(0.0, |enemy| {
+        // y += 5; icon 1.25 * ICON_SIZE (ICON_SIZE=32); name and title,
+        // plus an optional duel score line and duel-health bar.
+        let mut height = 5.0 + 40.0;
+        if enemy.name.is_some() { height += 30.0; }
+        else { height += 24.0; }
+        if enemy.detail.is_some() { height += 15.0; }
+        if enemy.health.is_some() { height += 15.0; }
+        height + 2.0
+    })
+}
+
+/// CG_DrawEnemyInfo, drawn below the upper-right FPS/timer rows and before
+/// CG_DrawMiniScoreboard. Uses the same lazy player icon atlas as Duel HUD.
+pub(in crate::ui) fn build_enemy_info(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(enemy) = ui.enemy_info.as_ref() else { return; };
+    let sy = h as f32 / 480.0;
+    let ratio = crate::lagometer::width_ratio_coef(w, h);
+    let sx = (w as f32 / 640.0) * ratio;
+    let rows = (ui.video.draw_fps != 0) as usize + ui.game_timer.is_some() as usize;
+    let mut y = (12.0 + rows as f32 * 22.0 + 5.0) * sy;
+    let icon_size = 40.0 * sy;
+    let icon_x = w as f32 - (40.0 + 5.0) * sx;
+    let absolute_cell = u16::try_from(enemy_icon_atlas_offset(ui)).ok();
+    player_icon_atlas_cell(out, shared_player_icon_count(ui), absolute_cell,
+        icon_x, y, 40.0 * sx, icon_size, w, h);
+    y += icon_size;
+    let paint_right = |out: &mut Vec<UiVertex>, label: &str, ypos: f32| {
+        let glyph_w = 5.0 * sy;
+        let x = w as f32 - 5.0 * sx - visible_jka_chars(label) as f32 * glyph_w;
+        fixed_charset_text(out, label, x, ypos, glyph_w, 9.0 * sy, glyph_w, [1.0; 4], false, w, h);
+    };
+    if let Some(name) = &enemy.name {
+        paint_right(out, name, y);
+        y += 15.0 * sy;
+        paint_right(out, &enemy.title, y);
+        if let Some(detail) = &enemy.detail {
+            y += 15.0 * sy;
+            paint_right(out, detail, y);
+        }
+        if let Some(health) = enemy.health {
+            y += 15.0 * sy;
+            let bar_x = w as f32 - 69.0 * sx;
+            rect(out, bar_x, y, 64.0 * sx, 8.0 * sy, [1.0; 4], w, h);
+            let fraction = (health as f32 / 100.0).clamp(0.0, 1.0);
+            rect(out, bar_x + sx, y + sy, 62.0 * sx * fraction, 6.0 * sy,
+                [0.5 + 0.2 * fraction, 0.0, 0.0, 0.7], w, h);
+        }
+    } else {
+        paint_right(out, &enemy.title, y);
+    }
 }
 
 pub(in crate::ui) fn build_mini_scores(
@@ -68,7 +147,7 @@ pub(in crate::ui) fn build_mini_scores(
             // In Tayst this receives CG_DrawUpperRight's running y. Our upper
             // right stack currently consists of FPS and the classic timer.
             let rows = (ui.video.draw_fps != 0) as usize + ui.game_timer.is_some() as usize;
-            let y = 12.0 + rows as f32 * 22.0;
+            let y = (12.0 + rows as f32 * 22.0 + enemy_info_extent(ui)) * sy;
             fixed_charset_text(
                 out,
                 &label,

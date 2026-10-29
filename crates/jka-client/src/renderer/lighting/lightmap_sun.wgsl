@@ -53,8 +53,11 @@ fn shade_composed_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<
     if flux <= 0.0 { return lightmap; }
     let visibility = lightmap_moving_sun_visibility(input);
     if lighting_settings.runtime_sun_radiance.w > 0.5 {
-        return max(lightmap-lighting_settings.runtime_sun_radiance.rgb*flux*(1.0-visibility),vec3(0.0));
+        return max(lightmap-lighting_settings.runtime_sun_radiance.rgb*flux*(1.0-visibility)*shadow_settings.params.z,vec3(0.0));
     }
     if visibility >= 0.9999 { return lightmap; }
-    return lightmap-max(lightmap-baked_local_total(input),vec3(0.0))*flux*(1.0-visibility);
+    // The compositor applies the user strength to legacy alpha. Facing and
+    // static sun visibility remain geometric, independent of sun intensity.
+    let moving_fraction = clamp(flux, 0.0, 1.0);
+    return lightmap-max(lightmap-baked_local_total(input),vec3(0.0))*moving_fraction*(1.0-visibility);
 }

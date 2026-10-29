@@ -23,6 +23,7 @@ mod initialize;
 mod input;
 mod inspector;
 mod lifecycle;
+mod process_memory;
 mod update_runtime;
 mod local;
 mod map_loading;
@@ -31,17 +32,33 @@ mod notices;
 mod performance;
 mod race_ghost_runtime;
 mod render_studio;
+mod render_studio_project;
+mod render_studio_media;
+mod render_studio_picker;
+mod render_studio_cfg;
+mod render_studio_director;
+mod render_studio_race;
+mod render_studio_race_map;
+mod render_studio_auto_director;
 mod render_studio_camera;
 mod render_studio_navigation;
 mod render_studio_cinematics;
 mod render_studio_spatial;
 mod render_studio_timeline;
+mod render_studio_profile;
+mod render_studio_lights;
+mod render_studio_audio;
+mod restrictions;
+mod render_studio_transitions;
+mod render_studio_demo;
+mod render_studio_dm26;
 mod session;
 mod settings;
 mod siege;
 mod text_input;
 mod tick;
 mod water_wetness;
+mod wallrun_camera;
 mod world_effects;
 use commands::buffer::{random_unit, split_console_script};
 use connection::types::{
@@ -101,9 +118,11 @@ mod egui_pages;
 mod egui_race_ghosts;
 mod egui_settings;
 mod egui_strafe_trails;
+mod egui_telemarks;
 mod egui_theme;
 mod egui_trace_menu;
 mod frontend;
+mod menu_ambience;
 mod hitch;
 mod map_editor;
 mod quality;
@@ -237,6 +256,8 @@ pub struct App {
     extensions: crate::extensions::Manager,
     updater: crate::updater::State,
     base: PathBuf,
+    /// Requested roots. Filesystem changes are persistent, applied on restart.
+    fs_roots: jka_assets::pk3::FilesystemRoots,
     /// Command-line/local game directory. Session fs_game is restored to this on disconnect.
     startup_game: Option<PathBuf>,
     /// Active asset game directory. Remote/demo fs_game may replace this for the session.
@@ -249,6 +270,9 @@ pub struct App {
     frontend_skip_chrome_fade: bool,
     /// Renderer-drawn frontend Main page: selection and what was last sent.
     neon_menu: egui_menu::NeonMenuState,
+    neon_chrome_sent: Option<crate::neon_menu::ChromeFrame>,
+    /// Confirmation for QUIT in the shared frontend footer.
+    frontend_quit_confirmation: bool,
     solo_maps: Vec<SoloMapEntry>,
     solo_map_selected: usize,
     solo_catalog_loaded: bool,
@@ -268,6 +292,15 @@ pub struct App {
     asset_viewer_selected: Option<String>,
     asset_viewer_filter: AssetFilter,
     asset_viewer_search: String,
+    pk3_manager_loaded: bool,
+    pk3_manager_packages: Vec<jka_assets::pk3::PackageInfo>,
+    pk3_manager_disabled: HashSet<PathBuf>,
+    pk3_manager_search: String,
+    pk3_manager_selected: Option<PathBuf>,
+    pk3_manager_entries: Vec<String>,
+    pk3_manager_entries_search: String,
+    pk3_manager_entries_error: Option<String>,
+    pk3_manager_status: Option<String>,
     asset_viewer_folder: String,
     /// Highlighted autocomplete row while the folder filter owns focus.
     asset_viewer_folder_suggestion: usize,
@@ -296,6 +329,9 @@ pub struct App {
     pending_screenshot_jump: Option<crate::screenshot::ScreenshotMetadata>,
     /// Startup drag/drop can ask the browser to select a plain/non-jumpable image.
     startup_screenshot_select: Option<PathBuf>,
+    /// `.dm_26` supplied on the command line (dragged onto the exe); played
+    /// once the first frame has been presented.
+    startup_demo_file: Option<PathBuf>,
     chat_log_browser_entries: Vec<ChatLogBrowserEntry>,
     chat_log_browser_catalog_loaded: bool,
     chat_log_browser_catalog_error: Option<String>,
@@ -393,6 +429,8 @@ pub struct App {
     profile_dynamic_models: Arc<Vec<DynamicModelSurface>>,
     profile_preview_active: bool,
     render_studio: RenderStudio,
+    /// Last physical viewport sent to the world compositor (command dedup).
+    render_studio_world_compositor: Option<[u32; 4]>,
     demo_entries: Vec<DemoEntry>,
     demo_catalog_pending: bool,
     demo_catalog_generation: u64,
@@ -435,6 +473,7 @@ pub struct App {
     strafe_trails: crate::strafe_trail::Manager,
     strafe_trail_filter: String,
     strafe_trail_name_input: String,
+    telemark_ui: egui_telemarks::TelemarkUi,
     strafe_trail_log_input: String,
     strafe_trail_slot: u8,
     demo_console_filter: DemoConsoleFilter,
@@ -496,6 +535,12 @@ pub struct App {
     /// gamestate arrives. Receiver absence means there is no worker in flight.
     live_cgame_prep_rx: Option<Receiver<Result<LiveCgamePrepared, String>>>,
     live_cgame_prepared: Option<LiveCgamePrepared>,
+    /// Stop flag of the in-flight prep worker; set when it is superseded.
+    live_cgame_prep_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Last fs_game each server advertised this run. Applied at connect so the
+    /// speculative CGame prep starts on the right mod instead of being
+    /// restarted when infoResponse arrives; the server's answer still wins.
+    live_fs_game_hints: HashMap<SocketAddr, Vec<u8>>,
     pending_live_gamestate: bool,
     /// Socket of the last `rcon`, kept so the server's `print` replies arrive.
     rcon: Option<crate::net::RconChannel>,
@@ -560,6 +605,7 @@ pub struct App {
     startup_commands: Vec<String>,
     audio: config::AudioSettings,
     menu_emote_sound: Option<crate::cgame::sound_presenter::SoundPresenter>,
+    menu_ambience: menu_ambience::MenuAmbience,
     window_focused: bool,
     pending_frontend_map_launch: bool,
     /// Request id of the passive map currently being prepared for the main menu.
@@ -577,8 +623,13 @@ pub struct App {
     startup_first_menu_frame_seen: bool,
     proxy: EventLoopProxy<UserEvent>,
     loader_tx: Sender<MapLoadRequest>,
+    /// Let the map worker stop a stale browser-map guess at stage boundaries.
+    /// Updated only when a new map request is submitted or invalidated.
+    map_loader_latest_requested: Arc<std::sync::atomic::AtomicU64>,
     window: Option<Arc<Window>>,
     render: Option<RenderThread>,
+    /// Avoid enqueuing empty combat HUD updates every gameplay tick.
+    combat_ui_was_active: bool,
     startup_first_frame_seen: bool,
     camera: Camera,
     /// Render-only mapping from the newest real local viewangles onto the camera.
@@ -600,6 +651,8 @@ pub struct App {
     third_person: ThirdPersonSettings,
     spectator_camera: SpectatorCameraSettings,
     spectator_camera_state: SpectatorCameraState,
+    wallrun_camera_yaw: wallrun_camera::WallrunCameraYaw,
+    wallrun_camera_mode: u8,
     first_person_lightsaber: bool,
     saber_trail: i32,
     saber_team_colors: bool,
@@ -613,6 +666,12 @@ pub struct App {
     spectator_ping_guesses: [SpectatorPingGuessState; 32],
     /// TaystJK cg_drawScores (0..3).
     draw_scores: i32,
+    draw_score: i32,
+    draw_score_x: f32,
+    draw_score_y: f32,
+    draw_enemy_info: bool,
+    hud_score_shown: Option<ui::UiHudScore>,
+    enemy_info_shown: Option<ui::UiEnemyInfo>,
     mini_scores_shown: Option<ui::UiMiniScores>,
     team_overlay_shown: Option<ui::TeamOverlayUi>,
     cg_debug_events: u8,
@@ -630,6 +689,8 @@ pub struct App {
     force_select_until: Option<Instant>,
     /// TaystJK cg.weaponSelectTime (WEAPON_SELECT_TIME = 1400 ms).
     weapon_select_until: Option<Instant>,
+    /// TaystJK cg.invenSelectTime (WEAPON_SELECT_TIME = 1400 ms).
+    inventory_select_until: Option<Instant>,
     /// TaystJK cg_drawPlayerNames. Occlusion is sampled at 30 Hz; the render
     /// thread still projects accepted labels every frame for smooth late-latched motion.
     player_names: ui::PlayerNameSettings,
@@ -817,8 +878,11 @@ pub struct App {
     /// OpenJK-style CVAR_LATCH pending values. The live value remains unchanged
     /// until the owning subsystem is restarted.
     latched_console_cvars: BTreeMap<String, String>,
+    /// Wrapped-row index, independent of logical lines / companion console.
+    console_reflow: std::cell::RefCell<console_state::ConsoleReflow>,
     console_scroll: usize,
     console_size: ConsoleSize,
+    console_scale: f32,
     console_selection_anchor: Option<ConsolePoint>,
     console_selection_focus: Option<ConsolePoint>,
     console_selecting: bool,
@@ -970,6 +1034,9 @@ pub struct App {
     latest_request_id: u64,
     latest_prepare_options: scene::MapPrepareOptions,
     prepared_map_cache: Option<PreparedMapCache>,
+    /// One-transition CPU seed from another fs_game. Only immutable stages
+    /// with matching BSP/content fingerprints may be reused by the new VFS.
+    cross_game_map_seed: Option<PreparedMapCache>,
     /// EFX light-promotion metadata built off-thread during the active map load.
     fx_light_promotion_catalog: Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
     /// Active OpenJK/TaystJK R_RemapShader state. Changes are resolved into a

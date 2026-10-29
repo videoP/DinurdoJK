@@ -132,6 +132,10 @@ impl Drop for DemoVideoExport {
 }
 
 pub(in crate::app) fn adjacent_ffmpeg_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("DJK_STUDIO_TEST_FFMPEG").map(PathBuf::from) {
+        return path.is_file().then_some(path);
+    }
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.join("ffmpeg.exe");
     path.is_file().then_some(path)

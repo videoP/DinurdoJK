@@ -322,6 +322,7 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
     world: &WorldGpu,
     lights: &[TransientLight],
 ) {
+    let fx_diag_start = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
     // A paused scene or stationary FX lights used to rewalk the entire
     // surface BVH, clear all lit masks, and re-upload them every frame.
     // The mask test below depends only on the first 32 positions/radii;
@@ -341,6 +342,7 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
     if state.last_mask_light_count == light_count
         && state.last_mask_light_bits[..light_count] == light_bits[..light_count]
     {
+        crate::fx::diagnostics::add(crate::fx::diagnostics::LEGACY_MASK_HITS, 1);
         return;
     }
     state.last_mask_light_count = light_count;
@@ -356,6 +358,8 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
     }
     state.lit.clear();
     state.light_boxes.clear();
+    let mut diag_bvh_visits = 0u64;
+    let mut diag_bvh_accepts = 0u64;
     for (bit, light) in lights.iter().take(32).enumerate() {
         let position = Vec3::from_array(light.position);
         let radius = light.radius.max(0.0);
@@ -363,9 +367,11 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
         state.light_boxes.push((minimum, maximum));
         let (masks, lit) = (&mut state.masks, &mut state.lit);
         index.surfaces_in_box(minimum, maximum, |surface| {
+            if fx_diag_start.is_some() { diag_bvh_visits += 1; }
             if !legacy_dlight_touches_surface(&surfaces[surface as usize], position, radius) {
                 return;
             }
+            if fx_diag_start.is_some() { diag_bvh_accepts += 1; }
             let slot = surface as usize;
             if masks[slot] == 0 {
                 lit.push(surface);
@@ -376,11 +382,19 @@ pub(in crate::renderer) fn update_legacy_dlight_masks(
         });
     }
     if dirty.start < dirty.end {
+        crate::fx::diagnostics::add(crate::fx::diagnostics::LEGACY_UPLOAD_BYTES, ((dirty.end - dirty.start) * 4) as u64);
         queue.write_buffer(
             &world.legacy_dlight_surface_mask_buffer,
             dirty.start as u64 * 4,
             bytemuck::cast_slice(&state.masks[dirty]),
         );
+    }
+    if let Some(started) = fx_diag_start {
+        use crate::fx::diagnostics as diag;
+        diag::add(diag::LEGACY_MASK_REBUILDS, 1);
+        diag::add(diag::LEGACY_MASK_US, diag::micros(started.elapsed()));
+        diag::add(diag::LEGACY_BVH_VISITS, diag_bvh_visits);
+        diag::add(diag::LEGACY_LIT_SURFACES, diag_bvh_accepts);
     }
 }
 
@@ -393,6 +407,7 @@ pub(in crate::renderer) fn prepare_legacy_dlight_draws(
     mode: PvsMode,
     view_proj: Mat4,
 ) {
+    let fx_diag_started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
     let lists = &mut world.legacy_dlight;
     let mut draws = std::mem::take(&mut lists.draws);
     let mut inline_batches = std::mem::take(&mut lists.inline_batches);
@@ -429,6 +444,12 @@ pub(in crate::renderer) fn prepare_legacy_dlight_draws(
         if let Some(buffer) = &lists.index_buffer {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(&indices));
         }
+    }
+    if let Some(started) = fx_diag_started {
+        use crate::fx::diagnostics as diag;
+        diag::add(diag::LEGACY_DRAW_US, diag::micros(started.elapsed()));
+        diag::add(diag::LEGACY_INDICES, indices.len() as u64);
+        diag::add(diag::LEGACY_DRAW_GROUPS, draws.len() as u64);
     }
     lists.draws = draws;
     lists.inline_batches = inline_batches;

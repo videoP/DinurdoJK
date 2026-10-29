@@ -97,7 +97,7 @@ pub(in crate::scene) fn neutral_deluxemap(label: impl Into<String>) -> TextureDa
         source: None,
         width: 1,
         height: 1,
-        rgba: vec![127, 127, 127, 0],
+        rgba: (vec![127, 127, 127, 0]).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -162,12 +162,12 @@ pub(in crate::scene) fn embedded_lightmap_texture(index: usize, page: &[u8]) -> 
         source: None,
         width: 128,
         height: 128,
-        rgba: page
+        rgba: (page
             .as_chunks::<3>()
             .0
             .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
-            .collect(),
+            .collect::<Vec<_>>()).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -194,7 +194,7 @@ pub(in crate::scene) fn embedded_deluxemap_texture(index: usize, page: &[u8]) ->
         source: None,
         width: 128,
         height: 128,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,

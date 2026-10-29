@@ -181,6 +181,17 @@ fn full_resolution_footprint(source: &str, scale: u32) -> String {
 /// `composer_with_noise` with every module at the full-resolution footprint of a material shaded at `1 / scale`
 /// resolution (`full_resolution_footprint`); 1 leaves the modules unchanged.
 pub fn composer_with_footprint(cheap_noise: Option<()>, scale: u32) -> Result<Composer, Box<ComposerError>> {
+    composer_with_options(cheap_noise, scale, false, false)
+}
+
+/// Surface experiments leave the shared vendor shaders untouched.
+pub fn composer_with_surface_probes(probe: u32, scale: u32) -> Result<Composer, Box<ComposerError>> {
+    composer_with_options((probe & COST_PROBE_CHEAP_NOISE != 0).then_some(()), scale,
+        probe & COST_PROBE_SERIAL_REFINEMENT != 0,
+        probe & COST_PROBE_SINGLE_WAVE_COPY != 0 && probe & SURFACE_GODOT_WATER == 0)
+}
+
+fn composer_with_options(cheap_noise: Option<()>, scale: u32, serial_refinement: bool, single_wave_copy: bool) -> Result<Composer, Box<ComposerError>> {
     const BODY_START: &str = "fn value_noise(p: vec2<f32>, seed: u32) -> f32 {";
     let cheap = cheap_noise.map(|()| {
         let source = MODULES.iter().find(|(path, _)| *path == "naval-ocean/shaders/noise.wgsl").unwrap().1;
@@ -194,7 +205,14 @@ pub fn composer_with_footprint(cheap_noise: Option<()>, scale: u32) -> Result<Co
             Some(cheap) if file_path == "naval-ocean/shaders/noise.wgsl" => cheap.as_str(),
             _ => source,
         };
-        let source = full_resolution_footprint(source, scale);
+        let source = if single_wave_copy && file_path == "naval-ocean/shaders/waves.wgsl" {
+            // Change the shared displacement/normal/reflected-hit sampling
+            // together. This removes anti-tiling, not the FFT or foam fields.
+            replace_once(source, "    if i >= 2 {", "    if true {")
+        } else if serial_refinement && file_path == "naval-ocean/shaders/screen_reflection.wgsl" {
+            jka_serial_refinement(source)
+        } else { source.to_owned() };
+        let source = full_resolution_footprint(&source, scale);
         composer
             .add_composable_module(ComposableModuleDescriptor {
                 source: &source,
@@ -223,7 +241,7 @@ pub fn jka_surface_module(
 }
 
 /// `jka_surface_module` with `r_oceanCostProbe` feature stubs (`COST_PROBE_*`). A/B cost measurement only: every
-/// nonzero mask changes the image.
+/// Most masks change the image; defer-body and serial-refinement retain the material's math.
 pub fn jka_surface_module_with_probe(
     composer: &mut Composer,
     reflection_steps: u32,
@@ -251,6 +269,15 @@ pub const COST_PROBE_UNDERSIDE: u32 = 1 << 11;
 /// Admission only: a constant colour after the footprint test (the pass's fixed floor).
 pub const COST_PROBE_FLOOR: u32 = 1 << 12;
 pub const COST_PROBE_ALL: u32 = (1 << 13) - 1;
+/// Same material expressions, computed after SSR to shorten temporary lifetimes.
+pub const COST_PROBE_DEFER_BODY: u32 = 1 << 13;
+/// Wave-sampling diagnostic: native FFT uses one coherent copy at every scale.
+/// The same bit already flattens the pixel wave frame for the Gerstner material;
+/// the SURFACE_GODOT_WATER tag distinguishes those mutually exclusive backends.
+/// Lossy: allows tile repetition and changes the sampled wave pattern.
+pub const COST_PROBE_SINGLE_WAVE_COPY: u32 = 1 << 14;
+/// Same eight bisections, reading only the selected quarter instead of both quarters.
+pub const COST_PROBE_SERIAL_REFINEMENT: u32 = 1 << 15;
 /// Finer foam probes (the parts `COST_PROBE_FOAM` removes together): the wave field's spread reads for the bubble cloud,
 /// the breaking groups' noise, the gale streaks, and the foam texture's pattern reads.
 pub const COST_PROBE_FOAM_SPREAD: u32 = 1 << 17;
@@ -306,6 +333,9 @@ pub const SURFACE_WAVE_STATISTICS_DEBUG: u32 = 1 << 29;
 /// water body and foam, lit by Blue Water. The vertex stage's waves are the uniform-driven `jka_hybrid.godot` path,
 /// shared by every Hybrid-family module.
 pub const SURFACE_GODOT_WATER: u32 = 1 << 30;
+/// Opt-in FFT Hybrid material with Godot-style GGX, simple foam and filtered
+/// environment reflection. Geometry and every displacement consumer stay native.
+pub const SURFACE_FAST_HYBRID: u32 = 1 << 31;
 /// `SURFACE_GODOT_WATER` cost probe (a bit the Blue Water probes leave free): the per-pixel wave frame stubbed (flat).
 pub const COST_PROBE_GODOT_PIXEL: u32 = 1 << 14;
 /// The cost probes that rewrite the FFT wave sample or the foam stack, which `SURFACE_GODOT_WATER` has replaced.
@@ -418,6 +448,36 @@ fn replace_span(source: &str, start: &str, end: &str, to: &str) -> String {
 }
 
 /// The `r_oceanCostProbe` stubs on the JKA surface source (after its JKA replacements, before admission).
+fn jka_defer_body(source: &str) -> String {
+    let start = source.find("    // The opaque scene behind this pixel").expect("water body start");
+    let end = source[start..].find("    // Fresnel between the reflected sky").expect("water body end") + start;
+    let body = source[start..end].to_owned();
+    let mut source = source.to_owned();
+    source.replace_range(start..end, "");
+    let after = source.find("    // How far up a wave this point sits").expect("reflection result");
+    source.insert_str(after, &body);
+    source
+}
+
+fn jka_serial_refinement(source: &str) -> String {
+    // The original reads middle/lower/upper, then uses only middle and one
+    // quarter. These eight sequential bisections visit exactly those same
+    // selected points; the unselected four depth reads are unnecessary.
+    let start = source.find("                for (var r = 0; r < REFINEMENTS; r += 2)").expect("SSR refinement start");
+    let end = source[start..].find("                // Accept a surface within").expect("SSR refinement end") + start;
+    let mut result = source.to_owned();
+    result.replace_range(start..end, concat!(
+        "                for (var r = 0; r < REFINEMENTS; r++) {\n",
+        "                    let middle = (low + high) * 0.5;\n",
+        "                    let centre = probe_at(ray, middle, depth_along(ray, depth_copy, middle));\n",
+        "                    if crossed(centre, edge, front_scene) {\n",
+        "                        high = middle;\n",
+        "                        refined = centre;\n",
+        "                    } else { low = middle; }\n",
+        "                }\n"));
+    result
+}
+
 fn jka_cost_probe_source(source: &str, probe: u32) -> String {
     let mut s = source.to_owned();
     let on = |bit: u32| probe & bit != 0;
@@ -518,6 +578,10 @@ fn jka_cost_probe_source(source: &str, probe: u32) -> String {
     }
     if on(COST_PROBE_UNDERSIDE) {
         s = replace_span(&s, "if !front && (submerged", "{", "if false ");
+    }
+    if on(COST_PROBE_DEFER_BODY)
+        && !on(COST_PROBE_PACK_HALF | COST_PROBE_PACK_HALF_WIDE | COST_PROBE_PACK_BITS) {
+        s = jka_defer_body(&s);
     }
     s
 }
@@ -788,6 +852,10 @@ fn compose_surface_probed(
         ("CASCADES".to_owned(), ShaderDefValue::UInt(3)),
         ("REFLECTION_STEPS".to_owned(), ShaderDefValue::UInt(reflection_steps)),
     ];
+    let fast_hybrid = cost_probe & SURFACE_FAST_HYBRID != 0 && cost_probe & SURFACE_GODOT_WATER == 0;
+    if fast_hybrid && cost_probe & COST_PROBE_SSR == 0 {
+        shader_defs.push(("JKA_FAST_SSR".to_owned(), ShaderDefValue::UInt(1)));
+    }
     if point_lights {
         shader_defs.push(("POINT_LIGHTS".to_owned(), ShaderDefValue::UInt(1)));
     }
@@ -830,7 +898,9 @@ fn compose_surface_probed(
         let godot = cost_probe & SURFACE_GODOT_WATER != 0;
         // Cost probes alone (no lossless/lossy variant bits) decide whether reduced modes split the glints.
         let probe_only = cost_probe & !SURFACE_GODOT_WATER;
-        let cost_probe = if godot { cost_probe & !GODOT_REPLACED_PROBES } else { cost_probe };
+        let cost_probe = if fast_hybrid {
+            cost_probe & (SURFACE_FAST_HYBRID | COST_PROBE_SSR | COST_PROBE_FLOOR)
+        } else if godot { cost_probe & !GODOT_REPLACED_PROBES } else { cost_probe };
         let original = if godot { jka_godot_material(&original, cost_probe) } else { original };
         // Reduced-resolution variants execute the original *entire* material
         // on a smaller attachment. Only the screen-space opaque scene lookup
@@ -843,7 +913,16 @@ fn compose_surface_probed(
             "\n    if !jka_water_contains(input.grid) { discard; }"
         };
         let original = if cost_probe & SURFACE_SKIP_FADED_CASCADES != 0 { jka_skip_faded_cascades(&original) } else { original };
-        let core = jka_cost_probe_source(&original, cost_probe);
+        let core = if fast_hybrid {
+            let start = original.find(entry).expect("native fragment");
+            let start = original[..start].rfind("@fragment").expect("native fragment attribute");
+            let end = start + original[start..].find("// The motion pass for temporal anti-aliasing").expect("native motion pass");
+            let tint = crate::original_surface::SurfaceAppearance::default().transmission;
+            let fast = include_str!("hybrid_fast_surface.wgsl").replace("JKA_FAST_TRANSMISSION",
+                &format!("vec3<f32>({}, {}, {})", tint[0], tint[1], tint[2]));
+            format!("{}\n{}\n{}", &original[..start], fast, &original[end..])
+                .replace("#import naval_ocean::foam::{FOAM_GLOSS,", "#import naval_ocean::foam::{FoamPatterns, FOAM_GLOSS,")
+        } else { jka_cost_probe_source(&original, cost_probe) };
         let core = if cost_probe & SURFACE_WAVE_STATISTICS != 0 {
             jka_wave_statistics(&core, cost_probe & SURFACE_WAVE_STATISTICS_FOAM != 0,
                 cost_probe & SURFACE_WAVE_STATISTICS_DEBUG != 0)
@@ -854,7 +933,20 @@ fn compose_surface_probed(
             composer.capabilities |= wgpu::naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32;
             jka_pack_half_source(&core, cost_probe & COST_PROBE_PACK_HALF_WIDE != 0, cost_probe & COST_PROBE_PACK_BITS != 0)
         } else { core };
-        let core = core.replace(entry, &format!("{entry}{admission}"));
+        // Upstream treats the atlas as globally visible. A closed BSP room must
+        // not reflect its sky lobe or solar halo. Do this after cost probes:
+        // their exact-string anchors still see the unmodified upstream material.
+        let core = core.replace(
+            "let sun_radiance = sky_env.light_color * sun_intensity;",
+            "let sun_radiance = sky_env.light_color * sun_intensity * jka_admission;",
+        ).replace(
+            "return aerial_apply(color, world);",
+            "return mix(color, aerial_apply(color, world), jka_water_sky_admission(world.xz));",
+        ).replace(
+            "let sky = shelter_reflect(contact, sky_lobe(sky_atlas, sky_sampler, sky_env, lobe));",
+            "let sky = shelter_reflect(contact, sky_lobe(sky_atlas, sky_sampler, sky_env, lobe)) * jka_admission;",
+        );
+        let core = core.replace(entry, &format!("{entry}{admission}\n    let jka_admission = jka_water_sky_admission(input.grid);"));
         let core = if near_detail {
             // Only near fragments run the original, expensive material. The
             // overlaid color blends from full quality to reconstructed water
@@ -1230,6 +1322,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn equivalent_work_order_variants_validate_with_material_modes() {
+        for mask in [COST_PROBE_SINGLE_WAVE_COPY, COST_PROBE_SINGLE_WAVE_COPY | COST_PROBE_SSR,
+            COST_PROBE_DEFER_BODY, COST_PROBE_SERIAL_REFINEMENT,
+            COST_PROBE_DEFER_BODY | COST_PROBE_SERIAL_REFINEMENT,
+            COST_PROBE_DEFER_BODY | COST_PROBE_SSR,
+            COST_PROBE_DEFER_BODY | COST_PROBE_FOAM,
+            COST_PROBE_DEFER_BODY | COST_PROBE_PACK_HALF] {
+            for mode in [0, 1, 2, 5] {
+                let mut composer = composer_with_surface_probes(mask, pixel_scale(mode)).expect("modules");
+                let module = jka_surface_module_with_probe(&mut composer, 16, mode, mask)
+                    .unwrap_or_else(|error| panic!("mask {mask}, mode {mode}: {}", error.emit_to_string(&composer)));
+                wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+                    .validate(&module).expect("equivalent work ordering validates");
+            }
+        }
+    }
+
+    #[test]
     fn original_surface_shader_composes_and_validates() {
         for point_lights in [false, true] {
             let mut composer = composer()
@@ -1242,6 +1353,18 @@ mod tests {
             )
             .validate(&module)
             .expect("preserved Blue Water surface validates");
+        }
+    }
+
+    #[test]
+    fn fast_hybrid_material_validates_with_and_without_reflections() {
+        for probe in [SURFACE_FAST_HYBRID, SURFACE_FAST_HYBRID | COST_PROBE_SSR,
+            SURFACE_FAST_HYBRID | FAR_SHADER_DEFAULT, SURFACE_FAST_HYBRID | COST_PROBE_FLOOR] {
+            let mut composer = composer_with_surface_probes(probe, 1).expect("modules");
+            let module = jka_surface_module_with_probe(&mut composer, 16, 0, probe)
+                .unwrap_or_else(|error| panic!("fast Hybrid {probe:#x}: {}", error.emit_to_string(&composer)));
+            wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::default()).validate(&module).expect("fast Hybrid validates");
         }
     }
 

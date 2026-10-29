@@ -15,7 +15,7 @@ const TEAM_RED: i32 = 1;
 const TEAM_BLUE: i32 = 2;
 const WP_SABER: i32 = 2;
 const PW_CLOAKED: i32 = 11;
-const FP_SEE: i32 = 13;
+const FP_SEE: i32 = 14;
 /// `NPCTEAM_PLAYER` (`teams.h`): NPCs on the player side outside siege.
 const NPCTEAM_PLAYER: i32 = 2;
 
@@ -261,12 +261,15 @@ pub fn crosshair_name(
     } else {
         RED
     };
-    if viewer.duel_in_progress {
-        if target != viewer.duel_index {
+    // In the coloured-name mode the initial tint must stay white until a
+    // genuine ^0..^9 name escape overrides it. Black duel/mindtrick target
+    // tints belong to the friend/foe mode, not to the authored name colors.
+    if !coloured {
+        if viewer.duel_in_progress {
+            if target != viewer.duel_index { color = BLACK; }
+        } else if target_state.is_some_and(|state| field_i32(state, "bolt1") != 0) {
             color = BLACK;
         }
-    } else if target_state.is_some_and(|state| field_i32(state, "bolt1") != 0) {
-        color = BLACK;
     }
 
     let mut text = if coloured { name } else { sanitize_name(&name) };
@@ -376,6 +379,11 @@ mod tests {
         assert_eq!(crosshair_name(&team, &me, 4, false, None, 1.0, false, 1.0).unwrap().color, RED);
         let coloured = crosshair_name(&team, &me, 4, false, None, 0.5, true, 0.5).unwrap();
         assert_eq!((coloured.color, coloured.alpha), (WHITE, 0.25));
+        let mut duel_view = me;
+        duel_view.duel_in_progress = true;
+        duel_view.duel_index = 4;
+        assert_eq!(crosshair_name(&team, &duel_view, 3, false, None, 1.0, true, 1.0).unwrap().color, WHITE);
+        assert_eq!(crosshair_name(&team, &duel_view, 3, false, None, 1.0, false, 1.0).unwrap().color, BLACK);
         assert!(crosshair_name(&team, &me, 40, false, None, 1.0, true, 1.0).is_none());
         assert_eq!(sanitize_name("^1Red^7 ^xName"), "Red xName");
     }

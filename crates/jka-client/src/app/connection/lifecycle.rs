@@ -44,6 +44,10 @@ impl App {
         // the request id, so a late completion from the disconnected session will
         // be ignored instead of repopulating the renderer behind the front end.
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
+        self.map_loader_latest_requested.store(
+            self.latest_request_id,
+            std::sync::atomic::Ordering::Release,
+        );
         self.pending_frontend_map_launch = false;
         self.frontend_background_request_id = None;
         self.frontend_cinematic = None;
@@ -51,8 +55,10 @@ impl App {
         self.loading = None;
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
+        self.cross_game_map_seed = None;
         self.game_session = None;
         self.weapon_select_until = None;
+        self.inventory_select_until = None;
         self.force_select_until = None;
         self.reset_world_effects();
         self.live_without_world = false;
@@ -65,8 +71,7 @@ impl App {
         self.live_http_base = None;
         self.live_download = None;
         self.live_join_ui = None;
-        self.live_cgame_prep_rx = None;
-        self.live_cgame_prepared = None;
+        self.cancel_live_cgame_prep();
         self.pending_live_gamestate = false;
         self.pending_live_server_commands.clear();
         self.live_join_timing = None;
@@ -147,6 +152,7 @@ impl App {
         self.prepared_map_cache = None;
         self.game_session = None;
         self.weapon_select_until = None;
+        self.inventory_select_until = None;
         self.force_select_until = None;
         self.reset_world_effects();
         self.live_without_world = false;
@@ -159,8 +165,7 @@ impl App {
         self.live_http_base = None;
         self.live_download = None;
         self.live_join_ui = None;
-        self.live_cgame_prep_rx = None;
-        self.live_cgame_prepared = None;
+        self.cancel_live_cgame_prep();
         self.pending_live_gamestate = false;
         self.pending_live_server_commands.clear();
         self.live_join_timing = None;

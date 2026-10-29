@@ -62,7 +62,7 @@ fn view_depth(depth: f32) -> f32 {
 
 // The ray through a fragment of the drawing buffer, built as the march builds it (`march_pixel`).
 fn pixel_ray(position: vec2<f32>) -> vec3<f32> {
-    let size = clouds.screen.xy;
+    let size = clouds.viewport.xy;
     let uv = position / size;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let tangent = 1.0 / clouds.forward.w;
@@ -142,29 +142,81 @@ fn cloud_at(pixel: vec2<u32>) -> vec4<f32> {
     return sum / weight;
 }
 
+// Bilinear upscaling with the reconstruction's scene-depth classification. A sky
+// pixel must not blend in a neighbour whose cloud ray stopped at foreground geometry.
+// The full-resolution path retains its existing sample-count spatial filter.
+fn cloud_upscaled(uv: vec2<f32>, scene_z: f32) -> vec4<f32> {
+    let size = textureDimensions(cloud_color);
+    let position = uv * vec2<f32>(size) - 0.5;
+    let base = vec2<i32>(floor(position));
+    let fraction = fract(position);
+    var sum = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let at = clamp(base + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(size) - 1);
+            let state = textureLoad(cloud_state, at, 0);
+            if !same_surface(state.b, scene_z * 0.001) {
+                continue;
+            }
+            let wx = select(1.0 - fraction.x, fraction.x, x == 1);
+            let wy = select(1.0 - fraction.y, fraction.y, y == 1);
+            let weight = wx * wy;
+            sum += textureLoad(cloud_color, at, 0) * weight;
+            total += weight;
+        }
+    }
+    if total > 1e-5 {
+        return sum / total;
+    }
+    let pixel = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+    return cloud_at(pixel);
+}
+
 @fragment
 fn composite_fragment(in: CompositeVertex) -> @location(0) vec4<f32> {
+    let uv = in.position.xy / clouds.viewport.xy;
+    if clouds.experiments.x > 4.5 {
+        let size = textureDimensions(opaque_depth);
+        let pixel = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+        let depth = textureLoad(opaque_depth, pixel, 0);
+        if depth <= 0.0 { return vec4<f32>(0.0, 0.05, 0.3, 1.0); }
+        let distance = view_depth(depth);
+        return vec4<f32>(vec3<f32>(1.0 - exp(-distance / 100.0)), 1.0);
+    }
+    if ray_starts_under_water(underwater_probe, uv) {
+        return vec4<f32>(0.0);
+    }
+    let depth_size = textureDimensions(opaque_depth);
+    let depth_pixel = min(vec2<u32>(uv * vec2<f32>(depth_size)), depth_size - 1u);
+    let depth = textureLoad(opaque_depth, depth_pixel, 0);
+    var scene_z = 0.0;
+    var maximum_opacity = 1e20;
+    if depth > 0.0 {
+        scene_z = view_depth(depth);
+        let direction = pixel_ray(in.position.xy);
+        let near = clouds.planes.x;
+        let origin = camera_planet() + direction * near;
+        let entry = cloud_entry(origin, direction);
+        let distance = scene_z / max(dot(direction, clouds.forward.xyz), 1e-4) - near;
+        if entry > 0.0 && distance < entry {
+            maximum_opacity = haze_opacity(origin, direction, max(distance, 0.0));
+            // Most foreground geometry cannot have cloud in front of it. Reject
+            // before the upscaling / up-to-5x5 spatial filter, including at 100%.
+            if maximum_opacity <= 0.0 {
+                return vec4<f32>(0.0);
+            }
+        }
+    }
     let size = textureDimensions(cloud_color);
-    let pixel = min(vec2<u32>(in.position.xy), size - 1u);
-    let color = cloud_at(pixel);
+    var color: vec4<f32>;
+    if all(vec2<f32>(size) == clouds.viewport.xy) {
+        color = cloud_at(min(vec2<u32>(in.position.xy), size - 1u));
+    } else {
+        color = cloud_upscaled(uv, scene_z);
+    }
     if color.a <= 0.0 {
         return color;
     }
-    if ray_starts_under_water(underwater_probe, in.position.xy / clouds.screen.xy) {
-        return vec4<f32>(0.0);
-    }
-    let direction = pixel_ray(in.position.xy);
-    let depth_size = textureDimensions(opaque_depth);
-    let depth = textureLoad(opaque_depth, min(vec2<u32>(in.position.xy), depth_size - 1u), 0);
-    if depth <= 0.0 {
-        return color;
-    }
-    let near = clouds.planes.x;
-    let origin = camera_planet() + direction * near;
-    let entry = cloud_entry(origin, direction);
-    let distance = view_depth(depth) / max(dot(direction, clouds.forward.xyz), 1e-4) - near;
-    if entry <= 0.0 || distance >= entry {
-        return color;
-    }
-    return color * min(haze_opacity(origin, direction, max(distance, 0.0)) / color.a, 1.0);
+    return color * min(maximum_opacity / color.a, 1.0);
 }

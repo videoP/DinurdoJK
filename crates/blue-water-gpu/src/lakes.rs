@@ -86,13 +86,15 @@ pub fn module() -> wgpu::naga::Module {
     source = source.replace("    photo_haze: vec4<f32>,", "    photo_haze: vec4<f32>,\n    frames: array<vec4<f32>, 10>,\n    clipmap: vec4<f32>,\n    deformation: vec4<f32>,\n    tint: vec4<f32>,\n    reflection: vec4<f32>,\n    base_color: vec4<f32>,\n    appearance: vec4<f32>,\n    transmission: vec4<f32>,\n    shallow_color: vec4<f32>,\n    deep_color: vec4<f32>,\n    ripples: vec4<f32>,");
     source = source.replace("let body = water_body(bed, deep, column_transmittance(absorption, backscatter, column, view));",
         "let body = water_body(bed, deep, column_transmittance(absorption, backscatter, column, view)) * lake.tint.rgb;");
+    // Explicitly gate the fallback at the reflection call. The lake's sky
+    // expression differs from the ocean's upstream sky-lobe implementation.
     source = source.replace(
         "mix(body, sky, reflectance)",
-        "mix(body, jka_lake_reflection(world, up, sky), reflectance)",
+        "mix(body, jka_lake_reflection(world, up, sky * jka_water_sky_admission(world.xz)), reflectance)",
     );
     source = source.replace(
-        "mix(body, jka_lake_reflection(world, up, sky), reflectance) + glint * shadow",
-        "mix(body, jka_lake_reflection(world, up, sky), reflectance * lake.tint.w) + glint * shadow * lake.tint.w",
+        "mix(body, jka_lake_reflection(world, up, sky * jka_water_sky_admission(world.xz)), reflectance) + glint * shadow",
+        "mix(body, jka_lake_reflection(world, up, sky * jka_water_sky_admission(world.xz)), reflectance * lake.tint.w) + glint * shadow * lake.tint.w * jka_water_sun_admission(world.xz)",
     );
     source = source.replace("let world = vec3<f32>(input.position.x + lake.offset.x, input.position.y, input.position.z + lake.offset.y);",
         "let world = jka_lake_world(input);");
@@ -205,6 +207,7 @@ impl LakePipeline {
                 sampled(14, frag, t2, false),
                 sampled(15, frag, wgpu::TextureViewDimension::D2Array, false),
                 uniform(16, both),
+                crate::original_surface::roof_sampled(frag),
                 sampled(17, frag, t2, false),
                 wgpu::BindGroupLayoutEntry {
                     binding: 18,
@@ -386,6 +389,7 @@ impl LakePipeline {
         normal: Option<&wgpu::TextureView>,
         ripples: Option<&wgpu::TextureView>,
         submerged: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+        sky_roof: Option<&wgpu::TextureView>,
     ) -> LakeBindings {
         let camera = buffer(
             device,
@@ -445,6 +449,7 @@ impl LakePipeline {
                 entry_texture(14, normal.unwrap_or(&self.cloud)),
                 entry_texture(15, ripples.unwrap_or(&self.photo)),
                 entry_buffer(16, &boundary),
+                entry_texture(22, sky_roof.unwrap_or(&self.cloud)),
                 entry_texture(17, submerged.map_or(&self.cloud, |p| p.0)),
                 entry_texture(18, submerged.map_or(&self.cloud, |p| p.1)),
             ],
@@ -749,6 +754,7 @@ mod tests {
                 Some(&normal),
                 Some(&ripples.view),
                 Some((&submerged_color, &submerged_depth)),
+                None,
             );
             let changing: Vec<[f32; 4]> = (0..64)
                 .map(|i| {
@@ -776,6 +782,7 @@ mod tests {
                 Some(&normal),
                 Some(&ripples.view),
                 Some((&submerged_color, &submerged_depth)),
+                None,
             );
             let environment = crate::sky_environment::EnvironmentMap::new(
                 &device,

@@ -140,6 +140,19 @@ impl PlayerPresenter {
         }
     }
 
+    pub(crate) fn set_hair_physics_mode(&mut self, mode: u8) {
+        let mode = mode.min(2);
+        if self.hair_physics_mode == mode { return; }
+        self.hair_physics_mode = mode;
+        // Avoid carrying spring velocity across an Off/Authored/GLM transition.
+        // The neutral parent matrices are already present in the model's pose,
+        // so toggling doesn't rebuild or re-register any meshes.
+        self.preview_source_jiggles.clear();
+        for entity in self.entities.values_mut() {
+            entity.source_jiggle_sim = None;
+        }
+    }
+
     pub(crate) fn set_jiggle_config(
         &mut self,
         enabled: bool,
@@ -679,8 +692,9 @@ impl PlayerPresenter {
     /// Begin one CG_AddEntities blob-shadow collection pass. All eligible
     /// players/NPCs are packed into one dynamic surface so the OpenJK visual
     /// costs one draw rather than one temporary-poly draw per character.
-    pub fn begin_blob_shadow_frame(&mut self, opacity: f32) {
-        self.blob_shadow_opacity = opacity.clamp(0.0, 1.0);
+    pub fn begin_blob_shadow_frame(&mut self, settings: crate::ui::PlayerBlobShadowSettings) {
+        self.blob_shadow_opacity = settings.opacity.clamp(0.0, 4.0);
+        self.blob_shadow_contact = settings.contact;
         self.blob_shadow_instances.clear();
     }
 

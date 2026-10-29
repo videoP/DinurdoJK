@@ -863,6 +863,16 @@ fn build_character_model(
         None
     };
 
+    // Model-load-only promotion: ordinary GLM hair* surfaces get virtual
+    // secondary-motion palette bones. Existing animation skeletons stay intact.
+    let mut hair_jiggles = Vec::new();
+    let promoted_hair = jka_assets::source1_jiggle::promote_named_hair_surfaces(
+        Arc::make_mut(&mut glm), &gla, &mut hair_jiggles,
+    );
+    if promoted_hair > 0 {
+        devprintln!(2, "PLAYER HAIR PHYSICS: {model_qpath} auto surfaces={promoted_hair}");
+    }
+
     let jiggle = if humanoid {
         match JiggleProfile::auto_humanoid(&glm, &gla, body_shape_pivots.as_deref().map(Vec::as_slice)) {
             Ok(Some(profile)) => {
@@ -992,8 +1002,8 @@ fn build_character_model(
         retargeter,
         source_native_pivots: body_shape_pivots,
         source_imported: false,
-        source_jiggles: None,
-        source_jiggles_enabled: false,
+        source_jiggles: (!hair_jiggles.is_empty()).then(|| Arc::new(hair_jiggles)),
+        source_jiggles_enabled: promoted_hair > 0,
         emote_contacts: Default::default(),
         humanoid,
         animations,
@@ -1554,7 +1564,7 @@ impl PlayerPresenter {
 
     /// Re-scan the active VFS namespace and discard remembered registration
     /// failures. Successful model caches remain hot; this is the targeted
-    /// `fs_refresh` boundary for content that appeared on disk after CGame was
+    /// `fs_restart` boundary for content that appeared on disk after CGame was
     /// created, not a destructive CGame restart.
     pub fn retry_failed_assets(&mut self) -> Result<usize, String> {
         self.assets

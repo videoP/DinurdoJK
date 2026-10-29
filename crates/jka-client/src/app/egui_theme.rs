@@ -694,6 +694,10 @@ pub(super) enum Reset {
     Video(usize),
     /// The client user-command cadence shown on Setup -> Movement.
     MovementCommandRate,
+    /// AUTO/manual warning window shown below client command rate.
+    MovementCommandSize,
+    /// Live world-foliage sway control on Environment -> Surfaces.
+    FoliageWind,
     /// A split-toning control, identified by its archived cvar.
     Color(&'static str),
     /// Glass controls restore the selected style's preset value.

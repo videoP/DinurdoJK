@@ -16,6 +16,7 @@ mod glass;
 mod image;
 mod interface;
 mod lighting;
+mod relighting;
 mod materials;
 mod mod_options;
 mod models;
@@ -25,6 +26,7 @@ mod preset_preview;
 // Shared with quality::apply_quality_preset_to_page; keeps the cvar-to-page
 // ownership mapping in one place.
 pub(in crate::app) use preset_preview::preset_cvar_section;
+#[cfg(test)]
 pub(in crate::app) use optimizations::OPTIMIZATION_CVARS;
 mod post;
 mod reflections;
@@ -119,6 +121,7 @@ const PHYS_JIGGLE_GLUTE_DAMPING: u8 = 57;
 const PHYS_JIGGLE_STOMACH: u8 = 58;
 const PHYS_JIGGLE_STOMACH_STIFFNESS: u8 = 59;
 const PHYS_JIGGLE_STOMACH_DAMPING: u8 = 60;
+const PHYS_HAIR: u8 = 61;
 
 const OCEAN_MAP_SIZE: u8 = 0;
 const OCEAN_MESH_QUALITY: u8 = 1;

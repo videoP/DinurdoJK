@@ -17,7 +17,7 @@ fn clouds_shadow_length(pixel: vec2<f32>) -> f32 {
         return 0.0;
     }
     let size = textureDimensions(shadow_length_a);
-    let at = min(vec2<u32>(max(pixel, vec2<f32>(0.0))), size - 1u);
+    let at = min(vec2<u32>(max(pixel / clouds.viewport.xy * vec2<f32>(size), vec2<f32>(0.0))), size - 1u);
     if clouds.state.w > 0.5 {
         return textureLoad(shadow_length_b, at, 0).r;
     }

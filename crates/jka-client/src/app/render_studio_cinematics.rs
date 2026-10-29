@@ -56,7 +56,7 @@ mod tests {
     fn timeline_clip(clip:&StudioCinematicClip)->StudioAnimationClip {
         StudioAnimationClip {name:clip.label.clone(),emote:Some(clip.emote().unwrap()),start:2.,first_frame:clip.first_frame,
             end_frame:clip.end_frame(),source_fps:f64::from(clip.fps),lane:0,source_first:clip.first_frame,
-            source_end:clip.end_frame(),motion:vec![Default::default()],tail_frames:0,playback:StudioClipPlayback::Hold}
+            source_end:clip.end_frame(),motion:vec![Default::default()],tail_frames:0,playback:StudioClipPlayback::Hold,speed_keys:vec![], blend:Default::default()}
     }
     #[test]
     fn cinematic_catalog_discovers_separate_banks_preserves_fps_and_rejects_empty_or_invalid_ranges() {

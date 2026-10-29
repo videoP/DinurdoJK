@@ -5,9 +5,62 @@ use crate::renderer::{
 use wgpu::util::DeviceExt;
 
 #[derive(Clone)]
-pub(in crate::renderer) struct GpuImage {
+pub(in crate::renderer) struct GpuImage(pub(in crate::renderer) std::sync::Arc<GpuImageInner>);
+
+pub(in crate::renderer) struct GpuImageInner {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,
+    pub(in crate::renderer) _pixels: Option<super::image_cache::Pixels>,
+    pub(in crate::renderer) _cache: Option<std::sync::Arc<super::image_cache::DeviceImages>>,
+}
+impl std::ops::Deref for GpuImage {
+    type Target = GpuImageInner;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl GpuImage {
+    pub(in crate::renderer) fn new(texture: wgpu::Texture, view: wgpu::TextureView) -> Self {
+        Self(std::sync::Arc::new(GpuImageInner { _texture: texture, view, _pixels: None, _cache: None }))
+    }
+    pub(in crate::renderer) fn is_shared(&self) -> bool { self._cache.is_some() }
+    pub(in crate::renderer) fn detach_for_write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        if !self.is_shared() { return false; }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Private mutable asset copy"), size: self._texture.size(),
+            mip_level_count: self._texture.mip_level_count(), sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format: self._texture.format(),
+            usage: self._texture.usage(), view_formats: &[],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for mip in 0..self._texture.mip_level_count() {
+            let mut from = self._texture.as_image_copy(); from.mip_level = mip;
+            let mut to = texture.as_image_copy(); to.mip_level = mip;
+            encoder.copy_texture_to_texture(from, to, wgpu::Extent3d {
+                width: (texture.width() >> mip).max(1), height: (texture.height() >> mip).max(1), depth_or_array_layers: 1,
+            });
+        }
+        queue.submit(Some(encoder.finish()));
+        let view = texture.create_view(&Default::default());
+        *self = Self::new(texture, view);
+        true
+    }
+}
+
+pub(in crate::renderer) fn upload_cached_texture(device: &wgpu::Device, queue: &wgpu::Queue, data: &TextureData) -> GpuImage {
+    upload_cached_texture_picmip(device, queue, data, 0)
+}
+
+pub(in crate::renderer) fn upload_cached_texture_picmip(device: &wgpu::Device, queue: &wgpu::Queue, data: &TextureData, picmip: u32) -> GpuImage {
+    use super::image_cache::{get_or_upload, ImageSpec, Pixels};
+    let (width, height, mips, offset) = if data.rgba16f.is_some() { (data.width, data.height, data.mip_level_count, 0) }
+        else { mip_upload_window(data, picmip, 4) };
+    let (format, pixels) = match &data.rgba16f {
+        Some(p) => (wgpu::TextureFormat::Rgba16Float, Pixels::U16(p.interned())),
+        None => (if data.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm }, Pixels::U8(data.rgba.interned(), offset)),
+    };
+    let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+        | if data.srgb && data.rgba16f.is_none() { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() };
+    get_or_upload(device, ImageSpec {width, height, mips, format, usage}, pixels,
+        || upload_texture_picmip(device, queue, data, picmip))
 }
 
 pub(in crate::renderer) fn create_texture_sampler(
@@ -290,7 +343,7 @@ pub(in crate::renderer) fn load_ui_key_atlas(base: &Path, game: Option<&Path>) -
                 // resolutions.  CG_DrawPic scales it anyway, so requiring an
                 // exact 128x128 source made the whole overlay silently transparent.
                 let (source_w, source_h) = (image.width, image.height);
-                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba)
+                let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba.into_vec())
                 else {
                     eprintln!("UI movement key {path}: unexpected pixel format");
                     missing += 1;
@@ -329,7 +382,7 @@ pub(in crate::renderer) fn load_ui_key_atlas(base: &Path, game: Option<&Path>) -
         source: None,
         width,
         height,
-        rgba,
+        rgba: (rgba).into(),
         rgba16f: None,
         mip_level_count: 1,
         clamp: true,
@@ -528,10 +581,7 @@ pub(in crate::renderer) fn upload_texture_bc3_picmip(
         &encoded,
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    GpuImage {
-        _texture: texture,
-        view,
-    }
+    GpuImage::new(texture, view)
 }
 
 pub(in crate::renderer) fn upload_texture_picmip(
@@ -579,10 +629,7 @@ pub(in crate::renderer) fn upload_texture_picmip(
         bytes,
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    GpuImage {
-        _texture: texture,
-        view,
-    }
+    GpuImage::new(texture, view)
 }
 
 pub(in crate::renderer) fn upload_texture(
@@ -600,7 +647,7 @@ pub(in crate::renderer) fn upload_texture(
     let bytes: &[u8] = data
         .rgba16f
         .as_deref()
-        .map(bytemuck::cast_slice)
+        .map(|pixels| bytemuck::cast_slice(pixels.as_slice()))
         .unwrap_or(&data.rgba);
     let texture = device.create_texture_with_data(
         queue,
@@ -628,10 +675,7 @@ pub(in crate::renderer) fn upload_texture(
         bytes,
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    GpuImage {
-        _texture: texture,
-        view,
-    }
+    GpuImage::new(texture, view)
 }
 
 pub(in crate::renderer) fn gpu_blend_factor(factor: BlendFactor) -> wgpu::BlendFactor {

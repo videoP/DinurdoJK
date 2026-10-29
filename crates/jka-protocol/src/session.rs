@@ -22,6 +22,9 @@ use crate::{
 };
 
 pub const RETRANSMIT_TIMEOUT: i32 = 3000;
+/// Bound unsuccessful admission attempts. This is separate from the much longer
+/// idle timeout of an established connection (which can be downloading a map).
+const JOIN_TIMEOUT: i32 = 30_000;
 /// Client usercmd history. Vanilla OpenJK uses 64, which only covers 64 ms at
 /// 1000 commands/s; prediction then stalls ("exceeded PACKET_BACKUP on
 /// commands") whenever latency exceeds it. TaystJK/JAPro raise it with
@@ -124,6 +127,10 @@ pub struct ClientSession {
     preflight_wait_started: Option<i32>,
     connect_time: i32,
     connect_packet_count: i32,
+    connect_started_at: i32,
+    /// A `connectResponse` alone is not an accepted gameplay gamestate.
+    gamestate_received: bool,
+    awaiting_gamestate_since: Option<i32>,
     netchan: Option<Netchan>,
     last_packet_time: i32,
     last_packet_sent_time: i32,
@@ -141,6 +148,9 @@ pub struct ClientSession {
 
     cmds: Vec<UserCmd>,
     cmd_number: i32,
+    /// Effective cl_commandsize (64/128/256/512). Physical storage remains
+    /// CMD_BACKUP so AUTO changes never remap live command slots.
+    command_window: usize,
     out_packets: [OutPacket; PACKET_BACKUP],
     packet_debug: PacketDebug,
     /// cl_packetdup: how many earlier packets' usercmds each packet repeats (0..=5).
@@ -198,6 +208,9 @@ impl ClientSession {
             preflight_wait_started: None,
             connect_time: -99999,
             connect_packet_count: 0,
+            connect_started_at: realtime,
+            gamestate_received: false,
+            awaiting_gamestate_since: None,
             netchan: None,
             last_packet_time: realtime,
             last_packet_sent_time: -9999,
@@ -213,6 +226,7 @@ impl ClientSession {
             sv_pure: false,
             cmds: vec![UserCmd::default(); CMD_BACKUP],
             cmd_number: 0,
+            command_window: 64,
             out_packets: [OutPacket::default(); PACKET_BACKUP],
             packet_debug: PacketDebug::default(),
             packet_dup: 1,
@@ -242,6 +256,7 @@ impl ClientSession {
 
     pub fn server(&self) -> SocketAddr { self.server }
     pub fn state(&self) -> ConnectionState { self.state }
+    pub fn has_gamestate(&self) -> bool { self.gamestate_received }
     pub fn decoder(&self) -> &Decoder { &self.decoder }
     pub fn server_time(&self) -> i32 { self.server_time }
     /// Server time minus the commandTime the newest snapshot acknowledged: how far behind the
@@ -286,6 +301,14 @@ impl ClientSession {
     }
     pub fn ping(&self) -> i32 { self.ping }
     pub fn cmd_number(&self) -> i32 { self.cmd_number }
+    pub fn command_window(&self) -> usize { self.command_window }
+
+    /// TaystJK CL_GetUserCmd / CL_WritePacket share REAL_CMD_MASK.
+    /// Use a logical window instead of physically remasking the 512-slot ring
+    /// so changing AUTO during a session cannot reinterpret old ring slots.
+    pub fn set_command_window(&mut self, requested: usize) {
+        self.command_window = requested.clamp(64, CMD_BACKUP).next_power_of_two();
+    }
     pub fn client_num(&self) -> i32 { self.decoder.client_number }
     pub fn server_id(&self) -> i32 { self.server_id }
     pub fn server_message_sequence(&self) -> i32 { self.server_message_sequence }
@@ -301,6 +324,10 @@ impl ClientSession {
         }
         self.connect_preflight_paused = false;
         self.preflight_wait_started = None;
+        // Time spent on the user's missing-map dialog is not a stalled server.
+        if self.server_info_seen && self.state == ConnectionState::Challenging {
+            self.connect_started_at = realtime;
+        }
         self.connect_time = -99999;
         self.check_for_resend(realtime);
     }
@@ -313,9 +340,10 @@ impl ClientSession {
         }
     }
 
-    /// cl.cmds[number & CMD_MASK] if it is still in the backup window.
+    /// CL_GetUserCmd: do not expose commands past the active cl_commandsize
+    /// history window, even though the backing ring retains 512 slots.
     pub fn command(&self, number: i32) -> Option<UserCmd> {
-        if number <= 0 || number > self.cmd_number || self.cmd_number - number >= CMD_BACKUP as i32 {
+        if number <= 0 || number > self.cmd_number || self.cmd_number - number >= self.command_window as i32 {
             return None;
         }
         Some(self.cmds[number as usize & (CMD_BACKUP - 1)])
@@ -341,6 +369,7 @@ impl ClientSession {
         }
         self.state = ConnectionState::Disconnected;
         self.netchan = None;
+        self.outgoing.clear(); // Do not flush a queued connect resend after rejection.
         self.events.push_back(SessionEvent::Disconnected(reason));
     }
 
@@ -401,6 +430,27 @@ impl ClientSession {
             self.resume_connect(realtime);
         }
         self.check_for_resend(realtime);
+        // Stock OpenJK retries the handshake indefinitely. With speculative BSP
+        // loading that can leave an apparently complete world on screen after a
+        // rejection, so bound admission independently of the in-game timeout.
+        // A missing-map/password preflight dialog can remain open by choice.
+        if !(self.connect_preflight_paused && self.server_info_seen
+            && self.state == ConnectionState::Challenging)
+            && realtime.saturating_sub(self.connect_started_at) >= JOIN_TIMEOUT
+        {
+            match self.state {
+                ConnectionState::Connecting => self.drop_connection("Timed out awaiting challenge.".into()),
+                ConnectionState::Challenging => self.drop_connection("Timed out awaiting connection.".into()),
+                _ => {}
+            }
+        }
+        if self.state == ConnectionState::Connected && !self.gamestate_received
+            && self.awaiting_gamestate_since.is_some_and(|since| {
+                realtime.saturating_sub(since) >= JOIN_TIMEOUT
+            })
+        {
+            self.drop_connection("Timed out awaiting gamestate.".into());
+        }
         if self.state >= ConnectionState::Connected && realtime - self.last_packet_time > timeout_ms {
             self.drop_connection("Server connection timed out.".into());
         }
@@ -487,6 +537,7 @@ impl ClientSession {
                 self.netchan = Some(Netchan::new(self.qport));
                 self.last_packet_sent_time = -9999;
                 self.last_packet_time = realtime;
+                self.awaiting_gamestate_since = Some(realtime);
                 self.set_state(ConnectionState::Connected);
                 // CL_Frame sends immediately; the first packet makes the server
                 // (re)send the gamestate it queued on connect.
@@ -500,7 +551,23 @@ impl ClientSession {
             }
             b"print" => {
                 if from == self.server {
-                    self.events.push_back(SessionEvent::Print(packet.rest.clone()));
+                    if !self.gamestate_received {
+                        // SV_DirectConnect uses connectionless `print` for
+                        // refusals (IP limit, full/banned server, bad password,
+                        // etc.). It never sends a gamestate for that attempt.
+                        // Preserve the server's text instead of retrying while
+                        // the speculative map continues loading.
+                        let reason = String::from_utf8_lossy(&packet.rest)
+                            .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                            .to_owned();
+                        self.drop_connection(if reason.is_empty() {
+                            "Server refused the connection.".into()
+                        } else {
+                            reason
+                        });
+                    } else {
+                        self.events.push_back(SessionEvent::Print(packet.rest.clone()));
+                    }
                 }
             }
             b"echo" => {
@@ -589,6 +656,8 @@ impl ClientSession {
 
     /// CL_ParseGamestate's client-state side (CL_ClearState + serverId).
     fn gamestate_parsed(&mut self) {
+        self.gamestate_received = true;
+        self.awaiting_gamestate_since = None;
         let info = self.decoder.configstrings.get(&CS_SYSTEMINFO).cloned().unwrap_or_default();
         self.system_info_changed(&info);
         self.connect_packet_count = 0;
@@ -734,7 +803,12 @@ impl ClientSession {
             .collect();
         // cl_packetdup N: resend the commands of the previous N packets too.
         let old_packet = self.out_packets[(outgoing_sequence - 1 - self.packet_dup) as usize & (PACKET_BACKUP - 1)];
-        let count = (self.cmd_number - old_packet.cmd_number).clamp(0, MAX_PACKET_USERCMDS as i32) as usize;
+        // TaystJK serializes commands through its cl_commandsize ring mask.
+        // Since MAX_PACKET_USERCMDS (32) < our minimum window (64), normal
+        // packet command counts remain identical. Keep the explicit bound for
+        // correctness if protocol limits or the window change in future.
+        let count = (self.cmd_number - old_packet.cmd_number)
+            .clamp(0, MAX_PACKET_USERCMDS.min(self.command_window) as i32) as usize;
         let commands: Vec<UserCmd> = (0..count)
             .map(|i| self.cmds[(self.cmd_number - count as i32 + i as i32 + 1) as usize & (CMD_BACKUP - 1)])
             .collect();
@@ -922,6 +996,42 @@ mod tests {
     }
 
     #[test]
+    fn commandsize_window_limits_prediction_and_preserves_ring_indices_on_resize() {
+        let mut session = active_session();
+        // The default mirrors the cl_commandsize minimum, not the 512-slot
+        // backing capacity. Both directions of a live AUTO change must work.
+        assert_eq!(session.command_window(), 64);
+        for time in 1..=140 {
+            session.create_command_at(UserCmd::default(), time);
+        }
+        assert!(session.command(140).is_some());
+        assert!(session.command(77).is_some(), "newest 64 commands remain visible");
+        assert!(session.command(76).is_none(), "older commands are not exposed to prediction");
+        session.set_command_window(100); // snap upward, just like the cvar setter
+        assert_eq!(session.command_window(), 128);
+        assert_eq!(session.command(76).unwrap().server_time, 76);
+        session.set_command_window(512);
+        assert_eq!(session.command(20).unwrap().server_time, 20);
+        session.set_command_window(1);
+        assert_eq!(session.command_window(), 64);
+        assert!(session.command(76).is_none());
+    }
+
+    #[test]
+    fn commandsize_change_does_not_corrupt_wire_command_selection() {
+        let mut session = active_session();
+        for time in 1..=580 {
+            session.create_command_at(UserCmd::default(), time);
+        }
+        session.set_command_window(128);
+        session.send_commands(1000, 1000);
+        let debug = session.packet_debug();
+        assert_eq!(debug.last_command_count, MAX_PACKET_USERCMDS);
+        assert_eq!(debug.first_command_time, 580 - MAX_PACKET_USERCMDS as i32 + 1);
+        assert_eq!(debug.last_command_time, 580);
+    }
+
+    #[test]
     fn high_packet_cap_preserves_command_redundancy_between_app_ticks() {
         let mut session = active_session();
         session.create_command_at(UserCmd::default(), 1000);
@@ -1015,6 +1125,55 @@ mod tests {
         assert!(session.take_outgoing().is_empty());
         session.send_commands(4200, 30);
         assert_eq!(session.take_outgoing().len(), 1);
+    }
+
+    #[test]
+    fn server_rejection_before_gamestate_ends_join_with_exact_reason() {
+        let mut session = ClientSession::connect(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        session.take_outgoing();
+        session.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345 777", 10);
+        session.take_events();
+        session.packet_event(addr(), b"\xff\xff\xff\xffprint\nToo many connections from the same IP\n", 20);
+        assert_eq!(session.state(), ConnectionState::Disconnected);
+        assert!(session.take_events().iter().any(|event| matches!(event,
+            SessionEvent::Disconnected(reason) if reason == "Too many connections from the same IP"
+        )));
+        session.frame(40_000, 200_000);
+        assert!(session.take_outgoing().is_empty(), "a refused connection must not retry");
+    }
+
+    #[test]
+    fn unsuccessful_join_times_out_at_each_handshake_stage() {
+        let mut challenge = ClientSession::connect(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        challenge.take_outgoing();
+        challenge.frame(JOIN_TIMEOUT, 200_000);
+        assert_eq!(challenge.state(), ConnectionState::Disconnected);
+        assert!(challenge.take_events().iter().any(|event| matches!(event,
+            SessionEvent::Disconnected(reason) if reason.contains("awaiting challenge")
+        )));
+
+        let mut connect = ClientSession::connect(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        connect.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345 777", 10);
+        connect.frame(JOIN_TIMEOUT, 200_000);
+        assert_eq!(connect.state(), ConnectionState::Disconnected);
+
+        let mut gamestate = ClientSession::connect(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        gamestate.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345 777", 10);
+        gamestate.packet_event(addr(), b"\xff\xff\xff\xffconnectResponse", 20);
+        gamestate.frame(20 + JOIN_TIMEOUT, 200_000);
+        assert_eq!(gamestate.state(), ConnectionState::Disconnected);
+        assert!(gamestate.take_events().iter().any(|event| matches!(event,
+            SessionEvent::Disconnected(reason) if reason.contains("awaiting gamestate")
+        )));
+    }
+
+    #[test]
+    fn preflight_prompt_does_not_time_out_while_waiting_for_user() {
+        let mut session = ClientSession::connect_preflight(addr(), USERINFO.to_vec(), 4321, 777, 0);
+        session.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345 777", 10);
+        session.server_info_seen = true;
+        session.frame(JOIN_TIMEOUT + 1, 200_000);
+        assert_eq!(session.state(), ConnectionState::Challenging);
     }
 
     #[test]

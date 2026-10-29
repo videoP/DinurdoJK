@@ -32,6 +32,7 @@ jka-emotes = { path = "../jka-emotes" }
 jka-ue-assets = { path = "../jka-ue-assets" }
 jka-ue-runtime = { path = "../jka-ue-runtime" }
 jka-movement = { path = "../jka-movement" }
+jka-water = { path = "../jka-water" }
 jka-protocol = { path = "../jka-protocol" }
 log = "=0.4.34"
 meshopt = "=0.6.2"
@@ -53,7 +54,6 @@ wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl
 winit = "=0.30.13"
 
 [dev-dependencies]
-jka-water = { path = "../jka-water" }
 # Offline WGSL parsing/validation for the shader tests. Pinned to the same
 # version wgpu 30 uses so the tests accept exactly what the runtime will.
 naga = { version = "=30.0.0", features = ["wgsl-in"] }
@@ -63,7 +63,11 @@ png = "=0.18.1"
 cc = "=1.4.6"
 
 [target.'cfg(windows)'.dependencies]
+# Native Spout2 D3D11On12 sender; no GPU-to-CPU frame readback.
+spout2-rs = { version = "=0.1.1", default-features = false, features = ["dx", "dx12"] }
+# Native Vulkan interop for the Spout2 D3D11 KMT transport.
+ash = "=0.38.0"
 # H.264 MP4 videoMap promotion through native Windows Media Foundation + DXVA.
 # MP4 demuxing is built into Windows; no Alhazen/FFmpeg/NASM.
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Media_MediaFoundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_System_Threading", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Security"] }

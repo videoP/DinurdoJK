@@ -1366,4 +1366,74 @@ app_cvars! {
         implementations: []
     }
 
+
+    APP_CG_HUDSCORE {
+        runtime: CvarDef::new("cg_hudScore", "tl 0 0 1", "anchor x y scale",
+            "HUD editor transform for Score; independent of TaystJK visibility cvars.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::Score).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string())
+                    .ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::Score) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) {
+                    *settings.hud_layout.element_mut(HudElementId::Score) = layout;
+                }
+            }),
+            archive: Some((808, |state| state.presentation.hud_layout.element(HudElementId::Score).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDMINISCORES {
+        runtime: CvarDef::new("cg_hudMiniScores", "tl 0 0 1", "anchor x y scale",
+            "HUD editor position and scale for cg_drawScores; separate from cg_drawScore.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::MiniScores).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string())
+                    .ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::MiniScores) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) {
+                    *settings.hud_layout.element_mut(HudElementId::MiniScores) = layout;
+                }
+            }),
+            archive: Some((810, |state| state.presentation.hud_layout.element(HudElementId::MiniScores).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_HUDENEMYINFO {
+        runtime: CvarDef::new("cg_hudEnemyInfo", "tl 0 0 1", "anchor x y scale",
+            "HUD editor transform for EnemyInfo; independent of TaystJK visibility cvars.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::EnemyInfo).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string())
+                    .ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::EnemyInfo) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) {
+                    *settings.hud_layout.element_mut(HudElementId::EnemyInfo) = layout;
+                }
+            }),
+            archive: Some((809, |state| state.presentation.hud_layout.element(HudElementId::EnemyInfo).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
 }

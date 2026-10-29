@@ -1,0 +1,87 @@
+{
+  "main_asset_sha1": "ef7c1d07a697489503a4a5819e5a5074711e09a1",
+  "module_asset_sha1": "88ad108e6b543d5234c5f7de16f000e1901fd837",
+  "selected_module_version": [
+    3612507619,
+    1087816312,
+    3019695006,
+    2516571793
+  ],
+  "frame_budget": 0.016666999086737633,
+  "substep_cap": 0.011110999621450901,
+  "execution_loops": [
+    {
+      "NumLoopsBinding": "None",
+      "NumLoops": 1,
+      "StartStageIndex": 0,
+      "EndStageIndex": 7
+    },
+    {
+      "NumLoopsBinding": "ShallowWaterRiverEmitter.NumSubsteps",
+      "NumLoops": 2,
+      "StartStageIndex": 8,
+      "EndStageIndex": 12
+    },
+    {
+      "NumLoopsBinding": "None",
+      "NumLoops": 1,
+      "StartStageIndex": 13,
+      "EndStageIndex": 17
+    }
+  ],
+  "vectors": [
+    {
+      "dx": 80.0,
+      "substeps": 10,
+      "speed": 10.0,
+      "outputs": {
+        "Emitter.SimDt": 0.016666999086737633,
+        "Emitter.DtOverDx": 0.00020833748567383736,
+        "Emitter.MaxDepth": 23509.267578125,
+        "Emitter.dx": 80.0,
+        "Emitter.MaxVelocity": 4799.904296875,
+        "Emitter.WorldScale": 1.0
+      }
+    },
+    {
+      "dx": 1.0,
+      "substeps": 3,
+      "speed": 0.25,
+      "outputs": {
+        "Emitter.SimDt": 0.0013889166293665767,
+        "Emitter.DtOverDx": 0.0013889166293665767,
+        "Emitter.MaxDepth": 528.9584350585938,
+        "Emitter.dx": 1.0,
+        "Emitter.MaxVelocity": 719.985595703125,
+        "Emitter.WorldScale": 1.0
+      }
+    },
+    {
+      "dx": 20.0,
+      "substeps": 1,
+      "speed": 1.0,
+      "outputs": {
+        "Emitter.SimDt": 0.011110999621450901,
+        "Emitter.DtOverDx": 0.000555549981072545,
+        "Emitter.MaxDepth": 3306.188720703125,
+        "Emitter.dx": 20.0,
+        "Emitter.MaxVelocity": 1800.01806640625,
+        "Emitter.WorldScale": 1.0
+      }
+    },
+    {
+      "dx": 37.5,
+      "substeps": 60,
+      "speed": 12.5,
+      "outputs": {
+        "Emitter.SimDt": 0.003472291398793459,
+        "Emitter.DtOverDx": 9.259443322662264e-05,
+        "Emitter.MaxDepth": 119015.671875,
+        "Emitter.dx": 37.5,
+        "Emitter.MaxVelocity": 10799.7841796875,
+        "Emitter.WorldScale": 1.0
+      }
+    }
+  ],
+  "caveat": "Evaluated serialized graph arithmetic, not a fresh Niagara compilation or runtime execution."
+}

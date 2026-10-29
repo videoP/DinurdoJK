@@ -171,9 +171,36 @@ impl TrailView {
     }
 }
 
+/// Labels on race-clock ticks in Studio. Independent of the gameplay cvar
+/// controlling legacy loaded-trail plums.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StudioTickLabels {
+    #[default] Off,
+    Seconds,
+    MinutesSeconds,
+}
+impl StudioTickLabels {
+    fn text(self, seconds: u32) -> Option<String> {
+        match self {
+            Self::Off => None,
+            Self::Seconds => Some(seconds.to_string()),
+            Self::MinutesSeconds => Some(format!("{}:{:02}", seconds / 60, seconds % 60)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TimeMarker {
     origin: [f32; 3],
+    seconds: u32,
+}
+
+/// A perpendicular race-clock notch, precomputed on the ghost decoder thread.
+#[derive(Debug, Clone, Copy)]
+struct TimedTick {
+    origin: [f32; 3],
+    tangent: [f32; 2],
     seconds: u32,
 }
 
@@ -187,6 +214,7 @@ pub struct LoadedTrail {
     source_points: Box<[[f32; 3]]>,
     marker_fps: u16,
     markers: Vec<TimeMarker>,
+    studio_ticks: Vec<TimedTick>,
 }
 
 impl LoadedTrail {
@@ -222,6 +250,7 @@ impl LoadedTrail {
             source_points: points.to_vec().into_boxed_slice(),
             marker_fps: 0,
             markers: Vec::new(),
+            studio_ticks: Vec::new(),
         }
     }
 
@@ -245,6 +274,80 @@ impl LoadedTrail {
         }
     }
 
+    /// Race ghost samples are not guaranteed to be at constant SV_FPS. Resolve
+    /// whole-second marks against their actual duelTime-relative timestamps on
+    /// the decoder thread, preserving the source race clock through Studio seeks.
+    pub(crate) fn set_race_ticks(&mut self, samples: &[(i32, [f32; 3])]) {
+        self.studio_ticks.clear();
+        let Some(last) = samples.last() else { return };
+        let mut next_second = 1i32;
+        for pair in samples.windows(2) {
+            let (start_ms, a) = pair[0];
+            let (end_ms, b) = pair[1];
+            if end_ms <= start_ms || !a.iter().chain(b.iter()).all(|n| n.is_finite()) {
+                continue;
+            }
+            // Same teleport gap rule as the existing indexed route builder.
+            let distance_sq = squared_distance(a, b);
+            if distance_sq <= f32::EPSILON || distance_sq >= MAX_LINK_DISTANCE * MAX_LINK_DISTANCE {
+                continue;
+            }
+            let dx=b[0]-a[0];
+            let dy=b[1]-a[1];
+            let planar=(dx*dx+dy*dy).sqrt();
+            if planar <= 0.001 { continue; }
+            // Skipped invalid/teleport spans must not generate a backlog of
+            // race markers at a later unrelated position.
+            next_second = next_second.max(start_ms.saturating_add(999) / 1000);
+            while next_second <= last.0 / 1000 && next_second.saturating_mul(1000) <= end_ms {
+                let tick_time=next_second*1000;
+                if tick_time >= start_ms {
+                    let t=(tick_time-start_ms) as f32 / (end_ms-start_ms) as f32;
+                    self.studio_ticks.push(TimedTick {
+                        origin: [a[0]+dx*t,a[1]+dy*t,a[2]+(b[2]-a[2])*t],
+                        tangent: [-dy/planar,dx/planar],
+                        seconds: next_second as u32,
+                    });
+                }
+                next_second += 1;
+            }
+        }
+    }
+
+    /// Studio uses this exact loaded-trail frustum, spatial grid, LOD and FX
+    /// line shader; only its per-assignment tint and clock notches differ.
+    pub(crate) fn append_studio_draws(
+        &mut self, settings: &Settings, view: TrailView, rgb: [u8; 3], alpha: u8,
+        ticks: bool, labels: StudioTickLabels, draws: &mut Vec<FxDraw>,
+    ) {
+        self.append_draws(settings, view, false, Some((rgb, alpha)), draws);
+        if !ticks { return; }
+        let max_distance = settings.draw_distance.clamp(256.0, 131_072.0).min(PLUM_DISTANCE);
+        let distance_sq = max_distance * max_distance;
+        let width = settings.radius.clamp(0.1, 100.0) * 0.5;
+        // Share the exact trail RGBA with both the one-second notch and its
+        // numeric label; a translucent ghost trail should not leave bright,
+        // fully opaque clock markers behind it.
+        let rgba = [rgb[0], rgb[1], rgb[2], alpha.min(if settings.ghost { 120 } else { 255 })];
+        for tick in &self.studio_ticks {
+            if squared_distance(tick.origin,view.origin)>distance_sq
+                || !view.sphere_visible(tick.origin,10.0) {continue;}
+            let half_length=8.0;
+            let offset=[tick.tangent[0]*half_length,tick.tangent[1]*half_length];
+            draws.push(FxDraw::Line {
+                start:[tick.origin[0]-offset[0],tick.origin[1]-offset[1],tick.origin[2]],
+                end:[tick.origin[0]+offset[0],tick.origin[1]+offset[1],tick.origin[2]],
+                width:width.max(1.0), rgba,
+                shader:TRAIL_SHADER.to_owned(),
+            });
+            if let Some(text) = labels.text(tick.seconds) {
+                append_formatted_time_marker(draws,
+                    [tick.origin[0],tick.origin[1],tick.origin[2]+8.0],
+                    view.origin,&text,rgba);
+            }
+        }
+    }
+
     /// Build an indexed trail from points already resident in memory. Race
     /// ghosts use this on their demo-loader thread so the render thread gets the
     /// same spatial cells and angular LODs as an ordinary `loadTrail` asset.
@@ -261,16 +364,18 @@ impl LoadedTrail {
         settings: &Settings,
         view: TrailView,
         include_plums: bool,
+        tint: Option<([u8; 3], u8)>,
         draws: &mut Vec<FxDraw>,
     ) {
         let camera = view.origin;
         let distance = settings.draw_distance.clamp(256.0, 131_072.0);
         let distance_sq = distance * distance;
         let width = settings.radius.clamp(0.1, 100.0) * 0.5;
-        let alpha = if settings.ghost { 120 } else { 255 };
+        let ghost_alpha: u8 = if settings.ghost { 120 } else { 255 };
+        let alpha = tint.map_or(ghost_alpha, |(_, a)| a.min(ghost_alpha));
         let radius_cells = ((distance + MAX_LINK_DISTANCE) / CELL_SIZE).ceil() as i32;
         let center = cell(camera);
-        let rgb = slot_color(self.slot);
+        let rgb = tint.map_or_else(|| slot_color(self.slot), |(rgb, _)| rgb);
 
         for y in (center.1 - radius_cells)..=(center.1 + radius_cells) {
             for x in (center.0 - radius_cells)..=(center.0 + radius_cells) {
@@ -351,6 +456,7 @@ pub struct Manager {
     pub settings: Settings,
     loaded: Vec<LoadedTrail>,
     live: [LiveTrail; MAX_CLIENTS],
+    live_restricted: bool,
     available: Vec<String>,
     catalog_error: Option<String>,
     catalog_pending: bool,
@@ -373,6 +479,7 @@ impl Manager {
             settings,
             loaded: Vec::new(),
             live: std::array::from_fn(|_| LiveTrail::default()),
+            live_restricted: false,
             available: Vec::new(),
             catalog_error: None,
             catalog_pending: false,
@@ -388,6 +495,19 @@ impl Manager {
     pub fn loaded(&self) -> impl Iterator<Item = &LoadedTrail> { self.loaded.iter() }
     pub fn is_tracing(&self, client: usize) -> bool {
         client < MAX_CLIENTS && self.settings.players & (1u32 << client) != 0
+    }
+
+    /// TaystJK RESTRICT_STRAFETRAIL only disables live player trace geometry.
+    /// Keep the configured player mask, race logging and recorded CFGs intact.
+    /// Clear old samples once on activation so lifting the restriction never
+    /// resurrects stale lines. Updated when serverinfo changes during a match.
+    pub fn set_live_restricted(&mut self, restricted: bool) {
+        if restricted != self.live_restricted {
+            self.live_restricted = restricted;
+            if restricted {
+                self.clear_live(None);
+            }
+        }
     }
 
     pub fn request_scan(&mut self, base: &Path, game: Option<&Path>) -> Result<(), String> {
@@ -558,7 +678,7 @@ impl Manager {
     }
 
     pub fn sample_player(&mut self, client: usize, origin: [f32; 3], now_ms: i32) {
-        if client >= MAX_CLIENTS || !self.is_tracing(client) || !origin.iter().all(|v| v.is_finite()) {
+        if self.live_restricted || client >= MAX_CLIENTS || !self.is_tracing(client) || !origin.iter().all(|v| v.is_finite()) {
             return;
         }
         let trail = &mut self.live[client];
@@ -589,7 +709,7 @@ impl Manager {
         view: TrailView,
         draws: &mut Vec<FxDraw>,
     ) {
-        trail.append_draws(&self.settings, view, false, draws);
+        trail.append_draws(&self.settings, view, false, None, draws);
     }
 
     pub fn append_draws(&mut self, view: TrailView, now_ms: i32, draws: &mut Vec<FxDraw>) {
@@ -606,7 +726,10 @@ impl Manager {
         let width = self.settings.radius.clamp(0.1, 100.0) * 0.5;
         let alpha = if self.settings.ghost { 120 } else { 255 };
         for trail in &mut self.loaded {
-            trail.append_draws(&self.settings, view, true, draws);
+            trail.append_draws(&self.settings, view, true, None, draws);
+        }
+        if self.live_restricted {
+            return;
         }
 
         // Expire live samples even when a tracked player disappears from the
@@ -648,41 +771,42 @@ impl Drop for Manager {
 }
 
 fn append_time_marker(draws: &mut Vec<FxDraw>, marker: TimeMarker, camera: [f32; 3]) {
-    let dir = [
-        camera[0] - marker.origin[0],
-        camera[1] - marker.origin[1],
-        camera[2] - marker.origin[2],
-    ];
-    // Same camera-relative horizontal layout used by JKA/TaystJK score plums.
-    let mut side = [dir[1], -dir[0], 0.0];
-    let side_len = (side[0] * side[0] + side[1] * side[1]).sqrt();
+    // Preserve the native TaystJK red numeric plum style for non-Studio trails.
+    append_formatted_time_marker(draws,marker.origin,camera,&marker.seconds.to_string(),[255,0,0,255]);
+}
+
+fn append_formatted_time_marker(draws: &mut Vec<FxDraw>, origin: [f32; 3], camera: [f32; 3],
+    text: &str, rgba: [u8; 4]) {
+    let dir = [camera[0]-origin[0],camera[1]-origin[1],camera[2]-origin[2]];
+    // Same camera-relative horizontal layout as legacy JKA/TaystJK plums.
+    let mut side = [dir[1],-dir[0],0.0];
+    let side_len = (side[0]*side[0]+side[1]*side[1]).sqrt();
     if side_len > f32::EPSILON {
         side[0] /= side_len;
         side[1] /= side_len;
-    } else {
-        side = [1.0, 0.0, 0.0];
-    }
-
-    let text = marker.seconds.to_string();
-    let count = text.len() as f32;
-    // TaystJK's trail-number flavor of CG_AddScorePlum has c == 0, leaving a
-    // constant -10-unit camera-relative side offset before laying out digits.
-    let base = [
-        marker.origin[0] - side[0] * 10.0,
-        marker.origin[1] - side[1] * 10.0,
-        marker.origin[2],
-    ];
-    for (index, byte) in text.bytes().enumerate() {
-        let Some(digit) = byte.checked_sub(b'0').filter(|digit| *digit <= 9) else { continue };
-        let offset = (count * 0.5 - index as f32) * PLUM_NUMBER_SIZE;
-        draws.push(FxDraw::Sprite { shader_time: 0.0,
-            origin: [base[0] + side[0] * offset, base[1] + side[1] * offset, base[2]],
-            radius: PLUM_NUMBER_SIZE * 0.5,
-            rotation: 0.0,
-            // TaystJK explicitly overrides trail-plum score sprites to red.
-            rgba: [255, 0, 0, 255],
-            shader: NUMBER_SHADERS[digit as usize].to_owned(),
-        });
+    } else {side=[1.0,0.0,0.0];}
+    let count=text.len() as f32;
+    let base=[origin[0]-side[0]*10.0, origin[1]-side[1]*10.0,origin[2]];
+    for (index,byte) in text.bytes().enumerate() {
+        let offset=(count*0.5-index as f32)*PLUM_NUMBER_SIZE;
+        let pos=[base[0]+side[0]*offset,base[1]+side[1]*offset,base[2]];
+        if byte==b':' {
+            // Native score plums only have numeral textures. Render the colon
+            // with two tiny existing white-line FX primitives, not a missing
+            // glyph asset or a new Studio text renderer.
+            for z in [-2.0f32,2.0] {
+                draws.push(FxDraw::Line {
+                    start:[pos[0],pos[1],pos[2]+z-0.5],
+                    end:[pos[0],pos[1],pos[2]+z+0.5],width:1.7,
+                    rgba,shader:TRAIL_SHADER.to_owned(),
+                });
+            }
+        } else if let Some(digit)=byte.checked_sub(b'0').filter(|d|*d<=9) {
+            draws.push(FxDraw::Sprite {shader_time:0.0,origin:pos,
+                radius:PLUM_NUMBER_SIZE*0.5,rotation:0.0,rgba,
+                shader:NUMBER_SHADERS[digit as usize].to_owned(),
+            });
+        }
     }
 }
 
@@ -969,6 +1093,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn studio_ticks_follow_real_ghost_clock_not_assumed_sv_fps() {
+        let mut trail=LoadedTrail::from_points("test".into(), 0,
+            &[[0.0,0.0,0.0],[75.0,0.0,0.0],[125.0,0.0,0.0],[215.0,0.0,0.0]]);
+        trail.set_race_ticks(&[(0,[0.0,0.0,0.0]),(750,[75.0,0.0,0.0]),
+            (1250,[125.0,0.0,0.0]),(2150,[215.0,0.0,0.0])]);
+        assert_eq!(trail.studio_ticks.len(),2);
+        assert!((trail.studio_ticks[0].origin[0]-100.0).abs()<0.001);
+        assert!((trail.studio_ticks[1].origin[0]-200.0).abs()<0.001);
+        assert_eq!(trail.studio_ticks[0].tangent,[0.0,1.0]);
+    }
+    #[test]
+    fn studio_tick_notches_and_numbers_inherit_the_trail_tint_and_opacity() {
+        let mut trail = LoadedTrail::from_points("studio".into(), 28,
+            &[[50.0, 0.0, 0.0], [150.0, 0.0, 0.0]]);
+        trail.set_race_ticks(&[(500, [50.0, 0.0, 0.0]), (1500, [150.0, 0.0, 0.0])]);
+        let view = TrailView {
+            origin: [0.0, 0.0, 0.0], forward: [1.0, 0.0, 0.0],
+            left: [0.0, 1.0, 0.0], up: [0.0, 0.0, 1.0],
+            tan_half_fov_x: 1.0, tan_half_fov_y: 1.0, focal_length_pixels: 500.0,
+        };
+        for (ghost, alpha) in [(true, 120), (false, 255)] {
+            let mut draws = Vec::new();
+            let settings = Settings { ghost, ..Settings::default() };
+            trail.append_studio_draws(&settings, view, [36, 159, 224], 255, true,
+                StudioTickLabels::Seconds, &mut draws);
+            assert!(draws.iter().any(|d| matches!(d, FxDraw::Line { .. })));
+            assert!(draws.iter().any(|d| matches!(d, FxDraw::Sprite { .. })));
+            for draw in &draws {
+                let rgba = match draw {
+                    FxDraw::Line { rgba, .. } | FxDraw::Sprite { rgba, .. } => rgba,
+                    _ => panic!("unexpected Studio trail primitive"),
+                };
+                assert_eq!(*rgba, [36, 159, 224, alpha]);
+            }
+        }
+    }
+
+    #[test]
+    fn studio_ticks_do_not_bridge_teleports() {
+        let mut trail=LoadedTrail::from_points("test".into(), 0,
+            &[[0.0,0.0,0.0],[1024.0,0.0,0.0],[1100.0,0.0,0.0]]);
+        trail.set_race_ticks(&[(0,[0.0,0.0,0.0]),(1500,[1024.0,0.0,0.0]),
+            (2500,[1100.0,0.0,0.0])]);
+        assert_eq!(trail.studio_ticks.len(),1);
+        assert!((trail.studio_ticks[0].origin[0]-1062.0).abs()<0.001);
+    }
+
+    #[test]
     fn parses_legacy_integer_cfg_and_float_cfg() {
         assert_eq!(parse_points(b"1 2 3\n4.5 -6 7\n").unwrap(), vec![[1.0, 2.0, 3.0], [4.5, -6.0, 7.0]]);
     }
@@ -1017,9 +1189,40 @@ mod tests {
     }
 
     #[test]
+    fn server_live_restriction_clears_samples_but_retains_settings() {
+        let mut trails = Manager::spawn(Settings {
+            players: 1,
+            ..Settings::default()
+        }).unwrap();
+        trails.sample_player(0, [0.0, 0.0, 0.0], 100);
+        trails.sample_player(0, [10.0, 0.0, 0.0], 200);
+        assert_eq!(trails.live[0].points.len(), 2);
+        trails.set_live_restricted(true);
+        assert!(trails.live[0].points.is_empty());
+        assert!(trails.is_tracing(0));
+        trails.sample_player(0, [20.0, 0.0, 0.0], 300);
+        assert!(trails.live[0].points.is_empty());
+        trails.set_live_restricted(false);
+        trails.sample_player(0, [30.0, 0.0, 0.0], 400);
+        assert_eq!(trails.live[0].points.len(), 1);
+    }
+
+    #[test]
     fn refuses_path_traversal_names() {
         assert!(sanitize_name("../evil").is_err());
         assert!(sanitize_name("folder/evil").is_err());
         assert_eq!(sanitize_name("dash1-jka.cfg").unwrap(), "dash1-jka");
+    }
+}
+
+#[cfg(test)]
+mod studio_time_label_tests {
+    use super::StudioTickLabels;
+    #[test]
+    fn race_labels_use_duel_elapsed_seconds_not_source_duration() {
+        assert_eq!(StudioTickLabels::Off.text(63),None);
+        assert_eq!(StudioTickLabels::Seconds.text(63).as_deref(),Some("63"));
+        assert_eq!(StudioTickLabels::MinutesSeconds.text(63).as_deref(),Some("1:03"));
+        assert_eq!(StudioTickLabels::MinutesSeconds.text(60).as_deref(),Some("1:00"));
     }
 }

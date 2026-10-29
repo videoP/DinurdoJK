@@ -24,6 +24,13 @@ impl App {
         ) {
             self.set_environment_quality_segment(ui::ENV_ROW_FOOTPRINTS, target);
         }
+        theme::row(ui, "Foliage wind",
+            "Let tree leaves, plants and grass cards sway in the shared weather wind. Applies immediately. Procedural Godot grass keeps its own wind animation. Console: r_foliageWind.",
+            theme::Reset::FoliageWind, |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.foliage_wind) {
+                    let _ = self.set_console_cvar("r_foliageWind", if enabled { "1" } else { "0" });
+                }
+            });
         // Off / native JKA surfaceSprites / promoted to Godot procedural grass
         // (r_surfaceSprites + r_grass). Godot replaces the sprite emitters it
         // can promote; anything it cannot keeps its JKA sprites.

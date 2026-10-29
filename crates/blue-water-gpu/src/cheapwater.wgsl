@@ -85,8 +85,10 @@ fn cheapwater_underwater(input: VertexOut, up: vec3<f32>, view: vec3<f32>) -> ve
     let valid = shifted_depth >= 999999.0 || hit.y > input.world.y;
     let transmitted = textureLoad(cheapwater_submerged_scene, select(pixel, shifted, valid), 0).rgb;
     let direction = reflect(-view, normal);
+    // Under a BSP roof the global atmosphere (including its solar halo) is
+    // not a valid fallback for reflections seen from below the surface.
     let reflection = env_radiance(sky_atlas, sky_sampler, sky_env, direction,
-        clamp(lake.appearance.x, 0.08, 1.0));
+        clamp(lake.appearance.x, 0.08, 1.0)) * jka_water_sky_admission(input.world.xz);
     // Same spectral ratios, exponential falloff and depth darkening as Hybrid.
     let ratios = vec3<f32>(38.0/7.5, 38.0/22.0, 1.0);
     let attenuation = exp2(-4.321928 * ratios * length(input.world-camera.position)
@@ -134,7 +136,10 @@ fn jka_cheapwater_fragment(input: VertexOut) -> @location(0) vec4<f32> {
         let direction = reflect(-view, up);
         let environment = env_radiance(sky_atlas, sky_sampler, sky_env,
             normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z)), roughness);
-        specular = jka_lake_reflection(input.world, up, environment) * reflected_share;
+        // SSR/planar hits remain untouched. Only the global sky fallback is
+        // removed when roofs block the reflected sky/sun halo.
+        let admitted_sky = environment * jka_water_sky_admission(input.world.xz);
+        specular = jka_lake_reflection(input.world, up, admitted_sky) * reflected_share;
         let half_vector = normalize(view + light);
         let nh = max(dot(up, half_vector), 0.0);
         let vh = max(dot(view, half_vector), 0.0);
@@ -147,7 +152,8 @@ fn jka_cheapwater_fragment(input: VertexOut) -> @location(0) vec4<f32> {
         let sun_grazing2 = sun_grazing * sun_grazing;
         let sun_fresnel = 0.02 + 0.98 * sun_grazing2 * sun_grazing2 * sun_grazing;
         let sun = sky_env.light_color * sky_env.light_intensity;
-        specular += sun * (sun_fresnel * distribution * visibility * 0.25) * lake.tint.w;
+        specular += sun * (sun_fresnel * distribution * visibility * 0.25)
+            * lake.tint.w * jka_water_sun_admission(input.world.xz);
     }
     var body = color * (0.04 + nl * 0.12);
     // The absorption is exponential, but a constant body/transmission blend

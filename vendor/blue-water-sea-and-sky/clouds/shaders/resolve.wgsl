@@ -93,7 +93,9 @@ fn view_depth(depth: f32) -> f32 {
 // Metres along the view to the opaque scene through a pixel of the drawing buffer; 0 where there is none (sky or sea).
 fn pixel_scene_view_z(pixel: vec2<u32>) -> f32 {
     let size = textureDimensions(opaque_depth);
-    let depth = textureLoad(opaque_depth, min(pixel, size - 1u), 0);
+    let uv = (vec2<f32>(pixel) + 0.5) / clouds.screen.xy;
+    let at = min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+    let depth = textureLoad(opaque_depth, at, 0);
     if depth <= 0.0 {
         return 0.0;
     }
@@ -208,7 +210,7 @@ fn turn_velocity(uv: vec2<f32>) -> vec2<f32> {
     let size = clouds.screen.xy;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let tangent = 1.0 / clouds.forward.w;
-    let view_ray = vec3<f32>(ndc.x * tangent * size.x / size.y, ndc.y * tangent, -1.0);
+    let view_ray = vec3<f32>(ndc.x * tangent * clouds.viewport.x / clouds.viewport.y, ndc.y * tangent, -1.0);
     let rotation = mat3x3<f32>(clouds.view[0].xyz, clouds.view[1].xyz, clouds.view[2].xyz);
     let previous = clouds.previous_view_projection * vec4<f32>(transpose(rotation) * view_ray, 0.0);
     let previous_ndc = previous.xy / previous.w;

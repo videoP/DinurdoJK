@@ -1,8 +1,8 @@
 //! The single Profile page. Uses the real player, saber, Force and PK3 systems.
 //! No parallel model loader, invented skeleton or duplicate userinfo cvars.
 use crate::app::egui_menu::{
-    theme, App, BTreeMap, ProfileModelEntry,
-    PROFILE_COSMETICS, PROFILE_EMOTES, PROFILE_FORCE, PROFILE_MODEL,
+    jka_colored_text, theme, App, BTreeMap, ProfileModelEntry,
+    PROFILE_EMOTES, PROFILE_FORCE, PROFILE_MODEL,
 };
 
 const INK: egui::Color32 = egui::Color32::from_rgb(10, 15, 23);
@@ -12,16 +12,140 @@ const EDGE: egui::Color32 = egui::Color32::from_rgb(48, 66, 86);
 const SKY: egui::Color32 = theme::ACCENT;
 const SKY_SOFT: egui::Color32 = egui::Color32::from_rgb(125, 199, 255);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(142, 162, 183);
-const STUDIO_NAV: [(usize, &str); 4] = [
+const STUDIO_NAV: [(usize, &str); 3] = [
     (PROFILE_MODEL, "LOOK"),
     (PROFILE_FORCE, "FORCE"),
-    (PROFILE_COSMETICS, "COSMETICS"),
     (PROFILE_EMOTES, "EMOTES"),
 ];
 
 #[derive(Clone, Default)]
 struct BodyEditor { group: String, search: String }
 fn body_editor_id() -> egui::Id { egui::Id::new("studio_anny_editor") }
+
+
+/// Inspect the actual virtual filesystem providers, not a guessed PK3 name.
+/// The portrait is only one resource: a model may load its skeleton, meshes,
+/// skins, and animation configuration from different archives.
+fn studio_model_sources(base: &std::path::Path, game: Option<&std::path::Path>,
+    allow_overrides: bool, entry: &ProfileModelEntry) -> String {
+    let Ok(mut assets) = jka_assets::pk3::AssetSearchPath::open_game(base, game) else {
+        return "Unable to inspect the current asset search path".into();
+    };
+    assets.set_allow_asset_overrides(allow_overrides);
+    let folder = format!("models/players/{}/", entry.model_name);
+    let mut lines = vec![format!("Model: {}    Skin: {}", entry.model_name, entry.skin_name),
+        format!("Userinfo model: {}", entry.value), String::new()];
+    let mut chosen_icon = None;
+    let fallback = if crate::app::frontend::profile_is_rgb_skin(&entry.model_name, &entry.skin_name)
+        || entry.skin_name.eq_ignore_ascii_case("sp") { "icons/icon_rgb_unknown" }
+        else if entry.skin_name.eq_ignore_ascii_case("red") { "icons/icon_red_unknown" }
+        else if entry.skin_name.eq_ignore_ascii_case("blue") { "icons/icon_blue_unknown" }
+        else { "icons/icon_default_unknown" };
+    // Same jpg/jpeg/png/tga priority as frontend::read_profile_icon.
+    for stem in [format!("{folder}icon_{}", entry.skin_name), fallback.to_owned()] {
+        for ext in ["jpg", "jpeg", "png", "tga"] {
+            let path = format!("{stem}.{ext}");
+            if assets.contains_qpath(&path) {
+                chosen_icon = Some(path); break;
+            }
+        }
+        if chosen_icon.is_some() { break; }
+    }
+    if let Some(icon) = &chosen_icon {
+        lines.push(format!("PORTRAIT: {icon}"));
+        for (i, info) in assets.indexed_providers(icon).into_iter().enumerate() {
+            lines.push(format!("  {} {}{}", if info.selected { "ACTIVE" } else { "SHADOWED" },
+                info.source.display(), if i == 0 { "" } else { " (override candidate)" }));
+        }
+    } else {
+        lines.push("PORTRAIT: no image; UI draws a placeholder".into());
+    }
+    lines.push(String::new());
+    lines.push("MODEL FILES / PROVIDERS (VFS priority):".into());
+    let mut count = 0_usize;
+    let mut total = 0_usize;
+    for qpath in assets.names().filter(|name| name.starts_with(&folder)) {
+        let leaf = qpath.rsplit('/').next().unwrap_or("");
+        let skin = entry.skin_name.to_ascii_lowercase();
+        let relevant_skin = leaf == format!("model_{skin}.skin")
+            || leaf == format!("{skin}.skin")
+            || leaf == "model_default.skin" && entry.source_model
+            || leaf.starts_with("head_") && skin.starts_with("head_") && leaf == format!("{skin}.skin")
+            || leaf.starts_with("torso_") && skin.starts_with("torso_") && leaf == format!("{skin}.skin")
+            || leaf.starts_with("lower_") && skin.starts_with("lower_") && leaf == format!("{skin}.skin");
+        let relevant = relevant_skin || leaf == "source_model.json" || leaf == "animation.cfg"
+            || leaf.ends_with(".glm") || leaf.ends_with(".gla") || leaf.ends_with(".md3")
+            || leaf.ends_with(".mdr") || leaf.ends_with(".iqm");
+        if !relevant { continue; }
+        total += 1;
+        if count >= 70 { continue; }
+        count += 1;
+        let providers = assets.indexed_providers(qpath);
+        lines.push(format!("{qpath}:"));
+        for info in providers {
+            lines.push(format!("  {} {}{}", if info.selected { "ACTIVE" } else { "SHADOWED" },
+                info.source.display(), if info.archive { " [PK3/ZIP]" } else { " [loose]" }));
+        }
+    }
+    if total > count { lines.push(format!("... {} more model files", total - count)); }
+    if total == 0 { lines.push("No matching mesh/skin/animation files indexed".into()); }
+    lines.push(String::new());
+    lines.push("Textures and shader scripts referenced by .skin files may be in other PK3s.".into());
+    lines.push("Use /which <qpath> all to check any dependency and its overrides.".into());
+    lines.join("\n")
+}
+
+fn studio_model_source_popup(ui: &mut egui::Ui, base: &std::path::Path,
+    game: Option<&std::path::Path>, allow_overrides: bool, entry: &ProfileModelEntry) {
+    ui.set_min_width(360.0);
+    ui.heading("MODEL ASSET SOURCES");
+    ui.small("Selected model, skin, portrait and their physical PK3 providers");
+    let text = studio_model_sources(base, game, allow_overrides, entry);
+    if ui.button("Copy full report").clicked() { ui.ctx().copy_text(text.clone()); }
+    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+        ui.add(egui::Label::new(egui::RichText::new(text).monospace().size(10.0)).selectable(true));
+    });
+}
+
+/// Navigate a focused Profile selector without changing its stored cvar format.
+/// The selected value is always taken from the same filtered choices shown in
+/// its popup (e.g. staff vs single hilts), not from a parallel catalog.
+fn studio_selector_arrow(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    selected: &str,
+    choices: &[&str],
+) -> Option<String> {
+    if response.clicked() { response.request_focus(); }
+    if !(response.has_focus() || egui::ComboBox::is_open(ui.ctx(), response.id))
+        || choices.is_empty() { return None; }
+    let movement = ui.input(|input| {
+        if input.key_pressed(egui::Key::ArrowDown) { 1isize }
+        else if input.key_pressed(egui::Key::ArrowUp) { -1isize }
+        else { 0 }
+    });
+    if movement == 0 { return None; }
+    let old = choices.iter().position(|name| name.eq_ignore_ascii_case(selected));
+    let next = match (old, movement) {
+        (Some(index), step) => (index as isize + step).rem_euclid(choices.len() as isize) as usize,
+        (None, 1) => 0,
+        (None, _) => choices.len() - 1,
+    };
+    let next = choices[next];
+    (!next.eq_ignore_ascii_case(selected)).then(|| next.to_owned())
+}
+
+/// Cosmetic buttons use a popup rather than an egui ComboBox. Keep its keyboard
+/// sequence identical to the popup order, with 'None' as the first choice.
+fn studio_cosmetic_arrow(group: u8, mask: u32, movement: isize) -> Option<Option<u32>> {
+    if movement == 0 { return None; }
+    let choices: Vec<Option<u32>> = std::iter::once(None)
+        .chain(crate::japro_cg::cosmetics_in_group(group).map(|item| Some(item.bit)))
+        .collect();
+    let current = choices.iter().position(|bit| bit.is_some_and(|bit| mask & bit != 0)).unwrap_or(0);
+    let next = (current as isize + movement).rem_euclid(choices.len() as isize) as usize;
+    (next != current).then_some(choices[next])
+}
 
 fn studio_deformation_slider_reset(response: &egui::Response) -> bool {
     // Match egui_theme::slider_with: Slider rails sense drag only, so read
@@ -89,7 +213,7 @@ fn studio_button(ui: &mut egui::Ui, text: &str, selected: bool, primary: bool, w
 impl App {
     pub(in crate::app::egui_menu) fn egui_profile_studio(&mut self, ui: &mut egui::Ui) {
         self.ensure_profile_catalog();
-        if !matches!(self.profile_selected_section, PROFILE_MODEL | PROFILE_FORCE | PROFILE_COSMETICS | PROFILE_EMOTES) {
+        if !matches!(self.profile_selected_section, PROFILE_MODEL | PROFILE_FORCE | PROFILE_EMOTES) {
             self.profile_selected_section = PROFILE_MODEL;
         }
         let available_w = ui.available_width();
@@ -123,14 +247,15 @@ impl App {
             .stroke(egui::Stroke::new(1.0, EDGE)).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
                 ui.set_width((width - 28.0).max(1.0));
                 ui.set_min_height((height - 28.0).max(1.0));
-                // The tabs, appearance options and search never scroll. Only the
-                // model library owns a ScrollArea, within its remaining height.
-                let nav_w = (ui.available_width() - 18.0) / 4.0;
+                // The tabs and search remain fixed; catalog and the optional
+                // other-player appearance group own bounded scroll regions.
+                let nav_w = (ui.available_width() - 12.0) / STUDIO_NAV.len() as f32;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     for (section, title) in STUDIO_NAV {
                         if studio_button(ui, title, self.profile_selected_section == section, false, nav_w) {
                             self.profile_selected_section = section;
+                            if section != PROFILE_MODEL { self.profile_studio_cosmetic_group = 0; }
                             let group = if section == PROFILE_MODEL {
                                 ui.ctx().data_mut(|data| data.get_temp::<BodyEditor>(body_editor_id()))
                                     .map_or(String::new(), |editor| editor.group)
@@ -151,7 +276,6 @@ impl App {
                         egui::ScrollArea::vertical().id_salt("studio_force_scroll")
                             .max_height((height - 125.0).max(150.0)).show(ui, |ui| self.egui_profile_force(ui));
                     }
-                    PROFILE_COSMETICS => self.studio_visibility(ui),
                     PROFILE_EMOTES => self.studio_emotes(ui, (height - 151.0).max(140.0)),
                     _ => {}
                 }
@@ -191,8 +315,15 @@ impl App {
                 ui.checkbox(&mut self.profile_studio_skin_visible[index], title);
             }
         });
-        ui.add_space(11.0);
-        ui.add_space(5.0);
+        ui.add_space(9.0);
+        egui::CollapsingHeader::new("OTHER PLAYER APPEARANCE")
+            .id_salt("studio_other_players")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("studio_other_player_options")
+                    .max_height(220.0).show(ui, |ui| self.studio_visibility(ui));
+            });
+        ui.add_space(7.0);
         cap(ui, "MODEL LIBRARY", "");
         ui.add_sized([ui.available_width(), 30.0],
             egui::TextEdit::singleline(&mut self.profile_model_search).hint_text("Search models or skins…"));
@@ -332,6 +463,9 @@ impl App {
             ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, variant_count.to_string(),
                 egui::FontId::proportional(10.0), theme::TEXT);
         }
+        response.context_menu(|ui| {
+            studio_model_source_popup(ui, &self.base, self.game.as_deref(), self.video.allow_asset_overrides, entry);
+        });
         if let Some(variants) = variants.filter(|list| list.len() > 1) {
             let mut pick = None;
             let response = response.on_hover_ui(|ui| {
@@ -388,6 +522,9 @@ impl App {
                                 egui::Align2::CENTER_CENTER, &skin.skin_name,
                                 egui::FontId::proportional(if cell_width < 40.0 { 7.0 } else { 9.0 }), theme::TEXT);
                             if click.clicked() { pick = Some(skin.value.clone()); }
+                            click.context_menu(|ui| {
+                                studio_model_source_popup(ui, &self.base, self.game.as_deref(), self.video.allow_asset_overrides, skin);
+                            });
                             if (i + 1) % cols == 0 { ui.end_row(); }
                         }
                     });
@@ -434,6 +571,11 @@ impl App {
                                 &item.skin_name).changed() { changed = true; }
                         }
                     }).response;
+                if let Some(next) = studio_selector_arrow(ui, &dropdown, &selected[i],
+                    &parts[i].iter().map(|item| item.skin_name.as_str()).collect::<Vec<_>>()) {
+                    selected[i] = next;
+                    changed = true;
+                }
                 if dropdown.clicked_by(egui::PointerButton::Middle) {
                     selected[i] = parts[i][0].skin_name.clone();
                     changed = true;
@@ -482,6 +624,10 @@ impl App {
                                 for model in &choices { ui.selectable_value(picked, model.clone(), model); }
                             });
                         }).response;
+                    if let Some(next) = studio_selector_arrow(ui, &response, picked,
+                        &choices.iter().map(String::as_str).collect::<Vec<_>>()) {
+                        *picked = next;
+                    }
                     if response.clicked_by(egui::PointerButton::Middle) { *picked = own.clone(); }
                 });
             };
@@ -626,14 +772,20 @@ impl App {
         }
         let mut groups: Vec<_> = LOCAL_CONTROLS.iter().map(|c|c.1).collect();
         groups.sort_unstable(); groups.dedup();
-        egui::ComboBox::from_id_salt("anny_body_region")
+        let body_choices: Vec<_> = std::iter::once("")
+            .chain(groups.iter().copied())
+            .chain(["facial actions", "all"]).collect();
+        let region = egui::ComboBox::from_id_salt("anny_body_region")
             .selected_text(if editor.group.is_empty() { "Whole body" } else { &editor.group })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut editor.group, String::new(), "Whole body");
-                for group in groups { ui.selectable_value(&mut editor.group, group.to_owned(), group); }
+                for group in &groups { ui.selectable_value(&mut editor.group, (*group).to_owned(), *group); }
                 ui.selectable_value(&mut editor.group, "facial actions".to_owned(), "Facial actions");
                 ui.selectable_value(&mut editor.group, "all".to_owned(), "All controls");
-            });
+            }).response;
+        if let Some(next) = studio_selector_arrow(ui, &region, &editor.group, &body_choices) {
+            editor.group = next;
+        }
         ui.add(egui::TextEdit::singleline(&mut editor.search).hint_text("Find a slider"));
         let needle = editor.search.to_ascii_lowercase();
         let searching = !needle.trim().is_empty();
@@ -906,23 +1058,34 @@ impl App {
             let entry_label = self.profile_sabers.iter()
                 .find(|entry| entry.name.eq_ignore_ascii_case(&current))
                 .map(Self::profile_saber_label).unwrap_or(current.as_str()).to_owned();
+            // One filtered source for both mouse selection and arrow navigation.
+            // Keep the real internal saber name in userinfo; colors affect labels only.
+            let available: Vec<_> = self.profile_sabers.iter().filter(|saber| {
+                if hand == 1 { Self::profile_saber_is_single(saber) }
+                else if staff { Self::profile_saber_is_staff(saber) }
+                else { Self::profile_saber_is_single(saber) }
+            }).collect();
             let combo = egui::ComboBox::from_id_salt(("studio_saber_hilt", hand))
-                .selected_text(if hand == 1 && !dual { "None" } else { &entry_label })
+                .selected_text(jka_colored_text(
+                    if hand == 1 && !dual { "None" } else { &entry_label },
+                    12.0, theme::TEXT))
                 .width(141.0).show_ui(ui, |ui| {
                     if hand == 1 {
                         ui.selectable_value(&mut selected, "none".to_owned(), "None");
                     }
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        for saber in &self.profile_sabers {
-                            if if hand == 1 { Self::profile_saber_is_single(saber) }
-                                else if staff { Self::profile_saber_is_staff(saber) }
-                                else { Self::profile_saber_is_single(saber) } {
-                                ui.selectable_value(&mut selected, saber.name.clone(),
-                                    Self::profile_saber_label(saber));
-                            }
+                        for saber in &available {
+                            ui.selectable_value(&mut selected, saber.name.clone(),
+                                jka_colored_text(Self::profile_saber_label(saber), 12.0, theme::TEXT));
                         }
                     });
                 }).response;
+            let choices: Vec<_> = std::iter::once("none").filter(|_| hand == 1)
+                .chain(available.iter().map(|saber| saber.name.as_str())).collect();
+            if let Some(next) = studio_selector_arrow(ui, &combo, &selected, &choices) {
+                selected = next;
+            }
+            if combo.clicked() { self.profile_studio_cosmetic_group = 0; }
             if combo.clicked() || combo.clicked_by(egui::PointerButton::Middle) || selected != current {
                 self.focus_profile_studio_camera(if hand == 0 { "saber:right" } else { "saber:left" });
             }
@@ -1191,7 +1354,7 @@ impl App {
         // Callout positions remain legible. Their connector endpoints come
         // exclusively from animated Ghoul2 bolt matrices, projected through
         // the same preview camera used by WGPU (never hardcoded stage percents).
-        if self.profile_selected_section==PROFILE_COSMETICS {
+        if self.profile_selected_section==PROFILE_MODEL {
         for (title, bx, by, group, joint) in [
             ("HEADWEAR", 0.19, 0.25, 1u8, 0usize),
             ("FACE", 0.19, 0.35, 2u8, 1usize),
@@ -1220,6 +1383,7 @@ impl App {
                 }
                 self.profile_preview_key = None;
             } else if button.clicked() {
+                button.request_focus();
                 self.focus_profile_studio_camera(match group {
                     1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
                 });
@@ -1282,8 +1446,22 @@ impl App {
                     .show(ui, |ui| self.studio_saber_editor(ui, hand));
             });
         }
-        if self.profile_selected_section==PROFILE_COSMETICS && self.profile_studio_cosmetic_group != 0 {
+        if self.profile_selected_section==PROFILE_MODEL && self.profile_studio_cosmetic_group != 0 {
             let group=self.profile_studio_cosmetic_group;
+            let movement = ui.input(|input| {
+                if input.key_pressed(egui::Key::ArrowDown) { 1isize }
+                else if input.key_pressed(egui::Key::ArrowUp) { -1isize }
+                else { 0 }
+            });
+            if let Some(next) = studio_cosmetic_arrow(group, self.network.cosmetics, movement) {
+                self.focus_profile_studio_camera(match group {
+                    1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
+                });
+                if let Err(error) = self.studio_set_cosmetic_group(group, next) {
+                    self.console_status = error;
+                }
+                self.profile_preview_key = None;
+            }
             let title=match group {1=>"Headwear",2=>"Face",_=>"Back & capes"};
             // Keep popover within the viewport, not over the main navigation.
             let popup=egui::pos2((rect.left()+rect.width()*0.27).min(rect.right()-285.0),
@@ -1369,5 +1547,30 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod profile_selector_tests {
+    use super::*;
+
+    #[test]
+    fn cosmetic_arrows_follow_popup_order_and_wrap() {
+        for group in [1, 2, 3] {
+            let bits: Vec<u32> = crate::japro_cg::cosmetics_in_group(group)
+                .map(|cosmetic| cosmetic.bit).collect();
+            assert!(!bits.is_empty());
+            assert_eq!(studio_cosmetic_arrow(group, 0, 1), Some(Some(bits[0])));
+            assert_eq!(studio_cosmetic_arrow(group, 0, -1), Some(Some(*bits.last().unwrap())));
+            assert_eq!(studio_cosmetic_arrow(group, bits[0], -1), Some(None));
+            assert_eq!(studio_cosmetic_arrow(group, *bits.last().unwrap(), 1), Some(None));
+        }
+    }
+
+    #[test]
+    fn saber_colored_label_hides_caret_tokens_but_preserves_spans() {
+        let job = jka_colored_text("^0(^8HALLOWEEN^0) ^7Knife", 12.0, theme::TEXT);
+        assert_eq!(job.text, "(HALLOWEEN) Knife");
+        assert!(job.sections.len() >= 3);
     }
 }

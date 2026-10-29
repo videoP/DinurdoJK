@@ -146,15 +146,16 @@ fn scene_hash(scene: &str, mod_name: &str, video: &crate::ui::VideoSettings) -> 
 /// effects follow gamma in the shader, so reconstruction from an 8-bit final
 /// image is NOT exact; an exact solution needs a pre-grading capture.
 ///
-/// Hardware gamma acts on the entire desktop output *after* our readback:
-/// both cached egui and live 3D receive the same hardware ramp, so no pixel
-/// transform is necessary. Baked gamma and unlocked brightness multipliers
+/// Hardware gamma acts on the whole desktop *after* readback. Standard HW
+/// applies to the egui UI too; hardware_scene uses a separate UI composite
+/// to counter-adjust egui while leaving live 3D under the display ramp.
+/// Baked gamma and unlocked brightness multipliers
 /// alter actual scene lighting and must retain separate cache identities.
 pub(super) fn gamma_independent_cache(video: &crate::ui::VideoSettings) -> bool {
     video.hdr_output == 0
         && video.model_brightness_locked
         && video.dynamic_light_brightness_locked
-        && matches!(video.gamma_method, crate::gamma::GammaMethod::Shader | crate::gamma::GammaMethod::Hardware)
+        && matches!(video.gamma_method, crate::gamma::GammaMethod::Shader | crate::gamma::GammaMethod::Hardware | crate::gamma::GammaMethod::HardwareSceneOnly)
 }
 
 /// Shader-gamma image neutralization is performed only on workers, never as
@@ -165,7 +166,7 @@ pub(super) fn shader_gamma_reusable(video: &crate::ui::VideoSettings) -> bool {
 
 pub(super) fn path(base: &Path, game: Option<&Path>, scene: &str, video: &crate::ui::VideoSettings) -> PathBuf {
     let mod_name = game.map_or("base", |path| path.to_str().unwrap_or("mod"));
-    base.join("cache").join("frontend_scenes").join(format!(
+    jka_assets::pk3::game_write_directory(base, None).join("cache").join("frontend_scenes").join(format!(
         "v7_{:016x}.png", scene_hash(scene, mod_name, video),
     ))
 }

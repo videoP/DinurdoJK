@@ -18,14 +18,35 @@ impl App {
         launch_map: bool,
         proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Self, String> {
-        let loader_tx = spawn_map_loader(base.clone(), proxy.clone())?;
+        // main.rs configures roots before the index prewarm. Direct App::new
+        // callers (unit tests/tooling) retain a portable default.
+        let fs_roots = jka_assets::pk3::configured_filesystem_roots(&base);
+        let map_loader_latest_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let loader_tx = spawn_map_loader(
+            base.clone(),
+            proxy.clone(),
+            Arc::clone(&map_loader_latest_requested),
+        )?;
         let log_rx = crate::logging::subscribe();
-        let settings_dir = jka_assets::pk3::active_game_directory(&base, game.as_deref());
+        let settings_dir = jka_assets::pk3::game_write_directory(&base, game.as_deref());
         let extensions = crate::extensions::Manager::spawn(base.clone(), game.clone())?;
         // External LUTs must be listed before the saved r_colorLut is parsed.
         crate::color_lut::scan_external(&base, game.as_deref());
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::LutScanReady);
         let config_path = settings_dir.join("DinurdoJK.cfg");
+        // First-time relocation must not silently reset an existing user's
+        // config. Migrate the old portable config exactly once; all subsequent
+        // reads/writes use the new writable root.
+        if !config_path.exists() {
+            let old_dir = jka_assets::pk3::active_game_directory(&base, game.as_deref());
+            let old_config = old_dir.join("DinurdoJK.cfg");
+            if old_config != config_path && old_config.is_file() {
+                std::fs::create_dir_all(&settings_dir)
+                    .map_err(|e| format!("Couldn't create homepath directory: {e}"))?;
+                std::fs::copy(&old_config, &config_path)
+                    .map_err(|e| format!("Couldn't migrate {}: {e}", old_config.display()))?;
+            }
+        }
         let mut video = config::load_video_settings(&config_path);
         crate::logging::set_developer_level(video.developer_level);
         crate::logging::set_renderer_verbose_level(video.renderer_verbose);
@@ -97,7 +118,7 @@ impl App {
             && !presentation.strafe_trail.log_name.trim().is_empty()
         {
             if let Err(error) = strafe_trails.set_log_name(
-                jka_assets::pk3::active_game_directory(&base, game.as_deref()),
+                &jka_assets::pk3::game_write_directory(&base, game.as_deref()),
                 &presentation.strafe_trail.log_name,
             ) {
                 eprintln!("Ignoring invalid cg_logStrafeTrail from config: {error}");
@@ -143,11 +164,13 @@ impl App {
                 }
             });
         }
-        let emote_wheel = super::emote_wheel::EmoteWheel::load(&base);
+        let favorites_dir = jka_assets::pk3::game_write_directory(&base, None);
+        let emote_wheel = super::emote_wheel::EmoteWheel::load(&favorites_dir);
         let mut app = Self {
             extensions,
             updater: crate::updater::State::load(&settings_dir),
             base,
+            fs_roots,
             startup_game: game.clone(),
             game,
             map_name: initial_label.clone(),
@@ -167,6 +190,8 @@ impl App {
             game_launch_screen: presentation.game_launch_screen,
             frontend_skip_chrome_fade: presentation.game_launch_screen != config::GameLaunchScreen::Main,
             neon_menu: Default::default(),
+            neon_chrome_sent: None,
+            frontend_quit_confirmation: false,
             solo_maps: Vec::new(),
             solo_map_selected: 0,
             solo_catalog_loaded: false,
@@ -186,6 +211,15 @@ impl App {
             asset_viewer_selected: None,
             asset_viewer_filter: AssetFilter::All,
             asset_viewer_search: String::new(),
+            pk3_manager_loaded: false,
+            pk3_manager_packages: Vec::new(),
+            pk3_manager_disabled: HashSet::new(),
+            pk3_manager_search: String::new(),
+            pk3_manager_selected: None,
+            pk3_manager_entries: Vec::new(),
+            pk3_manager_entries_search: String::new(),
+            pk3_manager_entries_error: None,
+            pk3_manager_status: None,
             asset_viewer_folder: String::new(),
             asset_viewer_folder_suggestion: 0,
             asset_viewer_shader_file: String::new(),
@@ -207,6 +241,7 @@ impl App {
             screenshot_preview_error: None,
             pending_screenshot_jump: None,
             startup_screenshot_select: None,
+            startup_demo_file: None,
             chat_log_browser_entries: Vec::new(),
             chat_log_browser_catalog_loaded: false,
             chat_log_browser_catalog_error: None,
@@ -277,6 +312,7 @@ impl App {
             profile_dynamic_models: Arc::new(Vec::new()),
             profile_preview_active: false,
             render_studio: Default::default(),
+            render_studio_world_compositor: None,
             demo_entries: Vec::new(),
             demo_catalog_pending: false,
             demo_catalog_generation: 0,
@@ -318,6 +354,7 @@ impl App {
             strafe_trails,
             strafe_trail_filter: String::new(),
             strafe_trail_name_input: String::new(),
+            telemark_ui: Default::default(),
             strafe_trail_log_input: presentation.strafe_trail.log_name.clone(),
             strafe_trail_slot: crate::strafe_trail::DEFAULT_SLOT,
             demo_console_filter: DemoConsoleFilter::All,
@@ -349,6 +386,8 @@ impl App {
             net: None,
             live_cgame_prep_rx: None,
             live_cgame_prepared: None,
+            live_cgame_prep_cancel: None,
+            live_fs_game_hints: HashMap::new(),
             pending_live_gamestate: false,
             rcon: None,
             pending_live_server_commands: VecDeque::new(),
@@ -382,6 +421,7 @@ impl App {
             startup_commands: Vec::new(),
             audio,
             menu_emote_sound: None,
+            menu_ambience: Default::default(),
             emote_wheel,
             emote_gallery: None,
             emote_gallery_request: None,
@@ -399,8 +439,10 @@ impl App {
             startup_first_menu_frame_seen: false,
             proxy,
             loader_tx,
+            map_loader_latest_requested,
             window: None,
             render: None,
+            combat_ui_was_active: false,
             startup_first_frame_seen: false,
             camera: Camera::new_with_fov([0.0, 0.0, 0.0], 0.0, presentation.fov),
             render_view_latch: ViewLatchMode::Disabled,
@@ -417,6 +459,8 @@ impl App {
             third_person: presentation.third_person,
             spectator_camera: presentation.spectator_camera,
             spectator_camera_state: SpectatorCameraState::default(),
+            wallrun_camera_yaw: Default::default(),
+            wallrun_camera_mode: 0,
             first_person_lightsaber: presentation.first_person_lightsaber,
             saber_trail: presentation.saber_trail,
             saber_team_colors: presentation.saber_team_colors,
@@ -426,6 +470,12 @@ impl App {
             score_spectator_guess: presentation.score_spectator_guess,
             spectator_ping_guesses: [Default::default(); 32],
             draw_scores: presentation.draw_scores,
+            draw_score: presentation.draw_score,
+            draw_score_x: presentation.draw_score_x,
+            draw_score_y: presentation.draw_score_y,
+            draw_enemy_info: presentation.draw_enemy_info,
+            hud_score_shown: None,
+            enemy_info_shown: None,
             mini_scores_shown: None,
             team_overlay_shown: None,
             cg_debug_events: match super::cvar_registry().find("cg_debugEvents").unwrap().default_value() {
@@ -441,6 +491,7 @@ impl App {
             crosshair_scan_at: Instant::now(),
             force_select_until: None,
             weapon_select_until: None,
+            inventory_select_until: None,
             player_names: presentation.player_names,
             player_name_visible: [false; 32],
             race_ghost_label_visible: [false; 128],
@@ -569,8 +620,10 @@ impl App {
             console_map_barrier: false,
             perf_sample: None,
             latched_console_cvars: BTreeMap::new(),
+            console_reflow: std::cell::RefCell::new(Default::default()),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,
+            console_scale: presentation.console_scale,
             console_selection_anchor: None,
             console_selection_focus: None,
             console_selecting: false,
@@ -683,6 +736,7 @@ impl App {
                 menu_props: false,
             },
             prepared_map_cache: None,
+            cross_game_map_seed: None,
             fx_light_promotion_catalog: Arc::new(
                 crate::fx::light_promotion::FxLightPromotionCatalog::default(),
             ),

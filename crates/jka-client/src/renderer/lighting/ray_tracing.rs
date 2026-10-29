@@ -1986,7 +1986,7 @@ pub(in crate::renderer) fn compose_world_shader(base: &str) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         weather::with_world_weather(base),
-        include_str!("../../surface_deformation.wgsl"),
+        crate::foliage::surface_shader(),
         include_str!("../../sky_fractal.wgsl"),
         include_str!("lightmap_sun.wgsl"),
         raster_receiver_guard,
@@ -2212,7 +2212,7 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
     scene: RtReceiverScene<'_>,
     receiver: &rt_receiver::RtReceiverResources,
 ) -> wgpu::BindGroup {
-    let shadow_sampler = if matches!(cascaded_shadow_mode, DynamicShadowsMode::CascadedShadowMaps) {
+    let shadow_sampler = if cascaded_shadow_mode.is_csm() {
         &shadow.bevy_sampler
     } else {
         &shadow.legacy_sampler

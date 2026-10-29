@@ -4,7 +4,7 @@ use crate::app::egui_menu::{
     EguiRenderData, ElementState, FrontendPage, Instant, KeyCode, KeyEvent, MapEditor, MouseButton,
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
     GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
-    SETUP_TAB_MOD, SETUP_TAB_EXTENSIONS, SETUP_TAB_STREAMER, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
+    SETUP_TAB_MOD, SETUP_TAB_PK3, SETUP_TAB_EXTENSIONS, SETUP_TAB_STREAMER, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
     TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
 
@@ -25,6 +25,7 @@ impl App {
         self.egui_renderer_active = false;
         self.egui_apply_video_requested = false;
         self.map_edit_toolbar_rect = None;
+        self.neon_chrome_sent = None;
         self.load_frontend_scene_cache();
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = None;
@@ -67,6 +68,7 @@ impl App {
                     | OverlayMode::ShaderRemap
                     | OverlayMode::StrafeTrails
                     | OverlayMode::RaceGhosts
+                    | OverlayMode::Telemarks
             ))
             && self.video_confirmation.is_none()
             && (blocking_download_ui || self.loading.is_none())
@@ -311,6 +313,7 @@ impl App {
     }
 
     pub(in crate::app) fn tick_egui_menu(&mut self) {
+        if !self.front_end { self.release_neon_chrome(); }
         self.poll_server_browser_events();
         self.poll_ui_catalog();
         if self.tick_egui_confirmation() {
@@ -329,15 +332,25 @@ impl App {
         // monitor refresh or com_maxfps, whichever is lower. In particular the
         // animated Profile page must not impose its own 30/60/120 Hz cadence.
         // Gameplay overlays keep the original lightweight ~120 Hz UI throttle.
-        let ui_interval = if self.front_end {
+        // A Render Studio export locks the editor: a ~10 Hz progress view is
+        // enough, and each skipped UI build is main-thread time per frame.
+        let exporting = self.render_studio.export.is_some();
+        let ui_interval = if exporting {
+            Duration::from_millis(100)
+        } else if self.front_end {
             Duration::from_secs_f64(1.0 / f64::from(self.active_render_fps_cap().max(1)))
         } else {
             Duration::from_millis(8)
         };
-        if !self.egui_repaint_requested && self.egui_last_frame.elapsed() < ui_interval {
+        if (!self.egui_repaint_requested || exporting) && self.egui_last_frame.elapsed() < ui_interval {
             return;
         }
+        let ui_started = std::time::Instant::now();
         self.run_egui_menu_frame();
+        if let Some(export) = self.render_studio.export.as_mut() {
+            export.app_cost(crate::app::render_studio_profile::StudioAppCost::Ui,
+                ui_started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     pub(in crate::app::egui_menu) fn run_egui_menu_frame(&mut self) {
@@ -372,6 +385,10 @@ impl App {
             ctx.run_ui(raw_input, |ui| self.build_egui_menu(ui))
         };
         state.handle_platform_output(&window, platform_output);
+        // OS cursor ownership is centralized after egui's platform output.
+        // Eg. opening Map Mods and switching to captured ENT edit must not
+        // leave the egui arrow visible on top of the crosshair.
+        window.set_cursor_visible(!self.captured);
         self.egui_state = Some(state);
 
         // Applying display/backend changes recreates both the wgpu renderer and
@@ -460,7 +477,12 @@ impl App {
             self.egui_demo_missing_map_dialog(ui);
             return;
         }
-        if self.live_join_ui.is_some() {
+        if self.live_join_ui.is_some() || self.net.as_ref().is_some_and(|net| {
+            net.state() != jka_protocol::session::ConnectionState::Active
+                || self.game_session.as_ref().is_none_or(|session| {
+                    session.phase != crate::app::SessionPhase::Playing
+                })
+        }) {
             self.egui_live_join_pipeline(ui);
             return;
         }
@@ -518,6 +540,10 @@ impl App {
         }
         if painted_overlay == OverlayMode::StrafeTrails {
             self.egui_strafe_trails(ui);
+            return;
+        }
+        if painted_overlay == OverlayMode::Telemarks {
+            self.egui_telemarks(ui);
             return;
         }
         if painted_overlay == OverlayMode::RaceGhosts {
@@ -711,10 +737,12 @@ impl App {
                 Some("chatlogs") | Some("chatlog") => FrontendPage::ChatLogs,
                 Some("devtools") => FrontendPage::DeveloperTools,
                 Some("assets") => FrontendPage::AssetViewer,
+                Some("pk3") | Some("packages") => FrontendPage::Pk3Manager,
                 Some("screenshots") | Some("shots") => FrontendPage::Screenshots,
                 Some("maps") => FrontendPage::MapViewer,
                 Some("renderstudio") => {
                     self.open_render_studio();
+                    self.render_studio_ui_script(&args[1..]);
                     FrontendPage::RenderStudio
                 },
                 Some("setup") => {
@@ -767,7 +795,7 @@ impl App {
             }
             _ => {
                 self.console_status =
-                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|extensions|streamer|mod]".into();
+                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|extensions|streamer|pk3|mod]".into();
             }
         }
     }
@@ -784,6 +812,7 @@ impl App {
             return SETUP_TAB_MOD;
         }
         if tab.eq_ignore_ascii_case("streamer") { return SETUP_TAB_STREAMER; }
+        if tab.eq_ignore_ascii_case("pk3") || tab.eq_ignore_ascii_case("assets") { return SETUP_TAB_PK3; }
         SETUP_TABS
             .iter()
             .position(|name| name.eq_ignore_ascii_case(tab))
@@ -877,19 +906,19 @@ impl App {
         // leaves the renderer and window alone.
         let map_only = restart && !self.display_restart_required() && self.map_reprep_wanted();
         egui::Panel::bottom("jka_menu_footer")
-            .exact_size(theme::FOOTER_H)
+            .exact_size(if self.front_end { crate::neon_menu::footer::HEIGHT } else { theme::FOOTER_H })
             .frame(
                 egui::Frame::new()
-                    .fill(theme::CHROME)
+                    .fill(if self.front_end { egui::Color32::TRANSPARENT } else { theme::CHROME })
                     .inner_margin(egui::Margin::symmetric(0, 0)),
             )
             .show(root, |ui| {
                 let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
-                    egui::CornerRadius::ZERO,
-                    theme::LINE,
-                );
+                if !self.front_end {
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
+                        egui::CornerRadius::ZERO, theme::LINE);
+                }
                 ui.horizontal_centered(|ui| {
                     ui.add_space(GUTTER);
                     let hint = if map_only {
@@ -903,15 +932,11 @@ impl App {
                     } else {
                         "ESC goes back.  ` opens the console."
                     };
-                    theme::label(
-                        ui,
-                        theme::plain(
-                            hint,
-                            11.5,
-                            if restart { theme::WARNING } else { theme::TEXT_FAINT },
-                        ),
-                    );
-                    if restart {
+                    if !self.front_end {
+                        theme::label(ui, theme::plain(hint,11.5,
+                            if restart { theme::WARNING } else { theme::TEXT_FAINT }));
+                    }
+                    if restart && !self.front_end {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(GUTTER);
                             let button_text = format!(
@@ -974,7 +999,9 @@ impl App {
                     self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let content_w = if server_page {
                     ui.available_width().min(1120.0)
-                } else if profile_page {
+                } else if profile_page || (self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_PK3) {
+                    // The three-pane PK3 Manager needs the full canvas, but
+                    // other Setup pages keep their familiar left column.
                     ui.available_width()
                 } else {
                     ui.available_width().min(CONTENT_MAX_W)
@@ -1028,7 +1055,8 @@ impl App {
         if self.egui_display_overlay() == OverlayMode::Video {
             // Video keeps search alongside its pinned quality-preset toolbar.
             // Other Setup pages render the same field above their page title.
-            if self.setup_selected != SETUP_TAB_VIDEO {
+            if self.setup_selected != SETUP_TAB_VIDEO && self.setup_selected != SETUP_TAB_PK3 {
+                // PK3 Manager has a dedicated package search spanning both panes.
                 let searching = super::settings_search::search_bar(ui);
                 ui.add_space(10.0);
                 if searching {
@@ -1046,6 +1074,7 @@ impl App {
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
                 SETUP_TAB_EXTENSIONS => self.egui_extensions_page(ui),
                 SETUP_TAB_STREAMER => self.egui_streamer_settings(ui),
+                SETUP_TAB_PK3 => self.egui_pk3_manager_page(ui),
                 SETUP_TAB_MOD => self.egui_mod_setup_settings(ui),
                 _ => unreachable!("setup tab index is bounded by the visible setup tabs"),
             }

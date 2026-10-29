@@ -15,11 +15,16 @@ pub(in crate::app) struct MapLoadRequest {
     /// Gameplay/live loads build the immutable EFX light-promotion catalog.
     /// Frontend scenery and source-editor preview rebuilds skip it.
     pub(in crate::app) analyze_fx_light_profiles: bool,
+    /// Gameplay/frontend/editor requests share `latest_request_id`, so the
+    /// loader may skip or abandon one once a newer id is published. Studio
+    /// requests carry their own ids and must always run.
+    pub(in crate::app) supersedable: bool,
     /// The already-prepared copy of this same map (the restart cache), lent so
     /// the loader can copy unchanged stages instead of recomputing them.
     pub(in crate::app) seed: Option<Arc<scene::PreparedMap>>,
 }
 
+#[derive(Clone)]
 pub(in crate::app) struct PreparedMapCache {
     pub(in crate::app) label: String,
     pub(in crate::app) prepare_options: scene::MapPrepareOptions,
@@ -348,7 +353,12 @@ impl App {
     }
 
     pub(in crate::app) fn request_map(&mut self, source: scene::MapSource) {
+        self.leave_render_studio_for_launch();
         self.request_map_internal(source, MapLoadPurpose::Gameplay);
+    }
+
+    pub(in crate::app) fn request_studio_demo_map(&mut self, source: scene::MapSource) {
+        self.request_map_internal(source, MapLoadPurpose::StudioDemo);
     }
 
     /// Client physics only needs the BSP's static triangle mesh, so turning it
@@ -445,6 +455,7 @@ impl App {
     pub(in crate::app) fn request_map_edit_preview(&mut self, path: PathBuf, text: String) {
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         let request_id = self.latest_request_id;
+        self.map_loader_latest_requested.store(request_id, std::sync::atomic::Ordering::Release);
         self.map_edit_preview_request_id = Some(request_id);
         self.map_edit_preview_pending_collision = None;
         self.map_edit_preview_dirty = false;
@@ -468,6 +479,7 @@ impl App {
                 source,
                 prepare_options,
                 analyze_fx_light_profiles: false,
+                supersedable: true,
                 seed: None,
                 sub_bsp_names: Vec::new(),
             })
@@ -564,7 +576,7 @@ impl App {
         // The exported props file is part of the cache identity, so an edited
         // layout never shows a still of the previous one.
         let props_stamp = std::fs::metadata(
-            self.game.as_deref().unwrap_or(&self.base).join("mapmods").join("mp").join("duel9.ent"),
+            self.game_write_path("mapmods").join("mp").join("duel9.ent"),
         )
         .ok()
         .map(|meta| {
@@ -668,6 +680,9 @@ impl App {
         source: scene::MapSource,
         purpose: MapLoadPurpose,
     ) {
+        if purpose != MapLoadPurpose::FrontendBackground {
+            self.stop_menu_ambience();
+        }
         // A real world/cgame registration must not inherit runtime redirects
         // from the previous map. Remap-only presentation uploads bypass this
         // entry point; a new gamestate replays its CS_SHADERSTATE normally.
@@ -716,6 +731,7 @@ impl App {
         self.initial_source = source.clone();
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         let request_id = self.latest_request_id;
+        self.map_loader_latest_requested.store(request_id, std::sync::atomic::Ordering::Release);
         self.frontend_background_request_id =
             (purpose == MapLoadPurpose::FrontendBackground).then_some(request_id);
         if purpose != MapLoadPurpose::FrontendBackground {
@@ -745,7 +761,13 @@ impl App {
             .prepared_map_cache
             .as_ref()
             .filter(|cache| cache.label == label)
+            .or_else(|| self.cross_game_map_seed.as_ref().filter(|cache| cache.label == label))
             .map(|cache| Arc::clone(&cache.map));
+        // A cross-mod seed is only useful for the very next map preparation.
+        // Its BSP hash, texture bytes and per-stage fingerprints are checked
+        // on the worker before any portion is reused. External lightmaps are
+        // always loaded from the new game's active asset search path.
+        self.cross_game_map_seed = None;
         if self
             .loader_tx
             .send(MapLoadRequest {
@@ -755,6 +777,7 @@ impl App {
                 source,
                 prepare_options,
                 analyze_fx_light_profiles: purpose != MapLoadPurpose::FrontendBackground,
+                supersedable: true,
                 seed,
                 sub_bsp_names,
             })
@@ -868,6 +891,7 @@ impl App {
             }
         }
         loading.begin_upload();
+        self.stop_menu_ambience();
         self.loading = Some(loading);
         self.console_status = format!(
             "RE-UPLOADING CACHED {label} TO {}...",
@@ -884,6 +908,7 @@ impl App {
             started,
             name: label,
             map,
+            studio_world: None,
         });
         self.publish_snapshot();
         true
@@ -1107,23 +1132,36 @@ impl App {
     }
 }
 
+/// Inputs the full FX promotion catalog is derived from; see `spawn_map_loader`.
+#[derive(PartialEq, Eq)]
+struct FxCatalogKey {
+    game: Option<PathBuf>,
+    allow_asset_overrides: bool,
+    pbr_materials: bool,
+    index: jka_assets::pk3::VfsIndexToken,
+}
+
 pub(in crate::app) fn spawn_map_loader(
     base: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
+    latest_requested: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Sender<MapLoadRequest>, String> {
     let (tx, rx) = mpsc::channel::<MapLoadRequest>();
     thread::Builder::new()
         .name("jka-map-loader".into())
         .spawn(move || {
             let progress_proxy = proxy.clone();
-            let jobs = match crate::map_jobs::MapJobPool::new_with_progress(move |progress| {
-                let _ = progress_proxy.send_event(UserEvent::MapLoadProgress {
-                    request_id: progress.request_id,
-                    task: progress.task,
-                    completed: progress.completed,
-                    total: progress.total,
-                });
-            }) {
+            let jobs = match crate::map_jobs::MapJobPool::new_with_progress_and_latest(
+                move |progress| {
+                    let _ = progress_proxy.send_event(UserEvent::MapLoadProgress {
+                        request_id: progress.request_id,
+                        task: progress.task,
+                        completed: progress.completed,
+                        total: progress.total,
+                    });
+                },
+                Arc::clone(&latest_requested),
+            ) {
                 Ok(jobs) => jobs,
                 Err(error) => {
                     eprintln!("Map worker pool: {error}");
@@ -1134,8 +1172,21 @@ pub(in crate::app) fn spawn_map_loader(
                 "Map loader: {} worker job thread(s) available",
                 jobs.worker_count()
             );
+            // The full promotion catalog depends only on the VFS (game dir,
+            // override policy, index identity) and the shader library parsed
+            // from it, never on the map, so map changes and rejoins reuse it.
+            let mut fx_catalog_cache: Option<(
+                FxCatalogKey,
+                Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
+            )> = None;
             while let Ok(request) = rx.recv() {
+                if request.supersedable
+                    && request.request_id != latest_requested.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    continue; // A newer map won before this queued request even started.
+                }
                 jobs.begin_request(request.request_id);
+                jobs.set_supersedable(request.supersedable);
                 let name = request.source.label();
                 let _activity = crate::thread_activity::activity(
                     crate::thread_activity::ThreadSlot::MapLoader,
@@ -1151,6 +1202,10 @@ pub(in crate::app) fn spawn_map_loader(
                     &request.sub_bsp_names,
                 ) {
                     Ok(mut map) => {
+                        if jobs.is_superseded() {
+                            continue;
+                        }
+                        map.intern_images();
                         // Promotion profiling is a real map-prep stage. It runs
                         // after the world shader table is available so it can reuse
                         // that parsed data instead of reparsing every .shader file,
@@ -1168,61 +1223,85 @@ pub(in crate::app) fn spawn_map_loader(
                                     fx_assets.set_allow_asset_overrides(
                                         request.prepare_options.allow_asset_overrides,
                                     );
-                                    let effect_names = if request.analyze_fx_light_profiles {
-                                        crate::fx::light_promotion::effect_asset_names(&fx_assets)
-                                    } else {
-                                        // Profile only this scene's runners on the map
-                                        // worker; reuse the regular classifier and avoid
-                                        // scanning all game FX for the menu.
-                                        crate::fx::light_promotion::runner_effect_asset_names(&map.fx_runners)
+                                    let key = FxCatalogKey {
+                                        game: request.game.clone(),
+                                        allow_asset_overrides: request.prepare_options.allow_asset_overrides,
+                                        pbr_materials: request.prepare_options.pbr_materials,
+                                        index: fx_assets.index_token(),
                                     };
-                                    let total = effect_names.len().max(1).min(u32::MAX as usize) as u32;
-                                    let shaders = Arc::clone(&map.shader_library);
-                                    match jobs.submit_progress(
-                                        crate::thread_activity::Task::MapFxLightProfiles,
-                                        total,
-                                        move |progress| {
-                                            crate::fx::light_promotion::build_catalog(
-                                                &mut fx_assets,
-                                                shaders.as_ref(),
-                                                &effect_names,
-                                                |completed, _total| {
-                                                    progress.set_completed(completed);
-                                                },
-                                            )
-                                        },
-                                    ) {
-                                        Ok(job) => match job.join() {
-                                            Ok(catalog) => {
-                                                println!(
-                                                    "{name}: FX light promotion profiled {} EFX / {} semantic candidates / {} promotable effects / {} material(s) in {:.1} ms",
-                                                    catalog.scanned_effects(),
-                                                    catalog.semantic_candidates(),
-                                                    catalog.promotable_effects(),
-                                                    catalog.analyzed_materials(),
-                                                    profile_started.elapsed().as_secs_f64() * 1000.0,
-                                                );
-                                                Arc::new(catalog)
-                                            }
+                                    let cached = fx_catalog_cache
+                                        .as_ref()
+                                        .filter(|(cached, _)| *cached == key)
+                                        .map(|(_, catalog)| Arc::clone(catalog));
+                                    if let Some(catalog) = cached {
+                                        jobs.mark_done(crate::thread_activity::Task::MapFxLightProfiles);
+                                        println!(
+                                            "{name}: FX light promotion reused cached catalog ({} EFX / {} material(s))",
+                                            catalog.scanned_effects(),
+                                            catalog.analyzed_materials(),
+                                        );
+                                        catalog
+                                    } else {
+                                        let effect_names = if request.analyze_fx_light_profiles {
+                                            crate::fx::light_promotion::effect_asset_names(&fx_assets)
+                                        } else {
+                                            // Profile only this scene's runners on the map
+                                            // worker; reuse the regular classifier and avoid
+                                            // scanning all game FX for the menu.
+                                            crate::fx::light_promotion::runner_effect_asset_names(&map.fx_runners)
+                                        };
+                                        let total = effect_names.len().max(1).min(u32::MAX as usize) as u32;
+                                        let shaders = Arc::clone(&map.shader_library);
+                                        match jobs.submit_progress(
+                                            crate::thread_activity::Task::MapFxLightProfiles,
+                                            total,
+                                            move |progress| {
+                                                crate::fx::light_promotion::build_catalog(
+                                                    &mut fx_assets,
+                                                    shaders.as_ref(),
+                                                    &effect_names,
+                                                    |completed, _total| {
+                                                        progress.set_completed(completed);
+                                                    },
+                                                )
+                                            },
+                                        ) {
+                                            Ok(job) => match job.join() {
+                                                Ok(catalog) => {
+                                                    println!(
+                                                        "{name}: FX light promotion profiled {} EFX / {} semantic candidates / {} promotable effects / {} material(s) in {:.1} ms",
+                                                        catalog.scanned_effects(),
+                                                        catalog.semantic_candidates(),
+                                                        catalog.promotable_effects(),
+                                                        catalog.analyzed_materials(),
+                                                        profile_started.elapsed().as_secs_f64() * 1000.0,
+                                                    );
+                                                    let catalog = Arc::new(catalog);
+                                                    if request.analyze_fx_light_profiles {
+                                                        fx_catalog_cache = Some((key, Arc::clone(&catalog)));
+                                                    }
+                                                    catalog
+                                                }
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "{name}: FX light promotion worker failed: {error}"
+                                                    );
+                                                    Arc::new(
+                                                        crate::fx::light_promotion::FxLightPromotionCatalog::default(),
+                                                    )
+                                                }
+                                            },
                                             Err(error) => {
                                                 eprintln!(
-                                                    "{name}: FX light promotion worker failed: {error}"
+                                                    "{name}: could not queue FX light promotion worker: {error}"
+                                                );
+                                                jobs.mark_done(
+                                                    crate::thread_activity::Task::MapFxLightProfiles,
                                                 );
                                                 Arc::new(
                                                     crate::fx::light_promotion::FxLightPromotionCatalog::default(),
                                                 )
                                             }
-                                        },
-                                        Err(error) => {
-                                            eprintln!(
-                                                "{name}: could not queue FX light promotion worker: {error}"
-                                            );
-                                            jobs.mark_done(
-                                                crate::thread_activity::Task::MapFxLightProfiles,
-                                            );
-                                            Arc::new(
-                                                crate::fx::light_promotion::FxLightPromotionCatalog::default(),
-                                            )
                                         }
                                     }
                                 }
@@ -1251,6 +1330,9 @@ pub(in crate::app) fn spawn_map_loader(
                         // world has been delivered, so first-time offline baking can
                         // never hold up joining a live server.
                         let bake_request = map.steam_audio_bake_request.take();
+                        if jobs.is_superseded() {
+                            continue;
+                        }
                         if proxy
                             .send_event(UserEvent::MapPrepared {
                                 request_id: request.request_id,

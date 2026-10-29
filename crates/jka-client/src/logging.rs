@@ -27,6 +27,10 @@ pub enum ConsoleLineKind {
     CommandEcho,
     Error,
     NotifyMention,
+    /// Chat received over tchat/ltchat, retained unfiltered in game logs.
+    TeamChat,
+    TeamChatMention,
+    TeamChatCommandEcho,
     NotifyConnect,
     NotifyVote,
 }

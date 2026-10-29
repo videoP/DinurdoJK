@@ -432,9 +432,11 @@ pub fn shader_bindings(group: u32) -> String {
 }
 pub fn model_shader(base: &str, group: u32) -> String {
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}\n{}",
         crate::weather::with_model_weather(base),
-        shader_bindings(group)
+        shader_bindings(group),
+        include_str!("predator_cloak.wgsl"),
+        if base.contains("studio_lights:") {include_str!("studio_lighting.wgsl")}else{""},
     )
 }
 pub fn world_shader() -> String {

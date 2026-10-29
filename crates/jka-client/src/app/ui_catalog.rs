@@ -42,6 +42,7 @@ pub(super) enum CatalogRequest {
     Levelshot { source: bool, map_name: String },
     ProfileBackground { map_name: String },
     ProfileBackgroundMaps,
+    StudioBspMaps,
     StudioCinematics {token:u64,allow_overrides:bool},
     ProfileIcon { key: String, model: String, skin: String },
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
@@ -68,6 +69,7 @@ pub(super) enum CatalogPayload {
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
     ProfileBackground { map_name: String, image: Option<DecodedImage> },
     ProfileBackgroundMaps(Vec<String>),
+    StudioBspMaps(Vec<String>),
     StudioCinematics {token:u64,catalog:Result<super::render_studio_cinematics::StudioCinematicCatalog,String>},
     ProfileIcon { key: String, image: Option<DecodedImage> },
     CrosshairImage { index: u8, image: Option<DecodedImage> },
@@ -284,6 +286,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         }
                         CatalogRequest::ProfileBackground {map_name}=>Some(CatalogPayload::ProfileBackground{map_name,image:None}),
                         CatalogRequest::ProfileBackgroundMaps=>Some(CatalogPayload::ProfileBackgroundMaps(Vec::new())),
+                        CatalogRequest::StudioBspMaps=>Some(CatalogPayload::StudioBspMaps(Vec::new())),
                         CatalogRequest::StudioCinematics {token,..}=>Some(CatalogPayload::StudioCinematics {token,catalog:Err(error)}),
                         CatalogRequest::ProfileIcon { key, .. } => {
                             Some(CatalogPayload::ProfileIcon { key, image: None })
@@ -317,7 +320,32 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
             CatalogRequest::ModelThumbnail { qpath } => {
                 let image = assets.read(&qpath, 32 * 1024 * 1024).ok().flatten()
                     .and_then(|file| jka_assets::md3::parse(&file.bytes).ok())
-                    .and_then(|model| raster_md3_thumbnail(&model));
+                    .and_then(|model| raster_md3_thumbnail(&model, |shader| {
+                        // MD3 shader names often reference image assets directly.
+                        // Keep the worker responsible for all VFS/decode work;
+                        // scripted/multipass shaders still use the live renderer.
+                        let stem = shader.replace('\\', "/");
+                        let stem = stem.trim_end_matches(".tga")
+                            .trim_end_matches(".jpg").trim_end_matches(".jpeg")
+                            .trim_end_matches(".png");
+                        for ext in ["tga", "png", "jpg", "jpeg"] {
+                            let path = format!("{stem}.{ext}");
+                            let Ok(Some(file)) = assets.read(&path, 8 * 1024 * 1024) else { continue; };
+                            let format = match ext {
+                                "tga" => image::ImageFormat::Tga,
+                                "png" => image::ImageFormat::Png,
+                                _ => image::ImageFormat::Jpeg,
+                            };
+                            if let Ok(image) = image::load_from_memory_with_format(&file.bytes, format) {
+                                let image = image.thumbnail(256, 256).to_rgba8();
+                                return Some(DecodedImage {
+                                    size: [image.width() as usize, image.height() as usize],
+                                    rgba: image.into_raw(),
+                                });
+                            }
+                        }
+                        None
+                    }));
                 ("model thumbnail", CatalogPayload::ModelThumbnail { qpath, image })
             }
             CatalogRequest::AssetViewer => (
@@ -363,6 +391,11 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     });
                 ("profile background",CatalogPayload::ProfileBackground{map_name,image})
             }
+            CatalogRequest::StudioBspMaps => (
+                "studio BSP maps",
+                CatalogPayload::StudioBspMaps(frontend::scan_solo_maps(assets).into_iter()
+                    .map(|entry|entry.map_name).collect()),
+            ),
             CatalogRequest::ProfileBackgroundMaps=>{
                 let names:HashSet<_>=assets.names().map(|n|n.to_ascii_lowercase()).collect();
                 let maps=frontend::scan_solo_maps(assets).into_iter().map(|m|m.map_name).filter(|name|{
@@ -428,13 +461,14 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
 }
 
 
-/// Software thumbnail of real MD3 frame-zero mesh geometry. The catalog worker
-/// handles all triangles and the UI receives just a small RGBA icon; no GPU
-/// allocations or asset disk reads happen while scrolling the picker. Thumbs
-/// deliberately use neutral material so a missing image cannot hide geometry.
-fn raster_md3_thumbnail(model: &jka_assets::md3::Model) -> Option<DecodedImage> {
-    const W: usize = 96;
-    const H: usize = 96;
+/// Material-aware software thumbnail of MD3 frame-zero mesh geometry. This is
+/// only for the scroll list: hovering renders the *actual* CGame material path
+/// in the map, including scripted textures and blending. VFS and decoding run
+/// exclusively on the catalog worker, never on the egui paint thread.
+fn raster_md3_thumbnail(model: &jka_assets::md3::Model,
+    mut read_texture: impl FnMut(&str) -> Option<DecodedImage>) -> Option<DecodedImage> {
+    const W: usize = 144;
+    const H: usize = 144;
     let (yaw, elevation) = (0.65_f32, 0.43_f32);
     let (sy,cy) = yaw.sin_cos();
     let (sp,cp) = elevation.sin_cos();
@@ -460,15 +494,19 @@ fn raster_md3_thumbnail(model: &jka_assets::md3::Model) -> Option<DecodedImage> 
     let center = [(range_min[0]+range_max[0])*0.5, (range_min[1]+range_max[1])*0.5];
     let width = (range_max[0]-range_min[0]).max(0.01);
     let height = (range_max[1]-range_min[1]).max(0.01);
-    let scale = 83.0 / width.max(height);
+    let scale = (W as f32 - 16.0) / width.max(height);
     let screen = |p: [f32; 3]| -> [f32; 3] {
         let v = project(p);
-        [48.0+(v[0]-center[0])*scale, 48.0-(v[1]-center[1])*scale, v[2]]
+        [W as f32 * 0.5+(v[0]-center[0])*scale,
+         H as f32 * 0.5-(v[1]-center[1])*scale, v[2]]
     };
     let mut rgba = vec![0u8; W*H*4];
     for pixel in rgba.chunks_exact_mut(4) { pixel.copy_from_slice(&[25,34,46,255]); }
     let mut depth = vec![f32::NEG_INFINITY; W*H];
+    let mut textures = std::collections::HashMap::new();
     for surface in &model.surfaces {
+        let material = textures.entry(surface.shader.clone())
+            .or_insert_with(|| read_texture(&surface.shader));
         let vertices: Vec<_> = surface.vertices.iter().map(|v| screen(v.position)).collect();
         for face in surface.indices.chunks_exact(3) {
             let (Some(a),Some(b),Some(c)) = (
@@ -479,10 +517,15 @@ fn raster_md3_thumbnail(model: &jka_assets::md3::Model) -> Option<DecodedImage> 
             let area = (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
             if area.abs() < 0.001 { continue; }
             let lo_x = a[0].min(b[0]).min(c[0]).floor().max(0.0) as usize;
-            let hi_x = a[0].max(b[0]).max(c[0]).ceil().min(95.0) as usize;
+            let hi_x = a[0].max(b[0]).max(c[0]).ceil().min((W-1) as f32) as usize;
             let lo_y = a[1].min(b[1]).min(c[1]).floor().max(0.0) as usize;
-            let hi_y = a[1].max(b[1]).max(c[1]).ceil().min(95.0) as usize;
+            let hi_y = a[1].max(b[1]).max(c[1]).ceil().min((H-1) as f32) as usize;
             let brightness = (105.0 + area.abs().sqrt().min(90.0)*0.33).round() as u8;
+            let (ua,ub,uc) = (
+                surface.vertices.get(face[0] as usize).map(|v|v.uv).unwrap_or([0.0;2]),
+                surface.vertices.get(face[1] as usize).map(|v|v.uv).unwrap_or([0.0;2]),
+                surface.vertices.get(face[2] as usize).map(|v|v.uv).unwrap_or([0.0;2]),
+            );
             for y in lo_y..=hi_y {
                 for x in lo_x..=hi_x {
                     let px = x as f32 + 0.5;
@@ -495,10 +538,25 @@ fn raster_md3_thumbnail(model: &jka_assets::md3::Model) -> Option<DecodedImage> 
                     let i = y*W+x;
                     if z <= depth[i] { continue; }
                     depth[i] = z;
-                    rgba[i*4..i*4+4].copy_from_slice(&[
-                        brightness.saturating_sub(18), brightness,
-                        brightness.saturating_add(24), 255
-                    ]);
+                    let color = if let Some(image) = material.as_ref() {
+                        // JKA repeats MD3 texture coordinates outside 0..1.
+                        let tx = (u*ua[0] + v*ub[0] + w*uc[0]).rem_euclid(1.0);
+                        let ty = (u*ua[1] + v*ub[1] + w*uc[1]).rem_euclid(1.0);
+                        let xx = ((tx * image.size[0] as f32) as usize).min(image.size[0]-1);
+                        let yy = ((ty * image.size[1] as f32) as usize).min(image.size[1]-1);
+                        let index = (yy * image.size[0] + xx) * 4;
+                        let light = 0.72 + brightness as f32 / 600.0;
+                        [
+                            (image.rgba[index] as f32 * light).min(255.0) as u8,
+                            (image.rgba[index+1] as f32 * light).min(255.0) as u8,
+                            (image.rgba[index+2] as f32 * light).min(255.0) as u8,
+                            255,
+                        ]
+                    } else {
+                        [brightness.saturating_sub(18), brightness,
+                         brightness.saturating_add(24), 255]
+                    };
+                    rgba[i*4..i*4+4].copy_from_slice(&color);
                 }
             }
         }

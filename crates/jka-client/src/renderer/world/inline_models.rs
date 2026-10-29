@@ -197,6 +197,12 @@ impl Renderer {
                     let Some(batch) = set.get_mut(index) else { continue; };
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
+                    if batch.source.foliage_wind {
+                        for axis in 0..3 {
+                            batch.bounds_min[axis] -= crate::foliage::BOUNDS_PADDING;
+                            batch.bounds_max[axis] += crate::foliage::BOUNDS_PADDING;
+                        }
+                    }
                     if cull_records_read {
                         write_cull_bounds(&self.queue, cull_records_buffer, record_stride, batch);
                     } else {
@@ -212,6 +218,12 @@ impl Renderer {
                 if let Some(batch) = auto4_batches.get_mut(auto4_index) {
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
+                    if batch.source.foliage_wind {
+                        for axis in 0..3 {
+                            batch.bounds_min[axis] -= crate::foliage::BOUNDS_PADDING;
+                            batch.bounds_max[axis] += crate::foliage::BOUNDS_PADDING;
+                        }
+                    }
                 }
             }
         }

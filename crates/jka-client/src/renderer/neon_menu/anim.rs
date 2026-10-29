@@ -28,6 +28,7 @@ pub(super) struct Geometry {
     pub sill: f32,
     pub width: f32,
     pub monitor: [f32; 4],
+    pub entry_count: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -72,11 +73,6 @@ pub(super) struct Anim {
     active_time: f32,
     press_serial: u32,
     pub items: [ItemAnim; ITEM_COUNT],
-    pub title_level: f32,
-    /// Neon lightsaber under the title: lit level and how far the blade has
-    /// extended from the hilt (0..1).
-    pub saber_level: f32,
-    pub saber_fill: f32,
     pub drips: Vec<Drip>,
     next_ambient: f32,
     rng: u32,
@@ -97,9 +93,6 @@ impl Default for Anim {
             active_time: -10.0,
             press_serial: 0,
             items: [ItemAnim::default(); ITEM_COUNT],
-            title_level: 0.0,
-            saber_level: 0.0,
-            saber_fill: 0.0,
             drips: Vec::new(),
             next_ambient: 3.0,
             rng: 0x9E37_79B9,
@@ -161,13 +154,13 @@ impl Anim {
         if frame.revealed && self.revealed_at.is_none() {
             self.revealed_at = Some(time);
         }
-        let selected = usize::from(frame.selected).min(ITEM_COUNT - 1);
+        let selected = usize::from(frame.selected).min(geo.entry_count - 1);
         if selected != self.selected {
             self.selected = selected;
             self.select_time = time;
             self.lightbox_switch = time;
         }
-        let active = frame.active.map(|a| usize::from(a).min(ITEM_COUNT - 1));
+        let active = frame.active.map(|a| usize::from(a).min(geo.entry_count - 1));
         if active != self.active {
             self.active = active;
             self.active_time = time;
@@ -179,27 +172,11 @@ impl Anim {
             }
         }
 
-        // Title: a pale tube that powers on first and stays steady.
-        self.title_level = match self.revealed_at {
-            Some(at) if time > at + 0.15 => strike(time - at - 0.15, 0.35, 30.0, 0.5) * 0.85,
-            _ => 0.0,
-        };
-
-        // The saber ignites after the title: the blade runs out of the hilt,
-        // then hums.
-        match self.revealed_at {
-            Some(at) if time > at + 0.6 => {
-                let t = ((time - at - 0.6) / 0.28).min(1.0);
-                self.saber_fill = 1.0 - (1.0 - t) * (1.0 - t);
-                self.saber_level = 1.15 + 0.06 * (hash((time * 17.0).floor() + 3.3) - 0.5);
-            }
-            _ => {
-                self.saber_fill = 0.0;
-                self.saber_level = 0.0;
-            }
-        }
-
         for index in 0..ITEM_COUNT {
+            if index >= geo.entry_count {
+                self.items[index] = ItemAnim::default();
+                continue;
+            }
             let power_on = self.power_on_time(index);
             let is_active = Some(index) == self.active;
             let active_time = self.active_time;
@@ -266,7 +243,7 @@ impl Anim {
         let time = self.time;
         let mut spawns: Vec<(usize, [f32; 4])> = Vec::new();
         let mut hands: Vec<([f32; 4], f32)> = Vec::new();
-        for index in 0..ITEM_COUNT {
+        for index in 0..geo.entry_count {
             let ready = self.power_on_time(index).is_some_and(|on| time >= on + 0.25);
             let active = Some(index) == self.active && ready;
             let (seed, tilt) = (self.random(), self.random());
@@ -340,7 +317,7 @@ impl Anim {
             // Many of them settle over the signs, so the menu slowly gets
             // covered until someone wipes it.
             let (x, y) = if self.random() < 0.45 {
-                let rect = geo.wipe[((self.random() * ITEM_COUNT as f32) as usize).min(ITEM_COUNT - 1)];
+                let rect = geo.wipe[((self.random() * geo.entry_count as f32) as usize).min(geo.entry_count - 1)];
                 (rect[0] + (rect[2] - rect[0]) * self.random(), rect[1] + (rect[3] - rect[1]) * self.random())
             } else {
                 ((0.04 + self.random() * 0.92) * geo.width, (0.06 + self.random() * 0.55) * geo.sill)

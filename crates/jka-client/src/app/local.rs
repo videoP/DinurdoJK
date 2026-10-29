@@ -6,6 +6,10 @@ impl App {
         self.startup_commands = commands;
     }
 
+    pub fn configure_startup_demo(&mut self, path: std::path::PathBuf) {
+        self.startup_demo_file = Some(path);
+    }
+
     pub(in crate::app) fn toggle_noclip(&mut self) {
         let result = if let Some(server) = &mut self.local_server {
             server.toggle_noclip()
@@ -33,6 +37,38 @@ impl App {
         self.update_solo_player_view_and_presentation();
         self.publish_snapshot();
         self.publish_ui();
+    }
+
+    /// Solo equivalent of jaPRO coordinate amTele. Unlike setviewpos,
+    /// amTele's server handlers parse coordinates and yaw as integers and
+    /// do not accept a pitch in coordinate form.
+    pub(in crate::app) fn local_amtele(&mut self, arguments: &[&str]) {
+        if !(3..=4).contains(&arguments.len()) {
+            self.push_console_line("usage: amTele x y z [yaw]".to_owned());
+            return;
+        }
+        let values: Option<Vec<i32>> = arguments.iter().map(|text| text.parse::<i32>().ok()).collect();
+        let Some(values) = values else {
+            self.push_console_line("^1amTele:^7 coordinates must be integers".to_owned());
+            return;
+        };
+        let origin = [values[0] as f32, values[1] as f32, values[2] as f32];
+        let angles = [0.0, values.get(3).copied().unwrap_or(0) as f32, 0.0];
+        // This is the local implementation of amTele, not a setviewpos call.
+        let result = self.local_server.as_mut().expect("checked by caller").teleport(origin, angles);
+        match result {
+            Ok(()) => {
+                self.push_console_line(format!(
+                    "^2amTele:^7 ({}, {}, {}) yaw {}",
+                    values[0], values[1], values[2], values.get(3).copied().unwrap_or(0)
+                ));
+                self.push_local_snapshot(true);
+                self.third_person_camera.reset();
+                self.update_solo_player_view_and_presentation();
+                self.publish_snapshot();
+            }
+            Err(error) => self.push_console_line(format!("^1amTele:^7 {error}")),
+        }
     }
 
     /// OpenJK `Cmd_SetViewpos_f`: `setviewpos x y z yaw`, answered by the

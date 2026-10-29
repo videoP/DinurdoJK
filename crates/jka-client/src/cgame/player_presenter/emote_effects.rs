@@ -17,7 +17,7 @@ pub struct EmoteEffectFrame {
 
 impl PlayerPresenter {
     pub(super) fn emote_effect_frame(active: &crate::emotes::Preview, model: &PlayerModelAsset, pose: &[Matrix3x4], axis: [[f32; 3]; 3], origin: [f32; 3], entity_num: u16) -> EmoteEffectFrame {
-        let mut out = EmoteEffectFrame::default();
+        let out = EmoteEffectFrame::default();
         let emote = &active.emote;
         let Some(effects) = emote.effects.as_ref() else { return out };
         let Some(track) = effects.data.as_ref() else { return out };

@@ -139,18 +139,47 @@ impl PlayerPresenter {
                     self.fx_requests.push(PlayerFxRequest::GripPuffs { origin });
                     self.fx_requests.push(PlayerFxRequest::GripPuffs { origin });
                 } else if !gripping {
-                    // cg_renderToTextureFX 0 path. The default refraction
-                    // half-shield (which grows for PW_PULL, shrinks for push)
-                    // needs a screen-copy distortion pass (not ported yet).
-                    self.fx_requests.push(PlayerFxRequest::PushPuffs { origin });
+                    if self.japro.render_to_texture_fx != 0 {
+                        self.queue_force_refraction(entity, origin, current_time);
+                    } else {
+                        self.fx_requests.push(PlayerFxRequest::PushPuffs { origin });
+                    }
                 }
             }
+        } else {
+            self.force_refractions.remove(&entity.number);
         }
         Ok(())
     }
 
+    fn queue_force_refraction(&mut self, entity: &PresentedEntity, origin: [f32; 3], now: i32) {
+        // TaystJK CG_ForcePushBlur: 500 ms, follows the hand for 200 ms.
+        const PW_PULL: i32 = 3;
+        let pull = entity.state.field_i32("powerups").unwrap_or(0) & (1 << PW_PULL) != 0;
+        let (state, scale, alpha) = super::cloak::ForceRefractionState::advance(
+            self.force_refractions.get(&entity.number).copied(), now, origin, pull,
+        );
+        self.force_refractions.insert(entity.number, state);
+        let Some(eye) = self.stage_view_position else { return; };
+        let direction = std::array::from_fn(|i| state.origin[i] - eye[i]);
+        if direction.iter().map(|v| v * v).sum::<f32>() <= 0.01 { return; }
+        let mut angles = super::openjk_vectoangles(direction);
+        angles[2] += 180.0;
+        let axis = angles_to_axis(angles).map(|v| v.map(|c| c * scale));
+        self.cosmetic_draws.push(super::CosmeticDraw {
+            entity_num: entity.number,
+            model: "models/weaphits/testboom.md3".into(),
+            origin: state.origin,
+            axis,
+            rgba: [(now - state.start) as f32 * 0.001, 1.0, 1.0, alpha],
+            custom_shader: Some("internal/force_refraction"),
+            skin_pose: None,
+            face_camera: None,
+        });
+    }
+
     /// CG_Player's extra full-body refEntities with a customShader.
-    /// `(shader, rgba, force_alpha_blend)`. `force_alpha_blend` mirrors
+    /// `(shader, rgba, force_alpha_blend, sight_through_walls)`. `force_alpha_blend` mirrors
     /// CG_Player's `RF_FORCE_ENT_ALPHA` on the team-power shell: that shell is
     /// the only one here the stock engine draws with standard alpha blending
     /// (and `rgbGen`/`blendFunc` overridden to the entity colour) instead of
@@ -159,8 +188,9 @@ impl PlayerPresenter {
     pub(in crate::cgame::player_presenter) fn force_shells(
         &self,
         entity: &PresentedEntity,
+        target_team: i32,
         current_time: i32,
-    ) -> Vec<(&'static str, [f32; 4], bool)> {
+    ) -> Vec<(&'static str, [f32; 4], bool, bool)> {
         let state = &entity.state;
         let active = state.field_i32("forcePowersActive").unwrap_or(0);
         let mut shells = Vec::new();
@@ -176,7 +206,7 @@ impl PlayerPresenter {
             } else {
                 "gfx/misc/fullbodyelectric2"
             };
-            shells.push((shader, [1.0, 0.0, 0.0, 1.0], false));
+            shells.push((shader, [1.0, 0.0, 0.0, 1.0], false, false));
         }
         let number = i32::from(entity.number);
         if self.look.duel_bubble && number != self.viewer_client && entity.entity_type == ET_PLAYER
@@ -186,6 +216,7 @@ impl PlayerPresenter {
                 "gfx/misc/sightbubble",
                 [100.0 / 255.0, 100.0 / 255.0, 1.0, 1.0],
                 false,
+                false,
             ));
         }
         if let Some(gray) = self.duel_shell_gray {
@@ -194,13 +225,14 @@ impl PlayerPresenter {
             if entity.entity_type == ET_PLAYER
                 && (number == partner || number == self.viewer_client)
             {
-                shells.push(("powerups/forceshell", [gray, gray, gray, 1.0], false));
+                shells.push(("powerups/forceshell", [gray, gray, gray, 1.0], false, false));
             }
         }
         if active & (1 << FP_PROTECT) != 0 {
             shells.push((
                 "gfx/misc/forceprotect",
                 [0.0, 128.0 / 255.0, 0.0, 254.0 / 255.0],
+                false,
                 false,
             ));
         }
@@ -212,6 +244,7 @@ impl PlayerPresenter {
                     shells.push((
                         "gfx/misc/personalshield",
                         [0.0, 0.0, 1.0, 254.0 / 255.0],
+                        false,
                         false,
                     ));
                 } else {
@@ -226,6 +259,7 @@ impl PlayerPresenter {
                         "powerups/ysalimarishell",
                         [rgb[0], rgb[1], rgb[2], alpha],
                         true,
+                        false,
                     ));
                 }
             }
@@ -235,6 +269,23 @@ impl PlayerPresenter {
                 "powerups/forceshell",
                 [100.0 / 255.0, 100.0 / 255.0, 1.0, 1.0],
                 false,
+                false,
+            ));
+        }
+        // TaystJK cg_players.c CG_Player: other players gain a colored
+        // powerups/sightshell while OUR Force Seeing is active. The shader is
+        // rendered as its own pass; it is not a replacement skin.
+        if self.force_sight_level > 0 && number != self.viewer_client
+            && (entity.entity_type == ET_PLAYER || entity.entity_type == ET_NPC)
+        {
+            let rgb = force_sight_shell_color(
+                self.force_sight_gametype, self.force_sight_team, target_team,
+            );
+            shells.push((
+                "powerups/sightshell",
+                [rgb[0], rgb[1], rgb[2], 1.0],
+                false,
+                self.force_sight_level >= FORCE_LEVEL_2,
             ));
         }
         shells
@@ -418,7 +469,7 @@ impl PlayerPresenter {
         let mut end = entity.origin;
         // Supplemental contact blobs stay close to the feet and fade quickly
         // with height; the explicit classic Blob mode retains its long drop.
-        end[2] -= if self.blob_shadow_opacity < 1.0 { 96.0 } else { BLOB_SHADOW_DISTANCE };
+        end[2] -= if self.blob_shadow_contact { 96.0 } else { BLOB_SHADOW_DISTANCE };
         let trace = world.trace(TraceQuery {
             start: entity.origin,
             mins: BLOB_SHADOW_MINS,
@@ -442,9 +493,15 @@ impl PlayerPresenter {
         let radius = if npc_class == CLASS_REMOTE || npc_class == CLASS_SEEKER {
             BLOB_SHADOW_DROID_RADIUS
         } else {
-            BLOB_SHADOW_RADIUS * if self.blob_shadow_opacity < 1.0 { 0.75 } else { 1.0 }
+            BLOB_SHADOW_RADIUS * if self.blob_shadow_contact { 0.75 } else { 1.0 }
         };
-        let shade = (1.0 - trace.fraction).clamp(0.0, 1.0) * self.blob_shadow_opacity;
+        // Allow contact multipliers above one to strengthen the texture's soft
+        // edges. Opacity does not change the footprint or height fade.
+        // JKA's classic markShadow uses alphaGen vertex with alpha 1; its RGB
+        // height fade has no effect on the black texture. Keep contact's fade.
+        let shade = if self.blob_shadow_contact {
+            (1.0 - trace.fraction).clamp(0.0, 1.0) * self.blob_shadow_opacity
+        } else { 1.0 };
         self.push_blob_shadow_request(entity.number, trace.end, trace.normal, yaw, radius, shade);
     }
 
@@ -492,7 +549,7 @@ impl PlayerPresenter {
             },
             up: {
                 let b = scene::render_position(bitangent.to_array());
-                [b[0], b[1], b[2], 0.0]
+                [b[0], b[1], b[2], f32::from(!self.blob_shadow_contact)]
             },
             color: [0.0; 4],
         });
@@ -1000,6 +1057,7 @@ pub(in crate::cgame::player_presenter) fn saber_blade_fx_request(
     trail_style: i32,
     num_blades: u8,
     no_dlight: bool,
+    no_blade: bool,
     no_wall_marks: bool,
 ) -> Option<PlayerFxRequest> {
     // A zero/near-zero terminal sample clears WeaponFx contact history when
@@ -1024,6 +1082,41 @@ pub(in crate::cgame::player_presenter) fn saber_blade_fx_request(
         trail_style,
         num_blades,
         no_dlight,
+        no_blade,
         no_wall_marks,
     })
+}
+
+/// TaystJK CG_Player Force Seeing shell colors. This uses the target's
+/// clientinfo team, with siege comparing that team to the viewer's team.
+fn force_sight_shell_color(gametype: i32, viewer_team: i32, target_team: i32) -> [f32; 3] {
+    const YELLOW: [f32; 3] = [1.0, 1.0, 0.0];
+    if gametype == 7 { // GT_SIEGE
+        match target_team {
+            0 | 3 => YELLOW, // TEAM_FREE or TEAM_SPECTATOR
+            team if team != viewer_team => [1.0, 50.0 / 255.0, 50.0 / 255.0],
+            _ => [50.0 / 255.0, 1.0, 50.0 / 255.0],
+        }
+    } else if gametype >= 6 { // GT_TEAM and above
+        match target_team {
+            1 => [1.0, 50.0 / 255.0, 50.0 / 255.0],
+            2 => [75.0 / 255.0, 75.0 / 255.0, 1.0],
+            _ => YELLOW,
+        }
+    } else {
+        YELLOW
+    }
+}
+
+#[cfg(test)]
+mod force_sight_tests {
+    use super::force_sight_shell_color;
+    #[test]
+    fn taystjk_force_sight_team_colors() {
+        assert_eq!(force_sight_shell_color(0, 1, 2), [1.0, 1.0, 0.0]);
+        assert_eq!(force_sight_shell_color(6, 1, 1), [1.0, 50.0 / 255.0, 50.0 / 255.0]);
+        assert_eq!(force_sight_shell_color(6, 1, 2), [75.0 / 255.0, 75.0 / 255.0, 1.0]);
+        assert_eq!(force_sight_shell_color(7, 1, 1), [50.0 / 255.0, 1.0, 50.0 / 255.0]);
+        assert_eq!(force_sight_shell_color(7, 1, 2), [1.0, 50.0 / 255.0, 50.0 / 255.0]);
+    }
 }

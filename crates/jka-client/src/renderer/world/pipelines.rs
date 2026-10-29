@@ -60,12 +60,21 @@ impl Renderer {
         }
     }
 
-    /// The asset viewer draws its model straight into the swapchain image with
-    /// no post pass, so its pipelines and MSAA target must use the surface
-    /// format even while HDR / bloom / halation are configured.
+    /// The asset viewer draws without a gameplay post pass. Its color PSOs and
+    /// MSAA resolve must match the actual preview destination: SDR swapchain
+    /// or, when native HDR is active, the Rgba16Float HDR compositor input.
+    /// Gameplay HDR/bloom settings alone must not force an FP16 SDR preview.
+    pub(in crate::renderer) fn preview_scene_format(&self) -> wgpu::TextureFormat {
+        if self.hdr_output.is_some() {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            self.config.format
+        }
+    }
+
     pub(in crate::renderer) fn scene_format(&self) -> wgpu::TextureFormat {
         if self.asset_preview_mode {
-            self.config.format
+            self.preview_scene_format()
         } else {
             self.gameplay_scene_format()
         }
@@ -395,6 +404,7 @@ impl Renderer {
         // format/MSAA; drop them and let ensure_lazy_scene_pipelines recompile
         // only the ones the current settings actually use.
         self.taa_post_pipeline = None;
+        self.thermal_taa_pipeline = None;
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
         self.rebuild_gpu_visibility_resources();
@@ -713,6 +723,16 @@ pub(in crate::renderer) fn material_uniform(
         out.header[3] |= 2;
     }
     out.header[3] |= u32::from(source.surface_material & 31) << 8;
+    // Thermal-specific classifier reads these low unused header.w bits only
+    // when the lazy thermal prepass is active. Regular shaders ignore them.
+    if source.thermal_lava { out.header[3] |= 1 << 3; }
+    // Stage-level glow/additive emission is resolved by the authored thermal
+    // capture at individual texels, not in the opaque depth prepass. Only an
+    // explicit q3map_surfacelight has whole-surface heat (level 3).
+    if source.thermal_emission == 3 { out.header[3] |= 1 << 5; }
+    if source.foliage_wind {
+        out.header[3] |= crate::foliage::MATERIAL_FLAG;
+    }
     if source.glass_primary {
         out.header[3] |= 1 << 17;
         out.ocean_color = [source.glass_tint[0], source.glass_tint[1], source.glass_tint[2], source.glass_reflectance];
@@ -2034,6 +2054,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    thermal: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA AO depth prepass pipeline"),
@@ -2063,7 +2084,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(if thermal { "fs_thermal" } else { "fs_main" }),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {
@@ -2195,6 +2216,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    thermal: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA alpha-tested depth prepass pipeline"),
@@ -2224,7 +2246,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_mask"),
+            entry_point: Some(if thermal { "fs_thermal_mask" } else { "fs_mask" }),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {

@@ -1,7 +1,31 @@
 //! Cache.
 use crate::scene::{
-    active_game_directory, DrawBatch, GpuVertex, Path, PathBuf, Pod, STATIC_BSP_AO_CACHE_VERSION,
+    active_game_directory, Arc, DrawBatch, GpuVertex, Path, PathBuf, Pod, STATIC_BSP_AO_CACHE_VERSION,
 };
+
+impl super::PreparedMap {
+    pub(crate) fn intern_images(&mut self) {
+        for images in [&mut self.textures, &mut self.lightmaps, &mut self.deluxemaps] {
+            for image in Arc::make_mut(images) { image.intern_pixels(); }
+        }
+    }
+    /// Intern identical decoded images across independent demos. Lighting and
+    /// remap edits still detach through Arc::make_mut.
+    pub(crate) fn share_immutable_images_from(&mut self, previous: &Self) {
+        self.intern_images();
+        fn share(images: &mut Arc<Vec<super::TextureData>>, old: &Arc<Vec<super::TextureData>>) {
+            if Arc::ptr_eq(images, old) { return; }
+            if images.len() == old.len() && images.iter().zip(old.iter()).all(|(a, b)|
+                a.label == b.label && a.source == b.source && a.width == b.width && a.height == b.height
+                && a.mip_level_count == b.mip_level_count && a.clamp == b.clamp && a.srgb == b.srgb
+                && a.rgba == b.rgba && a.rgba16f == b.rgba16f)
+            { *images = Arc::clone(old); }
+        }
+        share(&mut self.textures, &previous.textures);
+        share(&mut self.lightmaps, &previous.lightmaps);
+        share(&mut self.deluxemaps, &previous.deluxemaps);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StaticBspAoCacheInfo {
@@ -157,7 +181,7 @@ pub(in crate::scene) fn static_bsp_ao_cache_info(
 ) -> StaticBspAoCacheInfo {
     StaticBspAoCacheInfo {
         directory: active_game_directory(root, game)
-            .join("jka-rust-cache")
+            .join("cache")
             .join("static-bsp-ao"),
         map_name: name.to_string(),
         map_hash,

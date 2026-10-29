@@ -26,8 +26,10 @@
 //! * Dropped snapshots are the gaps in `message_num` between snapshots read for a live
 //!   server. `trap->GetSnapshot` fails for exactly those numbers in the C, so the
 //!   samples are the same.
-//! * `REAL_CMD_BACKUP` follows `cl_commandsize` (jaPRO's cgame default is 64): the
-//!   warning looks at the command that many back. The usercmd ring itself is 512 deep.
+//! * TaystJK uses `cl_commandsize` to bound usercmd history for prediction,
+//!   packet encoding, and the disconnect warning. AUTO additionally chooses a
+//!   power-of-two window using cl_commandRate and ping. The physical ring stays
+//!   512 deep to keep slot indices stable when AUTO changes at runtime.
 
 pub const LAG_SAMPLES: usize = 256;
 /// `MAX_LAGOMETER_PING` / `MAX_LAGOMETER_RANGE`.
@@ -55,28 +57,55 @@ pub struct Settings {
     pub mode: i32,
     pub x: i32,
     pub y: i32,
-    /// `cl_commandsize` (jaPRO's cgame mirror of it, default 64).
+    /// `cl_commandsize`: 0 = AUTO; otherwise the power-of-two logical usercmd
+    /// history window used by prediction, packet selection and disconnect checks.
     pub command_size: i32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: 0, x: 48, y: 144, command_size: DEFAULT_COMMAND_SIZE }
+        Self { mode: 0, x: 48, y: 144, command_size: AUTO_COMMAND_SIZE }
     }
 }
 
-/// `cl_commandsize`'s default in jaPRO's `cg_xcvar.h`.
+/// TaystJK/jaPRO's manual `cl_commandsize` default (still usable explicitly).
 pub const DEFAULT_COMMAND_SIZE: i32 = 64;
+/// Our config-only AUTO selection; TaystJK does not provide an AUTO mode.
+pub const AUTO_COMMAND_SIZE: i32 = 0;
 
 impl Settings {
-    /// `REAL_CMD_BACKUP` in `CG_DrawDisconnect`: `cl_commandsize` when it is 4..=512,
-    /// else the full `CMD_BACKUP`.
-    pub fn real_command_backup(&self) -> i32 {
-        if (4..=COMMAND_BACKUP).contains(&self.command_size) {
-            self.command_size
+    pub fn command_size_cvar(&self) -> String {
+        if self.command_size == AUTO_COMMAND_SIZE {
+            "auto".to_owned()
         } else {
-            COMMAND_BACKUP
+            self.command_size.to_string()
         }
+    }
+
+    /// Convert arbitrary manual input into a safe TaystJK-style index mask
+    /// size. TaystJK does not validate powers of two, which can alias commands.
+    /// Round UP so an explicit history request is never silently shortened.
+    pub fn normalize_command_size(value: i64) -> i32 {
+        (value.clamp(i64::from(DEFAULT_COMMAND_SIZE), i64::from(COMMAND_BACKUP)) as u32)
+            .next_power_of_two() as i32
+    }
+
+    pub fn real_command_backup(&self) -> i32 {
+        Self::normalize_command_size(i64::from(self.command_size))
+    }
+
+    /// AUTO is a DinurdoJK extension. Preserve at least 64 commands and
+    /// ~512 ms of history at typical ping, then account for RTT + jitter.
+    /// Snap upward to the powers of two needed for TaystJK's ring semantics.
+    pub fn effective_command_backup(&self, command_rate: u32, ping_ms: Option<i32>) -> i32 {
+        if self.command_size != AUTO_COMMAND_SIZE {
+            return self.real_command_backup();
+        }
+        let ping = ping_ms.filter(|ping| (1..999).contains(ping)).unwrap_or(0) as i64;
+        let window_ms = 512_i64.max(2 * ping + 150);
+        let rate = i64::from(command_rate.clamp(15, 1000));
+        let required = (rate * window_ms + 999) / 1000;
+        Self::normalize_command_size(required)
     }
 }
 
@@ -804,17 +833,45 @@ mod tests {
     }
 
     #[test]
+    fn auto_command_size_scales_with_command_rate_and_ping() {
+        let settings = Settings::default();
+        assert_eq!(settings.command_size_cvar(), "auto");
+        assert_eq!(settings.effective_command_backup(125, Some(40)), 64);
+        assert_eq!(settings.effective_command_backup(250, Some(40)), 128);
+        assert_eq!(settings.effective_command_backup(500, Some(40)), 256);
+        assert_eq!(settings.effective_command_backup(1000, Some(40)), 512);
+        assert_eq!(settings.effective_command_backup(125, Some(300)), 128);
+        assert_eq!(settings.effective_command_backup(15, None), 64);
+        assert_eq!(settings.effective_command_backup(125, Some(200)), 128);
+        assert_eq!(settings.effective_command_backup(125, Some(0)), 64);
+        assert_eq!(settings.effective_command_backup(1000, Some(300)), 512);
+        assert_eq!(settings.effective_command_backup(125, None), 64);
+
+        let manual = Settings { command_size: 64, ..settings };
+        assert_eq!(manual.effective_command_backup(1000, Some(300)), 64);
+        assert_eq!(manual.command_size_cvar(), "64");
+    }
+
+    #[test]
     fn command_size_picks_the_command_the_warning_checks() {
         let mut settings = Settings::default();
         assert_eq!(settings.real_command_backup(), 64);
-        settings.command_size = 3; // below 4: falls back to CMD_BACKUP
-        assert_eq!(settings.real_command_backup(), COMMAND_BACKUP);
+        settings.command_size = 64;
+        assert_eq!(settings.real_command_backup(), 64);
+        settings.command_size = 3; // invalid sizes round to minimum 64
+        assert_eq!(settings.real_command_backup(), 64);
         settings.command_size = 513;
         assert_eq!(settings.real_command_backup(), COMMAND_BACKUP);
         settings.command_size = 512;
         assert_eq!(settings.real_command_backup(), 512);
         settings.command_size = 4;
-        assert_eq!(settings.real_command_backup(), 4);
+        assert_eq!(settings.real_command_backup(), 64);
+        settings.command_size = 65;
+        assert_eq!(settings.real_command_backup(), 128);
+        settings.command_size = 250;
+        assert_eq!(settings.real_command_backup(), 256);
+        settings.command_size = 300;
+        assert_eq!(settings.real_command_backup(), 512);
     }
 
     #[test]

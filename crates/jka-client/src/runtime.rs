@@ -5,6 +5,21 @@ use crate::{
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
+#[derive(Clone, Debug, Default)]
+pub struct LoadProgressState {
+    pub label: String,
+    pub completed: u64,
+    pub total: u64,
+}
+#[derive(Default)]
+pub struct LoadProgress(std::sync::Mutex<LoadProgressState>);
+impl LoadProgress {
+    pub fn set(&self, label: impl Into<String>, completed: u64, total: u64) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = LoadProgressState { label: label.into(), completed, total };
+    }
+    pub fn snapshot(&self) -> LoadProgressState { self.0.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderStats {
     pub fps: f64,
@@ -87,6 +102,8 @@ pub struct SurfaceInspectorInfo {
 
 #[derive(Debug, Clone, Default)]
 pub struct WorldUploadTimings {
+    /// A Render Studio world swap reused resident geometry and textures.
+    pub studio_world_reused: bool,
     /// A remap requested new geometry and required the compatibility full-world path.
     pub remap_full_fallback: bool,
     pub vertex_buffer_ms: f64,
@@ -157,7 +174,54 @@ pub enum ScreenshotOutput {
         height: u32,
         bgra: Vec<u8>,
         depth_f32le: Option<Vec<u8>>,
+        timing: VideoFrameTiming,
     },
+}
+
+/// Recycled byte buffers for video-frame readbacks (Render Studio export).
+/// The FFmpeg writer hands each frame back after its pipe write, so the next
+/// readback copies into resident pages instead of faulting in a fresh one.
+static VIDEO_FRAME_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// An empty buffer with at least `len` bytes of capacity, recycled if possible.
+pub fn take_video_frame_buffer(len: usize) -> Vec<u8> {
+    let mut pool = VIDEO_FRAME_POOL.lock().unwrap_or_else(|error| error.into_inner());
+    match pool.iter().position(|buffer| buffer.capacity() >= len) {
+        Some(index) => {
+            let mut buffer = pool.swap_remove(index);
+            buffer.clear();
+            buffer
+        }
+        None => Vec::with_capacity(len),
+    }
+}
+
+pub fn recycle_video_frame_buffer(buffer: Vec<u8>) {
+    let mut pool = VIDEO_FRAME_POOL.lock().unwrap_or_else(|error| error.into_inner());
+    if pool.len() < 8 { pool.push(buffer); }
+}
+
+/// Release pooled frame memory once an export ends.
+pub fn clear_video_frame_pool() {
+    VIDEO_FRAME_POOL.lock().unwrap_or_else(|error| error.into_inner()).clear();
+}
+
+/// Renderer-side milestones of one video-frame capture, for export profiling.
+/// Consecutive instants; `gpu_wait_ms`/`readback_copy_ms` split presented..queued.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoFrameTiming {
+    /// CaptureVideoFrame was handled by the render thread.
+    pub received: Instant,
+    /// The capturing render frame prepared its readback (after surface acquire).
+    pub frame_started: Instant,
+    /// That frame was recorded, submitted and presented; readback mapping begins.
+    pub presented: Instant,
+    pub gpu_wait_ms: f64,
+    pub readback_copy_ms: f64,
+    /// Mapped pixels were handed to the encode worker.
+    pub queued: Instant,
+    pub worker_started: Instant,
+    pub worker_done: Instant,
 }
 
 pub enum UserEvent {
@@ -170,6 +234,11 @@ pub enum UserEvent {
     GammaPrepared(u64),
     HardwareGamma(crate::display_gamma::Status),
     ScreenshotFinished(Result<ScreenshotOutput, String>),
+    /// `vram` is process dedicated-VRAM (usage, OS budget) after the scene
+    /// settled; `scenes` counts the retained Studio scenes at that point.
+    StudioSourceReady { id: u64, error: Option<String>, vram: Option<(u64, u64)>, scenes: usize },
+    #[cfg(test)]
+    StudioTestScenePresented { overlap: bool },
     HdrOutputChanged { status: String, active: bool, available_modes: u8 },
     RendererReady {
         supported_msaa: Vec<u32>,

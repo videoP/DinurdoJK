@@ -9,7 +9,7 @@ impl App {
         overlay_busy: bool,
         locked: bool,
     ) {
-        let pressed_here = ui.ctx().input(|i| {
+        let pressed_here = response.contains_pointer() && ui.ctx().input(|i| {
             i.pointer.any_pressed()
                 && i.pointer
                     .interact_pos()
@@ -22,6 +22,8 @@ impl App {
         let can_navigate = !locked
             && self.studio_navigation_available()
             && self.render_studio.navigation.selected
+            && !self.render_studio.background_popup_open
+            && !egui::Popup::is_any_open(ui.ctx())
             && !ui.ctx().text_edit_focused();
         if !can_navigate || !ui.ctx().input(|i| i.pointer.secondary_down()) {
             self.set_studio_mouse_look(false);
@@ -59,8 +61,26 @@ impl App {
             0.0
         };
         self.render_studio.navigation.change_speed(scroll);
+        // Keys first pressed inside a Ctrl/Alt chord (Ctrl+A select all,
+        // Ctrl+D ...) never move the camera, even if the modifier is released
+        // before the letter: that used to throw the view into Scene mode.
+        let chord_id = egui::Id::new("studio_navigation_chorded_keys");
+        // Context accessors share a lock: read stored keys before taking the
+        // input lock, otherwise selecting the preview deadlocks the UI thread.
+        let mut chorded: Vec<egui::Key> = ui.ctx().data(|d| d.get_temp(chord_id)).unwrap_or_default();
+        let chorded = ui.ctx().input(|i| {
+            let keys = &mut chorded;
+            keys.retain(|k| i.key_down(*k));
+            if i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt {
+                for k in [egui::Key::W, egui::Key::A, egui::Key::S, egui::Key::D, egui::Key::E, egui::Key::C] {
+                    if i.key_down(k) && !keys.contains(&k) { keys.push(k); }
+                }
+            }
+            keys.clone()
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(chord_id, chorded.clone()));
         let (movement, dt) = ui.ctx().input(|i| {
-            let key = |k| if i.key_down(k) { 1.0 } else { 0.0 };
+            let key = |k| if i.key_down(k) && !chorded.contains(&k) { 1.0 } else { 0.0 };
             let movement = if i.modifiers.ctrl || i.modifiers.command || i.modifiers.alt {
                 glam::Vec3::ZERO
             } else {
@@ -72,7 +92,16 @@ impl App {
             };
             (movement, i.stable_dt)
         });
-        let mut camera = key_from_camera(self.asset_preview_camera());
+        // Entering Scene view from demo footage starts at the camera the demo
+        // sampler actually rendered, not the stage key (which sits near the
+        // map origin, often under the floor).
+        let demo_shot = self.render_studio.spatial.scene_camera.is_none()
+            && self.render_studio.cinematic_preview.is_none()
+            && self.render_studio.timeline.demo_at(self.render_studio.timeline_time()).is_some();
+        let base = if demo_shot {
+            self.render_studio.scene_frame.as_ref().map(|frame| frame.outgoing.shot_camera)
+        } else { None };
+        let mut camera = key_from_camera(base.unwrap_or_else(|| self.asset_preview_camera()));
         let scale = [
             self.mouse_input.sensitivity * self.mouse_input.yaw,
             self.mouse_input.sensitivity * self.mouse_input.pitch,

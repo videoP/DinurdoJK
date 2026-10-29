@@ -11,13 +11,13 @@ use crate::cgame::player_presenter::{
     smooth_ghoul2_pose, smooth_head_look_yaw, source_dismember_surface_set, suppressed_during_intermission,
     transform_jka_model_point, update_weapon_attachment, viewer_style_from, weapon_world_model,
     swim_tilt, move_lean::MoveLeanState, Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
-    DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator,
+    DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator, CloakState, CloakVisual,
     Ghoul2PresentationView, HashMap, HashSet, Instant, ModelResolution, PlayerAngleState,
     PlayerAnimationState, PlayerPresenter, PresentedEntity, MindTrickFade, RagdollMode, SaberBladeLengthKey,
     SaberBladeLengthState, ViewerAnimDebug, BONE_ANGLES_POSTMULT, DEFAULT_SABER_BLADE_LENGTH_MAX,
     EF2_SHIP_DEATH, EF_DEAD, EF_JETPACK, EF_NODRAW, EF_RAG, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE,
     entity_is_mind_tricked,
-    MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER,
+    MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER, FP_SEE, PW_CLOAKED,
 };
 
 /// TaystJK `CG_Player` (`cg_players.c`): `EF_NODRAW` and
@@ -47,6 +47,29 @@ pub(super) fn local_body_for_entity(
 }
 
 impl PlayerPresenter {
+    /// TaystJK CG_Player: PW_CLOAKED drives a per-centity 2000ms transition.
+    /// Update this even for the first-person body (which isn't rasterized).
+    fn cloak_visual(&mut self, entity: &PresentedEntity, current_time: i32) -> CloakVisual {
+        if entity.entity_type != ET_PLAYER && entity.entity_type != ET_NPC {
+            return CloakVisual::Normal;
+        }
+        let cloaked = entity.state.field_i32("powerups").unwrap_or(0)
+            & (1 << PW_CLOAKED) != 0;
+        let previous = self.cloak_states.get(&entity.number).copied();
+        let (state, visual) = if (2..=5).contains(&self.japro.render_to_texture_fx) {
+            CloakState::advance_predator(previous, cloaked, current_time)
+        } else {
+            CloakState::advance(previous, cloaked, current_time)
+        };
+        self.cloak_states.insert(entity.number, state);
+        // CG_Player: FP_SEE reveals OTHER players, not the viewer's own cloak.
+        if self.viewer_force_see && i32::from(entity.number) != self.viewer_client {
+            CloakVisual::Normal
+        } else {
+            visual
+        }
+    }
+
     pub fn present_snapshot_players(
         &mut self,
         entities: &[PresentedEntity],
@@ -59,6 +82,8 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        self.studio_bones.clear();
+        self.studio_saber_tips.clear();
         crate::emotes::network::set_render_time(current_time);
         self.japro_cinfo2 = game.japro_cinfo2();
         self.cold_breath_effects = game.cold_breath_effects();
@@ -71,10 +96,22 @@ impl PlayerPresenter {
         };
         self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
+        // TaystJK CG_Player reads the viewing player's authoritative snapshot.
+        // Never use the target's forcePowersActive to decide whether we see it.
+        self.force_sight_level = 0;
+        self.force_sight_team = 0;
+        self.force_sight_gametype = game.gametype();
         let japlus_cinfo = game.japlus_cinfo();
         let mut viewer_alt_dim_eflags = 0;
+        self.viewer_force_see = false;
         if let Some(snapshot) = game.current_snapshot() {
             viewer_alt_dim_eflags = snapshot.player_state.field_i32("eFlags").unwrap_or(0);
+            let ps = &snapshot.player_state;
+            if ps.field_i32("fd.forcePowersActive").unwrap_or(0) & (1 << FP_SEE) != 0 {
+                self.force_sight_level = ps.field_i32("fd.forcePowerLevel[FP_SEE]")
+                    .unwrap_or(1).clamp(1, 3);
+            }
+            self.force_sight_team = ps.persistant[3]; // PERS_TEAM
             let viewer_client = snapshot.player_state.field_i32("clientNum").unwrap_or(-1);
             if viewer_client != self.viewer_client {
                 self.viewer_foot_bolts = None;
@@ -86,6 +123,9 @@ impl PlayerPresenter {
                 .field_i32("duelInProgress")
                 .unwrap_or(0)
                 != 0;
+            self.viewer_force_see = snapshot.player_state
+                .field_i32("fd.forcePowersActive")
+                .unwrap_or(0) & (1 << 13) != 0; // TaystJK FP_SEE
             self.viewer_style = viewer_style_from(
                 &snapshot.player_state,
                 game.is_japro(),
@@ -369,11 +409,16 @@ impl PlayerPresenter {
             };
 
             let look_target_origin = openjk_look_target_origin(entity, &entity_origins);
+            let hidden = hidden_first_person_entity == Some(entity.number);
+            // cg_fpls for a Studio first-person view of this player: keep the
+            // Ghoul2 instance and its saber, turn the body surfaces off.
+            let weapon = entity.state.field_i32("weapon").unwrap_or(0);
+            let fpls = hidden && self.studio_fpls && matches!(weapon, 2 | 3);
             self.queue_player_sprites(
                 entity,
                 game,
                 current_time,
-                hidden_first_person_entity != Some(entity.number),
+                !hidden,
             );
             match self.present_player(
                 entity,
@@ -383,8 +428,8 @@ impl PlayerPresenter {
                 body_alpha,
                 look_target_origin,
                 false,
-                hidden_first_person_entity != Some(entity.number),
-                false,
+                !hidden || fpls,
+                fpls,
                 view,
                 false, // Snapshot entityState does not contain authoritative pm_type.
             ) {
@@ -466,6 +511,10 @@ impl PlayerPresenter {
         self.player_diagnostics
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.mind_trick_fades
+            .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.cloak_states
+            .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.force_refractions
             .retain(|entity_num, _| live_entities.contains(entity_num));
         if !self.logged_first_draw && !draws.is_empty() {
             devprintln!(
@@ -595,6 +644,8 @@ impl PlayerPresenter {
         entity_alpha: f32,
         force_reset: bool,
         view: Option<Ghoul2PresentationView>,
+        studio_sabers: bool,
+        studio_audio: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let previous_look = self.look;
         self.look = crate::japro_cg::Appearance::NORMAL;
@@ -602,7 +653,7 @@ impl PlayerPresenter {
         let fx_request_count = self.fx_requests.len();
         let footstep_stages = self.footstep_stages;
         self.footstep_stages = FootstepStages {
-            sounds: false,
+            sounds: studio_audio,
             effects: false,
             marks: false,
         };
@@ -624,8 +675,11 @@ impl PlayerPresenter {
         // footstep ground traces, and let no animation/force FX escape to the
         // shared event/audio/WeaponFx queues. Cosmetic model draws are retained.
         self.footstep_stages = footstep_stages;
-        self.footsteps.truncate(footstep_count);
-        self.fx_requests.truncate(fx_request_count);
+        if !studio_audio { self.footsteps.truncate(footstep_count); }
+        let ghost_fx=self.fx_requests.split_off(fx_request_count);
+        if studio_sabers {
+            self.fx_requests.extend(ghost_fx.into_iter().filter(|fx|matches!(fx,crate::cgame::player_presenter::PlayerFxRequest::SaberBlade{..})));
+        }
         let mut draws = result?;
         for draw in &mut draws {
             draw.rt_rigid = None;
@@ -946,7 +1000,7 @@ impl PlayerPresenter {
                 for blade in 0..MAX_SABER_BLADES {
                     self.saber_blade_lengths.insert(
                         SaberBladeLengthKey {
-                            client_num: info.client_num,
+                            client_num: if entity.number >= 60000 { usize::from(entity.number) } else { info.client_num },
                             saber_num: slot as u8,
                             blade_num: blade as u8,
                         },
@@ -1376,7 +1430,7 @@ impl PlayerPresenter {
                     let radius = ghoul2_entity_radius(entity) * ghoul2_model_scale(entity);
                     if view.sphere_outside(cull_origin, radius) {
                         self.perf.frustum_culled = self.perf.frustum_culled.saturating_add(1);
-                        if !self.rt_shadow_casters_enabled {
+                        if !self.rt_shadow_casters_enabled && !self.studio_bone_masks.contains_key(&entity.number) {
                             // Out of view is not out of earshot: the pose is not built,
                             // so the feet are taken to be under the entity.
                             if let (false, Some(world)) =
@@ -1535,12 +1589,12 @@ impl PlayerPresenter {
             runtime.bone_smooth_history = None;
         }
 
-        // Source 1 native procedural bones are appended to the skin palette,
+        // Authored Source and promoted hair springs append extra skin-palette bones,
         // *after* animation, ragdoll and jaPRO smoothing. The original GLA
         // pose and attachments stay untouched; only weighted Source jiggle
-        // vertices receive secondary motion. Simulate in world space so
+        // and hair vertices receive secondary motion. Simulate in world space so
         // footsteps and character turns transfer inertia naturally.
-        if model.source_jiggles_enabled {
+        if model.procedural_jiggles_enabled(self.hair_physics_mode) {
             if let Some(bindings) = model.source_jiggles.as_deref() {
                 runtime.source_jiggle_sim.get_or_insert_with(Default::default).update(
                     bindings,
@@ -1555,6 +1609,23 @@ impl PlayerPresenter {
             runtime.source_jiggle_sim = None;
         }
 
+        // Capture anchors from the exact pose used to render this player,
+        // after animation, bone smoothing and procedural deformations. The
+        // result is in renderer Y-up space and matches skinning/attachments.
+        if entity.entity_type == ET_PLAYER {
+            if let Some(&mask)=self.studio_bone_masks.get(&entity.number) {
+                let scale=ghoul2_model_scale(entity);
+                let points=std::array::from_fn(|i| {
+                    if mask&(1<<i)==0 {return None;}
+                    model_bolt_matrix_timed(&mut self.perf,&model.glm,&model.gla,&pose,
+                        super::studio_camera::DEMO_BONE_NAMES[i]).ok().flatten().map(|m| {
+                            crate::scene::render_position(transform_jka_model_point(
+                                [m[0][3]*scale,m[1][3]*scale,m[2][3]*scale],render_axis,render_origin))
+                        })
+                });
+                self.studio_bones.insert(entity.number,points);
+            }
+        }
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
             self.viewer_foot_bolts =
                 foot_bolts_timed(&mut self.perf, &model, &pose, ghoul2_model_scale(entity));
@@ -1660,6 +1731,7 @@ impl PlayerPresenter {
             submit_geometry,
         )?;
 
+        let cloak = self.cloak_visual(entity, current_time);
         if !submit_geometry && !self.rt_shadow_casters_enabled {
             // OpenJK still runs CG_Player for the local player in first person
             // and marks the refEntity RF_THIRD_PERSON.  Keep all animation and
@@ -1776,105 +1848,6 @@ impl PlayerPresenter {
             }
         }
 
-        self.report_player_status(
-            entity.number,
-            format!(
-                "clientNum={} requested={}/{} resolved={} bodySurfaces={} submitted={}",
-                info.client_num,
-                info.model_name,
-                info.skin_name,
-                model.key,
-                draws.len(),
-                usize::from(!draws.is_empty()),
-            ),
-        );
-        if self.gore_limit > 0 {
-            let snaps = draws
-                .iter()
-                .filter_map(|surface| {
-                    surface
-                        .ghoul2_gpu
-                        .as_ref()
-                        .map(|skin| crate::cgame::player_gore::GpuSnap {
-                            mesh_key: Arc::clone(&skin.mesh_key),
-                            vertices: Arc::clone(&skin.vertices),
-                            indices: Arc::clone(&skin.indices),
-                            bones: Arc::clone(&skin.bones),
-                            jiggle_offsets: skin.jiggle_offsets,
-                            axis: skin.axis,
-                            origin: skin.origin,
-                        })
-                })
-                .collect();
-            self.last_gpu.insert(entity.number, snaps);
-            self.append_gore(entity.number, current_time, &mut draws);
-        }
-        let shells = self.force_shells(entity, current_time);
-        if !shells.is_empty() {
-            let body = draws.clone();
-            let seconds = self.stage_time_ms as f32 * 0.001;
-            for (shader, rgba, force_alpha_blend) in shells {
-                let (texture, mut alpha_mode, authored_glow) = self.custom_shader_material(shader);
-                if force_alpha_blend {
-                    // RF_FORCE_ENT_ALPHA: the team-power shell draws with
-                    // standard alpha blending regardless of its own shader's
-                    // (additive) blendFunc.
-                    alpha_mode = DynamicModelAlphaMode::BlendUnlit;
-                }
-                let uv_xform = self.custom_shader_uv_xform(shader, seconds);
-                let bulge_height = self.custom_shader_bulge_height(shader, seconds);
-                let env_map = self.custom_shader_env_map(shader);
-                let overlays =
-                    self.custom_shader_overlay_stages(shader, seconds, force_alpha_blend);
-                for surface in &body {
-                    let mut shell = Self::clone_surface_with_material_xform(
-                        surface,
-                        texture.clone(),
-                        alpha_mode,
-                        rgba,
-                        Some(uv_xform),
-                        Some(bulge_height),
-                        Some(env_map),
-                    );
-                    // rgbGen identity/const customShader shells are flat-colored,
-                    // scene-light-independent overlays (RF_RGB_TINT forces the
-                    // color outright) and never their own shadow casters.
-                    shell.lighting_origin = None;
-                    shell.authored_glow = authored_glow;
-                    shell.rt_rigid = None;
-                    shell.rt_skinned_key = None;
-                    draws.push(shell);
-                    for (overlay_texture, overlay_mode, overlay_uv, overlay_glow) in &overlays {
-                        let mut overlay = Self::clone_surface_with_material_xform(
-                            surface,
-                            overlay_texture.clone(),
-                            *overlay_mode,
-                            rgba,
-                            Some(*overlay_uv),
-                            Some(bulge_height),
-                            Some(env_map),
-                        );
-                        overlay.lighting_origin = None;
-                        overlay.authored_glow = *overlay_glow;
-                        overlay.rt_rigid = None;
-                        overlay.rt_skinned_key = None;
-                        draws.push(overlay);
-                    }
-                }
-            }
-        }
-        if submit_geometry {
-            self.queue_cosmetics(
-                entity,
-                info,
-                &model,
-                &pose,
-                render_axis,
-                render_origin,
-                look.ghost,
-                entity_alpha,
-            );
-        }
         if attached_sabers[0] || attached_sabers[1] {
             if let Err(error) = self.append_player_sabers(
                 &mut draws,
@@ -1909,6 +1882,250 @@ impl PlayerPresenter {
                     &format!("held weapon {weapon}: {error}"),
                 );
             }
+        }
+
+        // The cloak replaces CG_Player's normal body refEntity submission. It
+        // must not be another pass on top of an opaque body: that would occlude
+        // the refractive silhouette and leak a fully visible player.
+        let cloak = match cloak {
+            CloakVisual::Cloaked if self.japro.render_to_texture_fx == 0 =>
+                CloakVisual::Transition { shell: 1.0, skin: 0.0 },
+            other => other,
+        };
+        match cloak {
+            CloakVisual::Normal => {}
+            CloakVisual::Transition { shell, skin } => {
+                let original = std::mem::take(&mut draws);
+                draws.extend(self.cloak_shells(&original, shell, render_axis, render_origin));
+                for mut base in original {
+                    if skin <= 0.0 { continue; }
+                    // Both CPU and GPU skinning honor the RF_FORCE_ENT_ALPHA
+                    // fade. Make no opaque depth prepass and cast no RT shadow.
+                    if let Some(ref mut gpu) = base.ghoul2_gpu {
+                        gpu.color[3] *= skin;
+                    } else {
+                        base.vertices = Arc::new(base.vertices.iter().map(|v| {
+                            let mut v = *v;
+                            v.color[3] *= skin;
+                            v
+                        }).collect());
+                    }
+                    base.alpha_mode = match base.alpha_mode {
+                        DynamicModelAlphaMode::Mask => DynamicModelAlphaMode::MaskBlend,
+                        _ => DynamicModelAlphaMode::Blend,
+                    };
+                    base.rt_rigid = None;
+                    base.rt_skinned_key = None;
+                    draws.push(base);
+                }
+            }
+            CloakVisual::Predator { progress } => {
+                // Source: PredatorMaterial.js buildGridMask() projection indices.
+                // Expose *only* the four projection modes authored upstream.
+                // 2 = UV (0), 3 = local (1), 4 = world (2), 5 = view (3).
+                let source_projection = f32::from(self.japro.render_to_texture_fx.saturating_sub(2).min(3));
+                // The source uses one MeshPhysicalNodeMaterial per original mesh,
+                // retaining the original diffuse/normal maps. Keep the JKA
+                // surface texture attached, and transmit the reference's
+                // progress independently of the original base material alpha.
+                for surface in &mut draws {
+                    // Predator.js applies 40x40 head, 60x65 body and 20x20
+                    // helmet grids to its three GLTF meshes. For JKA surface
+                    // naming, default to the original body's dimensions;
+                    // named Ghoul2 head and helmet meshes use the originals.
+                    let name = surface.ghoul2_gpu.as_ref().map(|gpu| gpu.mesh_key.as_ref())
+                        .or(surface.material_trace.as_deref()).unwrap_or("");
+                    let name = name.to_ascii_lowercase();
+                    let grid = if name.contains("helmet") || name.contains("casco") {
+                        [20.0, 20.0]
+                    } else if name.contains("head") || name.contains("cabeza") {
+                        [40.0, 40.0]
+                    } else { [60.0, 65.0] };
+                    surface.alpha_mode = DynamicModelAlphaMode::Glass;
+                    if let Some(ref mut gpu) = surface.ghoul2_gpu {
+                        gpu.color = [1.0, 1.0, source_projection, -3.0 - progress];
+                        gpu.uv_cross = [grid[0], grid[1], 0.0, 0.0];
+                        gpu.uv_xform = [1.0, 1.0, 0.0, 0.0];
+                        gpu.specular = None;
+                        gpu.env_map = false;
+                    } else {
+                        // CPU Ghoul2 has already baked the model-to-world
+                        // transform into vertex.position. Recover the animated
+                        // *model-space* position for TSL's positionLocal node.
+                        // This uses the exact inverse of transform_jka_model_point
+                        // (the entity axes are orthogonal, including uniform
+                        // model scale), not camera-relative coordinates.
+                        // These three vertex channels are otherwise unused by
+                        // this Glass pass; no vertex format/stride changes.
+                        surface.vertices = Arc::new(surface.vertices.iter().map(|vertex| {
+                            let mut v = *vertex;
+                            let jka_world = [v.position[0], -v.position[2], v.position[1]];
+                            let relative: [f32; 3] = std::array::from_fn(|i| jka_world[i] - render_origin[i]);
+                            let local_jka: [f32; 3] = std::array::from_fn(|i| {
+                                let axis = render_axis[i];
+                                let dot: f32 = (0..3).map(|j| relative[j] * axis[j]).sum();
+                                let norm: f32 = axis.iter().map(|component| component * component).sum();
+                                dot / norm.max(1.0e-10)
+                            });
+                            // jka_to_render([x,y,z]) = [x,z,-y]. The vertex
+                            // shader forwards this as the actual local varying.
+                            v.depth_hack = local_jka[0];
+                            v.water_wetness = local_jka[2];
+                            v.foliage_wind = -local_jka[1];
+                            v.color = [grid[0], grid[1], source_projection, -3.0 - progress];
+                            v
+                        }).collect());
+                    }
+                    surface.lighting_origin = None;
+                    surface.authored_lighting = false;
+                    surface.authored_glow = false;
+                    surface.rt_rigid = None;
+                    surface.rt_skinned_key = None;
+                }
+            }
+            CloakVisual::Cloaked => {
+                // TaystJK prefers the renderer's refractive path over the old
+                // shader. Reuse our existing Ghoul2 scene-transmission pass.
+                // This is the geometry-only refractive silhouette, not the
+                // regular skin behind an alpha-blended cloak shader.
+                for surface in &mut draws {
+                    surface.alpha_mode = DynamicModelAlphaMode::Glass;
+                    surface.texture = None; // neutral optical tint, no skin leak
+                    // The negative alpha is a private marker for fs_glass:
+                    // cloak refraction has its own optics, independent of
+                    // user-selected glass style, blur and tint settings.
+                    if let Some(ref mut gpu) = surface.ghoul2_gpu {
+                        gpu.color = [1.0, 1.0, 1.0, -1.0];
+                        gpu.source_material = None;
+                        gpu.specular = None;
+                    } else {
+                        surface.vertices = Arc::new(surface.vertices.iter().map(|v| {
+                            let mut v = *v;
+                            v.color = [1.0, 1.0, 1.0, -1.0];
+                            v
+                        }).collect());
+                    }
+                    surface.lighting_origin = None;
+                    surface.authored_lighting = false;
+                    surface.authored_glow = false;
+                    surface.rt_rigid = None;
+                    surface.rt_skinned_key = None;
+                }
+            }
+        }
+
+        self.report_player_status(
+            entity.number,
+            format!(
+                "clientNum={} requested={}/{} resolved={} bodySurfaces={} submitted={}",
+                info.client_num,
+                info.model_name,
+                info.skin_name,
+                model.key,
+                draws.len(),
+                usize::from(!draws.is_empty()),
+            ),
+        );
+        if self.gore_limit > 0 {
+            let snaps = draws
+                .iter()
+                .filter_map(|surface| {
+                    surface
+                        .ghoul2_gpu
+                        .as_ref()
+                        .map(|skin| crate::cgame::player_gore::GpuSnap {
+                            mesh_key: Arc::clone(&skin.mesh_key),
+                            vertices: Arc::clone(&skin.vertices),
+                            indices: Arc::clone(&skin.indices),
+                            bones: Arc::clone(&skin.bones),
+                            jiggle_offsets: skin.jiggle_offsets,
+                            axis: skin.axis,
+                            origin: skin.origin,
+                        })
+                })
+                .collect();
+            self.last_gpu.insert(entity.number, snaps);
+            self.append_gore(entity.number, current_time, &mut draws);
+        }
+        let shells = self.force_shells(entity, info.team, current_time);
+        if !shells.is_empty() {
+            let body = draws.clone();
+            let seconds = self.stage_time_ms as f32 * 0.001;
+            for (shader, rgba, force_alpha_blend, sight_through_walls) in shells {
+                let (texture, mut alpha_mode, authored_glow) = self.custom_shader_material(shader);
+                // TaystJK RF_NODEPTH on the sight shell at Force Seeing 2+.
+                // This is additive and depth-read-only; it cannot modify the scene Z.
+                if sight_through_walls {
+                    alpha_mode = DynamicModelAlphaMode::SightShellNoDepth;
+                }
+                if force_alpha_blend {
+                    // RF_FORCE_ENT_ALPHA: the team-power shell draws with
+                    // standard alpha blending regardless of its own shader's
+                    // (additive) blendFunc.
+                    alpha_mode = DynamicModelAlphaMode::BlendUnlit;
+                }
+                let uv_xform = self.custom_shader_uv_xform(shader, seconds);
+                let bulge_height = self.custom_shader_bulge_height(shader, seconds);
+                let env_map = self.custom_shader_env_map(shader);
+                let overlays =
+                    self.custom_shader_overlay_stages(shader, seconds, force_alpha_blend);
+                let mut seen = HashSet::new();
+                for surface in &body {
+                    let key = surface.ghoul2_gpu.as_ref().map_or(
+                        ("", Arc::as_ptr(&surface.indices) as usize), |gpu| (gpu.mesh_key.as_ref(), 0));
+                    if !seen.insert(key) { continue; }
+                    let mut shell = Self::clone_surface_with_material_xform(
+                        surface,
+                        texture.clone(),
+                        alpha_mode,
+                        rgba,
+                        Some(uv_xform),
+                        Some(bulge_height),
+                        Some(env_map),
+                    );
+                    // rgbGen identity/const customShader shells are flat-colored,
+                    // scene-light-independent overlays (RF_RGB_TINT forces the
+                    // color outright) and never their own shadow casters.
+                    shell.lighting_origin = None;
+                    self.custom_shell_cpu_geometry(&mut shell, surface, uv_xform, env_map, bulge_height);
+                    shell.authored_glow = authored_glow;
+                    shell.rt_rigid = None;
+                    shell.rt_skinned_key = None;
+                    draws.push(shell);
+                    for (overlay_texture, overlay_mode, overlay_uv, overlay_glow, overlay_env) in &overlays {
+                        let mut overlay = Self::clone_surface_with_material_xform(
+                            surface,
+                            overlay_texture.clone(),
+                            *overlay_mode,
+                            rgba,
+                            Some(*overlay_uv),
+                            Some(bulge_height),
+                            Some(*overlay_env),
+                        );
+                        if sight_through_walls {
+                            overlay.alpha_mode = DynamicModelAlphaMode::SightShellNoDepth;
+                        }
+                        overlay.lighting_origin = None;
+                        self.custom_shell_cpu_geometry(&mut overlay, surface, *overlay_uv, *overlay_env, bulge_height);
+                        overlay.authored_glow = *overlay_glow;
+                        overlay.rt_rigid = None;
+                        overlay.rt_skinned_key = None;
+                        draws.push(overlay);
+                    }
+                }
+            }
+        }
+        if submit_geometry {
+            self.queue_cosmetics(
+                entity,
+                info,
+                &model,
+                &pose,
+                render_axis,
+                render_origin,
+                look.ghost,
+                entity_alpha,
+            );
         }
         if !raster_visible {
             for surface in &mut draws {

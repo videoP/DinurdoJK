@@ -49,8 +49,8 @@ impl Renderer {
         // Static map lights keep their raster cache even when transient lights
         // use RT; transient lights never consume cubemap slots.
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows;
-        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows) {
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows || self.entity_fixture_active();
+        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows || self.entity_fixture_active()) {
             return;
         }
 
@@ -80,10 +80,11 @@ impl Renderer {
                 world,
                 focus,
                 self.static_point_lighting_enabled(),
-                self.emissive_area_lights_enabled,
-                self.shader_light_promotion_enabled,
-                self.shader_light_promotion_mask,
-                if self.baked_local_shadows { self.baked_local_sources } else { 0 },
+                self.added_map_light_sources() & super::lightmap_local::AUTHORED != 0,
+                self.added_map_light_sources() & crate::materials::SHADER_LIGHT_ALL != 0,
+                self.added_map_light_sources() & crate::materials::SHADER_LIGHT_ALL,
+                (if self.baked_local_shadows { self.baked_local_sources } else { 0 })
+                    | if self.entity_fixture_active() { super::lightmap_local::AUTHORED } else { 0 },
             )
         };
 
@@ -143,7 +144,7 @@ impl Renderer {
                                     camera.position.x,
                                     camera.position.y,
                                     camera.position.z,
-                                    self.started.elapsed().as_secs_f32(),
+                                    self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32()),
                                 ],
                             }),
                         );
@@ -178,10 +179,33 @@ impl Renderer {
         self.update_lighting_settings();
     }
 
+    /// Idle Studio scenes release the local-light shadow cache (~96 MiB); a
+    /// drawn scene restores it. Rebinds every group that samples the cache.
+    pub(in crate::renderer) fn set_local_shadow_cache_parked(&mut self, parked: bool) {
+        let Some(world) = self.world.as_mut() else { return; };
+        if !world.local_shadows.set_parked(&self.device, parked) {
+            return;
+        }
+        let (full, lean) = crate::renderer::world::upload::create_world_lighting_bind_groups(
+            &self.device, &self.lighting_layout, &self.lighting_layout_lean,
+            &world.light_buffer, &world._cluster_buffer,
+            &self.lighting_settings_buffer, &self.pbr_settings_buffer, &world.local_shadows,
+            &world._static_light_grid, &world.voxel_probe_gi, &world.legacy_dlight_surface_mask_buffer,
+        );
+        world.lighting_bind_group = full;
+        world.lighting_bind_group_lean = lean;
+        if let Some(receivers) = self.ray_traced_shadows.as_mut().and_then(|rt| rt.model_receivers.as_mut()) {
+            receivers.lights = crate::renderer::rt_models::model_lights_bind_group(
+                &self.device, &receivers.lights_layout, world, &self.lighting_settings_buffer,
+            );
+        }
+        self.rebuild_world_froxel_bind_group();
+    }
+
     pub(in crate::renderer) fn ensure_local_shadow_cache(&mut self) {
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows;
-        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows) {
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows || self.entity_fixture_active();
+        if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows || self.entity_fixture_active()) {
             return;
         }
         let pending_slots = self
@@ -560,7 +584,7 @@ pub(in crate::renderer) fn moving_caster_octants(
 
 pub(in crate::renderer) fn local_shadow_face_matrices(position: Vec3, radius: f32) -> [Mat4; 6] {
     let far_plane = radius.max(LOCAL_SHADOW_NEAR + 1.0);
-    let mut projection = Mat4::perspective_rh(
+    let mut projection = glam::camera::rh::proj::directx::perspective(
         std::f32::consts::FRAC_PI_2,
         1.0,
         LOCAL_SHADOW_NEAR,
@@ -579,23 +603,23 @@ pub(in crate::renderer) fn local_shadow_face_matrices(position: Vec3, radius: f3
         (Vec3::Z, -Vec3::Y),
         (-Vec3::Z, -Vec3::Y),
     ];
-    faces.map(|(direction, up)| projection * Mat4::look_to_rh(position, direction, up))
+    faces.map(|(direction, up)| projection * glam::camera::rh::view::look_to_mat4(position, direction, up))
 }
 
 #[cfg(test)]
 #[path = "local_shadow_tests.rs"]
 mod tests;
 
-pub(in crate::renderer) fn create_local_shadow_resources(
-    device: &wgpu::Device,
-    caster_layout: &wgpu::BindGroupLayout,
-) -> LocalShadowResources {
+/// Cube-array depth cache and its per-face render views. A parked Studio
+/// scene keeps a 1x1 cache (same layers/format, bindings stay valid).
+fn create_local_shadow_cache(device: &wgpu::Device, size: u32)
+    -> (wgpu::Texture, wgpu::TextureView, Vec<wgpu::TextureView>) {
     let layer_count = u32::try_from(LOCAL_SHADOW_CACHE_SLOTS * 12).unwrap_or(6);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA local-light shadow cubemap cache"),
         size: wgpu::Extent3d {
-            width: LOCAL_SHADOW_MAP_SIZE,
-            height: LOCAL_SHADOW_MAP_SIZE,
+            width: size,
+            height: size,
             depth_or_array_layers: layer_count,
         },
         mip_level_count: 1,
@@ -616,6 +640,57 @@ pub(in crate::renderer) fn create_local_shadow_resources(
         aspect: wgpu::TextureAspect::DepthOnly,
         usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
     });
+    let layer_views = (0..layer_count)
+        .map(|layer| texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("JKA local-light cached shadow face"),
+            format: Some(DEPTH_FORMAT),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        }))
+        .collect();
+    (texture, cube_view, layer_views)
+}
+
+impl LocalShadowResources {
+    pub(in crate::renderer) fn parked(&self) -> bool {
+        self._texture.width() < LOCAL_SHADOW_MAP_SIZE
+    }
+
+    /// Swap between the full and a 1x1 cache. Returns true when the views
+    /// changed (the caller rebinds them). Every cached face is forgotten, so
+    /// the next drawn frame reselects lights and re-renders their faces.
+    pub(in crate::renderer) fn set_parked(&mut self, device: &wgpu::Device, parked: bool) -> bool {
+        if self.parked() == parked {
+            return false;
+        }
+        let (texture, cube_view, layer_views) =
+            create_local_shadow_cache(device, if parked { 1 } else { LOCAL_SHADOW_MAP_SIZE });
+        self._texture = texture;
+        self.cube_view = cube_view;
+        self.layer_views = layer_views;
+        self.cache_entries.fill(LocalShadowCacheEntry::default());
+        self.active_light_indices.clear();
+        self.pending_slots.clear();
+        self.shadowed_light_count = 0;
+        self.selection_cluster = None;
+        self.selection_position = None;
+        self.moving_face_masks.fill(0);
+        self.moving_octant_masks.fill(0);
+        self.moving_cameras = None;
+        true
+    }
+}
+
+pub(in crate::renderer) fn create_local_shadow_resources(
+    device: &wgpu::Device,
+    caster_layout: &wgpu::BindGroupLayout,
+) -> LocalShadowResources {
+    let (texture, cube_view, layer_views) = create_local_shadow_cache(device, LOCAL_SHADOW_MAP_SIZE);
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("JKA local-light shadow comparison sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -631,21 +706,9 @@ pub(in crate::renderer) fn create_local_shadow_resources(
         view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         camera_pos_time: [0.0; 4],
     };
-    let mut layer_views = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
     let mut caster_buffers = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
     let mut caster_bind_groups = Vec::with_capacity(LOCAL_SHADOW_CACHE_SLOTS * 6);
-    for layer in 0..LOCAL_SHADOW_CACHE_SLOTS * 12 {
-        layer_views.push(texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("JKA local-light cached shadow face"),
-            format: Some(DEPTH_FORMAT),
-            dimension: Some(wgpu::TextureViewDimension::D2),
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            base_array_layer: u32::try_from(layer).unwrap_or(0),
-            array_layer_count: Some(1),
-            aspect: wgpu::TextureAspect::DepthOnly,
-            usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
-        }));
+    for _ in 0..LOCAL_SHADOW_CACHE_SLOTS * 12 {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA local-light cached shadow caster uniform"),
             contents: bytemuck::bytes_of(&identity),
@@ -711,7 +774,7 @@ pub(in crate::renderer) fn aabb_intersects_sphere(
 }
 
 /// True when every point of the box is more than one unit on the negative
-/// side of `plane` (n·p + d < 0), i.e. fully discarded by a clip plane.
+/// side of `plane` (nÂ·p + d < 0), i.e. fully discarded by a clip plane.
 pub(in crate::renderer) fn aabb_behind_plane(
     minimum: [f32; 3],
     maximum: [f32; 3],
@@ -888,7 +951,8 @@ impl Renderer {
                 && !hidden_inline_batch(batch,&world.inline_models)
                 && (batch.source.pipeline.class==DrawClass::Opaque || batch.source.alpha_cutoff!=0.0)).collect();
         let cameras=world.local_shadows.moving_cameras.get_or_insert_with(||
-            crate::renderer::lighting::entity_shadows::EntityShadowState::with_count(&self.device,&self.camera_layout,LOCAL_SHADOW_CACHE_SLOTS*6));
+            crate::renderer::lighting::entity_shadows::EntityShadowState::with_count(&self.device,&self.camera_layout,LOCAL_SHADOW_CACHE_SLOTS*6,
+                &self.weather.rain.gpu.wind_noise_view,&self.weather.rain.gpu.wind_noise_sampler));
         for &light_index in &world.local_shadows.active_light_indices {
             let Some(slot)=world.local_shadows.cache_entries.iter().position(|e|e.light_index==Some(light_index)) else {continue;};
             let light=world.dynamic_lights[light_index];

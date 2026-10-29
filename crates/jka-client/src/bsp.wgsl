@@ -24,6 +24,7 @@ struct Camera {
     unjittered_view_proj: mat4x4<f32>,
     previous_unjittered_view_proj: mat4x4<f32>,
     jump_shade: vec4<f32>,
+    foliage_wind: vec4<f32>,
 };
 struct Material {
     header: vec4<u32>,
@@ -712,7 +713,10 @@ fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
     }
     let unfolded = centre + offset;
     let folded = select(clamp(unfolded, minimum, maximum), unfolded, sky_enabled);
-    return vec3<f32>(folded.x, select(input.position.y, ocean.authored_plane.y, ocean.authored_plane.x > 0.0), folded.y);
+    // Promoted grids are shared by every pool of the map; the pool's own
+    // promoted view uniform carries its plane height.
+    let vertex_height = select(input.position.y, ocean.spray_planes[0].x, promoted_dynamic);
+    return vec3<f32>(folded.x, select(vertex_height, ocean.authored_plane.y, ocean.authored_plane.x > 0.0), folded.y);
 }
 
 // Whether the undisplaced world xz point `p` lies on the surface's real
@@ -1073,7 +1077,9 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     }
     let ocean_sample = sample_ocean_displacement(deformation.xyz, ocean_vertex, ocean_grid_center);
     let ocean_displacement_m = ocean_sample.xyz;
-    let world_position = deformation.xyz + ocean_displacement_m * max(ocean.ocean_info.z, 0.001);
+    let world_position = foliage_wind_position(
+        deformation.xyz + ocean_displacement_m * max(ocean.ocean_info.z, 0.001),
+        material_flags_w(), camera.foliage_wind);
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     if (ocean_vertex && output.clip_position.w > 0.0) {
         // The map's distanceCull sets the camera far plane, but water is meant to
@@ -1112,7 +1118,10 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     output.shell_coverage = deformation.w;
     output.ocean_wave_height = ocean_sample.w;
     output.ocean_uv_m = deformation.xz / max(ocean.ocean_info.z, 0.001);
-    output.ocean_vertex = select(0.0, 2.0 + input.color.a, ocean_vertex);
+    // Shared promoted grids carry no mask slot; the pool's promoted view has
+    // it as its surface index (an unmasked slot has an empty mask range).
+    let ocean_mask_slot = select(input.color.a, ocean.spray_planes[0].z, ocean.authored_plane.w > 0.5);
+    output.ocean_vertex = select(0.0, 2.0 + ocean_mask_slot, ocean_vertex);
     let vertex_lightgrid = sample_vertex_static_lightgrid(world_position);
     output.pbr_lightgrid_direction = vertex_lightgrid.direction;
     output.pbr_lightgrid_lighting = vertex_lightgrid.lighting;
@@ -1498,6 +1507,9 @@ fn sample_cascade_shadow_legacy(input: VertexOut, normal: vec3<f32>, cascade: i3
 }
 
 fn sample_cascade_shadow_bevy(input: VertexOut, normal: vec3<f32>, cascade: i32) -> f32 {
+    if shadow_settings.params.w > 1.5 {
+        return sample_dynamic_cascade(input.world_position, normal, cascade);
+    }
     let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
     let texel_size = shadow_settings.cascade_texel_sizes[u32(cascade)];
     // Bevy stores direction_to_light; JKA stores light travel direction, so negate it.
@@ -1517,6 +1529,7 @@ fn sample_cascade_shadow_bevy(input: VertexOut, normal: vec3<f32>, cascade: i32)
 }
 
 fn shader_sun_sky_admission(input: VertexOut, cascade: i32) -> f32 {
+    if shadow_settings.params.w > 1.5 { return 1.0; }
     let mode = shadow_settings.camera_forward.w;
     if (mode < 0.5) {
         return 1.0;
@@ -1809,7 +1822,7 @@ fn raster_sun_glass_throughput(receiver: vec3<f32>, normal: vec3<f32>) -> vec3<f
 fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {
     if (!ENABLE_CASCADED_SHADOWS) { return vec3<f32>(1.0); }
     let opaque_visibility = cascaded_shadow_visibility(input, normal);
-    if (opaque_visibility <= 0.0 || (lighting_settings.feature_flags.z & 0x200u) == 0u) {
+    if (opaque_visibility <= 0.0 || shadow_settings.params.w > 1.5 || (lighting_settings.feature_flags.z & 0x200u) == 0u) {
         return vec3<f32>(opaque_visibility);
     }
     let transmission = raster_sun_glass_throughput(input.world_position, normal);
@@ -4140,6 +4153,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
 
     // Lightmap alpha carries internal sun visibility. Legacy material blending
     // must continue to see an opaque lightmap even when removal is disabled.
+    // Preserve the lighting payload before replacing alpha for stage blending.
+    let explicit_lightmap_flux = source_sample.a;
     if (explicit_lightmap_stage) { source_sample.a = 1.0; }
 
     // Classic id Tech 3 world-lighting controls. Keep them runtime flags so
@@ -4181,7 +4196,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         && !explicit_lightmap_stage;
     if (relight_explicit || relight_vertex_lit) {
         let baked = light_bsp_surface(select(input.color.rgb, source_sample.rgb, relight_explicit),
-            select(0.0, source_sample.a, relight_explicit), input);
+            select(0.0, explicit_lightmap_flux, relight_explicit), input);
         if (lighting_settings.baked_sun_debug_mode.x != 0u) {
             return vec4<f32>(baked, select(stage_color.a, source_sample.a, relight_explicit));
         }

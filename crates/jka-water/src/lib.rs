@@ -5,3 +5,4 @@
 //! client scheduling, and gameplay state remain in `jka-client`.
 
 pub mod coastal;
+pub mod river;

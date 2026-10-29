@@ -28,6 +28,7 @@ pub(super) enum FrontendPage {
     ChatLogs,
     DeveloperTools,
     AssetViewer,
+    Pk3Manager,
     Screenshots,
     MapViewer,
     RenderStudio,
@@ -197,6 +198,7 @@ pub(super) struct ProfileSaberEntry {
     pub model: String,
     pub custom_skin: Option<String>,
     pub num_blades: usize,
+    pub ready_anim: i32,
 }
 
 pub(super) fn scan_profile_catalog(
@@ -214,6 +216,7 @@ pub(super) fn scan_profile_catalog(
             model: definition.model.clone(),
             custom_skin: definition.custom_skin.clone(),
             num_blades: definition.num_blades,
+            ready_anim: definition.ready_anim,
         })
         .collect::<Vec<_>>();
     sabers.sort_by(|a, b| a.display_name.to_ascii_lowercase().cmp(&b.display_name.to_ascii_lowercase()).then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())));
@@ -909,21 +912,25 @@ pub(super) fn scan_demo_game_directories(base: &Path) -> Result<Vec<String>, Str
         })
     }
 
-    let root = base.parent().unwrap_or(base);
-    let entries = fs::read_dir(root)
-        .map_err(|error| format!("could not scan {}: {error}", root.display()))?;
+    let roots = jka_assets::pk3::configured_filesystem_roots(base);
     let mut games = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let path = entry.path();
-        if !has_loose_dm26(&path) {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.is_empty() {
-            games.push(name);
+    let mut roots_to_scan = Vec::new();
+    if let Some(home) = roots.homepath { roots_to_scan.push(home); }
+    let local_root = base.parent().unwrap_or(base).to_path_buf();
+    if !roots_to_scan.contains(&local_root) { roots_to_scan.push(local_root); }
+    for root in roots_to_scan {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("could not scan {}: {e}", root.display())),
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
+            let path = entry.path();
+            if has_loose_dm26(&path) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.is_empty() { games.push(name); }
+            }
         }
     }
     games.sort_by_key(|game| (!game.eq_ignore_ascii_case("base"), game.to_ascii_lowercase()));
@@ -971,11 +978,10 @@ pub(super) fn scan_demos(
     base: &Path,
     game: Option<&Path>,
 ) -> Result<Vec<DemoEntry>, String> {
-    let assets = match game {
-        Some(game) => AssetSearchPath::open_search_dirs([game]),
-        None => AssetSearchPath::open(base),
-    }
-    .map_err(|error| error.to_string())?;
+    let roots = jka_assets::pk3::configured_filesystem_roots(base);
+    let assets = AssetSearchPath::open_search_dirs(
+        jka_assets::pk3::filesystem_game_layer_dirs(base, game, &roots)
+    ).map_err(|error| error.to_string())?;
     let mut demos: Vec<DemoEntry> = assets
         .names()
         .filter_map(|name| {
@@ -999,6 +1005,7 @@ pub(super) fn scan_demos(
 pub(super) enum DemoConsoleKind {
     Print,
     Chat,
+    TeamChat,
     CenterPrint,
     Event,
 }
@@ -1008,6 +1015,7 @@ impl DemoConsoleKind {
         match self {
             Self::Print => "PRINT",
             Self::Chat => "CHAT",
+            Self::TeamChat => "TEAM CHAT",
             Self::CenterPrint => "CENTER",
             Self::Event => "EVENT",
         }
@@ -1118,6 +1126,17 @@ pub(super) struct DemoScoreboardSample {
     pub entries: Vec<DemoScoreEntry>,
 }
 
+/// Presentation-only angle precomputed during demo indexing. No demo/gameplay
+/// state is changed; Studio can seek and export at any frame without depending
+/// on which frame was previewed previously.
+#[derive(Debug, Clone)]
+pub(super) struct DemoWallrunYawSample {
+    time_ms: i32,
+    client: i32,
+    anim: i32,
+    yaws: [f32; 3],
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct DemoIndex {
     pub first_active_server_time: Option<i32>,
@@ -1127,9 +1146,32 @@ pub(super) struct DemoIndex {
     pub transient_notices: Vec<DemoConsoleEntry>,
     /// Reliable `scores` payloads recorded in the demo, indexed by demo time.
     pub scoreboards: Vec<DemoScoreboardSample>,
+    pub wallrun_camera_yaws: Vec<DemoWallrunYawSample>,
 }
 
 impl DemoIndex {
+    /// Returns None outside active wallruns, where original camera yaw remains
+    /// byte-for-byte identical to the decoded playerState presentation.
+    pub fn wallrun_camera_yaw(&self, time: f64, anim: i32, client: i32, mode: u8) -> Option<f32> {
+        if !(1..=3).contains(&mode) || !super::wallrun_camera::is_wall_running(anim) || !time.is_finite() {
+            return None;
+        }
+        let upper = self.wallrun_camera_yaws.partition_point(|s| f64::from(s.time_ms) <= time);
+        let prev = self.wallrun_camera_yaws.get(upper.checked_sub(1)?)?;
+        if prev.client != client || !super::wallrun_camera::is_wall_running(prev.anim) { return None; }
+        let next = self.wallrun_camera_yaws.get(upper);
+        let Some(next) = next.filter(|next| next.client == client
+            && super::wallrun_camera::is_wall_running(prev.anim)
+            && super::wallrun_camera::is_wall_running(next.anim)
+            && next.time_ms - prev.time_ms <= 150) else { return Some(prev.yaws[(mode - 1) as usize]); };
+        let t = ((time - f64::from(prev.time_ms)) / f64::from(next.time_ms - prev.time_ms).max(1.0))
+            .clamp(0.0, 1.0) as f32;
+        let prev_yaw = prev.yaws[(mode - 1) as usize];
+        let next_yaw = next.yaws[(mode - 1) as usize];
+        let delta = (next_yaw - prev_yaw + 180.0).rem_euclid(360.0) - 180.0;
+        Some(prev_yaw + delta * t)
+    }
+
     pub fn duration_ms(&self) -> i32 {
         match (self.first_active_server_time, self.last_server_time) {
             (Some(first), Some(last)) => last.saturating_sub(first).max(0),
@@ -1424,11 +1466,10 @@ pub(super) fn index_demo_metadata(
 ) -> Result<DemoMetadata, String> {
     const MAX_DEMO_FILE_BYTES: usize = 512 * 1024 * 1024;
     let qpath = format!("demos/{demo_name}.dm_26");
-    let mut assets = match game {
-        Some(game) => AssetSearchPath::open_search_dirs([game]),
-        None => AssetSearchPath::open(base),
-    }
-    .map_err(|error| error.to_string())?;
+    let roots = jka_assets::pk3::configured_filesystem_roots(base);
+    let mut assets = AssetSearchPath::open_search_dirs(
+        jka_assets::pk3::filesystem_game_layer_dirs(base, game, &roots)
+    ).map_err(|error| error.to_string())?;
     let asset = assets
         .read(&qpath, MAX_DEMO_FILE_BYTES)
         .map_err(|error| format!("{qpath}: {error}"))?
@@ -1461,6 +1502,8 @@ fn scan_demo_bytes(
     let mut first_active = None::<i32>;
     let mut last_time = None::<i32>;
     let mut snapshot_count = 0usize;
+    let mut wallrun_camera_yaws = Vec::new();
+    let mut wallrun_filters: [super::wallrun_camera::WallrunCameraYaw; 3] = Default::default();
     let mut recorded_client_num = None::<i32>;
     let mut recorded_player_name = None::<String>;
     let mut active_players = vec![None::<ActivePlayer>; 32];
@@ -1527,6 +1570,15 @@ fn scan_demo_bytes(
                     }
                     last_time = Some(server_time);
                     snapshot_count += 1;
+                    let state = &snapshot.player_state;
+                    if let Some(yaw) = state.field_f32("viewangles[1]").filter(|v| v.is_finite()) {
+                        let client = state.field_i32("clientNum").unwrap_or(0);
+                        let anim = state.field_i32("legsAnim").unwrap_or(0);
+                        let yaws = std::array::from_fn(|mode| wallrun_filters[mode].apply(
+                            yaw, anim, client, f64::from(server_time), false, (mode + 1) as u8,
+                        ));
+                        wallrun_camera_yaws.push(DemoWallrunYawSample { time_ms: server_time, client, anim, yaws });
+                    }
 
                     if pending_roster_refresh {
                         for slot in 0..active_players.len() {
@@ -1627,10 +1679,10 @@ fn scan_demo_bytes(
                         }
                         let (kind, start) = if name.eq_ignore_ascii_case(b"print") {
                             (Some(DemoConsoleKind::Print), 1)
-                        } else if name.eq_ignore_ascii_case(b"chat") || name.eq_ignore_ascii_case(b"tchat") {
+                        } else if name.eq_ignore_ascii_case(b"chat") || name.eq_ignore_ascii_case(b"lchat") {
                             (Some(DemoConsoleKind::Chat), 1)
-                        } else if name.eq_ignore_ascii_case(b"lchat") || name.eq_ignore_ascii_case(b"ltchat") {
-                            (Some(DemoConsoleKind::Chat), 1)
+                        } else if name.eq_ignore_ascii_case(b"tchat") || name.eq_ignore_ascii_case(b"ltchat") {
+                            (Some(DemoConsoleKind::TeamChat), 1)
                         } else if name.eq_ignore_ascii_case(b"cp") {
                             (Some(DemoConsoleKind::CenterPrint), 1)
                         } else {
@@ -1640,7 +1692,7 @@ fn scan_demo_bytes(
                             let raw_text = String::from_utf8_lossy(&args.get(start..).unwrap_or_default().join(&b' '))
                                 .trim_matches(|ch| ch == '\0' || ch == '\r' || ch == '\n')
                                 .to_owned();
-                            if matches!(kind, DemoConsoleKind::Chat | DemoConsoleKind::CenterPrint)
+                            if matches!(kind, DemoConsoleKind::Chat | DemoConsoleKind::TeamChat | DemoConsoleKind::CenterPrint)
                                 && !raw_text.is_empty()
                             {
                                 transient_notices.push((server_time, kind, raw_text));
@@ -1891,6 +1943,7 @@ fn scan_demo_bytes(
         kill_markers,
         transient_notices,
         scoreboards,
+        wallrun_camera_yaws,
     };
 
     Ok((index, DemoMetadata {
@@ -1912,6 +1965,31 @@ fn scan_demo_bytes(
         console,
         kill_count,
     }))
+}
+
+#[cfg(test)]
+mod wallrun_camera_index_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_wallrun_angles_are_seek_order_independent() {
+        let anim = jka_assets::animation::animation_index("BOTH_FORCEWALLRUNFLIP_START").unwrap() as i32;
+        let index = DemoIndex {
+            wallrun_camera_yaws: vec![
+                DemoWallrunYawSample { time_ms: 100, client: 3, anim, yaws: [359.0, 359.0, 359.0] },
+                DemoWallrunYawSample { time_ms: 150, client: 3, anim, yaws: [359.0, 363.0, 359.0] },
+            ],
+            ..Default::default()
+        };
+        assert!((index.wallrun_camera_yaw(125.0, anim, 3, 2).unwrap() - 361.0).abs() < 0.01);
+        assert_eq!(index.wallrun_camera_yaw(150.0, anim, 3, 2), Some(363.0));
+        assert_eq!(index.wallrun_camera_yaw(125.0, anim, 4, 2), None);
+        assert_eq!(index.wallrun_camera_yaw(125.0, 0, 3, 2), None);
+        assert_eq!(index.wallrun_camera_yaw(125.0, anim, 3, 0), None);
+        assert_eq!(index.wallrun_camera_yaw(125.0, anim, 3, 1), Some(359.0));
+        // A later query must not affect another editor seek to the same time.
+        assert_eq!(index.wallrun_camera_yaw(125.0, anim, 3, 2), Some(361.0));
+    }
 }
 
 #[cfg(test)]

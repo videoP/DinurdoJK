@@ -3,8 +3,8 @@ use crate::ui::{
     build_background_progress, build_shader_compile_progress, build_center_print, build_chat_history, build_chat_input,
     build_console, build_console_notify, build_crosshair_name, build_crosshair_vertices,
     build_demo_timeline,
-    build_follow_indicator, build_force_select, build_weapon_select, build_fps_simple, build_game_timer, build_hud,
-    build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
+    build_follow_indicator, build_force_select, build_weapon_select, build_inventory_select, build_fps_simple, build_game_timer, build_hud,
+    build_enemy_info, build_hud_score, build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
     build_siege_hud,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
     build_speedometer, build_splash_background, build_strafe_helper, build_team_overlay,
@@ -72,6 +72,7 @@ pub fn build_vertices(
         | OverlayMode::EmoteRadial
         | OverlayMode::StrafeTrails
         | OverlayMode::RaceGhosts
+        | OverlayMode::Telemarks
         | OverlayMode::ShaderRemap => {}
     }
     // The trace result panel used to be drawn here from `ui.surface_inspector`
@@ -157,6 +158,12 @@ pub fn build_transient_vertices(
             | OverlayMode::CameraEdit
             | OverlayMode::MapEdit
     );
+    if gameplay_overlay {
+        if let Some(race)=&ui.studio_race {super::studio_race::draw(out,race,small_font,width,height);}
+        for label in &ui.studio_world_labels {
+            super::text::build_studio_label_vertices(out, label, small_font, width, height);
+        }
+    }
     if gameplay_hud_visible(ui, width, height) {
         // Colour and name follow the aim target, so they share the small batch
         // that is rebuilt when it changes rather than the stable HUD prefix.
@@ -171,6 +178,7 @@ pub fn build_transient_vertices(
         });
         build_force_select(out, ui, small_font, width, height);
         build_weapon_select(out, ui, small_font, width, height);
+        build_inventory_select(out, ui, small_font, width, height);
     }
     if gameplay_overlay {
         // Follows the snapshot's client every frame (CG_DrawFollow), so it lives
@@ -216,7 +224,20 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::Fps, width, height, |out| {
             build_game_timer(out, ui, width, height);
         });
-        build_mini_scores(out, ui, small_font, width, height);
+        draw_placed(out, ui, HudElementId::EnemyInfo, width, height, |out| {
+            build_enemy_info(out, ui, width, height);
+        });
+        // cg_drawScore is snapshot-dependent: keep it in the transient HUD
+        // batch so score and team deltas update on score changes without
+        // rebuilding the large static health/force HUD.
+        if ui.video.draw_hud {
+            draw_placed(out, ui, HudElementId::Score, width, height, |out| {
+                build_hud_score(out, ui, width, height);
+            });
+        }
+        draw_placed(out, ui, HudElementId::MiniScores, width, height, |out| {
+            build_mini_scores(out, ui, small_font, width, height);
+        });
         build_siege_hud(out, ui, width, height);
     }
     if ui.mode == OverlayMode::Chat {

@@ -4,6 +4,7 @@ use std::fmt;
 use std::ops::Range;
 mod collision;
 pub mod bathymetry;
+pub mod river;
 mod marks;
 mod visibility;
 pub mod patch;

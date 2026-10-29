@@ -26,7 +26,7 @@ use crate::ui::{
 
 /// `SCREEN_WIDTH` / `SCREEN_HEIGHT`: the virtual space every coordinate here uses.
 mod extended;
-pub use extended::{extended_hud, ExtendedHud, StrafeFill, StrafeLabel, StrafeTriangle};
+pub use extended::{extended_hud, ExtendedHud};
 
 pub const SCREEN_WIDTH: f32 = 640.0;
 pub const SCREEN_HEIGHT: f32 = 480.0;

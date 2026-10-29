@@ -9,7 +9,8 @@
 //!   contents are fog, is never marked;
 //! * `SF_TRIANGLES` surfaces are never marked, because the stock
 //!   `r_marksOnTriangleMeshes` cvar defaults to 0. Compiled-in MD3 geometry
-//!   (q3map2 `misc_model`) is triangle soup, so models get no marks;
+//!   (q3map2 `misc_model`) is triangle soup. Blob shadows opt into these
+//!   receivers through `project_blob`, without enabling weapon marks on them;
 //! * with no drawn world surface under the hit (a hidden clip/caulk brush, an
 //!   entity model's collision hull) nothing is produced at all.
 //!
@@ -41,6 +42,8 @@ struct MarkTriangle {
     normal: [f32; 3],
     /// The triangle is skipped unless `dot(normal, dir) <= -min_facing`.
     min_facing: f32,
+    /// Compiled model soup receives blobs, but retains the stock weapon-mark exclusion.
+    blob_only: bool,
     /// Authored UV and BSP shader for *local* burn-color lookup; none for
     /// synthetic/test geometry which has no material attached.
     base_uv: Option<[[f32; 2]; 3]>,
@@ -110,7 +113,7 @@ fn bounds_of(points: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
 impl MarkTriangle {
     fn new(points: [[f32; 3]; 3], normal: [f32; 3], min_facing: f32) -> Self {
         let (mins, maxs) = bounds_of(&points);
-        Self { points, mins, maxs, normal, min_facing, base_uv: None, shader: usize::MAX }
+        Self { points, mins, maxs, normal, min_facing, blob_only: false, base_uv: None, shader: usize::MAX }
     }
 }
 
@@ -199,6 +202,7 @@ impl MarkSurfaces {
         let mut best: Option<([f32; 3], f32)> = None;
         let mut visit = |index: usize| {
             let Some(t) = self.triangles.get(index) else { return; };
+            if t.blob_only { return; }
             if dot(t.normal, n) < 0.95 { return; }
             let (Some(uvs), Some(texture)) = (t.base_uv, self.color_textures.get(t.shader).and_then(Option::as_ref)) else { return; };
             let e0 = sub(t.points[1], t.points[0]);
@@ -252,12 +256,12 @@ impl MarkSurfaces {
             if surface_flags & (SURF_NOIMPACT | SURF_NOMARKS) != 0 || contents & CONTENTS_FOG != 0 {
                 continue;
             }
-            // SF_TRIANGLES is only marked when r_marksOnTriangleMeshes is set;
-            // it defaults to 0 in OpenJK and JKA.
+            // Keep compiled model receivers in the same spatial index. Only
+            // blob queries admit them; ordinary impact/saber marks still skip them.
             let planar = match surface.kind {
                 SurfaceKind::Planar => true,
-                SurfaceKind::Patch => false,
-                SurfaceKind::Triangles | SurfaceKind::Flare => continue,
+                SurfaceKind::Patch | SurfaceKind::Triangles => false,
+                SurfaceKind::Flare => continue,
             };
             let Some(indices) = mesh.indices.get(batch.indices.clone()) else { continue };
             let face_normal = if planar {
@@ -291,7 +295,9 @@ impl MarkSurfaces {
                     // (v1, v[w], v[w+1]); the mesh keeps that winding and order.
                     // The engine tests the triangle's own normal, -0.1 then -0.05.
                     let normal = normalize(cross(sub(points[0], points[1]), sub(points[2], points[1])));
-                    let mut triangle = MarkTriangle::new(points, normal, if n % 2 == 0 { 0.1 } else { 0.05 });
+                    let blob_only = surface.kind == SurfaceKind::Triangles;
+                    let mut triangle = MarkTriangle::new(points, normal, if blob_only || n % 2 == 0 { 0.1 } else { 0.05 });
+                    triangle.blob_only = blob_only;
                     triangle.base_uv = Some([a.texcoord, b.texcoord, c.texcoord]);
                     triangle.shader = batch.shader;
                     triangles.push(triangle);
@@ -335,6 +341,16 @@ impl MarkSurfaces {
     /// replaces the contents of `out`: convex fans clipped to drawn, markable
     /// triangles, capped at the stock fragment and point limits.
     pub fn project(&self, points: &[[f32; 3]; 4], projection: [f32; 3], out: &mut MarkBuffer) {
+        self.project_filtered(points, projection, out, false);
+    }
+
+    /// Blob receivers include compiled-in model triangles, with the same
+    /// material flags, spatial lookup, facing tests and clipping as world faces.
+    pub fn project_blob(&self, points: &[[f32; 3]; 4], projection: [f32; 3], out: &mut MarkBuffer) {
+        self.project_filtered(points, projection, out, true);
+    }
+
+    fn project_filtered(&self, points: &[[f32; 3]; 4], projection: [f32; 3], out: &mut MarkBuffer, include_blob_only: bool) {
         out.clear();
         if self.triangles.is_empty() {
             return;
@@ -388,7 +404,8 @@ impl MarkSurfaces {
 
         for &index in out.candidates.iter() {
             let triangle = &self.triangles[index as usize];
-            if dot(triangle.normal, dir) > -triangle.min_facing
+            if (triangle.blob_only && !include_blob_only)
+                || dot(triangle.normal, dir) > -triangle.min_facing
                 || (0..3).any(|axis| triangle.maxs[axis] < mins[axis] || triangle.mins[axis] > maxs[axis])
             {
                 continue;
@@ -662,6 +679,47 @@ mod tests {
         for z in [40.0, -30.0] {
             let floor = MarkSurfaces::from_world_triangles([face([[-50.0, -50.0, z], [50.0, -50.0, z], [0.0, 50.0, z]])]);
             assert!(project(&floor, &quad, projection).fragments.is_empty(), "floor at z={z} must not be marked");
+        }
+    }
+
+    #[test]
+    fn compiled_model_triangles_receive_blobs_without_enabling_weapon_marks() {
+        use super::super::{Model, Shader, Surface, Vertex};
+        let bsp = Bsp {
+            collision: None, visibility: None, fogs: vec![], planes: vec![],
+            brushes: vec![], brush_sides: vec![], entities: vec![],
+            lightmaps: vec![], light_grid: None,
+            shaders: vec![Shader { name: b"models/test/receiver".to_vec(), surface_flags: 0, contents: 1 }],
+            vertices: [[-100.0, -100.0, 0.0], [0.0, 100.0, 0.0], [100.0, -100.0, 0.0]]
+                .map(|position| Vertex { position, normal: [0.0, 0.0, 1.0],
+                    texcoord: [0.0; 2], lightmap_uv: [[0.0; 2]; 4], color: [[255; 4]; 4] }).to_vec(),
+            indices: vec![0, 1, 2],
+            surfaces: vec![Surface { shader: 0, fog_num: -1, kind: SurfaceKind::Triangles,
+                flare: None, vertices: 0..3, indices: 0..3, lightmaps: [-1; 4],
+                lightmap_styles: [255; 4], vertex_styles: [0; 4],
+                patch_size: [0; 2], patch_lod_bounds: [[0.0; 3]; 2] }],
+            models: vec![Model { mins: [-100.0, -100.0, 0.0], maxs: [100.0, 100.0, 0.0],
+                surfaces: 0..1, brushes: 0..0 }],
+        };
+        let mesh = bsp.world_mesh(4).unwrap();
+        let (quad, projection) = blob(24.0);
+        for (flags, contents, receives_blob) in [
+            (0, 0, true), (SURF_NOMARKS, 0, false),
+            (SURF_NOIMPACT, 0, false), (0, CONTENTS_FOG, false),
+        ] {
+            let surfaces = MarkSurfaces::from_bsp(&bsp, &mesh, &[(flags, contents)]);
+            let mut out = MarkBuffer::default();
+            surfaces.project(&quad, projection, &mut out);
+            assert!(out.fragments.is_empty(), "weapon marks must still skip model soup");
+            assert!(!surfaces.has_markable_surface([0.0; 3], [0.0, 0.0, 1.0]));
+            surfaces.project_blob(&quad, projection, &mut out);
+            assert_eq!(!out.fragments.is_empty(), receives_blob, "flags={flags:x} contents={contents:x}");
+            for (polygon, normal) in out.iter() {
+                assert_eq!(normal, [0.0, 0.0, 1.0]);
+                for point in polygon {
+                    assert!(point[0].abs() <= 24.01 && point[1].abs() <= 24.01 && point[2].abs() < 0.001);
+                }
+            }
         }
     }
 }

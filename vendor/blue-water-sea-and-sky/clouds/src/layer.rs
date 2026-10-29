@@ -30,6 +30,8 @@ pub struct CloudUniforms {
     pub camera: [f32; 4],
     pub forward: [f32; 4],
     pub screen: [f32; 4],
+    /// Full output viewport in xy; screen.xy is the independently scaled cloud buffer.
+    pub viewport: [f32; 4],
     pub frame: [f32; 4],
     pub planes: [f32; 4],
     pub sun: [f32; 4],
@@ -91,6 +93,50 @@ pub struct CloudUniforms {
     /// x 1 while a lightning flash's light on the clouds changes (this update's or the last's lit them): the
     /// reconstruction clips its history as a moving view's. yzw unused.
     pub flash: [f32; 4],
+    /// Live experiments: debug view, bypass Beer attenuation, far-ray step multiplier, mean local sun depth.
+    pub experiments: [f32; 4],
+}
+
+/// Optional host experiments. Defaults retain the native tier's rendering and budgets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudTuning {
+    pub debug: u8,
+    pub shadow_mode: u8,
+    /// Independent cascade fitting distance (m); zero uses the scene camera.
+    pub shadow_far: f32,
+    pub far_step_scale: f32,
+    /// -1 uses the tier; 0 keeps Beer shadows but skips the local sunlight march.
+    pub sun_steps: i32,
+}
+
+impl Default for CloudTuning {
+    fn default() -> Self {
+        Self { debug: 0, shadow_mode: 0, shadow_far: 0.0, far_step_scale: 1.0, sun_steps: -1 }
+    }
+}
+
+impl CloudTuning {
+    fn sanitize(mut self) -> Self {
+        self.debug = self.debug.min(5);
+        self.shadow_mode = self.shadow_mode.min(1);
+        self.shadow_far = if self.shadow_far.is_finite() { self.shadow_far.clamp(0.0, 200_000.0) } else { 0.0 };
+        self.far_step_scale = if self.far_step_scale.is_finite() { self.far_step_scale.clamp(1.0, 4.0) } else { 1.0 };
+        self.sun_steps = self.sun_steps.clamp(-1, 8);
+        self
+    }
+
+    /// Only fitting uses this projection. Scene depth, rays and reprojection retain the host camera.
+    fn shadow_view(self, view: &CloudView) -> CloudView {
+        if self.shadow_far <= 0.0 { return *view; }
+        let far = self.shadow_far.max(view.near * 2.0);
+        let projection = glam::camera::rh::proj::directx::perspective(
+            2.0 * view.tan_half_fov().atan(),
+            view.projection.y_axis.y / view.projection.x_axis.x,
+            far,
+            view.near,
+        );
+        CloudView { projection, far, ..*view }
+    }
 }
 
 /// The camera the clouds march for this frame.
@@ -417,6 +463,8 @@ struct MarchGroups {
 /// The cloud layer. See the module docs.
 pub struct CloudLayer {
     quality: SkyQuality,
+    render_scale: f32,
+    tuning: CloudTuning,
     tier: CloudTier,
     layers: Layers,
     coverage: f32,
@@ -936,6 +984,8 @@ impl CloudLayer {
 
         let mut layer = Self {
             quality,
+            render_scale: 1.0,
+            tuning: CloudTuning::default(),
             tier,
             layers: Layers::takram(0.3),
             coverage: 0.3,
@@ -1419,6 +1469,30 @@ impl CloudLayer {
         self.write_static_uniforms();
     }
 
+    /// Scale the cloud history and reconstruction, independently of the quality tier.
+    /// Targets and history are replaced only when prepare observes a new pixel size.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        self.render_scale = if scale.is_finite() { scale.clamp(0.25, 1.0) } else { 1.0 };
+    }
+
+    /// Live controls use the existing uniforms/targets. Switching drops contaminated histories once.
+    pub fn set_tuning(&mut self, tuning: CloudTuning) {
+        let tuning = tuning.sanitize();
+        if self.tuning != tuning {
+            self.tuning = tuning;
+            self.write_tuning_uniforms();
+            self.drop_history();
+        }
+    }
+
+    fn write_tuning_uniforms(&mut self) {
+        self.uniforms.experiments = [self.tuning.debug as f32, self.tuning.shadow_mode as f32,
+            self.tuning.far_step_scale, if self.tuning.sun_steps == 0 { 1.0 } else { 0.0 }];
+        self.uniforms.secondary[0] = if self.tuning.sun_steps < 0 {
+            self.tier.clouds.max_iteration_count_to_sun as f32
+        } else { self.tuning.sun_steps as f32 };
+    }
+
     /// The uniforms that change only with the tier or the layers.
     fn write_static_uniforms(&mut self) {
         let tier = self.tier;
@@ -1504,6 +1578,7 @@ impl CloudLayer {
         u.ground[3] = tier.ground_steps as f32;
         u.bake[0] = tier.environment_steps as f32;
         self.write_layer_uniforms();
+        self.write_tuning_uniforms();
     }
 
     fn write_layer_uniforms(&mut self) {
@@ -1578,7 +1653,8 @@ impl CloudLayer {
         sky: &Sky,
         cut: bool,
     ) {
-        let [width, height] = view.viewport;
+        let viewport = view.viewport.map(|size| size.max(1));
+        let [width, height] = viewport.map(|size| (size as f32 * self.render_scale).ceil().max(1.0) as u32);
         if width.max(1) != self.width || height.max(1) != self.height {
             self.width = width.max(1);
             self.height = height.max(1);
@@ -1657,6 +1733,7 @@ impl CloudLayer {
         let converged =
             (self.held && self.held_updates >= HOLD_UPDATES) || self.still_updates >= HOLD_UPDATES;
 
+        let fit_view = self.tuning.shadow_view(view);
         let cascades = Cascades::fit(
             &CascadeSettings {
                 count: self.tier.shadow.cascade_count,
@@ -1665,15 +1742,15 @@ impl CloudLayer {
                 // A theatre view drawing the land beyond its window reaches far past a battle view's 60 km
                 // (`HORIZON_FAR`): the cascades keep a battle view's span, which spread over its far plane would lose
                 // their resolution about the camera. The last still serves out to `reach_far`.
-                max_far: (view.far > naval_render::camera::DEFAULT_FAR
+                max_far: (self.tuning.shadow_far == 0.0 && view.far > naval_render::camera::DEFAULT_FAR
                     && view.far <= naval_render::camera::HORIZON_FAR)
                     .then_some(naval_render::camera::DEFAULT_FAR),
                 ..CascadeSettings::default()
             },
             camera_world,
-            view.projection,
-            view.near,
-            view.far,
+            fit_view.projection,
+            fit_view.near,
+            fit_view.far,
             sun,
             light_distance(sun.y.clamp(0.0, 1.0)),
         );
@@ -1695,6 +1772,7 @@ impl CloudLayer {
                 low[0] as f32,
                 low[1] as f32,
             ];
+            u.viewport = [viewport[0] as f32, viewport[1] as f32, 0.0, 0.0];
             u.planes = [view.near, view.far, cascades.far, MIP_LEVEL_SCALE];
             u.sun = [sun.x, sun.y, sun.z, PLANET_RADIUS];
             let drift = Vec3::new(wind.x, 0.0, wind.z);
@@ -2385,6 +2463,147 @@ fn make_shadow_interface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blue_cloud_experiment_fitting_preserves_scene_projection_and_depth() {
+        let near = 0.1;
+        let far = 259.8076;
+        let view = CloudView { position: Vec3::new(0.0, 25.0, 0.0),
+            view: glam::camera::rh::view::look_to_mat4(Vec3::new(0.0, 25.0, 0.0), Vec3::NEG_Z, Vec3::Y),
+            projection: glam::camera::rh::proj::directx::perspective(1.1, 16.0 / 9.0, far, near), near, far,
+            viewport: [1280, 720] };
+        assert_eq!(CloudTuning::default().shadow_view(&view).projection, view.projection);
+        for shadow_far in [10_000.0, 60_000.0, 200_000.0] {
+            let tuning = CloudTuning { shadow_far, ..Default::default() };
+            let fitted = tuning.shadow_view(&view);
+            let corners = crate::cascades::FrustumCorners::from_projection(fitted.projection, fitted.far);
+            for corner in corners.far {
+                assert!((-corner.z - shadow_far).abs() < shadow_far * 1e-5);
+            }
+            assert_eq!(fitted.view, view.view);
+            assert_eq!(fitted.position, view.position);
+            for distance in [0.1, 1.0, 25.0, 200.0] {
+                let clip = view.projection * Vec3::new(0.0, 0.0, -distance).extend(1.0);
+                let depth = clip.z / clip.w;
+                let decoded = far * near / (depth * (far - near) + near);
+                assert!((decoded - distance).abs() < distance * 1e-5);
+            }
+        }
+        let bad = CloudTuning { shadow_far: f32::NAN, far_step_scale: f32::INFINITY,
+            debug: 255, shadow_mode: 255, sun_steps: 99 }.sanitize();
+        assert_eq!(bad.shadow_far, 0.0);
+        assert_eq!(bad.far_step_scale, 1.0);
+        assert_eq!((bad.debug, bad.shadow_mode, bad.sun_steps), (5, 1, 8));
+    }
+
+    /// Read actual output pixels: reduced histories must cover the whole viewport,
+    /// preserve their orientation and stay behind full-resolution foreground depth.
+    #[test]
+    fn scaled_cloud_composite_preserves_viewport_and_foreground_occlusion() {
+        futures_lite::future::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance.request_adapter(&Default::default()).await.expect("GPU adapter");
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), ..Default::default()
+            }).await.expect("GPU device");
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let sky = Sky::new(&device, &queue, SkyQuality::Low, Default::default());
+            let mut layer = CloudLayer::new(&device, &queue, &sky, SkyQuality::Low,
+                Targets { color: wgpu::TextureFormat::Rgba16Float, depth: None });
+            let viewport = [65, 33];
+            let make_target = |format, usage| device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("scaled cloud composite fixture"),
+                size: wgpu::Extent3d { width: viewport[0], height: viewport[1], depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format, usage, view_formats: &[],
+            });
+            let output = make_target(wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+            let output_view = output.create_view(&Default::default());
+            let depth = make_target(wgpu::TextureFormat::Depth32Float,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+            let depth_view = depth.create_view(&Default::default());
+            layer.composite_depth.1 = gpu::bind_group(&device, "fixture depth", &layer.composite_depth_layout, &[
+                (0, wgpu::BindingResource::TextureView(&depth_view)),
+                (1, wgpu::BindingResource::TextureView(&layer.underwater_probe)),
+            ]);
+            let view = CloudView {
+                position: Vec3::ZERO, view: Mat4::IDENTITY,
+                projection: glam::camera::rh::proj::directx::perspective(1.0, 65.0 / 33.0, 6000.0, 0.1),
+                near: 0.1, far: 6000.0, viewport,
+            };
+            let stride = 768;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cloud pixel readback"), size: u64::from(stride * viewport[1]),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
+            for scale in [1.0, 0.75, 0.5, 0.25, 1.0] {
+                layer.set_render_scale(scale);
+                layer.prepare(&device, &mut naval_render::UploadSink::Queue(&queue), &view, &sky, false);
+                // Four solid quadrants, already converged. Exact half-float values
+                // make an incorrect screen/depth coordinate mapping unambiguous.
+                let mut colors = Vec::<u16>::new();
+                let mut states = Vec::<u16>::new();
+                for y in 0..layer.height {
+                    for x in 0..layer.width {
+                        colors.extend_from_slice(&[if x < layer.width / 2 { 0x3400 } else { 0x3a00 },
+                            if y < layer.height / 2 { 0x3400 } else { 0x3a00 }, 0, 0x3c00]);
+                        states.extend_from_slice(&[0, 0x4800, 0, 0]);
+                    }
+                }
+                for (texture, pixels) in [(&layer.screen.history_color[layer.current].texture, colors),
+                    (&layer.screen.history_shadow_length[layer.current].texture, states)] {
+                    queue.write_texture(texture.as_image_copy(), bytemuck::cast_slice(&pixels),
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(layer.width * 8), rows_per_image: None },
+                        wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 });
+                }
+                for blocked in [false, true] {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    {
+                        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &depth_view, depth_ops: Some(wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(if blocked { 1.0 } else { 0.0 }),
+                                    store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                            ..Default::default()
+                        });
+                    }
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &output_view, depth_slice: None, resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store }
+                            })], ..Default::default()
+                        });
+                        layer.draw_composite(&mut pass);
+                    }
+                    encoder.copy_texture_to_buffer(output.as_image_copy(), wgpu::TexelCopyBufferInfo {
+                        buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0,
+                            bytes_per_row: Some(stride), rows_per_image: None }
+                    }, output.size());
+                    queue.submit([encoder.finish()]);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    readback.slice(..).map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
+                    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                    rx.recv().unwrap().unwrap();
+                    let pixels = readback.slice(..).get_mapped_range().unwrap();
+                    for (x, y) in [(4, 4), (60, 4), (4, 28), (60, 28)] {
+                        let at = (y * stride + x * 8) as usize;
+                        let pixel: Vec<_> = pixels[at..at + 8].chunks_exact(2)
+                            .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
+                        let expected = if blocked { vec![0; 4] } else {
+                            // The upstream composite preserves destination alpha.
+                            vec![if x < 32 { 0x3400 } else { 0x3a00 }, if y < 16 { 0x3400 } else { 0x3a00 }, 0, 0]
+                        };
+                        assert_eq!(pixel, expected, "scale {scale}, blocked {blocked}, pixel ({x},{y})");
+                    }
+                    drop(pixels);
+                    readback.unmap();
+                }
+            }
+            assert!(scope.pop().await.is_none(), "scaled cloud GPU validation");
+        });
+    }
 
     /// The WGSL struct's size and a few offsets, as naga lays them out, equal the Rust struct's.
     #[test]

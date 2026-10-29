@@ -9,6 +9,7 @@ mod attachments;
 mod breath;
 mod bodies;
 mod cloth;
+mod cloak;
 mod cosmetics;
 mod diagnostics;
 mod effects;
@@ -45,10 +46,11 @@ use attachments::WP_MELEE;
 use attachments::{
     body_queue_model1_weapon, reset_remote_player_saber_attachment, update_weapon_attachment,
     DEFAULT_PLAYER_MAXS, DEFAULT_PLAYER_MINS, DEFAULT_SABER_BLADE_LENGTH_MAX, DEFAULT_VIEWHEIGHT,
-    EF_BODYPUSH, EF_JETPACK, FORCE_LEVEL_2, FORCE_LEVEL_3, FP_GRIP, FP_PROTECT, FP_RAGE,
+    EF_BODYPUSH, EF_JETPACK, FORCE_LEVEL_2, FORCE_LEVEL_3, FP_GRIP, FP_PROTECT, FP_RAGE, FP_SEE,
     MAX_CLIENTS, MAX_GRIP_DISTANCE, MAX_SABER_BLADES, PUSH_BONE_NAMES, PW_DISINT_4, TEAM_SPECTATOR,
 };
 pub use attachments::{CosmeticDraw, PlayerFxRequest};
+use cloak::{CloakState, CloakVisual};
 use bodies::dismemberment::{
     dismember_source_entity, dismember_source_ready, source_dismember_surface_set,
     BodyQueueCopyState, DetachedLimbVisual, DismemberPart, DismemberSourceSnap,
@@ -78,7 +80,7 @@ use pose::{foot_bolts_timed, model_bolt_origin_timed, skin_surface_timed};
 use sabers::state::{EntityPlayerState, SaberBladeLengthKey, SaberBladeLengthState};
 use state::resolve_vehicle_model_request;
 use submission::mesh::{
-    build_joined_breast_bakes, build_lod_gpu_meshes, gpu_bones_from_pose, is_asset_pending, player_model_key,
+    build_joined_breast_bakes, build_lod_gpu_meshes, gpu_bones_with_heat_sources, is_asset_pending, player_model_key,
     sibling_default_skin_qpath, static_model_key, ASSET_PENDING,
 };
 use view::{
@@ -91,6 +93,7 @@ use view::{
     WP_BRYAR_PISTOL, WP_SABER,
 };
 pub use view::{Ghoul2PresentationView, ViewerAnimDebug};
+pub use studio_camera::{SABER_HILT_ANCHOR, SABER_TIP_ANCHOR};
 
 // Shared JKA player visual presentation for snapshot, followed, and local players.
 //
@@ -191,6 +194,17 @@ impl MindTrickFade {
 /// Asset/runtime state corresponding to the player-model subset of OpenJK cgame.
 /// Models and textures are cached by qpath; animation state is kept per entity,
 /// matching the persistent `centity_t` ownership in the original client.
+/// The other clip of a smoothed Render Studio transition.
+#[derive(Clone, Debug)]
+pub struct StudioPoseBlend {
+    pub animation_name: String,
+    pub time_ms: i32,
+    pub emote: Option<crate::emotes::Preview>,
+    pub frame_range: Option<(i32, i32)>,
+    /// Weight of this sample in the blend (0 = current clip only).
+    pub weight: f32,
+}
+
 pub struct PlayerPresenter {
     /// This frame's force-power FX requests (drained by the caller).
     fx_requests: Vec<PlayerFxRequest>,
@@ -221,9 +235,29 @@ pub struct PlayerPresenter {
     /// Viewer (cg.snap->ps) client and duel state for shells like the duel bubble.
     viewer_client: i32,
     viewer_dueling: bool,
+    /// Force Seeing is read from cg.snap->ps.fd.forcePowersActive, never the target.
+    viewer_force_see: bool,
+    /// TaystJK centity_t::cloaked/uncloaking, retained across frames.
+    cloak_states: HashMap<u16, CloakState>,
+    force_refractions: HashMap<u16, cloak::ForceRefractionState>,
+    /// CG_Player's local Force Seeing state; sourced from cg.snap->ps.fd,
+    /// not the target entity's forcePowersActive.
+    force_sight_level: i32,
+    force_sight_team: i32,
+    force_sight_gametype: i32,
     /// The viewer's `*l_leg_foot` / `*r_leg_foot` in model space from its last
     /// posed frame: `pmove_t::ghoul2` for prediction's leg-dangle slope anims.
     viewer_foot_bolts: Option<[[f32; 3]; 2]>,
+    /// Render Studio only: real bone coordinates of selected demo players.
+    studio_bone_masks: HashMap<u16,u8>,
+    studio_bones: HashMap<u16,[Option<[f32;3]>;6]>,
+    /// Render Studio "Saber tip" anchor: requested clients and their blade-1
+    /// tips (renderer space) from this frame's saber pass.
+    studio_saber_clients: Vec<u16>,
+    /// Render Studio first-person views of a demo player (victim POV, player
+    /// eyes): apply cg_fpls to that player instead of hiding it entirely.
+    pub studio_fpls: bool,
+    studio_saber_tips: HashMap<u16,([f32;3],[f32;3])>,
     /// What the viewer's model was told to play and the lerp frames it is on, for
     /// the `hitchmark` recorder.
     viewer_anim_debug: Option<ViewerAnimDebug>,
@@ -333,6 +367,8 @@ pub struct PlayerPresenter {
     preview_source_jiggles: HashMap<String, jka_assets::source1_jiggle::SourceJiggleAnimator>,
     /// r_jigglePhysics target selection by the loaded model's authored sex.
     jiggle_sex_filter: u8,
+    /// cg_hairPhysics: 0 off, 1 authored only, 2 authored and promoted native GLM hair.
+    hair_physics_mode: u8,
     /// Topology-only breast/glute height offsets. A change invalidates the cached
     /// player-model meshes so wireframe and promoted geometry update immediately.
     jiggle_remesh: JiggleRemeshTuning,
@@ -389,6 +425,7 @@ pub struct PlayerPresenter {
     /// original CM_Trace call this traces static BSP collision, not entities.
     collision_world: Option<CollisionWorld>,
     blob_shadow_opacity: f32,
+    blob_shadow_contact: bool,
     blob_shadow_instances: Vec<FxGpuSpriteInstance>,
     blob_shadow_texture: Option<Arc<TextureData>>,
     blob_shadow_alpha_mode: DynamicModelAlphaMode,
@@ -408,6 +445,9 @@ pub struct PlayerPresenter {
     /// Never shared with live entity state, and invalidated on model/clip or
     /// timeline discontinuities (including switching force demonstrations).
     profile_bone_smooth_history: Option<(String, String, i32, Vec<Matrix3x4>)>,
+    /// Render Studio smoothed clip transition: blend the next preview pose
+    /// with this other animation sample. Consumed by that one pose.
+    pub studio_pose_blend: Option<StudioPoseBlend>,
     /// TaystJK CG_MapTorsoToWeaponFrame's process-wide busy-holster state.
     view_weapon_frame: i32,
     view_weapon_frame_time: i32,

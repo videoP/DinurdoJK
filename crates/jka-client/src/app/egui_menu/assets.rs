@@ -904,10 +904,10 @@ impl App {
         // moving; model/shader paths cheaply return when their cache key matches.
         self.update_asset_preview_content();
 
-        // refresh_filesystem() invalidates this catalog. Defer it until every
+        // restart_filesystem() invalidates this catalog. Defer it until every
         // list index/reference from the current frame has been consumed.
         if refresh_requested {
-            self.refresh_filesystem();
+            self.restart_filesystem();
             self.egui_repaint_requested = true;
         }
     }

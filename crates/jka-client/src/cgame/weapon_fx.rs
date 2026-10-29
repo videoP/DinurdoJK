@@ -41,6 +41,9 @@ const WP_DEMP2: i32 = 9;
 const WP_FLECHETTE: i32 = 10;
 const WP_ROCKET_LAUNCHER: i32 = 11;
 const WP_THERMAL: i32 = 12;
+const WP_TRIP_MINE: i32 = 13;
+const EF_FIRING: i32 = 1 << 9;
+const FP_SEE: i32 = 14;
 const WP_DET_PACK: i32 = 14;
 const WP_CONCUSSION: i32 = 15;
 const WP_BRYAR_OLD: i32 = 16;
@@ -165,12 +168,30 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
             FxWorkerCommand::SetLightPromotionCatalog(catalog) => {
                 worker.fx.set_light_promotion_catalog(catalog);
             }
-            FxWorkerCommand::PlayDir { name, origin, dir } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir(id, origin, dir); } }
+            FxWorkerCommand::PlayDir { name, origin, dir } => {
+                let started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
+                let id = worker.effect(&name);
+                if id != 0 { worker.fx.play_effect_dir(id, origin, dir); }
+                if let Some(started) = started {
+                    use crate::fx::diagnostics as diag;
+                    diag::add(diag::FX_PLAY_US, diag::micros(started.elapsed()));
+                    diag::add(diag::FX_PLAY_CALLS, 1);
+                }
+            }
             FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
             FxWorkerCommand::PlayAxis { name, origin, axis } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect(id, origin, axis); } }
-            FxWorkerCommand::Frame { saber_impact_fx, runner_culling, reply } => { let frame = if runner_culling {
+            FxWorkerCommand::Frame { saber_impact_fx, runner_culling, reply } => {
+                let started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
+                let frame = if runner_culling {
                 worker.fx.frame_with_runner_tracking(saber_impact_fx)
-            } else { worker.fx.frame_with_visibility(saber_impact_fx) }; let _ = reply.send((frame, worker.fx.stats())); }
+            } else { worker.fx.frame_with_visibility(saber_impact_fx) };
+                if let Some(started) = started {
+                    use crate::fx::diagnostics as diag;
+                    diag::add(diag::WORKER_US, diag::micros(started.elapsed()));
+                    diag::add(diag::WORKER_CALLS, 1);
+                }
+                let _ = reply.send((frame, worker.fx.stats()));
+            }
             FxWorkerCommand::RefreshAssets { reply } => {
                 let retried = worker.missing.len();
                 let result = worker
@@ -358,6 +379,38 @@ pub fn profile_saber_blade_draws(
     draws
 }
 
+/// The Profile has a separate CPU-tessellated saber pass. Route its blade
+/// submission through the same `no_blade` decision as live WeaponFx, instead
+/// of discarding that flag when unpacking the PlayerFxRequest.
+/// `noBlade` is deliberately independent of `noDlight`: a hidden single blade
+/// can still illuminate its surroundings in TaystJK.
+pub(crate) fn profile_saber_blade_draws_for_request(
+    request: &PlayerFxRequest,
+    modern_sabers: bool,
+    rng: &mut Rng,
+) -> Vec<FxDraw> {
+    let PlayerFxRequest::SaberBlade {
+        origin, direction, length, length_max, radius, color,
+        entity_alpha, no_blade, ..
+    } = request else { return Vec::new(); };
+    if *no_blade { return Vec::new(); }
+    profile_saber_blade_draws(
+        *origin, *direction, *length, *length_max, *radius, *color,
+        *entity_alpha, modern_sabers, rng,
+    )
+}
+
+/// The Profile's CPU vertex light is only a menu approximation of the actual
+/// CG_DoSaber light. Honor the exact suppressors used by the gameplay effect
+/// path (including black single blades and fully hidden 3+ blade sabers).
+pub(crate) fn profile_saber_light_allowed(request: &PlayerFxRequest) -> bool {
+    let PlayerFxRequest::SaberBlade {
+        length, no_dlight, no_blade, num_blades, color, ..
+    } = request else { return false; };
+    *length >= 0.5 && !*no_dlight && !(*no_blade && *num_blades >= 3)
+        && (*num_blades >= 3 || *color != SABER_BLACK)
+}
+
 fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
@@ -539,6 +592,18 @@ fn player_impacts(weapon: i32, alt: bool) -> &'static [(&'static str, bool)] {
         (WP_ROCKET_LAUNCHER, _) => &[("rocket/explosion", false)],
         (WP_THERMAL, _) => &[("thermal/explosion", false), ("thermal/shockwave", true)],
         _ => &[],
+    }
+}
+
+/// Only armed and firing mines emit a standing beam; bolt2 selects the
+/// authored glow-only variation. Taken from TaystJK CG_General.
+fn armed_tripmine_effect(time: i32, weapon: i32, flags: i32, bolt2: i32) -> Option<&'static str> {
+    if time != -1 || weapon != WP_TRIP_MINE || flags & EF_FIRING == 0 {
+        None
+    } else if bolt2 == 1 {
+        Some("tripMine/glowbit")
+    } else {
+        Some("tripMine/laserMP")
     }
 }
 
@@ -839,6 +904,68 @@ struct Shard {
     stationary: bool,
 }
 
+// Armed tripmines are continuously presented, but their .efx emission must
+// follow cg_fxFPS rather than spawning fresh 50ms lines on every render frame.
+// The actual visible lines remain owned by the FX scheduler.
+#[derive(Clone, Debug)]
+struct TripmineLaserCadence {
+    last_seen_time: i32,
+    next_sample_time: f64,
+    effect: &'static str,
+    start: [f32; 3],
+    direction: [f32; 3],
+}
+
+fn tripmine_sample_due(
+    states: &mut HashMap<u16, TripmineLaserCadence>,
+    entity_number: u16,
+    time: i32,
+    fx_fps: u32,
+    effect: &'static str,
+    start: [f32; 3],
+    direction: [f32; 3],
+) -> bool {
+    // Explicit 0 retains the game's original per-presentation-frame density.
+    if fx_fps == crate::fx::FX_FPS_LEGACY_JKA { return true; }
+    let period = 1000.0 / f64::from(fx_fps.max(1));
+    use std::collections::hash_map::Entry;
+    let state = match states.entry(entity_number) {
+        Entry::Vacant(slot) => {
+            slot.insert(TripmineLaserCadence {
+                last_seen_time: time, next_sample_time: f64::from(time) + period,
+                effect, start, direction,
+            });
+            return true;
+        }
+        Entry::Occupied(slot) => slot.into_mut(),
+    };
+    // Entity-number reuse, rearming, map/demo seeks and moved/rotated mines
+    // start a new cadence at their current pose (never backfill old beams).
+    if time < state.last_seen_time
+        || time > state.last_seen_time.saturating_add(CONTINUOUS_FX_BACKFILL_MAX_MS * 4)
+        || state.effect != effect
+        || state.start.iter().zip(start)
+            .map(|(a, b)| (*a - b) * (*a - b)).sum::<f32>() > 32.0 * 32.0
+        || state.direction.iter().zip(direction)
+            .map(|(a, b)| *a * b).sum::<f32>() < 0.90
+    {
+        *state = TripmineLaserCadence {
+            last_seen_time: time, next_sample_time: f64::from(time) + period,
+            effect, start, direction,
+        };
+        return true;
+    }
+    state.last_seen_time = time;
+    state.start = start;
+    state.direction = direction;
+    if f64::from(time) + 1.0e-6 < state.next_sample_time { return false; }
+    // One EFX play at most per presentation frame; advance the fixed-rate
+    // phase past 'time' without queuing bursts after slow frames.
+    let missed = ((f64::from(time) - state.next_sample_time) / period).floor().max(0.0);
+    state.next_sample_time += (missed + 1.0) * period;
+    true
+}
+
 const SHARD_LIFE_MS: i32 = 6000;
 const MAX_SHARDS: usize = 1024;
 
@@ -875,6 +1002,7 @@ pub struct WeaponFx {
     cached_stats: FxStats,
     entity_fx: HashMap<u16, EntityFxState>,
     missile_fx: HashMap<u16, MissileFxState>,
+    tripmine_fx: HashMap<u16, TripmineLaserCadence>,
     /// `0` is stock JKA: invoke continuous projectile FX every presentation
     /// frame. Non-zero values sample them at a fixed rate independent of FPS.
     continuous_fx_fps: u32,
@@ -983,6 +1111,7 @@ impl WeaponFx {
             cached_stats: FxStats::default(),
             entity_fx: HashMap::new(),
             missile_fx: HashMap::new(),
+            tripmine_fx: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
@@ -1190,6 +1319,7 @@ impl WeaponFx {
             // Start the new cadence from the next presented sample instead of
             // inheriting phase from the previous rate/mode.
             self.missile_fx.clear();
+            self.tripmine_fx.clear();
             self.saber_contact_history.clear();
         }
     }
@@ -1210,6 +1340,7 @@ impl WeaponFx {
         let _ = self.worker_tx.send(FxWorkerCommand::ResetTime(time));
         self.entity_fx.clear();
         self.missile_fx.clear();
+        self.tripmine_fx.clear();
         self.vehicle_weapon_names.clear();
         self.reported_vehicle_weapon_missing.clear();
         self.puffs.clear();
@@ -1255,6 +1386,7 @@ impl WeaponFx {
             self.pending_glass.clear();
             self.entity_fx.clear();
             self.missile_fx.clear();
+            self.tripmine_fx.clear();
             self.saber_trail_history.clear();
             self.saber_trail_segments.clear();
             self.saber_clash_flare = None;
@@ -1265,6 +1397,9 @@ impl WeaponFx {
         }
         self.missile_fx.retain(|_, state| {
             time <= state.last_time.saturating_add(CONTINUOUS_FX_BACKFILL_MAX_MS * 4)
+        });
+        self.tripmine_fx.retain(|_, state| {
+            time <= state.last_seen_time.saturating_add(CONTINUOUS_FX_BACKFILL_MAX_MS * 4)
         });
         self.repeated_time = time == self.time && !self.fresh_time;
         self.fresh_time = false;
@@ -1632,9 +1767,15 @@ impl WeaponFx {
     /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
     pub fn end_frame(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
+        let fx_diag_started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
         let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { saber_impact_fx: self.saber_impact_fx, runner_culling: self.runner_culling, reply }).is_ok() {
             match recv.recv() { Ok((frame, stats)) => { self.cached_stats = stats; frame }, Err(_) => FxFrame::default() }
         } else { FxFrame::default() };
+        if let Some(started) = fx_diag_started {
+            use crate::fx::diagnostics as diag;
+            diag::add(diag::FX_END_FRAMES, 1);
+            diag::add(diag::WORKER_WAIT_US, diag::micros(started.elapsed()));
+        }
         let time = self.time;
         self.saber_trail_segments.retain(|segment| {
             if time >= segment.end_time {
@@ -1707,7 +1848,9 @@ impl WeaponFx {
                 // feed them through the SAME material classifier and merging
                 // pass, rather than introducing a parallel light renderer.
                 let length2 = spec.start.iter().zip(spec.end).map(|(a, b)| (*a - b) * (*a - b)).sum::<f32>();
-                if length2 > 16.0 {
+                // FX_AddLine does not impose a 4u minimum line length.
+                // Aggressive promotion projects all finite non-degenerate beams.
+                if length2.is_finite() && length2 > 1.0e-8 {
                     let effect = spec.shader.bytes().fold(2166136261_u32, |h, b| h.wrapping_mul(16777619) ^ u32::from(b));
                     frame.auto_light_candidates.push(FxAutoLightCandidate {
                         effect, score: 3, kind: PrimType::Line,
@@ -2109,6 +2252,7 @@ impl WeaponFx {
                 trail_style,
                 num_blades,
                 no_dlight,
+                no_blade,
                 no_wall_marks,
             } => {
                 let key = SaberTrailKey {
@@ -2131,7 +2275,7 @@ impl WeaponFx {
                     *length,
                     *color,
                     *num_blades,
-                    *no_dlight,
+                    *no_dlight || (*no_blade && *num_blades >= 3),
                 );
                 self.saber_trail(
                     key,
@@ -2145,15 +2289,17 @@ impl WeaponFx {
                     *saber_in_flight,
                     *trail_style,
                 );
-                self.saber_blade(
-                    *origin,
-                    *direction,
-                    clipped_length,
-                    *length_max,
-                    *radius,
-                    *color,
-                    *entity_alpha,
-                );
+                if !*no_blade {
+                    self.saber_blade(
+                        *origin,
+                        *direction,
+                        clipped_length,
+                        *length_max,
+                        *radius,
+                        *color,
+                        *entity_alpha,
+                    );
+                }
             }
             PlayerFxRequest::PushPuffs { origin } => {
                 // CG_ForcePushBlur (LE_PUFF path).
@@ -2816,6 +2962,54 @@ impl WeaponFx {
         self.worker_tx
             .send(FxWorkerCommand::PlayDir { name: name.to_owned(), origin, dir })
             .is_ok()
+    }
+
+    /// TaystJK CG_General: armed tripmines continuously emit authored .efx.
+    /// cg_fxFPS resamples the *emissions*, rather than starting a new 50ms
+    /// effect on every presentation frame. Rendering and FX promotion are
+    /// independent, and Force Sight's extra visuals remain supported.
+    pub fn tripmine_laser(&mut self, entity: &PresentedEntity, game: &ClientGameState) {
+        let state = &entity.state;
+        let Some(effect) = armed_tripmine_effect(
+            state.field_i32("time").unwrap_or(0),
+            state.field_i32("weapon").unwrap_or(0),
+            state.field_i32("eFlags").unwrap_or(0),
+            state.field_i32("bolt2").unwrap_or(0),
+        ) else {
+            self.tripmine_fx.remove(&entity.number);
+            return;
+        };
+        if self.repeated_time { return; }
+        // ent.origin + 6.6 * ent.axis[0], preserving CG_General's angles.
+        let angles = entity.angles;
+        let (sp, cp) = angles[0].to_radians().sin_cos();
+        let (sy, cy) = angles[1].to_radians().sin_cos();
+        let forward = [cp * cy, cp * sy, -sp];
+        let start: [f32; 3] = std::array::from_fn(|i| entity.origin[i] + 6.6 * forward[i]);
+        let Some(delta) = super::entity_vec3(state, "pos.trDelta") else { return; };
+        if !delta.iter().all(|v| v.is_finite()) { return; }
+        let len2: f32 = delta.iter().map(|v| v * v).sum();
+        if len2 < 1.0e-10 { return; }
+        let inv_len = len2.sqrt().recip();
+        let direction = delta.map(|v| v * inv_len);
+        if !tripmine_sample_due(
+            &mut self.tripmine_fx, entity.number, self.time,
+            self.continuous_fx_fps, effect, start, direction,
+        ) { return; }
+        // Force Sight boosts visibility exactly as CG_General: 2 extra plays
+        // per active force level plus the baseline single play.
+        let sight_level = if effect == "tripMine/laserMP" {
+            game.presentation_player_state().map_or(0, |ps| {
+                let active = ps.field_i32("fd.forcePowersActive").unwrap_or(0);
+                if active & (1 << FP_SEE) != 0 {
+                    ps.field_i32("fd.forcePowerLevel[FP_SEE]").unwrap_or(0).clamp(0, 3)
+                } else { 0 }
+            })
+        } else { 0 };
+        for _ in 0..(1 + sight_level * 2) {
+            crate::fx::diagnostics::add(crate::fx::diagnostics::TRIPMINE_PLAYS, 1);
+            self.play(effect, start, direction);
+        }
     }
 
     fn play_saber_impact(&mut self, name: &str, origin: [f32; 3], dir: [f32; 3]) -> bool {
@@ -3962,6 +4156,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_saber_respects_no_blade_and_no_dlight_independently() {
+        let blade = PlayerFxRequest::SaberBlade {
+            origin: [1.0, 2.0, 3.0], direction: [1.0, 0.0, 0.0],
+            length: 40.0, length_max: 40.0, radius: 3.0, color: 0,
+            entity_alpha: 1.0, entity_num: 0, saber_num: 0, blade_num: 0,
+            saber_move: 0, torso_anim: 0, saber_in_flight: false,
+            trail_style: 0, num_blades: 1,
+            no_blade: false, no_dlight: false, no_wall_marks: false,
+        };
+        let mut rng = Rng::new(1234);
+        assert!(!profile_saber_blade_draws_for_request(&blade, false, &mut rng).is_empty());
+        assert!(!profile_saber_blade_draws_for_request(&blade, true, &mut rng).is_empty());
+        assert!(profile_saber_light_allowed(&blade));
+
+        let mut hidden = blade.clone();
+        if let PlayerFxRequest::SaberBlade { no_blade, .. } = &mut hidden { *no_blade = true; }
+        for modern in [false, true] {
+            assert!(profile_saber_blade_draws_for_request(&hidden, modern, &mut rng).is_empty(),
+                "Profile must honor noBlade in both its classic and modern shader paths");
+        }
+        assert!(profile_saber_light_allowed(&hidden),
+            "TaystJK noBlade must not implicitly set noDlight for a single blade");
+
+        let mut dark = blade.clone();
+        if let PlayerFxRequest::SaberBlade { no_dlight, .. } = &mut dark { *no_dlight = true; }
+        assert!(!profile_saber_blade_draws_for_request(&dark, false, &mut rng).is_empty(),
+            "noDlight alone must not remove the visible blade");
+        assert!(!profile_saber_light_allowed(&dark));
+        let mut fully_hidden = hidden.clone();
+        if let PlayerFxRequest::SaberBlade { no_dlight, .. } = &mut fully_hidden { *no_dlight = true; }
+        assert!(profile_saber_blade_draws_for_request(&fully_hidden, false, &mut rng).is_empty());
+        assert!(!profile_saber_light_allowed(&fully_hidden));
+
+        let mut hidden_staff = hidden;
+        if let PlayerFxRequest::SaberBlade { num_blades, .. } = &mut hidden_staff { *num_blades = 3; }
+        assert!(!profile_saber_light_allowed(&hidden_staff),
+            "TaystJK CG_DoSaberLight also suppresses hidden multi-blade light");
+        let mut black = blade;
+        if let PlayerFxRequest::SaberBlade { color, .. } = &mut black { *color = SABER_BLACK; }
+        assert!(!profile_saber_light_allowed(&black),
+            "Black single blades have no stock saber dlight");
+    }
+
+    #[test]
     fn projected_efx_marks_respect_world_geometry_count_and_lifetime() {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
@@ -4343,7 +4581,7 @@ mod tests {
             saber_in_flight: false,
             trail_style: 0,
             num_blades: 1,
-            no_dlight: false,
+            no_dlight: false, no_blade: false,
             no_wall_marks: false,
         };
 
@@ -4418,7 +4656,7 @@ mod tests {
             saber_in_flight: false,
             trail_style: 0,
             num_blades: 1,
-            no_dlight: true,
+            no_dlight: true, no_blade: false,
             no_wall_marks: false,
         };
         fx.begin_frame(1000);
@@ -4426,6 +4664,32 @@ mod tests {
         let frame = fx.end_frame();
         assert!(frame.lights.is_empty());
         assert!(!frame.draws.is_empty(), "noDlight must not suppress the blade itself");
+    }
+
+    #[test]
+    fn tayst_no_blade_keeps_optional_single_blade_light_but_never_draws_core() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        let blade = PlayerFxRequest::SaberBlade {
+            origin: [0.0; 3], direction: [1.0, 0.0, 0.0], length: 32.0,
+            length_max: 32.0, radius: 3.0, color: crate::cgame::SABER_BLUE, entity_alpha: 1.0,
+            entity_num: 2, saber_num: 0, blade_num: 0, saber_move: 0,
+            torso_anim: 0, saber_in_flight: false, trail_style: 2,
+            num_blades: 1, no_dlight: false, no_blade: true, no_wall_marks: false,
+        };
+        fx.begin_frame(1000);
+        fx.player_fx(&blade);
+        let frame = fx.end_frame();
+        assert!(frame.draws.is_empty(), "noBlade forbids blade core and glow");
+        assert_eq!(frame.lights.len(), 1, "TaystJK allows noBlade to still cast light");
+
+        fx.begin_frame(1100);
+        let mut dark = blade;
+        if let PlayerFxRequest::SaberBlade { no_dlight, .. } = &mut dark { *no_dlight = true; }
+        fx.player_fx(&dark);
+        let frame = fx.end_frame();
+        assert!(frame.draws.is_empty());
+        assert!(frame.lights.is_empty(), "noBlade plus noDlight is fully invisible");
     }
 
     #[test]
@@ -4454,7 +4718,7 @@ mod tests {
                 saber_in_flight: false,
                 trail_style: 0,
                 num_blades: 3,
-                no_dlight: false,
+                no_dlight: false, no_blade: false,
                 no_wall_marks: false,
             });
         }
@@ -4512,7 +4776,7 @@ mod tests {
             origin: [0.0, 0.0, 0.0], direction: [1.0, 0.0, 0.0], length: 10.0, length_max: 10.0, radius: 2.0,
             color: 4, entity_alpha: 1.0, entity_num: 2, saber_num: 0, blade_num: 0,
             saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
-            num_blades: 1, no_dlight: false, no_wall_marks: false,
+            num_blades: 1, no_dlight: false, no_blade: false, no_wall_marks: false,
         };
         fx.begin_frame(1000);
         fx.player_fx(&blade);
@@ -4547,7 +4811,7 @@ mod tests {
             origin, direction: [1.0, 0.0, 0.0], length, length_max: 40.0, radius: 2.0,
             color: 4, entity_alpha: 1.0, entity_num: 2, saber_num: 0, blade_num: 1,
             saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
-            num_blades: 2, no_dlight: false, no_wall_marks: false,
+            num_blades: 2, no_dlight: false, no_blade: false, no_wall_marks: false,
         };
         let has_quad = |frame: &FxFrame| frame.draws.iter().any(|draw| matches!(draw, FxDraw::Quad { .. }));
 
@@ -4816,5 +5080,114 @@ mod event_beam_tests {
         let gib = event(EntityEvent::EV_GIB_PLAYER, 0, &[]);
         fx.entity_event_prepared(&gib, &prepare(&gib));
         assert_eq!(fx.chunk_models().len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod tripmine_laser_tests {
+    use super::*;
+    #[test]
+    fn tripmine_fx_obeys_fixed_rate_per_entity_and_resets_after_rearming() {
+        let mut states = HashMap::new();
+        let o = [10.0, 20.0, 30.0];
+        let d = [1.0, 0.0, 0.0];
+        let e = "tripMine/laserMP";
+        let mut emissions = 0;
+        for time in 0..1000 {
+            if tripmine_sample_due(&mut states, 5, time, 90, e, o, d) { emissions += 1; }
+        }
+        assert!((89..=91).contains(&emissions), "90 Hz emission got {emissions}");
+        assert_eq!(states.len(), 1);
+        // Slow moving/attached lasers should stay rate limited too.
+        let mut moving = HashMap::new();
+        let mut moving_emissions = 0;
+        for time in 0..1000 {
+            let start = [time as f32 * 0.1, 0.0, 0.0];
+            if tripmine_sample_due(&mut moving, 15, time, 90, e, start, d) {
+                moving_emissions += 1;
+            }
+        }
+        assert!((89..=91).contains(&moving_emissions));
+        assert!(tripmine_sample_due(&mut states, 6, 500, 90, e, o, d));
+        assert!(!tripmine_sample_due(&mut states, 6, 501, 90, e, o, d));
+        // Moved mine / entity-number reuse must emit immediately.
+        assert!(tripmine_sample_due(&mut states, 6, 502, 90, e, [75.0, 20.0, 30.0], d));
+        assert!(tripmine_sample_due(&mut states, 6, 503, 0, e, o, d));
+        assert!(tripmine_sample_due(&mut states, 6, 504, 0, e, o, d));
+        // Seek backwards or restart must not preserve the prior cadence.
+        assert!(tripmine_sample_due(&mut states, 6, 100, 90, e, o, d));
+    }
+
+    #[test]
+    fn tripmine_fx_cadence_does_not_backfill_or_burst_after_long_frames() {
+        let mut states = HashMap::new();
+        let o = [0.0; 3];
+        let d = [0.0, 1.0, 0.0];
+        assert!(tripmine_sample_due(&mut states, 1, 0, 90, "tripMine/laserMP", o, d));
+        assert!(tripmine_sample_due(&mut states, 1, 100, 90, "tripMine/laserMP", o, d));
+        assert!(!tripmine_sample_due(&mut states, 1, 101, 90, "tripMine/laserMP", o, d));
+    }
+
+
+    #[test]
+    fn tripmine_emission_uses_mount_direction_force_sight_and_advancing_time() {
+        use jka_protocol::{gamestate::{EntityState, ENTITY_FIELDS}, server::{PlayerState, Snapshot}};
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        // Observe presentation requests without requiring installed game assets.
+        let (tx, rx) = mpsc::channel();
+        fx.worker_tx = tx;
+        let mut state = EntityState { number: 7, fields: [0; ENTITY_FIELDS.len()] };
+        let set = |state: &mut EntityState, name: &str, bits: u32| {
+            state.fields[ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap()] = bits;
+        };
+        set(&mut state, "time", (-1_i32) as u32);
+        set(&mut state, "weapon", WP_TRIP_MINE as u32);
+        set(&mut state, "eFlags", EF_FIRING as u32);
+        set(&mut state, "pos.trDelta[1]", 2.0_f32.to_bits());
+        let mut entity = PresentedEntity {
+            number: 7, entity_type: super::super::ET_GENERAL,
+            origin: [10.0, 20.0, 30.0], angles: [0.0; 3], state,
+        };
+        for (step, (active, level, glow, count)) in [
+            (false, 3, false, 1), (true, 1, false, 3),
+            (true, 2, false, 5), (true, 3, false, 7), (true, 3, true, 1),
+        ].into_iter().enumerate() {
+            let mut player_state = PlayerState::default();
+            assert!(player_state.set_field_bits("fd.forcePowersActive", if active { 1 << FP_SEE } else { 0 }));
+            assert!(player_state.set_field_bits("fd.forcePowerLevel[FP_SEE]", level));
+            let mut game = ClientGameState::new();
+            game.set_initial_snapshot(&Snapshot {
+                server_time: 1000, message_num: 1, delta_num: -1, snap_flags: 0, ping: 0,
+                server_command_num: 0, area_mask: [0; 32], player_state,
+                vehicle_player_state: None, entities: Vec::new(),
+            }).unwrap();
+            set(&mut entity.state, "bolt2", u32::from(glow));
+            let time = 1000 + step as i32 * 16;
+            fx.begin_frame(time);
+            fx.tripmine_laser(&entity, &game);
+            let plays: Vec<_> = rx.try_iter().filter_map(|command| match command {
+                FxWorkerCommand::PlayDir { name, origin, dir } => Some((name, origin, dir)),
+                _ => None,
+            }).collect();
+            assert_eq!(plays.len(), count);
+            for (name, origin, dir) in plays {
+                assert_eq!(name, if glow { "tripMine/glowbit" } else { "tripMine/laserMP" });
+                assert_eq!(origin, [16.6, 20.0, 30.0], "mount angle controls the offset");
+                assert_eq!(dir, [0.0, 1.0, 0.0], "trajectory controls the beam direction");
+            }
+            fx.begin_frame(time);
+            fx.tripmine_laser(&entity, &game);
+            assert!(!rx.try_iter().any(|command| matches!(command, FxWorkerCommand::PlayDir { .. })),
+                "paused frames must not accumulate standing effects");
+        }
+    }
+
+    #[test]
+    fn standing_tripmine_selection_matches_taystjk() {
+        assert_eq!(armed_tripmine_effect(-1, WP_TRIP_MINE, EF_FIRING, 0), Some("tripMine/laserMP"));
+        assert_eq!(armed_tripmine_effect(-1, WP_TRIP_MINE, EF_FIRING, 1), Some("tripMine/glowbit"));
+        assert_eq!(armed_tripmine_effect(0, WP_TRIP_MINE, EF_FIRING, 0), None);
+        assert_eq!(armed_tripmine_effect(-1, WP_TRIP_MINE, 0, 0), None);
+        assert_eq!(armed_tripmine_effect(-1, WP_DISRUPTOR, EF_FIRING, 0), None);
     }
 }

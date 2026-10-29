@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn projects_jka_world_axes_to_output_pixels_and_detects_behind_camera() {
-        let matrix = Mat4::perspective_rh(90.0_f32.to_radians(), 2.0, 0.1, 100.0);
+        let matrix = glam::camera::rh::proj::directx::perspective(90.0_f32.to_radians(), 2.0, 0.1, 100.0);
         let (center, inside) = project([0.0, 5.0, 0.0], matrix, [200, 100]);
         assert!(inside);
         assert!((center[0] - 100.0).abs() < 0.001);

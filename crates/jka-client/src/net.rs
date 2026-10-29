@@ -18,7 +18,7 @@ use jka_protocol::{
     commands::{atoi, info_value},
     netchan::UserCmd,
     server::{PlayerState, Snapshot},
-    session::{set_info_value, ClientSession, ConnectionState, SessionEvent, CMD_BACKUP},
+    session::{set_info_value, ClientSession, ConnectionState, SessionEvent},
 };
 
 pub mod mod_support;
@@ -1442,47 +1442,95 @@ pub struct SolidEntity {
     pub bounds: Option<([f32; 3], [f32; 3])>,
 }
 
-/// CG_BuildSolidList over this frame's lerped entities: triggers and items
-/// are not solid; `solid` is either SOLID_BMODEL or an encoded bbox. Brush
-/// models sit where their trajectory puts them at `physics_time`
-/// (CG_ClipMoveToEntities: `BG_EvaluateTrajectory(&currentState.pos,
-/// cg.physicsTime)`), the time the predicted commands are replayed from, not
-/// at the smoothed render time.
-pub fn solid_entities(entities: &[crate::cgame::PresentedEntity], physics_time: i32) -> Vec<SolidEntity> {
-    const ET_ITEM: i32 = 2;
-    const ET_PUSH_TRIGGER: i32 = 10;
-    const ET_TELEPORT_TRIGGER: i32 = 11;
+/// CG_BuildSolidList excludes item/push/teleport triggers. Unlike an
+/// eType-based missile exclusion, this still permits genuinely solid missiles
+/// (for example when a server explicitly enables solid owner rockets).
+fn prediction_trigger(entity_type: i32) -> bool {
+    matches!(entity_type, 2 | 10 | 11) // ET_ITEM, ET_PUSH_TRIGGER, ET_TELEPORT_TRIGGER
+}
+
+/// CG_ClipMoveToEntities resolves shape and placement from currentState, not
+/// from the next snapshot's `solid` that admitted the entity to the list.
+/// Keeping these steps separate matters when projectiles spawn/despawn.
+fn solid_entity_from_state(
+    state: &jka_protocol::gamestate::EntityState,
+    origin: [f32; 3],
+    angles: [f32; 3],
+    physics_time: i32,
+) -> SolidEntity {
     const SOLID_BMODEL: i32 = 0x00ff_ffff;
-    entities
-        .iter()
-        .filter(|entity| !matches!(entity.entity_type, ET_ITEM | ET_PUSH_TRIGGER | ET_TELEPORT_TRIGGER))
-        .filter_map(|entity| {
-            let solid = entity.state.field_i32("solid").unwrap_or(0);
-            if solid == 0 {
-                return None;
-            }
-            let clip = if solid == SOLID_BMODEL {
-                EntityClip::InlineModel {
-                    index: entity.state.field_i32("modelindex").unwrap_or(0),
-                    origin: crate::cgame::evaluate_entity_trajectory(&entity.state, "pos", physics_time).unwrap_or(entity.origin),
-                    angles: entity.angles,
-                }
-            } else {
-                // Encoded bbox: x, down, up - 32.
-                let x = (solid & 255) as f32;
-                let zd = ((solid >> 8) & 255) as f32;
-                let zu = ((solid >> 16) & 255) as f32 - 32.0;
-                EntityClip::Box { mins: [-x, -x, -zd], maxs: [x, x, zu], origin: entity.origin }
-            };
-            Some(SolidEntity {
-                number: i32::from(entity.number),
-                generic_enemy_index: entity.state.field_i32("genericenemyindex").unwrap_or(0),
-                skip_movement: false,
-                clip,
-                bounds: None,
-            })
-        })
+    let solid = state.field_i32("solid").unwrap_or(0);
+    let clip = if solid == SOLID_BMODEL {
+        EntityClip::InlineModel {
+            index: state.field_i32("modelindex").unwrap_or(0),
+            origin: crate::cgame::evaluate_entity_trajectory(state, "pos", physics_time).unwrap_or(origin),
+            angles,
+        }
+    } else {
+        // OpenJK's packed bbox: (x radius, down extent, up extent + 32).
+        let x = (solid & 255) as f32;
+        let zd = ((solid >> 8) & 255) as f32;
+        let zu = ((solid >> 16) & 255) as f32 - 32.0;
+        EntityClip::Box { mins: [-x, -x, -zd], maxs: [x, x, zu], origin }
+    };
+    SolidEntity {
+        number: i32::from(state.number),
+        generic_enemy_index: state.field_i32("genericenemyindex").unwrap_or(0),
+        skip_movement: false,
+        clip,
+        bounds: None,
+    }
+}
+
+/// Solid geometry from the presented scene (for HUD/debug geometry queries).
+/// Network movement prediction must use `prediction_solid_entities` instead.
+pub fn solid_entities(entities: &[crate::cgame::PresentedEntity], physics_time: i32) -> Vec<SolidEntity> {
+    entities.iter()
+        .filter(|e| !prediction_trigger(e.entity_type) && e.state.field_i32("solid").unwrap_or(0) != 0)
+        .map(|e| solid_entity_from_state(&e.state, e.origin, e.angles, physics_time))
         .collect()
+}
+
+/// TaystJK CG_BuildSolidList selects cg.nextSnap (unless a teleport boundary)
+/// and admits entities by their *nextState.solid*. CG_ClipMoveToEntities then
+/// clips using currentState and lerpOrigin. Using the renderer's current-snap
+/// list for both jobs makes projectiles appear solid for an extra snapshot,
+/// even after the authoritative collision bit has been cleared.
+///
+/// `solid_snapshot` is the already selected Pmove base snapshot: the caller
+/// applies TaystJK's next-snapshot / teleport gating before calling us.
+fn prediction_solid_entities(
+    solid_snapshot: &Snapshot,
+    presented: &[crate::cgame::PresentedEntity],
+    physics_time: i32,
+) -> Vec<SolidEntity> {
+    const MAX_GENTITIES: usize = 1024;
+    let mut current = [None; MAX_GENTITIES];
+    for entity in presented {
+        if let Some(slot) = current.get_mut(usize::from(entity.number)) {
+            *slot = Some(entity);
+        }
+    }
+    let mut solids = Vec::with_capacity(solid_snapshot.entities.len());
+    for next in &solid_snapshot.entities {
+        let displayed = current.get(usize::from(next.number)).copied().flatten();
+        // CG_BuildSolidList tests currentState.eType, but nextState.solid.
+        let current_type = displayed.map_or_else(|| next.field_i32("eType").unwrap_or(0), |e| e.entity_type);
+        if prediction_trigger(current_type) || next.field_i32("solid").unwrap_or(0) == 0 {
+            continue;
+        }
+        let (state, origin, angles) = if let Some(visible) = displayed {
+            (&visible.state, visible.origin, visible.angles)
+        } else {
+            // An entity just entering nextSnap can be absent from the current
+            // rendered scene. Use its own trajectory until it becomes current.
+            let origin = crate::cgame::evaluate_entity_trajectory(next, "pos", physics_time).unwrap_or([0.0; 3]);
+            let angles = crate::cgame::evaluate_entity_trajectory(next, "apos", physics_time).unwrap_or([0.0; 3]);
+            (next, origin, angles)
+        };
+        solids.push(solid_entity_from_state(state, origin, angles, physics_time));
+    }
+    solids
 }
 
 const ET_MOVER: i32 = 6;
@@ -1980,7 +2028,7 @@ impl Predictor {
         let old = self.predicted.clone().expect("seeded above");
 
         let current = session.cmd_number();
-        let first = current - CMD_BACKUP as i32 + 1;
+        let first = current - session.command_window() as i32 + 1;
         let command = |number: i32| session.command(number).unwrap_or_default();
         let oldest = command(first);
         if oldest.server_time > snap.player_state.field_i32("commandTime").unwrap_or(0) && oldest.server_time < time {
@@ -2032,7 +2080,7 @@ impl Predictor {
         {
             physics_time = base_ps.field_i32("commandTime").unwrap_or(0) + 8;
         }
-        let mut solids = solid_entities(entities, physics_time);
+        let mut solids = prediction_solid_entities(base, entities, physics_time);
         let native = match &mut self.native {
             Some(native) => {
                 native.configure(&prediction_settings)?;
@@ -2055,18 +2103,19 @@ impl Predictor {
         native.set_foot_bolts(self.foot_bolts)?;
         native.configure(&prediction_settings)?;
         {
-            let prediction_entities: Vec<_> = entities.iter().map(|entity| {
-                let int = |key| entity.state.field_i32(key).unwrap_or(0);
-                let float = |key| entity.state.field_f32(key).unwrap_or(0.0);
+            let as_prediction_entity = |state: &jka_protocol::gamestate::EntityState| {
+                let int = |key| state.field_i32(key).unwrap_or(0);
+                let float = |key| state.field_f32(key).unwrap_or(0.0);
+                let entity_type = int("eType");
                 jka_movement::PredictionEntity {
-                    number: i32::from(entity.number), entity_type: entity.entity_type,
+                    number: i32::from(state.number), entity_type,
                     model_index: int("modelindex"), bolt1: int("bolt1"),
                     trajectory_type: int("pos.trType"),
                     origin: [float("pos.trBase[0]"), float("pos.trBase[1]"), float("pos.trBase[2]")],
                     velocity: [float("pos.trDelta[0]"), float("pos.trDelta[1]"), float("pos.trDelta[2]")],
                     angular_velocity: [float("apos.trDelta[0]"), float("apos.trDelta[1]"), float("apos.trDelta[2]")],
                     legs_anim: int("legsAnim"), torso_anim: int("torsoAnim"), saber_move: int("saberMove"),
-                    mover_class: if entity.entity_type == 6 {
+                    mover_class: if entity_type == 6 {
                         entity_graph.and_then(|graph| graph.entities.iter().find(|map_ent| {
                             map_ent.inline_model == u32::try_from(int("modelindex")).ok()
                         })).map_or(0, |map_ent| match map_ent.classname.to_ascii_lowercase().as_str() {
@@ -2076,7 +2125,26 @@ impl Predictor {
                         })
                     } else { 0 },
                 }
-            }).collect();
+            };
+            let mut prediction_entities: Vec<_> = entities.iter()
+                .map(|entity| as_prediction_entity(&entity.state)).collect();
+            // A rocket/mover first seen in the selected nextSnap might not yet
+            // have a rendered currentState. Still register it with native Pmove
+            // so the same JA+/jaPRO clipping gates apply to its solid entry.
+            let mut registered = [false; 1024];
+            for entity in &prediction_entities {
+                if let Ok(index) = usize::try_from(entity.number) {
+                    if let Some(slot) = registered.get_mut(index) { *slot = true; }
+                }
+            }
+            for entity in &base.entities {
+                if let Some(slot) = registered.get_mut(usize::from(entity.number)) {
+                    if !*slot {
+                        prediction_entities.push(as_prediction_entity(entity));
+                        *slot = true;
+                    }
+                }
+            }
             native.set_prediction_entities(&prediction_entities)?;
             let mut skip = [false; 1024];
             for entity in &prediction_entities {
@@ -2609,6 +2677,7 @@ mod tests {
             let index = ENTITY_FIELDS.iter().position(|(n, _)| *n == name).unwrap();
             state.fields[index] = bits;
         };
+        set("eType", entity_type as u32);
         set("pos.trType", 2); // TR_LINEAR
         set("pos.trTime", 0);
         for axis in 0..3 {
@@ -2651,6 +2720,54 @@ mod tests {
         let mut follower = standing_on(70);
         follower.set_field_bits("pm_flags", PMF_FOLLOW_FLAG as u32);
         assert_eq!(adjust_position_for_mover(&entities, &follower, position, 0, 500), position);
+    }
+
+    #[test]
+    fn rocket_solidity_is_authoritative_not_inferred_from_missile_type() {
+        // A normal rocket on a server without solid-owner rockets is visual
+        // only. A server explicitly marking it solid must still be honored.
+        let mut rocket = mover_entity(77, 3, [10.0, 20.0, 30.0], [500.0, 0.0, 0.0]);
+        let solid_field = jka_protocol::gamestate::ENTITY_FIELDS.iter()
+            .position(|(name, _)| *name == "solid").unwrap();
+        assert!(solid_entities(&[rocket.clone()], 500).is_empty());
+        rocket.state.fields[solid_field] = 0x0048_180f; // 15/24/40 bbox
+        let solids = solid_entities(&[rocket], 500);
+        assert_eq!(solids.len(), 1, "do not suppress intentionally solid missiles");
+        assert!(matches!(solids[0].clip, EntityClip::Box { .. }));
+    }
+
+    #[test]
+    fn selected_next_snapshot_controls_solid_list_not_stale_rendered_rockets() {
+        let mut rocket = mover_entity(77, 3, [10.0, 20.0, 30.0], [500.0, 0.0, 0.0]);
+        let solid_field = jka_protocol::gamestate::ENTITY_FIELDS.iter()
+            .position(|(name, _)| *name == "solid").unwrap();
+        let snapshot = |entity: jka_protocol::gamestate::EntityState| Snapshot {
+            server_time: 500, message_num: 5, delta_num: 4, snap_flags: 0,
+            ping: 0, server_command_num: 0, area_mask: [0; 32],
+            player_state: PlayerState::default(), vehicle_player_state: None,
+            entities: vec![entity],
+        };
+        // The displayed rocket is still marked solid in currentState, but
+        // its nextState already cleared the bit. CG_BuildSolidList drops it.
+        rocket.state.fields[solid_field] = 0x0048_180f;
+        let mut non_solid = rocket.state.clone();
+        non_solid.fields[solid_field] = 0;
+        let next = snapshot(non_solid);
+        assert_eq!(solid_entities(&[rocket.clone()], 500).len(), 1);
+        assert!(prediction_solid_entities(&next, &[rocket.clone()], 500).is_empty());
+
+        // A newly solid entity is admitted by nextState even while its
+        // currentState is non-solid; clipping still uses currentState shape.
+        rocket.state.fields[solid_field] = 0;
+        let mut solid_next = rocket.state.clone();
+        solid_next.fields[solid_field] = 0x0048_180f;
+        let next = snapshot(solid_next);
+        assert_eq!(prediction_solid_entities(&next, &[rocket.clone()], 500).len(), 1);
+        // If it has no current rendered entity yet, use the snapshot's own
+        // geometry (and don't quietly lose a just-spawned missile).
+        let from_next_only = prediction_solid_entities(&next, &[], 500);
+        assert_eq!(from_next_only.len(), 1);
+        assert_eq!(from_next_only[0].number, 77);
     }
 
     #[test]

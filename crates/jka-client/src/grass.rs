@@ -1842,7 +1842,7 @@ pub(crate) fn godot_clump_noise() -> Arc<Vec<u8>> {
 }
 
 /// The wind noise image, built once per process like [`godot_clump_noise`].
-fn godot_wind_noise() -> Arc<Vec<u8>> {
+pub(crate) fn godot_wind_noise() -> Arc<Vec<u8>> {
     static WIND: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
     Arc::clone(WIND.get_or_init(|| Arc::new(generate_wind_noise())))
 }

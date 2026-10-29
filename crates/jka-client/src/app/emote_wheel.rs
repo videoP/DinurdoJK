@@ -332,7 +332,7 @@ impl App {
         if let Ok(catalog) = crate::emotes::catalog(&self.base) {
             crate::emotes::update_favorite_assets(&catalog, &self.emote_wheel.favorites);
         }
-        let path = self.base.join("emotes/favorites.json");
+        let path = jka_assets::pk3::game_write_directory(&self.base, None).join("emotes/favorites.json");
         let result = (|| -> Result<(), String> {
             std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             let data = self.emote_wheel.settings();

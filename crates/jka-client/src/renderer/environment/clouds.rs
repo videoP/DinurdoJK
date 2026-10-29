@@ -48,7 +48,8 @@ impl Renderer {
         camera_position: Vec3,
     ) -> ([[f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2], f32) {
         let mut packed = [[0.0f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2];
-        if !self.clouds_enabled || self.cloud_foreground.is_empty() {
+        // Thermal vision also draws each lit blade as a heat source.
+        if !(self.clouds_enabled || self.thermal_vision != 0) || self.cloud_foreground.is_empty() {
             return (packed, 0.0);
         }
         let width = self.config.width.max(1) as f32;

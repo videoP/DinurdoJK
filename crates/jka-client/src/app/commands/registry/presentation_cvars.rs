@@ -90,6 +90,93 @@ app_cvars! {
         ]
     }
 
+
+    APP_CG_DRAWSCORE {
+        runtime: CvarDef::new("cg_drawScore", "2", "0..2", "TaystJK: score on the player HUD; 0 off, 1 score only, 2 includes team score and team lead/deficit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score.to_string()), |app, value| App::cvar_set_draw_score(app, "cg_drawScore", &value.to_string())).with_text_setter(App::cvar_set_draw_score, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(value) = value.trim().parse::<i32>() {
+                    settings.draw_score = value.clamp(0, 2);
+                }
+            }),
+            archive: Some((379, |state| state.presentation.draw_score.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_draw_score(&mut self, _: &str, value: &str) -> Result<(), String> {
+                self.draw_score = value.trim().parse::<i32>().map_err(|_| "cg_drawScore expects 0..2".to_owned())?.clamp(0, 2);
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_CG_DRAWSCOREX {
+        runtime: CvarDef::new("cg_drawScoreX", "0", "float", "TaystJK: horizontal offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_x.to_string()), |app, value| App::cvar_set_draw_score_x(app, "cg_drawScoreX", &value.to_string())).with_text_setter(App::cvar_set_draw_score_x, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(value) = value.trim().parse::<f32>() {
+                    if value.is_finite() { settings.draw_score_x = value; }
+                }
+            }),
+            archive: Some((380, |state| state.presentation.draw_score_x.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_draw_score_x(&mut self, _: &str, value: &str) -> Result<(), String> {
+                let offset = value.trim().parse::<f32>().map_err(|_| "cg_drawScoreX expects a float".to_owned())?;
+                if !offset.is_finite() { return Err("cg_drawScoreX expects a finite float".into()); }
+                self.draw_score_x = offset;
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_CG_DRAWSCOREY {
+        runtime: CvarDef::new("cg_drawScoreY", "0", "float", "TaystJK: vertical offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_y.to_string()), |app, value| App::cvar_set_draw_score_y(app, "cg_drawScoreY", &value.to_string())).with_text_setter(App::cvar_set_draw_score_y, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(value) = value.trim().parse::<f32>() {
+                    if value.is_finite() { settings.draw_score_y = value; }
+                }
+            }),
+            archive: Some((381, |state| state.presentation.draw_score_y.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_draw_score_y(&mut self, _: &str, value: &str) -> Result<(), String> {
+                let offset = value.trim().parse::<f32>().map_err(|_| "cg_drawScoreY expects a float".to_owned())?;
+                if !offset.is_finite() { return Err("cg_drawScoreY expects a finite float".into()); }
+                self.draw_score_y = offset;
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_CG_DRAWENEMYINFO {
+        runtime: CvarDef::new("cg_drawEnemyInfo", "1", "0|1", "TaystJK: top-right duel opponent, leader, and Jedi Master information.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(u8::from(app.draw_enemy_info).to_string()), |app, value| App::cvar_set_draw_enemy_info(app, "cg_drawEnemyInfo", &value.to_string())).with_text_setter(App::cvar_set_draw_enemy_info, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                settings.draw_enemy_info = parse_bool(value).unwrap_or(settings.draw_enemy_info);
+            }),
+            archive: Some((382, |state| u8::from(state.presentation.draw_enemy_info).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_draw_enemy_info(&mut self, _: &str, value: &str) -> Result<(), String> {
+                self.draw_enemy_info = parse_bool(value).ok_or_else(|| "cg_drawEnemyInfo expects 0 or 1".to_owned())?;
+                self.mark_config_dirty();
+                self.publish_transient_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_CG_DRAWTEAMOVERLAY {
         runtime: CvarDef::new("cg_drawTeamOverlay", "", "0..6", "TaystJK team overlay: 0 off; 1/2 classic, 3/4 alternate, 5/6 compact scalable; even modes omit your own row.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawteamoverlay(app)), |app, value| App::cvar_set_cg_drawteamoverlay(app, APP_CG_DRAWTEAMOVERLAY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawteamoverlay, None),
         config: CvarBinding {

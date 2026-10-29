@@ -4,7 +4,7 @@
 struct JkaHybridSwell {
     direction_wave: vec4<f32>, // xy unit travel dir, z radians/m, w Gerstner amplitude (m)
     motion_mix: vec4<f32>,     // x radians/s, y horizontal ratio, z FFT weight, w seconds
-    breaker: vec4<f32>,        // x A/B mode: 0 original, 1 limit, 2 spilling crests
+    breaker: vec4<f32>,        // x: crest mode; y: compact foam gain; z: compact foam detail
     // `r_oceanType 5` (godot_water.wgsl): x 1 on, y wave scale, z seconds, w foam bits (1 near, 2 far, 4 distant).
     godot: vec4<f32>,
     // The persistent foam maps' capture centres (grid xz, m): xy near, zw far (each where its map was last drawn).

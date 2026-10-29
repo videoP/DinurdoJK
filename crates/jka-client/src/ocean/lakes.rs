@@ -191,7 +191,7 @@ pub(super) struct LakeRenderer {
     faces: Option<[wgpu::TextureView; 6]>,
     environment: Option<wgpu::BindGroup>,
     environment_view: Option<wgpu::TextureView>,
-    resources: Option<(Option<wgpu::TextureView>, Option<wgpu::TextureView>)>,
+    pub(super) resources: Option<(Option<wgpu::TextureView>, Option<wgpu::TextureView>)>,
     planar_view: Option<wgpu::TextureView>,
     ripple_view: Option<wgpu::TextureView>,
     submerged_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
@@ -409,7 +409,7 @@ impl OceanGpu {
                     &super::gerstner_patterns::lake_noise(),
                     128,
                 ),
-                normal: super::gerstner_patterns::cheapwater_normal(device, queue),
+                normal: self.lake_normal.clone(),
                 cheap: self.settings.lake.shader == 1,
                 slots: std::array::from_fn(|_| None),
                 map,
@@ -549,6 +549,7 @@ impl OceanGpu {
                     Some(&r.normal),
                     r.ripples.as_ref().map(|p| &p.view),
                     submerged,
+                    self.sky_admission.as_ref().map(|a| &a.0),
                 );
             }
             r.resources = Some(resources);
@@ -624,6 +625,7 @@ impl OceanGpu {
                     Some(&r.normal),
                     r.ripples.as_ref().map(|p| &p.view),
                     submerged,
+                    self.sky_admission.as_ref().map(|a| &a.0),
                 );
                 use wgpu::util::DeviceExt;
                 let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -800,6 +802,8 @@ impl OceanGpu {
             queue.write_buffer(&slot.bindings.uniforms, 0, bytemuck::bytes_of(&uniforms));
             // The coarse mesh is clipped to the exact footprint, including holes.
             let mut boundary = slot.boundary;
+            boundary.sky_plane[0] = promoted.descriptor.surface.plane_height;
+            boundary.sky_uv = self.sky_admission.as_ref().map_or([0.0; 4], |a| a.1);
             if let Some(sky) = extension {
                 boundary.counts[1] = sky.count as u32;
                 boundary.sky = sky.segments;

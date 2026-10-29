@@ -46,9 +46,25 @@ const EF_INVULNERABLE: i32 = 1 << 27;
 const EF2_HYPERSPACE: i32 = 1 << 5;
 const SOLID_BMODEL: i32 = 0x00ff_ffff;
 const WP_SABER: i32 = 3;
+// TaystJK q_shared.h: FP_HEAL..FP_SABERTHROW (0..17), then sentinel 18.
+const NUM_FORCE_POWERS: i32 = 18;
+const MAX_CLIENTS: u16 = 32;
+const MAX_GENTITIES: i32 = 1024;
+const ENTITYNUM_NONE: i32 = 1023;
+const EF_SEEKERDRONE: i32 = 1 << 21;
+const CLASS_VEHICLE: i32 = 53;
+const SEEKER_MODEL: &str = "models/items/remote.md3";
 const G2_MODEL_PART: i32 = 50;
 const INVULNERABILITY_MODEL: &str = "models/weaphits/testboom.md3";
 const INVULNERABILITY_SHADER: &str = "powerups/invulnerabilityshell";
+// bg_public.h powerup_t (the entityState powerups bit field, not the
+// playerState expiration-time array). These are the actual CGame shell bits.
+const PW_REDFLAG: i32 = 4;
+const PW_BLUEFLAG: i32 = 5;
+const PW_FORCE_ENLIGHTENED_LIGHT: i32 = 12;
+const PW_FORCE_ENLIGHTENED_DARK: i32 = 13;
+const PW_FORCE_BOON: i32 = 14;
+const PW_YSALAMIRI: i32 = 15;
 /// `cgs.media.halfShieldShader` (same `testboom.md3` model as the sphere above).
 const SHIELD_HIT_SHADER: &str = "halfShieldShell";
 /// cg_players.c MAX_SHIELD_TIME / MIN_SHIELD_TIME.
@@ -56,6 +72,7 @@ const SHIELD_MAX_TIME_MS: i32 = 2000;
 
 #[derive(Clone)]
 struct Md3SurfaceAsset {
+    foliage_wind: bool,
     surface_index: usize,
     cached_indices: Arc<Vec<u32>>,
     texture: Option<Arc<TextureData>>,
@@ -104,6 +121,7 @@ struct Md3Chain {
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct Md3GeometrySlot {
+    foliage_wind: bool,
     model: usize,
     surface: usize,
     entity: u16,
@@ -191,6 +209,9 @@ pub struct EntityPresenter {
     /// every surviving prop still runs the exact original per-prop tests.
     static_visibility_tree: StaticVisibilityTree,
     static_md3_bvh: bool,
+    /// Cached secondary BSP cluster visibility for map-authored misc_model_static only.
+    /// A/B toggle is live and never invalidates the static MD3 build.
+    static_md3_pvs_fallback: bool,
     occlusion_stats: bool,
     /// Whether `static_props` carry RT caster sources (they must be rebuilt when
     /// hardware RT shadows are toggled).
@@ -205,6 +226,13 @@ pub struct EntityPresenter {
     ue_materials:HashMap<String,Option<Arc<jka_ue_assets::material::Program>>>,
     material_eye:[f32;3],
     turret_states: HashMap<u16, TurretState>,
+    /// CG_General uses cg.refdef.viewangles for the first-person local
+    /// emplaced gunner instead of the interpolated snapshot player angles.
+    emplaced_first_person_view: Option<(u16, [f32; 3])>,
+    /// playerState.emplacedIndex directly identifies the gun controlled by
+    /// this POV. Unlike the entity's owner/force marker it is present even
+    /// when the local player's packet entity is suppressed by prediction.
+    local_emplaced_gunner: Option<(u16, [f32; 3])>,
 }
 
 /// `centity_t::damageTime` and `damageAngles` for the armor hit shell.
@@ -237,8 +265,11 @@ struct StaticProp {
     origin: [f32; 3],
     /// Origin the cull tests use (jaPRO adds 1 + zoffset to z).
     cull_origin: [f32; 3],
-    /// PVS cluster of `cull_origin`; `None` skips the PVS test.
-    cull_cluster: Option<usize>,
+    /// Cached once at MD3 registration: original zoffset test cluster, plus
+    /// the rotated/scaled MD3 bounds center's cluster (if distinct).
+    /// A missing cluster means the point was in solid; when both are missing
+    /// there is no valid PVS answer and we conservatively keep the prop.
+    pvs_clusters: [Option<usize>; 2],
     /// `RadiusFromBounds` of the frame-0 bounds scaled by the model scale; 0
     /// when the model has no bounds, which disables the frustum test.
     radius: f32,
@@ -258,8 +289,10 @@ struct StaticVisibilityTree {
 struct StaticVisibilityNode {
     center: [f32; 3],
     radius: f32,
-    /// If all children share one valid cluster, PVS can reject the group.
+    /// Old BVH grouping uses the primary cluster only. Keep it for exact A/B.
     shared_cluster: Option<usize>,
+    /// Fallback BVH grouping only when every prop has this full cached PVS pair.
+    shared_pvs: Option<[Option<usize>; 2]>,
     start: usize,
     end: usize,
     children: Option<[usize; 2]>,
@@ -284,14 +317,16 @@ impl StaticVisibilityTree {
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         let mut bounds_valid = true;
-        let mut shared_cluster = props[self.prop_indices[start]].cull_cluster;
+        let mut shared_cluster = props[self.prop_indices[start]].pvs_clusters[0];
+        let mut shared_pvs = Some(props[self.prop_indices[start]].pvs_clusters);
         for &prop_index in &self.prop_indices[start..end] {
             let prop = &props[prop_index];
             if !prop.radius.is_finite() || prop.radius <= 0.0
                 || !prop.origin.iter().chain(prop.cull_origin.iter()).all(|v| v.is_finite()) {
                 bounds_valid = false;
             }
-            if shared_cluster != prop.cull_cluster { shared_cluster = None; }
+            if shared_cluster != prop.pvs_clusters[0] { shared_cluster = None; }
+            if shared_pvs != Some(prop.pvs_clusters) { shared_pvs = None; }
             for axis in 0..3 {
                 let lower = prop.origin[axis].min(prop.cull_origin[axis]) - prop.radius;
                 let upper = prop.origin[axis].max(prop.cull_origin[axis]) + prop.radius;
@@ -306,7 +341,7 @@ impl StaticVisibilityTree {
         if !radius.is_finite() { bounds_valid = false; }
         let node_index = self.nodes.len();
         self.nodes.push(StaticVisibilityNode {
-            center, radius, shared_cluster, start, end, children: None, bounds_valid,
+            center, radius, shared_cluster, shared_pvs, start, end, children: None, bounds_valid,
         });
         if end - start > Self::LEAF_SIZE {
             let axis = (0..3).max_by(|&a, &b| {
@@ -328,6 +363,7 @@ impl StaticVisibilityTree {
         view: Ghoul2PresentationView,
         visibility: Option<&jka_assets::bsp::Visibility>,
         view_cluster: Option<usize>,
+        use_fallback: bool,
         output: &mut Vec<usize>,
     ) -> (usize, usize) {
         // Not a visibility *decision*: returns conservative candidates for
@@ -335,7 +371,7 @@ impl StaticVisibilityTree {
         let mut checked = 0;
         let mut rejected = 0;
         if !self.nodes.is_empty() {
-            self.gather(0, view, visibility, view_cluster, output, &mut checked, &mut rejected);
+            self.gather(0, view, visibility, view_cluster, use_fallback, output, &mut checked, &mut rejected);
         }
         (checked, rejected)
     }
@@ -344,7 +380,7 @@ impl StaticVisibilityTree {
     fn gather(
         &self, index: usize, view: Ghoul2PresentationView,
         visibility: Option<&jka_assets::bsp::Visibility>, view_cluster: Option<usize>,
-        output: &mut Vec<usize>, checked: &mut usize, rejected: &mut usize,
+        use_fallback: bool, output: &mut Vec<usize>, checked: &mut usize, rejected: &mut usize,
     ) {
         *checked += 1;
         let node = self.nodes[index];
@@ -353,17 +389,49 @@ impl StaticVisibilityTree {
             || (view.distance_cull() > 0.0
                 && view.distance_to(node.center) - node.radius > view.distance_cull())
         );
-        let pvs_hidden = node.shared_cluster.is_some_and(|cluster| {
-            visibility.is_some_and(|vis| !vis.r_in_pvs(view_cluster, Some(cluster)))
+        let pvs_hidden = visibility.is_some_and(|vis| {
+            if use_fallback {
+                node.shared_pvs.is_some_and(|clusters|
+                    static_pvs_hidden(vis, view_cluster, &clusters, true))
+            } else {
+                // Original BVH behavior: no group PVS culling if the
+                // original cull-point cluster is missing or mixed.
+                node.shared_cluster.is_some_and(|cluster|
+                    !vis.r_in_pvs(view_cluster, Some(cluster)))
+            }
         });
         if outside || pvs_hidden { *rejected += 1; return; }
         if let Some([left, right]) = node.children {
-            self.gather(left, view, visibility, view_cluster, output, checked, rejected);
-            self.gather(right, view, visibility, view_cluster, output, checked, rejected);
+            self.gather(left, view, visibility, view_cluster, use_fallback, output, checked, rejected);
+            self.gather(right, view, visibility, view_cluster, use_fallback, output, checked, rejected);
         } else {
             output.extend_from_slice(&self.prop_indices[node.start..node.end]);
         }
     }
+}
+
+/// All expensive target-point and BSP leaf lookups happen during static MD3
+/// registration. Each frame reads at most two PVS bits (without allocation).
+/// No valid target cluster means no PVS answer: let frustum/depth decide.
+fn static_pvs_hidden(
+    visibility: &jka_assets::bsp::Visibility,
+    view_cluster: Option<usize>,
+    targets: &[Option<usize>; 2],
+    use_fallback: bool,
+) -> bool {
+    if !use_fallback {
+        // Exact legacy R_inPVS semantics, including the invalid (-1) target
+        // cluster. This is deliberately not the corrected fallback semantics.
+        return !visibility.r_in_pvs(view_cluster, targets[0]);
+    }
+    let mut any_valid = false;
+    for cluster in targets.iter().copied().flatten() {
+        any_valid = true;
+        if visibility.r_in_pvs(view_cluster, Some(cluster)) {
+            return false;
+        }
+    }
+    any_valid
 }
 
 /// Transform all eight corners, including rotated and negative-scale models.
@@ -439,6 +507,7 @@ impl EntityPresenter {
             static_candidate_scratch: Vec::new(),
             static_visibility_tree: StaticVisibilityTree::default(),
             static_md3_bvh: false,
+            static_md3_pvs_fallback: true,
             occlusion_stats: false,
             static_props_rt: false,
             shield_hits: HashMap::new(),
@@ -449,6 +518,8 @@ impl EntityPresenter {
             ue_materials:HashMap::new(),
             material_eye:[0.;3],
             turret_states: HashMap::new(),
+            emplaced_first_person_view: None,
+            local_emplaced_gunner: None,
         })
     }
 
@@ -574,6 +645,13 @@ impl EntityPresenter {
         self.static_md3_bvh = enabled;
     }
 
+    /// Live A/B; cached model bounds and clusters remain valid in both modes.
+    /// Affects only BSP/map-authored misc_model_static placements, never snapshot
+    /// entities such as misc_model_breakable or server-spawned/moving models.
+    pub fn set_static_md3_pvs_fallback(&mut self, enabled: bool) {
+        self.static_md3_pvs_fallback = enabled;
+    }
+
     pub fn set_occlusion_stats(&mut self, enabled: bool) {
         self.occlusion_stats = enabled;
         if enabled { self.md3_static_report_at = None; }
@@ -673,7 +751,8 @@ impl EntityPresenter {
         let (tree_tested, tree_pruned) = if self.static_md3_bvh {
             candidates.clear();
             if let Some(view) = view {
-                self.static_visibility_tree.candidates(view, pvs, view_cluster, &mut candidates)
+                self.static_visibility_tree.candidates(
+                    view, pvs, view_cluster, self.static_md3_pvs_fallback, &mut candidates)
             } else {
                 candidates.extend(0..props.len());
                 (0, 0)
@@ -682,11 +761,13 @@ impl EntityPresenter {
         let tree_us = tree_started.map(|now| now.elapsed().as_micros()).unwrap_or(0);
         let candidate_count = if self.static_md3_bvh { candidates.len() } else { props.len() };
         let hierarchy_skipped_props = props.len().saturating_sub(candidate_count);
+        let use_pvs_fallback = self.static_md3_pvs_fallback;
         let mut select_lod = |prop: &StaticProp| {
             let culled = view.is_some_and(|view| {
                 let distance_cull = view.distance_cull();
                 (prop.radius > 0.0 && view.sphere_outside(prop.cull_origin, prop.radius))
-                    || pvs.is_some_and(|vis| !vis.r_in_pvs(view_cluster, prop.cull_cluster))
+                    || pvs.is_some_and(|vis| static_pvs_hidden(
+                        vis, view_cluster, &prop.pvs_clusters, use_pvs_fallback))
                     || (distance_cull > 0.0
                         && view.distance_to(prop.origin) - prop.radius > distance_cull)
             });
@@ -830,6 +911,7 @@ impl EntityPresenter {
                             (frame.mins[axis] * scale).abs().max((frame.maxs[axis] * scale).abs())
                         };
                         (corner(0).powi(2) + corner(1).powi(2) + corner(2).powi(2)).sqrt()
+                            + if asset.surfaces.iter().any(|s| s.foliage_wind) { crate::foliage::BOUNDS_PADDING } else { 0.0 }
                     })
                 })
                 .unwrap_or(0.0);
@@ -842,6 +924,26 @@ impl EntityPresenter {
                 })).unwrap_or(radius);
             let mut cull_origin = placement.origin;
             cull_origin[2] += 1.0 + placement.zoffset;
+            // The original cull point can be embedded in a wall. Cache the
+            // alternate test point *now*, never per frame. The model-space
+            // frame bounds must be transformed by authored rotation and
+            // nonuniform (including negative) scale, not just translated.
+            let center_cluster = source.visibility.as_ref().and_then(|vis| {
+                self.load_md3(&placement.model).ok().and_then(|asset| {
+                    asset.model.frames.first().and_then(|frame| {
+                        let center = std::array::from_fn(|i| {
+                            placement.origin[i] + (0..3).map(|j| {
+                                axis[j][i] * (frame.mins[j] * 0.5 + frame.maxs[j] * 0.5)
+                            }).sum::<f32>()
+                        });
+                        vis.cluster_at(center)
+                    })
+                })
+            });
+            let pvs_clusters = [
+                placement.cull_cluster,
+                center_cluster.filter(|&cluster| Some(cluster) != placement.cull_cluster),
+            ];
             props.push(StaticProp {
                 surfaces,
                 gpu_surfaces,
@@ -851,7 +953,7 @@ impl EntityPresenter {
                 lod_radius,
                 origin: placement.origin,
                 cull_origin,
-                cull_cluster: placement.cull_cluster,
+                pvs_clusters,
                 radius,
                 layers,
             });
@@ -930,11 +1032,11 @@ impl EntityPresenter {
                     gpu_draw.vertices = Arc::new(Vec::new());
                     gpu_draw.indices = Arc::new(Vec::new());
                     gpu_draw.rt_rigid = None;
-                    gpu_draw.ghoul2_gpu = Some(Ghoul2GpuSkinning {
+                    gpu_draw.ghoul2_gpu = Some(Ghoul2GpuSkinning { foliage_wind: surface_asset.foliage_wind,
                         mesh_key: Arc::from(key),
                         vertices: Arc::clone(vertices),
                         indices: Arc::clone(indices),
-                        bones: Arc::clone(&self.static_md3_identity_bone),
+                        bones: Arc::clone(&self.static_md3_identity_bone), heat_bone: 0,
                         axis: submission.axis,
                         origin: submission.origin,
                         color: stage.map_or(submission.rgba, |s| md3_stage_color(s, submission.rgba)),
@@ -1055,6 +1157,13 @@ impl EntityPresenter {
                         }
                     }
                 }
+                EntityPresentationKind::Special => {
+                    // TaystJK CG_Special / FX_DrawPortableShield: a deployed
+                    // HI_SHIELD is a server-authored translucent WORLD wall,
+                    // not a pickup MD3. Its dimensions live in time2.
+                    summary.fx += 1;
+                    self.present_portable_shield(entity, time, &mut draws);
+                }
                 EntityPresentationKind::Npc => {
                     // CG_G2Animated -> CG_Player: presented by PlayerPresenter
                     // with the NPC's own clientinfo.
@@ -1105,15 +1214,92 @@ impl EntityPresenter {
         (draws, inline_models, summary)
     }
 
-    /// TaystJK/OpenJK `CG_DrawPlayerSphere` for `EF_INVULNERABLE`.
-    ///
-    /// This is intentionally driven only by the network `eFlags` bit. Do not
-    /// infer a spawn timer locally: server mods control exactly when protection
-    /// begins and ends. TaystJK registers `models/weaphits/testboom.md3`, moves
-    /// it 9 units above the player origin, faces the half-shield toward
-    /// `cg.refdef.vieworg`, and overrides its material with
-    /// `powerups/invulnerabilityshell`.
-    pub fn present_invulnerability_bubbles(
+    /// `CG_General` uses the live view instead of network-interpolated angles
+    /// for a local gunner in first person. Call once per presentation frame;
+    /// None clears a previous view on camera changes/map transitions.
+    pub fn set_emplaced_first_person_view(&mut self, view: Option<(u16, [f32; 3])>) {
+        self.emplaced_first_person_view = view;
+    }
+
+    /// The predicted playerState's emplacedIndex is the authoritative link
+    /// between the local gunner and the mounted gun (including third person).
+    /// Call each frame, passing None after dismount/spectate/map changes.
+    pub fn set_local_emplaced_gunner(&mut self, gun: Option<(u16, [f32; 3])>) {
+        self.local_emplaced_gunner = gun;
+    }
+
+    /// TaystJK cg_players.c CG_Player: the seeker is an independent MD3
+    /// orbiting its owner (including the first-person player), not a Ghoul2
+    /// player attachment or ET_GENERAL snapshot entity. Prefer the predicted
+    /// local player over its snapshot copy to match CG_AddPacketEntities.
+    pub fn present_seeker_drones(
+        &mut self,
+        entities: &[PresentedEntity],
+        predicted_player: Option<&PresentedEntity>,
+        current_time: i32,
+        intermission: bool,
+    ) -> Vec<DynamicModelSurface> {
+        let mut draws = Vec::new();
+        if intermission { return draws; }
+        for entity in entities.iter().filter(|e| e.entity_type == super::ET_PLAYER) {
+            let source = predicted_player.filter(|p| p.number == entity.number).unwrap_or(entity);
+            self.present_seeker_drone(source, entities, predicted_player, current_time, &mut draws);
+        }
+        if let Some(predicted) = predicted_player {
+            if !entities.iter().any(|e| e.number == predicted.number) {
+                self.present_seeker_drone(predicted, entities, predicted_player, current_time, &mut draws);
+            }
+        }
+        draws
+    }
+
+    fn present_seeker_drone(
+        &mut self,
+        owner: &PresentedEntity,
+        entities: &[PresentedEntity],
+        predicted_player: Option<&PresentedEntity>,
+        current_time: i32,
+        draws: &mut Vec<DynamicModelSurface>,
+    ) {
+        if owner.entity_type != super::ET_PLAYER ||
+            owner.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0 {
+            return;
+        }
+        let flags = owner.state.field_i32("eFlags").unwrap_or(0);
+        let enemy_index = owner.state.field_i32("genericenemyindex").unwrap_or(-1);
+        if flags & EF_SEEKERDRONE == 0 && enemy_index == -1 {
+            return;
+        }
+        let enemy_origin = if (0..MAX_GENTITIES).contains(&enemy_index)
+            && enemy_index != ENTITYNUM_NONE {
+            predicted_player.filter(|e| i32::from(e.number) == enemy_index)
+                .or_else(|| entities.iter().find(|e| i32::from(e.number) == enemy_index))
+                .map(|e| e.origin)
+        } else { None };
+        let (origin, angles) = seeker_pose(owner.origin, enemy_index, enemy_origin, current_time);
+        let submission = ItemDraw {
+            model: SEEKER_MODEL.to_owned(),
+            origin,
+            axis: angles_to_axis(angles),
+            rgba: [1.0; 4],
+            custom_shader: None,
+        };
+        match self.present_md3_ref_entity(owner.number, &submission) {
+            Ok(mut surfaces) => draws.append(&mut surfaces),
+            Err(error) => {
+                let key = format!("seeker:{error}");
+                if self.logged_unsupported.insert(key) {
+                    devprintln!(1, "SEEKER DRONE {}: {error}", SEEKER_MODEL);
+                }
+            }
+        }
+    }
+
+    /// TaystJK cg_players.c CG_DrawPlayerSphere / CG_Player.
+    /// Every shell uses models/weaphits/testboom.md3 rather than tinting
+    /// the Ghoul2 body: Boon, Enlightenment, Ysalamiri and invulnerability.
+    /// Source sizes are 2.0, 2.0, 1.4, and 1.0 respectively.
+    pub fn present_player_spheres(
         &mut self,
         entities: &[PresentedEntity],
         followed: Option<&PresentedEntity>,
@@ -1124,32 +1310,42 @@ impl EntityPresenter {
         let mut seen = HashSet::new();
         let mut draws = Vec::new();
         for entity in followed.into_iter().chain(entities.iter()) {
-            if entity.entity_type != super::ET_PLAYER
+            if !matches!(entity.entity_type, super::ET_PLAYER | super::ET_NPC)
                 || suppressed_during_intermission(intermission, entity)
                 || !seen.insert(entity.number)
             {
                 continue;
             }
             let flags = entity.state.field_i32("eFlags").unwrap_or(0);
-            if flags & EF_INVULNERABLE == 0 || flags & EF_DEAD != 0 {
-                continue;
+            if flags & (EF_NODRAW | EF_DEAD) != 0 { continue; }
+            let powerups = entity.state.field_i32("powerups").unwrap_or(0);
+            const SHELL_BITS: i32 = (1 << PW_YSALAMIRI)
+                | (1 << PW_FORCE_BOON)
+                | (1 << PW_FORCE_ENLIGHTENED_DARK)
+                | (1 << PW_FORCE_ENLIGHTENED_LIGHT)
+                | (1 << PW_REDFLAG) | (1 << PW_BLUEFLAG);
+            if flags & EF_INVULNERABLE == 0 && powerups & SHELL_BITS == 0 {
+                continue; // Almost every player, almost every frame.
             }
             let Some((origin, axis)) = invulnerability_sphere_transform(entity.origin, view_origin) else {
                 continue;
             };
-            match self.present_custom_md3_stages(
-                entity.number,
-                INVULNERABILITY_MODEL,
-                origin,
-                axis,
-                [1.0; 4],
-                INVULNERABILITY_SHADER,
-            ) {
-                Ok(mut sphere) => draws.append(&mut sphere),
-                Err(error) => {
-                    let key = format!("invulnerability:{}", entity.number);
-                    if self.logged_unsupported.insert(key) {
-                        rverbose!(1, "INVULNERABILITY BUBBLE: {error}");
+            // A player can have multiple overlays simultaneously.
+            let mut spheres = player_powerup_spheres(powerups, game.gametype() == 9);
+            if flags & EF_INVULNERABLE != 0 {
+                spheres.push((INVULNERABILITY_SHADER, 1.0));
+            }
+            for (shader, scale) in spheres {
+                let scaled_axis = axis.map(|basis| basis.map(|v| v * scale));
+                match self.present_custom_md3_stages(
+                    entity.number, INVULNERABILITY_MODEL, origin, scaled_axis, [1.0; 4], shader,
+                ) {
+                    Ok(mut sphere) => draws.append(&mut sphere),
+                    Err(error) => {
+                        let key = format!("player-sphere:{shader}:{}", entity.number);
+                        if self.logged_unsupported.insert(key) {
+                            rverbose!(1, "PLAYER SPHERE {shader}: {error}");
+                        }
                     }
                 }
             }
@@ -1238,6 +1434,11 @@ impl EntityPresenter {
         entities: &[PresentedEntity],
         draws: &mut Vec<DynamicModelSurface>,
     ) {
+        // TaystJK CG_General emits the armed tripmine's effect independently of
+        // its model. Even with r_drawMapModels=0, the gameplay laser remains.
+        if entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW == 0 {
+            weapon_fx.tripmine_laser(entity, game);
+        }
         // Holocrons are gameplay pickups that share this path, not map props.
         if !self.draw_map_models
             && !matches!(entity.presentation_kind(), EntityPresentationKind::Holocron)
@@ -1248,7 +1449,21 @@ impl EntityPresenter {
             return;
         }
         let model_ghoul2 = entity.state.field_i32("modelGhoul2").unwrap_or(0);
-        if model_ghoul2 != 0 {
+        let local_gunner_angles = local_emplaced_angles(self.local_emplaced_gunner, entity.number);
+        // Keep the exact TaystJK server marker for remote players. For the
+        // local gun, playerState.emplacedIndex is more reliable than the
+        // mounted entity's snapshot owner marker (or a snapshot ET_PLAYER).
+        let server_emplaced = entity.number >= MAX_CLIENTS
+            && entity.state.field_i32("activeForcePass").unwrap_or(0) == NUM_FORCE_POWERS + 1
+            && entity.state.field_i32("NPC_class").unwrap_or(0) != CLASS_VEHICLE;
+        // Only permit the GLM fallback for a known mounted gun if the
+        // snapshot did not advertise modelGhoul2. Never reinterpret MD3s.
+        // Use the Ghoul2 renderer only when this *specific*
+        // entity is verified as a mounted gun and its model is a GLM.
+        let mounted_glm = (local_gunner_angles.is_some() || server_emplaced)
+            && game.model_qpath(entity.state.field_i32("modelindex").unwrap_or(0))
+                .is_some_and(|name| name.to_ascii_lowercase().ends_with(".glm"));
+        if model_ghoul2 != 0 || mounted_glm {
             // OpenJK uses 127 as the "Ghoul2 requested but not initialized"
             // sentinel and CG_General returns without drawing it.
             if model_ghoul2 == 127 {
@@ -1295,15 +1510,39 @@ impl EntityPresenter {
                 return;
             }
             self.turret_states.remove(&entity.number);
-            match ghoul2.present_static_glm(
-                entity.number,
-                &qpath,
-                entity.origin,
-                angles_to_axis(entity.angles),
-                entity_color(entity),
-                None,
-                time,
-            ) {
+            // TaystJK CG_General: update Bone02 each frame. Preserve the
+            // original pitch limit / base-yaw subtraction / signed bone axes.
+            // The local player is removed from the packet-entity list, so the
+            // authoritative playerState.emplacedIndex -> gun relation takes
+            // precedence over the optional snapshot emplacedOwner marker.
+            let owner_angles = local_gunner_angles.or_else(|| {
+                if !server_emplaced { return None; }
+                let owner_num = u16::try_from(
+                    entity.state.field_i32("emplacedOwner").unwrap_or(-1),
+                ).ok()?;
+                self.emplaced_first_person_view
+                    .filter(|(number, _)| *number == owner_num)
+                    .map(|(_, angles)| angles)
+                    .or_else(|| entities.iter().find(|e| e.number == owner_num)
+                        .map(|owner| owner.angles))
+            });
+            let angles = owner_angles.map(|view| {
+                let base_yaw = entity.state.field_f32("angles[1]")
+                    .unwrap_or(entity.angles[1]);
+                emplaced_bone_angles(view, base_yaw)
+            });
+            let result = if let Some(angles) = angles {
+                ghoul2.present_emplaced_glm(
+                    entity.number, &qpath, entity.origin,
+                    angles_to_axis(entity.angles), entity_color(entity), time, angles,
+                )
+            } else {
+                ghoul2.present_static_glm(
+                    entity.number, &qpath, entity.origin,
+                    angles_to_axis(entity.angles), entity_color(entity), None, time,
+                )
+            };
+            match result {
                 Ok(mut model_draws) => draws.append(&mut model_draws),
                 Err(error) => self.log_entity_once(entity, &format!("Ghoul2 {qpath}: {error}")),
             }
@@ -1446,15 +1685,46 @@ impl EntityPresenter {
                 Some(locked) => facing_axis(cosmetic.axis, cosmetic.origin, self.material_eye, locked),
                 None => cosmetic.axis,
             };
+            let force_refraction = cosmetic.custom_shader == Some("internal/force_refraction");
             let submission = ItemDraw {
                 model: cosmetic.model.to_owned(),
                 origin: cosmetic.origin,
                 axis,
                 rgba: cosmetic.rgba,
-                custom_shader: cosmetic.custom_shader,
+                custom_shader: if force_refraction { Some("effects/refraction") } else { cosmetic.custom_shader },
             };
             match self.present_md3_ref_entity(cosmetic.entity_num, &submission) {
                 Ok(mut surfaces) => {
+                    if force_refraction {
+                        let seconds = cosmetic.rgba[0];
+                        let angle = (-15.0 * seconds).to_radians();
+                        let (sin, cos) = angle.sin_cos();
+                        let centre = scene::render_position(cosmetic.origin);
+                        for surface in &mut surfaces {
+                            surface.vertices = Arc::new(surface.vertices.iter().map(|vertex| {
+                                let mut v = *vertex;
+                                let world = [v.position[0], -v.position[2], v.position[1]];
+                                let delta = std::array::from_fn::<_, 3, _>(|i| world[i] - cosmetic.origin[i]);
+                                let local = axis.map(|a| {
+                                    let norm = a.iter().map(|x| x*x).sum::<f32>().max(0.0001);
+                                    (0..3).map(|i| a[i] * delta[i]).sum::<f32>() / norm
+                                });
+                                let st = [v.uv[0] - 0.5, v.uv[1] - 0.5];
+                                v.uv = [cos*st[0] - sin*st[1] + 0.5, sin*st[0] + cos*st[1] + 0.5];
+                                let phase = [(local[0] + local[2])/1024.0 + seconds*2.0, local[1]/1024.0 + seconds*2.0];
+                                for i in 0..2 { v.uv[i] += (phase[i]*std::f32::consts::TAU).sin()*0.03; }
+                                v.color = [centre[0], centre[1], centre[2], -2.0 - cosmetic.rgba[3]];
+                                v
+                            }).collect());
+                            surface.alpha_mode = DynamicModelAlphaMode::Glass;
+                            surface.texture = None;
+                            surface.lighting_origin = None;
+                            surface.authored_lighting = false;
+                            surface.authored_glow = false;
+                            surface.rt_rigid = None;
+                            surface.rt_skinned_key = None;
+                        }
+                    }
                     if cosmetic.custom_shader.is_some_and(|s| s.starts_with("fnemote/fx/")) {
                         self.fresnel_fade_fx_mesh(&mut surfaces);
                     }
@@ -1523,7 +1793,7 @@ impl EntityPresenter {
         let vertices=mesh.vertices.iter().map(|v|{
             let mut p=[0.;3];let mut n=[0.;3];
             for i in 0..4{if v.weights[i]==0.{continue;}let (point,normal)=if let Some(pose)=pose{let m=&pose[v.bones[i]];(std::array::from_fn(|r|m[r][0]*v.position[0]+m[r][1]*v.position[1]+m[r][2]*v.position[2]+m[r][3]),std::array::from_fn(|r|m[r][0]*v.normal[0]+m[r][1]*v.normal[1]+m[r][2]*v.normal[2]))}else{(v.position,v.normal)};for r in 0..3{p[r]+=point[r]*v.weights[i];n[r]+=normal[r]*v.weights[i];}}
-            DynamicModelVertex{position:transform_model_point(p,axis,origin,1.),normal:transform_model_normal(n,axis),uv:v.uv,color:rgba,depth_hack:0.,water_wetness:0.}
+            DynamicModelVertex{ foliage_wind: 0.0,position:transform_model_point(p,axis,origin,1.),normal:transform_model_normal(n,axis),uv:v.uv,color:rgba,depth_hack:0.,water_wetness:0.}
         }).collect::<Vec<_>>();
         if vertices.iter().any(|v|v.position.iter().chain(&v.normal).any(|n|!n.is_finite())){return Err("non-finite prop pose".into());}
         let mut draws=Vec::new();let seconds=self.material_clock.elapsed().as_secs_f32();
@@ -1553,7 +1823,7 @@ impl EntityPresenter {
             let indices=Arc::new(indices);
             let gpu=if stage==0&&material.tc_mods.is_empty()&&program.is_none(){normal.as_ref().map(|normal|{
                 let vertices=self.prop_gpu_vertices.entry(path.into()).or_insert_with(||Arc::new(mesh.vertices.iter().map(|v|crate::renderer::Ghoul2GpuVertex{position:v.position,normal:v.normal,uv:v.uv,bone_indices:v.bones.map(|n|n as u32),weights:v.weights,weight_count:4,jiggle_region:u32::MAX,jiggle_weight:0.,jiggle_coord:4.}).collect())).clone();
-                crate::renderer::Ghoul2GpuSkinning{mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
+                crate::renderer::Ghoul2GpuSkinning{ foliage_wind: false,mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
             })}else{None};
             let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
             draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
@@ -1577,6 +1847,7 @@ impl EntityPresenter {
         depth_hack: f32,
     ) -> (Arc<Vec<DynamicModelVertex>>, Arc<Vec<u32>>) {
         let slot = Md3GeometrySlot {
+            foliage_wind: surface_asset.foliage_wind,
             model: Arc::as_ptr(&asset.model) as usize,
             surface: surface_asset.surface_index,
             entity,
@@ -1592,8 +1863,9 @@ impl EntityPresenter {
             }
         }
         let surface = &asset.model.surfaces[surface_asset.surface_index];
+        let foliage_tag = if surface_asset.foliage_wind { crate::foliage::model_tag(origin) } else { 0.0 };
         let vertices = Arc::new(surface.frame_vertices(frame).unwrap_or_default().iter()
-            .map(|vertex| DynamicModelVertex {
+            .map(|vertex| DynamicModelVertex { foliage_wind: foliage_tag,
                 position: transform_model_point(vertex.position, axis, origin, scale),
                 normal: transform_model_normal(vertex.normal, axis),
                 uv: vertex.uv,
@@ -2168,9 +2440,9 @@ impl EntityPresenter {
                 if !material.tc_mods.is_empty(){for vertex in Arc::make_mut(&mut vertices){for modifier in &material.tc_mods{vertex.uv=crate::fx::draw::modified_uv(vertex.uv,vertex.position,*modifier,seconds-material.shader_time_offset);}}}
                 if definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided")){let original=indices.clone();for tri in original.chunks_exact(3){Arc::make_mut(&mut indices).extend([tri[2],tri[1],tri[0]]);}}
                 let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
-                let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning {
+                let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning { foliage_wind: surface.foliage_wind,
                     mesh_key:Arc::from(format!("{}#surface{}",asset.key,surface.surface_index)),vertices:gpu.clone(),indices:indices.clone(),
-                    bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:surface.source_material.clone()
+                    bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:surface.source_material.clone()
                 })}else{None};
                 draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
             }
@@ -2286,7 +2558,11 @@ impl EntityPresenter {
                 }
             }
         }
-        let material_trace = self.md3_material_trace(key, surface, texture.as_ref(), alpha_mode);
+        let foliage_wind = definition.as_ref()
+            .is_some_and(|shader| crate::foliage::promotes_shader(&effective, shader));
+        let material_trace = Arc::from(format!("{}\nFOLIAGE WIND: {}",
+            self.md3_material_trace(key, surface, texture.as_ref(), alpha_mode),
+            if foliage_wind { "AUTO (shared atmospheric wind)" } else { "OFF" }));
         // Imported emote props carry a normal map; light them on the GPU path.
         let normal = definition.as_ref().and_then(Shader::primary).and_then(|s| s.normal_map.clone());
         let source_material = if key.starts_with("models/fnemote/") {
@@ -2297,7 +2573,7 @@ impl EntityPresenter {
             })
         } else { None };
         let gpu_vertices = source_material.as_ref().map(|_| Arc::new(surface.vertices.iter().map(|v| crate::renderer::Ghoul2GpuVertex { position: v.position, normal: v.normal, uv: v.uv, bone_indices: [0; 4], weights: [1., 0., 0., 0.], weight_count: 1, jiggle_region: u32::MAX, jiggle_weight: 0., jiggle_coord: 4. }).collect()));
-        Md3SurfaceAsset { surface_index, cached_indices, texture, alpha_mode,
+        Md3SurfaceAsset { foliage_wind, surface_index, cached_indices, texture, alpha_mode,
             authored_glow, source_material, gpu_vertices, material_trace, invisible_without_override,
             extra_stages, two_sided_indices, authored_lighting }
     }
@@ -2561,6 +2837,95 @@ impl EntityPresenter {
         }];
         self.fx_materials.insert(key, materials.clone());
         Some(materials)
+    }
+
+    /// TaystJK cg_ents.c: CG_Special -> FX_DrawPortableShield.
+    /// Does not infer placement from the HUD item selection: servers own
+    /// ET_SPECIAL state, which also supports modded shield dimensions.
+    fn present_portable_shield(&mut self, entity: &PresentedEntity, time: i32, out: &mut Vec<DynamicModelSurface>) {
+        // bg_public.h: HI_SHIELD = 2, EF_NODRAW = 0x100.
+        if entity.state.field_i32("modelindex") != Some(2)
+            || entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0
+        {
+            return;
+        }
+        let packed = entity.state.field_bits("time2").unwrap_or(0);
+        let x_axis = packed >> 24 & 1 != 0;
+        let height = ((packed >> 16) & 255) as f32;
+        let positive = ((packed >> 8) & 255) as f32;
+        let negative = (packed & 255) as f32;
+        if height < 1.0 || positive + negative < 1.0 {
+            return;
+        }
+        let damaged = entity.state.field_i32("trickedentindex").unwrap_or(0) != 0;
+        let red = entity.state.field_i32("otherEntityNum2").unwrap_or(0) == 1; // TEAM_RED
+        let shader = match (red, damaged) {
+            (true, true) => "gfx/misc/red_dmgshield",
+            (true, false) => "gfx/misc/red_portashield",
+            (false, true) => "gfx/misc/blue_dmgshield",
+            (false, false) => "gfx/misc/blue_portashield",
+        };
+        let mut start = entity.origin;
+        let mut end = entity.origin;
+        let axis = if x_axis { 0 } else { 1 };
+        start[axis] -= negative;
+        end[axis] += positive;
+        let z0 = entity.origin[2];
+        let z1 = z0 + height;
+        let corners = [
+            [start[0], start[1], z0],
+            [end[0], end[1], z0],
+            [end[0], end[1], z1],
+            [start[0], start[1], z1],
+        ];
+        // Double sided so the wall is visible from both teams' approaches.
+        let normal = if x_axis { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+        let base_uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = Arc::new(vec![0, 1, 2, 0, 2, 3, 2, 1, 0, 3, 2, 0]);
+        // An oriented-line FX shader is evaluated every presentation frame in
+        // OpenJK. Resolve the authored animation frame, RGBA waves and tcMods
+        // at this frame's *CGame clock*, not at wall-clock or mapload time.
+        // In particular an animated shield cannot share a static MD3 material.
+        let seconds = time as f32 * 0.001;
+        for stage in self.fx_material_stages(shader) {
+            let stage_time = jka_assets::shader::shader_time(
+                seconds, stage.shader_time_offset, stage.shader_clamp_time,
+            );
+            let stage_color = stage.float_vertex_color_at_time([1.0; 4], seconds);
+            let vertices: Arc<Vec<_>> = Arc::new(corners.into_iter().zip(base_uvs).map(|(position, mut uv)| {
+                let render_position = scene::render_position(position);
+                for modifier in &stage.tc_mods {
+                    uv = crate::fx::draw::modified_uv(uv, render_position, *modifier, stage_time);
+                }
+                DynamicModelVertex {
+                    position: render_position,
+                    normal: scene::render_position(normal),
+                    uv,
+                    color: stage_color,
+                    depth_hack: 0.0,
+                    water_wetness: 0.0,
+                    foliage_wind: 0.0,
+                }
+            }).collect());
+            out.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Fx,
+                authored_lighting: false,
+                material_trace: Some(Arc::from(shader)),
+                entity_num: entity.number,
+                wireframe_class: DynamicWireframeClass::Effect,
+                raster_visible: true,
+                vertices: Arc::clone(&vertices),
+                indices: Arc::clone(&indices),
+                lighting_origin: None,
+                rt_rigid: None,
+                rt_skinned_key: None,
+                ghoul2_gpu: None,
+                fx_gpu_sprites: None,
+                authored_glow: stage.authored_glow,
+                texture: stage.texture_at_time(seconds),
+                alpha_mode: stage.blend.custom_shader_alpha_mode(),
+            });
+        }
     }
 
     /// Every renderable stage of an FX shader. Jedi Academy effects are often
@@ -3076,6 +3441,56 @@ fn position_on_md3_tag(
     (origin, axis)
 }
 
+/// Only the gun referenced by playerState.emplacedIndex receives the local
+/// predicted gunner's angles. Do not rotate nearby unoccupied E-Webs.
+fn local_emplaced_angles(
+    gunner: Option<(u16, [f32; 3])>,
+    entity_num: u16,
+) -> Option<[f32; 3]> {
+    gunner.and_then(|(gun_num, angles)| (gun_num == entity_num).then_some(angles))
+}
+
+/// cg_ents.c CG_General: cap only positive pitch and make gunner yaw
+/// relative to the fixed weapon yaw (the incoming entityState.angles).
+fn emplaced_bone_angles(mut owner_angles: [f32; 3], gun_yaw: f32) -> [f32; 3] {
+    if owner_angles[0] > 40.0 {
+        owner_angles[0] = 40.0;
+    }
+    owner_angles[1] -= gun_yaw;
+    owner_angles
+}
+
+/// cg_players.c CG_Player: retain JKA's integer-time orbit phase and
+/// original target/launch behavior. `genericenemyindex > MAX_GENTITIES` is
+/// the deployment timestamp encoded by the server, not a target entity.
+fn seeker_pose(
+    owner_origin: [f32; 3],
+    generic_enemy_index: i32,
+    target_origin: Option<[f32; 3]>,
+    current_time: i32,
+) -> ([f32; 3], [f32; 3]) {
+    let angle = ((current_time.div_euclid(12) & 255) as f32)
+        * (std::f32::consts::PI * 2.0 / 255.0);
+    let mut elevated = owner_origin;
+    elevated[2] += 40.0;
+    let dir = [angle.cos() * 20.0, angle.sin() * 20.0, angle.cos() * 5.0];
+    let mut origin = std::array::from_fn(|i| elevated[i] + dir[i]);
+    let seekorg = origin;
+    if generic_enemy_index > MAX_GENTITIES {
+        let prefig = ((generic_enemy_index - current_time) as f32 / 80.0).clamp(1.0, 55.0);
+        elevated[2] -= 55.0 - prefig;
+        origin = std::array::from_fn(|i| elevated[i] + dir[i]);
+    }
+    let angles = if let Some(target) = target_origin {
+        openjk_vectoangles(std::array::from_fn(|i| target[i] - seekorg[i]))
+    } else {
+        let mut yaw = angle.to_degrees() + 90.0;
+        if yaw > 360.0 { yaw -= 360.0; }
+        [angle.sin() * 30.0, yaw, 0.0]
+    };
+    (origin, angles)
+}
+
 fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
@@ -3092,6 +3507,28 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
         cr * cp,
     ];
     [forward, [-right[0], -right[1], -right[2]], up]
+}
+
+/// Authored CG_Player sphere shaders and scales, keyed to snapshot powerup bits.
+/// This stays separate from the Ghoul2 full-body force-shell path.
+fn player_powerup_spheres(powerups: i32, cty: bool) -> Vec<(&'static str, f32)> {
+    let mut spheres = Vec::with_capacity(3);
+    if cty && powerups & (1 << PW_REDFLAG) != 0 {
+        spheres.push(("powerups/ysaliredshell", 1.4));
+    } else if cty && powerups & (1 << PW_BLUEFLAG) != 0 {
+        spheres.push(("powerups/ysaliblueshell", 1.4));
+    } else if powerups & (1 << PW_YSALAMIRI) != 0 {
+        spheres.push(("powerups/ysalimarishell", 1.4));
+    }
+    if powerups & (1 << PW_FORCE_BOON) != 0 {
+        spheres.push(("powerups/boonshell", 2.0));
+    }
+    if powerups & (1 << PW_FORCE_ENLIGHTENED_DARK) != 0 {
+        spheres.push(("powerups/endarkenmentshell", 2.0));
+    } else if powerups & (1 << PW_FORCE_ENLIGHTENED_LIGHT) != 0 {
+        spheres.push(("powerups/enlightenmentshell", 2.0));
+    }
+    spheres
 }
 
 /// Exact transform portion of TaystJK `CG_DrawPlayerSphere`: the model origin
@@ -3285,7 +3722,7 @@ mod tests {
             key: "synthetic.md3".into(),
             content_hash: 0,
             model: Arc::new(Md3Model { frames: vec![frame.clone(), frame], tags: vec![], surfaces: vec![surface] }),
-            surfaces: vec![Md3SurfaceAsset {
+            surfaces: vec![Md3SurfaceAsset { foliage_wind: false,
                 surface_index: 0, cached_indices: Arc::new(vec![0, 2, 1]), texture: None,
                 alpha_mode: DynamicModelAlphaMode::Opaque, authored_glow: true,
                 source_material:None,gpu_vertices:None,
@@ -3401,6 +3838,60 @@ mod tests {
     }
 
     #[test]
+    fn static_pvs_fallback_is_cached_and_bvh_preserves_visible_wall_props() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        // A wall-mounted prop at -1 reaches into room 0 (bounds center +4).
+        // Exercise both solid (no origin cluster) and a valid-but-hidden origin.
+        for original_cluster in [None, Some(1)] {
+            presenter.set_static_models(Arc::new(StaticModels {
+                placements: vec![jka_assets::bsp::StaticModel {
+                    model: "synthetic.md3".into(), origin: [-1.0, 0.0, 0.0],
+                    angles: [0.0; 3], scale: [1.0; 3], zoffset: 0.0,
+                    cull_cluster: original_cluster,
+                }],
+                visibility: Some(two_room_visibility()),
+            }));
+            let props = presenter.build_static_props();
+            assert_eq!(props.len(), 1);
+            assert_eq!(props[0].pvs_clusters, [original_cluster, Some(0)]);
+            let visible = Ghoul2PresentationView::new(
+                scene::render_position([100.0, 0.0, 0.0]),
+                scene::render_position([-1.0, 0.0, 0.0]), 1.2, 1.0, 0.0,
+            );
+            let hidden = Ghoul2PresentationView::new(
+                scene::render_position([-100.0, 0.0, 0.0]),
+                scene::render_position([1.0, 0.0, 0.0]), 1.2, 1.0, 0.0,
+            );
+            let pvs = presenter.static_model_source.visibility.as_ref().unwrap();
+            assert!(!static_pvs_hidden(pvs, pvs.cluster_at(visible.jka_position()), &props[0].pvs_clusters, true));
+            // A valid original cluster retains the old visibility from room 1.
+            assert_eq!(static_pvs_hidden(pvs, pvs.cluster_at(hidden.jka_position()), &props[0].pvs_clusters, true),
+                original_cluster.is_none());
+            let tree = StaticVisibilityTree::build(&props);
+            let mut candidates = Vec::new();
+            tree.candidates(visible, Some(pvs), pvs.cluster_at(visible.jka_position()), true, &mut candidates);
+            assert_eq!(candidates, [0]);
+            // Accelerated and direct paths must agree on the fallback.
+            for bvh in [false, true] {
+                presenter.set_static_md3_bvh(bvh);
+                assert!(!presenter.present_static_models(Some(visible)).is_empty());
+                assert_eq!(presenter.present_static_models(Some(hidden)).is_empty(), original_cluster.is_none());
+                // No map reload, static-model rebuild or mesh cache invalidation.
+                let cache_ptr = presenter.static_props.as_ref().unwrap().as_ptr();
+                presenter.set_static_md3_pvs_fallback(false);
+                assert!(presenter.present_static_models(Some(visible)).is_empty(),
+                    "legacy path must reject an invalid/hidden original cluster (BVH={bvh})");
+                assert_eq!(presenter.present_static_models(Some(hidden)).is_empty(),
+                    original_cluster.is_none());
+                assert_eq!(presenter.static_props.as_ref().unwrap().as_ptr(), cache_ptr);
+                presenter.set_static_md3_pvs_fallback(true);
+                assert!(!presenter.present_static_models(Some(visible)).is_empty());
+                assert_eq!(presenter.static_props.as_ref().unwrap().as_ptr(), cache_ptr);
+            }
+        }
+    }
+
+    #[test]
     fn static_bvh_preserves_every_original_frustum_and_distance_candidate() {
         let (_fixture, mut presenter) = synthetic_md3_presenter();
         presenter.set_static_models(test_static_props(256));
@@ -3411,7 +3902,7 @@ mod tests {
         for max_dist in [0.0, 256.0, 2048.0] {
             let view = Ghoul2PresentationView::new(camera_origin, forward, 1.2, 16.0/9.0, max_dist);
             let mut candidates = Vec::new();
-            let (_, pruned) = tree.candidates(view, None, None, &mut candidates);
+            let (_, pruned) = tree.candidates(view, None, None, true, &mut candidates);
             let set: HashSet<usize> = candidates.into_iter().collect();
             for (index, prop) in props.iter().enumerate() {
                 let baseline_visible = !(prop.radius > 0.0
@@ -3440,7 +3931,7 @@ mod tests {
             1.2, 1.6, 0.0,
         );
         let mut candidates = Vec::new();
-        tree.candidates(view, None, None, &mut candidates);
+        tree.candidates(view, None, None, true, &mut candidates);
         assert!(candidates.contains(&30));
     }
 
@@ -3599,7 +4090,7 @@ models/map_objects/factory/glass_b
         let color = md3_stage_color(&stage, [0.3, 0.4, 0.5, 0.8]);
         assert_eq!(&color[0..3], &[1.0, 1.0, 1.0]);
         assert!((color[3] - 0.05).abs() < 1.0e-5);
-        let vertex = DynamicModelVertex {
+        let vertex = DynamicModelVertex { foliage_wind: 0.0,
             position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0],
             uv: [0.7, 0.2], color: [1.0; 4], depth_hack: 0.0, water_wetness: 0.0,
         };
@@ -3786,6 +4277,45 @@ models/map_objects/factory/glass_b
     }
 
     #[test]
+    fn foliage_md3_material_reaches_cached_vertices_and_gpu_instances() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_md3_geometry_cache(true);
+        let shader_name = "models/map_objects/yavin/plant_b";
+        presenter.shaders.extend(jka_assets::shader::parse(&format!(
+            "{shader_name}\n{{\ncull twosided\n{{\nmap $whiteimage\nalphaFunc GE128\nrgbGen lightingDiffuse\n}}\n}}\n"
+        )).unwrap());
+        let original = Arc::clone(&presenter.md3_models["synthetic.md3"]);
+        let mut model = (*original.model).clone();
+        model.surfaces[0].shader = format!("{shader_name}.tga");
+        let material = presenter.md3_surface_material(&model.surfaces[0], "synthetic.md3",
+            0, Arc::clone(&original.surfaces[0].cached_indices));
+        assert!(material.foliage_wind);
+        let asset = Arc::new(Md3Asset {
+            key: Arc::clone(&original.key), content_hash: original.content_hash,
+            model: Arc::new(model), surfaces: vec![material],
+        });
+        presenter.md3_models.insert("synthetic.md3".into(), Arc::clone(&asset));
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let origin = [-1267.0, -5964.0, 406.0];
+        let draws = presenter.present_static_md3(7, "synthetic.md3", origin, axis, [1.0; 4], 0).unwrap();
+        assert!(!draws.is_empty());
+        assert!(draws[0].vertices.iter().all(|v| v.foliage_wind == crate::foliage::model_tag(origin)));
+        let again = presenter.present_static_md3(7, "synthetic.md3", origin, axis, [1.0; 4], 0).unwrap();
+        assert!(Arc::ptr_eq(&draws[0].vertices, &again[0].vertices), "wind must retain the geometry cache");
+        let submission = ItemDraw { model: "synthetic.md3".into(), origin, axis,
+            rgba: [1.0; 4], custom_shader: None };
+        let instances = presenter.static_md3_gpu_surfaces(&submission, None, &draws);
+        assert!(instances[0].as_ref().unwrap().ghoul2_gpu.as_ref().unwrap().foliage_wind);
+
+        // A remap can change eligibility without changing source geometry.
+        let mut still = asset.surfaces[0].clone();
+        still.foliage_wind = false;
+        let vertices = presenter.md3_geometry(&asset, &still, 7, 0, 0,
+            axis, origin, 1.0, [1.0; 4], 0.0).0;
+        assert!(vertices.iter().all(|v| v.foliage_wind == 0.0));
+    }
+
+    #[test]
     fn md3_geometry_cache_keeps_multistage_and_view_weapon_draw_semantics() {
         let (_fixture, mut presenter) = synthetic_md3_presenter();
         presenter.set_md3_geometry_cache(true);
@@ -3851,6 +4381,19 @@ models/map_objects/factory/glass_b
         let burn = presenter.fx_material_stages("gfx/damage/burnmark4");
         assert_eq!(burn[0].blend, FxBlend::Alpha);
         assert!(burn[0].texture.as_ref().unwrap().clamp);
+    }
+
+    #[test]
+    fn force_boon_uses_taystjk_separate_two_x_sphere() {
+        assert_eq!(player_powerup_spheres(1 << PW_FORCE_BOON, false),
+            vec![("powerups/boonshell", 2.0)]);
+        assert_eq!(player_powerup_spheres(1 << PW_FORCE_ENLIGHTENED_LIGHT, false),
+            vec![("powerups/enlightenmentshell", 2.0)]);
+        assert_eq!(player_powerup_spheres(1 << PW_YSALAMIRI, false),
+            vec![("powerups/ysalimarishell", 1.4)]);
+        assert_eq!(player_powerup_spheres(1 << PW_REDFLAG, true),
+            vec![("powerups/ysaliredshell", 1.4)]);
+        assert!(player_powerup_spheres(1 << PW_REDFLAG, false).is_empty());
     }
 
     #[test]
@@ -4189,5 +4732,47 @@ mod md3_lod_tests {
     #[test]
     fn md3_lod_filenames_match_taystjk() {
         assert_eq!(replace_md3_suffix("models/map/rock.md3", "_2.md3"), "models/map/rock_2.md3");
+    }
+}
+
+#[cfg(test)]
+mod emplaced_seeker_parity_tests {
+    use super::*;
+
+    #[test]
+    fn emplaced_bone02_uses_relative_yaw_and_40_degree_positive_pitch_cap() {
+        assert_eq!(emplaced_bone_angles([56.0, 170.0, 4.0], 90.0), [40.0, 80.0, 4.0]);
+        // TaystJK does not clamp negative pitch or normalize relative yaw.
+        assert_eq!(emplaced_bone_angles([-42.0, -170.0, 0.0], 170.0), [-42.0, -340.0, 0.0]);
+    }
+
+    #[test]
+    fn emplaced_index_targets_only_the_mounted_eweb() {
+        let angles = [20.0, 170.0, 0.0];
+        assert_eq!(local_emplaced_angles(Some((87, angles)), 87), Some(angles));
+        assert_eq!(local_emplaced_angles(Some((87, angles)), 88), None);
+        assert_eq!(local_emplaced_angles(None, 87), None);
+        assert_eq!(emplaced_bone_angles(
+            local_emplaced_angles(Some((87, angles)), 87).unwrap(), 90.0,
+        ), [20.0, 80.0, 0.0]);
+    }
+
+    #[test]
+    fn seeker_orbits_with_taystjk_integer_clock_and_tracks_target() {
+        let (start, ang) = seeker_pose([100.0, 200.0, 10.0], -1, None, 0);
+        assert_eq!(start, [120.0, 200.0, 55.0]);
+        assert_eq!(ang, [0.0, 90.0, 0.0]);
+        let (still, _) = seeker_pose([100.0, 200.0, 10.0], -1, None, 11);
+        assert_eq!(still, start); // cg.time / 12 is integral
+        let (target, aim) = seeker_pose([0.0, 0.0, 0.0], 10, Some([100.0, 0.0, 45.0]), 0);
+        assert_eq!(target, [20.0, 0.0, 45.0]);
+        assert_eq!(aim, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn seeker_launch_height_follows_genericenemyindex_timestamp() {
+        let (orbit, _) = seeker_pose([0.0; 3], -1, None, 1000);
+        let (launch, _) = seeker_pose([0.0; 3], 2000, None, 1000);
+        assert!((orbit[2] - launch[2] - 42.5).abs() < 0.01);
     }
 }

@@ -1,6 +1,6 @@
 //! Submission draw.
 use crate::cgame::player_presenter::{
-    blend_for_alpha, gpu_bones_from_pose, skin_glm_surface, skin_surface_timed, specular_alpha, environment_uv,
+    blend_for_alpha, gpu_bones_with_heat_sources, skin_glm_surface, skin_surface_timed, specular_alpha, environment_uv,
     stage_uv_affine, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
@@ -243,7 +243,7 @@ impl PlayerPresenter {
             };
 
         if self.skinning_mode == Ghoul2SkinningMode::Gpu {
-            let bones = gpu_bones_from_pose(pose);
+            let (bones, heat_bone) = gpu_bones_with_heat_sources(pose, gla);
             let empty_vertices = Arc::new(Vec::new());
 
             // Cloth remains a CPU post-skin deformation path. Jiggle stays on
@@ -396,11 +396,12 @@ impl PlayerPresenter {
                     lighting_origin: Some(origin),
                     rt_rigid: None,
                     rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(draw_key)),
-                    ghoul2_gpu: Some(Ghoul2GpuSkinning {
+                    ghoul2_gpu: Some(Ghoul2GpuSkinning { foliage_wind: false,
                         mesh_key: Arc::clone(draw_key),
                         vertices: Arc::clone(draw_vertices),
                         indices: Arc::clone(draw_indices),
                         bones: Arc::clone(&bones),
+                        heat_bone,
                         axis,
                         origin,
                         color: surface_rgba,
@@ -689,7 +690,7 @@ impl PlayerPresenter {
                             Some(viewer) => environment_uv(vertex.position, vertex.normal, viewer),
                             None => vertex.uv,
                         };
-                        DynamicModelVertex {
+                        DynamicModelVertex { foliage_wind: 0.0,
                             uv: [
                                 uv[0] * xform[0] + uv[1] * cross[0] + xform[2],
                                 uv[0] * cross[1] + uv[1] * xform[1] + xform[3],
@@ -759,11 +760,12 @@ impl PlayerPresenter {
         bulge_height: Option<f32>,
         env_map: Option<bool>,
     ) -> DynamicModelSurface {
-        let ghoul2_gpu = surface.ghoul2_gpu.as_ref().map(|skin| Ghoul2GpuSkinning {
+        let ghoul2_gpu = surface.ghoul2_gpu.as_ref().map(|skin| Ghoul2GpuSkinning { foliage_wind: skin.foliage_wind,
             mesh_key: Arc::clone(&skin.mesh_key),
             vertices: Arc::clone(&skin.vertices),
             indices: Arc::clone(&skin.indices),
             bones: Arc::clone(&skin.bones),
+            heat_bone: skin.heat_bone,
             axis: skin.axis,
             origin: skin.origin,
             color,
@@ -784,7 +786,7 @@ impl PlayerPresenter {
                 surface
                     .vertices
                     .iter()
-                    .map(|vertex| DynamicModelVertex {
+                    .map(|vertex| DynamicModelVertex { foliage_wind: vertex.foliage_wind,
                         uv: match uv_xform {
                             Some(m) => [
                                 vertex.uv[0] * m[0] + vertex.uv[1] * m[2] + m[4],

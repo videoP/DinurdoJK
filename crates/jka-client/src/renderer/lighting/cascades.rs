@@ -31,7 +31,7 @@ pub(in crate::renderer) fn bevy_cascade_shadow_matrices(
     // Bevy builds cascades from the light transform's pure rotation. JKA stores
     // the sun's forward/travel direction directly, so construct the equivalent
     // zero-translation light view and transpose it to obtain world_from_light.
-    let light_from_world = Mat4::look_to_rh(Vec3::ZERO, light_direction, reference_up);
+    let light_from_world = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, light_direction, reference_up);
     let world_from_light = light_from_world.transpose();
     let bounds = bevy_cascade_bounds();
     let overlap_factor = 1.0 - BEVY_CSM_OVERLAP_PROPORTION;

@@ -16,6 +16,7 @@ pub(crate) struct VideoLoadState {
     pub pvs_mode: Option<PvsMode>,
     pub anisotropy: Option<f32>,
     pub dynamic_shadows_mode_seen: bool,
+    pub static_world_csm_seen: bool,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct CvarBinding {
