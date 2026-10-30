@@ -153,7 +153,7 @@ impl App {
         } else {
             self.push_console_line(rendered.clone());
         }
-        if self.chat_lines.len() >= 16 {
+        if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
             self.chat_lines.pop_front();
         }
         let now = Instant::now();

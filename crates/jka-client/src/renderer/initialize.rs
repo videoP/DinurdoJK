@@ -16,7 +16,7 @@ use crate::renderer::{
     create_targets, create_texture_sampler, create_ui_pipeline, cube_texture_entry,
     depth_array_texture_entry, depth_cube_array_texture_entry, depth_texture_entry,
     empty_ui_font_texture, encode_screenshot_job, env_flag, load_texture_asset_or_missing,
-    load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font,
+    load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font, load_ui_clean_font,
     load_ui_unknown_map_texture, mpsc, no_vsync_mode, nonfiltering_sampler_entry,
     sampler_entry, sampler_entry_stages, storage_buffer_entry, supported_msaa,
     texture_2d_array_entry, texture_3d_entry, texture_3d_entry_stages, texture_entry,
@@ -1153,6 +1153,8 @@ impl Renderer {
                 texture_entry(5),
                 texture_entry(6),
                 texture_entry(7),
+                texture_entry(8),
+                texture_entry(9),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1205,6 +1207,10 @@ impl Renderer {
         let (ui_small_font_data, ui_small_font_metrics) =
             load_ui_proportional_font(base, game, "ocr_a");
         let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
+        let (ui_clean_font_data, ui_clean_font_metrics) = load_ui_clean_font(base, game);
+        let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
+        // Filled in the background the first time a scoreboard is shown.
+        let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
         let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
@@ -1281,6 +1287,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&ui_ext_images.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&ui_clean_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&ui_avatars.view),
                 },
             ],
         });
@@ -2520,6 +2534,11 @@ impl Renderer {
             ui_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
+            _ui_clean_font: ui_clean_font,
+            ui_clean_font_metrics: ui_clean_font_metrics.map(std::sync::Arc::new),
+            _ui_avatars: ui_avatars,
+            ui_avatar_atlas: None,
+            ui_avatar_job: None,
             studio_race_font: None,
             _ui_splash: ui_splash,
             _ui_keys: ui_keys,

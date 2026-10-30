@@ -132,11 +132,11 @@ impl App {
             let highlighted = selected == tool;
             let planned = false;
             let fill = if highlighted {
-                egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
+                egui::Color32::from_rgba_unmultiplied(70, 102, 68, 240)
             } else if planned {
-                egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219)
             } else {
-                egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234)
+                egui::Color32::from_rgba_unmultiplied(27, 24, 21, 234)
             };
             paint_annular_sector(painter, center, inner, outer, start, end, fill);
             let arc_color = if highlighted {

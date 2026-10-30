@@ -146,7 +146,7 @@ pub(in crate::ui) fn build_vote(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
     let glyph_w = w as f32 * (8.0 / 640.0);
     let glyph_h = h as f32 * (12.0 / 480.0);
     let mut y = 62.0 * h as f32 / 480.0;
-    for text in [line, "or press ESC then click Vote"] {
+    for text in [line, "hold SCORES + Mouse 2 to vote, or ESC > Vote"] {
         fixed_charset_text(
             out,
             text,

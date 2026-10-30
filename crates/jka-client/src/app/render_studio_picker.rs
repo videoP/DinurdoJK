@@ -147,7 +147,7 @@ impl StudioFilePicker {
                 .desired_width(ui.available_width()).hint_text("Search this folder…"));
         });
         if !self.error.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(238,156,105),&self.error);
+            ui.colored_label(super::egui_theme::DANGER,&self.error);
         }
         ui.separator();
         if self.pending.is_some() {

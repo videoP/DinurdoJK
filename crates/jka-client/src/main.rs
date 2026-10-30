@@ -76,6 +76,7 @@ mod media_mp4;
 mod model_frame_log;
 mod net;
 mod neon_menu;
+mod palette;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;

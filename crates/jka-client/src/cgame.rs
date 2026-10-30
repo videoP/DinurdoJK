@@ -736,7 +736,13 @@ pub enum CgameNotice {
     /// `print`: console text (may contain @@@ StringEd references).
     Print(Vec<u8>),
     /// `chat`/`tchat`/`lchat`/`ltchat`: a chat-box line.
-    Chat { team: bool, kind: ChatKind, text: Vec<u8> },
+    Chat {
+        team: bool,
+        kind: ChatKind,
+        text: Vec<u8>,
+        /// Sending client, when the server named it (client-side mutes).
+        sender: Option<i32>,
+    },
     /// `cp`: CG_CenterPrint.
     CenterPrint(Vec<u8>),
     /// `CG_DrawSiegeMessageNonMenu`: a Siege-authored objective message. A
@@ -761,6 +767,10 @@ pub enum CgameNotice {
         target: String,
         attacker: Option<String>,
         key: &'static str,
+        /// Client numbers and means of death, for the kill feed.
+        target_client: i32,
+        attacker_client: Option<i32>,
+        mod_: i32,
     },
     /// JKA/TaystJK playerState reward counter transition. The app chooses
     /// cg_drawRewards mode assets and owns the visual FIFO.
@@ -1518,7 +1528,7 @@ impl ClientGameState {
         text.extend_from_slice(speaker_name);
         text.extend_from_slice(b"^7: ");
         text.extend_from_slice(description.as_bytes());
-        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text })
+        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text, sender: i32::try_from(speaker).ok() })
     }
 
     pub fn presentation_event_count(&self) -> usize {
@@ -2265,7 +2275,9 @@ impl ClientGameState {
         if name.eq_ignore_ascii_case(b"chat") || name.eq_ignore_ascii_case(b"tchat") {
             let team = name.eq_ignore_ascii_case(b"tchat");
             let kind = if team { ChatKind::Team } else { ChatKind::Say };
-            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)) });
+            // OpenJK G_SayTo appends the sender's client number after the text.
+            let sender = parts.get(2).copied().and_then(parse_i32_ascii);
+            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)), sender });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"lchat") || name.eq_ignore_ascii_case(b"ltchat") {
@@ -2275,7 +2287,8 @@ impl ClientGameState {
             // "%s^7<%s> ^%s%s": name, location, colour, message.
             let text = [arg(1), b"^7<".to_vec(), arg(2), b"> ^".to_vec(), arg(3), arg(4)].concat();
             let team = name.eq_ignore_ascii_case(b"ltchat");
-            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text) });
+            let sender = parts.get(5).copied().and_then(parse_i32_ascii);
+            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text), sender });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"cps") {

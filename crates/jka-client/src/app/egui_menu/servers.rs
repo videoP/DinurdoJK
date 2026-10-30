@@ -775,7 +775,7 @@ impl App {
                     theme::section(
                         ui,
                         self.server_browser.source.label(),
-                        &format!("{} visible — {}", servers.len(), self.server_browser.status_text),
+                        &format!("{} visible · {}", servers.len(), self.server_browser.status_text),
                     );
                     ui.horizontal(|ui| {
                         self.server_browser_sort_header(ui, server_browser::BrowserSort::Name, name_w);
@@ -835,7 +835,7 @@ impl App {
                                             name_padding,
                                         );
 
-                                        let map = if server.map.is_empty() { "—" } else { &server.map };
+                                        let map = if server.map.is_empty() { "-" } else { &server.map };
                                         let map_response = ui.add_sized(
                                             [118.0, 24.0],
                                             egui::Label::new(theme::plain(map, 11.5, row_text))
@@ -885,7 +885,7 @@ impl App {
                                             0.0,
                                         );
 
-                                        let ping = if server.ping_ms == 0 { "—".to_owned() } else { server.ping_ms.to_string() };
+                                        let ping = if server.ping_ms == 0 { "-".to_owned() } else { server.ping_ms.to_string() };
                                         let ping_color = match server.ping_ms {
                                             0 => theme::TEXT_FAINT,
                                             1..=79 => egui::Color32::from_rgb(0x83, 0xD6, 0x8A),
@@ -920,7 +920,7 @@ impl App {
                                                 )
                                             })
                                             .unwrap_or_else(|| {
-                                                ("—".to_owned(), "This server has not been visited yet.".to_owned())
+                                                ("-".to_owned(), "This server has not been visited yet.".to_owned())
                                             });
                                         let visit_response = ui.add_sized(
                                             [last_visited_w, 24.0],
@@ -1035,7 +1035,7 @@ impl App {
                     );
                     theme::label(ui, theme::plain(&address.to_string(), 11.5, theme::TEXT_FAINT));
                     ui.add_space(8.0);
-                    theme::label(ui, theme::plain(&format!("Map: {}", if server.map.is_empty() { "—" } else { &server.map }), 12.0, theme::TEXT_DIM));
+                    theme::label(ui, theme::plain(&format!("Map: {}", if server.map.is_empty() { "-" } else { &server.map }), 12.0, theme::TEXT_DIM));
                     theme::label(ui, theme::plain(&format!("Mode: {}", server.gametype_label()), 12.0, theme::TEXT_DIM));
                     let visible_clients = self.server_browser.visible_client_count(&server);
                     let connecting_hidden = if self.server_browser.hide_connecting {

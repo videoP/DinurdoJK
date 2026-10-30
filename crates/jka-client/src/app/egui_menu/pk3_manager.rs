@@ -26,10 +26,10 @@ mod apply_tests {
 
 // The pane fills are deliberately subdued, so package status is readable
 // without competing with the blue selection highlight or other Setup pages.
-const DISABLED_PANE: egui::Color32 = egui::Color32::from_rgb(47, 27, 32);
-const ENABLED_PANE: egui::Color32 = egui::Color32::from_rgb(24, 48, 35);
-const DISABLED_ACCENT: egui::Color32 = egui::Color32::from_rgb(234, 120, 115);
-const ENABLED_ACCENT: egui::Color32 = egui::Color32::from_rgb(114, 208, 145);
+const DISABLED_PANE: egui::Color32 = egui::Color32::from_rgb(0x36, 0x24, 0x20);
+const ENABLED_PANE: egui::Color32 = egui::Color32::from_rgb(0x26, 0x33, 0x25);
+const DISABLED_ACCENT: egui::Color32 = theme::DANGER;
+const ENABLED_ACCENT: egui::Color32 = theme::ACCENT;
 
 /// A package's selected state is separate from its staged enabled state.
 /// The arrow stages a move, while clicking its filename only changes the

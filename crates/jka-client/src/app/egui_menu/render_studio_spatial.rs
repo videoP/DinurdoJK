@@ -129,7 +129,7 @@ impl App {
             let tint=color(marker.lane);
             painter.circle_filled(anchor,3.,tint);
             painter.line_segment([anchor,rect.left_center()],egui::Stroke::new(1.,tint.gamma_multiply(0.6)));
-            painter.rect_filled(rect,4.,if selected {egui::Color32::from_rgb(48,63,72)}else{egui::Color32::from_black_alpha(210)});
+            painter.rect_filled(rect,4.,if selected {theme::CONTROL_SELECTED}else{egui::Color32::from_black_alpha(210)});
             painter.rect_stroke(rect,4.,egui::Stroke::new(if selected{2.}else{1.},if selected {egui::Color32::WHITE}else{tint}),egui::StrokeKind::Inside);
             let icon=rect.left_center()+egui::vec2(11.,0.);
             painter.add(egui::Shape::convex_polygon(vec![icon+egui::vec2(0.,-6.),icon+egui::vec2(6.,0.),

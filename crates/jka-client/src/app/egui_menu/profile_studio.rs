@@ -5,13 +5,13 @@ use crate::app::egui_menu::{
     PROFILE_EMOTES, PROFILE_FORCE, PROFILE_MODEL,
 };
 
-const INK: egui::Color32 = egui::Color32::from_rgb(10, 15, 23);
-const PLATE: egui::Color32 = egui::Color32::from_rgb(17, 24, 35);
-const PLATE_LIFT: egui::Color32 = egui::Color32::from_rgb(25, 34, 48);
-const EDGE: egui::Color32 = egui::Color32::from_rgb(48, 66, 86);
+const INK: egui::Color32 = theme::CHROME;
+const PLATE: egui::Color32 = theme::SURFACE;
+const PLATE_LIFT: egui::Color32 = theme::SURFACE_ALT;
+const EDGE: egui::Color32 = theme::LINE;
 const SKY: egui::Color32 = theme::ACCENT;
-const SKY_SOFT: egui::Color32 = egui::Color32::from_rgb(125, 199, 255);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(142, 162, 183);
+const SKY_SOFT: egui::Color32 = theme::ACCENT_HOVER;
+const MUTED: egui::Color32 = theme::TEXT_FAINT;
 const STUDIO_NAV: [(usize, &str); 3] = [
     (PROFILE_MODEL, "LOOK"),
     (PROFILE_FORCE, "FORCE"),
@@ -249,11 +249,10 @@ impl App {
                 ui.set_min_height((height - 28.0).max(1.0));
                 // The tabs and search remain fixed; catalog and the optional
                 // other-player appearance group own bounded scroll regions.
-                let nav_w = (ui.available_width() - 12.0) / STUDIO_NAV.len() as f32;
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (section, title) in STUDIO_NAV {
-                        if studio_button(ui, title, self.profile_selected_section == section, false, nav_w) {
+                        if super::holo::tab(ui, title, 15.0, 38.0, self.profile_selected_section == section).clicked() {
                             self.profile_selected_section = section;
                             if section != PROFILE_MODEL { self.profile_studio_cosmetic_group = 0; }
                             let group = if section == PROFILE_MODEL {
@@ -284,7 +283,7 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
                 let pending = self.profile_has_pending_changes();
-                if studio_button(ui, if pending { "APPLY CHANGES" } else { "APPLIED ✓" },
+                if studio_button(ui, if pending { "APPLY CHANGES" } else { "APPLIED" },
                     pending, pending, (ui.available_width() * 0.6).max(125.0)) && pending {
                     self.apply_profile_changes();
                 }
@@ -1295,7 +1294,7 @@ impl App {
             frame.left_top() + egui::vec2(17.0, 77.0), egui::vec2(204.0, 36.0));
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio_stage_tint")
             .max_rect(tint_area), |ui| {
-            egui::Frame::new().fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 235))
+            egui::Frame::new().fill(theme::PANEL_FILL)
                 .corner_radius(egui::CornerRadius::same(5))
                 .stroke(egui::Stroke::new(1.0, EDGE))
                 .inner_margin(egui::Margin::same(7))
@@ -1336,7 +1335,7 @@ impl App {
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt("studio_saber_attachment_debug").max_rect(panel), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(8, 16, 24, 240))
+                    .fill(theme::PANEL_FILL)
                     .stroke(egui::Stroke::new(1.0, SKY))
                     .inner_margin(egui::Margin::same(9))
                     .show(ui, |ui| {
@@ -1370,10 +1369,15 @@ impl App {
                 p.circle_filled(anchor, 3.0, SKY);
             }
             let button = ui.put(btn, egui::Button::new(
-                egui::RichText::new(format!("{title}  ▾")).size(10.0))
-                .fill(egui::Color32::from_rgba_premultiplied(15, 22, 32, 235))
+                egui::RichText::new(format!("{title}    ")).size(10.0))
+                .fill(theme::PANEL_FILL)
                 .stroke(egui::Stroke::new(1.0, EDGE)))
                 .on_hover_text("Middle-click to remove");
+            // Drawn chevron: the UI font has no down-pointing triangle glyph.
+            let c = egui::pos2(button.rect.right() - 12.0, button.rect.center().y);
+            p.add(egui::Shape::convex_polygon(
+                vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(3.5, -1.5), c + egui::vec2(0.0, 2.5)],
+                MUTED, egui::Stroke::NONE));
             if button.clicked_by(egui::PointerButton::Middle) {
                 self.focus_profile_studio_camera(match group {
                     1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
@@ -1415,7 +1419,7 @@ impl App {
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt("studio_anny_stage_panel").max_rect(shape_panel), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
+                    .fill(theme::PANEL_FILL)
                     .corner_radius(egui::CornerRadius::same(5))
                     .stroke(egui::Stroke::new(1.0, EDGE))
                     .inner_margin(egui::Margin::same(9))
@@ -1439,7 +1443,7 @@ impl App {
             }
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt(("studio_stage_saber", hand)).max_rect(panel), |ui| {
-                egui::Frame::new().fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
+                egui::Frame::new().fill(theme::PANEL_FILL)
                     .corner_radius(egui::CornerRadius::same(5))
                     .stroke(egui::Stroke::new(1.0, EDGE))
                     .inner_margin(egui::Margin::same(7))

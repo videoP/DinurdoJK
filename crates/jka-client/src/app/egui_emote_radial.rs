@@ -464,7 +464,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 33, 238))
+                    .fill(egui::Color32::from_rgba_unmultiplied(26, 24, 20, 238))
                     .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
                     .corner_radius(egui::CornerRadius::same(9))
                     .inner_margin(10.0)
@@ -745,11 +745,11 @@ impl App {
                     let end = angle + step * 0.5 - visual_gap;
                     let highlighted = selected_ring == Some(i) && choice.enabled();
                     let fill = if highlighted {
-                        egui::Color32::from_rgba_unmultiplied(38, 94, 151, 242)
+                        egui::Color32::from_rgba_unmultiplied(70, 102, 68, 242)
                     } else if choice.enabled() {
-                        egui::Color32::from_rgba_unmultiplied(17, 25, 37, 235)
+                        egui::Color32::from_rgba_unmultiplied(27, 24, 21, 235)
                     } else {
-                        egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                        egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219)
                     };
                     paint_annular_sector(painter, center, inner, ring_outer, start, end, fill);
                     paint_arc(painter, center, ring_outer, start, end,
@@ -778,13 +778,13 @@ impl App {
             let highlighted = selected_inner == Some(i) && choice.enabled();
             let dimmed = chosen_category.is_some();
             let fill = if highlighted {
-                egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
+                egui::Color32::from_rgba_unmultiplied(70, 102, 68, 240)
             } else if dimmed {
-                egui::Color32::from_rgba_unmultiplied(13, 20, 28, 195)
+                egui::Color32::from_rgba_unmultiplied(20, 18, 15, 195)
             } else if !choice.enabled() {
-                egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219)
             } else {
-                egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234)
+                egui::Color32::from_rgba_unmultiplied(27, 24, 21, 234)
             };
             paint_annular_sector(painter, center, ring_inner, ring_outer, start, end, fill);
             paint_arc(painter, center, ring_outer, start, end,

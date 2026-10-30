@@ -103,6 +103,12 @@ pub struct ClientPresentationSettings {
     pub fk_duration: i32,
     pub fk_first_jump_duration: i32,
     pub fk_second_jump_delay: i32,
+    /// DinurdoJK `cg_killfeed*`.
+    pub killfeed: crate::ui::KillfeedSettings,
+    /// DinurdoJK `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    pub scoreboard: crate::ui::ScoreboardSettings,
+    /// DinurdoJK `cg_chat*` chat box settings.
+    pub chat: crate::ui::ChatSettings,
     pub model: String,
     /// DinurdoJK compact forced-player-model cvar: 0=off, model=all other players, ally,enemy=team split.
     pub force_model: String,
@@ -375,6 +381,9 @@ impl Default for ClientPresentationSettings {
             fk_duration: 50,
             fk_first_jump_duration: 0,
             fk_second_jump_delay: 0,
+            killfeed: crate::ui::KillfeedSettings::default(),
+            scoreboard: crate::ui::ScoreboardSettings::default(),
+            chat: crate::ui::ChatSettings::default(),
             model: "kyle".to_owned(),
             force_model: "0".to_owned(),
             crosshair: CrosshairSettings::default(),

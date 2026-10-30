@@ -429,8 +429,8 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 for text in [
                                     format!("Mod: {}", detail.mod_name),
-                                    format!("Player: {}", if detail.player.is_empty() { "—" } else { detail.player.as_str() }),
-                                    format!("Initial map: {}", if detail.initial_map.is_empty() { "—" } else { detail.initial_map.as_str() }),
+                                    format!("Player: {}", if detail.player.is_empty() { "-" } else { detail.player.as_str() }),
+                                    format!("Initial map: {}", if detail.initial_map.is_empty() { "-" } else { detail.initial_map.as_str() }),
                                     format!("Time span: {}", chat_log_duration_label(detail.started_unix_ms, detail.ended_unix_ms)),
                                 ] {
                                     egui::Frame::new()

@@ -1436,4 +1436,22 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_HUDKILLFEED {
+        runtime: CvarDef::new("cg_hudKillFeed", "tl 0 0 1", "anchor x y scale", "KILL FEED layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::KillFeed).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string()).ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::KillFeed) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) { *settings.hud_layout.element_mut(HudElementId::KillFeed) = layout; }
+            }),
+            archive: Some((814, |state| state.presentation.hud_layout.element(HudElementId::KillFeed).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
 }

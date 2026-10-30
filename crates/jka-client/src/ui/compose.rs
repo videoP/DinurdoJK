@@ -193,6 +193,9 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::Vote, width, height, |out| {
             build_vote(out, ui, width, height);
         });
+        draw_placed(out, ui, HudElementId::KillFeed, width, height, |out| {
+            super::killfeed::build_killfeed(out, ui, small_font, width, height);
+        });
         draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
             build_chat_history(out, ui, small_font, width, height);
         });

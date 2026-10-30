@@ -372,6 +372,16 @@ pub fn build_world_player_label_vertices(
         // add a second stats line. Center each line independently instead of
         // letting the generic text drawer inherit the first line's x origin.
         let line_step = 20.0 * scale * sy;
+        if label.crowned {
+            // The crown gets its own box above the first line (and above the
+            // health bar when one is drawn), a third of the name's width.
+            let first = label.text.split('\n').next().unwrap_or_default();
+            let name_w = proportional_text_width(first, font, scale) * sx;
+            let cap = f32::from(font.glyphs[usize::from(b'A')].height.max(1)) * scale * sy;
+            let top = if label.health_fraction.is_some() { (y - 8.0 * sy).min(y - cap) } else { y - cap };
+            let crown = super::glyphs::crown_over([x - name_w * 0.5, top, name_w, cap], height as f32 / 1080.0);
+            super::glyphs::crown(out, crown, 0.9, width, height);
+        }
         for (line, text) in label.text.split('\n').enumerate() {
             let text_width = proportional_text_width(text, font, scale) * sx;
             proportional_text(
@@ -814,5 +824,134 @@ pub fn build_studio_label_vertices(
         let fallback = (1.25 * scale).max(0.25);
         let visible = crate::cgame::text_to_jka_bytes(&label.text).iter().filter(|&&c| c != b'^').count() as f32;
         text(out, &label.text, x - visible * 3.0 * fallback, y - 4.0 * fallback, fallback, [label.color[0],label.color[1],label.color[2],alpha], width, height);
+    }
+}
+
+
+/// Texture source of the clean TrueType UI font (`ui.wgsl` binding 8).
+pub(in crate::ui) const CLEAN_FONT_SOURCE: f32 = 8.0;
+
+/// Text for the redesigned surfaces (scoreboard, kill feed, player popup).
+/// Sizes are line heights in physical pixels. With the clean font loaded the
+/// glyphs scale uniformly, so text keeps its proportions on widescreen;
+/// without it, the JKA proportional font and then the charsgrid stand in.
+#[derive(Clone, Copy)]
+pub(in crate::ui) struct UiText<'a> {
+    clean: Option<&'a ProportionalFont>,
+    legacy: Option<&'a ProportionalFont>,
+    w: u32,
+    h: u32,
+}
+
+impl<'a> UiText<'a> {
+    pub(in crate::ui) fn new(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
+        Self { clean: ui.clean_font.as_deref(), legacy, w, h }
+    }
+
+    fn legacy_scale(&self, font: &ProportionalFont, px: f32) -> f32 {
+        px / (f32::from(font.height.max(1)) * self.h.max(1) as f32 / 480.0)
+    }
+
+    fn charsgrid_scale(px: f32) -> f32 {
+        px / 12.0
+    }
+
+    /// Advance width of `value`, colour codes excluded.
+    pub(in crate::ui) fn width(&self, value: &str, px: f32) -> f32 {
+        if let Some(font) = self.clean {
+            let scale = px / f32::from(font.height.max(1));
+            let bytes = crate::cgame::text_to_jka_bytes(value);
+            let mut width = 0.0;
+            let mut index = 0;
+            while index < bytes.len() {
+                if bytes[index] == b'^' && index + 1 < bytes.len() && color_code(bytes[index + 1] as char, 1.0).is_some() {
+                    index += 2;
+                    continue;
+                }
+                width += f32::from(font.glyphs[bytes[index] as usize].horiz_advance.max(0)) * scale;
+                index += 1;
+            }
+            width
+        } else if let Some(font) = self.legacy {
+            proportional_text_width(value, font, self.legacy_scale(font, px)) * self.w.max(1) as f32 / 640.0
+        } else {
+            crate::ui::visible_jka_chars(value) as f32 * 6.0 * Self::charsgrid_scale(px)
+        }
+    }
+
+    /// Height of a capital letter, for centring a line on a box.
+    pub(in crate::ui) fn cap(&self, px: f32) -> f32 {
+        if let Some(font) = self.clean {
+            let glyph = font.glyphs[usize::from(b'H')];
+            (glyph.baseline as f32 - 2.0).max(1.0) * px / f32::from(font.height.max(1))
+        } else if let Some(font) = self.legacy {
+            f32::from(font.glyphs[usize::from(b'A')].height.max(1)) * self.legacy_scale(font, px) * self.h.max(1) as f32 / 480.0
+        } else {
+            8.0 * Self::charsgrid_scale(px)
+        }
+    }
+
+    /// Baseline that vertically centres capitals in `bounds`.
+    pub(in crate::ui) fn baseline_in(&self, bounds: [f32; 4], px: f32) -> f32 {
+        bounds[1] + (bounds[3] + self.cap(px)) * 0.5
+    }
+
+    pub(in crate::ui) fn draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        let (w, h) = (self.w, self.h);
+        if let Some(font) = self.clean {
+            let scale = px / f32::from(font.height.max(1));
+            let bytes = crate::cgame::text_to_jka_bytes(value);
+            // Soft one-pixel drop shadow, then the glyphs.
+            let shadow = (px / 22.0).clamp(1.0, 2.0);
+            for pass in [true, false] {
+                let mut cursor = x;
+                let mut active = color;
+                let mut index = 0;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    if byte == b'^' && index + 1 < bytes.len() {
+                        if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
+                            active = code;
+                            index += 2;
+                            continue;
+                        }
+                    }
+                    let glyph = font.glyphs[byte as usize];
+                    if glyph.width > 0 && glyph.height > 0 && byte != b' ' {
+                        let offset = if pass { shadow } else { 0.0 };
+                        let tint = if pass { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active };
+                        textured_rect_with_source(
+                            out,
+                            cursor + f32::from(glyph.horiz_offset) * scale + offset,
+                            baseline - glyph.baseline as f32 * scale + offset,
+                            f32::from(glyph.width) * scale,
+                            f32::from(glyph.height) * scale,
+                            [glyph.s, glyph.t],
+                            [glyph.s2, glyph.t2],
+                            tint,
+                            CLEAN_FONT_SOURCE,
+                            w,
+                            h,
+                        );
+                    }
+                    cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
+                    index += 1;
+                }
+            }
+        } else if let Some(font) = self.legacy {
+            proportional_text(out, value, font, x, baseline, self.legacy_scale(font, px), color, true, w, h);
+        } else {
+            let scale = Self::charsgrid_scale(px);
+            text(out, value, x, baseline - 8.0 * scale, scale, color, w, h);
+        }
+    }
+
+    pub(in crate::ui) fn draw_right(&self, out: &mut Vec<UiVertex>, value: &str, right: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        self.draw(out, value, right - self.width(value, px), baseline, px, color);
+    }
+
+    pub(in crate::ui) fn draw_centered(&self, out: &mut Vec<UiVertex>, value: &str, bounds: [f32; 4], px: f32, color: [f32; 4]) {
+        let x = bounds[0] + (bounds[2] - self.width(value, px)) * 0.5;
+        self.draw(out, value, x, self.baseline_in(bounds, px), px, color);
     }
 }

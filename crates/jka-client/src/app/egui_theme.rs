@@ -8,61 +8,72 @@
 //! ratio over the live scene behind the panel.
 
 // ---------------------------------------------------------------- palette --
+//
+// Every tone below is derived from the five base colours in `crate::palette`
+// (Celadon, White Smoke, Stone Brown, Silver, Smoky Rose). Surfaces are Stone
+// Brown pulled toward near-black so they keep its warm undertone; Celadon is
+// the single accent and Smoky Rose the warm secondary/danger tone.
+
+const fn rgb(c: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(c[0], c[1], c[2])
+}
+use crate::palette::{mix, CELADON, INK, SILVER, SMOKY_ROSE, STONE_BROWN, WHITE_SMOKE};
 
 /// Window chrome behind the top bar and tab strip.
-pub(super) const CHROME: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0F, 0x15);
+pub(super) const CHROME: egui::Color32 = rgb(INK);
 /// Body surface for panels and pages.
-pub(super) const SURFACE: egui::Color32 = egui::Color32::from_rgb(0x13, 0x18, 0x20);
+pub(super) const SURFACE: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.16));
 /// Slightly lifted surface used for sidebars and grouped blocks.
-pub(super) const SURFACE_ALT: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1D, 0x26);
+pub(super) const SURFACE_ALT: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.26));
 /// Sunken surface for text fields and slider rails.
-pub(super) const INSET: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x11, 0x17);
+pub(super) const INSET: egui::Color32 = rgb(mix(INK, [0, 0, 0], 0.25));
 /// Resting fill for interactive controls.
-pub(super) const CONTROL: egui::Color32 = egui::Color32::from_rgb(0x20, 0x28, 0x33);
-pub(super) const CONTROL_HOVER: egui::Color32 = egui::Color32::from_rgb(0x2B, 0x35, 0x43);
-/// Selected fill. Kept dark on purpose so the label above it stays light.
-pub(super) const CONTROL_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x3E, 0x63);
-pub(super) const CONTROL_SELECTED_HOVER: egui::Color32 = egui::Color32::from_rgb(0x24, 0x4D, 0x79);
+pub(super) const CONTROL: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.38));
+pub(super) const CONTROL_HOVER: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.58));
+/// Selected fill. Celadon pushed deep enough that White Smoke text on top of
+/// it keeps a comfortable contrast ratio.
+pub(super) const CONTROL_SELECTED: egui::Color32 = rgb(mix(INK, CELADON, 0.30));
+pub(super) const CONTROL_SELECTED_HOVER: egui::Color32 = rgb(mix(INK, CELADON, 0.40));
 
-pub(super) const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x25, 0x2F);
-pub(super) const LINE: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x33, 0x40);
-pub(super) const LINE_STRONG: egui::Color32 = egui::Color32::from_rgb(0x3C, 0x49, 0x5A);
+pub(super) const HAIRLINE: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.36));
+pub(super) const LINE: egui::Color32 = rgb(mix(INK, STONE_BROWN, 0.62));
+pub(super) const LINE_STRONG: egui::Color32 = rgb(STONE_BROWN);
 
-pub(super) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x59, 0xA9, 0xFF);
-pub(super) const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x63, 0xA8);
-pub(super) const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x7C, 0xCB);
+pub(super) const ACCENT: egui::Color32 = rgb(CELADON);
+pub(super) const ACCENT_DEEP: egui::Color32 = rgb(mix(CELADON, INK, 0.45));
+pub(super) const ACCENT_HOVER: egui::Color32 = rgb(mix(CELADON, INK, 0.25));
 
-pub(super) const TEXT: egui::Color32 = egui::Color32::from_rgb(0xEB, 0xF0, 0xF6);
-pub(super) const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xAD, 0xBA, 0xC9);
-pub(super) const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x99, 0xAA);
-pub(super) const TEXT_DISABLED: egui::Color32 = egui::Color32::from_rgb(0x55, 0x5F, 0x6C);
+pub(super) const TEXT: egui::Color32 = rgb(WHITE_SMOKE);
+pub(super) const TEXT_DIM: egui::Color32 = rgb(mix(WHITE_SMOKE, SILVER, 0.55));
+pub(super) const TEXT_FAINT: egui::Color32 = rgb(SILVER);
+pub(super) const TEXT_DISABLED: egui::Color32 = rgb(mix(SILVER, INK, 0.50));
 
-pub(super) const WARNING: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB8, 0x3C);
+pub(super) const WARNING: egui::Color32 = rgb([0xE6, 0xC2, 0x6E]);
 /// Deeper warning tone used for controls whose value is staged for Apply.
-pub(super) const WARNING_DEEP: egui::Color32 = egui::Color32::from_rgb(0x8D, 0x59, 0x13);
-pub(super) const DANGER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x74, 0x66);
+pub(super) const WARNING_DEEP: egui::Color32 = rgb(mix([0xE6, 0xC2, 0x6E], INK, 0.55));
+pub(super) const DANGER: egui::Color32 = rgb(mix(SMOKY_ROSE, WHITE_SMOKE, 0.30));
 
 /// Drop shadow painted behind menu captions so they stay readable over the
 /// live, un-blurred world on the Video page.
 pub(super) const SHADOW: egui::Color32 =
-    egui::Color32::from_rgba_premultiplied(0x01, 0x03, 0x08, 0xE6);
+    egui::Color32::from_rgba_premultiplied(0x05, 0x04, 0x03, 0xE6);
 
 /// Scrim behind the Video page column. Deliberately thin: the whole point of
 /// leaving that page un-blurred is to watch a setting take effect, so the
 /// scrim only has to lift text off the world, not hide it.
 pub(super) const VIDEO_SCRIM: egui::Color32 =
-    egui::Color32::from_rgba_premultiplied(0x06, 0x09, 0x0E, 0x99);
+    egui::Color32::from_rgba_premultiplied(0x0C, 0x0B, 0x09, 0x99);
 
 /// Video-page rail. Translucent so the world stays partly visible beside the
 /// settings it is controlling.
 pub(super) const RAIL_FILL: egui::Color32 =
-    egui::Color32::from_rgba_premultiplied(0x0B, 0x0F, 0x15, 0xE0);
+    egui::Color32::from_rgba_premultiplied(0x12, 0x10, 0x0E, 0xE0);
 
 /// Panel body for the pages that sit over the renderer's blurred menu
 /// backdrop. The Video page does not use this: it stays transparent so the
 /// world behind it shows the effect of each setting as it changes.
 pub(super) const PANEL_FILL: egui::Color32 =
-    egui::Color32::from_rgba_premultiplied(0x11, 0x16, 0x1D, 0xF7);
+    egui::Color32::from_rgba_premultiplied(0x1A, 0x18, 0x14, 0xF7);
 
 // ---------------------------------------------------------------- metrics --
 
@@ -72,7 +83,9 @@ pub(super) const FOOTER_H: f32 = 40.0;
 pub(super) const ROW_H: f32 = 30.0;
 pub(super) const LABEL_W: f32 = 232.0;
 pub(super) const VALUE_W: f32 = 132.0;
-pub(super) const NAV_W: f32 = 170.0;
+/// Corner rounding for controls, popups and windows: soft enough to read as
+/// modern, small enough that dense rows still line up as a grid.
+pub(super) const CORNER: egui::CornerRadius = egui::CornerRadius::same(3);
 
 /// egui zoom derived from the drawable height so the menu keeps a usable
 /// physical size from 900p up to 4K without a manual UI-scale setting.
@@ -92,7 +105,7 @@ fn widget(
         bg_fill,
         weak_bg_fill,
         bg_stroke: egui::Stroke::new(1.0_f32, stroke),
-        corner_radius: egui::CornerRadius::ZERO,
+        corner_radius: CORNER,
         fg_stroke: egui::Stroke::new(1.0_f32, text),
         expansion: 0.0,
     }
@@ -107,10 +120,12 @@ pub(super) fn apply(ctx: &egui::Context) {
     visuals.panel_fill = SURFACE;
     visuals.window_fill = SURFACE;
     visuals.window_stroke = egui::Stroke::new(1.0_f32, LINE_STRONG);
-    visuals.window_corner_radius = egui::CornerRadius::ZERO;
-    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
-    visuals.window_shadow = egui::epaint::Shadow::NONE;
-    visuals.popup_shadow = egui::epaint::Shadow::NONE;
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    visuals.menu_corner_radius = CORNER;
+    // A soft, low drop shadow lifts popups and dialogs off the page without
+    // the hard outline the flat theme used to rely on.
+    visuals.window_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: egui::Color32::from_black_alpha(110) };
+    visuals.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(90) };
     visuals.extreme_bg_color = INSET;
     visuals.faint_bg_color = SURFACE_ALT;
     visuals.code_bg_color = INSET;
@@ -208,22 +223,35 @@ pub(super) fn glow_text(
     painter.text(pos, anchor, text, font, color);
 }
 
+/// [`glow_text`] for a run that wraps at `wrap_width`. Returns its size.
+fn glow_wrapped(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    wrap_width: f32,
+) -> egui::Vec2 {
+    let galley = painter.layout(text.to_owned(), font, color, wrap_width.max(40.0));
+    for offset in [egui::vec2(1.0, 1.0), egui::vec2(1.0, 0.0)] {
+        painter.galley_with_override_text_color(pos + offset, galley.clone(), SHADOW);
+    }
+    let size = galley.size();
+    painter.galley(pos, galley, color);
+    size
+}
+
 /// A haloed text run laid out as a widget, for use inside a control column.
+/// It wraps at the space left in the column instead of running past it.
 pub(super) fn glow_label(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) {
     let font = egui::FontId::proportional(size);
+    let wrap_width = ui.available_width().max(40.0);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), color);
+        .layout(text.to_owned(), font.clone(), color, wrap_width);
     let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
     let painter = ui.painter().clone();
-    glow_text(
-        &painter,
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        text,
-        font,
-        color,
-    );
+    glow_wrapped(&painter, rect.left_top(), text, font, color, wrap_width);
 }
 
 /// Fills `rect` and draws an optional 1px underline in `accent`.
@@ -307,59 +335,41 @@ pub(super) fn chip_sized(
         (false, false, _) => CONTROL,
         (false, true, _) => CONTROL_HOVER,
     };
-    fill_with_underline(
-        &painter,
-        rect,
-        fill,
-        selected.then_some(if pending { WARNING } else { ACCENT }),
-    );
+    painter.rect_filled(rect, 11.5, fill);
+    if selected {
+        painter.rect_stroke(rect, 11.5, egui::Stroke::new(1.0, if pending { WARNING } else { ACCENT }), egui::StrokeKind::Inside);
+    }
     painter.with_clip_rect(rect).text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
         font,
-        if selected { TEXT } else { TEXT_DIM },
+        if selected { if pending { TEXT } else { ACCENT } } else { TEXT_DIM },
     );
     response
 }
 
 /// Rectangular on/off switch. Returns the new value when the user flips it.
 pub(super) fn switch(ui: &mut egui::Ui, on: bool) -> Option<bool> {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::click());
+    // A small lightsaber: the hilt is the switch, and On ignites the blade.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, 20.0), egui::Sense::click());
     let painter = ui.painter().clone();
     let pending = controls_are_pending(ui);
-    let track = match (on, response.hovered(), pending) {
-        (true, false, true) => WARNING_DEEP,
-        (true, true, true) => WARNING,
-        (true, false, false) => ACCENT_DEEP,
-        (true, true, false) => ACCENT,
-        (false, false, _) => CONTROL,
-        (false, true, _) => CONTROL_HOVER,
-    };
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, track);
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::ZERO,
-        egui::Stroke::new(
-            1.0_f32,
-            if on { if pending { WARNING } else { ACCENT } } else { LINE },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let knob_w = 16.0;
-    let knob_x = if on {
-        rect.right() - knob_w - 2.0
+    let tone = if pending { WARNING } else { ACCENT };
+    let y = rect.center().y;
+    let hovered = response.hovered();
+    painter.rect_filled(rect, 10.0, if hovered { CONTROL_HOVER } else { CONTROL });
+    let hilt = egui::Rect::from_min_size(egui::pos2(rect.left() + 5.0, y - 3.5), egui::vec2(13.0, 7.0));
+    if on {
+        super::egui_menu::holo::blade(&painter, egui::pos2(hilt.right(), y), egui::pos2(rect.right() - 6.0, y), 2.2, tone, 1.0);
     } else {
-        rect.left() + 2.0
-    };
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(knob_x, rect.top() + 2.0),
-            egui::vec2(knob_w, rect.height() - 4.0),
-        ),
-        egui::CornerRadius::ZERO,
-        if on { TEXT } else { TEXT_FAINT },
-    );
+        painter.line_segment([egui::pos2(hilt.right() + 2.0, y), egui::pos2(rect.right() - 6.0, y)], egui::Stroke::new(1.0, LINE));
+    }
+    painter.rect_filled(hilt, 2.0, if on { TEXT } else { TEXT_FAINT });
+    painter.rect_filled(egui::Rect::from_min_size(egui::pos2(hilt.left() + 4.0, hilt.top()), egui::vec2(2.0, hilt.height())), 0.0, CONTROL);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.add_space(8.0);
     glow_label(
         ui,
@@ -831,19 +841,30 @@ fn controls_are_pending(ui: &egui::Ui) -> bool {
 pub(super) fn section(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.add_space(16.0);
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
     let painter = ui.painter().clone();
-    let font = egui::FontId::proportional(12.5);
+    // A short lit blade marks each section, the caption follows it, and a
+    // hairline runs out to the panel edge.
+    let blade_x = rect.left() + 1.5;
+    super::egui_menu::holo::blade(
+        &painter,
+        egui::pos2(blade_x, rect.center().y - 7.0),
+        egui::pos2(blade_x, rect.center().y + 7.0),
+        2.0,
+        ACCENT,
+        0.9,
+    );
+    let font = egui::FontId::proportional(13.0);
     let galley = painter.layout_no_wrap(title.to_owned(), font.clone(), ACCENT);
     glow_text(
         &painter,
-        rect.left_center(),
+        rect.left_center() + egui::vec2(12.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
         font,
         ACCENT,
     );
-    let rule_x = rect.left() + galley.size().x + 12.0;
+    let rule_x = rect.left() + 12.0 + galley.size().x + 12.0;
     if rule_x < rect.right() {
         painter.rect_filled(
             egui::Rect::from_min_size(
@@ -851,7 +872,7 @@ pub(super) fn section(ui: &mut egui::Ui, title: &str, detail: &str) {
                 egui::vec2(rect.right() - rule_x, 1.0),
             ),
             egui::CornerRadius::ZERO,
-            LINE,
+            HAIRLINE,
         );
     }
     if !detail.is_empty() {
@@ -917,6 +938,20 @@ pub(super) fn jump_to_setting(ctx: &egui::Context, label: &str) {
     }));
 }
 
+/// The label and control cells of a settings row starting at `rect`.
+fn row_columns(rect: egui::Rect, width: f32) -> (egui::Rect, egui::Rect) {
+    use crate::ui::flex::{Container, Flex};
+    let mut flex = Flex::new();
+    let label = flex.leaf(LABEL_W, ROW_H);
+    let control = flex.spring();
+    let mut row = Container::row().width(width).height(ROW_H);
+    row.align = taffy::prelude::AlignItems::STRETCH;
+    let line = flex.node(row, &[label, control]);
+    flex.compute(line, width, ROW_H);
+    let cell = |b: [f32; 4]| egui::Rect::from_min_size(rect.min + egui::vec2(b[0], b[1]), egui::vec2(b[2], b[3]));
+    (cell(flex.bounds(label)), cell(flex.bounds(control)))
+}
+
 fn row_inner<R>(
     ui: &mut egui::Ui,
     text: &str,
@@ -928,7 +963,12 @@ fn row_inner<R>(
 ) -> R {
     let preview_active = preset_preview_active(ui.ctx(), reset);
     let width = ui.available_width();
-    let note_h = if note.is_some() { 17.0 } else { 0.0 };
+    // The note wraps inside the control column; the row grows to hold it.
+    let note_font = egui::FontId::proportional(11.5);
+    let note_h = note.map_or(0.0, |note| {
+        let wrap = (width - LABEL_W - 8.0).max(40.0);
+        ui.painter().layout(note.to_owned(), note_font.clone(), TEXT_FAINT, wrap).size().y + 5.0
+    });
     let height = ROW_H + note_h;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter().clone();
@@ -957,12 +997,12 @@ fn row_inner<R>(
         .layout_no_wrap(text.to_owned(), label_font.clone(), TEXT)
         .size()
         .x;
+    // Label column and control column come from one Taffy row, so every row
+    // on a page shares the same two columns.
+    let (label_cell, control_cell) = row_columns(rect, width);
     let label_rect = egui::Rect::from_min_max(
-        rect.left_top(),
-        egui::pos2(
-            (rect.left() + label_width + 4.0).min(rect.left() + LABEL_W - 8.0),
-            rect.top() + ROW_H,
-        ),
+        label_cell.min,
+        egui::pos2((label_cell.left() + label_width + 4.0).min(label_cell.right() - 8.0), label_cell.bottom()),
     );
     let mut response = ui.interact(
         label_rect,
@@ -1027,13 +1067,13 @@ Click the label to restore the default.")
         );
     }
     if let Some(note) = note {
-        glow_text(
+        glow_wrapped(
             &painter,
             egui::pos2(rect.left() + LABEL_W, rect.top() + ROW_H + 1.0),
-            egui::Align2::LEFT_TOP,
             note,
-            egui::FontId::proportional(11.5),
+            note_font,
             TEXT_FAINT,
+            width - LABEL_W - 8.0,
         );
     }
     painter.rect_filled(
@@ -1048,10 +1088,7 @@ Click the label to restore the default.")
     // The row's height is already reserved above, so the control lives in a
     // child that does NOT advance the parent cursor: `scope_builder` would pull
     // it back to the control's own height and let the next row overlap.
-    let control_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + LABEL_W, rect.top()),
-        egui::pos2(rect.right(), rect.top() + ROW_H),
-    );
+    let control_rect = control_cell;
     let mut control = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(text)
@@ -1125,19 +1162,68 @@ pub(super) fn slider_with(
     default: Option<f32>,
     logarithmic: bool,
 ) -> bool {
-    // Slider ignores `add_sized` for its rail, so drive it through the spacing
-    // width instead. Matching `track_width` keeps every slider readout on the
-    // same column as the quality meters' value labels.
-    let width = track_width(ui);
-    ui.spacing_mut().slider_width = width;
-    let response = ui.add(
-        egui::Slider::new(value, range)
-            .show_value(false)
-            .trailing_fill(true)
-            .logarithmic(logarithmic)
-            .smallest_positive(1.0),
-    );
-    let mut changed = response.changed();
+    // [rail][readout] as one Taffy row; the rail width matches `track_width`
+    // so every readout lines up with the quality meters' value labels.
+    use crate::ui::flex::{Container, Flex};
+    let rail_w = track_width(ui);
+    let readout_w = ui.painter().layout_no_wrap(readout.to_owned(), egui::FontId::proportional(12.5), TEXT).size().x.max(40.0);
+    let mut flex = Flex::new();
+    let rail_node = flex.leaf(rail_w, 22.0);
+    let readout_node = flex.leaf(readout_w, 22.0);
+    let row_node = flex.node(Container::row().gap(12.0), &[rail_node, readout_node]);
+    flex.compute(row_node, rail_w + readout_w + 12.0, 22.0);
+    let (area, _) = ui.allocate_exact_size(egui::vec2(rail_w + readout_w + 12.0, 22.0), egui::Sense::hover());
+    let cell = |b: [f32; 4]| egui::Rect::from_min_size(area.min + egui::vec2(b[0], b[1]), egui::vec2(b[2], b[3]));
+    let rail = cell(flex.bounds(rail_node));
+    let readout_rect = cell(flex.bounds(readout_node));
+    let response = ui.interact(rail, ui.id().with(("saber_slider", readout_rect.min.x as i32, rail.min.y as i32)), egui::Sense::click_and_drag());
+
+    let (lo, hi) = (*range.start(), *range.end());
+    // Position along the rail, 0..1; logarithmic rails start at 1.
+    let to_t = |v: f32| -> f32 {
+        if hi <= lo {
+            return 0.0;
+        }
+        if logarithmic {
+            let (a, b) = (lo.max(1.0).ln(), hi.max(lo.max(1.0) + 1.0).ln());
+            ((v.max(lo.max(1.0)).ln() - a) / (b - a)).clamp(0.0, 1.0)
+        } else {
+            ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+        }
+    };
+    let from_t = |t: f32| -> f32 {
+        if logarithmic {
+            let (a, b) = (lo.max(1.0).ln(), hi.max(lo.max(1.0) + 1.0).ln());
+            if t <= 0.0 { lo } else { (a + (b - a) * t).exp() }
+        } else {
+            lo + (hi - lo) * t
+        }
+    };
+    let mut changed = false;
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let t = ((pointer.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0);
+            let next = from_t(t).clamp(lo.min(hi), hi.max(lo));
+            if next != *value {
+                *value = next;
+                changed = true;
+            }
+        }
+    }
+    let pending = controls_are_pending(ui);
+    let tone = if pending { WARNING } else { ACCENT };
+    let painter = ui.painter();
+    let y = rail.center().y;
+    painter.line_segment([egui::pos2(rail.left(), y), egui::pos2(rail.right(), y)], egui::Stroke::new(3.0, LINE));
+    let knob_x = rail.left() + rail.width() * to_t(*value);
+    let lit = if response.hovered() || response.dragged() { 1.0 } else { 0.75 };
+    super::egui_menu::holo::blade(painter, egui::pos2(rail.left(), y), egui::pos2(knob_x, y), 2.0, tone, lit);
+    let knob = egui::Rect::from_center_size(egui::pos2(knob_x, y), egui::vec2(8.0, 16.0));
+    painter.rect_filled(knob, 3.0, TEXT);
+    painter.rect_stroke(knob, 3.0, egui::Stroke::new(1.0, tone), egui::StrokeKind::Outside);
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
     if let Some(default) = default {
         // egui's Slider senses drag only, so `response.double_clicked()` never
         // fires; read the raw pointer double-click over the rail instead. A
@@ -1158,8 +1244,14 @@ pub(super) fn slider_with(
             changed = true;
         }
     }
-    ui.add_space(10.0);
-    glow_label(ui, readout, 12.5, TEXT);
+    glow_text(
+        ui.painter(),
+        readout_rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        readout,
+        egui::FontId::proportional(12.5),
+        TEXT,
+    );
     changed
 }
 
@@ -1204,27 +1296,16 @@ pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         egui::Sense::click(),
     );
     let painter = ui.painter().clone();
-    // Light text on a mid-blue fill: the reverse (near-black on bright blue)
-    // only reaches ~3:1 and was hard to read on this panel.
+    // Ink on a full Celadon fill: Celadon is light, so dark text is the
+    // high-contrast pairing (~10:1), and the button reads as the one bright
+    // object on an otherwise warm-dark page.
     let fill = if response.hovered() {
-        ACCENT_HOVER
+        rgb(crate::palette::mix(CELADON, WHITE_SMOKE, 0.35))
     } else {
-        ACCENT_DEEP
+        ACCENT
     };
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::ZERO,
-        egui::Stroke::new(1.0_f32, ACCENT),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        font,
-        egui::Color32::from_rgb(0xF4, 0xF9, 0xFF),
-    );
+    painter.rect_filled(rect, CORNER, fill);
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, CHROME);
     response
 }
 
@@ -1269,16 +1350,18 @@ pub(super) fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// Page title block shown at the top of every Setup page.
 pub(super) fn page_title(ui: &mut egui::Ui, title: &str, detail: &str) {
+    // Neon tube lettering, the same letterforms as the Main page's signs.
+    let cap = 17.0;
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), cap * 1.9), egui::Sense::hover());
     let painter = ui.painter().clone();
-    glow_text(
+    super::egui_menu::holo::neon_text(
         &painter,
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
+        egui::pos2(rect.left() + 2.0, rect.center().y + cap * 0.5),
         title,
-        egui::FontId::proportional(19.0),
+        cap,
         TEXT,
+        0.75,
     );
     if !detail.is_empty() {
         let (detail_rect, _) =

@@ -108,21 +108,22 @@ pub(in crate::ui) fn tail_chars(value: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
-// Console palette: rain-slick Tokyo night. Indigo asphalt for the body, cyan and
-// magenta neon for structure, tungsten amber for anything the user is driving.
-pub(in crate::ui) const CON_CYAN: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
+// Console palette, from `crate::palette`: warm Stone Brown ink for the body,
+// Celadon and Smoky Rose for structure, gold for anything the user is driving.
+// The CON_* names predate the palette and are kept for the call sites.
+pub(in crate::ui) const CON_CYAN: [f32; 4] = crate::palette::hud::ACCENT;
 
-pub(in crate::ui) const CON_MAGENTA: [f32; 4] = [1.0, 0.30, 0.56, 1.0];
+pub(in crate::ui) const CON_MAGENTA: [f32; 4] = crate::palette::hud::ROSE_LIGHT;
 
-pub(in crate::ui) const CON_AMBER: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
+pub(in crate::ui) const CON_AMBER: [f32; 4] = crate::palette::hud::GOLD;
 
-pub(in crate::ui) const CON_TEXT: [f32; 4] = [0.80, 0.86, 0.93, 1.0];
+pub(in crate::ui) const CON_TEXT: [f32; 4] = crate::palette::rgba(crate::palette::mix(crate::palette::WHITE_SMOKE, crate::palette::SILVER, 0.35), 1.0);
 
-pub(in crate::ui) const CON_BRIGHT: [f32; 4] = [0.95, 0.97, 1.0, 1.0];
+pub(in crate::ui) const CON_BRIGHT: [f32; 4] = crate::palette::hud::TEXT;
 
-pub(in crate::ui) const CON_DIM: [f32; 4] = [0.50, 0.60, 0.73, 1.0];
+pub(in crate::ui) const CON_DIM: [f32; 4] = crate::palette::hud::TEXT_DIM;
 
-pub(in crate::ui) const CON_FAINT: [f32; 4] = [0.32, 0.40, 0.52, 1.0];
+pub(in crate::ui) const CON_FAINT: [f32; 4] = crate::palette::hud::TEXT_FAINT;
 
 pub(in crate::ui) const SUGGEST_ROW_H: f32 = 20.0;
 
@@ -411,10 +412,10 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         0.0,
         wf,
         ph,
-        [0.012, 0.016, 0.036, 0.975],
-        [0.012, 0.016, 0.036, 0.975],
-        [0.024, 0.030, 0.066, 0.965],
-        [0.024, 0.030, 0.066, 0.965],
+        [0.062, 0.055, 0.047, 0.975],
+        [0.062, 0.055, 0.047, 0.975],
+        [0.090, 0.081, 0.069, 0.965],
+        [0.090, 0.081, 0.069, 0.965],
         w,
         h,
     );
@@ -467,7 +468,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         chip_y,
         chip_w,
         chip_h,
-        [0.04, 0.07, 0.13, 0.92],
+        [0.11, 0.10, 0.085, 0.92],
         w,
         h,
     );
@@ -525,7 +526,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         if ui.console_help_hover {
             [0.10, 0.16, 0.26, 0.98]
         } else {
-            [0.04, 0.07, 0.13, 0.92]
+            [0.11, 0.10, 0.085, 0.92]
         },
         w,
         h,
@@ -571,7 +572,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             field_y,
             field_w,
             28.0,
-            [0.03, 0.05, 0.10, 0.98],
+            [0.085, 0.077, 0.065, 0.98],
             w,
             h,
         );
@@ -840,7 +841,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         bar_y,
         wf,
         (ph - 2.0) - bar_y,
-        [0.045, 0.065, 0.125, 0.94],
+        [0.12, 0.108, 0.092, 0.94],
         w,
         h,
     );
@@ -950,7 +951,7 @@ pub(in crate::ui) fn build_console_help(out: &mut Vec<UiVertex>, w: u32, h: u32)
         w,
         h,
     );
-    rect(out, x, y, card_w, card_h, [0.020, 0.028, 0.056, 0.99], w, h);
+    rect(out, x, y, card_w, card_h, [0.075, 0.068, 0.058, 0.99], w, h);
     let edge_l = with_alpha(CON_CYAN, 0.6);
     let edge_r = with_alpha(CON_MAGENTA, 0.6);
     rect_gradient(out, x, y, card_w, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
@@ -1020,7 +1021,7 @@ pub(in crate::ui) fn build_console_suggestions(
 
     // Lift off the console/world, then the card itself.
     rect(out, x + 3.0, y + 5.0, pw, g.h, [0.0, 0.0, 0.0, 0.38], w, h);
-    rect(out, x, y, pw, g.h, [0.020, 0.028, 0.056, 0.985], w, h);
+    rect(out, x, y, pw, g.h, [0.075, 0.068, 0.058, 0.985], w, h);
     let edge_l = with_alpha(CON_CYAN, 0.55);
     let edge_r = with_alpha(CON_MAGENTA, 0.55);
     rect_gradient(out, x, y, pw, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);

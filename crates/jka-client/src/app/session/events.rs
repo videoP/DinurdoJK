@@ -239,6 +239,9 @@ impl GameSession {
                 target: target_name,
                 attacker: None,
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         } else if let Some(attacker_name) = attacker_name {
             let key = match mod_ {
@@ -272,6 +275,9 @@ impl GameSession {
                 target: target_name,
                 attacker: Some(attacker_name),
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         } else {
             let key = match mod_ {
@@ -282,6 +288,9 @@ impl GameSession {
                 target: target_name,
                 attacker: None,
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         };
         self.client_game.push_notice(notice);

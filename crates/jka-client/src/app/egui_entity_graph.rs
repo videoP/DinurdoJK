@@ -21,12 +21,12 @@ const FLOW_LIMIT: usize = 80;
 const FLOW_COLUMN_W: f32 = 270.0;
 const FLOW_ROW_H: f32 = 64.0;
 const FLOW_NODE: Vec2 = Vec2::new(210.0, 44.0);
-const BLUEPRINT: Color32 = Color32::from_rgb(0x0B, 0x1E, 0x35);
-const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(0x10, 0x22, 0x36, 0x40);
-const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x1B, 0x3A, 0x5C, 0x70);
-const LINK_DIM: Color32 = Color32::from_rgba_premultiplied(0x22, 0x36, 0x52, 0x50);
-const LINK_OUT: Color32 = Color32::from_rgb(0xFF, 0xA9, 0x40);
-const LINK_IN: Color32 = Color32::from_rgb(0x4F, 0xE0, 0xF0);
+const BLUEPRINT: Color32 = Color32::from_rgb(0x17, 0x15, 0x12);
+const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(0x1C, 0x1A, 0x16, 0x40);
+const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x2E, 0x2A, 0x23, 0x70);
+const LINK_DIM: Color32 = Color32::from_rgba_premultiplied(0x2E, 0x2A, 0x23, 0x50);
+const LINK_OUT: Color32 = Color32::from_rgb(0xE6, 0xC2, 0x6E);
+const LINK_IN: Color32 = Color32::from_rgb(0xAF, 0xD5, 0xAA);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum GraphMode {
@@ -996,7 +996,7 @@ fn plan_canvas(ui: &mut egui::Ui, graph: &EntityGraph, st: &mut EntityGraphUi, p
         let text = entity_line(entity);
         let galley = painter.layout_no_wrap(text, font.clone(), theme::TEXT);
         let label_rect = Rect::from_min_size(at + egui::vec2(8.0, -7.0), galley.size()).expand2(egui::vec2(3.0, 1.0));
-        painter.rect_filled(label_rect, egui::CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 14, 26, 210));
+        painter.rect_filled(label_rect, egui::CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x14, 0x12, 0x10, 210));
         painter.galley(label_rect.min + egui::vec2(3.0, 1.0), galley, theme::TEXT);
     }
 
@@ -1124,7 +1124,7 @@ fn flow_canvas(
         } else if link.to == root {
             LINK_IN
         } else {
-            Color32::from_rgba_unmultiplied(120, 170, 220, 170)
+            Color32::from_rgba_unmultiplied(0xA6, 0x9F, 0x98, 170)
         };
         let reach = ((end.x - start.x).abs() * 0.5).max(40.0 * view.zoom);
         painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
@@ -1163,7 +1163,7 @@ fn flow_canvas(
         painter.rect_filled(
             node,
             egui::CornerRadius::same(3),
-            if over { Color32::from_rgb(0x1A, 0x33, 0x52) } else { Color32::from_rgb(0x10, 0x27, 0x44) },
+            if over { theme::CONTROL_HOVER } else { theme::CONTROL },
         );
         painter.rect_stroke(
             node,

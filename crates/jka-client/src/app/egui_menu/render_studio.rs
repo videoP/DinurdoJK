@@ -229,7 +229,7 @@ impl App {
             .map(|clip|defaults.effective(&clip.hud_overrides)).unwrap_or(defaults);
         if virtual_layout.snap_to_grid {
             let grid=virtual_layout.grid_size.clamp(1.,64.);
-            let color=egui::Color32::from_rgba_premultiplied(90,180,220,28);
+            let color=egui::Color32::from_rgba_premultiplied(20,24,19,28);
             let step_x=grid/1280.*viewport.width();
             let step_y=grid/720.*viewport.height();
             let mut x=viewport.left();
@@ -1104,7 +1104,7 @@ impl App {
         }
         if self.profile_dynamic_models.is_empty() {
             sui::overlay_pill(&painter,viewport.center_bottom()+egui::vec2(0.0,-14.0),egui::Align2::CENTER_BOTTOM,
-                "No character surfaces produced for this model / animation — see console",theme::WARNING,12.0);
+                "No character surfaces produced for this model / animation: see console",theme::WARNING,12.0);
             return;
         }
         let first = active[0];
@@ -1118,7 +1118,7 @@ impl App {
         let direction=(center-camera.position).normalize_or_zero();
         if self.render_studio.spatial.scene_camera.is_none() && camera.forward().dot(direction) < 0.8 {
             sui::overlay_pill(&painter,viewport.center_bottom()+egui::vec2(0.0,-14.0),egui::Align2::CENTER_BOTTOM,
-                "Camera is pointed away from the character — use Frame actor in the transport bar",theme::WARNING,12.0);
+                "Camera is pointed away from the character: use Frame actor in the transport bar",theme::WARNING,12.0);
         }
     }
 
@@ -1520,7 +1520,7 @@ impl App {
                         for name in names {
                             let added=self.render_studio.timeline.demos[clip_index].race_overlays.iter()
                                 .any(|o|o.name==name && o.game==game);
-                            if ui.add_enabled(!added,egui::Button::new(format!("{}{}",if added{"✓ "}else{""},name)))
+                            if ui.add_enabled(!added,egui::Button::new(format!("{}{}",if added{"ADDED  "}else{""},name)))
                                 .on_hover_text(if added {"Already attached"}else{"Add this recording's race actor"}).clicked() {
                                 self.toggle_studio_race_overlay_for_demo(clip_index,name,game.clone());
                                 ui.close();

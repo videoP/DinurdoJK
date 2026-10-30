@@ -897,7 +897,7 @@ impl App {
                 self.model_placement.editor_selected = None;
             }
             self.model_placement.editor_mouse_owned = None;
-            self.model_placement.status = "Editing — select another object, or exit explicitly".into();
+            self.model_placement.status = "Editing: select another object, or exit explicitly".into();
             return;
         }
         self.exit_map_editing();
@@ -1503,7 +1503,7 @@ impl App {
                     return;
                 }
                 if let Some(error) = &self.asset_viewer_catalog_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    ui.colored_label(theme::DANGER, error);
                     return;
                 }
                 let query = state.search.trim().to_ascii_lowercase();

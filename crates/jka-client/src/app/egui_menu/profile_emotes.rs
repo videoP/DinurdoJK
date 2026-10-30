@@ -242,16 +242,16 @@ impl App {
                                         .any(|v| active.as_deref() == Some(&v.id));
                                 egui::Frame::new()
                                     .fill(if selected {
-                                        egui::Color32::from_rgb(26, 49, 70)
+                                        theme::CONTROL_SELECTED
                                     } else {
-                                        egui::Color32::from_rgb(21, 29, 40)
+                                        theme::CONTROL
                                     })
                                     .stroke(egui::Stroke::new(
                                         1.0,
                                         if selected {
                                             theme::ACCENT
                                         } else {
-                                            egui::Color32::from_rgb(45, 59, 75)
+                                            theme::LINE_STRONG
                                         },
                                     ))
                                     .corner_radius(5)

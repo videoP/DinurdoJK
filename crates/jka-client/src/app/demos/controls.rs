@@ -18,28 +18,38 @@ impl App {
     ) -> (Vec<UiChatLine>, Option<ui::UiCenterPrint>) {
         let now = Instant::now();
         let demo_now = self.current_demo_elapsed_ms(now);
+        // cg_chatFadeTime (stock MP cg_chatBox: 10 s). Demo messages age
+        // against demo time, so pause/scrub is deterministic and cannot flicker.
+        // While typing, the last cg_chatHistoryLines messages kept within
+        // cg_chatHistoryTime show at full strength.
+        let settings = self.chat_settings;
+        let typing = self.overlay == OverlayMode::Chat;
+        let fade_ms = f64::from(settings.fade_time.max(0.5)) * 1000.0;
+        let history_ms = f64::from(settings.history_time.max(settings.fade_time)) * 1000.0;
+        let recent_from = self.chat_lines.len().saturating_sub(usize::from(settings.history_lines));
         let chat_lines = self
             .chat_lines
             .iter()
-            .filter_map(|line| {
+            .enumerate()
+            .filter_map(|(index, line)| {
                 let age_ms = match (demo_now, line.demo_elapsed_ms) {
                     (Some(now_ms), Some(created_ms)) => (now_ms - created_ms).max(0.0),
                     _ => now.saturating_duration_since(line.created).as_secs_f64() * 1000.0,
                 };
-                // Stock MP cg_chatBox defaults to 10000 ms. Demo messages age
-                // against demo time, so pause/scrub is deterministic and cannot flicker.
-                if age_ms >= 10_000.0 {
+                let alpha = if typing && index >= recent_from && age_ms < history_ms {
+                    1.0
+                } else if age_ms >= fade_ms {
                     return None;
-                }
-                let alpha = if age_ms <= 9_000.0 {
+                } else if age_ms <= fade_ms - 1_000.0 {
                     1.0
                 } else {
-                    1.0 - ((age_ms - 9_000.0) / 1_000.0) as f32
+                    ((fade_ms - age_ms) / 1_000.0) as f32
                 };
                 Some(UiChatLine {
                     text: line.text.clone(),
                     team: line.team,
                     alpha: alpha.clamp(0.0, 1.0),
+                    enter: (age_ms / 220.0).clamp(0.0, 1.0) as f32,
                 })
             })
             .collect();
@@ -234,12 +244,12 @@ impl App {
             };
             if inside(layout.export) {
                 Some(if !export_available {
-                    "EXPORT DISABLED — put ffmpeg.exe next to DinurdoJK.exe".to_owned()
+                    "EXPORT DISABLED: put ffmpeg.exe next to DinurdoJK.exe".to_owned()
                 } else if self.demo_export_in_ms.is_none() || self.demo_export_out_ms.is_none() {
-                    "EXPORT DISABLED — mark a valid IN and OUT range first".to_owned()
+                    "EXPORT DISABLED: mark a valid IN and OUT range first".to_owned()
                 } else {
                     format!(
-                        "Export {} at {} FPS — {}",
+                        "Export {} at {} FPS: {}",
                         self.demo_export_preset.label(),
                         self.demo_export_fps,
                         self.demo_export_preset.short_description()
@@ -247,20 +257,20 @@ impl App {
                 })
             } else if inside(layout.export_preset) {
                 Some(format!(
-                    "QUALITY: {} — click to cycle. {}",
+                    "QUALITY: {}: click to cycle. {}",
                     self.demo_export_preset.label(),
                     self.demo_export_preset.short_description()
                 ))
             } else if inside(layout.export_fps) {
-                Some("EXPORT FPS — click to cycle 24 / 30 / 60 / 120. Export remains frame-perfect/offline.".to_owned())
+                Some("EXPORT FPS: click to cycle 24 / 30 / 60 / 120. Export remains frame-perfect/offline.".to_owned())
             } else if inside(layout.export_depth) {
                 Some(if self.demo_export_depth {
-                    "DEPTH EXR ON — synchronized 32-bit float scene depth for compositing/DOF; 2D HUD is not a depth layer.".to_owned()
+                    "DEPTH EXR ON: synchronized 32-bit float scene depth for compositing/DOF; 2D HUD is not a depth layer.".to_owned()
                 } else {
-                    "DEPTH EXR OFF — click to add synchronized 32-bit float scene depth; 2D HUD is not a depth layer.".to_owned()
+                    "DEPTH EXR OFF: click to add synchronized 32-bit float scene depth; 2D HUD is not a depth layer.".to_owned()
                 })
             } else if inside(layout.mark_out) && self.demo_export_in_ms.is_none() {
-                Some("OUT DISABLED — mark IN first".to_owned())
+                Some("OUT DISABLED: mark IN first".to_owned())
             } else {
                 None
             }

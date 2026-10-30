@@ -341,7 +341,7 @@ impl App {
                                             metadata
                                                 .map_name
                                                 .clone()
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(
                                             ui,
@@ -349,7 +349,7 @@ impl App {
                                             metadata
                                                 .map_time_ms
                                                 .map(Self::format_demo_time)
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(
                                             ui,
@@ -365,7 +365,7 @@ impl App {
                                             metadata
                                                 .server_address
                                                 .clone()
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(ui, "PLAYER", metadata.player_name.clone());
                                         Self::screenshot_metadata_row(ui, "FOV", format!("{:.1}", metadata.fov));

@@ -60,7 +60,7 @@ impl App {
                     left.label(egui::RichText::new("Scanning VFS…").weak());
                 }
                 if let Some(error) = self.strafe_trails.catalog_error() {
-                    left.colored_label(egui::Color32::LIGHT_RED, error);
+                    left.colored_label(super::egui_theme::DANGER, error);
                 }
                 let filter = self.strafe_trail_filter.trim().to_ascii_lowercase();
                 let names = self.strafe_trails.available().to_vec();

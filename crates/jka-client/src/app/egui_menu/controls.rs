@@ -11,7 +11,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(12, 17, 24, 242))
+                    .fill(theme::PANEL_FILL)
                     .stroke(egui::Stroke::new(1.0_f32, theme::WARNING))
                     .inner_margin(egui::Margin::symmetric(12, 7))
                     .show(ui, |ui| {

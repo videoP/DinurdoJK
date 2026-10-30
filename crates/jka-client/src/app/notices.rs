@@ -217,7 +217,7 @@ impl App {
             "sound/movers/switches/button_15.mp3",
         ];
         let mode = self.audio.game.chat_sounds;
-        if mode == 0 || kind == ChatKind::Voice {
+        if mode == 0 || kind == ChatKind::Voice || self.chat_sounds_muted_by_combat() {
             return;
         }
         let candidates: &[&str] = match (mode, kind) {
@@ -486,8 +486,13 @@ impl App {
                         }
                     }
                 }
-                crate::cgame::CgameNotice::Chat { team, kind, text } => {
+                crate::cgame::CgameNotice::Chat { team, kind, text, sender } => {
                     let text = crate::cgame::bytes_to_lossless_ascii(&text);
+                    // Scoreboard mutes are client-side: the line never reaches
+                    // the chat box, console or chat log.
+                    if self.chat_sender_muted(sender, &text) {
+                        continue;
+                    }
                     if log_live_chat {
                         self.chat_log
                             .message(kind, team, text.clone(), chat_server_time);
@@ -537,7 +542,7 @@ impl App {
                         (false, false) => crate::logging::ConsoleLineKind::Normal,
                     };
                     self.push_console_line_no_notify(text.clone(), console_kind);
-                    if self.chat_lines.len() >= 16 {
+                    if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
                         self.chat_lines.pop_front();
                     }
                     let now = Instant::now();
@@ -602,7 +607,16 @@ impl App {
                     target,
                     attacker,
                     key,
+                    target_client,
+                    attacker_client,
+                    mod_,
                 } => {
+                    self.push_killfeed(
+                        (target_client, target.clone()),
+                        attacker_client.zip(attacker.clone()),
+                        mod_,
+                    );
+                    self.note_match_obituary(target_client, attacker_client, mod_);
                     // OpenJK asks StringEd for MP_INGAME_<key> and prints the
                     // result with names reset to white. Loading the table lazily
                     // keeps live play and demos on the same localization path.
@@ -795,6 +809,14 @@ impl App {
                                 siege_class: entry.siege_class,
                                 siege_icon: None,
                                 spectating_you: false,
+                                muted: false,
+                                crowned: false,
+                                model: String::new(),
+                                model_fallback: String::new(),
+                                h2h: None,
+                                accuracy: entry.accuracy,
+                                excellent: entry.excellent_count,
+                                gauntlet: entry.gauntlet_count,
                             }
                         })
                         .collect();
@@ -835,6 +857,7 @@ impl App {
                         show_deaths,
                         icon_paths: scoreboard_icon_paths,
                         entries: mapped_entries,
+                        chrome: Default::default(),
                     });
                     if self.scoreboard_should_show() {
                         self.publish_ui();
@@ -845,6 +868,7 @@ impl App {
                 }
                 crate::cgame::CgameNotice::MapRestart => {
                     self.predictor.reset();
+                    self.reset_match_stats();
                     for guess in &mut self.spectator_ping_guesses {
                         guess.reset();
                     }

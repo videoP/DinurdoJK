@@ -28,6 +28,9 @@ impl Renderer {
         // The app never owns GPU atlas placement. Do not overwrite the UV
         // lookup after a scroll/HUD snapshot arrives on the render thread.
         ui_state.icon_atlas_uvs.clone_from(&self.ui_state.icon_atlas_uvs);
+        // Likewise the clean font: loaded once by the renderer, never by the app.
+        ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
+        ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
         self.ui_state = ui_state;
@@ -157,6 +160,14 @@ impl Renderer {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&self._ui_ext_images.view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_clean_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_avatars.view),
+                },
             ],
         });
     }
@@ -226,6 +237,35 @@ impl Renderer {
         };
         self._ui_team_icons = upload_texture(&self.device, &self.queue, &data);
         self.rebuild_ui_bind_group();
+    }
+
+    /// Scoreboard avatars: on the first board, pack every model's
+    /// `icon_default` into one atlas on a worker thread; when it lands, upload
+    /// it to binding 9. Returns true on the frame the atlas becomes ready.
+    pub(in crate::renderer) fn sync_ui_avatars(&mut self) -> bool {
+        if self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() && self.ui_state.scoreboard.is_some() {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let base = self.base.clone();
+            let game = self.detail_texture_game.clone();
+            let spawned = std::thread::Builder::new().name("ui-avatars".into()).spawn(move || {
+                let started = Instant::now();
+                let (data, atlas) = load_ui_avatar_atlas(&base, game.as_deref());
+                eprintln!("UI AVATARS: {} player icons in {:.0} ms", atlas.cells.len(), started.elapsed().as_secs_f64() * 1000.0);
+                let _ = sender.send((data, atlas));
+            });
+            if spawned.is_ok() {
+                self.ui_avatar_job = Some(receiver);
+            }
+        }
+        let Some(job) = self.ui_avatar_job.as_ref() else { return false };
+        let Ok((data, atlas)) = job.try_recv() else { return false };
+        self.ui_avatar_job = None;
+        self._ui_avatars = upload_texture(&self.device, &self.queue, &data);
+        let atlas = std::sync::Arc::new(atlas);
+        self.ui_state.avatar_atlas = Some(atlas.clone());
+        self.ui_avatar_atlas = Some(atlas);
+        self.rebuild_ui_bind_group();
+        true
     }
 
     /// Keep the extension image atlas in step with `ui_state.extension_images`.
@@ -571,6 +611,8 @@ impl Renderer {
         vote_line: Option<String>,
         scoreboard: Option<ui::UiScoreboard>,
         scoreboard_focus_client: Option<i32>,
+        killfeed: Option<ui::UiKillfeed>,
+        chat_anim: ui::UiChatAnim,
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,
@@ -595,13 +637,16 @@ impl Renderer {
             || self.ui_state.scoreboard_focus_client != scoreboard_focus_client;
         self.ui_state.scoreboard = scoreboard;
         self.ui_state.scoreboard_focus_client = scoreboard_focus_client;
+        self.ui_state.killfeed = killfeed;
+        self.ui_state.chat_anim = chat_anim;
+        let avatars_ready = self.sync_ui_avatars();
         self.ui_state.speedometer = speedometer;
         self.ui_state.lagometer = lagometer;
         self.ui_state.team_overlay = team_overlay;
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
         self.sync_ui_extension_images();
-        if scoreboard_changed {
+        if scoreboard_changed || avatars_ready {
             // Scoreboard visibility and focus are transient state. Rebuild its
             // retained batch only when either input changes.
             self.rebuild_retained_ui();
@@ -1540,6 +1585,81 @@ pub(in crate::renderer) fn load_ui_extension_images(
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
 /// Each cell key may contain newline-separated candidate qpaths; the first
 /// existing image wins (team-skin icon -> team fallback -> defer art).
+/// Every player icon the game can see (`models/players/<model>/icon_<skin>`,
+/// every model and every skin, stock and pk3 alike), at 48 px, in one atlas
+/// keyed `model/skin`. Runs off the render thread (see `sync_ui_avatars`).
+pub(in crate::renderer) fn load_ui_avatar_atlas(base: &Path, game: Option<&Path>) -> (TextureData, ui::AvatarAtlas) {
+    const CELL: u32 = 48;
+    const COLUMNS: u32 = 128;
+    // 8192 px tall at most: inside every adapter's minimum texture limit.
+    const MAX_ICONS: usize = (COLUMNS * (8192 / CELL)) as usize;
+    let mut icons: Vec<String> = Vec::new();
+    let mut assets = AssetSearchPath::open_game(base, game).ok();
+    if let Some(assets) = assets.as_ref() {
+        for name in assets.names() {
+            let lower = name.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("models/players/") else { continue };
+            let Some((model, file)) = rest.split_once('/') else { continue };
+            let Some(stem) = file.strip_suffix(".tga").or_else(|| file.strip_suffix(".jpg")).or_else(|| file.strip_suffix(".png")) else {
+                continue;
+            };
+            let Some(skin) = stem.strip_prefix("icon_") else { continue };
+            if !skin.is_empty() && !model.contains('/') {
+                icons.push(format!("{model}/{skin}"));
+            }
+        }
+    }
+    icons.sort();
+    icons.dedup();
+    if icons.len() > MAX_ICONS {
+        // Keep every model's default icon before extra skins.
+        icons.sort_by_key(|key| !key.ends_with("/default"));
+        icons.truncate(MAX_ICONS);
+    }
+    let rows = (icons.len() as u32).div_ceil(COLUMNS).max(1);
+    let (width, height) = (COLUMNS * CELL, rows * CELL);
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let mut atlas = ui::AvatarAtlas { columns: COLUMNS, rows, cells: Default::default() };
+    if let Some(assets) = assets.as_mut() {
+        for key in icons {
+            let Some((model, skin)) = key.split_once('/') else { continue };
+            let qpath = format!("models/players/{model}/icon_{skin}");
+            let Some(image) = try_load_texture_asset_from_search_path(assets, &qpath, true, false, true, "avatar") else {
+                continue;
+            };
+            let Some(source) = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec()) else {
+                continue;
+            };
+            let cell_image = if source.width() == CELL && source.height() == CELL {
+                source
+            } else {
+                image::imageops::resize(&source, CELL, CELL, image::imageops::FilterType::Triangle)
+            };
+            let index = atlas.cells.len() as u32;
+            let (col, row) = (index % COLUMNS, index / COLUMNS);
+            let row_bytes = (CELL * 4) as usize;
+            for y in 0..CELL {
+                let src = y as usize * row_bytes;
+                let dst = ((((row * CELL + y) * width) + col * CELL) * 4) as usize;
+                rgba[dst..dst + row_bytes].copy_from_slice(&cell_image.as_raw()[src..src + row_bytes]);
+            }
+            atlas.cells.insert(key, index);
+        }
+    }
+    let data = TextureData {
+        label: "JKA UI avatar atlas".into(),
+        source: None,
+        width,
+        height,
+        rgba: rgba.into(),
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    };
+    (data, atlas)
+}
+
 pub(in crate::renderer) fn load_ui_team_icon_atlas(
     base: &Path,
     game: Option<&Path>,
@@ -1874,6 +1994,47 @@ pub(in crate::renderer) fn load_ui_proportional_font(
     };
 
     (texture, metrics)
+}
+
+/// Clean UI font for the scoreboard and kill feed: a packaged
+/// `fonts/ui_clean.ttf`/`.otf` when present, else Segoe UI Semibold, Segoe UI
+/// or Arial from the system. `None` keeps those surfaces on the JKA font.
+pub(in crate::renderer) fn load_ui_clean_font(
+    base: &Path,
+    game: Option<&Path>,
+) -> (TextureData, Option<ui::ProportionalFont>) {
+    const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+    let mut assets = AssetSearchPath::open_game(base, game).ok();
+    let packaged = ["fonts/ui_clean.ttf", "fonts/ui_clean.otf"].into_iter().filter_map(|path| {
+        let bytes = assets.as_mut()?.read(path, MAX_FONT_BYTES).ok().flatten()?.bytes;
+        Some((path.to_owned(), bytes))
+    });
+    let system = ui::system_font_dirs().into_iter().flat_map(|dir| {
+        ["seguisb.ttf", "segoeui.ttf", "arial.ttf"].map(|name| dir.join(name))
+    });
+    let candidates = packaged.collect::<Vec<_>>().into_iter().chain(
+        system.filter_map(|path| Some((path.display().to_string(), std::fs::read(&path).ok()?))),
+    );
+    for (label, bytes) in candidates {
+        match ui::rasterize_ttf_font(&bytes) {
+            Ok(font) => {
+                let texture = TextureData {
+                    label: format!("UI clean font {label}"),
+                    source: None,
+                    width: font.width,
+                    height: font.height,
+                    rgba: font.rgba.into(),
+                    rgba16f: None,
+                    mip_level_count: font.mip_level_count,
+                    clamp: true,
+                    srgb: false,
+                };
+                return (texture, Some(font.font));
+            }
+            Err(error) => eprintln!("UI clean font {label}: {error}"),
+        }
+    }
+    (empty_ui_font_texture("JKA missing clean UI font"), None)
 }
 
 /// Studio overlay font for `choice`: `ui::STUDIO_FONT_CLASSIC` is JKA's

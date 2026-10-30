@@ -32,7 +32,8 @@ impl App {
             && !super::lifecycle::headless()
             && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && self.window_focused
-            && !self.connection_modal_active();
+            && !self.connection_modal_active()
+            && !self.scoreboard_cursor_active();
         if !captured {
             self.noclip_primary_down = false;
             self.noclip_alt_down = false;
@@ -461,6 +462,11 @@ impl App {
             && was_demo_ui_modifier != self.live_buttons.contains("+speed")
         {
             self.sync_demo_camera_capture();
+        }
+        if !self.scores_showing && was_scores_showing {
+            // Letting go of the scores key closes the board, and with it the
+            // M2/M3 cursor, even while the cursor is up.
+            self.close_scoreboard_cursor();
         }
         if self.scores_showing && !was_scores_showing {
             // TaystJK's CG_ScoresDown_f does not send `score` or clear the
