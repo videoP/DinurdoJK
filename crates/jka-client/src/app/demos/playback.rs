@@ -199,6 +199,14 @@ impl GameSession {
                             // Recorded demos do not have a live local ping stream to
                             // validate the spectator-follow heuristic against.
                             spectating_you: false,
+                            muted: false,
+                            crowned: false,
+                            model: String::new(),
+                            model_fallback: String::new(),
+                            h2h: None,
+                            accuracy: 0,
+                            excellent: 0,
+                            gauntlet: 0,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -237,6 +245,7 @@ impl GameSession {
             show_deaths,
             icon_paths: scoreboard_icon_paths,
             entries,
+            chrome: Default::default(),
         })
     }
 

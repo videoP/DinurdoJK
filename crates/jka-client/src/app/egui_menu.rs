@@ -9,6 +9,9 @@ mod demos;
 mod dialogs;
 mod editors;
 mod frontend_pages;
+pub(in crate::app) mod holo;
+mod force_page;
+mod shell_layout;
 mod maps;
 mod movement;
 mod neon_main;
@@ -400,23 +403,27 @@ fn rail_group(ui: &mut egui::Ui, title: &str) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     let painter = ui.painter().clone();
-    theme::glow_text(
-        &painter,
-        egui::pos2(rect.left() + GUTTER - 12.0, rect.center().y + 2.0),
-        egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::proportional(14.0),
-        theme::TEXT,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(rect.left() + GUTTER - 12.0, rect.bottom() - 1.0),
-            egui::vec2(rect.width() - (GUTTER - 12.0) - 12.0, 1.0),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::LINE,
-    );
-    ui.add_space(4.0);
+    let left = rect.left() + GUTTER - 12.0;
+    let galley = painter.layout_no_wrap(title.to_owned(), egui::FontId::proportional(12.0), theme::ACCENT);
+    let text_w = galley.size().x;
+    painter.galley(egui::pos2(left, rect.center().y - galley.size().y * 0.5 + 2.0), galley, theme::ACCENT);
+    // A hairline that fades out to the right of the caption.
+    let start = left + text_w + 10.0;
+    let end = rect.right() - 12.0;
+    if end > start {
+        let y = rect.center().y + 2.0;
+        let mut mesh = egui::Mesh::default();
+        let solid = theme::LINE_STRONG;
+        let clear = egui::Color32::TRANSPARENT;
+        mesh.colored_vertex(egui::pos2(start, y), solid);
+        mesh.colored_vertex(egui::pos2(end, y), clear);
+        mesh.colored_vertex(egui::pos2(start, y + 1.0), solid);
+        mesh.colored_vertex(egui::pos2(end, y + 1.0), clear);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(1, 3, 2);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    ui.add_space(2.0);
 }
 
 fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
@@ -552,33 +559,7 @@ fn asset_size_label(bytes: usize) -> String {
 }
 
 fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 27.0), egui::Sense::click());
-    let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL_SELECTED);
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
-            egui::CornerRadius::ZERO,
-            theme::ACCENT,
-        );
-    } else if response.hovered() {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL);
-    }
-    painter.text(
-        egui::pos2(rect.left() + GUTTER, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(13.0),
-        if selected {
-            theme::TEXT
-        } else if response.hovered() {
-            theme::TEXT
-        } else {
-            theme::TEXT_DIM
-        },
-    );
-    response
+    holo::rail_item(ui, label, selected, GUTTER)
 }
 
 /// A wide, flat action row used by the Resume page.

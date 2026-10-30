@@ -2015,6 +2015,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         if self.studio_navigation_window_event(&event) { return; }
+        if self.scoreboard_cursor_window_event(&event) { return; }
 
         // A focused Remap Editor text field owns *every* typed key before
         // global shortcuts and Dev-bind dismissal. Otherwise a shader path

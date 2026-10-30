@@ -589,6 +589,11 @@ impl App {
         let team_overlay = self.team_overlay_ui();
         let scoreboard = self.visible_scoreboard();
         let scoreboard_focus_client = self.scoreboard_focus_client();
+        let killfeed = if self.overlay == OverlayMode::HudEdit {
+            self.killfeed_ui().or_else(|| self.killfeed_sample_ui())
+        } else {
+            self.killfeed_ui()
+        };
         let force_select = self.force_select_ui(Instant::now());
         let weapon_select = self.weapon_select_ui(Instant::now());
         let inventory_select = self.inventory_select_ui(Instant::now());
@@ -625,6 +630,8 @@ impl App {
             vote_line,
             scoreboard,
             scoreboard_focus_client,
+            killfeed,
+            chat_anim: self.chat_anim_ui(Instant::now()),
             speedometer,
             lagometer: self.current_lagometer_ui(),
             team_overlay,

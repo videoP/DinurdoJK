@@ -420,15 +420,15 @@ pub(in crate::ui) const CHATBOX_FONT_SCALE: f32 = 0.65 * 0.5;
 
 pub(in crate::ui) const CHATBOX_CUTOFF: f32 = 550.0;
 
-// Night-Tokyo palette shared with the console: indigo ink, cyan/magenta neon,
-// tungsten amber. HUD accents pick one role per panel.
-pub(in crate::ui) const HUD_INK_TOP: [f32; 4] = [0.010, 0.014, 0.032, 0.84];
+// Panel ink and captions come from `crate::palette` (warm Stone Brown ink,
+// Silver labels, White Smoke values); the stat colours stay semantic.
+pub(in crate::ui) const HUD_INK_TOP: [f32; 4] = crate::palette::rgba(crate::palette::mix(crate::palette::INK, crate::palette::STONE_BROWN, 0.22), 0.84);
 
-pub(in crate::ui) const HUD_INK_BOTTOM: [f32; 4] = [0.020, 0.026, 0.058, 0.80];
+pub(in crate::ui) const HUD_INK_BOTTOM: [f32; 4] = crate::palette::rgba(crate::palette::INK, 0.80);
 
-pub(in crate::ui) const HUD_LABEL: [f32; 4] = [0.56, 0.66, 0.79, 1.0];
+pub(in crate::ui) const HUD_LABEL: [f32; 4] = crate::palette::rgba(crate::palette::SILVER, 1.0);
 
-pub(in crate::ui) const HUD_VALUE: [f32; 4] = [0.96, 0.98, 1.0, 1.0];
+pub(in crate::ui) const HUD_VALUE: [f32; 4] = crate::palette::rgba(crate::palette::WHITE_SMOKE, 1.0);
 
 pub(in crate::ui) const HUD_HEALTH: [f32; 4] = [0.92, 0.18, 0.15, 1.0];
 

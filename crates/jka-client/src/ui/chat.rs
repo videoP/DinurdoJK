@@ -77,6 +77,10 @@ pub(in crate::ui) fn build_chat_history(
     w: u32,
     h: u32,
 ) {
+    if ui.chat_settings.docked {
+        super::chat_dock::build(out, ui, small_font, w, h);
+        return;
+    }
     if ui.chat_lines.is_empty() {
         return;
     }
@@ -256,6 +260,10 @@ pub(in crate::ui) fn build_chat_input(
     // boundary so resizing the HUD chat history cannot clip or displace input.
     // Unlike the legacy single-line Field_BigDraw, wrap the *whole* composer
     // (prompt included) so long messages remain visible while being typed.
+    // The docked style draws its field with the feed (see chat_dock).
+    if ui.chat_settings.docked {
+        return;
+    }
     const BIG_CHAR_VIRTUAL: f32 = 16.0;
     const CHAT_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     let scale = (h as f32 / 480.0).max(0.5);

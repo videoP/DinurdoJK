@@ -35,6 +35,8 @@ pub enum HudElementId {
     JumpDistance,
     VerticalSpeed,
     YawSpeed,
+    /// DinurdoJK `cg_killfeed`: top-right obituary list.
+    KillFeed,
 }
 
 impl HudElementId {
@@ -42,7 +44,7 @@ impl HudElementId {
     // position is now the clickable `OverlayMode::Trace` egui menu, which
     // isn't a draggable HUD element. The variant, its cvar prefix and its
     // offset field stay (see `element`/`element_mut`) so old configs still load.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Health,
         Self::Shield,
         Self::Ammo,
@@ -71,6 +73,7 @@ impl HudElementId {
         Self::JumpDistance,
         Self::VerticalSpeed,
         Self::YawSpeed,
+        Self::KillFeed,
     ];
 
     pub fn label(self) -> &'static str {
@@ -104,6 +107,7 @@ impl HudElementId {
             Self::JumpDistance => "JUMP DISTANCE",
             Self::VerticalSpeed => "VERTICAL SPEED",
             Self::YawSpeed => "YAW SPEED",
+            Self::KillFeed => "KILL FEED",
 
         }
     }
@@ -139,6 +143,7 @@ impl HudElementId {
             Self::JumpDistance => "cg_hudJumpDistance",
             Self::VerticalSpeed => "cg_hudVerticalSpeed",
             Self::YawSpeed => "cg_hudYawSpeed",
+            Self::KillFeed => "cg_hudKillFeed",
 
         }
     }
@@ -311,6 +316,7 @@ pub struct HudLayout {
     pub jump_distance: HudElementLayout,
     pub vertical_speed: HudElementLayout,
     pub yaw_speed: HudElementLayout,
+    pub kill_feed: HudElementLayout,
 
     pub snap_to_grid: bool,
     pub grid_size: f32,
@@ -352,6 +358,7 @@ impl Default for HudLayout {
             jump_distance: HUD_UNMOVED,
             vertical_speed: HUD_UNMOVED,
             yaw_speed: HUD_UNMOVED,
+            kill_feed: HUD_UNMOVED,
 
             // These resolve to the exact pre-editor positions at scale 1.0.
             health: HudElementLayout {
@@ -416,6 +423,7 @@ impl HudLayout {
             HudElementId::JumpDistance => self.jump_distance,
             HudElementId::VerticalSpeed => self.vertical_speed,
             HudElementId::YawSpeed => self.yaw_speed,
+            HudElementId::KillFeed => self.kill_feed,
 
         }
     }
@@ -451,6 +459,7 @@ impl HudLayout {
             HudElementId::JumpDistance => &mut self.jump_distance,
             HudElementId::VerticalSpeed => &mut self.vertical_speed,
             HudElementId::YawSpeed => &mut self.yaw_speed,
+            HudElementId::KillFeed => &mut self.kill_feed,
 
         }
     }
@@ -517,6 +526,10 @@ pub struct HudRectContext {
     pub lagometer: crate::lagometer::Settings,
     pub speedometer: crate::speedometer::Settings,
     pub strafe_helper: crate::ui::StrafeHelperSettings,
+    /// The duel Enemy Info panel is up; the kill feed steps left of it.
+    pub enemy_info: bool,
+    /// Text rows stacked in the top-right corner; the kill feed hangs below.
+    pub corner_rows: u8,
 }
 
 impl HudRectContext {
@@ -545,6 +558,8 @@ impl HudRectContext {
             lagometer: race.lagometer,
             speedometer: race.speedometer,
             strafe_helper,
+            enemy_info: false,
+            corner_rows: u8::from(video.draw_fps != 0) + u8::from(draw_timer),
         }
     }
 
@@ -559,7 +574,7 @@ impl HudRectContext {
         }
         race.speedometer = ui.speedometer_settings;
         race.lagometer = ui.lagometer_settings;
-        Self::new(
+        let mut context = Self::new(
             ui.movement_keys,
             &ui.video,
             &ui.perf,
@@ -573,7 +588,10 @@ impl HudRectContext {
                 Some(crate::ui::UiMiniScores::Duel { .. }) => 3,
                 None => 1,
             },
-        )
+        );
+        context.enemy_info = ui.enemy_info.is_some();
+        context.corner_rows = crate::ui::killfeed::corner_rows(ui);
+        context
     }
 }
 
@@ -727,6 +745,12 @@ pub(crate) fn hud_stock_rect(
             else { virtual_rect(0.0, 240.0, 640.0, 240.0) }
         }
         HudElementId::VelocityCompass => virtual_rect(0.0, 288.0, 640.0, 32.0),
+        // Same column `killfeed::build_killfeed` draws into, six rows tall.
+        HudElementId::KillFeed => {
+            let [x, y, width, height] =
+                crate::ui::killfeed::column_bounds(w, h, ctx.corner_rows, ctx.enemy_info);
+            HudRect { x, y, width, height }
+        }
         HudElementId::AccelMeter if ctx.strafe_helper.flags & crate::ui::SHELPER_Q3DF_ACCEL != 0 => virtual_rect(210.0, 232.0, 220.0, 16.0),
         HudElementId::AccelMeter | HudElementId::GroundSpeed | HudElementId::JumpHeight
         | HudElementId::JumpDistance | HudElementId::VerticalSpeed | HudElementId::YawSpeed => {

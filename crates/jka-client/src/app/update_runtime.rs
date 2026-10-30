@@ -85,8 +85,8 @@ impl App {
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-22.0, 90.0))
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(24, 29, 39))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(95)))
+                    .fill(super::egui_theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0, super::egui_theme::LINE_STRONG))
                     .inner_margin(egui::Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_width(350.0);
@@ -111,7 +111,7 @@ impl App {
                         } else if ui.button("Download & Install").clicked() {
                             self.download_update();
                         }
-                        if let Some(error) = &self.updater.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+                        if let Some(error) = &self.updater.error { ui.colored_label(super::egui_theme::DANGER, error); }
                         if ui.button("Later / Dismiss").clicked() { self.updater.notice = false; }
                     });
             });

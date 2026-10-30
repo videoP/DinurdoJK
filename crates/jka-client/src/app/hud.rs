@@ -241,6 +241,8 @@ impl App {
             console_help_hover: self.console_help_hover && self.overlay == OverlayMode::Console,
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
+            chat_settings: self.chat_settings,
+            chat_anim: self.chat_anim_ui(Instant::now()),
             chat_lines,
             console_notify_lines,
             center_print,
@@ -254,6 +256,7 @@ impl App {
             race_components: [self.japro_cg.race_timer != 0, self.japro_cg.race_start],
             vote_line,
             scoreboard,
+            killfeed: self.killfeed_ui(),
             scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
             prediction_debug,
@@ -276,6 +279,8 @@ impl App {
             zoom_scope,
             rocket_lock,
             icon_atlas_uvs: Vec::new(),
+            clean_font: None,
+            avatar_atlas: None,
             movement_keys: self.movement_keys_hud,
             strafe_helper: if in_studio {
                 let mut helper=self.strafe_helper;
@@ -345,6 +350,7 @@ impl App {
                 text: text.to_owned(),
                 team: false,
                 alpha: 1.0,
+                enter: 1.0,
             })
             .into();
         }
@@ -1109,6 +1115,7 @@ impl App {
                 show_deaths: false,
                 icon_paths: Vec::new(),
                 entries: Vec::new(),
+                chrome: Default::default(),
             }
         });
 
@@ -1125,6 +1132,7 @@ impl App {
                 snapshot.player_state.stats[jka_protocol::server::STAT_CLIENTS_READY] as u16
             })
             .unwrap_or(0);
+        self.decorate_scoreboard(&mut board);
 
         Some(board)
     }
@@ -1767,6 +1775,7 @@ impl App {
         }
 
         let mut labels = Vec::new();
+        let leaders = self.score_leaders();
         if normal_active {
             let snapshot = session.client_game.current_snapshot()?;
             let viewer_team = snapshot.player_state.persistant[3];
@@ -1818,6 +1827,7 @@ impl App {
                     text: name,
                     health_fraction,
                     health_color,
+                    crowned: leaders.contains(&(client as i32)),
                 });
             }
         }
@@ -1871,6 +1881,7 @@ impl App {
                     text: first_line,
                     health_fraction: None,
                     health_color: [1.0, 1.0, 1.0, 0.0],
+                    crowned: false,
                 });
             }
         }

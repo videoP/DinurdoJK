@@ -193,6 +193,7 @@ pub(crate) mod hud;
 mod hud_commands;
 pub(crate) mod hud_layout_cvars;
 pub(crate) mod japro_cvars;
+pub(crate) mod killfeed_cvars;
 pub(crate) mod jiggle_cvars;
 pub(crate) mod jiggle_bounds_cvars;
 pub(crate) mod anny_cvars;
@@ -294,6 +295,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(jiggle_cvars::DEFINITIONS.iter());
         definitions.extend(jiggle_bounds_cvars::DEFINITIONS.iter());
         definitions.extend(anny_cvars::DEFINITIONS.iter());
+        definitions.extend(killfeed_cvars::DEFINITIONS.iter());
         definitions
     })
 }

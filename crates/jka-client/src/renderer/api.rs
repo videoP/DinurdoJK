@@ -1294,6 +1294,8 @@ pub enum RenderCommand {
         vote_line: Option<String>,
         scoreboard: Option<ui::UiScoreboard>,
         scoreboard_focus_client: Option<i32>,
+        killfeed: Option<ui::UiKillfeed>,
+        chat_anim: ui::UiChatAnim,
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,

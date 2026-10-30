@@ -199,19 +199,11 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_header(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("jka_frontend_header")
-            .exact_size(theme::TOP_BAR_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin::symmetric(GUTTER as i8, 0)),
-            )
-            .show(root, |ui| {
+        let shell = self.menu_shell(root.ctx());
+        super::shell_layout::region(root, "jka_frontend_header", shell.header, |ui| {
+                super::holo::header_backdrop(ui.painter(), ui.max_rect());
                 ui.horizontal_centered(|ui| {
-                    if self.frontend_page != FrontendPage::Profile {
-                        theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
-                        ui.add_space(14.0);
-                    }
+                    ui.add_space(GUTTER);
                     let page = if self.egui_display_overlay() == OverlayMode::Video {
                         "SETTINGS"
                     } else {
@@ -232,7 +224,21 @@ impl App {
                             FrontendPage::RenderStudio => "RENDER STUDIO",
                         }
                     };
-                    theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
+                    // The page name in neon tube lettering, like the
+                    // Main page's signs it was reached from.
+                    let cap = 22.0;
+                    let (title, _) = ui.allocate_exact_size(
+                        egui::vec2(super::holo::neon_width(page, cap) + 6.0, cap * 1.8),
+                        egui::Sense::hover(),
+                    );
+                    super::holo::neon_text(
+                        ui.painter(),
+                        egui::pos2(title.left() + 3.0, title.center().y + cap * 0.5),
+                        page,
+                        cap,
+                        theme::ACCENT,
+                        1.0,
+                    );
                     // Submenus use the persistent footer for BACK / QUIT.
                     // Render Studio's dedicated header tools stay here.
                     if self.frontend_page == FrontendPage::RenderStudio
@@ -371,21 +377,14 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_footer(&mut self, root: &mut egui::Ui) {
-        // Reserve workspace space; the footer itself is WGPU signage.
-        egui::Panel::bottom("jka_frontend_footer")
-            .exact_size(crate::neon_menu::footer::HEIGHT)
-            .frame(egui::Frame::NONE)
-            .show(root, |_ui| {});
+        // The shell reserves the footer strip; the footer itself is WGPU
+        // signage (`egui_frontend_neon_footer`).
+        let _ = root;
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_body(&mut self, root: &mut egui::Ui) {
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(root, |ui| {
+        let body = self.menu_shell(root.ctx()).body;
+        super::shell_layout::region(root, "jka_frontend_body_region", body, |ui| {
                 let max_w = if matches!(
                     self.frontend_page,
                     FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo
@@ -423,19 +422,10 @@ impl App {
                             // renderer-owned 3D viewport, while the controls pane
                             // paints its own opaque surface.
                             egui::Frame::new().fill(egui::Color32::TRANSPARENT)
+                        } else if matches!(self.frontend_page, FrontendPage::AssetViewer | FrontendPage::Screenshots) {
+                            egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, theme::LINE))
                         } else {
-                            egui::Frame::new()
-                                .fill(
-                                    if matches!(
-                                        self.frontend_page,
-                                        FrontendPage::AssetViewer | FrontendPage::Screenshots | FrontendPage::RenderStudio
-                                    ) {
-                                        egui::Color32::TRANSPARENT
-                                    } else {
-                                        theme::PANEL_FILL
-                                    },
-                                )
-                                .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                            super::holo::glass()
                         };
                         let studio = self.frontend_page == FrontendPage::RenderStudio;
                         let margin = if studio { egui::Margin::ZERO }

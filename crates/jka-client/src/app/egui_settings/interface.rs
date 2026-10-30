@@ -40,6 +40,10 @@ impl App {
                     },
                 );
 
+                self.egui_killfeed_settings(ui);
+                self.egui_scoreboard_settings(ui);
+                self.egui_chat_settings(ui);
+
                 theme::section(
                     ui,
                     "MOVEMENT COMPONENTS",
@@ -648,6 +652,144 @@ impl App {
             // Apply both final masks: neither setter can retain an old provider.
             let _ = self.set_console_cvar("cg_speedometer", &native.to_string());
             let _ = self.set_console_cvar("cg_strafeHelper", &helper.to_string());
+        }
+    }
+}
+
+impl App {
+    /// Setup -> Interface -> KILL FEED: style, own-line highlight, and the
+    /// lifetime and opacity of each kind of line.
+    fn egui_killfeed_settings(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::KillfeedStyle;
+        theme::section(
+            ui,
+            "KILL FEED",
+            "Top-right obituary list. Move and scale it with EDIT HUD; every option applies immediately.",
+        );
+        let settings = self.killfeed_settings;
+        theme::row(ui, "Kill feed", "cg_killfeed. Off hides the feed; obituaries still print to the console.", theme::Reset::None, |ui| {
+            if let Some(on) = theme::switch(ui, settings.enabled) {
+                let _ = self.set_console_cvar("cg_killfeed", if on { "1" } else { "0" });
+            }
+        });
+        if !settings.enabled {
+            return;
+        }
+        theme::row(ui, "Style", "cg_killfeedStyle. The look of each line, after the games it borrows from.", theme::Reset::None, |ui| {
+            for style in KillfeedStyle::ALL {
+                if theme::chip(ui, style.label(), settings.style == style).clicked() && settings.style != style {
+                    let _ = self.set_console_cvar("cg_killfeedStyle", &style.index().to_string());
+                }
+                ui.add_space(3.0);
+            }
+        });
+        theme::row(ui, "Highlight own lines", "cg_killfeedHighlightOwn. Your kills are marked in Celadon, your deaths in Smoky Rose.", theme::Reset::None, |ui| {
+            if let Some(on) = theme::switch(ui, settings.highlight_own) {
+                let _ = self.set_console_cvar("cg_killfeedHighlightOwn", if on { "1" } else { "0" });
+            }
+        });
+        theme::row(ui, "Lines", "cg_killfeedLines. Most lines shown at once; the newest is on top.", theme::Reset::None, |ui| {
+            let mut value = f32::from(settings.max_lines);
+            let readout = format!("{value:.0}");
+            if theme::slider(ui, &mut value, 1.0..=12.0, &readout) {
+                let _ = self.set_console_cvar("cg_killfeedLines", &(value.round() as i32).to_string());
+            }
+        });
+        let timing: [(&str, &str, &str, f32, &str, f32); 3] = [
+            ("Your kills", "cg_killfeedOwnKillTime", "How long your own kills stay up.", settings.own_kill_time,
+             "cg_killfeedOwnKillAlpha", settings.own_kill_alpha),
+            ("Your deaths", "cg_killfeedOwnDeathTime", "How long your own deaths stay up.", settings.own_death_time,
+             "cg_killfeedOwnDeathAlpha", settings.own_death_alpha),
+            ("Other kills", "cg_killfeedTime", "How long everyone else's kills stay up.", settings.other_time,
+             "cg_killfeedAlpha", settings.other_alpha),
+        ];
+        for (label, time_cvar, tip, time, alpha_cvar, alpha) in timing {
+            theme::row(ui, &format!("{label}: fade after"), &format!("{time_cvar}. {tip}"), theme::Reset::None, |ui| {
+                let mut value = time;
+                let readout = format!("{value:.1} s");
+                if theme::slider(ui, &mut value, 0.5..=30.0, &readout) {
+                    let _ = self.set_console_cvar(time_cvar, &format!("{:.1}", value));
+                }
+            });
+            theme::row(ui, &format!("{label}: opacity"), &format!("{alpha_cvar}. Peak opacity of these lines."), theme::Reset::None, |ui| {
+                let mut value = alpha;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    let _ = self.set_console_cvar(alpha_cvar, &format!("{:.2}", value));
+                }
+            });
+        }
+    }
+}
+
+impl App {
+    /// Setup -> Interface -> SCOREBOARD: how the mouse menu works, and the
+    /// players muted on this client.
+    fn egui_scoreboard_settings(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "SCOREBOARD",
+            "Hold your scores key, then press Mouse 2 or Mouse 3 to free the cursor. Click a player to mute them or call a kick vote.",
+        );
+        let board = self.scoreboard_settings;
+        theme::row(ui, "Avatars", "cg_scoreboardAvatars. Player portraits beside the centre divider.", theme::Reset::None, |ui| {
+            if let Some(on) = theme::switch(ui, board.avatars) {
+                let _ = self.set_console_cvar("cg_scoreboardAvatars", if on { "1" } else { "0" });
+            }
+        });
+        theme::row(ui, "Head-to-head", "cg_scoreboardHeadToHead. Your kills and deaths against each player, by the divider.", theme::Reset::None, |ui| {
+            if let Some(on) = theme::switch(ui, board.head_to_head) {
+                let _ = self.set_console_cvar("cg_scoreboardHeadToHead", if on { "1" } else { "0" });
+            }
+        });
+        if self.muted_clients.is_empty() {
+            theme::label(ui, theme::plain("Nobody is muted.", 12.5, theme::TEXT_FAINT));
+            return;
+        }
+        let mut unmute = None;
+        let mut muted: Vec<_> = self.muted_clients.iter().map(|(client, name)| (*client, name.clone())).collect();
+        muted.sort_by_key(|(client, _)| *client);
+        for (client, name) in muted {
+            theme::row(ui, &crate::logging::strip_jka_colors(&name), "Muted on this client: their chat and voice commands are hidden.", theme::Reset::None, |ui| {
+                if theme::ghost_button(ui, "UNMUTE").clicked() {
+                    unmute = Some(client);
+                }
+            });
+        }
+        if let Some(client) = unmute {
+            self.muted_clients.remove(&client);
+            self.publish_transient_ui();
+        }
+    }
+}
+
+impl App {
+    /// Setup -> Interface -> CHAT: the docked field and how long messages last.
+    fn egui_chat_settings(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "CHAT", "The chat box at the bottom left. Move and size it with EDIT HUD.");
+        let chat = self.chat_settings;
+        theme::row(ui, "Style", "cg_chatStyle. Docked puts the typing field under the feed with your recent messages; Classic is the stock top bar.", theme::Reset::None, |ui| {
+            for (docked, label) in [(true, "Docked"), (false, "Classic")] {
+                if theme::chip(ui, label, chat.docked == docked).clicked() && chat.docked != docked {
+                    let _ = self.set_console_cvar("cg_chatStyle", if docked { "1" } else { "0" });
+                }
+                ui.add_space(3.0);
+            }
+        });
+        let sliders: [(&str, &str, &str, f32, std::ops::RangeInclusive<f32>, &str); 4] = [
+            ("Messages while typing", "cg_chatHistoryLines", "How many recent messages show at full strength while you type.", f32::from(chat.history_lines), 1.0..=20.0, ""),
+            ("Fade after", "cg_chatFadeTime", "Seconds a message stays on screen.", chat.fade_time, 1.0..=60.0, " s"),
+            ("Keep history for", "cg_chatHistoryTime", "Seconds messages are kept for the typing view.", chat.history_time, 10.0..=600.0, " s"),
+            ("Quiet after attacking", "cg_chatMuteAfterAttack", "Silence chat sounds for this long after you attack, so they never distract mid-fight. 0 keeps them on.", chat.mute_after_attack, 0.0..=10.0, " s"),
+        ];
+        for (label, cvar, tip, value, range, unit) in sliders {
+            theme::row(ui, label, &format!("{cvar}. {tip}"), theme::Reset::None, |ui| {
+                let mut value = value;
+                let readout = if unit.is_empty() { format!("{value:.0}") } else { format!("{value:.0}{unit}") };
+                if theme::slider(ui, &mut value, range, &readout) {
+                    let _ = self.set_console_cvar(cvar, &format!("{}", value.round()));
+                }
+            });
         }
     }
 }

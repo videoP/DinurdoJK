@@ -1,43 +1,42 @@
 //! Render Studio's editor chrome: panes, sections, property rows and vector
 //! icons. Layout follows NLE conventions (Premiere / Resolve: media browser,
 //! program viewer with a transport bar, inspector, timeline with a fixed
-//! ruler). Colors follow the console and the neon main menu: indigo asphalt
-//! surfaces, neon cyan as the primary accent, magenta as the secondary.
+//! ruler). Colors come from `crate::palette`: warm Stone Brown surfaces,
+//! Celadon as the primary accent, Smoky Rose as the secondary.
 use self::palette as theme;
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui};
 
 /// Studio palette. Same token names as the global menu theme, so Studio
-/// files import it as `theme`. Lifted indigo surfaces keep the editor readable;
-/// accents come from the console and the neon menu gas colors.
+/// files import it as `theme`; a shade darker than the menus so footage in
+/// the viewer stays the brightest thing on screen.
 pub(super) mod palette {
+    use crate::palette::{mix, CELADON, INK, SILVER, SMOKY_ROSE, STONE_BROWN, WHITE_SMOKE};
     use egui::Color32;
-    const fn rgb(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
+    const fn rgb(c: [u8; 3]) -> Color32 { Color32::from_rgb(c[0], c[1], c[2]) }
     /// Editor background between panes.
-    pub(in crate::app::egui_menu) const CHROME: Color32 = rgb(15, 18, 28);
-    pub(in crate::app::egui_menu) const SURFACE: Color32 = rgb(23, 27, 42);
-    pub(in crate::app::egui_menu) const SURFACE_ALT: Color32 = rgb(30, 35, 53);
-    pub(in crate::app::egui_menu) const INSET: Color32 = rgb(17, 21, 34);
-    pub(in crate::app::egui_menu) const CONTROL: Color32 = rgb(35, 42, 64);
-    pub(in crate::app::egui_menu) const CONTROL_HOVER: Color32 = rgb(46, 56, 82);
-    /// Console suggestion highlight: deep teal.
-    pub(in crate::app::egui_menu) const CONTROL_SELECTED: Color32 = rgb(24, 76, 100);
-    pub(in crate::app::egui_menu) const HAIRLINE: Color32 = rgb(39, 46, 66);
-    pub(in crate::app::egui_menu) const LINE: Color32 = rgb(48, 58, 86);
-    pub(in crate::app::egui_menu) const LINE_STRONG: Color32 = rgb(63, 76, 112);
-    /// CON_CYAN / neon Primary.
-    pub(in crate::app::egui_menu) const ACCENT: Color32 = rgb(71, 219, 242);
-    pub(in crate::app::egui_menu) const ACCENT_DEEP: Color32 = rgb(13, 92, 116);
-    pub(in crate::app::egui_menu) const ACCENT_HOVER: Color32 = rgb(19, 122, 150);
-    /// CON_MAGENTA / neon Hero: secondary accent (title ticks, playhead).
-    pub(in crate::app::egui_menu) const MAGENTA: Color32 = rgb(255, 77, 143);
-    pub(in crate::app::egui_menu) const TEXT: Color32 = rgb(214, 226, 240);
-    pub(in crate::app::egui_menu) const TEXT_BRIGHT: Color32 = rgb(242, 247, 255);
-    pub(in crate::app::egui_menu) const TEXT_DIM: Color32 = rgb(140, 162, 192);
-    pub(in crate::app::egui_menu) const TEXT_FAINT: Color32 = rgb(108, 128, 160);
-    pub(in crate::app::egui_menu) const TEXT_DISABLED: Color32 = rgb(74, 85, 110);
-    /// CON_AMBER / neon Utility.
-    pub(in crate::app::egui_menu) const WARNING: Color32 = rgb(255, 184, 71);
-    pub(in crate::app::egui_menu) const DANGER: Color32 = rgb(255, 84, 112);
+    pub(in crate::app::egui_menu) const CHROME: Color32 = rgb(mix(INK, [0, 0, 0], 0.15));
+    pub(in crate::app::egui_menu) const SURFACE: Color32 = rgb(mix(INK, STONE_BROWN, 0.14));
+    pub(in crate::app::egui_menu) const SURFACE_ALT: Color32 = rgb(mix(INK, STONE_BROWN, 0.26));
+    pub(in crate::app::egui_menu) const INSET: Color32 = rgb(mix(INK, [0, 0, 0], 0.30));
+    pub(in crate::app::egui_menu) const CONTROL: Color32 = rgb(mix(INK, STONE_BROWN, 0.40));
+    pub(in crate::app::egui_menu) const CONTROL_HOVER: Color32 = rgb(mix(INK, STONE_BROWN, 0.60));
+    /// Deep Celadon: selected rows and clips.
+    pub(in crate::app::egui_menu) const CONTROL_SELECTED: Color32 = rgb(mix(INK, CELADON, 0.30));
+    pub(in crate::app::egui_menu) const HAIRLINE: Color32 = rgb(mix(INK, STONE_BROWN, 0.36));
+    pub(in crate::app::egui_menu) const LINE: Color32 = rgb(mix(INK, STONE_BROWN, 0.62));
+    pub(in crate::app::egui_menu) const LINE_STRONG: Color32 = rgb(STONE_BROWN);
+    pub(in crate::app::egui_menu) const ACCENT: Color32 = rgb(CELADON);
+    pub(in crate::app::egui_menu) const ACCENT_DEEP: Color32 = rgb(mix(CELADON, INK, 0.55));
+    pub(in crate::app::egui_menu) const ACCENT_HOVER: Color32 = rgb(mix(CELADON, INK, 0.35));
+    /// Smoky Rose, lifted for contrast: secondary accent (title ticks, playhead).
+    pub(in crate::app::egui_menu) const MAGENTA: Color32 = rgb(mix(SMOKY_ROSE, WHITE_SMOKE, 0.25));
+    pub(in crate::app::egui_menu) const TEXT: Color32 = rgb(mix(WHITE_SMOKE, SILVER, 0.25));
+    pub(in crate::app::egui_menu) const TEXT_BRIGHT: Color32 = rgb(WHITE_SMOKE);
+    pub(in crate::app::egui_menu) const TEXT_DIM: Color32 = rgb(SILVER);
+    pub(in crate::app::egui_menu) const TEXT_FAINT: Color32 = rgb(mix(SILVER, INK, 0.30));
+    pub(in crate::app::egui_menu) const TEXT_DISABLED: Color32 = rgb(mix(SILVER, INK, 0.55));
+    pub(in crate::app::egui_menu) const WARNING: Color32 = rgb([0xE6, 0xC2, 0x6E]);
+    pub(in crate::app::egui_menu) const DANGER: Color32 = rgb(mix(SMOKY_ROSE, WHITE_SMOKE, 0.30));
 }
 
 /// Editor background; shows as the thin gutters between panes.
@@ -46,8 +45,8 @@ pub(super) const PANE: Color32 = theme::SURFACE;
 pub(super) const PANE_HEADER: Color32 = theme::SURFACE_ALT;
 /// Recessed wells: viewer letterbox, ruler, track lanes, text fields.
 pub(super) const WELL: Color32 = theme::INSET;
-pub(super) const LANE_A: Color32 = Color32::from_rgb(28, 33, 49);
-pub(super) const LANE_B: Color32 = Color32::from_rgb(23, 27, 43);
+pub(super) const LANE_A: Color32 = Color32::from_rgb(0x2A, 0x26, 0x21);
+pub(super) const LANE_B: Color32 = Color32::from_rgb(0x22, 0x1F, 0x1B);
 pub(super) const PLAYHEAD: Color32 = theme::MAGENTA;
 pub(super) const DEMO: Color32 = Color32::from_rgb(168, 124, 255);
 pub(super) const AUDIO: Color32 = Color32::from_rgb(78, 226, 168);
@@ -501,7 +500,7 @@ pub(super) fn button_sized(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: B
             theme::TEXT_BRIGHT,
         ),
         ButtonKind::Danger => (
-            if hovered { Color32::from_rgb(70, 18, 38) } else { theme::CONTROL },
+            if hovered { Color32::from_rgb(0x5A, 0x34, 0x2F) } else { theme::CONTROL },
             if hovered { theme::DANGER } else { theme::LINE },
             theme::DANGER,
         ),
@@ -724,7 +723,7 @@ pub(super) fn prop_combo<T: PartialEq + Clone>(ui: &mut Ui, label: &str, id: imp
 pub(super) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T,
     options: &[(T, &str)]) -> bool {
     let before = value.clone();
-    let current = options.iter().find(|(v, _)| v == value).map_or("—", |(_, l)| *l);
+    let current = options.iter().find(|(v, _)| v == value).map_or("-", |(_, l)| *l);
     combo_box(id)
         .width(ui.available_width())
         .wrap_mode(egui::TextWrapMode::Truncate)

@@ -54,8 +54,8 @@ impl App {
         if self.hud_layout.snap_to_grid {
             let spacing_px = self.hud_layout.grid_size.clamp(1.0, 64.0);
             let spacing = to_points(spacing_px);
-            let line = egui::Color32::from_rgba_premultiplied(128, 180, 220, 24);
-            let major = egui::Color32::from_rgba_premultiplied(128, 180, 220, 42);
+            let line = egui::Color32::from_rgba_premultiplied(105, 128, 102, 24);
+            let major = egui::Color32::from_rgba_premultiplied(105, 128, 102, 42);
             let mut x = full.left();
             let mut column = 0usize;
             while x <= full.right() {
@@ -424,7 +424,7 @@ impl App {
             } else if response.hovered() {
                 theme::TEXT
             } else {
-                egui::Color32::from_rgba_premultiplied(170, 205, 230, 150)
+                egui::Color32::from_rgba_premultiplied(175, 213, 170, 150)
             };
             painter.rect_stroke(
                 // Draw the handle on the true snapped edge. The previous
@@ -437,6 +437,7 @@ impl App {
             let disabled = match id {
                 HudElementId::MovementKeys => self.movement_keys_hud.mode == 0,
                 HudElementId::Fps => self.video.draw_fps == 0,
+                HudElementId::KillFeed => !self.killfeed_settings.enabled,
                 _ => false,
             };
             let label = if disabled {
@@ -546,7 +547,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236))
+                    .fill(theme::PANEL_FILL)
                     .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
@@ -860,7 +861,7 @@ impl App {
                                     if selected_face_line {
                                         egui::Color32::from_rgba_unmultiplied(255, 214, 92, 210)
                                     } else {
-                                        egui::Color32::from_rgba_unmultiplied(80, 220, 255, 150)
+                                        egui::Color32::from_rgba_unmultiplied(175, 213, 170, 150)
                                     },
                                 ),
                             );
@@ -879,7 +880,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(8, 13, 20, 242))
+                    .fill(theme::PANEL_FILL)
                     .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
@@ -934,7 +935,7 @@ impl App {
                                 ),
                             );
                             theme::label(ui, theme::plain(
-                                &format!("{}  —  {}  —  LMB selects/drags. ESC exits edit mode without discarding pending edits.", selection, editor.status),
+                                &format!("{}  ·  {}  ·  LMB selects/drags. ESC exits edit mode without discarding pending edits.", selection, editor.status),
                                 10.5,
                                 theme::TEXT_FAINT,
                             ));
@@ -1033,7 +1034,7 @@ impl App {
             let selected = self.hud_edit_extension_selected.as_deref() == Some(widget.key.as_str());
             let outline = if selected { theme::ACCENT }
                 else if response.hovered() { theme::TEXT }
-                else { egui::Color32::from_rgba_premultiplied(170,205,230,150) };
+                else { egui::Color32::from_rgba_premultiplied(175,213,170,150) };
             painter.rect_stroke(rect,egui::CornerRadius::ZERO,
                 egui::Stroke::new(if selected {2.0}else{1.0},outline),egui::StrokeKind::Inside);
             painter.text(rect.left_top()+egui::vec2(0.0,-8.0),egui::Align2::LEFT_BOTTOM,

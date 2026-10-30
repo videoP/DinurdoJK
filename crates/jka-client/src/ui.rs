@@ -18,7 +18,7 @@ pub use studio_race::{StudioRaceUi,StudioRaceRunnerUi};
 pub(crate) use studio_race::leaderboard_bounds;
 mod ttf_font;
 pub(crate) use ttf_font::{
-    list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
+    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
     STUDIO_PACKAGED_FONTS,
 };
 pub(crate) use studio_race::draw_labels as draw_studio_labels;
@@ -39,6 +39,11 @@ pub(crate) mod movement_components;
 mod inspector;
 mod loading;
 mod scoreboard;
+pub(crate) mod flex;
+mod glyphs;
+mod killfeed;
+mod chat_dock;
+pub use killfeed::{KillfeedSettings, KillfeedStyle, UiKillfeed, UiKillfeedEntry};
 mod settings;
 mod text;
 use chat::{
@@ -90,6 +95,7 @@ use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_ce
 use inspector::surface_inspector_frame;
 use loading::{build_background_progress, build_loading_screen, build_shader_compile_progress, build_splash_background};
 use scoreboard::build_scoreboard;
+pub(crate) use scoreboard::{hit_test as scoreboard_hit_test, max_scroll as scoreboard_max_scroll};
 pub use settings::environment::{
     CloudRenderResolution, CloudType, FogMode, FootprintMode, PuddleQuality, RainIntensity,
     SaberMarkMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_ROW_AERIAL, CLOUD_ROW_BASE_VARIATION,
@@ -226,10 +232,44 @@ pub enum ChatMode {
     Direct(u8),
 }
 
+/// `cg_chat*` presentation settings for the DinurdoJK chat box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChatSettings {
+    /// Typing field docked under the feed (true) or the classic top bar.
+    pub docked: bool,
+    /// Messages shown at full strength while typing.
+    pub history_lines: u8,
+    /// Seconds a message stays on screen before it fades.
+    pub fade_time: f32,
+    /// Seconds a message is kept for the typing view.
+    pub history_time: f32,
+    /// Silence chat sounds this many seconds after you attack (0 = never).
+    pub mute_after_attack: f32,
+}
+
+impl Default for ChatSettings {
+    fn default() -> Self {
+        Self { docked: true, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
+    }
+}
+
+/// Animation state of the docked typing field, recomputed while it moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UiChatAnim {
+    /// 0 closed .. 1 fully open (eased).
+    pub open: f32,
+    /// Milliseconds since the last edit to the typed text.
+    pub idle_ms: u32,
+    /// Caret blink phase.
+    pub caret: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiChatLine {
     pub text: String,
     pub alpha: f32,
+    /// 0 just arrived .. 1 settled; drives the slide-in.
+    pub enter: f32,
     /// Received as `tchat` / `ltchat`, not guessed from the rendered text.
     pub team: bool,
 }
@@ -273,6 +313,22 @@ pub struct UiScoreEntry {
     /// changing ping for three consecutive distinct samples, which is how
     /// legacy JKA follow spectators can reveal their likely target.
     pub spectating_you: bool,
+    /// DinurdoJK client-side mute: chat from this client is dropped locally.
+    pub muted: bool,
+    /// Current score leader; gets the crown over their name.
+    pub crowned: bool,
+    /// `model/skin`, for the avatar (`AvatarAtlas`).
+    pub model: String,
+    /// What the game draws when `model` is not installed (kyle or jan), whose
+    /// icon stands in, dimmed, as CG_LoadClientInfo's fallback does.
+    pub model_fallback: String,
+    /// Viewer's head-to-head against this player: (you killed them, they killed you).
+    pub h2h: Option<(u16, u16)>,
+    /// Server-counted `scores` fields: accuracy percent, Excellent awards
+    /// (two kills within three seconds) and stun-baton kills.
+    pub accuracy: i32,
+    pub excellent: i32,
+    pub gauntlet: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +351,174 @@ pub struct UiScoreboard {
     /// Siege class/carrier cells following the team overlay and duel icons in the atlas.
     pub icon_paths: Vec<String>,
     pub entries: Vec<UiScoreEntry>,
+    /// DinurdoJK header/footer text and pointer state around the board.
+    pub chrome: ScoreboardChrome,
+}
+
+/// Everything the DinurdoJK scoreboard draws that the TaystJK board did not:
+/// the server banner, session clock and the clickable player menu.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreboardChrome {
+    /// `sv_hostname`, colour codes intact.
+    pub server_name: String,
+    /// Game type and map, e.g. "FREE FOR ALL  ·  mp/ffa3".
+    pub subtitle: String,
+    /// Local wall-clock time this session joined, "21:04".
+    pub joined: Option<String>,
+    /// Time in this session, "12:34" or "1:02:03".
+    pub playtime: Option<String>,
+    /// The open vote's summary; shows YES/NO buttons in the footer.
+    pub vote: Option<String>,
+    /// Present while the scoreboard owns a mouse cursor (M2/M3 on the board).
+    pub cursor: Option<ScoreboardCursorUi>,
+    /// jaPRO servers also accept `callvote forcespec`.
+    pub japro: bool,
+    /// First visible line of a board too long for the screen.
+    pub scroll: u16,
+    /// `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    pub avatars: bool,
+    pub head_to_head: bool,
+    /// Personal match statistics; shown instead of the player list while
+    /// `stats_open` (always at intermission).
+    pub stats: Option<UiMatchStats>,
+    pub stats_open: bool,
+}
+
+/// `cg_scoreboard*` presentation switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreboardSettings {
+    /// Player avatars beside the centre divider.
+    pub avatars: bool,
+    /// Your kills/deaths against each player, by the divider.
+    pub head_to_head: bool,
+}
+
+impl Default for ScoreboardSettings {
+    fn default() -> Self {
+        Self { avatars: true, head_to_head: true }
+    }
+}
+
+/// One opponent in the personal match breakdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiMatchup {
+    pub name: String,
+    pub team: i32,
+    pub kills: u16,
+    pub deaths: u16,
+    pub damage_taken: u32,
+}
+
+/// What this client measured about its own match (see `app::match_stats`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiMatchStats {
+    pub kills: u32,
+    pub deaths: u32,
+    pub suicides: u32,
+    pub aerial_kills: u32,
+    pub saber_kills: u32,
+    pub best_streak: u32,
+    pub hits: u32,
+    pub damage_taken: u32,
+    pub avg_force_per_kill: Option<u32>,
+    pub avg_ttk_ms: Option<u32>,
+    pub avg_damage_per_death: Option<u32>,
+    /// Red, blue.
+    pub team_kills: [u32; 2],
+    pub team_deaths: [u32; 2],
+    pub best: Option<String>,
+    pub nemesis: Option<String>,
+    pub matchups: Vec<UiMatchup>,
+    /// From the server's `scores` row for us, when it reports them.
+    pub accuracy: Option<i32>,
+    pub excellent: i32,
+    pub gauntlet: i32,
+}
+
+/// Every player icon (`icon_<skin>` of every model), packed once into one
+/// texture (binding 9) so the scoreboard's avatars cost a single texture and
+/// no reloads.
+#[derive(Debug, Clone, Default)]
+pub struct AvatarAtlas {
+    pub columns: u32,
+    pub rows: u32,
+    /// Lower-case `model/skin` -> cell index.
+    pub cells: std::collections::HashMap<String, u32>,
+}
+
+impl AvatarAtlas {
+    /// The cell for `model/skin`, falling back to the model's default skin.
+    pub fn cell(&self, key: &str) -> Option<u32> {
+        let key = key.to_ascii_lowercase();
+        if let Some(&cell) = self.cells.get(&key) {
+            return Some(cell);
+        }
+        // Composite skins ("head|torso|legs") use the head's icon, as cgame does.
+        let (model, skin) = key.split_once('/').unwrap_or((key.as_str(), "default"));
+        let head = skin.split('|').next().unwrap_or("default");
+        self.cells.get(&format!("{model}/{head}")).or_else(|| self.cells.get(&format!("{model}/default"))).copied()
+    }
+
+    pub fn uv(&self, key: &str) -> Option<([f32; 2], [f32; 2])> {
+        let cell = self.cell(key)?;
+        let (columns, rows) = (self.columns.max(1) as f32, self.rows.max(1) as f32);
+        let (col, row) = ((cell % self.columns.max(1)) as f32, (cell / self.columns.max(1)) as f32);
+        let inset = 0.5 / 48.0;
+        Some((
+            [(col + inset) / columns, (row + inset) / rows],
+            [(col + 1.0 - inset) / columns, (row + 1.0 - inset) / rows],
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreboardCursorUi {
+    /// Pointer in physical pixels.
+    pub pointer: Option<[i32; 2]>,
+    pub hovered: Option<ScoreboardHit>,
+    pub menu: Option<ScoreboardMenuUi>,
+}
+
+/// The per-player action popup opened by clicking a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreboardMenuUi {
+    pub client: i32,
+    pub name: String,
+    /// Where the click landed, physical pixels; the popup is clamped on screen.
+    pub anchor: [i32; 2],
+    pub actions: Vec<ScoreAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreAction {
+    Mute,
+    Unmute,
+    VoteKick,
+    ForceSpectate,
+}
+
+impl ScoreAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mute => "MUTE",
+            Self::Unmute => "UNMUTE",
+            Self::VoteKick => "VOTE KICK",
+            Self::ForceSpectate => "VOTE SPECTATE",
+        }
+    }
+}
+
+/// What the scoreboard pointer is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreboardHit {
+    /// A player row, by client number.
+    Row(i32),
+    /// An entry in the open player menu, by index into its `actions`.
+    Action(usize),
+    VoteYes,
+    VoteNo,
+    /// Footer button switching between players and personal stats.
+    StatsToggle,
 }
 
 pub(in crate::ui) fn shared_player_icon_count(ui: &UiSnapshot) -> usize {
@@ -607,6 +831,8 @@ pub struct UiWorldPlayerLabel {
     pub text: String,
     pub health_fraction: Option<f32>,
     pub health_color: [f32; 4],
+    /// Score leader: draw the crown above the name.
+    pub crowned: bool,
 }
 
 /// A Render Studio player name, already projected through the shot camera:
@@ -1110,6 +1336,8 @@ pub struct UiSnapshot {
     pub chat_mode: ChatMode,
     pub chat_input: String,
     pub chat_lines: Vec<UiChatLine>,
+    pub chat_settings: ChatSettings,
+    pub chat_anim: UiChatAnim,
     pub console_notify_lines: Vec<UiConsoleNotifyLine>,
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
@@ -1127,6 +1355,8 @@ pub struct UiSnapshot {
     /// `CG_DrawVote`: the open vote's summary line (colour codes included).
     pub vote_line: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
+    /// DinurdoJK kill feed (top right), newest line first.
+    pub killfeed: Option<UiKillfeed>,
     /// TaystJK scoreboard ownership: `cg.snap->ps.clientNum`. While following
     /// another player this is the followed client, so their row is highlighted
     /// instead of the spectator's own row.
@@ -1162,6 +1392,11 @@ pub struct UiSnapshot {
     /// Render-thread-owned UV coordinates for native-resolution icons. Kept
     /// across incoming app snapshots; empty until the atlas is lazily loaded.
     pub(crate) icon_atlas_uvs: Vec<([f32; 2], [f32; 2])>,
+    /// Render-thread-owned clean TrueType font (texture binding 8), kept
+    /// across app snapshots like `icon_atlas_uvs`.
+    pub(crate) clean_font: Option<std::sync::Arc<ProportionalFont>>,
+    /// Render-thread-owned avatar atlas (texture binding 9).
+    pub(crate) avatar_atlas: Option<std::sync::Arc<AvatarAtlas>>,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub movement_hud: MovementHudState,
@@ -1224,6 +1459,8 @@ impl Default for UiSnapshot {
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_lines: Vec::new(),
+            chat_settings: ChatSettings::default(),
+            chat_anim: UiChatAnim::default(),
             console_notify_lines: Vec::new(),
             center_print: None,
             follow_name: None,
@@ -1236,6 +1473,7 @@ impl Default for UiSnapshot {
             race_components: [false; 2],
             vote_line: None,
             scoreboard: None,
+            killfeed: None,
             scoreboard_focus_client: None,
             demo_timeline: None,
             prediction_debug: None,
@@ -1257,6 +1495,8 @@ impl Default for UiSnapshot {
             zoom_scope: None,
             rocket_lock: None,
             icon_atlas_uvs: Vec::new(),
+            clean_font: None,
+            avatar_atlas: None,
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             movement_hud: MovementHudState::default(),

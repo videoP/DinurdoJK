@@ -175,7 +175,7 @@ use models::types::{
 };
 use overlay::{
     empty_ui_font_texture, load_ui_font_texture, load_ui_loading_texture,
-    load_studio_overlay_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
+    load_studio_overlay_font, load_ui_clean_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
     ScreenFxTexture,
 };
 use post::bindings::{
@@ -781,6 +781,14 @@ struct Renderer {
     ui_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
+    /// Clean TrueType UI font (binding 8) and its metrics.
+    _ui_clean_font: GpuImage,
+    ui_clean_font_metrics: Option<std::sync::Arc<ui::ProportionalFont>>,
+    /// Scoreboard avatar atlas (binding 9), its lookup, and the background
+    /// build that produces both; no job and no atlas means not started.
+    _ui_avatars: GpuImage,
+    ui_avatar_atlas: Option<std::sync::Arc<ui::AvatarAtlas>>,
+    ui_avatar_job: Option<std::sync::mpsc::Receiver<(TextureData, ui::AvatarAtlas)>>,
     /// Studio overlay font, keyed by its choice (None inner = failed to load).
     studio_race_font: Option<(String, Option<(GpuImage, crate::ui::ProportionalFont, wgpu::BindGroup)>)>,
     _ui_splash: GpuImage,

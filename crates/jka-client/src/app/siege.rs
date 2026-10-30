@@ -492,7 +492,7 @@ mod tests {
             client: 1, name: "Player".into(), score: 0, powerups: 0,
             captures: 0, assists: 0, defends: 0, deaths: None,
             ping: 20, time: 1, team: 1, siege_class: "rebel tech".into(),
-            siege_icon: None, spectating_you: false,
+            siege_icon: None, spectating_you: false, muted: false, crowned: false, model: String::new(), model_fallback: String::new(), h2h: None, accuracy: 0, excellent: 0, gauntlet: 0,
         };
         let mut rows = vec![row.clone(), row.clone(), row.clone(), row];
         rows[1].powerups = 1 << PW_REDFLAG;

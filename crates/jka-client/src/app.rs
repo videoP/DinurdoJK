@@ -2,6 +2,10 @@
 // Retain the existing facade API, including entry points used by external callers or tests.
 #[allow(unused_imports)]
 pub(crate) use display::AntiAliasingChoice;
+mod killfeed;
+mod match_stats;
+mod chat_anim;
+mod scoreboard_cursor;
 mod capture;
 mod chat;
 mod commands;
@@ -857,6 +861,22 @@ pub struct App {
     japro_flipkick_frames: i32,
     japro_flipkick_jumps: i32,
     japro_flipkick_moveup: bool,
+    /// `cg_killfeed*` and the obituaries currently in the feed, oldest first.
+    killfeed_settings: crate::ui::KillfeedSettings,
+    killfeed: killfeed::Feed,
+    /// Personal match statistics (head-to-head, end-of-game breakdown).
+    match_stats: match_stats::MatchStats,
+    /// `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    scoreboard_settings: crate::ui::ScoreboardSettings,
+    /// `cg_chat*` and the docked chat field's animation clock.
+    chat_settings: crate::ui::ChatSettings,
+    chat_anim: chat_anim::State,
+    /// Client-side mutes from the scoreboard: client number -> name when muted.
+    muted_clients: std::collections::HashMap<i32, String>,
+    /// M2/M3 on the scoreboard: free cursor, hover and the player popup.
+    scoreboard_cursor: scoreboard_cursor::ScoreboardCursor,
+    /// When the current session reached the game (wall clock, monotonic).
+    session_joined: Option<(String, Instant)>,
     vgs_menu: crate::vgs::Menu,
     log_rx: Receiver<crate::logging::LogRecord>,
     console_history: Vec<String>,

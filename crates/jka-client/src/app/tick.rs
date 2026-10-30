@@ -472,10 +472,13 @@ impl App {
             && now.duration_since(self.last_chat_refresh) >= Duration::from_millis(250);
         if refresh_chat {
             let demo_now = self.current_demo_elapsed_ms(now);
+            // Keep lines for the typing view (cg_chatHistoryTime), not just
+            // while they are on screen (cg_chatFadeTime).
+            let keep_s = self.chat_settings.history_time.max(self.chat_settings.fade_time).max(1.0);
             self.chat_lines
                 .retain(|line| match (demo_now, line.demo_elapsed_ms) {
-                    (Some(now_ms), Some(created_ms)) => now_ms - created_ms < 10_000.0,
-                    _ => now.saturating_duration_since(line.created) < Duration::from_secs(10),
+                    (Some(now_ms), Some(created_ms)) => now_ms - created_ms < f64::from(keep_s) * 1000.0,
+                    _ => now.saturating_duration_since(line.created) < Duration::from_secs_f32(keep_s),
                 });
             self.last_chat_refresh = now;
         }
@@ -520,7 +523,13 @@ impl App {
         if refresh_demo_timeline {
             self.last_demo_timeline_refresh = now;
         }
-        if refresh_chat || refresh_center || refresh_console_notify || refresh_demo_timeline {
+        self.tick_match_stats(now);
+        let refresh_chat_anim = self.tick_chat_anim(now);
+        let refresh_killfeed = self.tick_killfeed(now);
+        let refresh_scoreboard = self.tick_scoreboard_ui();
+        if refresh_chat || refresh_center || refresh_console_notify || refresh_demo_timeline
+            || refresh_killfeed || refresh_scoreboard || refresh_chat_anim
+        {
             // Fade/timeline updates are intentionally isolated from retained UI.
             // This avoids cloning console/menu state and rebuilding unrelated HUD
             // geometry at render frequency.
