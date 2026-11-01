@@ -137,7 +137,7 @@ fn parallel_finish_preserves_loaded_color_depth_submission_and_queries() {
                 },
                 primitive: Default::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: crate::renderer::DEPTH_FORMAT,
+                    format: crate::renderer::depth_format(),
                     depth_write_enabled: Some(!blend),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(),
@@ -189,7 +189,7 @@ fn parallel_finish_preserves_loaded_color_depth_submission_and_queries() {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: crate::renderer::DEPTH_FORMAT,
+                    format: crate::renderer::depth_format(),
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });

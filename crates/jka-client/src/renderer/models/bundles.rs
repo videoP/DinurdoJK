@@ -1,7 +1,7 @@
 //! Exact command reuse for the ordinary opaque/masked indexed model stream.
 //! Buffers/uniforms remain live; changed commands or resource handles invalidate.
 use super::submission::model_runs;
-use crate::renderer::{DynamicModelAlphaMode, DynamicModelRenderer, DEPTH_FORMAT};
+use crate::renderer::{DynamicModelAlphaMode, DynamicModelRenderer, depth_format};
 use std::{ops::Range, time::Instant};
 
 const MIN_DRAWS: usize = 32;
@@ -59,7 +59,7 @@ impl Slot {
                 label: Some("JKA opaque/masked indexed model commands"),
                 color_formats: &colors,
                 depth_stencil: Some(wgpu::RenderBundleDepthStencil {
-                    format: DEPTH_FORMAT,
+                    format: depth_format(),
                     depth_read_only: false,
                     stencil_read_only: true,
                 }),
@@ -200,7 +200,7 @@ impl DynamicModelRenderer {
         camera: &wgpu::BindGroup,
     ) {
         self.perf_bundles = Default::default();
-        if !self.model_render_bundles {
+        if !self.model_render_bundles && self.igpu_ab_mode & 4 == 0 {
             return;
         }
         if self.rt_prepared || self.draws.is_empty() {

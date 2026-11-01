@@ -8,10 +8,10 @@ impl App {
         theme::row(
             ui,
             "FX FPS",
-            "Fixed sampling rate for continuous projectile/trail EFX. This removes the stock JKA \
-             render-FPS dependency without changing authored EFX count/life/delay values. Drag to \
-             the far-right Legacy JKA endpoint to restore one PlayEffect call per presentation frame. \
-             0 in cg_fxFPS also selects Legacy JKA.",
+            "Fixed FX worker update rate and projectile/trail emission sampling. Worker snapshots \
+             are prepared asynchronously while the renderer reuses the last completed FX \
+             visuals; authored EFX lifetimes and counts are preserved. Drag to the far-right \
+             Legacy JKA endpoint for synchronous per-frame updates (cg_fxFPS 0).",
             theme::Reset::Video(ui::VIDEO_ROW_FX_FPS),
             |ui| {
                 const LEGACY_SLIDER_VALUE: f32 = crate::fx::FX_FPS_MAX as f32 + 1.0;

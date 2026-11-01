@@ -1,6 +1,6 @@
 //! Hud crosshair.
 use crate::ui::{
-    disc, fixed_charset_text, gameplay_hud_visible, icon_cell_uv, proportional_text,
+    disc, fixed_charset_text, gameplay_hud_visible, icon_cell_uv, proportional_text_uniform,
     proportional_text_width, rect, rect_outline, textured_rect_with_source, visible_jka_chars,
     CrosshairSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_STRENGTH_MAX, CROSSHAIR_STYLE_LINE, ICON_CROSSHAIR_BASE, ICON_FORCE_BASE,
@@ -71,12 +71,12 @@ pub(in crate::ui) fn build_crosshair_name(
     if let Some(font) = small_font {
         // The medium-font role on the shared OCR font, as for the centre print.
         let scale = 0.78;
-        let x =
-            ((640.0 - proportional_text_width(&name.text, font, scale)) * 0.5) * w as f32 / 640.0;
-        proportional_text(out, &name.text, font, x, y, scale, color, true, w, h);
+        let text_width = proportional_text_width(&name.text, font, scale) * h as f32 / 480.0;
+        let x = (w as f32 - text_width) * 0.5;
+        proportional_text_uniform(out, &name.text, font, x, y, scale, color, true, w, h);
         return;
     }
-    let glyph_w = w as f32 * (10.0 / 640.0);
+    let glyph_w = h as f32 * (10.0 / 480.0);
     let glyph_h = h as f32 * (16.0 / 480.0);
     let x = (w as f32 - visible_jka_chars(&name.text) as f32 * glyph_w) * 0.5;
     fixed_charset_text(
@@ -174,7 +174,7 @@ pub(in crate::ui) fn build_force_select(
             uv0,
             uv1,
             [1.0; 4],
-            ICON_TEXTURE_SOURCE,
+            ui.icon_texture_source(ICON_FORCE_BASE + usize::from(power)),
             w,
             h,
         );
@@ -227,10 +227,10 @@ pub(in crate::ui) fn build_force_select(
     let text_y = 455.0 * sy;
     if let Some(font) = small_font {
         let scale = 0.55;
-        let x = ((640.0 - proportional_text_width(name, font, scale)) * 0.5) * sx;
-        proportional_text(out, name, font, x, text_y, scale, [1.0; 4], true, w, h);
+        let x = (w as f32 - proportional_text_width(name, font, scale) * sy) * 0.5;
+        proportional_text_uniform(out, name, font, x, text_y, scale, [1.0; 4], true, w, h);
     } else {
-        let glyph_w = 8.0 * sx;
+        let glyph_w = 8.0 * sy;
         let glyph_h = 12.0 * sy;
         let x = (w as f32 - name.len() as f32 * glyph_w) * 0.5;
         fixed_charset_text(
@@ -267,6 +267,7 @@ pub fn build_crosshair_vertices(
         w,
         h,
         Some(&ui.icon_atlas_uvs),
+        Some(&ui.icon_shader_flags),
     );
     // The Studio reuses its otherwise-unused CrosshairName layout slot to
     // position the *actual* crosshair. This transform only runs in Studio:
@@ -293,7 +294,7 @@ pub(in crate::ui) fn build_crosshair(
     w: u32,
     h: u32,
 ) {
-    build_crosshair_impl(out, crosshair, target_color, screen_position, line_width, w, h, None);
+    build_crosshair_impl(out, crosshair, target_color, screen_position, line_width, w, h, None, None);
 }
 
 fn build_crosshair_impl(
@@ -305,6 +306,7 @@ fn build_crosshair_impl(
     w: u32,
     h: u32,
     atlas_uvs: Option<&[([f32; 2], [f32; 2])]>,
+    shader_flags: Option<&[bool]>,
 ) {
     if crosshair.style == 0 {
         return;
@@ -346,8 +348,11 @@ fn build_crosshair_impl(
         // `size` pixels square, which matches the apparent size of the shapes above.
         let side = crosshair.size.clamp(4.0, 96.0);
         let index = ICON_CROSSHAIR_BASE + usize::from(crosshair.image) - 1;
-        let (uv0, uv1) = atlas_uvs.and_then(|uvs| uvs.get(index).copied())
-            .unwrap_or_else(|| icon_cell_uv(index));
+        let shader_authored = shader_flags
+            .and_then(|flags| flags.get(index).copied()).unwrap_or(false);
+        let (uv0, uv1) = if shader_authored { ([0.0, 0.0], [1.0, 1.0]) }
+            else { atlas_uvs.and_then(|uvs| uvs.get(index).copied())
+                .unwrap_or_else(|| icon_cell_uv(index)) };
         // The stock artwork is thin and translucent. Above 100% strength the same
         // image is drawn again, each pass raising the coverage of its faint pixels;
         // up to three extra passes at the maximum, the last one fractional.
@@ -368,7 +373,9 @@ fn build_crosshair_impl(
                 uv0,
                 uv1,
                 [c[0], c[1], c[2], c[3] * weight],
-                ICON_TEXTURE_SOURCE,
+                if shader_authored {
+                    crate::ui::ICON_SHADER_SOURCE_BASE + index as f32
+                } else { ICON_TEXTURE_SOURCE },
                 w,
                 h,
             );

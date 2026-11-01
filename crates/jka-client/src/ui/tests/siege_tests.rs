@@ -32,6 +32,7 @@ fn siege_scoreboard_icons_share_the_atlas_with_team_and_duel_huds() {
         show_deaths: false,
         icon_paths: vec!["siege_class".into()],
         entries: Vec::new(),
+        chrome: Default::default(),
     });
     assert_eq!(shared_player_icon_paths(&ui), ["team_a", "team_b", "duel_a", "duel_b", "siege_class"]);
     assert_eq!(duel_icon_atlas_offset(&ui), 2);

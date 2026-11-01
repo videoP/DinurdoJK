@@ -166,6 +166,8 @@ pub struct FxMaterial {
     pub shader_clamp_time: Option<f32>,
     /// Exact JKA shader-stage `glow` marker.
     pub authored_glow: bool,
+    /// Authored `alphaFunc` cutoff (negative means LT128).
+    pub alpha_test: f32,
 }
 
 /// One authored shader stage drawn in OpenJK's 640x480 virtual 2D space.
@@ -335,6 +337,7 @@ fn tessellate_impl<const FILTER: bool>(
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
+            | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
@@ -428,6 +431,7 @@ fn tessellate_workers_impl<const FILTER: bool>(
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
+            | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
@@ -550,13 +554,28 @@ pub fn tessellate_gpu_particles_masked(
     tessellate_gpu_particles_impl::<true>(draws, view, materials, visible)
 }
 
+/// Stable visual sampling clock, *not* the display/renderer clock. A fixed
+/// cg_fxFPS controls BOTH continuous FX births and the arc's appearance.
+fn lightning_sample_seconds(seconds: f32) -> f32 {
+    let fps = super::system::force_fx_sample_fps();
+    if fps == crate::fx::FX_FPS_LEGACY_JKA { seconds }
+    else { (seconds * fps as f32).floor() / fps as f32 }
+}
+
 fn tessellate_gpu_particles_impl<const FILTER: bool>(
     draws: &[FxDraw], view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    let mut cpu_batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
-    let mut sprite_batches: HashMap<(String, usize, usize), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
-    let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
+    // Give each unique shader one integer key for this frame. At 100k+ FX
+    // lines, lowercasing/cloning the shader string into every batch-key lookup
+    // was considerably more CPU work than building the GPU instances.
+    // Preserve case-insensitive shader identity while only allocating on
+    // first sight of a distinct spelling.
+    let mut shader_indices: HashMap<&str, usize> = HashMap::new();
+    let mut normalized_indices: HashMap<String, usize> = HashMap::new();
+    let mut shader_materials: Vec<Vec<FxMaterial>> = Vec::new();
+    let mut cpu_batches: HashMap<(usize, usize, usize), (FxMaterial, Batch)> = HashMap::new();
+    let mut sprite_batches: HashMap<(usize, usize, usize, bool), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
 
     for (draw_index, draw) in draws.iter().enumerate() {
@@ -566,6 +585,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
             | FxDraw::Line { shader, .. }
+            | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
@@ -575,19 +595,60 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
                 continue;
             }
         };
-        let shader_key = shader.to_ascii_lowercase();
-        let stages = material_cache
-            .entry(shader_key.clone())
-            .or_insert_with(|| materials(shader));
+        let shader_index = if let Some(&index) = shader_indices.get(shader.as_str()) {
+            index
+        } else {
+            let normalized = shader.to_ascii_lowercase();
+            let index = if let Some(&index) = normalized_indices.get(&normalized) {
+                index
+            } else {
+                let index = shader_materials.len();
+                shader_materials.push(materials(shader));
+                normalized_indices.insert(normalized, index);
+                index
+            };
+            shader_indices.insert(shader.as_str(), index);
+            index
+        };
+        let stages = &shader_materials[shader_index];
 
         for (stage_index, mat) in stages.iter().enumerate() {
             // Compact sprite instances have fixed 0..1 UVs. Animated stages
             // use the shared CPU path so tcMods match all FX backends.
             if !mat.tc_mods.is_empty() {
                 let entry = cpu_batches
-                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Batch::default()));
                 append_draw(draw, view, mat, &mut entry.1);
+                continue;
+            }
+            if let FxDraw::Lightning { start, end, width, chaos, seed, rgba, .. } = draw {
+                // 4 tiny bolt instances rather than 24 CPU tessellated segments.
+                // The vertex shader expands each to a curved, camera-facing ribbon.
+                let instances = &mut sprite_batches
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), true))
+                    .or_insert_with(|| (mat.clone(), Vec::new())).1;
+                let color = mat.vertex_color(*rgba, view.seconds);
+                let a = scene::render_position(*start);
+                let b = scene::render_position(*end);
+                let sample_seconds = lightning_sample_seconds(view.seconds);
+                for layer in 0..5 {
+                    let (thickness, intensity) = match layer {
+                        0 => (3.2, 0.12), // broad, soft-field corona
+                        1 => (0.92, 0.68), // energized blue plasma shell
+                        2 => (0.28, 0.94), // compact white-hot core
+                        3 => (0.35, 0.16), // restrained secondary arc
+                        _ => (2.2, 0.20), // soft endpoint flash
+                    };
+                    instances.push(FxGpuSpriteInstance {
+                        origin: [a[0], a[1], a[2], 1.0],
+                        left: [b[0], b[1], b[2], *seed],
+                        up: [width.max(0.15) * thickness, layer as f32 + 1.0,
+                            chaos.abs().min(100.0), sample_seconds],
+                        color: [color[0] * intensity, color[1] * intensity,
+                            color[2] * intensity, color[3] * intensity],
+                    });
+                }
                 continue;
             }
             // Legacy saber glow is a train of camera-facing quad stamps.
@@ -595,7 +656,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
             // four CPU vertices and indexed triangles every presentation frame.
             if let FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } = draw {
                 let instances = &mut sprite_batches
-                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1;
                 let color = mat.vertex_color(*rgba, view.seconds);
@@ -643,13 +704,13 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
             };
             if let Some((origin, left, up, rgba)) = billboard {
                 sprite_batches
-                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1
                     .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, draw_seconds(draw, view))));
             } else {
                 let entry = cpu_batches
-                    .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat)))
                     .or_insert_with(|| (mat.clone(), Batch::default()));
                 append_draw(draw, view, mat, &mut entry.1);
             }
@@ -683,7 +744,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
         sprite_batches
             .into_iter()
             .filter(|(_, (_, instances))| !instances.is_empty())
-            .map(|((_, _, slot), (mat, instances))| DynamicModelSurface {
+            .map(|((_, _, slot, lightning), (mat, instances))| DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Fx,
                 authored_lighting: false,
                 material_trace: None,
@@ -697,7 +758,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: Some(FxGpuSprites {
-                resident: None, instances: Arc::new(instances), blob_shadow: false }),
+                resident: None, instances: Arc::new(instances), blob_shadow: false, lightning }),
                 texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
@@ -791,6 +852,7 @@ pub fn tessellate_resident_sprites(
                 }),
                 instances: Arc::new(fallback_instances),
                 blob_shadow: false,
+                lightning: false,
             }),
             texture: mat.texture_at_time(view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
@@ -818,7 +880,7 @@ pub fn tessellate_resident_sprites(
                 resident: Some(crate::renderer::FxGpuResidentSprites {
                     frame: Arc::clone(&frame), slots: Arc::new(Vec::new()),
                 }),
-                instances: Arc::new(Vec::new()), blob_shadow: false,
+                instances: Arc::new(Vec::new()), blob_shadow: false, lightning: false,
             }),
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,
@@ -998,6 +1060,50 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
             batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, seconds));
+        }
+        FxDraw::Lightning { start, end, width, chaos, seed, rgba, .. } => {
+            // Reference CPU/workers fallback for users who don't select GPU
+            // geometry: still a jagged discharge, never a straight beam.
+            // Vertices share their generated endpoints to avoid gaps.
+            let color = mat.vertex_color(*rgba, seconds);
+            let ray = sub(*end, *start);
+            let ray_len = length(ray);
+            if ray_len <= 0.01 { return; }
+            let direction = scale(ray, 1.0 / ray_len);
+            let (side, other) = make_normal_vectors(direction);
+            let jitter_hash = |n: f32| {
+                let x = ((n * 127.1 + 78.233).sin() * 43758.5453).fract();
+                if x < 0.0 { x + 1.0 } else { x }
+            };
+            let frame = lightning_sample_seconds(view.seconds) * 34.0;
+            let phase = frame.floor();
+            let fade = ((frame.fract() - 0.10) / 0.78).clamp(0.0, 1.0);
+            let blend = fade * fade * (3.0 - 2.0 * fade);
+            let amplitude = (ray_len * 0.08 + 1.5).min(15.0)
+                * (1.0 + chaos.abs().min(10.0) * 0.03);
+            let point = |i: usize| {
+                let t = i as f32 / 24.0;
+                let key = i as f32 * 27.113 + seed * 91.39;
+                let x0 = jitter_hash(key + phase * 11.31);
+                let x1 = jitter_hash(key + (phase + 1.0) * 11.31);
+                let y0 = jitter_hash(key + phase * 15.17);
+                let y1 = jitter_hash(key + (phase + 1.0) * 15.17);
+                let falloff = (t * std::f32::consts::PI).sin().max(0.0).powf(0.75);
+                add(add(add(*start, scale(ray, t)),
+                    scale(side, ((x0 + (x1 - x0) * blend) * 2.0 - 1.0) * amplitude * falloff)),
+                    scale(other, ((y0 + (y1 - y0) * blend) * 2.0 - 1.0) * amplitude * falloff))
+            };
+            for i in 0..24 {
+                let a = point(i);
+                let b = point(i + 1);
+                let across = normalize(cross(sub(a, view.origin), sub(b, view.origin)));
+                let v0 = batch.vertex(add(a, scale(across, *width)), [0.0, i as f32 / 24.0], color);
+                let v1 = batch.vertex(sub(a, scale(across, *width)), [1.0, i as f32 / 24.0], color);
+                let v2 = batch.vertex(add(b, scale(across, *width)), [0.0, (i + 1) as f32 / 24.0], color);
+                let v3 = batch.vertex(sub(b, scale(across, *width)), [1.0, (i + 1) as f32 / 24.0], color);
+                batch.triangle(v0, v1, v2);
+                batch.triangle(v2, v1, v3);
+            }
         }
         FxDraw::Line { start, end, width, rgba, .. } => {
             // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
@@ -1232,6 +1338,24 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_force_lightning_uses_plasma_layers_and_endpoint_flare() {
+        let bolt = FxDraw::Lightning {
+            start: [100.0, 0.0, 8.0], end: [100.0, 512.0, 8.0],
+            width: 2.0, chaos: 3.0, seed: 0.42, rgba: [180, 200, 255, 255],
+            shader: "force/test".to_owned(),
+        };
+        let surfaces = tessellate_gpu_particles(&[bolt], &view(),
+            &mut |_| vec![white(FxBlend::AddAlpha)]);
+        assert_eq!(surfaces.len(), 1);
+        let ribbon = surfaces[0].fx_gpu_sprites.as_ref().expect("GPU ribbon");
+        assert!(ribbon.lightning);
+        assert_eq!(ribbon.instances.len(), 5);
+        assert!(ribbon.instances.iter().all(|instance| instance.origin[3] == 1.0));
+        assert_eq!(ribbon.instances[0].left[..3], scene::render_position([100.0, 512.0, 8.0]));
+        assert_eq!(ribbon.instances[4].up[1], 5.0);
+    }
+
     use super::*;
 
     #[test]
@@ -1297,7 +1421,7 @@ mod tests {
     }
 
     fn white(blend: FxBlend) -> FxMaterial {
-        FxMaterial { animation: None, texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, rgb_wave: None, alpha_wave: None, rgb_one_minus_vertex: false, alpha_one_minus_vertex: false, tc_mods: Vec::new(), shader_time_offset: 0.0, shader_clamp_time: None, authored_glow: false }
+        FxMaterial { animation: None, texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, rgb_wave: None, alpha_wave: None, rgb_one_minus_vertex: false, alpha_one_minus_vertex: false, tc_mods: Vec::new(), shader_time_offset: 0.0, shader_clamp_time: None, authored_glow: false, alpha_test: 0.0 }
     }
 
     #[test]
@@ -1781,7 +1905,7 @@ mod resident_fx_tests {
             rgb_wave: None, alpha_wave: None,
             rgb_one_minus_vertex: false, alpha_one_minus_vertex: false,
             tc_mods: Vec::new(), shader_time_offset: 0.0,
-            shader_clamp_time: None, authored_glow: false,
+            shader_clamp_time: None, authored_glow: false, alpha_test: 0.0,
         }
     }
 
@@ -1806,7 +1930,7 @@ mod resident_fx_tests {
             assert_eq!(sprite.resident.as_ref().unwrap().slots.as_slice(), &[3]);
             assert_eq!(sprite.instances.len(), 1, "retain fallback during compilation");
         }
-        let bad_stage = FxMaterial { authored_glow: true, ..stage() };
+        let bad_stage = FxMaterial { authored_glow: true, alpha_test: 0.0, ..stage() };
         let (surfaces, accepted, _) = tessellate_resident_sprites(
             &[(18, 3, &draw)], frame, &view, &mut |_| vec![stage(), bad_stage.clone()],
         );

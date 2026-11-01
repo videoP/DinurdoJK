@@ -24,7 +24,7 @@ pub(in crate::ui) fn saber_style_display(style: i32) -> (&'static str, [f32; 4],
         5 => ("TAVION", [0.75, 0.45, 1.0, 1.0], 3),
         6 => ("DUAL", [0.40, 1.0, 0.65, 1.0], 3),
         7 => ("STAFF", [1.0, 0.58, 0.25, 1.0], 3),
-        _ => ("--", HUD_LABEL, 0),
+        _ => ("--", HUD_LABEL(), 0),
     }
 }
 
@@ -175,10 +175,10 @@ fn hud_frame_with_accent_alpha(
         rect_.y,
         rect_.width,
         rect_.height,
-        HUD_INK_TOP,
-        HUD_INK_TOP,
-        HUD_INK_BOTTOM,
-        HUD_INK_BOTTOM,
+        HUD_INK_TOP(),
+        HUD_INK_TOP(),
+        HUD_INK_BOTTOM(),
+        HUD_INK_BOTTOM(),
         w,
         h,
     );
@@ -223,7 +223,7 @@ pub(in crate::ui) fn hud_texts(
         rect_.x + 10.0 * s,
         rect_.y + 5.5 * s,
         1.15 * s,
-        HUD_LABEL,
+        HUD_LABEL(),
         w,
         h,
     );
@@ -305,7 +305,7 @@ pub(in crate::ui) fn hud_meter(
     let value_color = if accent == HUD_HEALTH_LOW {
         [1.0, 0.64, 0.60, 1.0]
     } else {
-        HUD_VALUE
+        HUD_VALUE()
     };
     hud_texts(
         out,
@@ -342,7 +342,7 @@ pub(in crate::ui) fn hud_value_panel(
         w,
         h,
     );
-    hud_texts(out, rect_, scale, label, value, HUD_VALUE, w, h);
+    hud_texts(out, rect_, scale, label, value, HUD_VALUE(), w, h);
 }
 
 /// Saber form readout: style name plus three segments that light up with the
@@ -420,15 +420,19 @@ pub(in crate::ui) const CHATBOX_FONT_SCALE: f32 = 0.65 * 0.5;
 
 pub(in crate::ui) const CHATBOX_CUTOFF: f32 = 550.0;
 
-// Night-Tokyo palette shared with the console: indigo ink, cyan/magenta neon,
-// tungsten amber. HUD accents pick one role per panel.
-pub(in crate::ui) const HUD_INK_TOP: [f32; 4] = [0.010, 0.014, 0.032, 0.84];
+// Panel ink and captions come from `crate::palette` (warm Stone Brown ink,
+// Silver labels, White Smoke values); the stat colours stay semantic.
+#[allow(non_snake_case)]
+pub(in crate::ui) fn HUD_INK_TOP() -> [f32; 4] { crate::palette::hud::HUD_INK_TOP() }
 
-pub(in crate::ui) const HUD_INK_BOTTOM: [f32; 4] = [0.020, 0.026, 0.058, 0.80];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn HUD_INK_BOTTOM() -> [f32; 4] { crate::palette::hud::HUD_INK_BOTTOM() }
 
-pub(in crate::ui) const HUD_LABEL: [f32; 4] = [0.56, 0.66, 0.79, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn HUD_LABEL() -> [f32; 4] { crate::palette::hud::HUD_LABEL() }
 
-pub(in crate::ui) const HUD_VALUE: [f32; 4] = [0.96, 0.98, 1.0, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn HUD_VALUE() -> [f32; 4] { crate::palette::hud::HUD_VALUE() }
 
 pub(in crate::ui) const HUD_HEALTH: [f32; 4] = [0.92, 0.18, 0.15, 1.0];
 

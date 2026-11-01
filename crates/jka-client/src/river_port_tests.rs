@@ -7,6 +7,12 @@ use jka_water::river::{
 };
 #[path = "river_grid_mesh_tests.rs"]
 mod grid_mesh_tests;
+#[path = "river_foam_tests.rs"]
+mod foam_tests;
+#[path = "river_foam_field_tests.rs"]
+mod foam_field_tests;
+#[path = "river_slw_tests.rs"]
+mod slw_tests;
 #[path = "river_material_tests.rs"]
 mod material_tests;
 #[path = "river_ocean_tests.rs"]
@@ -64,6 +70,8 @@ fn read_state(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Texture
 #[test]
 fn river_shader_validates() {
     let wave_vertex = jka_water::river::wave_advection::vertex_shader();
+    let foam_field = jka_water::river::foam_field::shader();
+    let slw = jka_water::river::slw::SHADER;
     for shader in [
         SHALLOW_SHADER,
         jka_water::river::capture::PREPARE_SHADER,
@@ -75,6 +83,10 @@ fn river_shader_validates() {
         jka_water::river::wave_advection::SHADER,
         jka_water::river::ocean::SHADER,
         &wave_vertex,
+        &foam_field,
+        slw,
+        crate::river_composite::HZB_SHADER,
+        crate::river_discharge::SHADER,
     ] {
         let module = wgpu::naga::front::wgsl::parse_str(shader).expect("river WGSL parses");
         wgpu::naga::valid::Validator::new(
@@ -82,8 +94,16 @@ fn river_shader_validates() {
             wgpu::naga::valid::Capabilities::default(),
         )
         .validate(&module)
-        .expect("river WGSL validates");
+        .unwrap_or_else(|e| panic!("river WGSL validates: {e:?}"));
     }
+    // The water body, composed with Blue Water's environment module.
+    let water = crate::river_surface::compose().unwrap_or_else(|e| panic!("river water WGSL composes: {e}"));
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::default(),
+    )
+    .validate(&water)
+    .unwrap_or_else(|e| panic!("river water WGSL validates: {e:?}"));
     for precision in [
         crate::river_water_info::Precision::Half,
         crate::river_water_info::Precision::Full,
@@ -348,11 +368,15 @@ fn check_backend(backend: wgpu::Backends) {
         std::eprintln!("river stage check: {:?}", adapter.get_info());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                required_features: wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::FLOAT32_BLENDABLE,
                 // Offscreen normal diagnostics retain three full-precision
                 // outputs so typed stores cannot hide sampling differences.
                 required_limits: wgpu::Limits {
                     max_color_attachment_bytes_per_sample: 48,
+                    // The game device takes the adapter's limits; the water
+                    // body pipeline uses five groups, like the world's seven.
+                    max_bind_groups: adapter.limits().max_bind_groups,
+                    max_sampled_textures_per_shader_stage: adapter.limits().max_sampled_textures_per_shader_stage,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -365,6 +389,12 @@ fn check_backend(backend: wgpu::Backends) {
         material_tests::check(&device, &queue);
         wave_tests::check(&device, &queue);
         surface_tests::check(&device, &queue);
+        foam_tests::check(&device, &queue);
+        foam_field_tests::check(&device, &queue);
+        check_live_river(&device, &queue);
+        check_river_reflection_trace(&device, &queue);
+        check_river_discharge(&device, &queue);
+        slw_tests::check(&device, &queue);
         ocean_tests::check(&device, &queue);
         let oracle = sampling::Oracle::new(&device, &queue);
         oracle.check_exact_centres_edges_and_layers();
@@ -526,6 +556,7 @@ fn check_backend(backend: wgpu::Backends) {
                 }
             }
         }
+        let normal_grid = material.normal_grid().clone();
         let material_textures = material
             .freeze()
             .ok()
@@ -536,6 +567,7 @@ fn check_backend(backend: wgpu::Backends) {
             &channels(&water),
             "queued cycles",
         );
+        foam_field_tests::check_simulation(&device, &queue, &simulation, &normal_grid, p.dx);
         let live_bytes = simulation.logical_bytes();
         let frozen = simulation
             .freeze()
@@ -1058,50 +1090,27 @@ fn tsangpo_map_resolves_real_river_metadata() {
 /// Actual world geometry and explicit map material classification. This is a
 /// capture acceptance check, not a hydraulic solve with invented spline data.
 fn check_tsangpo_capture(bsp: &jka_assets::bsp::Bsp, river: &jka_assets::bsp::river::River) {
-    use crate::river_capture::{BspCapture, DepthCaptures, MeshClass, Selection, Sides};
+    use crate::river_capture::{BspCapture, DepthCaptures};
     use jka_water::river::{
         capture::{Camera, Channel, Settings},
         CENTIMETRES_PER_MAP_UNIT,
     };
-    let world = bsp.world_mesh(4).unwrap();
-    // These are Tsangpo's explicit terrain materials, inspected from the BSP.
-    // Rock is an obstacle; sky/caulk/nodraw/river trigger geometry is excluded.
-    let names = [
-        "textures/tsangpo/terrain",
-        "textures/tsangpo/terrain_3",
-        "textures/tsangpo/terrain_0to1",
-        "textures/tsangpo/terrain_1to3",
-        "textures/tsangpo/terrain_1",
-        "textures/tsangpo/terrain_0",
-        "textures/tsangpo/terrain_0to2",
-        "textures/tsangpo/terrain_2",
-        "textures/tsangpo/terrain_0to3",
-        "textures/tsangpo/terrain_1to2",
-    ];
-    let mut selection: Vec<_> = names
-        .iter()
-        .map(|shader| Selection {
-            shader,
-            class: MeshClass::Landscape,
-            sides: Sides::Clockwise,
-        })
-        .collect();
-    selection.push(Selection {
-        shader: "textures/yavin/rock2",
-        class: MeshClass::Actors,
-        sides: Sides::Clockwise,
-    });
+    // Generic bed: the map's collision geometry, no per-map texture list.
+    let triangles = jka_assets::bsp::river::collision_triangles(bsp).unwrap();
     let mapped = crate::river_map::MapRiver::from_bsp(bsp, river, 512).unwrap();
     let origin = mapped
         .domain
         .origin
         .map(|v| (v / f64::from(CENTIMETRES_PER_MAP_UNIT)) as f32);
-    let capture = BspCapture::from_world(bsp, &world, origin, &selection).unwrap();
-    assert!(BspCapture::from_world(bsp, &world, origin, &[]).is_err());
+    let half = mapped.domain.grid.world_size.map(|v| 0.5 * v / CENTIMETRES_PER_MAP_UNIT);
+    let capture = BspCapture::from_collision(&triangles, origin, half).unwrap();
+    assert!(BspCapture::from_collision(&triangles, [1e7, 1e7, 0.0], [1.0, 1.0]).is_err());
     let extent = mapped.domain.grid.world_size;
     let dx = mapped.domain.grid.cell_size[0];
     let dimensions = mapped.domain.grid.dimensions;
     let count = (dimensions[0] * dimensions[1]) as usize;
+    // Bounds of the captured collision geometry: banks may rise above the
+    // river volume, and a camera starting inside solid would read them low.
     let [lo, hi] = capture.vertical_bounds();
     let headroom = river.settings.capture_headroom * CENTIMETRES_PER_MAP_UNIT;
     let cameras = std::array::from_fn(|i| Camera {
@@ -1136,7 +1145,10 @@ fn check_tsangpo_capture(bsp: &jka_assets::bsp::Bsp, river: &jka_assets::bsp::ri
         });
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::FLOAT32_BLENDABLE,
+                ..Default::default()
+            })
             .await
             .unwrap();
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -1172,10 +1184,458 @@ fn check_tsangpo_capture(bsp: &jka_assets::bsp::Bsp, river: &jka_assets::bsp::ri
             top - bottom > 1000.0,
             "Tsangpo terrain lost its elevation range"
         );
-        std::eprintln!("Tsangpo actual-world capture: {}x{}, {covered}/{count} covered cells, local bed {bottom}..{top} cm; fixed diagnostic WaterInfo height=0, no hydraulic solve",dimensions[0],dimensions[1]);
+        std::eprintln!("Tsangpo actual-world capture: {}x{}, {covered}/{count} covered cells, local bed {bottom}..{top} cm",dimensions[0],dimensions[1]);
+
+        // Simulation-first (user decision): no spline. Native source/sink boxes
+        // at JAPRO's markers, spline matching off, dry WaterInfo. Water must
+        // enter at the source and find its own way over the captured bed.
+        let frame_delta = 1.0 / 60.0;
+        let frame = jka_water::river::control::Frame::new(
+            mapped.domain.grid,
+            jka_water::river::control::Controls::default(),
+            frame_delta,
+        )
+        .unwrap();
+        let boxes = mapped.height_boundary_boxes().unwrap();
+        let mut controls = Controls::cached_river_variant(frame_delta, mapped.domain.grid_min());
+        controls.match_spline = false;
+        let mut simulation = Simulation::from_prepared_bed(
+            &device,
+            bed,
+            frame.parameters(),
+            Transport::default(),
+            Presentation::default(),
+            BoundaryInput {
+                water_info: &info,
+                boxes: &boxes,
+                controls,
+            },
+        )
+        .unwrap();
+        let source = boxes.iter().find(|b| !b.sink).unwrap();
+        let cell_of = |p: [f32; 3]| {
+            let grid_min = mapped.domain.grid_min();
+            let x = ((p[0] - grid_min[0]) / dx).floor() as usize;
+            let y = ((p[1] - grid_min[1]) / dx).floor() as usize;
+            y * dimensions[0] as usize + x
+        };
+        let source_cell = cell_of(source.position);
+        let source_xy = [source.position[0], source.position[1]];
+        let reach = 0.5 * source.size[0].max(source.size[1]) + 4.0 * dx;
+        let summarize = |state: &[[f32; 4]]| {
+            assert!(state.iter().flatten().all(|v| v.is_finite()), "river state must stay finite");
+            assert!(state.iter().all(|w| w[1] >= 0.0 && w[1] <= frame.parameters().max_depth));
+            let grid_min = mapped.domain.grid_min();
+            let mut wet = 0usize;
+            let mut beyond = 0usize;
+            let mut farthest = 0.0f32;
+            for (i, w) in state.iter().enumerate() {
+                if w[1] > 1.0 {
+                    wet += 1;
+                    let x = grid_min[0] + ((i % dimensions[0] as usize) as f32 + 0.5) * dx;
+                    let y = grid_min[1] + ((i / dimensions[0] as usize) as f32 + 0.5) * dx;
+                    let distance = ((x - source_xy[0]).powi(2) + (y - source_xy[1]).powi(2)).sqrt();
+                    farthest = farthest.max(distance);
+                    beyond += usize::from(distance > reach);
+                }
+            }
+            (wet, beyond, farthest)
+        };
+        let mut run = |frames: usize| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            for _ in 0..frames {
+                simulation.encode_reference_frame(&device, &mut encoder, frame).unwrap();
+            }
+            queue.submit(Some(encoder.finish()));
+            read_state(&device, &queue, simulation.state())
+        };
+        let early = run(120);
+        assert!(early[source_cell][1] > 1.0, "source must hold water: depth {}", early[source_cell][1]);
+        let (early_wet, early_beyond, early_far) = summarize(&early);
+        let mut late = Vec::new();
+        for _ in 0..10 {
+            late = run(120);
+        }
+        let (late_wet, late_beyond, late_far) = summarize(&late);
+        std::eprintln!(
+            "Tsangpo simulation-first solve: after {:.0} s wet {early_wet} cells ({early_beyond} beyond source, farthest {:.0} cm); after {:.0} s wet {late_wet} ({late_beyond} beyond, farthest {:.0} cm)",
+            120.0 * frame.hydraulic_duration(), early_far, 1320.0 * frame.hydraulic_duration(), late_far
+        );
+        assert!(late_beyond > early_beyond && late_far > reach, "water must leave the source and keep spreading");
         assert!(
             scope.pop().await.is_none(),
             "Tsangpo capture GPU validation failed"
         );
     });
+}
+
+/// Developer "place water" path on synthetic collision: a plane sloping down
+/// toward +X. Water must appear at the source and run downhill, not uphill.
+fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
+    use wgpu::util::DeviceExt;
+    use crate::river_runtime::{LiveRiver, LocalSource};
+    let ground = |x: f32, _y: f32| -0.1 * x;
+    let mut collision = Vec::new();
+    let step = 64.0;
+    for i in -12..12 {
+        for j in -12..12 {
+            let (x0, y0) = (i as f32 * step, j as f32 * step);
+            let (x1, y1) = (x0 + step, y0 + step);
+            let p = |x: f32, y: f32| [x, y, ground(x, y)];
+            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y0), p(x1, y1)], solid_bottom_z: None });
+            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y1), p(x0, y1)], solid_bottom_z: None });
+        }
+    }
+    let source = LocalSource {
+        center: [0.0, 0.0, 0.0],
+        radius: 512.0,
+        water_level: 24.0,
+        source_width: 64.0,
+        resolution: 64,
+        // 240 frames of 1/60 s at 10x: 40 s of water, 10 solver frames each.
+        rate: 10.0,
+        discharge_cfs:None,
+    };
+    let spawn = |source| LiveRiver::spawn(device, queue, &collision, source, |_| None, None);
+    assert!(spawn(LocalSource { radius: 8.0, ..source }).is_err());
+    assert!(spawn(LocalSource { rate: 0.0, ..source }).is_err());
+    let mut river = spawn(source).unwrap();
+    // A material update must address only this patch's real GPU uniform.
+    let other=spawn(source).unwrap();
+    let before=read_buffer(device,queue,&other.authored);
+    let mut custom=crate::river_settings::Settings::default();
+    custom.foam.base_color=[1.0;3];custom.water.absorption=[8.0,12.0,24.0,3.0];
+    river.set_settings(queue,custom);
+    assert_eq!(read_buffer(device,queue,&other.authored),before,"editing one river must not recolor another");
+    assert_eq!(read_buffer(device,queue,&river.authored),custom.uniform());
+    river.set_settings(queue,crate::river_settings::Settings::default());
+    drop(other);
+    let mut supplied=spawn(LocalSource {discharge_cfs:Some(12.345),..source}).unwrap();
+    for i in 0..12 {
+        let mut encoder=device.create_command_encoder(&Default::default());
+        supplied.encode_frame(device,&mut encoder,1.0/60.0,f64::from(i)/60.0,None).unwrap();
+        queue.submit(Some(encoder.finish()));
+    }
+    let supplied_state=read_state(device,queue,supplied.state());
+    assert!(supplied_state.iter().any(|s|s[1]>0.01),"CFS source must feed the actual native solve");
+    assert!(supplied_state.iter().flatten().all(|v|v.is_finite()));
+    drop(supplied);
+
+    assert!(river.surface().is_none());
+    // The Single Layer Water body against the renderer's real camera layout,
+    // the shadow receiver bindings the shader declares, and a real view.
+    let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &crate::foliage::camera_layout_entries(),
+    });
+    let fragment = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty, count: None };
+    let depth_array = wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Depth,
+        view_dimension: wgpu::TextureViewDimension::D2Array,
+        multisampled: false,
+    };
+    let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            fragment(0, depth_array),
+            fragment(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
+            fragment(2, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+            fragment(7, depth_array),
+        ],
+    });
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut water = crate::river_surface::RiverSurface::new(device, queue).unwrap();
+    // The generated native foam detail when present locally (gitignored).
+    let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../jka-water/src/river/foam-detail.zip");
+    if let Ok(bytes) = std::fs::read(&archive) {
+        let detail = crate::river_foam::Detail::from_archive(device, queue, &bytes).unwrap();
+        water.set_foam_detail(detail.texture.create_view(&Default::default()));
+    }
+    std::eprintln!("live river water body foam detail: {}", water.has_foam_detail());
+    let format = wgpu::TextureFormat::Rgba32Float;
+    water.ensure_pipeline(device, &camera_layout, &shadow_layout, format, 1, wgpu::TextureFormat::Depth32Float, wgpu::CompareFunction::GreaterEqual);
+    // One submission per rendered frame, as the renderer does: each solver
+    // frame owns a small control upload until the queue retires it.
+    for frame in 0..240 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        river.encode_frame(device, &mut encoder, 1.0 / 60.0, f64::from(frame) / 60.0, Some(&water)).unwrap();
+        queue.submit(Some(encoder.finish()));
+    }
+    let mut encoder = device.create_command_encoder(&Default::default());
+    river.encode_frame(device, &mut encoder, 0.0, 4.0, Some(&water)).unwrap();
+    water.encode_ocean(device, &mut encoder, 4.0).unwrap();
+    assert!(river.body_group().is_some());
+    const SIZE: u32 = 64;
+    let before_composite = device.create_buffer(&wgpu::BufferDescriptor {label:Some("river base before composite"),size:u64::from(SIZE*SIZE*16),usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
+    let red_sky = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {label:Some("river reflection test sky"),size:wgpu::Extent3d {width:1,height:1,depth_or_array_layers:1},mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_DST,view_formats:&[]},wgpu::util::TextureDataOrder::LayerMajor,&[255,0,0,255]);
+    let red_view=red_sky.create_view(&Default::default());
+    water.set_map_sky(device,Some([&red_view;6]));
+    let clear = [0.2f32, 0.3, 0.4];
+    let color = {
+        use wgpu::util::DeviceExt;
+        let target = |format, label| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let (color, depth) = (target(format, "river water color"), target(wgpu::TextureFormat::Depth32Float, "river water depth"));
+        // Eye 400 units up over the uphill patch edge (x = -512), looking almost
+        // straight down: half the view is off the simulated grid. Native masks
+        // count any film above 1e-8 cm as water, so in-patch "dry" cells draw.
+        let mut camera = crate::camera::Camera::new(crate::scene::render_position([-512.0, 0.0, 400.0]), 0.0);
+        camera.pitch = -1.4;
+        let sun = crate::river_slw::SceneSun::classic(crate::scene::render_position([0.3, 0.2, -1.0]), [1.0, 0.95, 0.9], 255.0);
+        let foam = water.has_foam_detail();
+        let view = crate::river_surface::ViewUniform::new(&camera, [SIZE, SIZE], sun, false, 4.0, 1.0 / 60.0, foam);
+        water.prepare(device, queue, [SIZE, SIZE], 1, &view);
+        let mut uniform = [0u8; 512];
+        uniform[..64].copy_from_slice(bytemuck::cast_slice(&camera.view_projection(SIZE, SIZE).to_cols_array()));
+        // render_flags.x: shadow reception off (no caster map in this fixture).
+        uniform[96..100].copy_from_slice(&1u32.to_le_bytes());
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &uniform,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let small = |format, usage, layers| device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let noise = small(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING, 1);
+        let noise_view = noise.create_view(&Default::default());
+        let shadow_map = small(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::TEXTURE_BINDING, 2);
+        let shadow_view = shadow_map.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&Default::default());
+        let compare = device.create_sampler(&wgpu::SamplerDescriptor {
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_settings = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &[0u8; 352],
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &camera_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&noise_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let shadow_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &shadow_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&shadow_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&compare) },
+                wgpu::BindGroupEntry { binding: 2, resource: shadow_settings.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&shadow_view) },
+            ],
+        });
+        let (color_view, depth_view) = (color.create_view(&Default::default()), depth.create_view(&Default::default()));
+        // The scene without the river: a flat colour at the far plane.
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("river water scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: clear[0].into(), g: clear[1].into(), b: clear[2].into(), a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        water.capture(device, &mut encoder, &color_view, &depth_view);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("river water draw check"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            water.draw(&mut pass, &camera_group, &shadow_group, None, &river);
+        }
+        encoder.copy_texture_to_buffer(color.as_image_copy(),wgpu::TexelCopyBufferInfo {buffer:&before_composite,layout:wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(SIZE*16),rows_per_image:Some(SIZE)}},color.size());
+        {
+            let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label:Some("river reflection composite check"),
+                color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:&color_view,depth_slice:None,resolve_target:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
+                depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
+            });
+            water.draw_composite(&mut pass, &camera_group, &shadow_group, None, &river);
+        }
+        color
+    };
+    queue.submit(Some(encoder.finish()));
+    if let Some(error) = futures_lite::future::block_on(scope.pop()) {
+        panic!("river water body validation: {error}");
+    }
+    assert!(river.surface().is_some());
+    let base_pixels=read_buffer(device,queue,&before_composite);
+    let state = read_state(device, queue, river_state(&river));
+    let [nx, ny] = river.grid.dimensions.map(|n| n as usize);
+    assert!(state.iter().flatten().all(|v| v.is_finite()));
+    let wet = |range: std::ops::Range<usize>| {
+        (0..ny).flat_map(|y| range.clone().map(move |x| y * nx + x)).filter(|&i| state[i][1] > 1.0).count()
+    };
+    let (uphill, downhill) = (wet(2..nx / 2 - 4), wet(nx / 2 + 4..nx - 2));
+    let centre = state[(ny / 2) * nx + nx / 2][1];
+    std::eprintln!("live river: centre depth {centre} cm, wet uphill {uphill}, downhill {downhill}, {:.0} s simulated", river.simulated_seconds);
+    assert!(centre > 1.0, "source must hold water");
+    assert!(downhill > uphill, "water must run downhill");
+    // Rgba32Float rows are exactly 1024 bytes, so the buffer needs no unpadding.
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("river water readback"),
+        size: u64::from(SIZE * SIZE * 16),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        color.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SIZE * 16), rows_per_image: Some(SIZE) },
+        },
+        color.size(),
+    );
+    queue.submit(Some(encoder.finish()));
+    let pixels = read_buffer(device, queue, &buffer);
+    assert!(pixels.iter().flatten().all(|v| v.is_finite()), "water output must be finite");
+    let reflected=pixels.iter().zip(&base_pixels).filter(|(p,b)|p[0]>b[0]+1e-5).count();
+    assert!(reflected>0,"the composite must add the red environment on visible water");
+    for (p,b) in pixels.iter().zip(&base_pixels) {
+        assert!((p[1]-b[1]).abs()<1e-6&&(p[2]-b[2]).abs()<1e-6,"red-only environment must preserve green/blue");
+        if (0..3).all(|k|(b[k]-clear[k]).abs()<1e-6) {assert_eq!(p,b,"dry pixels must not receive reflections");}
+    }
+    let water_pixels = pixels.iter().filter(|p| (0..3).any(|k| (p[k] - clear[k]).abs() > 1e-3)).count();
+    let dry_pixels = pixels.len() - water_pixels;
+    std::eprintln!("live river water body: {water_pixels} water pixels, {dry_pixels} untouched");
+    assert!(water_pixels > 0 && dry_pixels > 0, "the patch must draw and the view beyond it stay untouched");
+    assert!(pixels.iter().all(|p| p[3] == 1.0), "Single Layer Water output is opaque");
+}
+
+fn river_state(river: &crate::river_runtime::LiveRiver) -> &wgpu::Texture {
+    river.state()
+}
+
+
+/// Exercises the production native SSR trace against a known plane, including
+/// the HZB and the sky-miss confidence that drives the composite's fallback.
+fn check_river_reflection_trace(device:&wgpu::Device,queue:&wgpu::Queue) {
+    use wgpu::util::DeviceExt;
+    let size=wgpu::Extent3d {width:32,height:32,depth_or_array_layers:1};
+    let depth=device.create_texture(&wgpu::TextureDescriptor {label:Some("river SSR plane depth"),size,mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Depth32Float,usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::RENDER_ATTACHMENT,view_formats:&[]});
+    let depth_view=depth.create_view(&Default::default());
+    let color=device.create_texture_with_data(queue,&wgpu::TextureDescriptor {label:Some("river SSR plane color"),size,mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_DST,view_formats:&[]},wgpu::util::TextureDataOrder::LayerMajor,&[51,102,204,255].repeat(32*32));
+    let color_view=color.create_view(&Default::default());
+    let hzb=crate::river_composite::DepthPyramid::new(device,[32,32],&depth_view);
+    let matrix=glam::Mat4::perspective_infinite_reverse_rh(std::f32::consts::FRAC_PI_2,1.0,1.0);
+    let camera=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {label:None,contents:bytemuck::cast_slice(&matrix.to_cols_array()),usage:wgpu::BufferUsages::UNIFORM});
+    let view=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {label:None,contents:bytemuck::cast_slice(&[0.0f32,1.0,0.0,0.0]),usage:wgpu::BufferUsages::UNIFORM});
+    let result=device.create_buffer(&wgpu::BufferDescriptor {label:None,size:32,usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
+    let point=device.create_sampler(&Default::default());
+    let linear=device.create_sampler(&wgpu::SamplerDescriptor {mag_filter:wgpu::FilterMode::Linear,min_filter:wgpu::FilterMode::Linear,..Default::default()});
+    let source=[r#"
+struct Camera {view_proj:mat4x4<f32>}
+struct View {forward:vec4<f32>}
+@group(0) @binding(0) var<uniform> camera:Camera;
+@group(0) @binding(1) var<uniform> river_view:View;
+@group(0) @binding(2) var scene_depth:texture_depth_2d;
+@group(0) @binding(3) var scene_color:texture_2d<f32>;
+@group(0) @binding(4) var reflection_hzb:texture_2d<f32>;
+@group(0) @binding(5) var scene_sampler:sampler;
+@group(0) @binding(6) var gf_sampler:sampler;
+@group(0) @binding(7) var<storage,read_write> result:array<vec4<f32>>;
+const RIVER_CM_PER_UNIT:f32=2.5;
+"#,crate::river_composite::TRACE_SHADER,r#"
+@compute @workgroup_size(1) fn probe() {
+    result[0]=river_ssr(vec3<f32>(0.0,100.0,0.0),normalize(vec3<f32>(0.5,1.0,0.0)),100.0,0.02,vec2<f32>(16.5));
+    result[1]=river_ssr(vec3<f32>(0.0,100.0,0.0),vec3<f32>(0.0,-1.0,0.0),100.0,0.02,vec2<f32>(16.5));
+}"#].join("\n");
+    let module=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("river production SSR probe"),source:wgpu::ShaderSource::Wgsl(source.into())});
+    let pipeline=device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {label:None,layout:None,module:&module,entry_point:Some("probe"),compilation_options:Default::default(),cache:None});
+    let resources=[camera.as_entire_binding(),view.as_entire_binding(),wgpu::BindingResource::TextureView(&depth_view),wgpu::BindingResource::TextureView(&color_view),wgpu::BindingResource::TextureView(&hzb.view),wgpu::BindingResource::Sampler(&point),wgpu::BindingResource::Sampler(&linear),result.as_entire_binding()];
+    let entries:Vec<_>=resources.into_iter().enumerate().map(|(i,resource)|wgpu::BindGroupEntry {binding:i as u32,resource}).collect();
+    let group=device.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&pipeline.get_bind_group_layout(0),entries:&entries});
+    for clear in [0.0125,0.0] {
+        let mut encoder=device.create_command_encoder(&Default::default());
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:None,color_attachments:&[],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Clear(clear),store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()});
+        hzb.encode(&mut encoder);
+        {let mut pass=encoder.begin_compute_pass(&Default::default());pass.set_pipeline(&pipeline);pass.set_bind_group(0,&group,&[]);pass.dispatch_workgroups(1,1,1);}
+        queue.submit(Some(encoder.finish()));
+        let pixels=read_buffer(device,queue,&result);
+        assert_eq!(pixels[1],[0.0;4],"ray toward camera must miss");
+        if clear>0.0 {
+            assert!(pixels[0][3]>0.99,"reflected ray must hit the known plane: {:?}",pixels[0]);
+            for (v,expected) in pixels[0].iter().zip([0.2,0.4,0.8,1.0]) {assert!((*v-expected).abs()<1e-3);}
+        } else {assert_eq!(pixels[0],[0.0;4],"sky depth must miss, allowing environment fallback");}
+    }
+}
+
+
+/// Delivered volume is Q*dt, regardless of resolution, width or blocked cells.
+fn check_river_discharge(device:&wgpu::Device,queue:&wgpu::Queue) {
+    use wgpu::util::DeviceExt;
+    for resolution in [16,32] {
+        for width in [1.0,160.0] {
+            for cfs in [0.0,12.345] {
+                let grid=jka_water::river::control::Grid::max_axis([640.0,640.0],resolution).unwrap();
+                let dims=grid.dimensions;
+                let count=(dims[0]*dims[1]) as usize;
+                let geo:Vec<[f32;4]>=(0..count).map(|i|[2.0,if i%3==0 && i!=(dims[1]/2*dims[0]+dims[0]/2) as usize {1.0}else{0.0},0.0,0.0]).collect();
+                let geometry=device.create_buffer_init(&wgpu::util::BufferInitDescriptor {label:None,contents:bytemuck::cast_slice(&geo),usage:wgpu::BufferUsages::STORAGE});
+                let states=std::array::from_fn(|_|device.create_texture(&wgpu::TextureDescriptor {
+                    label:Some("CFS conservation test"),size:wgpu::Extent3d {width:dims[0],height:dims[1],depth_or_array_layers:4},mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::R32Float,
+                    usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::STORAGE_BINDING|wgpu::TextureUsages::COPY_SRC,view_formats:&[],
+                }));
+                let forcing=crate::river_discharge::Discharge::new(device,grid,&states,&geometry,width,1000.0,cfs);
+                let mut encoder=device.create_command_encoder(&Default::default());
+                forcing.initialize(&mut encoder);
+                let mut seconds=0.0;
+                let mut current=0;
+                for dt in [0.01,0.02,0.03,0.01] {
+                    forcing.encode(device,&mut encoder,current,dt);current=1-current;seconds+=dt;
+                }
+                queue.submit(Some(encoder.finish()));
+                let water=read_state(device,queue,&states[current]);
+                let actual=water.iter().map(|s|f64::from(s[1])).sum::<f64>()*f64::from(grid.cell_size[0])*f64::from(grid.cell_size[1]);
+                let expected=f64::from(cfs)*crate::river_discharge::CM3_PER_CUBIC_FOOT*seconds;
+                assert!((actual-expected).abs()<1e-3+expected*2e-6,"CFS volume: res={resolution}, width={width}, actual={actual}, expected={expected}");
+                for (i,s) in water.iter().enumerate() {if geo[i][1]>0.5 {assert_eq!(s[1],0.0,"blocked cells cannot receive discharge");}}
+            }
+        }
+    }
 }

@@ -8,19 +8,19 @@
 //! display mode, render backend, vsync, FPS cap, gamma, input timing and the
 //! debug/instrumentation toggles are left alone: those are machine and
 //! preference settings, not quality, and silently rewriting them would be hostile.
-//! GPU-driven drawing and Hi-Z occlusion are optimization A/B controls, not quality levers.
+//! Shitter deliberately owns a small set of throughput A/B cvars; every other
+//! preset restores their reference values so switching tiers is reversible.
+//! GPU-driven drawing and Hi-Z occlusion remain independent optimization controls.
 //! Likewise, `cg_fxFPS` is a user preference and not part of quality presets.
 
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QualityPreset {
-    /// Every cost lever off, on the known-fast FastBaseline world renderer whenever
-    /// the settings allow it. The benchmark control.
+    /// Lightweight unified renderer with standard optimization defaults.
     Minimal,
-    /// The same settings as `Minimal`, forced through the unified world renderer
-    /// (`r_worldPath unified`) so the two can be compared directly.
-    MinimalUnified,
+    /// Lowest-quality UHD 630 throughput profile. No resolution change.
+    Shitter,
     Low,
     Medium,
     High,
@@ -29,8 +29,8 @@ pub(super) enum QualityPreset {
 
 impl QualityPreset {
     pub(super) const ALL: [Self; 6] = [
+        Self::Shitter,
         Self::Minimal,
-        Self::MinimalUnified,
         Self::Low,
         Self::Medium,
         Self::High,
@@ -39,8 +39,8 @@ impl QualityPreset {
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Minimal => "Minimal (Legacy)",
-            Self::MinimalUnified => "Minimal (Unified)",
+            Self::Minimal => "Minimal",
+            Self::Shitter => "Shitter",
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
@@ -53,6 +53,33 @@ impl QualityPreset {
     /// aliases that mutate the same state out of this table: for example,
     /// `r_dynamicShadows` already owns the derived cascaded-shadow boolean.
     pub(super) fn settings(self) -> Vec<(&'static str, &'static str)> {
+        // Shitter keeps the optimized PVS Auto/portal plan active. The earlier
+        // 660 FPS Off vs 550 FPS Auto measurement predated the cached-frustum
+        // change and must be rechecked under otherwise identical conditions.
+        // r_igpuAB 19 = fast CPU A/B 3 (single encoder + state cache) plus the
+        // experimental +16 per-frame main-view frustum planes. Never silently
+        // substitute PVS Off: it can render more surfaces and masks visibility
+        // regressions. Users can still A/B Off/Auto and 3/19 manually.
+        if self == Self::Shitter {
+            let mut settings = Self::Minimal.settings();
+            for (name, value) in &mut settings {
+                match *name {
+                    "r_pvsMode" => *value = "auto", // portal/cluster draw plans, NOT Off
+                    "r_igpuAB" => *value = "19", // A/B 3 + cached main-view frustum planes
+                    "r_igpuMemoryAB" => *value = "1", // Depth16Unorm (latched)
+                    "r_rgb565" => *value = "1", // native RGB565 swapchain when supported (latched)
+                    "r_competitiveAB" => *value = "5", // one BSP material stage + cheap baked lightmap (mode 11 stays unlit)
+                    "r_fragmentShaderMode" => *value = "5", // current measured compact-world family
+                    "r_drawfog" => *value = "0", // avoid Legacy 2 FP16/post on fog maps
+                    "r_fullbright" => *value = "0", // BSP baked global lightmaps, not forced unlit
+                    "r_vertexLight" => *value = "0", // use baked BSP lighting, not vertex-light fallback
+                    "r_lightmap" => *value = "0", // normal textured view; debug view remains switchable
+                    _ => {}
+                }
+            }
+            return settings;
+        }
+
         // Medium is Low with the requested visual upgrades. Derive it so the
         // rest of the Low profile stays aligned if it changes later.
         if self == Self::Medium {
@@ -112,12 +139,12 @@ impl QualityPreset {
                     _ => {}
                 }
             }
-            settings.push(("r_rtSamples", "4"));
+            settings.insert(settings.len() - 1, ("r_rtSamples", "4"));
             return settings;
         }
 
         let table: &'static [(&'static str, &'static str)] = match self {
-            Self::Minimal | Self::MinimalUnified => &[
+            Self::Minimal => &[
                 // The cvar's canonical "off" value is 0; the setter maps both
                 // 0 and 1 to the renderer's single-sample state. Using 0 here
                 // lets active_quality_preset() compare against the getter.
@@ -127,7 +154,7 @@ impl QualityPreset {
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
                 ("r_texturemode", "GL_LINEAR_MIPMAP_LINEAR"),
-                ("r_detailTextures", "off"),
+                ("r_detailTextures", "0"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -180,7 +207,7 @@ impl QualityPreset {
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "off"),
+                ("r_detailTextures", "0"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -228,6 +255,7 @@ impl QualityPreset {
                 ("r_localLightShadows", "0"),
                 ("r_glassPromotion", "0"),
             ],
+            Self::Shitter => unreachable!("Shitter derives from Minimal above"),
             Self::High => unreachable!("High derives from Medium above"),
             Self::Ultra => unreachable!("Ultra derives from High above"),
             Self::Medium => unreachable!("Medium derives from Low above"),
@@ -236,9 +264,9 @@ impl QualityPreset {
         // Preserve seam compatibility at every tier. Medium and above use the
         // menu's maximum patch quality and the highest native model detail.
         let (subdivisions, curve_error, model_scale) = match self {
-            Self::Minimal | Self::MinimalUnified => ("12", "125", "5"),
+            Self::Minimal => ("12", "125", "5"),
             Self::Low => ("8", "125", "5"),
-            Self::Medium | Self::High | Self::Ultra => unreachable!("derived presets return above"),
+            Self::Medium | Self::High | Self::Ultra | Self::Shitter => unreachable!("derived presets return above"),
         };
         settings.extend([
             ("r_subdivisions", subdivisions),
@@ -246,12 +274,24 @@ impl QualityPreset {
             ("r_patchStitching", "1"),
             ("r_lodScale", model_scale),
         ]);
-        // The two Minimal presets differ only in which world renderer draws.
-        match self {
-            Self::Minimal => settings.push(("r_worldPath", "auto")),
-            Self::MinimalUnified => settings.push(("r_worldPath", "unified")),
-            _ => {}
-        }
+        // Reset Shitter's performance overrides when applying ANY other preset.
+        // These are intentionally owned here (not merely changed by clicking
+        // Shitter) so another tier never inherits cached-frustum A/B or D16.
+        // Framebuffer formats are latched by the video-settings framework.
+        // Neither cvar must independently restart the renderer.
+        settings.extend([
+            ("r_pvsMode", "auto"),
+            ("r_igpuAB", "0"),
+            ("r_fragmentShaderMode", "1"),
+            ("r_competitiveAB", "0"),
+            ("r_fullbright", "0"),
+            ("r_vertexLight", "0"),
+            ("r_lightmap", "0"),
+            ("r_colorClearMode", "1"), // Auto; NEVER unconditional skip
+            ("r_legacyBlendTransfer", "4"), // direct SDR path, no transfer
+            ("r_rgb565", "0"),
+            ("r_igpuMemoryAB", "0"),
+        ]);
         settings
     }
 }
@@ -266,6 +306,13 @@ pub(super) fn cvar_values_match(a: &str, b: &str) -> bool {
 }
 
 impl App {
+    /// Include pending latched values in preset identification. The color/depth
+    /// formats are not active on the GPU until video settings are applied.
+    fn requested_quality_cvar_value(&self, name: &str) -> Option<String> {
+        self.latched_console_cvars.get(&name.to_ascii_lowercase()).cloned()
+            .or_else(|| self.console_cvar_value(name))
+    }
+
     pub(super) fn apply_quality_preset(&mut self, preset: QualityPreset) {
         self.apply_quality_preset_with_scope(preset, None);
     }
@@ -303,9 +350,14 @@ impl App {
         for (name, value) in &settings {
             self.render_command(RenderCommand::BatchLabel((*name).to_owned()));
             let setting_started = Instant::now();
-            // Applying a preset overrides pending console values for its own controls.
-            self.latched_console_cvars.remove(&name.to_ascii_lowercase());
-            let result = self.set_console_cvar(name, value);
+            // Color/depth formats are restart-latched. A preset must stage
+            // them exactly as a console cvar would, not invoke the live setter.
+            let result = if ["r_rgb565", "r_igpuMemoryAB"].contains(name) {
+                self.set_console_cvar_from_console(name, value).map(|_| ())
+            } else {
+                self.latched_console_cvars.remove(&name.to_ascii_lowercase());
+                self.set_console_cvar(name, value)
+            };
             timings.push((name, setting_started.elapsed().as_secs_f64() * 1000.0));
             if let Err(error) = result {
                 // A preset naming a cvar the build no longer has is a bug in the
@@ -345,7 +397,7 @@ impl App {
                 .settings()
                 .iter()
                 .filter_map(|(name, _)| {
-                    self.console_cvar_value(name)
+                    self.requested_quality_cvar_value(name)
                         .map(|value| ((*name).to_owned(), value))
                 })
                 .collect();
@@ -375,7 +427,7 @@ impl App {
         if let Some(preset) = self.quality_preset_selected {
             if self.quality_preset_values.len() == preset.settings().len()
                 && self.quality_preset_values.iter().all(|(name, value)| {
-                    self.console_cvar_value(name)
+                    self.requested_quality_cvar_value(name)
                         .is_some_and(|current| cvar_values_match(&current, value))
                 })
             {
@@ -385,7 +437,7 @@ impl App {
 
         QualityPreset::ALL.into_iter().find(|preset| {
             preset.settings().iter().all(|(name, value)| {
-                self.console_cvar_value(name)
+                self.requested_quality_cvar_value(name)
                     .is_some_and(|current| cvar_values_match(&current, value))
             })
         })
@@ -395,6 +447,33 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::QualityPreset;
+
+    #[test]
+    fn presets_order_and_detail_texture_values_match_the_ui() {
+        assert_eq!(QualityPreset::ALL[0], QualityPreset::Shitter);
+        assert_eq!(QualityPreset::ALL[1], QualityPreset::Minimal);
+        assert_eq!(QualityPreset::Minimal.label(), "Minimal");
+        // The detail-texture cvar getter is canonical 0/1, not off/on.
+        // Preset previews must not report a change for an already-off checkbox.
+        for preset in [QualityPreset::Shitter, QualityPreset::Minimal, QualityPreset::Low] {
+            let value = preset.settings().into_iter()
+                .find(|(name, _)| *name == "r_detailTextures").unwrap().1;
+            assert_eq!(value, "0", "{} should not highlight an off detail-texture checkbox", preset.label());
+            assert!(super::cvar_values_match("0", value));
+        }
+        for preset in [QualityPreset::Medium, QualityPreset::High, QualityPreset::Ultra] {
+            assert!(preset.settings().contains(&("r_detailTextures", "1")));
+        }
+    }
+
+    #[test]
+    fn presets_never_touch_model_lod_generation() {
+        for preset in QualityPreset::ALL {
+            let names = preset.settings();
+            assert!(!names.iter().any(|(name, _)| name.eq_ignore_ascii_case("r_md3AutoLod") || name.eq_ignore_ascii_case("r_bspModelLod")),
+                "{} changed the independently controlled LOD-generation switch", preset.label());
+        }
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
@@ -431,7 +510,7 @@ mod tests {
     fn quality_presets_keep_medium_high_ultra_patch_and_model_detail_at_maximum() {
         let mut previous_subdivisions = f32::INFINITY;
         let mut previous_curve_error = 0.0;
-        for preset in [QualityPreset::Minimal, QualityPreset::Low, QualityPreset::Medium, QualityPreset::High, QualityPreset::Ultra] {
+        for preset in [QualityPreset::Shitter, QualityPreset::Minimal, QualityPreset::Low, QualityPreset::Medium, QualityPreset::High, QualityPreset::Ultra] {
             let settings = preset.settings();
             let value = |key| settings.iter().find(|(name, _)| *name == key).unwrap().1;
             let subdivisions = value("r_subdivisions").parse::<f32>().unwrap();
@@ -460,13 +539,39 @@ mod tests {
     }
 
     #[test]
-    fn quality_presets_do_not_touch_optimization_controls() {
+    fn quality_presets_restore_shitter_overrides() {
+        let baseline = QualityPreset::Minimal.settings();
+        let shitter = QualityPreset::Shitter.settings();
+        for (name, on, off) in [
+            ("r_pvsMode", "auto", "auto"),
+            ("r_igpuAB", "19", "0"),
+            ("r_igpuMemoryAB", "1", "0"),
+            ("r_rgb565", "1", "0"),
+            ("r_fragmentShaderMode", "5", "1"),
+            ("r_competitiveAB", "5", "0"),
+            ("r_fullbright", "0", "0"),
+            ("r_vertexLight", "0", "0"),
+            ("r_lightmap", "0", "0"),
+            ("r_drawfog", "0", "2"),
+        ] {
+            assert!(shitter.contains(&(name, on)), "Shitter must set {name}");
+            assert!(baseline.contains(&(name, off)), "Minimal must reset {name}");
+            for preset in QualityPreset::ALL {
+                if preset != QualityPreset::Shitter && name != "r_drawfog" {
+                    assert!(preset.settings().contains(&(name, off)), "{} must reset {name}", preset.label());
+                }
+            }
+        }
+        let shitter_igpu_mode: u8 = shitter.iter()
+            .find(|(name, _)| *name == "r_igpuAB")
+            .unwrap().1.parse().unwrap();
+        assert_eq!(shitter_igpu_mode, 3 | 16, "Shitter needs the optimized main-view frustum on top of the fastest CPU A/B");
+        assert!(shitter.contains(&("r_pvsMode", "auto")), "Shitter must retain PVS portal/cluster plans");
         for preset in QualityPreset::ALL {
             let settings = preset.settings();
-            for (cvar, _, _) in super::super::egui_settings::OPTIMIZATION_CVARS {
-                assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case(cvar)),
-                    "{} preset must not change {cvar}", preset.label());
-            }
+            assert!(settings.contains(&("r_colorClearMode", "1")));
+            assert!(settings.contains(&("r_legacyBlendTransfer", "4")));
+            assert_eq!(settings.last(), Some(&("r_igpuMemoryAB", if preset == QualityPreset::Shitter {"1"} else {"0"})));
         }
     }
 
@@ -477,7 +582,7 @@ mod tests {
             let settings = preset.settings();
             assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case("cg_fxFPS")));
             let expected_bias = match preset {
-                QualityPreset::Minimal | QualityPreset::MinimalUnified => "3",
+                QualityPreset::Minimal | QualityPreset::Shitter => "3",
                 QualityPreset::Low
                 | QualityPreset::Medium
                 | QualityPreset::High

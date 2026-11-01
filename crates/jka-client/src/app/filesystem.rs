@@ -328,11 +328,17 @@ impl App {
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "base".to_owned());
+        // A vote proposal in the old fs_game cannot be promoted across VFS
+        // changes, even if its BSP qpath is identical.
+        self.cancel_vote_map_prewarm();
+        self.vote_map_candidate = None;
         // Keep only a completed, immutable CPU map as a *candidate* seed.
         // The map worker validates BSP bytes and per-resource/stage hashes;
         // this never reuses old GPU resources or old resolved lightmaps.
         self.cross_game_map_seed = self.prepared_map_cache.take();
         self.game = game;
+        self.siege_timer_menu = crate::ui::load_mp_timer(&self.base, self.game.as_deref());
+        self.siege_hud_shown = None;
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         self.map_loader_latest_requested.store(
             self.latest_request_id,
@@ -385,6 +391,8 @@ impl App {
             return;
         }
         self.game = self.startup_game.clone();
+        self.siege_timer_menu = crate::ui::load_mp_timer(&self.base, self.game.as_deref());
+        self.siege_hud_shown = None;
         self.reset_asset_catalogs_for_game_change();
         let name = self
             .game

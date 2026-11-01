@@ -385,7 +385,7 @@ pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
     pub(in crate::renderer) authored_glow: bool,
-
+    pub(in crate::renderer) lightning: bool,
 }
 
 pub(in crate::renderer) struct DynamicPreparedDraw {
@@ -405,6 +405,11 @@ pub(in crate::renderer) struct DynamicPreparedDraw {
 /// cached here and upload only final CPU-evaluated bones plus per-draw transforms.
 /// The renderer still knows nothing about demo/network provenance or JKA state.
 pub(in crate::renderer) struct DynamicModelRenderer {
+    /// Frame-latched: 0 reference 16-bit, 1 encoded 8-bit, 2 direct+resolve,
+    /// 3 direct without the legacy-forced scene resolve.
+    pub(in crate::renderer) legacy_blend_mode: u8,
+    /// Encoded pipelines are format-specific across 16-bit/8-bit transitions.
+    pub(in crate::renderer) legacy_blend_pipeline_format: wgpu::TextureFormat,
     pub(in crate::renderer) legacy_blend: Option<super::legacy_blend::LegacyModelBlend>,
     pub(in crate::renderer) legacy_model_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) legacy_skin_pipelines: [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
@@ -523,6 +528,8 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_instance_buffer: wgpu::Buffer,
     pub(in crate::renderer) fx_sprite_instance_capacity: u64,
     pub(in crate::renderer) fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
+    pub(in crate::renderer) lightning_gpu: Option<super::lightning_gpu::LightningGpu>,
+    pub(in crate::renderer) lightning_gpu_attempted: bool,
     /// Allocated only after the first eligible resident particle is submitted.
     pub(in crate::renderer) resident_fx: Option<super::resident_fx::ResidentFxBackend>,
     pub(in crate::renderer) resident_fx_frame: Option<Arc<crate::renderer::FxGpuResidentFrame>>,
@@ -553,6 +560,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) cpu_pack_pool: Option<rayon::ThreadPool>,
     pub(in crate::renderer) scratch_cpu_pack_jobs: Vec<super::prepare::CpuPackJob>,
     pub(in crate::renderer) model_render_bundles: bool,
+    pub(in crate::renderer) igpu_ab_mode: u8,
     pub(in crate::renderer) model_bundles: super::bundles::ModelBundles,
     pub(in crate::renderer) perf_bundles: super::bundles::BundlePerf,
     pub(in crate::renderer) md3_geometry_cache: bool,

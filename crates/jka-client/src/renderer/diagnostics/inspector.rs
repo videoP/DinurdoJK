@@ -219,8 +219,26 @@ impl Renderer {
             return None;
         }
 
+        // Pick from the *render* triangles, not the collision world. In
+        // particular `surfaceparm nonsolid` / translucent / water surfaces
+        // have no MASK_SHOT collision hit, but are still selectable here.
+        // Inline brush models must be sampled in their presented pose: the
+        // inspector_vertices array is an immutable copy of the *compiled*
+        // geometry, whereas their GPU buffer is moved by CGame each frame.
         let mut best: Option<(f32, usize, u32, Vec3)> = None;
         for (batch_index, batch) in world.coarse_batches.iter().enumerate() {
+            let inline_pose = if batch.inline_model_slot == u32::MAX {
+                None
+            } else {
+                let Some(model) = world.inline_models.get(batch.inline_model_slot as usize) else {
+                    continue;
+                };
+                match model.uploaded {
+                    Some(None) => continue, // explicitly absent in this snapshot
+                    Some(Some(pose)) => Some(pose),
+                    None => None, // compiled pose, before the first CGame update
+                }
+            };
             if !ray_hits_aabb(
                 ray_origin,
                 ray_direction,
@@ -240,9 +258,14 @@ impl Renderer {
                 .chunks_exact(3)
                 .enumerate()
             {
-                let a = Vec3::from_array(triangle[0].position);
-                let b = Vec3::from_array(triangle[1].position);
-                let c = Vec3::from_array(triangle[2].position);
+                let position = |vertex: &InspectorVertex| {
+                    Vec3::from_array(inline_pose.map_or(vertex.position, |pose| {
+                        pose.transform_point(vertex.position)
+                    }))
+                };
+                let a = position(&triangle[0]);
+                let b = position(&triangle[1]);
+                let c = position(&triangle[2]);
                 let Some(distance) = ray_triangle_distance(ray_origin, ray_direction, a, b, c)
                 else {
                     continue;
@@ -314,20 +337,21 @@ impl Renderer {
         let world_distance = best.map_or(f32::INFINITY, |entry| entry.0);
         let dynamic_distance = dynamic_best.map_or(f32::INFINITY, |entry| entry.0);
 
-        // The OpenJK-style CGame collision trace supplies protocol entity ownership
-        // for solid hits. This catches inline bmodels and GPU-skinned players even
-        // when their final raster triangles are unavailable to this CPU path.
+        // The CGame trace only sees MASK_SHOT solids. It is a fallback for
+        // GPU-skinned entities / collision-only bounds, NOT an occlusion test
+        // for visible non-solid faces (glass, water, translucent inline models,
+        // and non-solid MD3 meshes). A visible triangle at the same depth as
+        // the collision hit wins; only a *strictly nearer* entity can occlude it.
         let hinted_entity = entity_hint.filter(|hint| {
-            hint.distance <= world_distance + 0.5 && hint.distance <= dynamic_distance + 8.0
+            collision_hint_precedes_geometry(hint.distance, world_distance)
+                && collision_hint_precedes_geometry(hint.distance, dynamic_distance)
         });
 
-        let dynamic_wins = dynamic_best.is_some_and(|(distance, surface_index, _, _)| {
-            let entity_matches_hint = entity_hint.is_none_or(|hint| {
-                dynamic_models
-                    .get(surface_index)
-                    .is_some_and(|surface| surface.entity_num == hint.entity_num)
-            });
-            entity_matches_hint && distance <= world_distance + 0.001
+        let dynamic_wins = dynamic_best.is_some_and(|(distance, _, _, _)| {
+            distance <= world_distance + 0.001
+                && !entity_hint.is_some_and(|hint| {
+                    collision_hint_precedes_geometry(hint.distance, distance)
+                })
         });
 
         if dynamic_wins {
@@ -511,7 +535,7 @@ impl Renderer {
             batch.fragment_key.tc_gen, batch.fragment_key.alpha_func,
             batch.fragment_key.vertex_recipe.tc_mods,
         ));
-        for mode in 2..=4 {
+        for mode in 2..=5 {
             let mut candidate = active_variant;
             candidate.material_specialization = true;
             candidate.minimal_entries = mode == 2;
@@ -549,12 +573,23 @@ impl Renderer {
             .checked_add(3)
             .filter(|end| *end <= world.inspector_vertices.len())
             .map(|end| &world.inspector_vertices[triangle_offset..end]);
+        // Use the same presented vertices for UV/color interpolation as the
+        // intersection above. The source UVs remain unchanged by mover poses.
+        let inline_pose = (batch.inline_model_slot != u32::MAX)
+            .then(|| world.inline_models.get(batch.inline_model_slot as usize))
+            .flatten()
+            .and_then(|model| model.uploaded.flatten());
         let hit_barycentric = hit_triangle.and_then(|triangle| {
+            let position = |vertex: &InspectorVertex| {
+                Vec3::from_array(inline_pose.map_or(vertex.position, |pose| {
+                    pose.transform_point(vertex.position)
+                }))
+            };
             barycentric_coordinates(
                 hit,
-                Vec3::from_array(triangle[0].position),
-                Vec3::from_array(triangle[1].position),
-                Vec3::from_array(triangle[2].position),
+                position(&triangle[0]),
+                position(&triangle[1]),
+                position(&triangle[2]),
             )
         });
         let hit_base_uv = hit_triangle
@@ -1537,6 +1572,13 @@ pub(in crate::renderer) fn texture_edge_density(
     })
 }
 
+/// Collision is only a fallback: a rendered face at the same depth must be
+/// selectable even when it has no gameplay collision of its own. Half a unit
+/// absorbs the small collision-vs-render precision mismatch on BSP faces.
+fn collision_hint_precedes_geometry(collision_distance: f32, geometry_distance: f32) -> bool {
+    collision_distance + 0.5 < geometry_distance
+}
+
 pub(in crate::renderer) fn ray_triangle_distance(
     origin: Vec3,
     direction: Vec3,
@@ -1564,6 +1606,37 @@ pub(in crate::renderer) fn ray_triangle_distance(
     }
     let distance = edge2.dot(q) * inverse;
     (distance > 0.001 && distance.is_finite()).then_some(distance)
+}
+
+#[cfg(test)]
+mod inspector_nonsolid_pick_tests {
+    use super::{collision_hint_precedes_geometry, ray_triangle_distance};
+    use crate::renderer::Vec3;
+
+    #[test]
+    fn visible_face_in_front_of_solid_is_not_stolen_by_collision_hint() {
+        // Even though the world collision ray can only hit the distant solid
+        // wall, the nearer nonsolid face is present in the render triangles.
+        let origin = Vec3::ZERO;
+        let direction = Vec3::X;
+        let distance = ray_triangle_distance(
+            origin,
+            direction,
+            Vec3::new(3.0, -1.0, -1.0),
+            Vec3::new(3.0, 1.0, -1.0),
+            Vec3::new(3.0, 0.0, 1.0),
+        ).expect("render triangle must be raycast regardless of collision contents");
+        assert!((distance - 3.0).abs() < 0.001);
+        assert!(!collision_hint_precedes_geometry(7.0, distance));
+        assert!(!collision_hint_precedes_geometry(3.0, distance));
+    }
+
+    #[test]
+    fn nearer_solid_entity_still_occludes_rendered_geometry() {
+        assert!(collision_hint_precedes_geometry(2.0, 5.0));
+        assert!(collision_hint_precedes_geometry(2.0, f32::INFINITY));
+        assert!(!collision_hint_precedes_geometry(5.0, 5.0));
+    }
 }
 
 #[cfg(test)]

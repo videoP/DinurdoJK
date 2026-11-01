@@ -41,9 +41,9 @@ pub const EXT_IMAGE_COLUMNS: u32 = 8;
 
 /// UV rectangle of atlas cell `index`, inset half a texel. The atlas always has
 /// room for `MAX_HUD_IMAGES` cells so adding an image never moves another one.
-fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
+pub(in crate::ui) fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
     let columns = EXT_IMAGE_COLUMNS;
-    let rows = (MAX_HUD_IMAGES as u32).div_ceil(columns);
+    let rows = (MAX_HUD_IMAGES as u32 + 1).div_ceil(columns);
     let cell = EXT_IMAGE_CELL as f32;
     let (atlas_w, atlas_h) = (columns as f32 * cell, rows as f32 * cell);
     let (col, row) = (index as u32 % columns, index as u32 / columns);

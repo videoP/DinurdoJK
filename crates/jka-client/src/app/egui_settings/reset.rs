@@ -63,7 +63,6 @@ impl App {
                     "r_colorTint" => grade.tint.to_string(),
                     "r_colorShadows" => grade.shadows.to_string(),
                     "r_colorHighlights" => grade.highlights.to_string(),
-                    "r_splitToning" => u8::from(defaults.enabled).to_string(),
                     "r_splitToningStrength" => defaults.strength.to_string(),
                     "r_splitToningShadowHue" => defaults.shadow_hue.to_string(),
                     "r_splitToningShadowSaturation" => defaults.shadow_saturation.to_string(),
@@ -383,6 +382,7 @@ impl App {
             }
             ui::VIDEO_ROW_AMBIENT_OCCLUSION => {
                 self.video.ssao = defaults.ssao;
+                self.video.ssao_resolution = defaults.ssao_resolution;
                 self.video.static_bsp_ao = defaults.static_bsp_ao;
                 self.video.static_bsp_ao_lightmap = defaults.static_bsp_ao_lightmap;
                 self.sync_post_effects();

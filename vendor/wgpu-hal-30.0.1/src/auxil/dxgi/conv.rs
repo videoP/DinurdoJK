@@ -27,6 +27,7 @@ pub fn map_texture_format_failable(
         Tf::R16Snorm => DXGI_FORMAT_R16_SNORM,
         Tf::R16Float => DXGI_FORMAT_R16_FLOAT,
         Tf::Rg8Unorm => DXGI_FORMAT_R8G8_UNORM,
+        Tf::Rgb565Unorm => return None, // Native 565 swapchains are Vulkan-only.
         Tf::Rg8Snorm => DXGI_FORMAT_R8G8_SNORM,
         Tf::Rg8Uint => DXGI_FORMAT_R8G8_UINT,
         Tf::Rg8Sint => DXGI_FORMAT_R8G8_SINT,

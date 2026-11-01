@@ -525,12 +525,19 @@ pub(in crate::scene) fn prepare_internal(
     let mut external_lightmaps = Vec::new();
     let mut external_deluxemaps = Vec::new();
     let mut external_lightmap_lookup = BTreeMap::new();
+    let mut missing_external_lightmaps = BTreeSet::new();
     if embedded_lightmap_pages == 0 && !referenced_lightmaps.is_empty() {
         let paired_external = referenced_lightmaps.iter().all(|page| page % 2 == 0);
         let mut deluxe_count = 0usize;
         for &page in &referenced_lightmaps {
+            // TaystJK skips absent external pages and later substitutes vertex
+            // lighting for shaders that reference them. Keep the same behavior
+            // instead of failing the entire BSP; real decode errors still fail.
+            let Some(image) = load_external_lightmap(&mut assets, name, page, options.float_lightmap)? else {
+                missing_external_lightmaps.insert(page);
+                continue;
+            };
             let gpu_index = external_lightmaps.len();
-            let image = load_external_lightmap(&mut assets, name, page, options.float_lightmap)?;
             let deluxe = try_load_external_deluxemap(&mut assets, name, page, paired_external)?;
             if deluxe.is_some() {
                 deluxe_count += 1;
@@ -542,15 +549,27 @@ pub(in crate::scene) fn prepare_internal(
             );
             external_lightmap_lookup.insert(page, gpu_index);
         }
-        warnings.push(format!(
-            "{name}: using {} external lightmap page(s) from maps/{name}/lm_XXXX{}",
-            external_lightmaps.len(),
-            if deluxe_count != 0 {
-                format!("; {deluxe_count} directional deluxemap companion(s)")
-            } else {
-                String::new()
-            }
-        ));
+        if !external_lightmaps.is_empty() {
+            warnings.push(format!(
+                "{name}: using {} external lightmap page(s) from maps/{name}/lm_XXXX{}",
+                external_lightmaps.len(),
+                if deluxe_count != 0 {
+                    format!("; {deluxe_count} directional deluxemap companion(s)")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if !missing_external_lightmaps.is_empty() {
+            let preview = missing_external_lightmaps.iter().take(8)
+                .map(|page| format!("{page:04}"))
+                .collect::<Vec<_>>().join(", ");
+            warnings.push(format!(
+                "{name}: {} missing external lightmap page(s) ({preview}{}); using BSP vertex colors for affected surfaces (TaystJK fallback)",
+                missing_external_lightmaps.len(),
+                if missing_external_lightmaps.len() > 8 { ", ..." } else { "" },
+            ));
+        }
     } else if world_deluxe_mapping {
         warnings.push(format!(
             "{name}: q3map2/Rend2 embedded deluxemaps detected ({} lightmap + direction pairs)",
@@ -913,7 +932,15 @@ pub(in crate::scene) fn prepare_internal(
             (0..4).find(|&i| batch.lightmaps[i] >= 0 && batch.lightmap_styles[i] < 254);
         let vertex_lit_slot = (0..4)
             .find(|&i| batch.lightmaps[i] == LIGHTMAP_BY_VERTEX && surface.vertex_styles[i] < 254);
-        let vertex_lit = vertex_lit_slot.is_some();
+        // TaystJK's R_FindLightmaps falls back for the entire shader if ANY
+        // referenced lightmap style is missing (not just the first style).
+        // Applied to world and inline-model geometry at map-prepare time.
+        let missing_lightmap = (0..4).any(|i| {
+            batch.lightmaps[i] >= 0
+                && batch.lightmap_styles[i] < 254
+                && missing_external_lightmaps.contains(&(batch.lightmaps[i] as usize))
+        });
+        let vertex_lit = vertex_lit_slot.is_some() || missing_lightmap;
         if material_render_is_guaranteed_discarded(material, vertex_lit) {
             invisible_render_culled_batches.fetch_add(1, AtomicOrdering::Relaxed);
             invisible_render_culled_triangles
@@ -926,17 +953,17 @@ pub(in crate::scene) fn prepare_internal(
         }
         let class = class_for(material);
         let source_lightmap = lightmap_slot
-            .filter(|_| !material.sky)
+            .filter(|_| !material.sky && !missing_lightmap)
             .map(|i| batch.lightmaps[i] as usize);
-        let lightmap = source_lightmap.map(|page| {
+        let lightmap = source_lightmap.and_then(|page| {
             if atlas.is_some() {
-                0
-            } else if !external_lightmap_lookup.is_empty() {
-                external_lightmap_lookup[&page]
+                Some(0)
+            } else if embedded_lightmap_pages == 0 {
+                external_lightmap_lookup.get(&page).copied()
             } else if world_deluxe_mapping {
-                page >> 1
+                Some(page >> 1)
             } else {
-                page
+                Some(page)
             }
         });
         let color_slot = vertex_lit_slot
@@ -2067,6 +2094,7 @@ pub(in crate::scene) fn prepare_internal(
         load_timings,
         material_debug,
         map_hash,
+        vote_prepared_vfs: None,
         stage_keys: PrepStageKeys {
             grass: grass_key,
             gi: gi_key,

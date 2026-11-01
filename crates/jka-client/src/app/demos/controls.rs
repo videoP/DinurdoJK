@@ -18,28 +18,38 @@ impl App {
     ) -> (Vec<UiChatLine>, Option<ui::UiCenterPrint>) {
         let now = Instant::now();
         let demo_now = self.current_demo_elapsed_ms(now);
+        // cg_chatFadeTime (stock MP cg_chatBox: 10 s). Demo messages age
+        // against demo time, so pause/scrub is deterministic and cannot flicker.
+        // While typing, the last cg_chatHistoryLines messages kept within
+        // cg_chatHistoryTime show at full strength.
+        let settings = self.chat_settings;
+        let typing = self.overlay == OverlayMode::Chat;
+        let fade_ms = f64::from(settings.fade_time.max(0.5)) * 1000.0;
+        let history_ms = f64::from(settings.history_time.max(settings.fade_time)) * 1000.0;
+        let recent_from = self.chat_lines.len().saturating_sub(usize::from(settings.history_lines));
         let chat_lines = self
             .chat_lines
             .iter()
-            .filter_map(|line| {
+            .enumerate()
+            .filter_map(|(index, line)| {
                 let age_ms = match (demo_now, line.demo_elapsed_ms) {
                     (Some(now_ms), Some(created_ms)) => (now_ms - created_ms).max(0.0),
                     _ => now.saturating_duration_since(line.created).as_secs_f64() * 1000.0,
                 };
-                // Stock MP cg_chatBox defaults to 10000 ms. Demo messages age
-                // against demo time, so pause/scrub is deterministic and cannot flicker.
-                if age_ms >= 10_000.0 {
+                let alpha = if typing && index >= recent_from && age_ms < history_ms {
+                    1.0
+                } else if age_ms >= fade_ms {
                     return None;
-                }
-                let alpha = if age_ms <= 9_000.0 {
+                } else if age_ms <= fade_ms - 1_000.0 {
                     1.0
                 } else {
-                    1.0 - ((age_ms - 9_000.0) / 1_000.0) as f32
+                    ((fade_ms - age_ms) / 1_000.0) as f32
                 };
                 Some(UiChatLine {
                     text: line.text.clone(),
                     team: line.team,
                     alpha: alpha.clamp(0.0, 1.0),
+                    enter: (age_ms / 220.0).clamp(0.0, 1.0) as f32,
                 })
             })
             .collect();
@@ -218,69 +228,34 @@ impl App {
                 DEMO_FREE_SPEEDS[self.demo_free_speed_index.min(DEMO_FREE_SPEEDS.len() - 1)]
             ),
         };
-        let export_available = self.demo_export_available();
-        let hover_text = self.window.as_ref().and_then(|window| {
-            if !self.live_buttons.contains("+speed") {
-                return None;
+        let players = session.demo_visible_players().into_iter().map(|(client, name)| {
+            ui::DemoPlayerUi {
+                client,
+                name,
+                recorded: client == authoritative,
+                active: match self.demo_view_mode {
+                    DemoViewMode::Authoritative => client == authoritative,
+                    DemoViewMode::Follow(followed) => client == followed,
+                    DemoViewMode::Free => false,
+                },
             }
-            let size = window.inner_size();
-            let layout = ui::demo_timeline_layout(size.width, size.height)?;
-            let point = [self.cursor_position.0 as f32, self.cursor_position.1 as f32];
-            let inside = |rect: [f32; 4]| {
-                point[0] >= rect[0]
-                    && point[0] <= rect[0] + rect[2]
-                    && point[1] >= rect[1]
-                    && point[1] <= rect[1] + rect[3]
-            };
-            if inside(layout.export) {
-                Some(if !export_available {
-                    "EXPORT DISABLED — put ffmpeg.exe next to DinurdoJK.exe".to_owned()
-                } else if self.demo_export_in_ms.is_none() || self.demo_export_out_ms.is_none() {
-                    "EXPORT DISABLED — mark a valid IN and OUT range first".to_owned()
-                } else {
-                    format!(
-                        "Export {} at {} FPS — {}",
-                        self.demo_export_preset.label(),
-                        self.demo_export_fps,
-                        self.demo_export_preset.short_description()
-                    )
-                })
-            } else if inside(layout.export_preset) {
-                Some(format!(
-                    "QUALITY: {} — click to cycle. {}",
-                    self.demo_export_preset.label(),
-                    self.demo_export_preset.short_description()
-                ))
-            } else if inside(layout.export_fps) {
-                Some("EXPORT FPS — click to cycle 24 / 30 / 60 / 120. Export remains frame-perfect/offline.".to_owned())
-            } else if inside(layout.export_depth) {
-                Some(if self.demo_export_depth {
-                    "DEPTH EXR ON — synchronized 32-bit float scene depth for compositing/DOF; 2D HUD is not a depth layer.".to_owned()
-                } else {
-                    "DEPTH EXR OFF — click to add synchronized 32-bit float scene depth; 2D HUD is not a depth layer.".to_owned()
-                })
-            } else if inside(layout.mark_out) && self.demo_export_in_ms.is_none() {
-                Some("OUT DISABLED — mark IN first".to_owned())
-            } else {
-                None
-            }
-        });
+        }).collect();
+        let hover_point = self.live_buttons.contains("+speed")
+            .then(|| [self.cursor_position.0 as f32, self.cursor_position.1 as f32]);
         Some(DemoTimelineUi {
             elapsed_ms: session.demo_elapsed_ms(now).unwrap_or(0.0),
             duration_ms,
-            export_in_ms: self.demo_export_in_ms,
-            export_out_ms: self.demo_export_out_ms,
-            export_available,
-            export_preset_label: self.demo_export_preset.label().to_owned(),
-            export_fps: self.demo_export_fps,
-            export_depth: self.demo_export_depth,
-            hover_text,
             playback_rate,
             paused,
             scrub_fraction: self.demo_scrub_fraction,
             kill_markers,
             camera_label,
             outside_authoritative_view: self.demo_view_outside_authoritative,
+            hover_point,
+            players,
+            free_view: self.demo_view_mode == DemoViewMode::Free,
+            player_scroll: self.demo_player_list_scroll,
+            player_open: self.demo_player_list_open,
         })
     }
 
@@ -289,52 +264,62 @@ impl App {
             return None;
         }
         let size = self.window.as_ref()?.inner_size();
-        let layout = ui::demo_timeline_layout(size.width, size.height)?;
+        // Match the precise Taffy geometry used by the render pass.
+        let session = self.game_session.as_ref()?.demo_visible_players();
+        let layout = ui::demo_timeline_layout(size.width, size.height,
+            session.len(), self.demo_player_list_scroll, self.demo_player_list_open)?;
         let point = [x as f32, y as f32];
-        let inside = |rect: [f32; 4]| {
-            point[0] >= rect[0]
-                && point[0] <= rect[0] + rect[2]
-                && point[1] >= rect[1]
-                && point[1] <= rect[1] + rect[3]
-        };
-        // During demo playback the mouse belongs to the camera by default.
-        // Holding the user's +speed bind is the explicit, temporary UI modifier.
-        if !self.live_buttons.contains("+speed") {
-            return None;
+        // While camera input is active, a mouse press must never act on the UI.
+        if !self.live_buttons.contains("+speed") { return None; }
+        let inside = |bounds| ui::flex::contains(bounds, point);
+        if layout.player_header.is_some_and(inside) {
+            return Some(DemoTimelineHit::TogglePlayerList);
         }
-        if inside(layout.play) {
-            return Some(DemoTimelineHit::PlayPause);
+        for (i, row) in layout.player_rows.iter().enumerate() {
+            if inside(*row) {
+                if let Some((client, _)) = session.get(layout.player_start + i) {
+                    return Some(DemoTimelineHit::Player(*client));
+                }
+            }
         }
-        if inside(layout.mark_in) {
-            return Some(DemoTimelineHit::MarkIn);
-        }
-        if inside(layout.mark_out) && self.demo_export_in_ms.is_some() {
-            return Some(DemoTimelineHit::MarkOut);
-        }
-        if inside(layout.export)
-            && self.demo_export_available()
-            && self.demo_export_in_ms.is_some()
-            && self.demo_export_out_ms.is_some()
-        {
-            return Some(DemoTimelineHit::Export);
-        }
-        if inside(layout.export_preset) {
-            return Some(DemoTimelineHit::ExportPreset);
-        }
-        if inside(layout.export_fps) {
-            return Some(DemoTimelineHit::ExportFps);
-        }
-        if inside(layout.export_depth) {
-            return Some(DemoTimelineHit::ExportDepth);
-        }
-        if inside(layout.speed) {
-            return Some(DemoTimelineHit::Speed);
-        }
+        if inside(layout.back) { return Some(DemoTimelineHit::Back); }
+        if inside(layout.play) { return Some(DemoTimelineHit::PlayPause); }
+        if inside(layout.forward) { return Some(DemoTimelineHit::Forward); }
+        if inside(layout.recorded) { return Some(DemoTimelineHit::Recorded); }
+        if inside(layout.free) { return Some(DemoTimelineHit::Free); }
+        if inside(layout.speed) { return Some(DemoTimelineHit::Speed); }
         if inside(layout.track) {
-            let fraction = ((point[0] - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0);
-            return Some(DemoTimelineHit::Track(fraction));
+            return Some(DemoTimelineHit::Track(
+                ((point[0] - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0)
+            ));
         }
         None
+    }
+
+    /// Wheel-scrolling is restricted to the POV card while +speed releases the
+    /// cursor. Other demo wheel bindings continue to work outside this card.
+    pub(in crate::app) fn demo_player_list_hovered(&self) -> bool {
+        if !self.demo_playback_active() || self.overlay != OverlayMode::None
+            || !self.live_buttons.contains("+speed") { return false; }
+        let Some(window) = self.window.as_ref() else { return false; };
+        let size = window.inner_size();
+        let count = self.game_session.as_ref().map_or(0, |s| s.demo_visible_players().len());
+        let Some(layout) = ui::demo_timeline_layout(size.width, size.height,
+            count, self.demo_player_list_scroll, self.demo_player_list_open) else { return false; };
+        self.demo_player_list_open && layout.player_panel.is_some_and(|r| ui::flex::contains(r,
+            [self.cursor_position.0 as f32, self.cursor_position.1 as f32]))
+    }
+
+    pub(in crate::app) fn scroll_demo_player_list(&mut self, delta: i32) {
+        let Some(window) = self.window.as_ref() else { return; };
+        let size = window.inner_size();
+        let count = self.game_session.as_ref().map_or(0, |s| s.demo_visible_players().len());
+        let Some(layout) = ui::demo_timeline_layout(size.width, size.height,
+            count, self.demo_player_list_scroll, self.demo_player_list_open) else { return; };
+        let max_scroll = count.saturating_sub(layout.player_rows.len());
+        self.demo_player_list_scroll = (self.demo_player_list_scroll as i32)
+            .saturating_add(delta).clamp(0, max_scroll as i32) as usize;
+        self.publish_transient_ui();
     }
 
     pub(in crate::app) fn toggle_demo_pause_ui(&mut self) {
@@ -470,7 +455,7 @@ impl App {
         let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
             return;
         };
-        let Some(layout) = ui::demo_timeline_layout(size.width, size.height) else {
+        let Some(layout) = ui::demo_timeline_layout(size.width, size.height, 0, 0, false) else {
             return;
         };
         let fraction = ((x as f32 - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0);

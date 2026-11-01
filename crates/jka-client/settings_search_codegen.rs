@@ -36,6 +36,8 @@ const SOURCES: &[(&str, usize, &str)] = &[
     ("src/app/egui_settings/water.rs", 3, "Surface"),
     ("src/app/egui_settings/water.rs", 3, "Water"),
     ("src/app/egui_settings/blue_water.rs", 3, "Water"),
+    ("src/app/egui_settings/river.rs", 3, "River"),
+    ("src/app/egui_settings/river_sources.rs", 3, "River"),
     ("src/app/egui_settings/fog.rs", 3, "Weather"),
     ("src/app/egui_settings/glass.rs", 3, "Glass"),
     ("src/app/egui_settings/optimizations.rs", 3, "Optimizations"),

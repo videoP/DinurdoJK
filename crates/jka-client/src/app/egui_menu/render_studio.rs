@@ -94,12 +94,12 @@ fn bounds_rect(root:egui::Pos2,b:render_studio_layout::Bounds)->egui::Rect {
 fn collapsed_rail(ui:&mut egui::Ui,rect:egui::Rect,title:&str,expand_icon:Icon,id:&str)->bool {
     let r=ui.interact(rect,ui.make_persistent_id(id),egui::Sense::click());
     let p=ui.painter();
-    p.rect_filled(rect,2.0,if r.hovered(){theme::CONTROL}else{sui::PANE});
+    p.rect_filled(rect,2.0,if r.hovered(){theme::CONTROL()}else{sui::PANE()});
     sui::paint_icon(p,egui::pos2(rect.center().x,rect.top()+15.0),expand_icon,
-        if r.hovered(){theme::TEXT}else{theme::TEXT_DIM});
-    let galley=p.layout_no_wrap(title.to_owned(),egui::FontId::proportional(11.5),theme::TEXT_FAINT);
+        if r.hovered(){theme::TEXT()}else{theme::TEXT_DIM()});
+    let galley=p.layout_no_wrap(title.to_owned(),egui::FontId::proportional(11.5),theme::TEXT_FAINT());
     let pos=egui::pos2(rect.center().x+galley.size().y*0.5,rect.top()+38.0);
-    p.add(egui::epaint::TextShape::new(pos,galley,theme::TEXT_FAINT).with_angle(std::f32::consts::FRAC_PI_2));
+    p.add(egui::epaint::TextShape::new(pos,galley,theme::TEXT_FAINT()).with_angle(std::f32::consts::FRAC_PI_2));
     r.on_hover_text(format!("Expand {}",title.to_ascii_lowercase())).clicked()
 }
 
@@ -229,7 +229,7 @@ impl App {
             .map(|clip|defaults.effective(&clip.hud_overrides)).unwrap_or(defaults);
         if virtual_layout.snap_to_grid {
             let grid=virtual_layout.grid_size.clamp(1.,64.);
-            let color=egui::Color32::from_rgba_premultiplied(90,180,220,28);
+            let color=crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(90,180,220,28), egui::Color32::from_rgba_premultiplied(20,24,19,28));
             let step_x=grid/1280.*viewport.width();
             let step_y=grid/720.*viewport.height();
             let mut x=viewport.left();
@@ -300,14 +300,14 @@ impl App {
                 ui.ctx().request_repaint();
             }
             if response.drag_stopped(){self.render_studio.hud_drag_origin=None;}
-            let color=if selected {theme::ACCENT}else{theme::TEXT_DIM};
+            let color=if selected {theme::ACCENT()}else{theme::TEXT_DIM()};
             ui.painter().rect_stroke(rect,3.,egui::Stroke::new(if selected {2.} else {1.},color),
                 egui::StrokeKind::Inside);
             let label=if id==HudElementId::CrosshairName {"CROSSHAIR"}
                 else if id==HudElementId::Fps {"GAME TIMER"}else{id.label()};
             let tag=ui.painter().layout_no_wrap(label.to_owned(),egui::FontId::proportional(10.),color);
             let tag_pos=egui::pos2(rect.left()+3.,(rect.top()+3.).min(viewport.bottom()-12.));
-            ui.painter().rect_filled(egui::Rect::from_min_size(tag_pos,tag.size()+egui::vec2(6.,2.)),2.,theme::SURFACE);
+            ui.painter().rect_filled(egui::Rect::from_min_size(tag_pos,tag.size()+egui::vec2(6.,2.)),2.,theme::SURFACE());
             ui.painter().galley(tag_pos+egui::vec2(3.,1.),tag,color);
             if selected {
                 // Bottom-right resize grip scales the actual native HUD. The
@@ -393,7 +393,7 @@ impl App {
                                 egui::Align2::LEFT_TOP,
                                 if matched[0] && (!matched[1] || x_diff<=y_diff) {"MATCH WIDTH"}
                                 else {"MATCH HEIGHT"},
-                                egui::FontId::proportional(10.),theme::ACCENT);
+                                egui::FontId::proportional(10.),theme::ACCENT());
                         }
                     }
                     let mut candidate=virtual_layout.element(id);
@@ -410,12 +410,12 @@ impl App {
         }
         ui.painter().text(egui::pos2(viewport.left()+8.,viewport.bottom()-8.),
             egui::Align2::LEFT_BOTTOM,"HUD EDIT · drag to grid/neighbor edges · corner scales to grid/nearby size · Alt bypasses",
-            egui::FontId::proportional(11.),theme::ACCENT);
+            egui::FontId::proportional(11.),theme::ACCENT());
     }
 
     fn egui_studio_hud_inspector(&mut self,ui:&mut egui::Ui) {
         use crate::ui::{HudAnchor,HudLayout};
-        sui::inspector_title(ui,theme::ACCENT,"Studio HUD","Export layout",
+        sui::inspector_title(ui,theme::ACCENT(),"Studio HUD","Export layout",
             "Drag on the Program Preview. This layout is saved to the selected Studio CFG, never to gameplay.");
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("Copy gameplay").clicked() {
@@ -493,7 +493,7 @@ impl App {
         if self.render_studio.hud_layout.snap_to_grid {
             ui.add(egui::Slider::new(&mut self.render_studio.hud_layout.grid_size,1.0..=64.0).text("Grid size"));
         }
-        ui.label(egui::RichText::new("Reference: 1280×720. Move snaps visible edges to grid and adjacent panels; scaling uses grid-sized widths/heights and nearby matches. Alt bypasses snapping. Studio CFGs are separate.").size(11.).color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new("Reference: 1280×720. Move snaps visible edges to grid and adjacent panels; scaling uses grid-sized widths/heights and nearby matches. Alt bypasses snapping. Studio CFGs are separate.").size(11.).color(theme::TEXT_DIM()));
     }
 
     pub(super) fn studio_locked(&self)->bool {
@@ -507,11 +507,11 @@ impl App {
             sui::editor_style(ui);
             ui.spacing_mut().item_spacing.x=2.0;
             let (bar,_)=ui.allocate_exact_size(egui::vec2(1.0,18.0),egui::Sense::hover());
-            ui.painter().rect_filled(bar,0.0,theme::LINE);
+            ui.painter().rect_filled(bar,0.0,theme::LINE());
             ui.add_space(12.0);
             let name=if self.render_studio.project_name.trim().is_empty() {"Untitled project"}
                 else {self.render_studio.project_name.as_str()};
-            ui.label(egui::RichText::new(name).size(13.0).color(theme::TEXT))
+            ui.label(egui::RichText::new(name).size(13.0).color(theme::TEXT()))
                 .on_hover_text(format!("Project file: {}",self.studio_project_path().display()));
             ui.add_space(14.0);
             if sui::icon_button(ui,Icon::Undo,!locked,false,"Undo (Ctrl+Z)").clicked()
@@ -640,7 +640,7 @@ impl App {
                 egui::Rect::from_min_max(egui::pos2(root.left(),viewport.bottom()),root.max),
                 egui::Rect::from_min_max(egui::pos2(root.left(),viewport.top()),egui::pos2(viewport.left(),viewport.bottom())),
                 egui::Rect::from_min_max(egui::pos2(viewport.right(),viewport.top()),egui::pos2(root.right(),viewport.bottom())),
-            ] {p.rect_filled(band,0.0,sui::GUTTER);}
+            ] {p.rect_filled(band,0.0,sui::GUTTER());}
         }
         // The pane gutters double as resizing handles. The anchor is stored
         // on pointer-down, so resizing has no cumulative drag feedback.
@@ -672,7 +672,7 @@ impl App {
                 let line=if kind==2 {
                     egui::Rect::from_center_size(c,egui::vec2(grip.width(),2.0))
                 } else {egui::Rect::from_center_size(c,egui::vec2(2.0,grip.height()))};
-                ui.painter().rect_filled(line,1.0,theme::ACCENT_DEEP);
+                ui.painter().rect_filled(line,1.0,theme::ACCENT_DEEP());
             }
             if r.drag_started() {
                 if let Some(pos)=r.interact_pointer_pos() {
@@ -777,7 +777,7 @@ impl App {
         }
         let demo_ready = demo_footage && self.studio_demo_scene_active();
         if demo_footage && !demo_ready {
-            ui.painter().rect_filled(viewport,0.0,sui::WELL);
+            ui.painter().rect_filled(viewport,0.0,sui::WELL());
         }
         let header=rect(panels.preview_header);
         let tools=sui::pane_header(ui.painter(),header,
@@ -857,7 +857,7 @@ impl App {
         }
         self.egui_studio_hud_overlay(ui,viewport,locked);
         self.egui_studio_viewport_hints(ui,viewport,demo_footage,demo_ready);
-        ui.painter().rect_stroke(viewport,0.0,egui::Stroke::new(1.0,theme::HAIRLINE),egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(viewport,0.0,egui::Stroke::new(1.0,theme::HAIRLINE()),egui::StrokeKind::Inside);
         self.egui_studio_transport(ui,rect(panels.transport),locked);
 
         // ---- Inspector ----------------------------------------------------
@@ -1104,7 +1104,7 @@ impl App {
         }
         if self.profile_dynamic_models.is_empty() {
             sui::overlay_pill(&painter,viewport.center_bottom()+egui::vec2(0.0,-14.0),egui::Align2::CENTER_BOTTOM,
-                "No character surfaces produced for this model / animation — see console",theme::WARNING,12.0);
+                "No character surfaces produced for this model / animation: see console",theme::WARNING(),12.0);
             return;
         }
         let first = active[0];
@@ -1118,7 +1118,7 @@ impl App {
         let direction=(center-camera.position).normalize_or_zero();
         if self.render_studio.spatial.scene_camera.is_none() && camera.forward().dot(direction) < 0.8 {
             sui::overlay_pill(&painter,viewport.center_bottom()+egui::vec2(0.0,-14.0),egui::Align2::CENTER_BOTTOM,
-                "Camera is pointed away from the character — use Frame actor in the transport bar",theme::WARNING,12.0);
+                "Camera is pointed away from the character: use Frame actor in the transport bar",theme::WARNING(),12.0);
         }
     }
 
@@ -1126,8 +1126,8 @@ impl App {
     fn egui_studio_transport(&mut self,ui:&mut egui::Ui,rect:egui::Rect,locked:bool) {
         {
             let p=ui.painter();
-            p.rect_filled(rect,egui::CornerRadius{nw:0,ne:0,sw:2,se:2},sui::PANE_HEADER);
-            p.line_segment([rect.left_top(),rect.right_top()],egui::Stroke::new(1.0,theme::HAIRLINE));
+            p.rect_filled(rect,egui::CornerRadius{nw:0,ne:0,sw:2,se:2},sui::PANE_HEADER());
+            p.line_segment([rect.left_top(),rect.right_top()],egui::Stroke::new(1.0,theme::HAIRLINE()));
         }
         if self.render_studio.cinematic_preview.is_some() {
             self.egui_studio_cinematic_transport(ui,rect);
@@ -1138,7 +1138,7 @@ impl App {
         let duration=self.render_studio.timeline.duration();
         let row=rect.shrink2(egui::vec2(sui::PAD,0.0));
         sui::region(ui,row,"studio_transport_left",egui::Layout::left_to_right(egui::Align::Center),|ui| {
-            ui.label(egui::RichText::new(sui::timecode(t,fps)).monospace().size(16.0).color(theme::ACCENT))
+            ui.label(egui::RichText::new(sui::timecode(t,fps)).monospace().size(16.0).color(theme::ACCENT()))
                 .on_hover_text(format!("Playhead {t:.3} s · timecode at the {fps} fps export rate"));
         });
         let center=egui::Rect::from_center_size(rect.center(),egui::vec2(5.0*26.0+4.0*4.0,26.0));
@@ -1167,7 +1167,7 @@ impl App {
         });
         sui::region(ui,row,"studio_transport_right",egui::Layout::right_to_left(egui::Align::Center),|ui| {
             ui.spacing_mut().item_spacing.x=2.0;
-            ui.label(egui::RichText::new(sui::timecode(duration,fps)).monospace().size(12.5).color(theme::TEXT_FAINT))
+            ui.label(egui::RichText::new(sui::timecode(duration,fps)).monospace().size(12.5).color(theme::TEXT_FAINT()))
                 .on_hover_text(format!("Timeline duration {duration:.2} s"));
             ui.add_space(10.0);
             let snap=self.render_studio.timeline.snap;
@@ -1185,7 +1185,7 @@ impl App {
             // In this right-to-left region, the icon is visually left of the slider.
             ui.add_space(8.0);
             let mut volume=self.render_studio.preview_volume;
-            ui.label(egui::RichText::new(format!("{:.0}%",volume*100.0)).size(11.5).color(theme::TEXT_DIM));
+            ui.label(egui::RichText::new(format!("{:.0}%",volume*100.0)).size(11.5).color(theme::TEXT_DIM()));
             ui.spacing_mut().slider_width=86.0;
             if ui.add(egui::Slider::new(&mut volume,0.0..=1.0).show_value(false))
                 .on_hover_text(format!("Preview volume: {:.0}% (does not affect exports)",volume*100.0))
@@ -1193,7 +1193,7 @@ impl App {
                 self.render_studio.preview_volume=volume;
             }
             let (icon_rect,icon_response)=ui.allocate_exact_size(egui::vec2(17.0,20.0),egui::Sense::hover());
-            sui::paint_icon(ui.painter(),icon_rect.center(),Icon::Audio,theme::TEXT_DIM);
+            sui::paint_icon(ui.painter(),icon_rect.center(),Icon::Audio,theme::TEXT_DIM());
             icon_response.on_hover_text("Preview playback volume: demo audio and imported tracks only");
         });
     }
@@ -1211,15 +1211,15 @@ impl App {
                 preview.toggle();changed=true;
             }
             let duration=preview.clip.duration();let mut time=preview.elapsed();
-            ui.label(egui::RichText::new(format!("{time:.2}")).monospace().size(13.0).color(theme::ACCENT));
+            ui.label(egui::RichText::new(format!("{time:.2}")).monospace().size(13.0).color(theme::ACCENT()));
             ui.spacing_mut().slider_width=(ui.available_width()-430.0).max(60.0);
             if ui.add(egui::Slider::new(&mut time,0.0..=duration).show_value(false)).changed() {
                 preview.seek(time);changed=true;
             }
-            ui.label(egui::RichText::new(format!("{duration:.2}s")).monospace().size(12.0).color(theme::TEXT_FAINT));
+            ui.label(egui::RichText::new(format!("{duration:.2}s")).monospace().size(12.0).color(theme::TEXT_FAINT()));
             ui.add_space(8.0);
             changed|=sui::toggle(ui,&mut preview.emote.looping).on_hover_text("Loop the source preview").changed();
-            ui.label(egui::RichText::new("Loop").size(12.0).color(theme::TEXT_DIM));
+            ui.label(egui::RichText::new("Loop").size(12.0).color(theme::TEXT_DIM()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                 if sui::button(ui,Some(Icon::Plus),"Add at playhead",ButtonKind::Primary,true).clicked() {
                     add=Some((preview.clip.clone(),preview.lane));
@@ -1237,14 +1237,14 @@ impl App {
 
     fn egui_render_studio_library_footer(&mut self,ui:&mut egui::Ui,rect:egui::Rect) {
         let p=ui.painter();
-        p.line_segment([rect.left_top(),rect.right_top()],egui::Stroke::new(1.0,theme::HAIRLINE));
+        p.line_segment([rect.left_top(),rect.right_top()],egui::Stroke::new(1.0,theme::HAIRLINE()));
         let text=match self.render_studio.media_tab {
             StudioMediaTab::Demos=>"Drag a demo onto the DEMO POV track",
             StudioMediaTab::Cutscenes=>"Click to preview · drag onto a character track",
             _=>"Drag onto a character track",
         };
         p.with_clip_rect(rect.shrink2(egui::vec2(sui::PAD,0.0))).text(egui::pos2(rect.left()+sui::PAD,rect.center().y),
-            egui::Align2::LEFT_CENTER,text,egui::FontId::proportional(11.0),theme::TEXT_FAINT);
+            egui::Align2::LEFT_CENTER,text,egui::FontId::proportional(11.0),theme::TEXT_FAINT());
     }
 
     fn egui_render_studio_media_library(&mut self, ui: &mut egui::Ui, inspector_inline: bool) {
@@ -1287,7 +1287,7 @@ impl App {
                         if choices.is_empty(){sui::hint(ui,"No matching emotes.");}
                         for choice in choices {app.egui_render_studio_media_tile(ui,choice,locked);}
                     }
-                    Err(_)=>sui::callout(ui,"Fortnite emote catalog unavailable.",theme::WARNING),
+                    Err(_)=>sui::callout(ui,"Fortnite emote catalog unavailable.",theme::WARNING()),
                 });
             }
             StudioMediaTab::Cutscenes => self.studio_media_list(ui,"studio_cinematic_list",inspector_inline,
@@ -1317,7 +1317,7 @@ impl App {
     fn egui_render_studio_demo_library(&mut self,ui:&mut egui::Ui,locked:bool) {
         self.ensure_demo_catalog();
         if let Some(error)=&self.demo_catalog_error {
-            sui::callout(ui,&format!("Demo scan failed: {error}"),theme::WARNING);return;
+            sui::callout(ui,&format!("Demo scan failed: {error}"),theme::WARNING());return;
         }
         ui.spacing_mut().item_spacing.y=5.0;
         let games=self.demo_game_choices.clone();
@@ -1357,7 +1357,7 @@ impl App {
         if self.render_studio.scene_capacity != usize::MAX {
             status.push_str(&format!(" · GPU memory limit: {} kept", self.render_studio.scene_capacity.max(1)));
         }
-        ui.label(egui::RichText::new(status).small().color(theme::TEXT_FAINT));
+        ui.label(egui::RichText::new(status).small().color(theme::TEXT_FAINT()));
         ui.add_enabled_ui(!locked,|ui| {
             if sui::button(ui,Some(Icon::Open),"Import DM26 from PC…",ButtonKind::Primary,true).clicked() {
                 self.render_studio.file_picker.open(crate::app::render_studio_picker::StudioPickerKind::Demo);
@@ -1431,7 +1431,7 @@ impl App {
             let reference=clip.comparison.as_ref().map(|race| {
                 let runner=&race.runners[race.reference];(runner.name.clone(),runner.game.clone())
             });
-            sui::callout(ui,"All runners remain active throughout this ghost race. Add recordings to the timeline, then regenerate in Director to change the group.",theme::ACCENT);
+            sui::callout(ui,"All runners remain active throughout this ghost race. Add recordings to the timeline, then regenerate in Director to change the group.",theme::ACCENT());
             if let Some(race)=clip.comparison.as_mut() {
                 studio_overlay_style_section(ui,&mut race.style,&mut self.render_studio.overlay_fonts,
                     &mut self.render_studio.overlay_fonts_job,&mut self.render_studio.overlay_font_filter);
@@ -1480,7 +1480,7 @@ impl App {
                 studio_trail_color_picker(ui,auto_color,&mut setting.trail_color);
                 if let Some(runtime)=self.render_studio.race_runtime.iter().find(|r|
                     r.key==(clip.name.clone(),clip.game.clone())) {
-                    if let Some(error)=&runtime.error{sui::callout(ui,error,theme::WARNING);}
+                    if let Some(error)=&runtime.error{sui::callout(ui,error,theme::WARNING());}
                     else if runtime.ghost.is_some(){sui::hint(ui,"Race route ready");}
                     else{sui::hint(ui,"Decoding POV race route…");}
                 } else {sui::hint(ui,"Waiting for race route…");}
@@ -1520,7 +1520,7 @@ impl App {
                         for name in names {
                             let added=self.render_studio.timeline.demos[clip_index].race_overlays.iter()
                                 .any(|o|o.name==name && o.game==game);
-                            if ui.add_enabled(!added,egui::Button::new(format!("{}{}",if added{"✓ "}else{""},name)))
+                            if ui.add_enabled(!added,egui::Button::new(format!("{}{}",if added{"ADDED  "}else{""},name)))
                                 .on_hover_text(if added {"Already attached"}else{"Add this recording's race actor"}).clicked() {
                                 self.toggle_studio_race_overlay_for_demo(clip_index,name,game.clone());
                                 ui.close();
@@ -1539,7 +1539,7 @@ impl App {
                 ui.push_id(("clip_composite",clip_index,index),|ui| {
                     ui.horizontal(|ui| {
                         state_changed |= sui::toggle(ui,&mut setting.enabled).changed();
-                        ui.add(egui::Label::new(egui::RichText::new(&setting.name).size(12.5).color(theme::TEXT)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(&setting.name).size(12.5).color(theme::TEXT())).truncate());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                             if sui::icon_button(ui,Icon::Close,true,false,"Remove from this demo").clicked(){remove=Some((setting.name.clone(),setting.game.clone()));}
                         });
@@ -1556,7 +1556,7 @@ impl App {
                         studio_trail_color_picker(ui,setting.auto_trail_color(),&mut setting.trail_color);
                     });
                     if let Some(runtime)=self.render_studio.race_runtime.iter().find(|r|r.key==(setting.name.clone(),setting.game.clone())) {
-                        if let Some(error)=&runtime.error{sui::callout(ui,error,theme::WARNING);}
+                        if let Some(error)=&runtime.error{sui::callout(ui,error,theme::WARNING());}
                         else if runtime.ghost.is_some(){sui::hint(ui,"Ready · synced to race reset");}
                         else{sui::hint(ui,"Decoding local recording…");}
                     }else if setting.enabled{sui::hint(ui,"Waiting for race source…");}
@@ -1690,9 +1690,9 @@ impl App {
     /// layer row actions (e.g. the race-actor button) over it.
     pub(super) fn egui_render_studio_media_tile(&mut self,ui:&mut egui::Ui,asset:StudioMediaDrag,locked:bool)->egui::Response {
         let (icon,tint)=if asset.demo_game.is_some() {(Icon::Demo,sui::DEMO)}
-            else if asset.cinematic.is_some() {(Icon::Cinematic,theme::WARNING)}
+            else if asset.cinematic.is_some() {(Icon::Cinematic,theme::WARNING())}
             else if asset.emote_id.is_some() {(Icon::Emote,sui::SPEED)}
-            else {(Icon::Anim,theme::ACCENT)};
+            else {(Icon::Anim,theme::ACCENT())};
         let meta=if asset.demo_game.is_some() {
             if let Some(meta)=self.demo_metadata_cache.get(&asset.name) {Self::format_demo_time(meta.duration_ms)}
             else if self.demo_metadata_inflight.contains(&asset.name) {"indexing…".to_owned()} else {String::new()}
@@ -1833,7 +1833,7 @@ impl App {
                 if !can_export_alpha { self.render_studio.transparent = false; }
                 sui::prop_toggle(ui,"Depth EXR",&mut self.render_studio.export_depth)
                     .on_hover_text("Also write a 32-bit float EXR depth sequence: camera-to-surface radial JKA units, empty pixels are 1,000,000.");
-                if has_demos {sui::callout(ui,"Native demo footage exports opaque; recorded audio is not exported yet.",theme::WARNING);}
+                if has_demos {sui::callout(ui,"Native demo footage exports opaque; recorded audio is not exported yet.",theme::WARNING());}
                 if self.render_studio.transparent {
                     sui::hint(ui,match self.render_studio.preset {
                         StudioVideoFormat::Gif => "GIF alpha is 1-bit (threshold 128): soft hair and glow edges become solid or transparent. GIF loops forever.",
@@ -1905,14 +1905,14 @@ impl App {
     fn studio_modal<R>(ctx:&egui::Context,id:&str,title:&str,width:f32,add:impl FnOnce(&mut egui::Ui)->R)->(bool,R) {
         let response=egui::Modal::new(egui::Id::new(id))
             .backdrop_color(egui::Color32::from_black_alpha(140))
-            .frame(egui::Frame::new().fill(sui::PANE).stroke(egui::Stroke::new(1.0,theme::LINE_STRONG))
+            .frame(egui::Frame::new().fill(sui::PANE()).stroke(egui::Stroke::new(1.0,theme::LINE_STRONG()))
                 .corner_radius(4).inner_margin(egui::Margin::same(14)))
             .show(ctx,|ui| {
                 sui::editor_style(ui);
                 ui.set_width(width);
                 let mut close=false;
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(title).size(16.0).color(theme::TEXT));
+                    ui.label(egui::RichText::new(title).size(16.0).color(theme::TEXT()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                         close=sui::icon_button(ui,Icon::Close,true,false,"Close (Esc)").clicked();
                     });
@@ -1971,7 +1971,7 @@ impl App {
                     ||entry.skin_name.to_ascii_lowercase().contains(&search)).collect();
             sui::hint(ui,&format!("{} models / skins",models.len()));
             let current=self.render_studio.actor_model(lane);
-            if sui::list_row(ui,Icon::Layers,theme::TEXT_FAINT,"Project default model","",current.is_empty(),egui::Sense::click()).clicked() {
+            if sui::list_row(ui,Icon::Layers,theme::TEXT_FAINT(),"Project default model","",current.is_empty(),egui::Sense::click()).clicked() {
                 selected=Some(String::new());
             }
             ui.separator();
@@ -2050,7 +2050,7 @@ impl App {
                         let to_x=|t:f64|x0+(t as f32-scroll)*zoom;
                         let from_x=|x:f32|((x-x0)/zoom+scroll).max(0.0) as f64;
                         let painter=ui.painter().with_clip_rect(draw);
-                        painter.rect_filled(draw,0.0,sui::WELL);
+                        painter.rect_filled(draw,0.0,sui::WELL());
                         for row in 0..rows {
                             let y=draw.top()+ruler_h+row as f32*lane_h;
                             let kind=self.render_studio.timeline.row_kind(row);
@@ -2058,8 +2058,8 @@ impl App {
                                 StudioTrackRow::AudioVolume(_)|StudioTrackRow::Motion(_)|StudioTrackRow::Speed(_)|StudioTrackRow::Light(_, _)));
                             let lane_rect=egui::Rect::from_min_max(egui::pos2(x0,y),egui::pos2(right,y+lane_h));
                             let head=egui::Rect::from_min_max(egui::pos2(draw.left(),y),egui::pos2(x0,y+lane_h));
-                            painter.rect_filled(lane_rect,0.0,if row%2==0 {sui::LANE_A} else {sui::LANE_B});
-                            painter.rect_filled(head,0.0,if sub_row {sui::PANE} else {sui::PANE_HEADER});
+                            painter.rect_filled(lane_rect,0.0,if row%2==0 {sui::LANE_A()} else {sui::LANE_B()});
+                            painter.rect_filled(head,0.0,if sub_row {sui::PANE()} else {sui::PANE_HEADER()});
                             let actor_lane=if let Some(StudioTrackRow::Character(lane))=kind {Some(lane)}else{None};
                             let actor_row=actor_lane.is_some();
                             let demo_layer=if let Some(StudioTrackRow::Demo(layer))=kind {Some(layer)}else{None};
@@ -2091,9 +2091,9 @@ impl App {
                                 Some(StudioTrackRow::DemoAudio(_)|StudioTrackRow::Audio(_)|StudioTrackRow::AudioVolume(_))=>sui::AUDIO,
                                 Some(StudioTrackRow::Character(lane)|StudioTrackRow::Motion(lane))=>studio_layer_color(lane),
                                 Some(StudioTrackRow::Speed(_))=>sui::SPEED,
-                                Some(StudioTrackRow::Camera)=>sui::CAMERA,
+                                Some(StudioTrackRow::Camera)=>sui::CAMERA(),
                                 Some(StudioTrackRow::LightLayer(_)|StudioTrackRow::Light(_, _))=>super::render_studio_lights::LIGHT,
-                                None=>theme::TEXT_DIM,
+                                None=>theme::TEXT_DIM(),
                             };
                             // Track color tab, indented under its parent for sub-tracks.
                             let tab_x=draw.left()+if sub_row {16.0} else {2.0};
@@ -2106,7 +2106,7 @@ impl App {
                             painter.with_clip_rect(egui::Rect::from_min_max(egui::pos2(text_x,y),egui::pos2(text_right,y+lane_h)))
                                 .text(egui::pos2(text_x,y+lane_h/2.0),egui::Align2::LEFT_CENTER,label,
                                     egui::FontId::proportional(if sub_row {11.0} else {12.0}),
-                                    if !visible {theme::TEXT_DISABLED} else if sub_row {theme::TEXT_FAINT} else {theme::TEXT});
+                                    if !visible {theme::TEXT_DISABLED()} else if sub_row {theme::TEXT_FAINT()} else {theme::TEXT()});
                             if let Some(kind)=kind {self.egui_studio_light_header(ui,&painter,head,kind,locked);}
                             // Vector chevrons: the embedded font lacks triangle glyphs.
                             if actor_row || demo_layer.is_some() {
@@ -2117,7 +2117,7 @@ impl App {
                                 let toggle_rect=egui::Rect::from_center_size(center,egui::vec2(22.0,lane_h));
                                 let hovered=!locked && ui.rect_contains_pointer(toggle_rect);
                                 sui::paint_icon(&painter,center,if expanded {Icon::ChevronDown} else {Icon::ChevronRight},
-                                    if hovered {theme::TEXT} else {theme::TEXT_FAINT});
+                                    if hovered {theme::TEXT()} else {theme::TEXT_FAINT()});
                                 if !locked {
                                     let toggle=ui.interact(toggle_rect,
                                         ui.make_persistent_id(("studio_expand_speed",lane,demo_layer)),egui::Sense::click());
@@ -2137,7 +2137,7 @@ impl App {
                                     egui::vec2(22.0,22.0));
                                 let eye_hovered=!locked && ui.rect_contains_pointer(eye_rect);
                                 sui::paint_icon(&painter,eye_rect.center(),if visible {Icon::Eye} else {Icon::EyeOff},
-                                    if eye_hovered {theme::TEXT} else if visible {theme::TEXT_DIM} else {theme::TEXT_DISABLED});
+                                    if eye_hovered {theme::TEXT()} else if visible {theme::TEXT_DIM()} else {theme::TEXT_DISABLED()});
                                 if !locked {
                                     let eye=ui.interact(eye_rect,ui.make_persistent_id(("studio_lane_eye",lane)),egui::Sense::click());
                                     if eye.clicked() {
@@ -2150,7 +2150,7 @@ impl App {
                                     let r=ui.interact(label_rect,ui.make_persistent_id(("studio_actor_model",lane)),egui::Sense::click());
                                     if r.hovered() {
                                         painter.rect_stroke(label_rect.shrink2(egui::vec2(2.0,5.0)),3.0,
-                                            egui::Stroke::new(1.0,theme::LINE),egui::StrokeKind::Inside);
+                                            egui::Stroke::new(1.0,theme::LINE()),egui::StrokeKind::Inside);
                                     }
                                     if r.clicked(){self.render_studio.model_picker_lane=Some(lane);}
                                     if r.secondary_clicked(){self.render_studio.context_lane=Some(lane);}
@@ -2192,7 +2192,7 @@ impl App {
                                     egui::vec2(22.0,22.0));
                                 let eye_hovered=!locked && ui.rect_contains_pointer(eye_rect);
                                 sui::paint_icon(&painter,eye_rect.center(),if visible {Icon::Eye} else {Icon::EyeOff},
-                                    if eye_hovered {theme::TEXT} else if visible {theme::TEXT_DIM} else {theme::TEXT_DISABLED});
+                                    if eye_hovered {theme::TEXT()} else if visible {theme::TEXT_DIM()} else {theme::TEXT_DISABLED()});
                                 if !locked {
                                     let eye=ui.interact(eye_rect,ui.make_persistent_id(("studio_demo_layer_eye",layer)),egui::Sense::click());
                                     if eye.clicked() {
@@ -2206,7 +2206,7 @@ impl App {
                                 }
                             }
                             painter.line_segment([egui::pos2(draw.left(),y+lane_h-0.5),egui::pos2(right,y+lane_h-0.5)],
-                                egui::Stroke::new(1.0,theme::HAIRLINE));
+                                egui::Stroke::new(1.0,theme::HAIRLINE()));
                         }
                         // The insertion ghost uses the SAME forward-fit logic as
                         // add_clip/add_demo. It never displays a false 0-second
@@ -2228,13 +2228,13 @@ impl App {
                                     self.render_studio.timeline.character_row(target_lane.unwrap_or(0))};
                                 let y=draw.top()+ruler_h+target_row as f32*lane_h;
                                 let track=egui::Rect::from_min_size(egui::pos2(x0,y),egui::vec2(right-x0,lane_h));
-                                painter.rect_stroke(track.shrink(1.0),3.0,egui::Stroke::new(2.0,theme::ACCENT),egui::StrokeKind::Inside);
+                                painter.rect_stroke(track.shrink(1.0),3.0,egui::Stroke::new(2.0,theme::ACCENT()),egui::StrokeKind::Inside);
                                 if new_track {
                                     let head=egui::Rect::from_min_max(egui::pos2(draw.left(),y),egui::pos2(x0,y+lane_h));
-                                    painter.rect_filled(head,0.0,sui::PANE_HEADER);
+                                    painter.rect_filled(head,0.0,sui::PANE_HEADER());
                                     painter.text(head.left_center()+egui::vec2(14.0,0.0),egui::Align2::LEFT_CENTER,
                                         if is_demo {"+ New demo layer"} else {"+ New character track"},
-                                        egui::FontId::proportional(11.5),theme::ACCENT);
+                                        egui::FontId::proportional(11.5),theme::ACCENT());
                                 }
                                 let duration=if let Some(duration)=self.render_studio.media_drag_duration {
                                     Some(duration)
@@ -2260,10 +2260,10 @@ impl App {
                                 let ghost=egui::Rect::from_min_size(egui::pos2(px,y+5.0),
                                     egui::vec2(duration_pixels.min((right-px).max(1.0)),lane_h-10.0));
                                 if px<=right {
-                                    painter.rect_filled(ghost,3.0,theme::ACCENT.gamma_multiply(0.28));
-                                    painter.rect_stroke(ghost,3.0,egui::Stroke::new(1.5,theme::ACCENT),egui::StrokeKind::Inside);
+                                    painter.rect_filled(ghost,3.0,theme::ACCENT().gamma_multiply(0.28));
+                                    painter.rect_stroke(ghost,3.0,egui::Stroke::new(1.5,theme::ACCENT()),egui::StrokeKind::Inside);
                                     painter.line_segment([egui::pos2(px,y),egui::pos2(px,y+lane_h)],
-                                        egui::Stroke::new(2.0,theme::ACCENT));
+                                        egui::Stroke::new(2.0,theme::ACCENT()));
                                 }
                                 painter.text(pointer+egui::vec2(12.0,-16.0),egui::Align2::LEFT_CENTER,
                                     if duration.is_some() {format!("{} at {:.2}s",asset.name,projected)}
@@ -2272,12 +2272,12 @@ impl App {
                             }
                         }
                         let bottom=draw.top()+ruler_h+rows as f32*lane_h;
-                        painter.line_segment([egui::pos2(x0,draw.top()),egui::pos2(x0,bottom)],egui::Stroke::new(1.0,theme::LINE));
+                        painter.line_segment([egui::pos2(x0,draw.top()),egui::pos2(x0,bottom)],egui::Stroke::new(1.0,theme::LINE()));
                         // Grid lines follow the ruler's major ticks; labels live in the ruler.
                         for x in studio_ruler_ticks(scroll,zoom,right-x0).into_iter().map(|(t,_)|to_x(t)) {
                             if x<x0||x>right {continue;}
                             painter.line_segment([egui::pos2(x,draw.top()),egui::pos2(x,bottom)],
-                                egui::Stroke::new(1.0,theme::HAIRLINE.gamma_multiply(0.8)));
+                                egui::Stroke::new(1.0,theme::HAIRLINE().gamma_multiply(0.8)));
                         }
                         // Background interaction covers otherwise empty track space. Clip/key
                         // hit rectangles are registered afterwards and take precedence.
@@ -2664,7 +2664,7 @@ impl App {
                             if x2<=x1 {continue;}
                             let speed_rect=egui::Rect::from_min_max(egui::pos2(x1,top+2.0),egui::pos2(x2,top+lane_h-2.0));
                             let painter=painter.with_clip_rect(speed_rect.intersect(painter.clip_rect()));
-                            painter.rect_filled(speed_rect,2.0,sui::WELL.lerp_to_gamma(sui::SPEED,0.12));
+                            painter.rect_filled(speed_rect,2.0,sui::WELL().lerp_to_gamma(sui::SPEED,0.12));
                             let baseline=studio_speed_curve_y(1.0,top,lane_h);
                             painter.line_segment([egui::pos2(x1,baseline),egui::pos2(x2,baseline)],
                                 egui::Stroke::new(0.7,egui::Color32::from_gray(90)));
@@ -2697,7 +2697,7 @@ impl App {
                                 if x2<=x1 {continue;}
                                 let speed_rect=egui::Rect::from_min_max(egui::pos2(x1,top+2.0),egui::pos2(x2,top+lane_h-2.0));
                                 let painter=painter.with_clip_rect(speed_rect.intersect(painter.clip_rect()));
-                                painter.rect_filled(speed_rect,2.0,sui::WELL.lerp_to_gamma(sui::SPEED,0.12));
+                                painter.rect_filled(speed_rect,2.0,sui::WELL().lerp_to_gamma(sui::SPEED,0.12));
                                 let baseline=studio_speed_curve_y(1.0,top,lane_h);
                                 painter.line_segment([egui::pos2(x1,baseline),egui::pos2(x2,baseline)],
                                     egui::Stroke::new(0.7,egui::Color32::from_gray(90)));
@@ -2868,7 +2868,7 @@ impl App {
                                     egui::pos2(r,y+lane_h-4.0));
                                 let muted=clip.audio.mute;
                                 let selected=self.render_studio.timeline.selected_demo==Some(i);
-                                painter.rect_filled(rect,3.0,if muted {sui::clip_body(theme::TEXT_DISABLED,false)}
+                                painter.rect_filled(rect,3.0,if muted {sui::clip_body(theme::TEXT_DISABLED(),false)}
                                     else {sui::clip_body(sui::AUDIO,selected)});
                                 if selected {
                                     painter.rect_stroke(rect,3.0,egui::Stroke::new(1.5,
@@ -3066,7 +3066,7 @@ impl App {
                                 painter.circle_stroke(egui::pos2(x,y),14.0,egui::Stroke::new(2.0,egui::Color32::WHITE));
                             }
                             painter.add(egui::Shape::convex_polygon(vec![egui::pos2(x,y-9.0),egui::pos2(x+9.0,y),egui::pos2(x,y+9.0),egui::pos2(x-9.0,y)],
-                                if selected {egui::Color32::from_rgb(255,214,140)} else {sui::CAMERA},egui::Stroke::new(1.0,if selected {egui::Color32::WHITE} else {sui::WELL})));
+                                if selected {egui::Color32::from_rgb(255,214,140)} else {sui::CAMERA()},egui::Stroke::new(1.0,if selected {egui::Color32::WHITE} else {sui::WELL()})));
                             if !locked {
                                 let hit=egui::Rect::from_center_size(egui::pos2(x,y),egui::vec2(22.0,28.0));
                                 let r=ui.interact(hit,ui.make_persistent_id(("studio_camera",i)),egui::Sense::click_and_drag());
@@ -3183,7 +3183,7 @@ impl App {
                                         let popup=egui::Rect::from_min_size(
                                             egui::pos2((p.x+14.0).min(right-120.0),
                                                 (p.y-27.0).max(draw.top())),egui::vec2(116.0,22.0));
-                                        painter.rect_filled(popup,4.0,sui::PANE);
+                                        painter.rect_filled(popup,4.0,sui::PANE());
                                         painter.text(popup.center(),egui::Align2::CENTER_CENTER,
                                             format!("Frame {frame} · {t:.3}s"),egui::FontId::proportional(11.0),egui::Color32::WHITE);
                                     }
@@ -3219,7 +3219,7 @@ impl App {
                         let head_x=to_x(self.render_studio.timeline_time());
                         if head_x>=x0&&head_x<=right {
                             painter.line_segment([egui::pos2(head_x,draw.top()),egui::pos2(head_x,draw.bottom())],
-                                egui::Stroke::new(1.5,sui::PLAYHEAD));
+                                egui::Stroke::new(1.5,sui::PLAYHEAD()));
                         }
                         // Continue active pointer capture even if its original
                         // hit rectangle has moved fully outside the viewport.
@@ -3365,17 +3365,17 @@ impl App {
             ui.add_space(10.0);
             let selected=self.render_studio.timeline.selected_items().len();
             if selected>1 {
-                ui.label(egui::RichText::new(format!("{selected} selected")).size(11.5).color(theme::ACCENT));
+                ui.label(egui::RichText::new(format!("{selected} selected")).size(11.5).color(theme::ACCENT()));
             }
             if !self.render_studio.status.is_empty() {
                 let status=self.render_studio.status.clone();
-                ui.add(egui::Label::new(egui::RichText::new(&status).size(11.5).color(theme::TEXT_FAINT)).truncate())
+                ui.add(egui::Label::new(egui::RichText::new(&status).size(11.5).color(theme::TEXT_FAINT())).truncate())
                     .on_hover_text(status);
             } else {
                 ui.add(egui::Label::new(egui::RichText::new(format!("{} clips · {} demos · {} audio tracks · {} camera keys",
                     self.render_studio.timeline.clips.len(),self.render_studio.timeline.demos.len(),
                     self.render_studio.timeline.audio_tracks.len(),self.render_studio.timeline.camera.len()))
-                    .size(11.5).color(theme::TEXT_FAINT)).truncate());
+                    .size(11.5).color(theme::TEXT_FAINT())).truncate());
             }
         });
         sui::region(ui,right,"studio_timeline_zoom",egui::Layout::right_to_left(egui::Align::Center),|ui| {
@@ -3414,12 +3414,12 @@ impl App {
         let head_cell=egui::Rect::from_min_max(ruler.left_top(),egui::pos2(x0,ruler.bottom()));
         let lanes=egui::Rect::from_min_max(egui::pos2(x0,ruler.top()),egui::pos2(right,ruler.bottom()));
         let p=ui.painter().clone();
-        p.rect_filled(head_cell,0.0,sui::PANE_HEADER);
-        p.rect_filled(lanes,0.0,sui::WELL);
-        p.line_segment([ruler.left_bottom(),egui::pos2(right,ruler.bottom())],egui::Stroke::new(1.0,theme::LINE));
-        p.line_segment([egui::pos2(x0,ruler.top()),egui::pos2(x0,ruler.bottom())],egui::Stroke::new(1.0,theme::LINE));
+        p.rect_filled(head_cell,0.0,sui::PANE_HEADER());
+        p.rect_filled(lanes,0.0,sui::WELL());
+        p.line_segment([ruler.left_bottom(),egui::pos2(right,ruler.bottom())],egui::Stroke::new(1.0,theme::LINE()));
+        p.line_segment([egui::pos2(x0,ruler.top()),egui::pos2(x0,ruler.bottom())],egui::Stroke::new(1.0,theme::LINE()));
         p.text(head_cell.left_center()+egui::vec2(sui::PAD,0.0),egui::Align2::LEFT_CENTER,
-            sui::timecode(now,self.render_studio.fps),egui::FontId::monospace(14.0),theme::ACCENT);
+            sui::timecode(now,self.render_studio.fps),egui::FontId::monospace(14.0),theme::ACCENT());
         let clip=p.with_clip_rect(lanes);
         let step=studio_ruler_step(zoom);
         let minor=step/if step>=10.0 {5.0} else {4.0};
@@ -3428,20 +3428,20 @@ impl App {
         for tick in first..=last.min(first+2000) {
             let x=to_x(tick as f64*minor);
             clip.line_segment([egui::pos2(x,ruler.bottom()-4.0),egui::pos2(x,ruler.bottom())],
-                egui::Stroke::new(1.0,theme::LINE_STRONG));
+                egui::Stroke::new(1.0,theme::LINE_STRONG()));
         }
         for (t,label) in studio_ruler_ticks(scroll,zoom,right-x0) {
             let x=to_x(t);
             clip.line_segment([egui::pos2(x,ruler.bottom()-10.0),egui::pos2(x,ruler.bottom())],
-                egui::Stroke::new(1.0,theme::TEXT_FAINT));
+                egui::Stroke::new(1.0,theme::TEXT_FAINT()));
             clip.text(egui::pos2(x+4.0,ruler.top()+4.0),egui::Align2::LEFT_TOP,label,
-                egui::FontId::proportional(10.5),theme::TEXT_DIM);
+                egui::FontId::proportional(10.5),theme::TEXT_DIM());
         }
         let (in_time,out_time)=self.render_studio.timeline.export_range();
         let (in_x,out_x)=(to_x(in_time),to_x(out_time));
         let range=egui::Rect::from_min_max(egui::pos2(in_x.max(x0),ruler.bottom()-7.0),
             egui::pos2(out_x.min(right).max(in_x.max(x0)),ruler.bottom()-1.0));
-        clip.rect_filled(range,0.0,theme::ACCENT.gamma_multiply(0.35));
+        clip.rect_filled(range,0.0,theme::ACCENT().gamma_multiply(0.35));
         if !locked {
             let r=ui.interact(lanes,ui.make_persistent_id("studio_ruler"),egui::Sense::click_and_drag());
             if let Some(pointer)=r.interact_pointer_pos().filter(|_|r.clicked()||r.dragged()) {
@@ -3459,7 +3459,7 @@ impl App {
             if x<x0-10.0||x>right+10.0 {continue;}
             let marker=egui::Rect::from_center_size(egui::pos2(x,ruler.center().y),egui::vec2(14.0,ruler.height()));
             let hovered=!locked && ui.rect_contains_pointer(marker);
-            let color=if hovered {theme::TEXT} else {theme::ACCENT};
+            let color=if hovered {theme::TEXT()} else {theme::ACCENT()};
             let dir=if kind==StudioDragKind::In {1.0} else {-1.0};
             let stroke=egui::Stroke::new(2.0,color);
             clip.line_segment([egui::pos2(x,ruler.top()+3.0),egui::pos2(x,ruler.bottom()-1.0)],stroke);
@@ -3488,9 +3488,9 @@ impl App {
             clip.add(egui::Shape::convex_polygon(vec![
                 egui::pos2(hx-6.0,ruler.top()+3.0),egui::pos2(hx+6.0,ruler.top()+3.0),
                 egui::pos2(hx+6.0,ruler.bottom()-10.0),egui::pos2(hx,ruler.bottom()-4.0),
-                egui::pos2(hx-6.0,ruler.bottom()-10.0)],sui::PLAYHEAD,egui::Stroke::NONE));
+                egui::pos2(hx-6.0,ruler.bottom()-10.0)],sui::PLAYHEAD(),egui::Stroke::NONE));
             clip.line_segment([egui::pos2(hx,ruler.bottom()-4.0),egui::pos2(hx,ruler.bottom())],
-                egui::Stroke::new(1.5,sui::PLAYHEAD));
+                egui::Stroke::new(1.5,sui::PLAYHEAD()));
         }
     }
 
@@ -3527,17 +3527,17 @@ impl App {
             }
         }
         let p=ui.painter();
-        p.rect_filled(track,4.0,sui::WELL);
-        p.rect_stroke(track,4.0,egui::Stroke::new(1.0,theme::HAIRLINE),egui::StrokeKind::Inside);
+        p.rect_filled(track,4.0,sui::WELL());
+        p.rect_stroke(track,4.0,egui::Stroke::new(1.0,theme::HAIRLINE()),egui::StrokeKind::Inside);
         let (in_time,out_time)=self.render_studio.timeline.export_range();
         p.rect_filled(egui::Rect::from_min_max(egui::pos2(to_bar(in_time as f32),track.top()),
-            egui::pos2(to_bar(out_time as f32),track.bottom())),2.0,theme::ACCENT.gamma_multiply(0.18));
+            egui::pos2(to_bar(out_time as f32),track.bottom())),2.0,theme::ACCENT().gamma_multiply(0.18));
         let thumb=thumb_for(self.render_studio.timeline.scroll.min(max_scroll));
         let active=r.hovered() || r.dragged();
-        p.rect_filled(thumb,4.0,if active {theme::CONTROL_HOVER} else {theme::CONTROL});
-        p.rect_stroke(thumb,4.0,egui::Stroke::new(1.0,if active {theme::LINE_STRONG} else {theme::LINE}),egui::StrokeKind::Inside);
+        p.rect_filled(thumb,4.0,if active {theme::CONTROL_HOVER()} else {theme::CONTROL()});
+        p.rect_stroke(thumb,4.0,egui::Stroke::new(1.0,if active {theme::LINE_STRONG()} else {theme::LINE()}),egui::StrokeKind::Inside);
         let hx=to_bar(self.render_studio.timeline_time() as f32);
-        p.line_segment([egui::pos2(hx,track.top()),egui::pos2(hx,track.bottom())],egui::Stroke::new(1.5,sui::PLAYHEAD));
+        p.line_segment([egui::pos2(hx,track.top()),egui::pos2(hx,track.bottom())],egui::Stroke::new(1.5,sui::PLAYHEAD()));
         r.on_hover_text("Drag to pan the timeline (the playhead stays put) · Alt+wheel zooms");
     }
 
@@ -3558,7 +3558,7 @@ impl App {
         let fps=self.render_studio.fps;
         if let Some(preview)=self.render_studio.cinematic_preview.as_ref() {
             let clip=&preview.clip;
-            sui::inspector_title(ui,theme::WARNING,"Cinematic source",&clip.label,
+            sui::inspector_title(ui,theme::WARNING(),"Cinematic source",&clip.label,
                 &format!("{} frames · {:.2} fps",clip.frame_count,clip.fps));
             sui::section(ui,"studio_insp_cinematic","Source",None,true,|ui| {
                 sui::prop_value(ui,"Animation set",&clip.source.gla);
@@ -3614,7 +3614,7 @@ impl App {
             }
             let selected=self.render_studio.timeline.selected_items();
             if selected.len()>1 {
-                sui::inspector_title(ui,theme::ACCENT,"Selection",&format!("{} items",selected.len()),
+                sui::inspector_title(ui,theme::ACCENT(),"Selection",&format!("{} items",selected.len()),
                     "Ctrl+click toggles · Shift+click extends a time range");
                 match sui::button_row(ui,&[(None,"Copy  (Ctrl+C)",ButtonKind::Normal,true),
                     (None,"Delete  (Del)",ButtonKind::Danger,true)]) {
@@ -3670,7 +3670,7 @@ impl App {
             // Nothing selected: project / playhead context.
             let name=if self.render_studio.project_name.trim().is_empty() {"Untitled project".to_owned()}
                 else {self.render_studio.project_name.clone()};
-            sui::inspector_title(ui,theme::TEXT_DIM,"Project",&name,
+            sui::inspector_title(ui,theme::TEXT_DIM(),"Project",&name,
                 &format!("playhead {} · {:.2}s long",sui::timecode(now,fps),self.render_studio.timeline.duration()));
             sui::section(ui,"studio_insp_playhead","Playhead",None,true,|ui| {
                 sui::prop_value(ui,"Time",&format!("{} ({now:.3} s)",sui::timecode(now,fps)));
@@ -3691,7 +3691,7 @@ impl App {
                 sui::timecode(clip.start,fps),sui::timecode(clip.end(),fps)));
         let has_transition=self.render_studio.timeline.demo_has_transition(i);
         let comparison=clip.comparison.is_some();
-        if comparison {sui::callout(ui,"One retained ghost race. Camera and playback phases are generated together; regenerate the comparison to change them. HUD edits still apply normally.",theme::ACCENT);}
+        if comparison {sui::callout(ui,"One retained ghost race. Camera and playback phases are generated together; regenerate the comparison to change them. HUD edits still apply normally.",theme::ACCENT());}
         sui::section(ui,"studio_insp_demo_clip","Clip",
             Some("Source trims are milliseconds into the recording. While this clip overlaps another (a transition), trims and speed ramps stay locked: move the clips to adjust the overlap instead."),true,|ui| {
             let mut start=clip.start;
@@ -3886,12 +3886,12 @@ impl App {
                                 .map(|s|Self::profile_saber_label(s).to_owned()).unwrap_or_else(||current.clone())
                         };
                         sui::combo_box(("studio_actor_saber",lane,hand)).width(ui.available_width())
-                            .height(300.).wrap_mode(egui::TextWrapMode::Truncate).selected_text(super::jka_colored_text(&title,12.0,theme::TEXT)).show_ui(ui,|ui| {
+                            .height(300.).wrap_mode(egui::TextWrapMode::Truncate).selected_text(super::jka_colored_text(&title,12.0,theme::TEXT())).show_ui(ui,|ui| {
                                 ui.selectable_value(&mut sabers.names[hand],"none".into(),"None");
                                 for entry in &self.profile_sabers {
                                     if Self::profile_saber_is_single(entry) || (hand==0 && Self::profile_saber_is_staff(entry)) {
                                         ui.selectable_value(&mut sabers.names[hand],entry.name.clone(),
-                                            super::jka_colored_text(Self::profile_saber_label(entry),12.,theme::TEXT));
+                                            super::jka_colored_text(Self::profile_saber_label(entry),12.,theme::TEXT()));
                                     }
                                 }
                             });
@@ -4127,7 +4127,7 @@ impl App {
                 StudioCameraSource::Demo{pov:StudioDemoPov::Follow,..}=>"follow player",
                 StudioCameraSource::Demo{pov:StudioDemoPov::Free,..}=>"free demo camera",
             };
-            sui::inspector_title(ui,sui::CAMERA,"Camera key",&format!("Shot {}",i+1),
+            sui::inspector_title(ui,sui::CAMERA(),"Camera key",&format!("Shot {}",i+1),
                 &format!("{} · {}",sui::timecode(key.time,fps),source_label));
             let mut changed_source=false;
             sui::section(ui,"studio_insp_camera_source","Source",
@@ -4147,7 +4147,7 @@ impl App {
                 });
                 if mismatch {
                     sui::callout(ui,if is_demo {"No demo footage on the timeline: this key has nothing to show."}
-                        else {"The timeline has only demo footage: this key shows an empty stage. Switch it to Demo recording."},theme::WARNING);
+                        else {"The timeline has only demo footage: this key shows an empty stage. Switch it to Demo recording."},theme::WARNING());
                 }
                 if let StudioCameraSource::Demo{mut pov,client}=source {
                     let before=pov;
@@ -4368,13 +4368,13 @@ impl App {
         egui::Window::new("Studio graphics").id(egui::Id::new("studio_graphics_settings"))
             .open(&mut open).default_size([940.0,720.0]).max_width(1100.0).max_height(780.0)
             .default_pos([360.0,70.0]).resizable(true).collapsible(false)
-            .frame(egui::Frame::new().fill(sui::PANE).stroke(egui::Stroke::new(1.0,theme::LINE_STRONG))
+            .frame(egui::Frame::new().fill(sui::PANE()).stroke(egui::Stroke::new(1.0,theme::LINE_STRONG()))
                 .corner_radius(4).inner_margin(egui::Margin::same(12)))
             .show(ctx,|ui| {
                 ui.scope(|ui| {
                     sui::editor_style(ui);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Profile").size(12.0).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("Profile").size(12.0).color(theme::TEXT_DIM()));
                         self.egui_studio_profile_picker(ui,false,200.0);
                         ui.add_space(8.0);
                         let unsaved=self.studio_cfg_unsaved();
@@ -4421,7 +4421,7 @@ impl App {
                     });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Page").size(12.0).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("Page").size(12.0).color(theme::TEXT_DIM()));
                         let sections:Vec<(super::VideoSection,&str)>=super::VideoSection::RENDERING.iter()
                             .chain(super::VideoSection::ENVIRONMENT.iter())
                             .chain(super::VideoSection::OPTIMIZATIONS.iter())
@@ -4467,9 +4467,9 @@ impl App {
                 sui::prop_row(ui,"File",|ui|sui::hint(ui,&self.studio_project_path_for(&self.render_studio.new_project_name).display().to_string()));
                 sui::hint(ui,"Start a fresh timeline with default camera and lighting. Save the current project first to keep your edits. Studio graphics and HUD preferences are retained.");
                 let available=self.studio_new_project_name_available(&self.render_studio.new_project_name);
-                if !available {sui::callout(ui,"Choose an unused project name.",theme::WARNING);}
+                if !available {sui::callout(ui,"Choose an unused project name.",theme::WARNING());}
                 if self.render_studio.status.starts_with("Could not save timeline:") {
-                    sui::callout(ui,&self.render_studio.status,theme::WARNING);
+                    sui::callout(ui,&self.render_studio.status,theme::WARNING());
                 }
                 ui.add_space(6.0);
                 let enabled=available && !self.studio_locked();
@@ -4497,7 +4497,7 @@ impl App {
                 let r=sui::prop_text(ui,"Name",&mut self.render_studio.save_as_name,"timeline_project");
                 if r.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)) {save=true;}
                 sui::prop_row(ui,"File",|ui| sui::hint(ui,&path.display().to_string()));
-                if path.exists() {sui::callout(ui,"A project with this name exists; saving overwrites it.",theme::WARNING);}
+                if path.exists() {sui::callout(ui,"A project with this name exists; saving overwrites it.",theme::WARNING());}
                 ui.add_space(6.0);
                 if sui::button_row(ui,&[(Some(Icon::Save),"Save project",ButtonKind::Primary,true)]).is_some() {save=true;}
             });
@@ -4527,11 +4527,11 @@ impl App {
             let (close,_)=Self::studio_modal(ctx,"studio_open_project","Open project",440.0,|ui| {
                 sui::hint(ui,&format!("Folder: {}",dir.display()));
                 ui.add_space(4.0);
-                if entries.is_empty(){sui::callout(ui,"No saved JSON projects found.",theme::TEXT_FAINT);}
+                if entries.is_empty(){sui::callout(ui,"No saved JSON projects found.",theme::TEXT_FAINT());}
                 egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false,true]).show(ui,|ui| {
                     ui.spacing_mut().item_spacing.y=1.0;
                     for entry in entries {
-                        if sui::list_row(ui,Icon::Open,theme::ACCENT,&entry,"",
+                        if sui::list_row(ui,Icon::Open,theme::ACCENT(),&entry,"",
                             self.render_studio.project_name==entry,egui::Sense::click()).clicked() {
                             chosen=Some(entry);
                         }
@@ -4653,13 +4653,13 @@ pub(super) fn studio_paint_clip(p:&egui::Painter,block:egui::Rect,color:egui::Co
         if selected {egui::Color32::WHITE} else {color.gamma_multiply(0.45)}),egui::StrokeKind::Inside);
     if block.width()>28.0 {
         let clip=p.with_clip_rect(block.shrink2(egui::vec2(4.0,1.0)));
-        let galley=clip.layout_no_wrap(label.to_owned(),egui::FontId::proportional(11.5),theme::TEXT);
+        let galley=clip.layout_no_wrap(label.to_owned(),egui::FontId::proportional(11.5),theme::TEXT());
         let width=galley.size().x;
         let y=block.center().y+1.5;
-        clip.galley(egui::pos2(block.left()+7.0,y-galley.size().y*0.5),galley,theme::TEXT);
+        clip.galley(egui::pos2(block.left()+7.0,y-galley.size().y*0.5),galley,theme::TEXT());
         if !detail.is_empty() && block.width()>width+60.0 {
             clip.text(egui::pos2(block.left()+15.0+width,y),egui::Align2::LEFT_CENTER,detail,
-                egui::FontId::proportional(10.5),theme::TEXT_FAINT);
+                egui::FontId::proportional(10.5),theme::TEXT_FAINT());
         }
     }
 }

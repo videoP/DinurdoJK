@@ -216,7 +216,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("Some props/effects need conversion")
                         .size(10.0)
-                        .color(theme::WARNING),
+                        .color(theme::WARNING()),
                 )
                 .on_hover_text(&v.presentation_detail);
             }
@@ -242,16 +242,16 @@ impl App {
                                         .any(|v| active.as_deref() == Some(&v.id));
                                 egui::Frame::new()
                                     .fill(if selected {
-                                        egui::Color32::from_rgb(26, 49, 70)
+                                        crate::app::egui_theme::pick(egui::Color32::from_rgb(26, 49, 70), theme::CONTROL_SELECTED())
                                     } else {
-                                        egui::Color32::from_rgb(21, 29, 40)
+                                        crate::app::egui_theme::pick(egui::Color32::from_rgb(21, 29, 40), theme::CONTROL())
                                     })
                                     .stroke(egui::Stroke::new(
                                         1.0,
                                         if selected {
-                                            theme::ACCENT
+                                            theme::ACCENT()
                                         } else {
-                                            egui::Color32::from_rgb(45, 59, 75)
+                                            crate::app::egui_theme::pick(egui::Color32::from_rgb(45, 59, 75), theme::LINE_STRONG())
                                         },
                                     ))
                                     .corner_radius(5)
@@ -313,7 +313,7 @@ impl App {
                                                 " "
                                             })
                                             .size(9.0)
-                                            .color(theme::WARNING),
+                                            .color(theme::WARNING()),
                                         )
                                         .on_hover_text(&v.audio_detail);
                                         ui.horizontal(|ui| {

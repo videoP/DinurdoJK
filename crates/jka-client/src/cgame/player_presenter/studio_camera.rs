@@ -2,7 +2,7 @@
 //! without skinning meshes, emitting FX or advancing simulation history.
 use crate::cgame::ClientInfo;
 use super::{PlayerPresenter, Ghoul2Animator, model_bolt_matrix_timed,
-    saber_hand_bolt_matrix_timed, saber_name_is_removed, transform_jka_model_point,
+    saber_attachment_bolt_name, saber_hand_bolt_matrix_timed, saber_name_is_removed, transform_jka_model_point,
     transform_jka_model_vector, normalize_vec3};
 
 #[derive(Clone, Copy, Debug)]
@@ -177,11 +177,11 @@ impl PlayerPresenter {
         let Some(slot)=saber else {
             return Ok(model_bolt_matrix_timed(&mut self.perf,&model.glm,&model.gla,&pose,name)?.map(convert));
         };
-        let saber_name=if slot==0 {&info.saber_name}else{&info.saber2_name};
-        if saber_name.is_empty() || saber_name_is_removed(saber_name) {return Ok(None);}
-        let definition=self.saber_definitions.definition_or_default(saber_name);
+        let definition = self.equipped_sabers(info).get(slot).cloned().flatten();
+        let Some(definition) = definition else { return Ok(None); };
+        let hand_name = saber_attachment_bolt_name(slot, &definition);
         let Some(hand)=saber_hand_bolt_matrix_timed(&mut self.perf,&model,&pose,
-            if slot==0 {"*r_hand"}else{"*l_hand"})? else {return Ok(None)};
+            hand_name)? else {return Ok(None)};
         if name=="@hilt" {return Ok(Some(convert(hand)));}
         let hilt=self.load_saber_model(&definition)?;
         let mut animator=Ghoul2Animator::new(&hilt.animation_gla);

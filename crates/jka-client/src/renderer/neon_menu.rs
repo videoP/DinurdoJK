@@ -638,18 +638,18 @@ impl NeonMenu {
         self.text_crt_count = crt_text.len() as u32;
 
         let reveal = anim.revealed_at.map_or(0.0, |at| ((time - at) / crate::neon_menu::REVEAL_SECS).clamp(0.0, 1.0));
-        let cache_mix = if self.cached_scene.is_some() {
-            1.0 - frame.live_scene_blend.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        // Even on a cold cache miss, keep the worldless fog clear hidden
+        // until the live 3D scene is ready. The street shader uses black as
+        // the still image when no cached texture is resident.
+        let cache_mix = 1.0 - frame.live_scene_blend.clamp(0.0, 1.0);
         let cache_uv = self.cached_scene.as_ref().map_or([1.0, 1.0, 0.0, 0.0], |cached| {
             let cover = (w / cached.size[0] as f32).max(h / cached.size[1] as f32);
             [w / (cached.size[0] as f32 * cover), h / (cached.size[1] as f32 * cover), 0.0, 0.0]
         });
         queue.write_buffer(&shared.outside, 0, bytemuck::bytes_of(&OutsideUniform {
             control: [if self.scene_gamma { 1.0 } else { 0.0 }, time, 0.85, 1.0],
-            tone: [0.62, targets.halo.levels as f32, cache_mix, 0.0],
+            tone: [0.62, targets.halo.levels as f32, cache_mix,
+                if self.cached_scene.is_some() { 1.0 } else { 0.0 }],
             cache_uv,
             tv_inverse: screen_to_quad(&tv).map(|c| [c[0], c[1], c[2], 0.0]),
             tv: [1.3, 1.0, 0.0, 0.0],

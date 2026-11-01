@@ -176,6 +176,8 @@ enum Phase {
 
 pub struct Simulation {
     dimensions: [u32; 2],
+    geometry: wgpu::Buffer,
+    discharge: Option<crate::river_discharge::Discharge>,
     state: [wgpu::Texture; 2],
     initial_upload: Option<InitialUpload>,
     groups: [wgpu::BindGroup; 2],
@@ -371,6 +373,7 @@ impl Simulation {
                 controls.sink_dissipation,
                 controls.height_matching_amount,
                 controls.remove_outside_amount,
+                controls.source_rise_limit_cm,
             ]
             .iter()
             .any(|v| !v.is_finite() || *v < 0.0)
@@ -488,7 +491,7 @@ impl Simulation {
                 controls.grid_min[0],
                 controls.grid_min[1],
                 controls.grid_min[2],
-                0.0,
+                controls.source_rise_limit_cm,
             ],
             flags: [
                 boundary.boxes.len() as u32,
@@ -584,7 +587,7 @@ impl Simulation {
                 let geo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("UE river geometry"),
                     contents: &geometry_bytes(geometry),
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 });
                 let old_bottom: Vec<u8> = previous_bottom
                     .iter()
@@ -722,7 +725,7 @@ impl Simulation {
             cache: None,
         });
         Ok(Self {
-            dimensions,
+            dimensions, geometry:geo, discharge:None,
             state,
             initial_upload,
             groups,
@@ -847,6 +850,10 @@ impl Simulation {
         encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 0, 64);
         encoder.copy_buffer_to_buffer(&upload, 64, &self.boundary_uniform, 0, 48);
         self.encode_kernel(encoder, Kernel::SourceAndSink);
+        if let Some(discharge)=&self.discharge {
+            discharge.encode(device,encoder,self.current,frame.hydraulic_duration());
+            self.current=1-self.current;
+        }
         self.encode_kernel(encoder, Kernel::DistributeOverlap);
         for _ in 0..frame.substeps() {
             for kernel in &Kernel::ALL[2..8] {
@@ -858,10 +865,25 @@ impl Simulation {
         Ok(())
     }
 
+    /// Optional host volume forcing, separate from every native reference stage.
+    pub fn enable_discharge(&mut self,device:&wgpu::Device,encoder:&mut wgpu::CommandEncoder,grid:jka_water::river::control::Grid,width_cm:f32,level_cm:f32,cfs:f32) {
+        let discharge=crate::river_discharge::Discharge::new(device,grid,&self.state,&self.geometry,width_cm,level_cm,cfs);
+        discharge.initialize(encoder);
+        self.discharge=Some(discharge);
+    }
+
     /// Hydraulic attributes; initial sample uploads are recorded by the first
     /// encode call. Fresh captured-bed solves have reset-zero initial state.
     pub fn state(&self) -> &wgpu::Texture {
         &self.state[self.current]
+    }
+    /// Both ping-pong hydraulic arrays and the current one, for Always-stage
+    /// readers (foam) that keep their own bindings across solving and freeze.
+    pub fn state_textures(&self) -> &[wgpu::Texture; 2] {
+        &self.state
+    }
+    pub fn state_index(&self) -> usize {
+        self.current
     }
 
     #[cfg(test)]
@@ -878,6 +900,10 @@ impl Simulation {
     }
     pub fn normals(&self) -> &wgpu::Buffer {
         &self.normals
+    }
+    /// Existing captured bed; exposed for explicit debug readback only.
+    pub fn bed_geometry(&self) -> &wgpu::Buffer {
+        &self.geometry
     }
     pub fn surface_ready(&self) -> bool {
         self.phase == Phase::Ready

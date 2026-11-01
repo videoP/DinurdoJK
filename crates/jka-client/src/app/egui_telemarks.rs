@@ -313,7 +313,7 @@ impl App {
             });
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("MAP").color(theme::TEXT_DIM).strong());
+                ui.label(egui::RichText::new("MAP").color(theme::TEXT_DIM()).strong());
                 ui.label(egui::RichText::new(current_map.as_deref().unwrap_or("No active gameplay map")).strong());
                 ui.label(egui::RichText::new(format!("{} saved", marks.len())).weak());
             });
@@ -322,10 +322,10 @@ impl App {
                     origin[0], origin[1], origin[2], angles[1], angles[0])).weak().small());
             }
             if let Some(error) = &self.telemark_ui.error {
-                ui.colored_label(theme::DANGER, error);
+                ui.colored_label(theme::DANGER(), error);
             }
             if !self.telemark_ui.status.is_empty() {
-                ui.label(egui::RichText::new(&self.telemark_ui.status).color(theme::ACCENT));
+                ui.label(egui::RichText::new(&self.telemark_ui.status).color(theme::ACCENT()));
             }
             ui.add_space(8.0);
             let can_edit = self.telemark_ui.database.is_some() && current_map.is_some();
@@ -380,7 +380,7 @@ impl App {
                         "Teleport uses amTele X Y Z (rounded to whole units); the server controls permissions. \
                          The optional yaw command needs admin access on multiplayer servers. \
                          Pitch cannot be restored through coordinate-based amTele."
-                    ).color(theme::TEXT_DIM).small());
+                    ).color(theme::TEXT_DIM()).small());
                     right.separator();
                     right.horizontal(|ui| {
                         ui.label("Name");
@@ -393,7 +393,7 @@ impl App {
                     right.add_space(8.0);
                     if self.telemark_ui.confirm_delete == Some(index) {
                         right.horizontal(|ui| {
-                            ui.colored_label(theme::WARNING, "Delete this telemark?");
+                            ui.colored_label(theme::WARNING(), "Delete this telemark?");
                             if ui.button("Confirm delete").clicked() { action = Some(Action::Delete(index)); }
                             if ui.button("Cancel").clicked() { self.telemark_ui.confirm_delete = None; }
                         });
@@ -406,7 +406,7 @@ impl App {
             });
             ui.add_space(8.0);
             ui.label(egui::RichText::new(format!("Stored in {}", self.telemark_directory().join(DATABASE_FILE).display()))
-                .small().color(theme::TEXT_DIM));
+                .small().color(theme::TEXT_DIM()));
         });
         if let (Some(map), Some(action)) = (current_map.as_deref(), action) {
             self.telemark_apply(map, action);

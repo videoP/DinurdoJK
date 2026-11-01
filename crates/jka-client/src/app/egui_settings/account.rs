@@ -19,7 +19,7 @@ impl App {
                 theme::plain(
                     "Secure saved accounts are unavailable on this platform.",
                     11.5,
-                    theme::TEXT_FAINT,
+                    theme::TEXT_FAINT(),
                 ),
             );
             return;
@@ -59,7 +59,7 @@ impl App {
                     let display = name
                         .map(|name| format!("{name}  ·  {server}"))
                         .unwrap_or_else(|| server.to_string());
-                    theme::glow_label(ui, &display, 12.5, theme::TEXT);
+                    theme::glow_label(ui, &display, 12.5, theme::TEXT());
                 },
             );
 
@@ -69,7 +69,7 @@ impl App {
                     theme::plain(
                         "No saved accounts for this server yet.",
                         11.5,
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     ),
                 );
             } else {
@@ -87,7 +87,7 @@ impl App {
                         "Passwords stay in Windows Credential Manager and are never displayed here.",
                         theme::Reset::None,
                         |ui| {
-                            theme::glow_label(ui, &detail, 12.5, theme::TEXT);
+                            theme::glow_label(ui, &detail, 12.5, theme::TEXT());
                             ui.add_space(10.0);
                             if account_type != AccountType::Server {
                                 if theme::primary_button(ui, "LOG IN").clicked() {
@@ -124,7 +124,7 @@ impl App {
                 theme::plain(
                     "Join a server to add or use accounts for its exact IP:port.",
                     11.5,
-                    theme::TEXT_FAINT,
+                    theme::TEXT_FAINT(),
                 ),
             );
         }
@@ -166,7 +166,7 @@ impl App {
                         "Saved for another endpoint. Join that exact server before LOG IN / LOG OUT can be used.",
                         theme::Reset::None,
                         |ui| {
-                            theme::glow_label(ui, &detail, 12.0, theme::TEXT_FAINT);
+                            theme::glow_label(ui, &detail, 12.0, theme::TEXT_FAINT());
                             ui.add_space(10.0);
                             if account_type != AccountType::Server {
                                 ui.add_enabled_ui(false, |ui| {
@@ -251,7 +251,7 @@ impl App {
                 "Security identity. This cannot be edited; add an account while connected to another endpoint to save one there.",
                 theme::Reset::None,
                 |ui| {
-                    theme::glow_label(ui, &state.server.to_string(), 12.5, theme::TEXT);
+                    theme::glow_label(ui, &state.server.to_string(), 12.5, theme::TEXT());
                 },
             );
             theme::row(
@@ -416,7 +416,7 @@ impl App {
                 theme::plain(
                     &format!("Credential store: {error}"),
                     11.5,
-                    theme::TEXT_FAINT,
+                    theme::TEXT_FAINT(),
                 ),
             );
         }

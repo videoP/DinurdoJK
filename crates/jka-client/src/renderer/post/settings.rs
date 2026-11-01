@@ -12,6 +12,7 @@ impl Renderer {
         let old_bloom_pyramid = self.glow_mode.enabled() || self.halation_enabled;
         let old_authored_glow = self.glow_mode.authored();
         let old_ssao_enabled = self.ssao_enabled;
+        let old_ssao_resolution = self.ssao_resolution;
         let old_static_bsp_ao_enabled = self.static_bsp_ao_enabled;
         let old_ssr_enabled = self.ssr_enabled;
         let old_resolved_depth_target = self.targets._ssr_visibility_texture.is_some();
@@ -78,6 +79,7 @@ impl Renderer {
         self.glow_mode = if self.thermal_vision != 0 { crate::renderer::GlowMode::JkaAuthored } else { effects.glow };
         self.halation_enabled = effects.halation;
         self.ssao_enabled = effects.ssao;
+        self.ssao_resolution = effects.ssao_resolution.min(1);
         self.static_bsp_ao_enabled = effects.static_bsp_ao;
         self.static_bsp_ao_lightmap = true;
         let old_bake_key = (
@@ -384,7 +386,8 @@ impl Renderer {
         let bloom_pyramid_changed =
             old_bloom_pyramid != (self.glow_mode.enabled() || self.halation_enabled);
         let authored_glow_resources_changed = old_authored_glow != self.glow_mode.authored();
-        let ssao_resources_changed = old_ssao_enabled != self.ssao_enabled;
+        let ssao_resources_changed = old_ssao_enabled != self.ssao_enabled
+            || (self.ssao_enabled && old_ssao_resolution != self.ssao_resolution);
         let ssr_resources_changed = old_ssr_enabled != self.ssr_enabled;
         let resolved_depth_changed =
             old_resolved_depth_target != self.needs_resolved_depth_target();

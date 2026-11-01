@@ -1,6 +1,6 @@
 use super::*;
 use crate::renderer::{CameraUniform,DynamicModelAlphaMode as Mode,DynamicModelRenderer,
-    DynamicModelVertex,GpuImage,DEPTH_FORMAT};
+    DynamicModelVertex,GpuImage,depth_format};
 use crate::renderer::models::pipelines::create_dynamic_model_pipeline_inner;
 use wgpu::util::DeviceExt;
 
@@ -39,7 +39,7 @@ fn studio_alpha_gpu_preserves_light_coverage_and_normal_rendering() {
                 let target_view=target.create_view(&Default::default());
                 let msaa=(samples>1).then(||device.create_texture(&wgpu::TextureDescriptor {sample_count:samples,usage:wgpu::TextureUsages::RENDER_ATTACHMENT,..desc}));
                 let msaa_view=msaa.as_ref().map(|texture|texture.create_view(&Default::default()));
-                let depth=device.create_texture(&wgpu::TextureDescriptor {format:DEPTH_FORMAT,sample_count:samples,usage:wgpu::TextureUsages::RENDER_ATTACHMENT,..desc});
+                let depth=device.create_texture(&wgpu::TextureDescriptor {format:depth_format(),sample_count:samples,usage:wgpu::TextureUsages::RENDER_ATTACHMENT,..desc});
                 let depth_view=depth.create_view(&Default::default());
                 let pipelines:Vec<_>=draws.iter().map(|(mode,_,_)|create_dynamic_model_pipeline_inner(
                     &device,&renderer.pipeline_layout,&renderer.shader,format,samples,*mode,false,false,false,false,capture)).collect();

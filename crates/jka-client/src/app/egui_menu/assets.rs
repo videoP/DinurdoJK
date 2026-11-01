@@ -113,12 +113,12 @@ impl App {
         if self.ui_catalog.pending.asset_viewer {
             theme::label(
                 ui,
-                theme::plain("Scanning assets...", 12.0, theme::TEXT_FAINT),
+                theme::plain("Scanning assets...", 12.0, theme::TEXT_FAINT()),
             );
             return;
         }
         if let Some(error) = &self.asset_viewer_catalog_error {
-            theme::banner(ui, &format!("Asset scan failed: {error}"), theme::WARNING);
+            theme::banner(ui, &format!("Asset scan failed: {error}"), theme::WARNING());
             return;
         }
 
@@ -173,8 +173,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::RAIL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::RAIL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(9, 9))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -323,7 +323,7 @@ impl App {
                                     ui.horizontal(|ui| {
                                         theme::label(
                                             ui,
-                                            theme::plain("FOLDERS", 8.5, theme::TEXT_FAINT),
+                                            theme::plain("FOLDERS", 8.5, theme::TEXT_FAINT()),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -333,15 +333,15 @@ impl App {
                                                     theme::plain(
                                                         "↑ ↓ · ENTER",
                                                         8.0,
-                                                        theme::TEXT_FAINT,
+                                                        theme::TEXT_FAINT(),
                                                     ),
                                                 );
                                             },
                                         );
                                     });
                                     egui::Frame::new()
-                                        .fill(theme::CONTROL)
-                                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                                        .fill(theme::CONTROL())
+                                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                                         .inner_margin(egui::Margin::same(2))
                                         .show(ui, |ui| {
                                             ui.set_min_width(ui.available_width());
@@ -360,9 +360,9 @@ impl App {
                                                         rect,
                                                         egui::CornerRadius::same(2),
                                                         if keyboard_selected {
-                                                            theme::CONTROL_SELECTED
+                                                            theme::CONTROL_SELECTED()
                                                         } else {
-                                                            theme::CONTROL_HOVER
+                                                            theme::CONTROL_HOVER()
                                                         },
                                                     );
                                                 }
@@ -376,9 +376,9 @@ impl App {
                                                     path,
                                                     egui::FontId::monospace(9.5),
                                                     if keyboard_selected {
-                                                        theme::TEXT
+                                                        theme::TEXT()
                                                     } else {
-                                                        theme::TEXT_DIM
+                                                        theme::TEXT_DIM()
                                                     },
                                                 );
                                                 ui.painter().text(
@@ -386,7 +386,7 @@ impl App {
                                                     egui::Align2::RIGHT_CENTER,
                                                     count.to_string(),
                                                     egui::FontId::monospace(8.5),
-                                                    theme::TEXT_FAINT,
+                                                    theme::TEXT_FAINT(),
                                                 );
                                                 let response = response.on_hover_text(path);
                                                 if response.clicked() {
@@ -397,7 +397,7 @@ impl App {
                                 } else if !folder_query.is_empty() {
                                     theme::label(
                                         ui,
-                                        theme::plain("No matching folders", 9.0, theme::TEXT_FAINT),
+                                        theme::plain("No matching folders", 9.0, theme::TEXT_FAINT()),
                                     );
                                 }
                             }
@@ -450,7 +450,7 @@ impl App {
                                             self.asset_viewer_entries.len()
                                         ),
                                         9.5,
-                                        theme::TEXT_FAINT,
+                                        theme::TEXT_FAINT(),
                                     ),
                                 );
                                 ui.with_layout(
@@ -458,7 +458,7 @@ impl App {
                                     |ui| {
                                         theme::label(
                                             ui,
-                                            theme::plain("↑ ↓ browse", 9.0, theme::TEXT_FAINT),
+                                            theme::plain("↑ ↓ browse", 9.0, theme::TEXT_FAINT()),
                                         );
                                     },
                                 );
@@ -534,7 +534,7 @@ impl App {
                                             painter.rect_filled(
                                                 rect,
                                                 egui::CornerRadius::same(2),
-                                                theme::CONTROL_SELECTED,
+                                                theme::CONTROL_SELECTED(),
                                             );
                                             painter.rect_filled(
                                                 egui::Rect::from_min_size(
@@ -542,13 +542,13 @@ impl App {
                                                     egui::vec2(2.0, rect.height()),
                                                 ),
                                                 egui::CornerRadius::ZERO,
-                                                theme::ACCENT,
+                                                theme::ACCENT(),
                                             );
                                         } else if response.hovered() {
                                             painter.rect_filled(
                                                 rect,
                                                 egui::CornerRadius::same(2),
-                                                theme::CONTROL,
+                                                theme::CONTROL(),
                                             );
                                         }
                                         painter.text(
@@ -557,9 +557,9 @@ impl App {
                                             &entry.display_name,
                                             egui::FontId::monospace(10.5),
                                             if selected {
-                                                theme::TEXT
+                                                theme::TEXT()
                                             } else {
-                                                theme::TEXT_DIM
+                                                theme::TEXT_DIM()
                                             },
                                         );
                                         painter.text(
@@ -568,9 +568,9 @@ impl App {
                                             entry.kind.label(),
                                             egui::FontId::monospace(8.0),
                                             if selected {
-                                                theme::ACCENT
+                                                theme::ACCENT()
                                             } else {
-                                                theme::TEXT_FAINT
+                                                theme::TEXT_FAINT()
                                             },
                                         );
 
@@ -625,7 +625,7 @@ impl App {
                     ui.painter().rect_stroke(
                         preview_rect,
                         egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0_f32, theme::LINE),
+                        egui::Stroke::new(1.0_f32, theme::LINE()),
                         egui::StrokeKind::Inside,
                     );
                     let preview_label = match detail_snapshot.as_ref().map(|detail| detail.kind) {
@@ -641,7 +641,7 @@ impl App {
                         egui::Align2::LEFT_TOP,
                         preview_label,
                         egui::FontId::proportional(10.5),
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     );
                     self.set_asset_preview_viewport(
                         preview_rect.shrink(1.0),
@@ -693,8 +693,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::RAIL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::RAIL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(10, 9))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -711,14 +711,14 @@ impl App {
                                     } else {
                                         detail.qpath.as_str()
                                     };
-                                    theme::glow_label(ui, detail_title, 12.5, theme::TEXT);
+                                    theme::glow_label(ui, detail_title, 12.5, theme::TEXT());
                                     if detail.kind == AssetKind::Shader {
                                         theme::label(
                                             ui,
                                             theme::plain(
                                                 &format!("File: {}", detail.qpath),
                                                 9.0,
-                                                theme::TEXT_FAINT,
+                                                theme::TEXT_FAINT(),
                                             ),
                                         );
                                     }
@@ -731,7 +731,7 @@ impl App {
                                                 asset_size_label(detail.size_bytes)
                                             ),
                                             10.0,
-                                            theme::TEXT_DIM,
+                                            theme::TEXT_DIM(),
                                         ),
                                     );
                                     theme::label(
@@ -739,7 +739,7 @@ impl App {
                                         theme::plain(
                                             &format!("Source: {}", detail.source),
                                             9.0,
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         ),
                                     );
 
@@ -755,7 +755,7 @@ impl App {
                                         ui.horizontal(|ui| {
                                             theme::label(
                                                 ui,
-                                                theme::plain("Yaw", 10.0, theme::TEXT_FAINT),
+                                                theme::plain("Yaw", 10.0, theme::TEXT_FAINT()),
                                             );
                                             view_changed |= ui
                                                 .add(
@@ -770,7 +770,7 @@ impl App {
                                         ui.horizontal(|ui| {
                                             theme::label(
                                                 ui,
-                                                theme::plain("Pitch", 10.0, theme::TEXT_FAINT),
+                                                theme::plain("Pitch", 10.0, theme::TEXT_FAINT()),
                                             );
                                             view_changed |= ui
                                                 .add(
@@ -786,7 +786,7 @@ impl App {
                                     ui.horizontal(|ui| {
                                         theme::label(
                                             ui,
-                                            theme::plain("Zoom", 10.0, theme::TEXT_FAINT),
+                                            theme::plain("Zoom", 10.0, theme::TEXT_FAINT()),
                                         );
                                         view_changed |= ui
                                             .add(
@@ -819,14 +819,14 @@ impl App {
                                         ui.horizontal(|ui| {
                                             theme::label(
                                                 ui,
-                                                theme::plain(name, 10.0, theme::TEXT_FAINT),
+                                                theme::plain(name, 10.0, theme::TEXT_FAINT()),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
                                                     theme::label(
                                                         ui,
-                                                        theme::plain(value, 10.0, theme::TEXT),
+                                                        theme::plain(value, 10.0, theme::TEXT()),
                                                     );
                                                 },
                                             );
@@ -859,7 +859,7 @@ impl App {
                                                     egui::RichText::new(item)
                                                         .monospace()
                                                         .size(9.25)
-                                                        .color(theme::TEXT_DIM),
+                                                        .color(theme::TEXT_DIM()),
                                                 );
                                             }
                                             if let Some(text) = &detail.raw_text {
@@ -869,7 +869,7 @@ impl App {
                                                         egui::RichText::new(text)
                                                             .monospace()
                                                             .size(9.0)
-                                                            .color(theme::TEXT_DIM),
+                                                            .color(theme::TEXT_DIM()),
                                                     );
                                                 });
                                             }
@@ -881,7 +881,7 @@ impl App {
                                         detail_error
                                             .as_deref()
                                             .unwrap_or("Asset inspection failed"),
-                                        theme::WARNING,
+                                        theme::WARNING(),
                                     );
                                 }
                                 None => {
@@ -890,7 +890,7 @@ impl App {
                                         theme::plain(
                                             "Select an asset from the browser.",
                                             11.0,
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         ),
                                     );
                                 }

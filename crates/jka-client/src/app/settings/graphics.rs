@@ -650,6 +650,7 @@ impl App {
             glow: self.video.glow,
             halation: self.video.halation,
             ssao: self.video.ssao,
+            ssao_resolution: self.video.ssao_resolution,
             static_bsp_ao: self.video.static_bsp_ao,
             static_bsp_ao_lightmap: self.video.static_bsp_ao_lightmap,
             static_bsp_ao_samples: self.video.static_bsp_ao_samples,
@@ -1158,28 +1159,27 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_AMBIENT_OCCLUSION => {
-                // Final user-facing AO selector: OFF / REALTIME / BAKED.
-                // BAKED always uses the hybrid HQ path at the fixed quality target.
                 let mode = if self.video.ssao {
-                    1_i32
+                    if self.video.ssao_resolution == 1 { 3_i32 } else { 2 }
                 } else if self.video.static_bsp_ao {
-                    2
+                    1
                 } else {
                     0
                 };
-                match (mode + direction).rem_euclid(3) {
+                match (mode + direction).rem_euclid(4) {
                     0 => {
                         self.video.ssao = false;
                         self.video.static_bsp_ao = false;
                     }
                     1 => {
-                        self.video.ssao = true;
-                        self.video.static_bsp_ao = false;
-                    }
-                    _ => {
                         self.video.ssao = false;
                         self.video.static_bsp_ao = true;
                         self.video.static_bsp_ao_lightmap = true;
+                    }
+                    resolution => {
+                        self.video.ssao = true;
+                        self.video.static_bsp_ao = false;
+                        self.video.ssao_resolution = (resolution - 2) as u8;
                     }
                 }
                 self.sync_post_effects();

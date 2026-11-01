@@ -108,7 +108,16 @@ typedef struct jka_predict_settings_s {
     int32_t debug_melee, step_slide_fix, no_spec_move, tracemask, no_footsteps;
     int32_t backend, server_mod, cinfo, jcinfo, jcinfo2, taystjk_info, dmflags, hook_pull, restricts, base_game, plugin_disable;
     uint32_t legacy_fixes;
+    /* EV_PRIVATE_DUEL eventParm for the locally predicted client: 1=NF, 2=FF.
+     * 0 is unset/ended; other positive values are jaPRO gun duels. */
+    int32_t duel_client, duel_type;
+    int32_t roll_debug; /* live cg_predictionDebug; no logging inside Pmove */
 } jka_predict_settings;
+
+typedef struct jka_roll_debug_s {
+    int32_t queries, roll_queries, mode, client_num, duel_type, duel_in_progress;
+    int32_t command_time, legs_anim;
+} jka_roll_debug;
 
 typedef struct jka_prediction_entity_s {
     int32_t number, entity_type, model_index, bolt1, trajectory_type;

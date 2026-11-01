@@ -132,32 +132,32 @@ impl App {
             let highlighted = selected == tool;
             let planned = false;
             let fill = if highlighted {
-                egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240), egui::Color32::from_rgba_unmultiplied(70, 102, 68, 240))
             } else if planned {
-                egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219), egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219))
             } else {
-                egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234), egui::Color32::from_rgba_unmultiplied(27, 24, 21, 234))
             };
             paint_annular_sector(painter, center, inner, outer, start, end, fill);
             let arc_color = if highlighted {
-                theme::ACCENT
+                theme::ACCENT()
             } else if planned {
-                theme::LINE
+                theme::LINE()
             } else {
-                theme::LINE_STRONG
+                theme::LINE_STRONG()
             };
             paint_arc(painter, center, outer, start, end, egui::Stroke::new(1.5, arc_color));
-            paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE));
+            paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE()));
 
             let anchor = center + egui::vec2(angle.cos(), angle.sin()) * label_radius;
             let foreground = if highlighted {
                 egui::Color32::WHITE
             } else if planned {
-                theme::TEXT_DISABLED
+                theme::TEXT_DISABLED()
             } else {
-                theme::TEXT
+                theme::TEXT()
             };
-            let muted = if planned { theme::TEXT_DISABLED } else { theme::TEXT_FAINT };
+            let muted = if planned { theme::TEXT_DISABLED() } else { theme::TEXT_FAINT() };
             paint_tool_icon(painter, anchor + egui::vec2(0.0, -23.0), tool, foreground);
             painter.text(
                 anchor + egui::vec2(0.0, 8.0),
@@ -175,28 +175,28 @@ impl App {
             );
         }
 
-        painter.circle_filled(center, inner - 3.0, theme::CHROME);
-        painter.circle_stroke(center, inner - 2.0, egui::Stroke::new(1.0, theme::LINE_STRONG));
+        painter.circle_filled(center, inner - 3.0, theme::CHROME());
+        painter.circle_stroke(center, inner - 2.0, egui::Stroke::new(1.0, theme::LINE_STRONG()));
         painter.text(
             center + egui::vec2(0.0, -8.0),
             egui::Align2::CENTER_CENTER,
             "DEV",
             egui::FontId::proportional(25.0),
-            theme::TEXT,
+            theme::TEXT(),
         );
         painter.text(
             center + egui::vec2(0.0, 17.0),
             egui::Align2::CENTER_CENTER,
             "TOOLS",
             egui::FontId::proportional(11.0),
-            theme::ACCENT,
+            theme::ACCENT(),
         );
         painter.text(
             center + egui::vec2(0.0, outer + 28.0),
             egui::Align2::CENTER_CENTER,
             "LEFT CLICK TO SELECT · RELEASE DEV BIND TO CANCEL",
             egui::FontId::proportional(11.0),
-            theme::TEXT_DIM,
+            theme::TEXT_DIM(),
         );
     }
 }

@@ -18,6 +18,7 @@ impl super::PrivateCapabilities {
             Tf::R16Snorm => F::R16_SNORM,
             Tf::R16Float => F::R16_SFLOAT,
             Tf::Rg8Unorm => F::R8G8_UNORM,
+            Tf::Rgb565Unorm => F::R5G6B5_UNORM_PACK16,
             Tf::Rg8Snorm => F::R8G8_SNORM,
             Tf::Rg8Uint => F::R8G8_UINT,
             Tf::Rg8Sint => F::R8G8_SINT,
@@ -166,6 +167,7 @@ pub fn map_vk_surface_formats(
     // Format list we care about pulled from https://vulkan.gpuinfo.org/listsurfaceformats.php.
     let format = match sf.format {
         F::B8G8R8A8_UNORM => Tf::Bgra8Unorm,
+        F::R5G6B5_UNORM_PACK16 => Tf::Rgb565Unorm,
         F::B8G8R8A8_SRGB => Tf::Bgra8UnormSrgb,
         F::R8G8B8A8_SNORM => Tf::Rgba8Snorm,
         F::R8G8B8A8_UNORM => Tf::Rgba8Unorm,

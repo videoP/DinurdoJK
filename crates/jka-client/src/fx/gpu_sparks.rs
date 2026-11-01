@@ -314,6 +314,18 @@ impl GpuSparkPool {
         self.by_id.len()
     }
 
+    /// Keeps resident sprites visible between FX worker packets. Reap only
+    /// when the authoritative presentation clock passes their lifetime.
+    pub fn expire_at(&mut self, time_ms: i32) {
+        for slot in 0..self.slots.len() {
+            if self.slots[slot].as_ref().is_some_and(|p| time_ms > p.end_ms) {
+                let previous = self.slots[slot].take().expect("checked occupied slot");
+                self.by_id.remove(&previous.id);
+                self.free.push(slot);
+            }
+        }
+    }
+
     pub fn update(&mut self, commands: &GpuSparkCommands, capacity: usize) -> GpuSparkWrites {
         let mut writes = GpuSparkWrites::default();
         if commands.reset || self.generation != Some(commands.generation) {
@@ -324,13 +336,7 @@ impl GpuSparkPool {
             writes.clear = true;
         }
         // Stock CParticle survives at time==end but dies at time>end.
-        for slot in 0..self.slots.len() {
-            if self.slots[slot].as_ref().is_some_and(|p| commands.time_ms > p.end_ms) {
-                let previous = self.slots[slot].take().expect("checked occupied slot");
-                self.by_id.remove(&previous.id);
-                self.free.push(slot);
-            }
-        }
+        self.expire_at(commands.time_ms);
         for spawn in &commands.spawns {
             if spawn.generation != commands.generation
                 || commands.time_ms > spawn.end_ms
@@ -379,6 +385,20 @@ mod pool_tests {
             rgb_parm: 0.0, flags: 0,
         }
     }
+    #[test]
+    fn resident_particles_survive_render_frames_without_worker_packets() {
+        let mut pool = GpuSparkPool::default();
+        let packet = GpuSparkCommands { generation: 1, time_ms: 100, reset: true,
+            spawns: vec![spawn(10, 1)] };
+        assert_eq!(pool.update(&packet, 1800).writes.len(), 1);
+        for time in [101, 110, 130, 175, 200] {
+            pool.expire_at(time);
+            assert_eq!(pool.slot_for_id(10), Some(0), "particle must remain drawable at {time}ms");
+        }
+        pool.expire_at(201);
+        assert_eq!(pool.slot_for_id(10), None);
+    }
+
     #[test]
     fn pool_uploads_only_births_reuses_expired_slots_and_honors_generation() {
         let mut pool = GpuSparkPool::default();

@@ -9,7 +9,7 @@ use crate::renderer::{
     InputDiagFrameSample, InputDiagLatchPhase, InputDiagRendererMetadata, InputDiagnostic, Instant,
     JoinHandle, LatestViewState, Mutex, PathBuf, PostEffects, PreparedMap, Receiver,
     RenderBatchTiming, RenderCommand, RenderError, RenderSnapshot, RenderStats, Renderer,
-    RendererBackend, Sender, TryRecvError, UiSnapshot, UserEvent, Window, WorldRenderPath,
+    RendererBackend, Sender, TryRecvError, UiSnapshot, UserEvent, Window,
     WorldUploadTimings, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
 };
 
@@ -142,6 +142,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
     match command {
         RenderCommand::MemoryInfo => "MemoryInfo",
         RenderCommand::StartPerfCapture { .. } => "StartPerfCapture",
+        RenderCommand::StartPerfAudit { .. } => "StartPerfAudit",
         RenderCommand::StartSkyPerfSweep { .. } => "StartSkyPerfSweep",
         RenderCommand::TileCost(..) => "TileCost",
         RenderCommand::BatchBegin(..) => "BatchBegin",
@@ -152,6 +153,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetMaxFrameLatency(..) => "SetMaxFrameLatency",
         RenderCommand::SetEarlySubmit(..) => "SetEarlySubmit",
         RenderCommand::SetPresentCopy(..) => "SetPresentCopy",
+        RenderCommand::RunAcquireProbe(..) => "RunAcquireProbe",
         RenderCommand::SetInputLateLatch(..) => "SetInputLateLatch",
         RenderCommand::SetMsaa(..) => "SetMsaa",
         RenderCommand::SetTextureFilter(..) => "SetTextureFilter",
@@ -172,11 +174,13 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetDrawInlineModels(..) => "SetDrawInlineModels",
         RenderCommand::SetInlineTransformMode(..) => "SetInlineTransformMode",
         RenderCommand::SetFragmentShaderMode(..) => "SetFragmentShaderMode",
+        RenderCommand::SetShaderInputMode(..) => "SetShaderInputMode",
         RenderCommand::SetWorldSortMode(..) => "SetWorldSortMode",
         RenderCommand::SetPostSpecialize(..) => "SetPostSpecialize",
         RenderCommand::SetColorClearMode(..) => "SetColorClearMode",
         RenderCommand::SetWorldStageDebug { .. } => "SetWorldStageDebug",
         RenderCommand::SetFastSky(..) => "SetFastSky",
+        RenderCommand::SetCompetitiveAb(..) => "SetCompetitiveAb",
         RenderCommand::SetWorldFlares(..) => "SetWorldFlares",
         RenderCommand::SetFpsCap(..) => "SetFpsCap",
         RenderCommand::SetGamma(..) => "SetGamma",
@@ -197,6 +201,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetOceanEnabled(..) => "SetOceanEnabled",
         RenderCommand::SetOceanSkyExtend(..) => "SetOceanSkyExtend",
         RenderCommand::SetOceanSettings(..) => "SetOceanSettings",
+        RenderCommand::RiverMaterial(..) => "RiverMaterial",
+        RenderCommand::RiverRemove(..) => "RiverRemove",
         RenderCommand::OceanWake(..) => "OceanWake",
         RenderCommand::SetPromotedOceanSettings(..) => "SetPromotedOceanSettings",
         RenderCommand::SetAuthoredOceans(..) => "SetAuthoredOceans",
@@ -214,6 +220,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetWorldCompactMinDraws(..) => "SetWorldCompactMinDraws",
         RenderCommand::SetModelPrepareThreads(..) => "SetModelPrepareThreads",
         RenderCommand::SetEncoderFinishThreads(..) => "SetEncoderFinishThreads",
+        RenderCommand::SetIgpuAbMode(..) => "SetIgpuAbMode",
         RenderCommand::SetModelRenderBundles(..) => "SetModelRenderBundles",
         RenderCommand::SetSurfaceSpritesGpu(..) => "SetSurfaceSpritesGpu",
         RenderCommand::SetSurfaceSprites(..) => "SetSurfaceSprites",
@@ -241,7 +248,6 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetCascadedShadows(..) => "SetCascadedShadows",
         RenderCommand::SetCsmCoverageAB(..) => "SetCsmCoverageAB",
         RenderCommand::SetCullDebug(..) => "SetCullDebug",
-        RenderCommand::SetForceUnifiedWorld(..) => "SetForceUnifiedWorld",
         RenderCommand::SetFoliageWind(..) => "SetFoliageWind",
         RenderCommand::SetPom(..) => "SetPom",
         RenderCommand::SetPlanarReflectionDebug(..) => "SetPlanarReflectionDebug",
@@ -504,6 +510,11 @@ impl RenderThread {
             .map_err(|_| "renderer command channel closed")
     }
 
+    pub fn start_render_perf_audit(&self, stem: PathBuf) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::StartPerfAudit { stem })
+            .map_err(|_| "renderer command channel closed")
+    }
+
     pub fn tile_cost(&self, command: TileCostCommand) -> Result<(), &'static str> {
         self.command_tx.send(RenderCommand::TileCost(command))
             .map_err(|_| "renderer command channel closed")
@@ -649,6 +660,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         glow: video.glow,
         halation: video.halation,
         ssao: video.ssao,
+        ssao_resolution: video.ssao_resolution,
         static_bsp_ao: video.static_bsp_ao,
         static_bsp_ao_lightmap: video.static_bsp_ao_lightmap,
         static_bsp_ao_samples: video.static_bsp_ao_samples,
@@ -799,11 +811,13 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
     renderer.set_draw_inline_models(video.draw_inline_models);
     renderer.set_inline_transform_mode(video.inline_transform_mode);
     renderer.set_fragment_shader_mode(video.fragment_shader_mode);
+    renderer.set_shader_input_mode(video.shader_input_mode);
     renderer.world_sort_mode = video.world_sort_mode.min(1);
     renderer.post_specialize = video.post_specialize;
-    renderer.color_clear_mode = video.color_clear_mode.min(1);
+    renderer.color_clear_mode = video.color_clear_mode.min(2);
     renderer.set_world_stage_debug(video.draw_bsp_model_surfaces, video.world_stage_probe);
     renderer.set_fast_sky(video.fast_sky);
+    renderer.set_competitive_ab(video.competitive_ab);
     renderer.set_dynamic_lighting(video.dynamic_lights);
     renderer.set_rt_samples(video.rt_samples);
     renderer.set_dynamic_light_falloff(video.dynamic_light_falloff);
@@ -827,7 +841,6 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
     );
     renderer.set_cascaded_shadows(video.effective_shadow_mode());
     renderer.set_cull_debug(video.cull_debug);
-    renderer.set_force_unified_world(video.force_unified_world);
     renderer.foliage_wind_enabled = video.foliage_wind;
     renderer.set_pom_enabled(video.pom);
     renderer.set_planar_reflection_debug(video.planar_reflection_debug);
@@ -890,6 +903,13 @@ pub(in crate::renderer) fn render_thread_main(
         });
     }
     apply_scene_video_settings(&mut renderer, &initial_ui.video);
+    // r_igpuAB is a session-only setting, not part of VideoSettings. Depth
+    // format A/B and video restarts create a fresh Renderer (whose constructor
+    // starts with mode 0); reapply the user's active CPU path before drawing.
+    // This also keeps the dynamic model state-cache bit in sync with the world.
+    let igpu_ab_mode = crate::renderer::igpu_ab_mode();
+    renderer.igpu_ab_mode = igpu_ab_mode;
+    renderer.dynamic_model_renderer.igpu_ab_mode = igpu_ab_mode;
     let mut fps_cap = initial_ui.video.fps_cap;
     let mut input_latelatch = initial_ui.video.input_latelatch;
     // `inputdiag` force-enables GPU timestamps for the capture, because the CPU
@@ -935,6 +955,12 @@ pub(in crate::renderer) fn render_thread_main(
     let mut frame_pace_anchor = Instant::now();
     let mut stats_frames = 0_u64;
     let mut last_info = FrameInfo::default();
+    let mut competitive_fps_started = Instant::now();
+    let mut competitive_fps_frames: u32 = 0;
+    let mut competitive_prepare_ms = 0.0;
+    let mut competitive_world_prep_ms = 0.0;
+    let mut competitive_encode_ms = 0.0;
+    let mut competitive_submit_ms = 0.0;
     // Graph stage attribution is only taken from a completed render frame.
     let mut previous_graph_frame_complete = false;
     let mut last_r_speeds = Instant::now();
@@ -1263,7 +1289,9 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                         // Re-arming discards an incomplete run. Drop clears the
                         // global hook flag before the new capture enables it.
-                        drop(perf_capture.take());
+                        if let Some(previous) = perf_capture.take() {
+                            previous.restore(&mut renderer, user_gpu_timings || diag_forced_gpu_timings);
+                        }
                         match seconds {
                             Some(seconds) => eprintln!("[RENDER PERF] armed {seconds:.1}s -> {} (2s delay + 120 warmup frames)",
                                 stem.display()),
@@ -1272,10 +1300,28 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                         perf_capture = Some(PerfCapture::arm(stem, frames, seconds, &renderer));
                     }
+                    Ok(RenderCommand::StartPerfAudit { stem }) => {
+                        if let Some(mut sweep) = sky_sweep.take() {
+                            sweep.restore(&mut renderer);
+                        }
+                        if let Some(probe) = tile_probe.take() {
+                            probe.restore(&mut renderer);
+                        }
+                        if let Some(previous) = perf_capture.take() {
+                            previous.restore(&mut renderer, user_gpu_timings || diag_forced_gpu_timings);
+                        }
+                        // The audit has a timer-free control case. All other
+                        // cases force timestamps when the adapter supports them.
+                        renderer.set_gpu_timings(true);
+                        eprintln!("[IGPU AUDIT] One-shot 13-case capture armed -> {} (2s console grace, automatic restoration)", stem.display());
+                        perf_capture = Some(PerfCapture::arm_audit(stem, &mut renderer));
+                    }
                     Ok(RenderCommand::TileCost(command)) => match command {
                         TileCostCommand::Start { stem, cols, rows, samples } => {
                             if let Some(mut sweep) = sky_sweep.take() { sweep.restore(&mut renderer); }
-                            drop(perf_capture.take());
+                            if let Some(previous) = perf_capture.take() {
+                                previous.restore(&mut renderer, user_gpu_timings || diag_forced_gpu_timings);
+                            }
                             if let Some(probe) = tile_probe.take() { probe.restore(&mut renderer); }
                             renderer.tile_cost_overlay = None;
                             renderer.set_gpu_timings(true);
@@ -1311,7 +1357,9 @@ pub(in crate::renderer) fn render_thread_main(
                     },
                     Ok(RenderCommand::StartSkyPerfSweep { stem, frames }) => {
                         if let Some(mut sweep) = sky_sweep.take() { sweep.restore(&mut renderer); }
-                        drop(perf_capture.take());
+                        if let Some(previous) = perf_capture.take() {
+                            previous.restore(&mut renderer, user_gpu_timings || diag_forced_gpu_timings);
+                        }
                         renderer.set_gpu_timings(true);
                         eprintln!("[SKY SWEEP] starting six-phase Unified sky experiment -> {}", stem.display());
                         sky_sweep = Some(SkyPerfSweep::new(stem, frames, &mut renderer));
@@ -1351,6 +1399,19 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetPresentCopy(enabled)) => {
                         renderer.present_copy_enabled = enabled;
+                    }
+                    Ok(RenderCommand::RunAcquireProbe(seconds)) => {
+                        if renderer.offscreen_output.is_some() {
+                            println!("[JKA ACQUIRE PROBE] Only supported for windowed game presentation");
+                        } else {
+                            renderer.acquire_probe_started = Some(Instant::now());
+                            renderer.acquire_probe_seconds = seconds.clamp(1, 10);
+                            renderer.acquire_probe_frames = 0;
+                            renderer.acquire_probe_acquire_ms = 0.0;
+                            renderer.acquire_probe_submit_ms = 0.0;
+                            println!("[JKA ACQUIRE PROBE] Starting {}s clear-only test (normal rendering resumes automatically)", renderer.acquire_probe_seconds);
+                            frame_pace_anchor = Instant::now();
+                        }
                     }
                     Ok(RenderCommand::SetInputLateLatch(enabled)) => {
                         input_latelatch = enabled;
@@ -1407,13 +1468,15 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetDrawInlineModels(enabled)) => renderer.set_draw_inline_models(enabled),
                     Ok(RenderCommand::SetInlineTransformMode(mode)) => renderer.set_inline_transform_mode(mode),
                     Ok(RenderCommand::SetFragmentShaderMode(mode)) => renderer.set_fragment_shader_mode(mode),
+                    Ok(RenderCommand::SetShaderInputMode(mode)) => renderer.set_shader_input_mode(mode),
                     Ok(RenderCommand::SetWorldSortMode(mode)) => renderer.world_sort_mode = mode.min(1),
                     Ok(RenderCommand::SetPostSpecialize(enabled)) => renderer.post_specialize = enabled,
-                    Ok(RenderCommand::SetColorClearMode(mode)) => renderer.color_clear_mode = mode.min(1),
+                    Ok(RenderCommand::SetColorClearMode(mode)) => renderer.color_clear_mode = mode.min(2),
                     Ok(RenderCommand::SetWorldStageDebug { draw_bsp_model_surfaces, probe }) => {
                         renderer.set_world_stage_debug(draw_bsp_model_surfaces, probe);
                     },
                     Ok(RenderCommand::SetFastSky(mode)) => renderer.set_fast_sky(mode),
+                    Ok(RenderCommand::SetCompetitiveAb(mode)) => renderer.set_competitive_ab(mode),
                     Ok(RenderCommand::SetWorldFlares(enabled)) => {
                         if renderer.world_flares_enabled != enabled {
                             renderer.world_flares.invalidate_history();
@@ -1503,6 +1566,17 @@ pub(in crate::renderer) fn render_thread_main(
                             ocean.blue_wake_command(command);
                         }
                     }
+                    Ok(RenderCommand::RiverMaterial(id,settings)) => {
+                        if let Some(river)=renderer.live_rivers.iter().find(|r|r.id==id) {river.set_settings(&renderer.queue,settings);}
+                    }
+                    Ok(RenderCommand::RiverRemove(id)) => {renderer.live_rivers.retain(|r|r.id!=id);}
+                    Ok(RenderCommand::RiverSpawn(definition, collision)) => {
+                        let result=renderer.spawn_live_river(definition,&collision).map(|()|definition.source);
+                        let _=proxy.send_event(UserEvent::RiverUpdated {id:definition.id,result});
+                    }
+                    Ok(RenderCommand::RiverClear) => {
+                        renderer.clear_live_rivers();
+                    }
                     Ok(RenderCommand::SetPromotedOceanSettings(settings)) => {
                         renderer.promoted_ocean_overrides = settings;
                     }
@@ -1544,7 +1618,7 @@ pub(in crate::renderer) fn render_thread_main(
                         user_gpu_timings = enabled;
                         // A capture owns the profiler until it finishes; the new
                         // preference is applied when it restores.
-                        if !diag_forced_gpu_timings && sky_sweep.is_none() && tile_probe.is_none() {
+                        if !diag_forced_gpu_timings && sky_sweep.is_none() && tile_probe.is_none() && perf_capture.as_ref().is_none_or(|capture| !capture.is_audit()) {
                             renderer.set_gpu_timings(enabled);
                         }
                     }
@@ -1588,6 +1662,12 @@ pub(in crate::renderer) fn render_thread_main(
                         if let Err(error) = renderer.set_encoder_finish_threads(mode) {
                             eprintln!("Encoder finish worker: {error}");
                         }
+                    }
+                    Ok(RenderCommand::SetIgpuAbMode(mode)) => {
+                        // Render-thread command ordering latches all five A/B
+                        // experiments together for subsequent frames.
+                        renderer.igpu_ab_mode = mode & 31;
+                        renderer.dynamic_model_renderer.igpu_ab_mode = mode & 31;
                     }
                     Ok(RenderCommand::SetModelRenderBundles(enabled)) => {
                         renderer.dynamic_model_renderer.set_model_render_bundles(enabled);
@@ -1688,9 +1768,6 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetFoliageWind(enabled)) => {
                         renderer.foliage_wind_enabled = enabled;
-                    }
-                    Ok(RenderCommand::SetForceUnifiedWorld(force)) => {
-                        renderer.set_force_unified_world(force);
                     }
                     Ok(RenderCommand::SetPom(enabled)) => {
                         renderer.set_pom_enabled(enabled);
@@ -1806,7 +1883,13 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_combat_ui(zoom_scope, rocket_lock),
                     Ok(RenderCommand::SetNeonMenu(frame)) => renderer.set_neon_menu(frame),
                     Ok(RenderCommand::SetNeonChrome(frame)) => renderer.set_neon_chrome(frame),
-                    Ok(RenderCommand::SetNeonMenuCache(image)) => renderer.set_neon_menu_cache(image),
+                    Ok(RenderCommand::SetNeonMenuCache(image)) => {
+                        renderer.set_neon_menu_cache(image);
+                        // Cache uploads invalidate neon's bind group/targets.
+                        // Re-arm the ready notification for the new texture;
+                        // the UI uses its egui photo fallback until then.
+                        neon_compositor_ready_notified = false;
+                    }
                     Ok(RenderCommand::SetExtensionHud(widgets, hidden, images)) => renderer.set_extension_hud(widgets, hidden, images),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
@@ -1825,8 +1908,11 @@ pub(in crate::renderer) fn render_thread_main(
                         enemy_info,
                         race_timer,
                         vote_line,
+                        siege_hud,
                         scoreboard,
                         scoreboard_focus_client,
+                        killfeed,
+                        chat_anim,
                         speedometer,
                         lagometer,
                         team_overlay,
@@ -1848,8 +1934,11 @@ pub(in crate::renderer) fn render_thread_main(
                         enemy_info,
                             race_timer,
                             vote_line,
+                            siege_hud,
                             scoreboard,
                             scoreboard_focus_client,
+                            killfeed,
+                            chat_anim,
                             speedometer,
                             lagometer,
                             team_overlay,
@@ -1990,6 +2079,7 @@ pub(in crate::renderer) fn render_thread_main(
                         // present the latest loading state ("uploading") first; the
                         // upload itself runs at the top of the next iteration.
                         load_map_received_at = Some(Instant::now());
+                        renderer.clear_live_rivers();
                         deferred_load_map = Some((request_id, started, name, map, studio_world));
                         break;
                     }
@@ -2304,6 +2394,40 @@ pub(in crate::renderer) fn render_thread_main(
         if render_result.is_err() {
             renderer.retry_inline_transforms();
         }
+        if matches!(renderer.competitive_ab, 4 | 9 | 14 | 15) || renderer.competitive_ab >= 16 {
+            competitive_fps_frames = competitive_fps_frames.saturating_add(1);
+            if let Ok(ref info) = render_result {
+                competitive_prepare_ms += info.cpu_prepare_ms;
+                competitive_world_prep_ms += info.prep_world_ms;
+                competitive_encode_ms += info.cpu_encode_ms;
+                competitive_submit_ms += info.cpu_submit_ms;
+            }
+            let elapsed = competitive_fps_started.elapsed();
+            if elapsed >= Duration::from_secs(2) {
+                let count = f64::from(competitive_fps_frames.max(1));
+                println!("[COMPETITIVE FPS] mode={} mask=0x{:06x} fps={:.1} frames={} elapsed={:.3}s prepare={:.3}ms world_prep={:.3}ms encode={:.3}ms submit={:.3}ms",
+                    renderer.competitive_ab, crate::renderer::competitive_probe_mask(renderer.competitive_ab),
+                    competitive_fps_frames as f64 / elapsed.as_secs_f64(),
+                    competitive_fps_frames, elapsed.as_secs_f64(),
+                    competitive_prepare_ms / count,
+                    competitive_world_prep_ms / count,
+                    competitive_encode_ms / count,
+                    competitive_submit_ms / count);
+                competitive_fps_started = Instant::now();
+                competitive_fps_frames = 0;
+                competitive_prepare_ms = 0.0;
+                competitive_world_prep_ms = 0.0;
+                competitive_encode_ms = 0.0;
+                competitive_submit_ms = 0.0;
+            }
+        } else {
+            competitive_fps_started = Instant::now();
+            competitive_fps_frames = 0;
+            competitive_prepare_ms = 0.0;
+            competitive_world_prep_ms = 0.0;
+            competitive_encode_ms = 0.0;
+            competitive_submit_ms = 0.0;
+        }
         match render_result {
             Ok(info) => {
                 #[cfg(test)]
@@ -2376,9 +2500,24 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.ocean_settings.adaptive_mesh_tolerance,
                         reason, details);
                 }
-                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf, loop_sections)) {
+                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &mut renderer, &frame_camera, &snapshot.client_perf, loop_sections)) {
                     if let Some(completed) = perf_capture.take() {
-                        completed.finish();
+                        // One-run iGPU diagnosis: automatically follow broad
+                        // phase/time diagnostics with per-screen-region GPU
+                        // scissor measurements. These identify expensive pixels
+                        // versus fixed draw/clear/copy overhead. No extra
+                        // console commands or settings changes required.
+                        let tiles = completed.audit_tile_stem();
+                        completed.restore(&mut renderer, user_gpu_timings || diag_forced_gpu_timings).finish();
+                        if let Some(tile_stem) = tiles {
+                            renderer.set_gpu_timings(true);
+                            // 4x4 is enough to find a screen-space hotspot;
+                            // 5 resolved GPU timestamps per cell plus interleaved
+                            // full/baseline controls. More tiles increases disturbance.
+                            tile_probe = Some(TileCostProbe::new(tile_stem.clone(), 4, 4, 5, &mut renderer));
+                            tile_probe_reported_at = Instant::now();
+                            eprintln!("[IGPU AUDIT] Stage sweep saved. Now measuring full-screen vs 1px baseline vs 16 pixel tiles -> {}.json/.csv", tile_stem.display());
+                        }
                     }
                 }
                 if let Some(probe) = tile_probe.as_mut() {
@@ -2795,7 +2934,7 @@ pub(in crate::renderer) fn render_thread_main(
                 last_info.world_shader_programs.binds[0], last_info.world_shader_programs.binds[1],
                 last_info.world_shader_programs.binds[2], last_info.world_shader_programs.binds[3], last_info.world_shader_programs.binds[4]);
             // A/B line: which world renderer ran, plus the unified prepare split.
-            // FastBaseline does not split its prepare stage, so those read 0.
+            // Unified prepares the camera and dynamic scene in separate phases.
             println!(
                 "[JKA PERF PATH] path={} gpu_timings={} cpu_frame={:.4}ms prep={:.4}ms[camera={:.4} shadow={:.4} world={:.4} reflection={:.4} dynamic={:.4}] encode={:.4}ms submit={:.4}ms present={:.4}ms",
                 last_info.world_path,
@@ -2849,6 +2988,25 @@ pub(in crate::renderer) fn render_thread_main(
                 client.dynamic_surfaces,
                 client.dynamic_vertices,
                 client.dynamic_indices,
+            );
+            println!(
+                "[JKA FX SOURCES] trail_draws={} ghost_trail_draws={} remaining={} geometry={:.4}ms other_fx_tess={:.4}ms",
+                client.fx_trail_draws,
+                client.fx_ghost_trail_draws,
+                client.fx_draws.saturating_sub(client.fx_trail_draws).saturating_sub(client.fx_ghost_trail_draws),
+                client.fx_geometry_ms,
+                (client.fx_tessellate_ms - client.fx_geometry_ms).max(0.0),
+            );
+            println!(
+                "[JKA FX WORKER] wait={:.4}ms update={:.4}ms queued_wait={:.4}ms ticks={} deferred={} snapshot_age={}ms in_flight={} clone={:.4}ms (async wait=0; update is last completed tick)",
+                client.fx_worker_wait_ms,
+                client.fx_worker_update_ms,
+                (client.fx_worker_wait_ms - client.fx_worker_update_ms).max(0.0),
+                client.fx_worker_ticks,
+                client.fx_worker_deferred,
+                client.fx_worker_age_ms,
+                client.fx_worker_in_flight,
+                client.fx_snapshot_clone_ms,
             );
             println!(
                 "[JKA FX PERF] draws={} sprite={} oriented={} line={} quad={} mesh={} cylinder={} output[surfaces={} cpu_surfaces={} cpu_verts={} cpu_indices={} gpu_sprite_batches={} gpu_sprite_instances={}] zero_alpha_discard={} gpu_sprites={}ms",
@@ -3159,6 +3317,38 @@ pub(in crate::renderer) fn render_thread_main(
                 u8::from(renderer.pbr_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
                 u8::from(renderer.cascaded_shadows_enabled),
             );
+            let encoded_draws = renderer.dynamic_model_renderer.draws.iter()
+                .map(|d| d.alpha_mode)
+                .chain(renderer.dynamic_model_renderer.skin_draws.iter().map(|d| d.alpha_mode))
+                .filter(|m| crate::renderer::models::legacy_blend::eligible(*m)).count();
+            let effective_blend_mode = renderer.dynamic_model_renderer.legacy_blend_mode;
+            let requested_blend_mode = crate::renderer::legacy_blend_mode();
+            let effective_blend_format = if effective_blend_mode == 4 {
+                renderer.config.format.remove_srgb_suffix()
+            } else {
+                crate::renderer::models::legacy_blend::LegacyModelBlend::intermediate_format(effective_blend_mode)
+            };
+            let legacy_region = if !renderer.dynamic_model_renderer.legacy_blend_active() {
+                "none".to_owned()
+            } else if effective_blend_mode == 4 {
+                "direct".to_owned()
+            } else if let Some((x, y, width, height)) = last_info.legacy_transfer_rect {
+                let full_pixels = u64::from(renderer.config.width) * u64::from(renderer.config.height);
+                let pixels = u64::from(width) * u64::from(height);
+                format!("bounded({x},{y},{width},{height}) pixels={pixels}/{full_pixels}")
+            } else {
+                "full".to_owned()
+            };
+            println!("[JKA PERF BLEND A/B] requested={} effective={} format={:?} encoded_draws={} encoded_active={} scene_copy_forced={} effective_post={} native_unorm_alias={} encoded_region={}",
+                requested_blend_mode,
+                effective_blend_mode,
+                effective_blend_format,
+                encoded_draws,
+                u8::from(renderer.dynamic_model_renderer.legacy_blend_active()),
+                u8::from(last_info.scene_copy_forced),
+                u8::from(last_info.effective_post),
+                u8::from(effective_blend_mode == 4),
+                legacy_region);
             let (point_sources, area_sources, total_sources) =
                 renderer
                     .world
@@ -3201,10 +3391,7 @@ pub(in crate::renderer) fn render_thread_main(
                 u8::from(renderer.point_lighting_enabled()),
                 u8::from(renderer.any_area_lights_enabled()),
                 u8::from(renderer.voxel_probe_gi_enabled),
-                match renderer.frame_plan.world_path {
-                    WorldRenderPath::FastBaseline => "fast-baseline",
-                    WorldRenderPath::Advanced => "advanced",
-                },
+                "unified",
                 if renderer.enhanced_world_shader_needed() {
                     "enhanced"
                 } else {

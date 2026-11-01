@@ -1,13 +1,13 @@
 //! World settings.
 use crate::renderer::{
-    auto_detail_fallback_index, create_fast_world_wireframe_pipeline, create_wireframe_pipeline,
+    auto_detail_fallback_index, create_wireframe_pipeline,
     create_world_pipeline_variant_from_plan, create_world_wireframe_pipeline, pipeline_hash,
     required_auto_detail_indices, try_load_texture_asset_from_search_path, ui, upload_texture,
     wireframe_cull_slot, AssetSearchPath, CullDebugMode, CullMode, DrawClass, DynamicLightsMode, FootprintMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
     WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldPipelineVariant,
-    WorldRenderPath, WorldShaderFamily,
+    WorldShaderFamily,
     WorldShaderVariantKey, AUTO_DETAIL_TEXTURE_FILES, PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR,
     PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION, PBR_PROFILE_POM_ADAPTIVE_STEPS,
     PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL, PBR_PROFILE_SHARED_TANGENT_FRAME,
@@ -153,7 +153,7 @@ impl Renderer {
         self.jump_shade = state;
         if engaged_changed {
             // Compiles (once, then cached) the world variant that carries the tint,
-            // and routes off the fast baseline shader, which does not have it.
+            // and routes into the Unified shader, which supports it.
             self.rebuild_frame_plan();
             self.activate_world_pipeline_variant();
         }
@@ -169,6 +169,11 @@ impl Renderer {
             return;
         }
         self.detail_texture_game = next_game;
+        // The enemy-info shader resolver owns its own VFS/material cache.
+        // A mod switch must never retain the previous mod's icon shaders.
+        self.enemy_icon_key = None;
+        self.enemy_icon_materials.clear();
+        self.enemy_icon_resolver = None;
         self.detail_auto_textures.clear();
 
         let plan = self
@@ -234,47 +239,31 @@ impl Renderer {
             .filter(|b| b.source.pipeline.class != DrawClass::Sky && b.ocean_clipmap.is_none())
             .map(|b| b.source.pipeline)
             .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-        if self.frame_plan.world_path == WorldRenderPath::FastBaseline {
-            if !world.fast_complexity_pipelines.is_empty() || keys.is_empty() { return; }
-            let job = PipelineJobKey::new("fast-shader-complexity", 0,
-                pipeline_hash(&(format, samples, &keys)));
-            if let Some(pipelines) = self.pipeline_jobs.take_ready(job) {
-                if let Some(world) = self.world.as_mut() { world.fast_complexity_pipelines = pipelines; }
-            } else {
-                let device = self.device.clone();
-                let layout = self.fast_world_pipeline_layout.clone();
-                let shader = self.fast_world_shader.clone();
-                self.pipeline_jobs.request(job, "fast BSP shader heatmap", move || {
-                    crate::renderer::create_shader_complexity_pipelines(&device, &layout, &shader,
-                        format, samples, &keys, None)
+        let variant = world.active_pipeline_variant;
+        if world.complexity_pipelines.contains_key(&variant) || keys.is_empty() { return; }
+        let job = PipelineJobKey::new("shader-complexity", pipeline_hash(&variant) as u32,
+            pipeline_hash(&(format, samples, variant, &keys)));
+        if let Some(pipelines) = self.pipeline_jobs.take_ready(job) {
+            if let Some(world) = self.world.as_mut() { world.complexity_pipelines.insert(variant, pipelines); }
+        } else {
+            let device = self.device.clone();
+            let selected = if variant.ray_traced_shadows {
+                self.ray_traced_shadows.as_ref().map(|rt| match variant.family() {
+                    WorldShaderFamily::Lean => (rt.world_pipeline_layout_lean.clone(), rt.world_shader_for_variant(variant).clone()),
+                    WorldShaderFamily::Enhanced => (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone()),
+                })
+            } else { Some(match variant.family() {
+                WorldShaderFamily::Lean => (self.world_pipeline_layout_lean.clone(), self.world_shader_lean.clone()),
+                WorldShaderFamily::Enhanced => (self.world_pipeline_layout.clone(), self.world_shader.clone()),
+            }) };
+            if let Some((layout, shader)) = selected {
+                self.pipeline_jobs.request(job, "BSP shader heatmap", move || {
+                    crate::renderer::create_shader_complexity_pipelines(&device, &layout,
+                        &shader, format, samples, &keys, Some(variant))
                 });
             }
-        } else {
-            let variant = world.active_pipeline_variant;
-            if world.complexity_pipelines.contains_key(&variant) || keys.is_empty() { return; }
-            let job = PipelineJobKey::new("shader-complexity", pipeline_hash(&variant) as u32,
-                pipeline_hash(&(format, samples, variant, &keys)));
-            if let Some(pipelines) = self.pipeline_jobs.take_ready(job) {
-                if let Some(world) = self.world.as_mut() { world.complexity_pipelines.insert(variant, pipelines); }
-            } else {
-                let device = self.device.clone();
-                let selected = if variant.ray_traced_shadows {
-                    self.ray_traced_shadows.as_ref().map(|rt| match variant.family() {
-                        WorldShaderFamily::Lean => (rt.world_pipeline_layout_lean.clone(), rt.world_shader_for_variant(variant).clone()),
-                        WorldShaderFamily::Enhanced => (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone()),
-                    })
-                } else { Some(match variant.family() {
-                    WorldShaderFamily::Lean => (self.world_pipeline_layout_lean.clone(), self.world_shader_lean.clone()),
-                    WorldShaderFamily::Enhanced => (self.world_pipeline_layout.clone(), self.world_shader.clone()),
-                }) };
-                if let Some((layout, shader)) = selected {
-                    self.pipeline_jobs.request(job, "BSP shader heatmap", move || {
-                        crate::renderer::create_shader_complexity_pipelines(&device, &layout,
-                            &shader, format, samples, &keys, Some(variant))
-                    });
-                }
-            }
         }
+
     }
 
     pub(in crate::renderer) fn set_wireframe_mask(&mut self, mask: u32) {
@@ -380,35 +369,6 @@ impl Renderer {
             .world
             .as_ref()
             .map_or(false, |world| world.snow_shell.has_snow());
-        if self.frame_plan.world_path == WorldRenderPath::FastBaseline
-            && self.wireframe_mask & ui::wireframe::DEFORMATION != 0
-            && has_deformation
-            && self.fast_world_wireframe_pipeline.is_none()
-        {
-            let key = PipelineJobKey::new(
-                "fast-world-wireframe",
-                0,
-                pipeline_hash(&(scene_format, samples)),
-            );
-            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
-                self.fast_world_wireframe_pipeline = Some(pipeline);
-            } else {
-                let device = self.device.clone();
-                let layout = self.fast_world_pipeline_layout.clone();
-                let shader = self.fast_world_shader.clone();
-                self.pipeline_jobs
-                    .request(key, "fast world wireframe", move || {
-                        create_fast_world_wireframe_pipeline(
-                            &device,
-                            &layout,
-                            &shader,
-                            scene_format,
-                            samples,
-                        )
-                    });
-            }
-        }
-
         let active_key = self
             .world
             .as_ref()
@@ -424,10 +384,9 @@ impl Renderer {
                         .iter()
                         .any(|batch| batch.ocean_clipmap.is_some())
             });
-        let needs_deformed_world = self.frame_plan.world_path == WorldRenderPath::Advanced
-            && ((self.wireframe_mask & ui::wireframe::OCEAN != 0
+        let needs_deformed_world = (self.wireframe_mask & ui::wireframe::OCEAN != 0
                     && self.ocean_settings.backend == 0 && has_ocean_clipmap)
-                || (self.wireframe_mask & ui::wireframe::DEFORMATION != 0 && has_deformation));
+                || (self.wireframe_mask & ui::wireframe::DEFORMATION != 0 && has_deformation);
         if needs_deformed_world {
             if let Some(variant) = active_key {
                 if !self.world_wireframe_pipelines.contains_key(&variant) {
@@ -564,6 +523,7 @@ impl Renderer {
         let map_light_simulation = self.map_light_simulation_active_for(source_map);
         let shadowable_local_lights = point_lights || self.any_area_lights_enabled() || self.baked_local_shadows;
         WorldShaderVariantKey {
+            shader_input_mode: self.shader_input_mode,
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
             pom: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
             pbr_shared_material_eval: self.pbr_enabled && PBR_PROFILE_SHARED_MATERIAL_EVAL,
@@ -715,7 +675,7 @@ impl Renderer {
     /// r_fragmentShaderMode. The specialized programs are compiled in the
     /// background like any other variant; the switch happens once they are ready.
     pub(in crate::renderer) fn set_fragment_shader_mode(&mut self, mode: u8) {
-        let mode = mode.min(4);
+        let mode = mode.min(5);
         if self.fragment_shader_mode == mode {
             return;
         }
@@ -723,6 +683,19 @@ impl Renderer {
         if self.world.is_some() {
             self.activate_world_pipeline_variant();
         }
+    }
+
+    /// A/B shader *input* independent of the fragment program modes.
+    /// Retains the old pipelines until the new variant has compiled in the worker.
+    pub(in crate::renderer) fn set_shader_input_mode(&mut self, mode: u8) {
+        if mode > 1 {
+            eprintln!("[SHADER INPUT] mode 2 disabled: unsafe native passthrough crashed the NVIDIA driver; choosing WGSL instead");
+        }
+        let mode = if mode > 1 { 0 } else { mode };
+        if self.shader_input_mode == mode { return; }
+        self.shader_input_mode = mode;
+        eprintln!("[SHADER INPUT] requested mode {mode} (BSP pipeline rebuild queued)");
+        if self.world.is_some() { self.activate_world_pipeline_variant(); }
     }
 
     pub(in crate::renderer) fn enhanced_world_shader_needed(&self) -> bool {
@@ -1006,14 +979,6 @@ impl Renderer {
     ) {
         self.debug_volumes
             .set_coastal_debug_mesh(&self.device, mesh.as_ref());
-    }
-
-    pub(in crate::renderer) fn set_force_unified_world(&mut self, force: bool) {
-        if self.force_unified_world == force {
-            return;
-        }
-        self.force_unified_world = force;
-        self.rebuild_frame_plan();
     }
 
     pub(in crate::renderer) fn set_cull_debug(&mut self, mode: CullDebugMode) {

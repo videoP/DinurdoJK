@@ -64,9 +64,10 @@ impl FrontendStage {
         Some(self.epoch)
     }
 
-    /// Returns true when this ack started the clock.
+    /// Returns true when this ack started the clock. An in-flight frame
+    /// from before the cached photo finished decoding cannot release black.
     pub(super) fn on_presented(&mut self, token: u64, now: Instant) -> bool {
-        if token != self.epoch || self.presented_at.is_some() {
+        if token != self.epoch || self.cache_pending || self.presented_at.is_some() {
             return false;
         }
         self.presented_at = Some(now);
@@ -174,6 +175,9 @@ pub(super) fn path(base: &Path, game: Option<&Path>, scene: &str, video: &crate:
 impl App {
     pub(super) fn load_frontend_scene_cache(&mut self) {
         self.frontend_scene_texture = None;
+        // Clearing/replacing the GPU texture invalidates the neon compositor's
+        // bind group. Until its replacement is ready, egui must own the photo.
+        self.neon_menu.renderer_ready = false;
         self.render_command(crate::renderer::RenderCommand::SetNeonMenuCache(None));
         self.frontend_scene_cache_generation = self.frontend_scene_cache_generation.wrapping_add(1);
         let generation = self.frontend_scene_cache_generation;
@@ -214,9 +218,12 @@ impl App {
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(path.with_extension("json"));
                 }
+                let cache_hit = image.is_some();
                 let _ = proxy.send_event(crate::runtime::UserEvent::FrontendSceneCacheReady {
-                    path, generation, image,
+                    path: path.clone(), generation, image,
                 });
+                // Eviction/timestamp I/O remains off the main and render threads.
+                crate::frontend_cache_color::maintain_frontend_scene_cache(&path, cache_hit);
             });
         if let Err(error) = spawn {
             eprintln!("[MENU CACHE] failed to spawn decoder: {error}");
@@ -241,8 +248,14 @@ impl App {
     pub(super) fn frontend_visual_handoff_start(&self, ready: Instant) -> Instant {
         if self.frontend_scene_texture.is_some() {
             self.frontend_stage.presented_at
-                .map(|presented| ready.max(presented + Duration::from_millis(850)))
-                .unwrap_or(ready)
+                // Finish the black -> still reveal, then hold the photograph
+                // briefly before its independent still -> live 3D crossfade.
+                .map(|presented| ready.max(presented
+                    + Duration::from_secs_f32(FRONTEND_STAGE_FADE_IN_SECS)
+                    + Duration::from_millis(250)))
+                // A decoded photo may arrive before the first stage-present
+                // ack. Never consume the handoff while that frame is pending.
+                .unwrap_or_else(|| Instant::now() + Duration::from_millis(250))
         } else {
             ready
         }
@@ -300,6 +313,7 @@ impl App {
 
     pub(super) fn select_frontend_scene(&mut self, scene: &str) {
         let path = path(&self.base, self.game.as_deref(), scene, &self.video);
+        crate::frontend_cache_color::set_active_frontend_scene(&path);
         // Every entry to the menu scene restarts the one stage timeline.
         self.frontend_stage.begin_scene(false);
         if self.frontend_scene_cache_path.as_ref() != Some(&path) {
@@ -309,6 +323,12 @@ impl App {
             // The very first visit just populated this cache. Keep its cold
             // reveal undisturbed; load it when the menu is next requested.
             self.load_frontend_scene_cache();
+        } else if self.frontend_scene_texture.is_some() {
+            // Re-selecting an already resident photo is a cache hit too. Do
+            // not perform any disk I/O on the menu/UI thread.
+            let _ = std::thread::Builder::new()
+                .name("frontend-scene-lru".into())
+                .spawn(move || crate::frontend_cache_color::maintain_frontend_scene_cache(&path, true));
         }
         // A texture that is already resident is not pending.
         self.frontend_stage.cache_pending &= self.frontend_scene_texture.is_none();
@@ -341,17 +361,20 @@ impl App {
 /// Best-effort removal of snapshots written by older cache formats.
 /// v4 inherited gameplay FOV and can no longer be used for the fixed menu
 /// projection; v3 and earlier could contain console/HUD pixels.
+/// v6 snapshots are superseded by the current v7 PNG/metadata format.
 fn remove_legacy_snapshots(current: &Path) {
     let Some(dir) = current.parent() else { return; };
     let Ok(entries) = std::fs::read_dir(dir) else { return; };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (name.starts_with("v5_") || name.starts_with("v4_") || name.starts_with("v3_")
-            || name.starts_with("v2_") || name.starts_with("v1_"))
-            && name.ends_with(".jpg")
-        {
+        let older_jpeg = (name.starts_with("v5_") || name.starts_with("v4_")
+            || name.starts_with("v3_") || name.starts_with("v2_") || name.starts_with("v1_"))
+            && name.ends_with(".jpg");
+        let v6_image = name.starts_with("v6_") && (name.ends_with(".jpg") || name.ends_with(".png"));
+        if older_jpeg || v6_image {
             let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(entry.path().with_extension("json"));
         }
     }
 }
@@ -423,6 +446,7 @@ mod tests {
         assert!(stage.token_for_frame(t0 + Duration::from_secs(3)).is_some(), "timeout fallback");
         stage.begin_scene(true);
         assert_eq!(stage.token_for_frame(t0), None, "waiting on snapshot decode");
+        assert!(!stage.on_presented(stage.epoch, t0), "cannot fade while decoding");
         stage.cache_pending = false;
         let token = stage.token_for_frame(t0).expect("armed once snapshot resolved");
         assert_eq!(stage.brightness(t0, 0.9), 0.0);

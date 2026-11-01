@@ -38,6 +38,7 @@ fn category(item: SearchItem) -> &'static str {
             VideoSection::Physics => "Physics",
             VideoSection::Sun => "Sky",
             VideoSection::BlueWater | VideoSection::Water => "Ocean",
+            VideoSection::River => "River",
             VideoSection::Clouds => "Clouds",
             VideoSection::Weather => "Weather",
             VideoSection::Surface => "Surface interaction",
@@ -96,7 +97,7 @@ fn score(item: SearchItem, tokens: &[String], joined: &str) -> Option<i32> {
 pub(in crate::app) fn search_bar(ui: &mut egui::Ui) -> bool {
     let mut query = current_query(ui.ctx());
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("SEARCH SETTINGS").size(11.5).color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new("SEARCH SETTINGS").size(11.5).color(theme::TEXT_DIM()));
         let width = (ui.available_width() - 58.0).max(100.0);
         let response = ui.add_sized(
             [width, 27.0],
@@ -143,7 +144,7 @@ impl App {
         theme::page_title(ui, "SEARCH RESULTS", &format!("{} matching settings across Setup", results.len()));
         if hidden > 0 {
             theme::hint(ui, &format!("{hidden} gameplay / interface setting(s) also match. They live in Setup, outside \
-                Render Studio. The Studio camera (third person, FOV) is set on camera keys and Director shots."), theme::WARNING);
+                Render Studio. The Studio camera (third person, FOV) is set on camera keys and Director shots."), theme::WARNING());
         }
         let mut chosen = None;
         egui::ScrollArea::vertical()
@@ -152,7 +153,7 @@ impl App {
             .show(ui, |ui| {
                 if results.is_empty() {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("No matching settings. Try a shorter name or a cvar.").color(theme::TEXT_DIM));
+                    ui.label(egui::RichText::new("No matching settings. Try a shorter name or a cvar.").color(theme::TEXT_DIM()));
                 }
                 for &(_, item) in results.iter().take(150) {
                     let description = item.hint.split('.').next().unwrap_or("").trim();
@@ -161,13 +162,13 @@ impl App {
                     let response = ui.add_sized(
                         [ui.available_width(), 54.0],
                         egui::Button::new(format!("{}\n{}  ·  {}", item.label, path(item), preview))
-                            .fill(theme::CONTROL),
+                            .fill(theme::CONTROL()),
                     );
                     if response.clicked() { chosen = Some(item); }
                     ui.add_space(2.0);
                 }
                 if results.len() > 150 {
-                    ui.label(egui::RichText::new("Showing the first 150 matches. Type more to narrow the search.").color(theme::TEXT_FAINT));
+                    ui.label(egui::RichText::new("Showing the first 150 matches. Type more to narrow the search.").color(theme::TEXT_FAINT()));
                 }
             });
         if let Some(item) = chosen {

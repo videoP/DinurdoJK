@@ -228,6 +228,29 @@ commands! {
         CommandResult::Handled
     }
 
+    cmd_igpu_audit ["igpu_audit", "render_gpu_audit"] ("igpu_audit [label]", "One-command iGPU study: frame CPU/GPU timing, stage exclusions, color clear, timestamp overhead, and automatic 4x4 GPU pixel-cost map. Writes CSV/JSON reports and restores settings.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        if words.len() > 2 {
+            self.push_console_line("^3usage:^7 igpu_audit [label]".to_owned());
+            return CommandResult::Handled;
+        }
+        let label: String = words.get(1).copied().unwrap_or("")
+            .chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32).collect();
+        let name = if label.is_empty() { format!("igpu-audit-{}", demo_recording_timestamp()) }
+            else { format!("igpu-audit-{}-{label}", demo_recording_timestamp()) };
+        let stem = self.game_write_path(std::path::PathBuf::from("renderperf").join(name));
+        let result = self.render.as_ref().ok_or("renderer is unavailable")
+            .and_then(|render| render.start_render_perf_audit(stem.clone()));
+        match result {
+            Ok(()) => self.push_console_line(format!(
+                "^2IGPU AUDIT ARMED^7 Keep camera still; run will automatically finish and restore settings. Output: {}.csv/.json",
+                stem.display())),
+            Err(error) => self.push_console_line(format!("^1igpu_audit:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
     cmd_render_perf_capture ["render_perf_capture", "renderperfcapture"] ("render_perf_capture [frames=600|<seconds>s] [label]", "Record per-frame renderer CPU stage timings to CSV/JSON after a 2s delay and 120 warmup frames. A count ending in s (e.g. 10s) records for that long instead. Opt-in; no GPU stalls.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         if words.len() > 3 {
@@ -579,6 +602,77 @@ commands! {
         CommandResult::Handled
     }
 
+    cmd_riversource ["riversource", ] ("riversource [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'riverclear' removes all patches.", CommandScope::Always) |self, command| {
+        use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE};
+        let words: Vec<_> = command.split_whitespace().collect();
+        let defaults=self.river_editor.defaults;
+        let parsed=(||->Result<crate::river_authoring::SourceParameters,String> {
+            let number=|i:usize,default:f32|->Result<f32,String> {
+                words.get(i).map_or(Ok(default),|w|w.parse::<f32>().map_err(|_|format!("invalid source parameter: {w}")))
+            };
+            let cells=number(4,defaults.cells as f32)?;
+            if !cells.is_finite()||cells.fract()!=0.0||!(16.0..=1024.0).contains(&cells) {return Err("cells must be an integer from 16 to 1024".into());}
+            let discharge_cfs=match words.get(6) {
+                Some(w) if w.eq_ignore_ascii_case("level")=>None,
+                Some(w)=>Some(w.parse::<f32>().map_err(|_|"CFS must be a number or 'level'".to_owned())?),
+                None=>defaults.discharge_cfs,
+            };
+            Ok(crate::river_authoring::SourceParameters {height:number(1,defaults.height)?,radius:number(2,defaults.radius)?,width:number(3,defaults.width)?,cells:cells as u32,speed:number(5,defaults.speed)?,discharge_cfs})
+        })();
+        let params=match parsed {Ok(p)=>p,Err(error)=>{self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}};
+        if let Err(error)=params.at([0.0;3]).validate() {self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}
+        // World-only trace from the view (OpenJK SOLID | TERRAIN).
+        let start = crate::scene::jka_position(self.camera.position.to_array());
+        let direction = crate::scene::jka_position(self.camera.forward().to_array());
+        let end = std::array::from_fn(|axis| start[axis] + direction[axis] * 131_072.0);
+        let Some(world) = self.map_collision.as_mut() else {
+            self.push_console_line("^3riversource: no map collision loaded".to_owned());
+            return CommandResult::Handled;
+        };
+        let trace = world.trace(TraceQuery { start, mins: [0.0; 3], maxs: [0.0; 3], end, pass_entity: ENTITY_NONE, mask: 0x1 | 0x1000 });
+        if trace.fraction >= 1.0 || trace.start_solid != 0 {
+            self.push_console_line("^3riversource: aim at the ground".to_owned());
+            return CommandResult::Handled;
+        }
+        if crate::river_runtime::debug_mode() >= 2 {
+            self.push_console_line(format!(
+                "[RIVER DBG HIT] normal=({:.3},{:.3},{:.3}) flags=0x{:x} contents=0x{:x} trace_fraction={:.5} {}",
+                trace.normal[0], trace.normal[1], trace.normal[2], trace.surface_flags,
+                trace.contents, trace.fraction,
+                if trace.normal[2] < 0.6 { "WARNING: steep/vertical face, not a floor" } else { "floor-like face" }
+            ));
+        }
+        let key = format!("{:?}", self.initial_source);
+        if self.river_collision.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.push_console_line("riversource: reading map collision (first use on this map)...".to_owned());
+            match crate::scene::river_collision_triangles(&self.base, self.game.as_deref(), &self.initial_source, self.video.allow_asset_overrides) {
+                Ok(triangles) => self.river_collision = Some((key, std::sync::Arc::new(triangles))),
+                Err(error) => {
+                    self.push_console_line(format!("^1riversource: {error}"));
+                    return CommandResult::Handled;
+                }
+            }
+        }
+        let collision = std::sync::Arc::clone(&self.river_collision.as_ref().unwrap().1);
+        let source = params.at(trace.end);
+        if let Err(error) = source.validate() {
+            self.push_console_line(format!("^1riversource: {error}"));
+            return CommandResult::Handled;
+        }
+        let definition=self.river_editor.add(source,self.video.river_settings);
+        let supply=source.discharge_cfs.map(|q|format!("max {q} CFS to target")).unwrap_or_else(||format!("unlimited water level {:.0}",source.water_level));
+        self.push_console_line(format!("River {} at ({:.0} {:.0} {:.0}), {supply}, patch +/-{:.0}, {} cells, {}x simulation speed",definition.id,trace.end[0],trace.end[1],trace.end[2],source.radius,source.resolution,source.rate));
+        self.render_command(RenderCommand::RiverSpawn(definition, collision));
+        CommandResult::Handled
+    }
+
+    cmd_riverclear ["riverclear", ] ("riverclear", "Remove all developer river patches placed with riversource.", CommandScope::Always) |self, _command| {
+        self.river_editor.clear();
+        self.render_command(RenderCommand::RiverClear);
+        self.push_console_line("riverclear: removed river patches".to_owned());
+        CommandResult::Handled
+    }
+
     cmd_perfsample ["perfsample", ] ("perfsample [arguments]", "perfsample <seconds> [label]: hold the command buffer, then print the average render FPS.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -671,14 +765,26 @@ commands! {
         }
     }
 
-    cmd_trace ["trace", ] ("trace", "jaPRO: Trace what you are looking at.", CommandScope::Always) |self, command| {
+    cmd_trace ["trace", ] ("trace [entityNum]", "Trace the view or annotate a server trace with client-visible entity state, effect configstring and BSP key/value pairs.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb] => {
                 self.trace_surface_center();
                 CommandResult::Status
             }
-            _ => return CommandResult::Unhandled,
+            [_, number] => {
+                // Preserve the existing server-side `trace <entityNum>` output
+                // (including server-only fields) by forwarding the command.
+                // Add the information the client can resolve, especially the
+                // CS_EFFECTS qpath which the server's trace does not print.
+                if let Ok(number) = number.parse::<u16>() {
+                    if number < 1024 {
+                        self.trace_entity_number_details(number);
+                    }
+                }
+                if self.live_connected() { CommandResult::Unhandled } else { CommandResult::Handled }
+            }
+            _ => CommandResult::Unhandled,
         }
     }
 

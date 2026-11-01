@@ -268,3 +268,102 @@ fn force_refraction_shade(fragment: vec4<f32>, st: vec2<f32>, origin: vec3<f32>,
     let background = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(fragment.xy/dims), 0.0).rgb;
     return vec4<f32>(mix(background, refracted, alpha), 1.0);
 }
+
+// Cinematic Force Push/Pull shockwave: camera-facing quad, shaped entirely
+// in pixel space from the opaque scene/depth snapshot already used by Glass.
+// This never fetches the destination attachment (no read/write feedback),
+// and costs no extra pass or scene copy. No texture/noise asset is needed.
+fn force_shockwave_shade(fragment: vec4<f32>, st: vec2<f32>, origin: vec3<f32>,
+    view_proj: mat4x4<f32>, eye: vec3<f32>, forward: vec3<f32>,
+    age: f32, pull: bool, envelope: f32, time: f32) -> vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(glass_scene));
+    let screen_uv = glass_clamp_uv(fragment.xy / dims);
+    let base = textureSampleLevel(glass_scene, glass_sampler, screen_uv, 0.0).rgb;
+    let phase = clamp(age, 0.0, 1.0);
+    if (envelope <= 0.001) { discard; }
+    let clip = view_proj * vec4<f32>(origin, 1.0);
+    if (clip.w <= 0.01) { discard; }
+    let centre = (clip.xy / clip.w * vec2<f32>(0.5, -0.5) + 0.5) * dims;
+    let delta_px = fragment.xy - centre;
+    // The quad is square and camera-facing, so local UVs account for aspect
+    // ratio naturally; using delta_px for direction guarantees circular pixel
+    // displacement with no UV-space stretch at non-16:9 aspect ratios.
+    let local = (st - vec2<f32>(0.5)) * 2.0;
+    let radius = length(local);
+    if (radius >= 0.98) { discard; }
+    let pixel_radius = length(delta_px) / max(radius, 0.08);
+    // Keep a narrow coherent pressure crest, but widen it slightly versus the
+    // prior revision so it reads clearly at gameplay distances.
+    let band_width = clamp(2.6 / max(pixel_radius, 1.0), 0.020, 0.095);
+    // Coherent angular corrugation is stationary in polar coordinates as the
+    // front propagates, while two finer waves advect independently. This gives
+    // a pressure wave rather than a simple animated radial screen zoom.
+    let theta = atan2(delta_px.y, delta_px.x);
+    let wave = sin(theta * 11.0 + phase * 22.0 + time * 2.7) * 0.018
+        + sin(theta * 23.0 - phase * 35.0) * 0.010;
+    let front = 0.81 + wave;
+    let d = radius - front;
+    let crest = exp(-0.5 * pow(d / band_width, 2.0));
+    let wake = exp(-0.5 * pow((radius - (front - 0.12)) / (band_width * 2.5), 2.0));
+    let echo = exp(-0.5 * pow((radius - (front - 0.29)) / (band_width * 3.2), 2.0));
+    let compression = exp(-0.5 * pow((radius - (front + 0.05)) / (band_width * 1.5), 2.0));
+    // The shock is not a hollow ring: a large turbulent pressure volume
+    // occupies its interior while the high-frequency rim travels outward.
+    let interior_mask = 1.0 - smoothstep(0.40, 0.84, radius);
+    let inner_core = 1.0 - smoothstep(0.0, 0.15, radius);
+    let eddy = sin(radius * 32.0 - phase * 25.0 + theta * 5.0)
+        * sin(theta * 7.0 + radius * 17.0 + phase * 19.0);
+    let interior = interior_mask * (0.75 + 0.25 * eddy) * inner_core;
+    let edge_fade = 1.0 - smoothstep(0.90, 1.03, radius);
+    let strength = envelope * edge_fade;
+    // Balanced opposing displacements around the crest give the visible
+    // compression/rarefaction pair. Pull reverses the radial displacement.
+    let direction = select(1.0, -1.0, pull);
+    let normal = delta_px / max(length(delta_px), 0.001);
+    // Two independently moving components: the hard radial shockfront and
+    // an energetic, circulating heat-haze body inside it. This makes flat
+    // walls visibly warp even when the crest has already passed.
+    let magnitude_px = clamp((crest * 62.0 + compression * 17.0 - wake * 24.0
+        + echo * 8.0 + interior * 30.0) * strength, -67.0, 67.0);
+    let tangent = vec2<f32>(-normal.y, normal.x);
+    let swirl_px = (13.0 * sin(radius * 26.0 - phase * 21.0 + theta * 4.0)
+        + 8.0 * sin(theta * 9.0 + radius * 15.0 + time * 6.0))
+        * interior * strength;
+    var offset = (normal * (magnitude_px * direction) + tangent * swirl_px) / dims;
+    // Keep displacement finite at the viewport's edges and don't bend over
+    // opaque foreground silhouettes. glass_depth is linear view distance.
+    let centre_depth = max(dot(origin - eye, normalize(forward)), 0.0);
+    let candidate_uv = glass_clamp_uv(screen_uv + offset);
+    let sample_pixel = clamp(vec2<i32>(candidate_uv * dims),
+        vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+    let sampled_depth = textureLoad(glass_depth, sample_pixel, 0).r;
+    // A hand-sized wave commonly lies on the player's own depth silhouette.
+    // Treat samples at the hand's depth as visible; fade only foreground that
+    // is materially *closer* to the viewer, rather than suppressing the whole
+    // effect whenever a sampled pixel matches the emitter depth.
+    let visibility = smoothstep(centre_depth - 48.0, centre_depth + 2.0, sampled_depth);
+    offset *= visibility;
+    // Outside the active narrow bands, preserve the actual framebuffer
+    // rather than replacing it with even a subtly different scene snapshot.
+    // This also avoids hiding late-drawn authored materials at the wave's edge.
+    if ((abs(magnitude_px) + abs(swirl_px)) * visibility < 0.12
+        && (crest + interior) * strength * visibility < 0.018) {
+        discard;
+    }
+    let chromatic_px = min(4.2, (3.6 * crest + 1.3 * compression
+        + 1.0 * interior) * strength * visibility);
+    let chromatic = normal * chromatic_px / dims;
+    let base_uv = glass_clamp_uv(screen_uv + offset);
+    let red = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(base_uv + chromatic), 0.0).r;
+    let green = textureSampleLevel(glass_scene, glass_sampler, base_uv, 0.0).g;
+    let blue = textureSampleLevel(glass_scene, glass_sampler, glass_clamp_uv(base_uv - chromatic), 0.0).b;
+    // Pressure brightens the front and also refracts light throughout the
+    // blast interior. Keep the tint neutral enough not to bleach or recolor
+    // authored multi-stage shaders captured immediately before this pass.
+    let highlight = (crest * 0.28 + compression * 0.13 + wake * 0.045
+        + interior * (0.065 + 0.03 * eddy)) * strength * visibility;
+    let tint = vec3<f32>(0.010, 0.015, 0.022)
+        * (crest * 0.9 + compression * 0.6 + interior * 0.28) * strength * visibility;
+    let result = vec3<f32>(red, green, blue) * (1.0 + highlight) + tint;
+    return vec4<f32>(result, 1.0);
+}

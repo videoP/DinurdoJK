@@ -6,6 +6,43 @@ use super::cvar_prelude::*;
 type CvarDef = crate::console::cvars::CvarDef<App>;
 
 app_cvars! {
+    APP_R_FXCPUTRACE {
+        runtime: CvarDef::new(
+            "r_fxCpuTrace", "", "0..1",
+            "Live one-second averaged client FX CPU breakdown (requests, worker/end_frame, extras, promotion, output). 0 disables tracing; no renderer restart or environment variables.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app: &App| CvarValue::String(u8::from(crate::cgame::weapon_fx::fx_cpu_trace_enabled()).to_string()),
+            |app, value| App::cvar_set_r_fxcputrace(app, APP_R_FXCPUTRACE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_fxcputrace, None),
+        config: CvarBinding { ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_fxcputrace(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                crate::cgame::weapon_fx::set_fx_cpu_trace(enabled);
+                self.console_status = format!("FX CPU TRACE: {}", if enabled { "ON" } else { "OFF" });
+                Ok(())
+            }
+        }]
+    }
+    APP_R_FORCELIGHTNING {
+        runtime: CvarDef::new("r_forceLightning", "", "0|1|2", "Force Lightning A/B: 0 reference JKA, 1 original GPU procedural ribbons, 2 3D BSP-aware compute lightning and surface sparks (default). Geometry requires r_fxGeometry gpu; CPU fallback otherwise. cg_fxFPS controls cosmetic bolt shape/emission cadence; gameplay traces remain authoritative.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(crate::fx::system::force_lightning_style().to_string()),
+            |_app, value| { let mode = value.to_string().parse::<u8>().map_err(|_| "r_forceLightning expects 0, 1 or 2".to_owned())?;
+                if mode > 2 { return Err("r_forceLightning expects 0, 1 or 2".to_owned()); }
+                crate::fx::system::set_force_lightning_style(mode); Ok(()) }
+        ).with_text_setter(App::cvar_set_r_force_lightning, None),
+        config: CvarBinding { ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_force_lightning(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().map_err(|_| "r_forceLightning expects 0, 1 or 2".to_owned())?;
+                if mode > 2 { return Err("r_forceLightning expects 0, 1 or 2".to_owned()); }
+                crate::fx::system::set_force_lightning_style(mode);
+                self.console_status = format!("FORCE LIGHTNING: {}", match mode { 0 => "STOCK", 1 => "GPU PROCEDURAL", _ => "3D BSP COMPUTE" });
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_MARKCOUNT {
         runtime: CvarDef::new("r_markcount", "", "0..4096", "TaystJK wall mark count (default 100). Zero disables authored EFX decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.mark_count.to_string()), |app, value| App::cvar_set_r_markcount(app, APP_R_MARKCOUNT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_markcount, None),
         config: CvarBinding {
@@ -136,7 +173,7 @@ app_cvars! {
     }
 
     APP_CG_FXFPS {
-        runtime: CvarDef::new("cg_fxFPS", "", "0 or 15..250", "Continuous projectile/trail EFX sampling rate. 0 restores legacy JKA presentation-frame-driven density.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_fxfps(app)), |app, value| App::cvar_set_cg_fxfps(app, APP_CG_FXFPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_fxfps, None),
+        runtime: CvarDef::new("cg_fxFPS", "", "0 or 15..250", "FX scheduler worker sampling rate and continuous projectile/trail EFX spawn cadence. At nonzero values live visuals are refreshed asynchronously; 0 restores synchronous legacy JKA per-frame behavior. Offline demo export remains synchronous.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_fxfps(app)), |app, value| App::cvar_set_cg_fxfps(app, APP_CG_FXFPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_fxfps, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.fx_fps = normalize_fx_fps(value, settings.fx_fps);
@@ -426,6 +463,31 @@ app_cvars! {
         ]
     }
 
+    APP_R_HIDEFX {
+        runtime: CvarDef::new("r_hidefx", "", "0..2", "FX benchmark: 0 normal (default); 1 hide all client FX visuals, retain simulation; 2 stop client FX scheduling/simulation and hide visuals. Does not disable gameplay/audio systems; FX-authored sound/shake is suppressed in mode 2. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::fx::hide_mode().to_string()),
+            |app, value| App::cvar_set_r_hidefx(app, APP_R_HIDEFX.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_hidefx, None),
+        config: CvarBinding { ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_hidefx(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .map_err(|_| "r_hidefx expects 0 (normal), 1 (visuals), or 2 (FX processing off)".to_owned())?;
+                if mode > 2 {
+                    return Err("r_hidefx expects 0 (normal), 1 (visuals), or 2 (FX processing off)".to_owned());
+                }
+                crate::fx::set_hide_mode(mode);
+                self.console_status = format!("HIDE FX: {}", match mode {
+                    0 => "NORMAL",
+                    1 => "VISUALS HIDDEN; FX STILL SIMULATED",
+                    _ => "CLIENT FX PROCESSING AND VISUALS OFF",
+                });
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_FXOCCLUSION {
         runtime: CvarDef::new("r_fxOcclusion", "", "0..1 (2 reserved)", "FX raster A/B: 0 original tessellation, 1 stationary map fx_runner groups with live descendant bounds, rear-plane rejection only. GPU Hi-Z wall-occlusion mode 2 is NOT implemented and is rejected. Defaults 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.fx_occlusion.to_string()),
@@ -435,7 +497,7 @@ app_cvars! {
         implementations: [impl App {
             fn cvar_set_r_fxocclusion(&mut self, _name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>().map_err(|_| "r_fxOcclusion expects 0 or 1".to_owned())?;
-                if mode > 1 {
+                if mode > 2 {
                     return Err("r_fxOcclusion 2 (GPU Hi-Z) unavailable: raster query/draw integration is not implemented yet".to_owned());
                 }
                 self.video.fx_occlusion = mode;

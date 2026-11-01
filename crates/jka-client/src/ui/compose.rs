@@ -146,7 +146,10 @@ pub fn build_transient_vertices(
     width: u32,
     height: u32,
 ) {
-    if width == 0 || height == 0 || ui.video.skip_ui || ui.loading.is_some() {
+    // A 1x1 renderer placeholder can be used while Render Studio sources or
+    // output settings are initialized. Defer all transient HUD layout until
+    // there is a usable viewport (especially docked chat's width constraints).
+    if width <= 1 || height <= 1 || ui.video.skip_ui || ui.loading.is_some() {
         return;
     }
     let gameplay_overlay = ui.video.draw_2d && matches!(
@@ -193,13 +196,15 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::Vote, width, height, |out| {
             build_vote(out, ui, width, height);
         });
+        draw_placed(out, ui, HudElementId::KillFeed, width, height, |out| {
+            super::killfeed::build_killfeed(out, ui, small_font, width, height);
+        });
         draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
             build_chat_history(out, ui, small_font, width, height);
         });
         draw_placed(out, ui, HudElementId::CenterPrint, width, height, |out| {
             build_center_print(out, ui, small_font, width, height);
         });
-        build_demo_timeline(out, ui, width, height);
     }
     // TaystJK Con_DrawNotify remains visible while KEYCATCH_MESSAGE is active,
     // but not under the solid console or UI/cgame/menu catchers.
@@ -238,7 +243,10 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::MiniScores, width, height, |out| {
             build_mini_scores(out, ui, small_font, width, height);
         });
-        build_siege_hud(out, ui, width, height);
+        build_siege_hud(out, ui, small_font, width, height);
+        // Demo transport is the last gameplay overlay: legacy Score/Team HUD
+        // text must not draw on top of its playback buttons.
+        build_demo_timeline(out, ui, width, height);
     }
     if ui.mode == OverlayMode::Chat {
         // TaystJK message entry is a console/notify field, not a child of the
@@ -251,6 +259,16 @@ pub fn build_transient_vertices(
 #[cfg(test)]
 mod draw2d_tests {
     use super::*;
+
+    #[test]
+    fn transient_ui_skips_placeholder_viewports_used_during_renderer_init() {
+        let ui = UiSnapshot::default(); // Docked chat is enabled by default.
+        let mut vertices = Vec::new();
+        build_transient_vertices(&mut vertices, &ui, None, 1, 1);
+        assert!(vertices.is_empty());
+        build_transient_vertices(&mut vertices, &ui, None, 1, 720);
+        assert!(vertices.is_empty());
+    }
 
     #[test]
     fn draw2d_gates_gameplay_but_not_engine_console_and_chat_entry() {

@@ -716,7 +716,9 @@ impl StudioDemoSource {
         view.seconds = sample.presentation_time_ms as f32 / 1000.0;
         let session = &mut self.playback;
         let presenter = &mut session.entity_presenter;
-        let fx = match video.fx_geometry {
+        let fx = if !crate::fx::render_enabled() {
+            Vec::new()
+        } else { match video.fx_geometry {
             crate::ui::FxGeometryMode::Cpu => {
                 crate::fx::draw::tessellate(&session.fx_draws, &view, &mut |s| {
                     presenter.fx_material_stages(s)
@@ -732,7 +734,7 @@ impl StudioDemoSource {
                     presenter.fx_material_stages(s)
                 })
             }
-        };
+        }};
         let mut models = Vec::with_capacity(session.dynamic_models.len() + fx.len());
         models.extend(session.dynamic_models.iter().cloned());
         models.extend(fx);
@@ -746,9 +748,9 @@ impl StudioDemoSource {
             area_mask: session.demo_area_mask(),
             dynamic_models: Arc::new(models),
             inline_models: session.inline_models.clone(),
-            lights: session.fx_lights.clone(),
+            lights: if crate::fx::render_enabled() { session.fx_lights.clone() } else { Arc::new(Vec::new()) },
             screen_fx: session.screen_fx.clone(),
-            cloud_foreground: session.fx_blades.clone(),
+            cloud_foreground: if crate::fx::render_enabled() { session.fx_blades.clone() } else { Arc::new(Vec::new()) },
             ocean_actors: session.ocean_actors.clone(),
             hud: None,
         })
@@ -963,6 +965,7 @@ impl App {
                 request_id: source.id, started: Instant::now(), game: source.game_dir.clone(),
                 source: scene::MapSource::Bsp(map), sub_bsp_names, prepare_options: options,
                 analyze_fx_light_profiles: true, supersedable: false, seed,
+                vote_fast_adopt: false,
             }).map_err(|_| "Studio map loader is unavailable")?;
             self.render_studio.sources.push(source);
             Ok(())
@@ -2231,6 +2234,10 @@ fn studio_hud_for_source(
                 saber_style:ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
                 saber_active_style:ps.field_i32("fd.saberAnimLevel").unwrap_or(0),
                 force_flash:false,
+                force_powers_active:ps.field_i32("fd.forcePowersActive").unwrap_or(0),
+                rage_recovery_until_ms:ps.field_i32("fd.forceRageRecoveryTime").unwrap_or(0),
+                time_ms:session.cgame_time,
+                force_icons_hidden:ps.field_i32("zoomMode").unwrap_or(0)!=0 || ps.persistant[3]==3,
             });
         }
         if flags.enabled("speedometer") {

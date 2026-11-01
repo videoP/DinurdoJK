@@ -9,6 +9,15 @@ use crate::renderer::{
     UI_TRANSIENT_BUFFER_BYTES,
 };
 
+/// Shader source tags are sent through the existing UiVertex without adding
+/// attributes or changing the native UI WGSL pipeline layout.
+fn ui_shader_icon_index(source: f32) -> Option<usize> {
+    let index = source - ui::ICON_SHADER_SOURCE_BASE;
+    if index >= 0.0 && index < ui::ICON_NAMES.len() as f32 && index.fract() == 0.0 {
+        Some(index as usize)
+    } else { None }
+}
+
 pub(in crate::renderer) struct PendingUiLevelshot {
     pub(in crate::renderer) key: String,
     pub(in crate::renderer) map_name: String,
@@ -28,6 +37,10 @@ impl Renderer {
         // The app never owns GPU atlas placement. Do not overwrite the UV
         // lookup after a scroll/HUD snapshot arrives on the render thread.
         ui_state.icon_atlas_uvs.clone_from(&self.ui_state.icon_atlas_uvs);
+        ui_state.icon_shader_flags.clone_from(&self.ui_state.icon_shader_flags);
+        // Likewise the clean font: loaded once by the renderer, never by the app.
+        ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
+        ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
         self.ui_state = ui_state;
@@ -36,6 +49,7 @@ impl Renderer {
         }
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
+        self.sync_enemy_icon_shader();
         self.sync_ui_extension_images();
         self.sync_ui_loading_background();
         self.rebuild_ui();
@@ -157,6 +171,14 @@ impl Renderer {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&self._ui_ext_images.view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_clean_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_avatars.view),
+                },
             ],
         });
     }
@@ -183,12 +205,15 @@ impl Renderer {
             || self.ui_state.weapon_select.is_some()
             || self.ui_state.inventory_select.is_some()
             || self.ui_state.zoom_scope.is_some()
-            || self.ui_state.rocket_lock.is_some();
+            || self.ui_state.rocket_lock.is_some()
+            || self.ui_state.hud.is_some_and(|hud| {
+                hud.force_powers_active != 0 || hud.rage_recovery_until_ms > hud.time_ms
+            });
         if !wanted {
             return;
         }
         let started = Instant::now();
-        let (data, uvs) = load_ui_icon_atlas(
+        let (data, uvs, flags) = load_ui_icon_atlas(
             &self.base,
             self.detail_texture_game.as_deref(),
             self.device.limits().max_texture_dimension_2d,
@@ -197,6 +222,9 @@ impl Renderer {
         // Keep UV metadata and the uploaded pixels in sync. Incoming app
         // snapshots preserve this render-thread-owned lookup in set_ui().
         self.ui_state.icon_atlas_uvs = uvs;
+        self.ui_state.icon_shader_flags = flags;
+        self.ui_icon_shader_resolver = None;
+        self.ui_icon_shader_materials.clear();
         self.ui_icons_loaded = true;
         self.rebuild_ui_bind_group();
         rverbose!(
@@ -226,6 +254,174 @@ impl Renderer {
         };
         self._ui_team_icons = upload_texture(&self.device, &self.queue, &data);
         self.rebuild_ui_bind_group();
+    }
+
+
+    /// Resolve the ONE enemy-info icon via the ordinary CGame FX shader parser,
+    /// not the 64px model-icon atlas. This path understands implicit images,
+    /// shader remaps, animMap, ordered stages, blendFuncs, waves and tcMods.
+    /// Only an icon *change* does VFS/material work; the presentation clock
+    /// selects the already-loaded animation frames thereafter.
+    pub(in crate::renderer) fn sync_enemy_icon_shader(&mut self) {
+        let wanted = self.ui_state.enemy_info.as_ref()
+            .and_then(|enemy| enemy.icon_paths.first()).cloned();
+        if self.enemy_icon_key == wanted { return; }
+        self.enemy_icon_key = wanted.clone();
+        self.enemy_icon_materials.clear();
+        let Some(key) = wanted else { return; };
+        if self.enemy_icon_resolver.is_none() {
+            let Ok(assets) = AssetSearchPath::open_game(
+                &self.base, self.detail_texture_game.as_deref(),
+            ) else { return; };
+            match crate::cgame::entity_presenter::EntityPresenter::new(assets, false) {
+                Ok(resolver) => self.enemy_icon_resolver = Some(resolver),
+                Err(error) => {
+                    eprintln!("Enemy icon shader library: {error}");
+                    return;
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for name in key.split('\n').filter(|name| !name.is_empty()) {
+            if let Some(spec) = name.strip_prefix("@team-model-icon\t") {
+                let mut fields = spec.splitn(5, '\t');
+                let (Some(model), Some(skin), Some(team), Some(gametype), Some(jedi_v_merc)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+                else { continue; };
+                let (Ok(team), Ok(gametype)) =
+                    (team.parse::<i32>(), gametype.parse::<i32>()) else { continue; };
+                let mut final_skin = skin.to_owned();
+                if gametype >= crate::cgame::GT_TEAM
+                    && gametype != crate::cgame::GT_SIEGE && jedi_v_merc != "1"
+                {
+                    if let Ok(mut assets) = AssetSearchPath::open_game(
+                        &self.base, self.detail_texture_game.as_deref(),
+                    ) {
+                        let _ = crate::cgame::validate_skin_for_team(
+                            model, &mut final_skin, team,
+                            |path| assets.contains_qpath(path),
+                        );
+                    }
+                }
+                // CG_LoadClientInfo: full skin first, then composite head.
+                candidates.push(format!("models/players/{model}/icon_{final_skin}"));
+                if let Some((head, _)) = final_skin.split_once('|') {
+                    candidates.push(format!("models/players/{model}/icon_{head}"));
+                }
+            } else {
+                candidates.push(name.to_owned());
+            }
+        }
+        let Some(resolver) = self.enemy_icon_resolver.as_mut() else { return; };
+        for candidate in candidates {
+            if let Some(materials) = resolver.fx_material_stages_if_present(&candidate) {
+                self.enemy_icon_materials = materials;
+                rverbose!(2, "Enemy-info shader: {candidate} ({} stages, native resolution)",
+                    self.enemy_icon_materials.len());
+                break;
+            }
+        }
+    }
+
+    /// Builds only a handful of screen-space shader quads. This is evaluated
+    /// on every PRESENT, not only upon receiving a new UI snapshot, so `animMap`
+    /// and `rgbGen wave` animate even if the enemy/scoreboard never changes.
+    pub(in crate::renderer) fn prepare_enemy_icon_shader(&mut self) {
+        self.enemy_icon_batches.clear();
+        self.enemy_icon_vertex_count = 0;
+        let (w, h) = (self.config.width, self.config.height);
+        if self.enemy_icon_materials.is_empty()
+            || !ui::gameplay_hud_visible(&self.ui_state, w, h)
+            || self.ui_state.enemy_info.is_none()
+        { return; }
+        let sy = h as f32 / 480.0;
+        let sx = sy; // widthRatioCoef * width/640 == height/480
+        let rows = usize::from(self.ui_state.video.draw_fps != 0)
+            + usize::from(self.ui_state.game_timer.is_some());
+        let x0 = w as f32 - 45.0 * sx;
+        let y0 = (17.0 + rows as f32 * 22.0) * sy;
+        let x1 = x0 + 40.0 * sx;
+        let y1 = y0 + 40.0 * sy;
+        let seconds = self.frame_time();
+        let make_vertex = |x: f32, y: f32, uv: [f32; 2], color: [f32; 4], cut: f32| UiVertex {
+            position: [x / w as f32 * 2.0 - 1.0, 1.0 - y / h as f32 * 2.0],
+            uv, color,
+            // The shared screen-FX fragment shader applies alphaFunc only
+            // to specially tagged icon vertices (normal FX always uses 1).
+            textured: if cut >= 0.74 { 3.0 } else if cut >= 0.49 { 2.0 }
+                else if cut > 0.0 { 4.0 } else if cut < 0.0 { 5.0 } else { 1.0 },
+        };
+        // Reuse the vertex allocation and the cached stage list: a 2000-FPS
+        // icon must not clone all of its animation-frame Arcs every present.
+        let mut vertices = std::mem::take(&mut self.enemy_icon_vertices);
+        vertices.clear();
+        let materials = std::mem::take(&mut self.enemy_icon_materials);
+        for stage in materials.iter().take(64) {
+            self.ensure_screen_fx_pipeline(stage.blend);
+            let texture_key = stage.texture_at_time(seconds)
+                .map(|texture| self.ensure_screen_fx_texture(&texture));
+            let stage_time = jka_assets::shader::shader_time(
+                seconds, stage.shader_time_offset, stage.shader_clamp_time,
+            );
+            let color = stage.float_vertex_color_at_time([1.0; 4], seconds);
+            let uv_for = |uv| stage.tc_mods.iter().fold(uv, |uv, &modifier|
+                crate::fx::draw::modified_uv(uv, [0.0; 3], modifier, stage_time));
+            let start = vertices.len() as u32;
+            vertices.extend_from_slice(&[
+                make_vertex(x0, y0, uv_for([0.0, 0.0]), color, stage.alpha_test),
+                make_vertex(x0, y1, uv_for([0.0, 1.0]), color, stage.alpha_test),
+                make_vertex(x1, y1, uv_for([1.0, 1.0]), color, stage.alpha_test),
+                make_vertex(x0, y0, uv_for([0.0, 0.0]), color, stage.alpha_test),
+                make_vertex(x1, y1, uv_for([1.0, 1.0]), color, stage.alpha_test),
+                make_vertex(x1, y0, uv_for([1.0, 0.0]), color, stage.alpha_test),
+            ]);
+            self.enemy_icon_batches.push(ScreenFxBatch {
+                range: start..start + 6,
+                blend: stage.blend,
+                texture_key,
+            });
+        }
+        // Same editor element transform as the text, regardless of custom HUD
+        // offset/scale. This is intentionally done after shader UV processing.
+        let rect_ctx = ui::HudRectContext::from_snapshot(&self.ui_state);
+        ui::apply_hud_layout(&mut vertices, ui::HudElementId::EnemyInfo,
+            self.ui_state.hud_layout.element(ui::HudElementId::EnemyInfo),
+            &rect_ctx, w, h);
+        self.enemy_icon_vertex_count = vertices.len() as u32;
+        if !vertices.is_empty() {
+            self.queue.write_buffer(&self.enemy_icon_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+        self.enemy_icon_vertices = vertices;
+        self.enemy_icon_materials = materials;
+    }
+
+    /// Scoreboard avatars: on the first board, pack every model's
+    /// `icon_default` into one atlas on a worker thread; when it lands, upload
+    /// it to binding 9. Returns true on the frame the atlas becomes ready.
+    pub(in crate::renderer) fn sync_ui_avatars(&mut self) -> bool {
+        if self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() && self.ui_state.scoreboard.is_some() {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let base = self.base.clone();
+            let game = self.detail_texture_game.clone();
+            let spawned = std::thread::Builder::new().name("ui-avatars".into()).spawn(move || {
+                let started = Instant::now();
+                let (data, atlas) = load_ui_avatar_atlas(&base, game.as_deref());
+                eprintln!("UI AVATARS: {} player icons in {:.0} ms", atlas.cells.len(), started.elapsed().as_secs_f64() * 1000.0);
+                let _ = sender.send((data, atlas));
+            });
+            if spawned.is_ok() {
+                self.ui_avatar_job = Some(receiver);
+            }
+        }
+        let Some(job) = self.ui_avatar_job.as_ref() else { return false };
+        let Ok((data, atlas)) = job.try_recv() else { return false };
+        self.ui_avatar_job = None;
+        self._ui_avatars = upload_texture(&self.device, &self.queue, &data);
+        let atlas = std::sync::Arc::new(atlas);
+        self.ui_state.avatar_atlas = Some(atlas.clone());
+        self.ui_avatar_atlas = Some(atlas);
+        self.rebuild_ui_bind_group();
+        true
     }
 
     /// Keep the extension image atlas in step with `ui_state.extension_images`.
@@ -421,7 +617,7 @@ impl Renderer {
         texture: &Arc<TextureData>,
     ) -> String {
         let key = format!(
-            "{}|{}|{}x{}|{}",
+            "{}|{}|{}x{}|{}|clamp={}",
             texture.label,
             texture
                 .source
@@ -430,6 +626,7 @@ impl Renderer {
             texture.width,
             texture.height,
             texture.mip_level_count,
+            texture.clamp,
         );
         if !self.screen_fx_textures.contains_key(&key) {
             let image = upload_texture(&self.device, &self.queue, texture);
@@ -444,7 +641,11 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.screen_fx_sampler),
+                        resource: wgpu::BindingResource::Sampler(if texture.clamp {
+                            &self.screen_fx_sampler
+                        } else {
+                            &self.screen_fx_repeat_sampler
+                        }),
                     },
                 ],
             });
@@ -533,6 +734,10 @@ impl Renderer {
         hud: Option<ui::HudState>,
         movement_hud: ui::MovementHudState,
     ) {
+        let sight_before = self.ui_state.hud.as_ref().is_some_and(|hud|
+            hud.force_powers_active & (1 << 14) != 0);
+        let sight_after = hud.as_ref().is_some_and(|hud|
+            hud.force_powers_active & (1 << 14) != 0);
         let hud_changed = self.ui_state.hud != hud;
         let movement_changed = self.ui_state.movement_hud != movement_hud;
         if !hud_changed && !movement_changed {
@@ -540,6 +745,14 @@ impl Renderer {
         }
         self.ui_state.hud = hud;
         self.ui_state.movement_hud = movement_hud;
+        if sight_before != sight_after {
+            // PVS selection may be unchanged, but GPU visibility must update
+            // immediately when Force Seeing starts or stops.
+            self.update_gpu_cull_settings();
+            // Cached static sun caster layers were built with the old scene
+            // visibility. Rebuild once after a Force Seeing transition.
+            self.shadow_resources.static_cascades = [None; crate::renderer::SHADOW_CASCADES];
+        }
         if hud_changed {
             // HUD text/geometry can change size, so rebuild the stable prefix and
             // then append the current movement tail.
@@ -569,8 +782,11 @@ impl Renderer {
         enemy_info: Option<ui::UiEnemyInfo>,
         race_timer: Option<crate::japro_cg::RaceTimerUi>,
         vote_line: Option<String>,
+        siege_hud: Option<ui::UiSiegeHud>,
         scoreboard: Option<ui::UiScoreboard>,
         scoreboard_focus_client: Option<i32>,
+        killfeed: Option<ui::UiKillfeed>,
+        chat_anim: ui::UiChatAnim,
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,
@@ -591,17 +807,22 @@ impl Renderer {
         self.ui_state.enemy_info = enemy_info;
         self.ui_state.race_timer = race_timer;
         self.ui_state.vote_line = vote_line;
+        self.ui_state.siege_hud = siege_hud;
         let scoreboard_changed = self.ui_state.scoreboard != scoreboard
             || self.ui_state.scoreboard_focus_client != scoreboard_focus_client;
         self.ui_state.scoreboard = scoreboard;
         self.ui_state.scoreboard_focus_client = scoreboard_focus_client;
+        self.ui_state.killfeed = killfeed;
+        self.ui_state.chat_anim = chat_anim;
+        let avatars_ready = self.sync_ui_avatars();
         self.ui_state.speedometer = speedometer;
         self.ui_state.lagometer = lagometer;
         self.ui_state.team_overlay = team_overlay;
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
+        self.sync_enemy_icon_shader();
         self.sync_ui_extension_images();
-        if scoreboard_changed {
+        if scoreboard_changed || avatars_ready {
             // Scoreboard visibility and focus are transient state. Rebuild its
             // retained batch only when either input changes.
             self.rebuild_retained_ui();
@@ -829,9 +1050,127 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
     }
 
-    /// The renderer-drawn overlay (frame rate readout, perf graphs, surface
-    /// inspector, background bake progress) as its own submit.
-    ///
+    /// Resolve only visible authored HUD shaders, then evaluate their stages at
+    /// presentation time. The source UI vertex stream stays intact, and the
+    /// painter-order splitter below removes authored quads from the atlas pass.
+    pub(in crate::renderer) fn prepare_ui_icon_shaders(&mut self) {
+        self.ui_icon_shader_batches.clear();
+        self.ui_icon_shader_vertices.clear();
+        if !self.ui_icons_loaded || self.ui_state.video.skip_ui
+            || !self.ui_state.icon_shader_flags.iter().any(|&flag| flag)
+        { return; }
+        // Collect only the tagged triangles. In practice this is the small
+        // handful of scope/Force icons on screen, not the whole HUD.
+        let mut segments: Vec<(u8, u32, usize, Vec<UiVertex>)> = Vec::new();
+        for (layer, source) in [
+            (0, self.ui_dynamic_vertices.as_slice()),
+            (1, self.ui_transient_vertices.as_slice()),
+            (2, self.ui_retained_vertices.as_slice()),
+        ] {
+            let mut i = 0;
+            while i + 3 <= source.len() {
+                let mark = source[i].textured;
+                if let Some(index) = ui_shader_icon_index(mark) {
+                    let start = i;
+                    i += 3;
+                    while i + 3 <= source.len()
+                        && ui_shader_icon_index(source[i].textured) == Some(index)
+                    { i += 3; }
+                    segments.push((layer, start as u32, index, source[start..i].to_vec()));
+                } else { i += 3; }
+            }
+        }
+        if segments.is_empty() { return; }
+        if self.ui_icon_shader_resolver.is_none() {
+            let Ok(assets) = AssetSearchPath::open_game(
+                &self.base, self.detail_texture_game.as_deref(),
+            ) else { return; };
+            match crate::cgame::entity_presenter::EntityPresenter::new(assets, false) {
+                Ok(resolver) => self.ui_icon_shader_resolver = Some(resolver),
+                Err(error) => { eprintln!("HUD shader resolver: {error}"); return; }
+            }
+        }
+        // Reuse resolved frame textures/PSOs. The resolver is never used in
+        // the no-shader path, nor on subsequent frames for the same icon.
+        let seconds = self.frame_time();
+        for (layer, original_start, index, quad) in segments {
+            let original_end = original_start + quad.len() as u32;
+            // Every shader-tagged span must be excluded from the native UI
+            // pipeline even if its authored material is missing/unrenderable.
+            self.ui_icon_shader_batches.push(UiIconShaderBatch {
+                layer, original_start, original_end,
+                stage: ScreenFxBatch {
+                    range: 0..0, blend: FxBlend::Alpha, texture_key: None,
+                },
+            });
+            if !self.ui_icon_shader_materials.contains_key(&index) {
+                let Some(&name) = ui::ICON_NAMES.get(index) else { continue; };
+                let requested = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF)
+                    .contains(&index) { format!("{name}_na") }
+                    else { name.to_owned() };
+                let Some(resolver) = self.ui_icon_shader_resolver.as_mut() else { continue; };
+                let fallback = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE)
+                    .contains(&index) {
+                    Some(if index >= ui::ICON_WEAPON_STAFF {
+                        "gfx/hud/w_icon_lightsaber"
+                    } else { name })
+                } else { None };
+                let materials = resolver.fx_material_stages_if_present(&requested)
+                    .or_else(|| fallback.and_then(|path| resolver.fx_material_stages_if_present(path)));
+                let Some(stages) = materials else {
+                    eprintln!("HUD shader {requested}: unable to resolve authored material");
+                    // Avoid repeating VFS lookups/log spam at 2000 FPS.
+                    self.ui_icon_shader_materials.insert(index, Vec::new());
+                    continue;
+                };
+                self.ui_icon_shader_materials.insert(index, stages);
+            }
+            // Temporarily move the cached stage list to avoid borrowing self
+            // while lazy-created FX pipelines and texture bind groups are built.
+            let Some(stages) = self.ui_icon_shader_materials.remove(&index) else { continue; };
+            let shader_start = self.ui_icon_shader_vertices.len();
+            for stage in stages.iter().take(64) {
+                if self.ui_icon_shader_vertices.len() + quad.len() > 16_384 { break; }
+                self.ensure_screen_fx_pipeline(stage.blend);
+                let texture_key = stage.texture_at_time(seconds)
+                    .map(|texture| self.ensure_screen_fx_texture(&texture));
+                let time = jka_assets::shader::shader_time(
+                    seconds, stage.shader_time_offset, stage.shader_clamp_time,
+                );
+                let start = self.ui_icon_shader_vertices.len() as u32;
+                for mut v in quad.iter().copied() {
+                    v.uv = stage.tc_mods.iter().fold(v.uv, |uv, &modifier|
+                        crate::fx::draw::modified_uv(uv, [0.0; 3], modifier, time));
+                    v.color = stage.float_vertex_color_at_time(v.color, seconds);
+                    let cut = stage.alpha_test;
+                    v.textured = if cut >= 0.74 { 3.0 } else if cut >= 0.49 { 2.0 }
+                        else if cut > 0.0 { 4.0 } else if cut < 0.0 { 5.0 } else { 1.0 };
+                    self.ui_icon_shader_vertices.push(v);
+                }
+                self.ui_icon_shader_batches.push(UiIconShaderBatch {
+                    layer,
+                    original_start,
+                    original_end,
+                    stage: ScreenFxBatch {
+                        range: start..self.ui_icon_shader_vertices.len() as u32,
+                        blend: stage.blend,
+                        texture_key,
+                    },
+                });
+            }
+            if shader_start == self.ui_icon_shader_vertices.len() {
+                rverbose!(1, "HUD shader icon {index}: no renderable stages");
+            }
+            self.ui_icon_shader_materials.insert(index, stages);
+        }
+        if !self.ui_icon_shader_vertices.is_empty() {
+            self.queue.write_buffer(
+                &self.ui_icon_shader_buffer, 0,
+                bytemuck::cast_slice(&self.ui_icon_shader_vertices),
+            );
+        }
+    }
+
     pub(in crate::renderer) fn draw_ui_batches<'a>(
         pass: &mut wgpu::RenderPass<'a>,
         ui_pipeline: &'a wgpu::RenderPipeline,
@@ -858,6 +1197,88 @@ impl Renderer {
         if retained_vertex_count != 0 {
             pass.set_vertex_buffer(0, retained_buffer.slice(..));
             pass.draw(0..retained_vertex_count, 0..1);
+        }
+    }
+
+    /// Preserve painter order for mixed native atlas quads and authored FX
+    /// stages. In the common case (no shader-tagged UI), call the old fast
+    /// batcher directly: zero extra draws and no per-frame texture work.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn draw_ui_batches_shadered<'a>(
+        pass: &mut wgpu::RenderPass<'a>,
+        ui_pipeline: &'a wgpu::RenderPipeline,
+        ui_group: &'a wgpu::BindGroup,
+        ui_gamma_group: Option<&'a wgpu::BindGroup>,
+        dynamic_buffer: &'a wgpu::Buffer,
+        dynamic_count: u32,
+        transient_buffer: &'a wgpu::Buffer,
+        transient_count: u32,
+        retained_buffer: &'a wgpu::Buffer,
+        retained_count: u32,
+        shader_buffer: &'a wgpu::Buffer,
+        shader_batches: &'a [UiIconShaderBatch],
+        shaders: &'a HashMap<FxBlend, wgpu::RenderPipeline>,
+        textures: &'a HashMap<String, ScreenFxTexture>,
+        white: &'a wgpu::BindGroup,
+    ) {
+        if shader_batches.is_empty() {
+            Self::draw_ui_batches(pass, ui_pipeline, ui_group,
+                dynamic_buffer, dynamic_count, transient_buffer,
+                transient_count, retained_buffer, retained_count);
+            return;
+        }
+        for (layer, (buffer, total)) in [
+            (dynamic_buffer, dynamic_count),
+            (transient_buffer, transient_count),
+            (retained_buffer, retained_count),
+        ].into_iter().enumerate() {
+            let mut cursor = 0;
+            let mut index = 0;
+            while index < shader_batches.len() {
+                let item = &shader_batches[index];
+                if item.layer as usize != layer { index += 1; continue; }
+                let start = item.original_start.min(total);
+                let end = item.original_end.min(total);
+                if start > cursor {
+                    pass.set_pipeline(ui_pipeline);
+                    pass.set_bind_group(0, ui_group, &[]);
+                    if let Some(gamma) = ui_gamma_group {
+                        pass.set_bind_group(1, gamma, &[]);
+                    }
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(cursor..start, 0..1);
+                }
+                // All stages for this original span are emitted sequentially,
+                // before the next native HUD element is drawn.
+                pass.set_vertex_buffer(0, shader_buffer.slice(..));
+                while index < shader_batches.len()
+                    && shader_batches[index].layer as usize == layer
+                    && shader_batches[index].original_start == item.original_start
+                {
+                    let batch = &shader_batches[index].stage;
+                    if !batch.range.is_empty() {
+                        if let Some(pipeline) = shaders.get(&batch.blend) {
+                            let group = batch.texture_key.as_ref()
+                                .and_then(|key| textures.get(key))
+                                .map_or(white, |texture| &texture.bind_group);
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.draw(batch.range.clone(), 0..1);
+                        }
+                    }
+                    index += 1;
+                }
+                cursor = end;
+            }
+            if cursor < total {
+                pass.set_pipeline(ui_pipeline);
+                pass.set_bind_group(0, ui_group, &[]);
+                if let Some(gamma) = ui_gamma_group {
+                    pass.set_bind_group(1, gamma, &[]);
+                }
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(cursor..total, 0..1);
+            }
         }
     }
 
@@ -892,8 +1313,9 @@ impl Renderer {
     /// With a menu open this runs *after* egui so the readout stays on top of
     /// the menu instead of being covered by it: these are status displays the
     /// player is usually watching while changing a setting.
-    pub(in crate::renderer) fn submit_ui_overlay(&self, frame_view: &wgpu::TextureView) {
-        if self.screen_fx_vertex_count == 0
+    pub(in crate::renderer) fn submit_ui_overlay(&mut self, frame_view: &wgpu::TextureView) {
+        self.prepare_enemy_icon_shader();
+        if self.enemy_icon_vertex_count == 0 && self.screen_fx_vertex_count == 0
             && self.ui_vertex_count == 0
             && self.ui_dynamic_vertex_count == 0
             && self.ui_transient_vertex_count == 0
@@ -942,16 +1364,33 @@ impl Renderer {
             if let Some(resources) = ui_gamma {
                 pass.set_bind_group(1, &resources.group, &[]);
             }
-            Self::draw_ui_batches(
+            Self::draw_ui_batches_shadered(
                 &mut pass,
                 ui_pipeline,
                 &self.ui_bind_group,
+                ui_gamma.map(|r| &r.group),
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
                 &self.ui_transient_vertex_buffer,
                 self.ui_transient_vertex_count,
                 &self.ui_vertex_buffer,
                 self.ui_vertex_count,
+                &self.ui_icon_shader_buffer,
+                &self.ui_icon_shader_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
+            );
+            // The single enemy-info icon is a standalone authored multi-stage
+            // shader. It never samples the 64x64 UI icon atlas.
+            Self::draw_screen_fx_batches(
+                &mut pass,
+                &self.enemy_icon_vertex_buffer,
+                self.enemy_icon_vertex_count,
+                &self.enemy_icon_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
             );
             if !self.egui_active {
                 self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
@@ -987,6 +1426,11 @@ impl Renderer {
         if self.ui_vertex_count != 0 {
             self.queue
                 .write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+        if self.ui_state.icon_shader_flags.iter().any(|&authored| authored) {
+            self.ui_retained_vertices = vertices;
+        } else {
+            self.ui_retained_vertices.clear();
         }
         if let Some(started) = trace_started {
             rverbose!(
@@ -1234,6 +1678,7 @@ impl Renderer {
         }
         self.ui_transient_vertex_count =
             u32::try_from(self.ui_transient_vertices.len()).unwrap_or(u32::MAX);
+        self.prepare_ui_icon_shaders();
         let tail = &self.ui_transient_vertices[tail_start.min(self.ui_transient_vertices.len())..];
         if !tail.is_empty() {
             let byte_offset = (tail_start * std::mem::size_of::<UiVertex>()) as u64;
@@ -1290,7 +1735,9 @@ fn pack_native_icon_shelves(
     Some(((y + row_height + 2).max(4), coords))
 }
 
-/// Keep every HUD icon at its decoded native width and height. Only shrink an
+/// Keep image-only HUD icons at their decoded native width and height. Authored
+/// shader materials bypass this atlas entirely, preserving their live stages.
+/// Only shrink an
 /// exceptional oversized image when GPU texture-size or memory limits force it;
 /// unlike the old fixed-cell atlas, ordinary 32px, 128px, 512px and HD art
 /// are copied byte-for-byte into this texture. Returns both pixels and per-icon
@@ -1383,14 +1830,41 @@ fn assemble_native_icon_atlas(
     }, uvs)
 }
 
+/// An explicitly declared shader is authoritative even if a texture with
+/// exactly the same qpath also exists (R_RegisterShader semantics).
+fn ui_icon_has_authored_shader(
+    shaders: &std::collections::BTreeMap<String, jka_assets::shader::Shader>,
+    qpath: &str,
+) -> bool {
+    jka_assets::shader::find_shader(shaders, qpath).is_some()
+}
+
 pub(in crate::renderer) fn load_ui_icon_atlas(
     base: &Path,
     game: Option<&Path>,
     max_texture_size: u32,
-) -> (TextureData, Vec<([f32; 2], [f32; 2])>) {
+) -> (TextureData, Vec<([f32; 2], [f32; 2])>, Vec<bool>) {
     let mut images = vec![None; ui::ICON_NAMES.len()];
+    let mut shaders = vec![false; ui::ICON_NAMES.len()];
     match AssetSearchPath::open_game(base, game) {
         Ok(mut assets) => {
+            // Use the same shader-library parsing/override precedence as the
+            // world and model loader (including .oshader), not a filename-only
+            // atlas lookup. Resolve once per atlas creation, never per frame.
+            let mut shader_warnings = Vec::new();
+            let shader_library = match crate::materials::shader_library(
+                &mut assets, &mut shader_warnings, false,
+            ) {
+                Ok((library, _diagnostics)) => library,
+                Err(error) => {
+                    eprintln!("UI icon shader library: {error}");
+                    let (texture, uvs) = assemble_native_icon_atlas(images, max_texture_size);
+                    return (texture, uvs, shaders);
+                }
+            };
+            for warning in shader_warnings {
+                rverbose!(2, "UI icon shader library: {warning}");
+            }
             for (index, name) in ui::ICON_NAMES.iter().enumerate() {
                 if name.is_empty() { continue; }
                 let requested = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF).contains(&index) {
@@ -1398,19 +1872,33 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
                 } else {
                     (*name).to_owned()
                 };
-                let mut image = try_load_texture_asset_from_search_path(
-                    &mut assets, &requested, true, false, true, "UI icon",
-                );
-                if image.is_none() && (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE).contains(&index) {
+                let has_authored_shader = ui_icon_has_authored_shader(&shader_library, &requested);
+                shaders[index] = has_authored_shader;
+                // Authored shader definitions ALWAYS win, and all their stages
+                // are rendered standalone. Only implicit images enter the atlas.
+                let mut image = if has_authored_shader { None } else {
+                    try_load_texture_asset_from_search_path(
+                        &mut assets, &requested, true, false, true, "UI icon",
+                    )
+                };
+                // TaystJK's missing no-ammo icons can fall back to the normal
+                // weapon artwork, but never override a *found* authored shader.
+                if image.is_none() && !has_authored_shader
+                    && (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE).contains(&index)
+                {
                     let fallback = if index >= ui::ICON_WEAPON_STAFF {
                         "gfx/hud/w_icon_lightsaber"
                     } else { name };
-                    image = try_load_texture_asset_from_search_path(
-                        &mut assets, fallback, true, false, true, "UI icon fallback",
-                    );
+                    if jka_assets::shader::find_shader(&shader_library, fallback).is_some() {
+                        shaders[index] = true;
+                    } else {
+                        image = try_load_texture_asset_from_search_path(
+                            &mut assets, fallback, true, false, true, "UI icon fallback",
+                        );
+                    }
                 }
                 let Some(image) = image else {
-                    eprintln!("UI icon {requested}: not found");
+                    if !shaders[index] { eprintln!("UI icon {requested}: not found"); }
                     continue;
                 };
                 images[index] = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec());
@@ -1421,12 +1909,40 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
         }
         Err(error) => eprintln!("UI icon asset search: {error}"),
     }
-    assemble_native_icon_atlas(images, max_texture_size)
+    let (texture, uvs) = assemble_native_icon_atlas(images, max_texture_size);
+    (texture, uvs, shaders)
 }
 
 #[cfg(test)]
 mod native_icon_atlas_tests {
     use super::*;
+
+    #[test]
+    fn authored_shader_ignores_colliding_image_and_marks_full_uvs() {
+        let dir = std::env::temp_dir().join(format!("djk_ui_shader_{}", std::process::id()));
+        let image_dir = dir.join("gfx/2d");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(image_dir.join("binocularWindow.png")).unwrap();
+        let mut assets = AssetSearchPath::open(&dir).unwrap();
+        assert!(try_load_texture_asset_from_search_path(
+            &mut assets, "gfx/2d/binocularWindow", true, false, true, "test"
+        ).is_some());
+        let scripts = jka_assets::shader::parse(
+            "gfx/2d/binocularWindow {\n{\nanimMap 5 gfx/2d/first gfx/2d/second\nblendFunc blend\n}\n}\n"
+        ).unwrap();
+        assert!(ui_icon_has_authored_shader(&scripts, "gfx/2d/binocularWindow"));
+        let mut ui = ui::UiSnapshot::default();
+        ui.icon_atlas_uvs = vec![([0.1, 0.1], [0.8, 0.8]); ui::ICON_NAMES.len()];
+        ui.icon_shader_flags = vec![false; ui::ICON_NAMES.len()];
+        let index = ui::ICON_NAMES.iter().position(|name| *name == "gfx/2d/binocularWindow").unwrap();
+        ui.icon_shader_flags[index] = ui_icon_has_authored_shader(&scripts, "gfx/2d/binocularWindow");
+        assert_eq!(ui.icon_uv(index), ([0.0, 0.0], [1.0, 1.0]));
+        assert_eq!(ui_shader_icon_index(ui.icon_texture_source(index)), Some(index));
+        assert_eq!(ui.icon_texture_source(0), 5.0);
+        drop(assets);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn different_resolution_icons_are_copied_exactly_without_resampling() {
@@ -1477,7 +1993,7 @@ mod native_icon_atlas_tests {
 /// images are written into their cells as they are first needed.
 pub(in crate::renderer) fn blank_ui_extension_atlas() -> TextureData {
     let cell = ui::EXT_IMAGE_CELL;
-    let rows = (crate::extensions::MAX_HUD_IMAGES as u32).div_ceil(ui::EXT_IMAGE_COLUMNS);
+    let rows = (crate::extensions::MAX_HUD_IMAGES as u32 + 1).div_ceil(ui::EXT_IMAGE_COLUMNS);
     let (width, height) = (ui::EXT_IMAGE_COLUMNS * cell, rows * cell);
     TextureData {
         label: "JKA UI extension image atlas".into(),
@@ -1540,6 +2056,81 @@ pub(in crate::renderer) fn load_ui_extension_images(
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
 /// Each cell key may contain newline-separated candidate qpaths; the first
 /// existing image wins (team-skin icon -> team fallback -> defer art).
+/// Every player icon the game can see (`models/players/<model>/icon_<skin>`,
+/// every model and every skin, stock and pk3 alike), at 48 px, in one atlas
+/// keyed `model/skin`. Runs off the render thread (see `sync_ui_avatars`).
+pub(in crate::renderer) fn load_ui_avatar_atlas(base: &Path, game: Option<&Path>) -> (TextureData, ui::AvatarAtlas) {
+    const CELL: u32 = 48;
+    const COLUMNS: u32 = 128;
+    // 8192 px tall at most: inside every adapter's minimum texture limit.
+    const MAX_ICONS: usize = (COLUMNS * (8192 / CELL)) as usize;
+    let mut icons: Vec<String> = Vec::new();
+    let mut assets = AssetSearchPath::open_game(base, game).ok();
+    if let Some(assets) = assets.as_ref() {
+        for name in assets.names() {
+            let lower = name.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("models/players/") else { continue };
+            let Some((model, file)) = rest.split_once('/') else { continue };
+            let Some(stem) = file.strip_suffix(".tga").or_else(|| file.strip_suffix(".jpg")).or_else(|| file.strip_suffix(".png")) else {
+                continue;
+            };
+            let Some(skin) = stem.strip_prefix("icon_") else { continue };
+            if !skin.is_empty() && !model.contains('/') {
+                icons.push(format!("{model}/{skin}"));
+            }
+        }
+    }
+    icons.sort();
+    icons.dedup();
+    if icons.len() > MAX_ICONS {
+        // Keep every model's default icon before extra skins.
+        icons.sort_by_key(|key| !key.ends_with("/default"));
+        icons.truncate(MAX_ICONS);
+    }
+    let rows = (icons.len() as u32).div_ceil(COLUMNS).max(1);
+    let (width, height) = (COLUMNS * CELL, rows * CELL);
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    let mut atlas = ui::AvatarAtlas { columns: COLUMNS, rows, cells: Default::default() };
+    if let Some(assets) = assets.as_mut() {
+        for key in icons {
+            let Some((model, skin)) = key.split_once('/') else { continue };
+            let qpath = format!("models/players/{model}/icon_{skin}");
+            let Some(image) = try_load_texture_asset_from_search_path(assets, &qpath, true, false, true, "avatar") else {
+                continue;
+            };
+            let Some(source) = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec()) else {
+                continue;
+            };
+            let cell_image = if source.width() == CELL && source.height() == CELL {
+                source
+            } else {
+                image::imageops::resize(&source, CELL, CELL, image::imageops::FilterType::Triangle)
+            };
+            let index = atlas.cells.len() as u32;
+            let (col, row) = (index % COLUMNS, index / COLUMNS);
+            let row_bytes = (CELL * 4) as usize;
+            for y in 0..CELL {
+                let src = y as usize * row_bytes;
+                let dst = ((((row * CELL + y) * width) + col * CELL) * 4) as usize;
+                rgba[dst..dst + row_bytes].copy_from_slice(&cell_image.as_raw()[src..src + row_bytes]);
+            }
+            atlas.cells.insert(key, index);
+        }
+    }
+    let data = TextureData {
+        label: "JKA UI avatar atlas".into(),
+        source: None,
+        width,
+        height,
+        rgba: rgba.into(),
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    };
+    (data, atlas)
+}
+
 pub(in crate::renderer) fn load_ui_team_icon_atlas(
     base: &Path,
     game: Option<&Path>,
@@ -1876,6 +2467,47 @@ pub(in crate::renderer) fn load_ui_proportional_font(
     (texture, metrics)
 }
 
+/// Clean UI font for the scoreboard and kill feed: a packaged
+/// `fonts/ui_clean.ttf`/`.otf` when present, else Segoe UI Semibold, Segoe UI
+/// or Arial from the system. `None` keeps those surfaces on the JKA font.
+pub(in crate::renderer) fn load_ui_clean_font(
+    base: &Path,
+    game: Option<&Path>,
+) -> (TextureData, Option<ui::ProportionalFont>) {
+    const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+    let mut assets = AssetSearchPath::open_game(base, game).ok();
+    let packaged = ["fonts/ui_clean.ttf", "fonts/ui_clean.otf"].into_iter().filter_map(|path| {
+        let bytes = assets.as_mut()?.read(path, MAX_FONT_BYTES).ok().flatten()?.bytes;
+        Some((path.to_owned(), bytes))
+    });
+    let system = ui::system_font_dirs().into_iter().flat_map(|dir| {
+        ["seguisb.ttf", "segoeui.ttf", "arial.ttf"].map(|name| dir.join(name))
+    });
+    let candidates = packaged.collect::<Vec<_>>().into_iter().chain(
+        system.filter_map(|path| Some((path.display().to_string(), std::fs::read(&path).ok()?))),
+    );
+    for (label, bytes) in candidates {
+        match ui::rasterize_ttf_font(&bytes) {
+            Ok(font) => {
+                let texture = TextureData {
+                    label: format!("UI clean font {label}"),
+                    source: None,
+                    width: font.width,
+                    height: font.height,
+                    rgba: font.rgba.into(),
+                    rgba16f: None,
+                    mip_level_count: font.mip_level_count,
+                    clamp: true,
+                    srgb: false,
+                };
+                return (texture, Some(font.font));
+            }
+            Err(error) => eprintln!("UI clean font {label}: {error}"),
+        }
+    }
+    (empty_ui_font_texture("JKA missing clean UI font"), None)
+}
+
 /// Studio overlay font for `choice`: `ui::STUDIO_FONT_CLASSIC` is JKA's
 /// ergoec; a path is a font file on disk or in the game filesystem; empty
 /// picks a packaged `fonts/studio_overlay.ttf`, else a system UI font. Any
@@ -1922,6 +2554,16 @@ pub(in crate::renderer) fn load_studio_overlay_font(
         }
     }
     load_ui_proportional_font(base, game, "ergoec")
+}
+
+/// A single authored shader stage inserted at its original painter-order
+/// position inside the native UI stream. No extra render pass is required.
+#[derive(Clone)]
+pub(in crate::renderer) struct UiIconShaderBatch {
+    pub(in crate::renderer) layer: u8, // 0 dynamic, 1 transient, 2 retained
+    pub(in crate::renderer) original_start: u32,
+    pub(in crate::renderer) original_end: u32,
+    pub(in crate::renderer) stage: ScreenFxBatch,
 }
 
 #[derive(Clone)]

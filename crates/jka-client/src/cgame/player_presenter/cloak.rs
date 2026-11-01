@@ -11,14 +11,15 @@ pub(super) struct ForceRefractionState {
     pub start: i32,
     pub sampled_at: i32,
     pub origin: [f32; 3],
+    pub pull: bool,
 }
 
 impl ForceRefractionState {
-    pub(super) fn advance(prior: Option<Self>, now: i32, origin: [f32; 3], pull: bool) -> (Self, f32, f32) {
-        let mut state = prior.filter(|s| now >= s.sampled_at)
-            .unwrap_or(Self { start: now, sampled_at: now, origin });
+    pub(super) fn advance(prior: Option<Self>, now: i32, origin: [f32; 3], pull: bool, follow_ms: i32) -> (Self, f32, f32) {
+        let mut state = prior.filter(|s| now >= s.sampled_at && s.pull == pull)
+            .unwrap_or(Self { start: now, sampled_at: now, origin, pull });
         let elapsed = now.saturating_sub(state.start);
-        if elapsed < 200 { state.origin = origin; }
+        if elapsed < follow_ms { state.origin = origin; }
         state.sampled_at = now;
         let remaining = (500 - elapsed).max(0) as f32;
         let scale = (if pull { elapsed as f32 } else { remaining } * 0.003).clamp(0.2, 1.0);
@@ -186,24 +187,33 @@ mod tests {
 
     #[test]
     fn force_refraction_matches_taystjk_push_pull_and_hand_follow_window() {
-        let (start, scale, alpha) = ForceRefractionState::advance(None, 1000, [1.0; 3], false);
+        let (start, scale, alpha) = ForceRefractionState::advance(None, 1000, [1.0; 3], false, 200);
         assert_eq!(scale, 1.0);
         assert!((alpha - 244.0 / 255.0).abs() < 1e-6);
-        let (follow, _, _) = ForceRefractionState::advance(Some(start), 1199, [2.0; 3], false);
+        let (follow, _, _) = ForceRefractionState::advance(Some(start), 1199, [2.0; 3], false, 200);
         assert_eq!(follow.origin, [2.0; 3]);
-        let (fixed, scale, _) = ForceRefractionState::advance(Some(follow), 1400, [3.0; 3], false);
+        let (fixed, scale, _) = ForceRefractionState::advance(Some(follow), 1400, [3.0; 3], false, 200);
         assert_eq!(fixed.origin, [2.0; 3]);
         assert!((scale - 0.3).abs() < 1e-6);
-        let (_, scale, alpha) = ForceRefractionState::advance(Some(fixed), 1600, [4.0; 3], false);
+        let (_, scale, alpha) = ForceRefractionState::advance(Some(fixed), 1600, [4.0; 3], false, 200);
         assert_eq!(scale, 0.2);
         assert_eq!(alpha, 10.0 / 255.0);
-        let (pull, scale, _) = ForceRefractionState::advance(None, 1000, [1.0; 3], true);
+        let (pull, scale, _) = ForceRefractionState::advance(None, 1000, [1.0; 3], true, 200);
         assert_eq!(scale, 0.2);
-        assert_eq!(ForceRefractionState::advance(Some(pull), 1400, [2.0; 3], true).1, 1.0);
-        let (rewind, scale, _) = ForceRefractionState::advance(Some(fixed), 500, [5.0; 3], false);
+        assert_eq!(ForceRefractionState::advance(Some(pull), 1400, [2.0; 3], true, 200).1, 1.0);
+        let (rewind, scale, _) = ForceRefractionState::advance(Some(fixed), 500, [5.0; 3], false, 200);
         assert_eq!(rewind.start, 500);
         assert_eq!(rewind.origin, [5.0; 3]);
         assert_eq!(scale, 1.0);
+    }
+
+    #[test]
+    fn force_refraction_modern_path_can_follow_for_full_lifetime() {
+        let (start, _, _) = ForceRefractionState::advance(None, 1000, [1.0, 2.0, 3.0], false, 500);
+        let (mid, _, _) = ForceRefractionState::advance(Some(start), 1300, [4.0, 5.0, 6.0], false, 500);
+        assert_eq!(mid.origin, [4.0, 5.0, 6.0]);
+        let (end, _, _) = ForceRefractionState::advance(Some(mid), 1499, [7.0, 8.0, 9.0], false, 500);
+        assert_eq!(end.origin, [7.0, 8.0, 9.0]);
     }
 
     #[test]

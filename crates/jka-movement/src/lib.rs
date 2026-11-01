@@ -630,6 +630,11 @@ pub struct PredictSettings {
     pub base_game: i32,
     pub plugin_disable: i32,
     pub legacy_fixes: u32,
+    /// Local clientNum and authoritative jaPRO EV_PRIVATE_DUEL eventParm.
+    /// 0 = no known duel; 1 = NF; 2 = FF; higher values = gun duels.
+    pub duel_client: i32,
+    pub duel_type: i32,
+    pub roll_debug: i32,
 }
 
 impl Default for PredictSettings {
@@ -640,8 +645,23 @@ impl Default for PredictSettings {
             tracemask: 0x1111, no_footsteps: 0, backend: 0, server_mod: 0,
             cinfo: 0, jcinfo: 0, jcinfo2: 0, taystjk_info: 0, dmflags: 0,
             hook_pull: 0, restricts: 0, base_game: 0, plugin_disable: 1536, legacy_fixes: 0,
+            duel_client: 0, duel_type: 0, roll_debug: 0,
         }
     }
+}
+
+/// Values captured inside GetFixRoll during the most recent native prediction command.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RollPredictionDebug {
+    pub queries: i32,
+    pub roll_queries: i32,
+    pub mode: i32,
+    pub client_num: i32,
+    pub duel_type: i32,
+    pub duel_in_progress: i32,
+    pub command_time: i32,
+    pub legs_anim: i32,
 }
 
 /// A playerState_t in wire form: the stock playerStateFields slots in schema
@@ -693,6 +713,13 @@ pub struct PredictionEntity {
 // Ownership is exclusive; native globals are always protected by NativeGuard.
 unsafe impl Send for PlayerState {}
 impl PlayerState {
+    pub fn roll_prediction_debug(&self) -> RollPredictionDebug {
+        let _guard = ffi::NativeGuard::new();
+        let mut result = RollPredictionDebug::default();
+        unsafe { ffi::jka_player_roll_debug(self.raw.as_ptr(), &mut result) };
+        result
+    }
+
     pub fn set_prediction_entities(&mut self, entities: &[PredictionEntity]) -> Result<(), String> {
         if entities.len() > 1024 {
             return Err(format!("Too many prediction entities: {}", entities.len()));

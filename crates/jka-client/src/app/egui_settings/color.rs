@@ -456,27 +456,16 @@ impl App {
             "SPLIT TONING",
             "Give shadows and highlights different color tints.",
         );
-        theme::row(
+        let settings = self.video.split_toning;
+        self.egui_toning_slider(
             ui,
-            "Split toning",
-            "Tint shadows and highlights by perceived scene brightness before output gamma. Works on its own or together with a film look.",
-            theme::Reset::Color("r_splitToning"),
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.video.split_toning.enabled) {
-                    let _ = self.set_console_cvar("r_splitToning", if enabled { "1" } else { "0" });
-                }
-            },
+            "Strength",
+            "Overall shadow and highlight tint intensity. Zero disables split toning.",
+            "r_splitToningStrength",
+            settings.strength,
+            0.0..=1.0,
         );
-        ui.add_enabled_ui(self.video.split_toning.enabled, |ui| {
-            let settings = self.video.split_toning;
-            self.egui_toning_slider(
-                ui,
-                "Strength",
-                "How strongly both tints affect the image.",
-                "r_splitToningStrength",
-                settings.strength,
-                0.0..=1.0,
-            );
+        ui.add_enabled_ui(settings.strength > 0.0, |ui| {
             self.egui_toning_color(
                 ui,
                 "Shadow color",
@@ -518,7 +507,11 @@ impl App {
         range: std::ops::RangeInclusive<f32>,
     ) {
         theme::row(ui, label, tip, theme::Reset::Color(name), |ui| {
-            let readout = percent(value);
+            let readout = if name == "r_splitToningStrength" && value == 0.0 {
+                "Off".to_owned()
+            } else {
+                percent(value)
+            };
             if theme::slider(ui, &mut value, range, &readout) {
                 let _ = self.set_console_cvar(name, &value.to_string());
             }
@@ -586,7 +579,7 @@ impl App {
                 ui,
                 &format!("{}  {}  {}", shown[0], shown[1], shown[2]),
                 12.5,
-                theme::TEXT_FAINT,
+                theme::TEXT_FAINT(),
             );
         });
     }

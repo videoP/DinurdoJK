@@ -209,7 +209,7 @@ impl App {
                 let time = self.render_studio.timeline_time();
                 let on_demo = self.render_studio.timeline.footage_at(time, None).is_some();
                 if !on_demo {
-                    sui::callout(ui, "Move the playhead onto demo or animation footage first.", theme::WARNING);
+                    sui::callout(ui, "Move the playhead onto demo or animation footage first.", theme::WARNING());
                 }
                 if sui::button_row(ui, &[(Some(Icon::Plus), "Add at playhead", ButtonKind::Primary, on_demo)]).is_some() {
                     let preset = self.render_studio.director_new_preset;
@@ -286,7 +286,7 @@ impl App {
                 }
                 if players.is_empty() {
                     ui.label(egui::RichText::new("Move the playhead onto demo footage to list its players")
-                        .size(11.5).color(theme::TEXT_FAINT));
+                        .size(11.5).color(theme::TEXT_FAINT()));
                 }
             });
         }
@@ -383,9 +383,9 @@ impl App {
         let main_exists = self.render_studio.route_options.main.as_ref()
             .is_none_or(|(name, game)| inputs.iter().any(|(n, g, _)| n == name && g == game));
         let ready = (2..=32).contains(&inputs.len()) && main_exists && !running && !self.studio_locked();
-        if !main_exists { sui::callout(ui, "Choose a main POV recording that is still on the timeline.", theme::WARNING); }
+        if !main_exists { sui::callout(ui, "Choose a main POV recording that is still on the timeline.", theme::WARNING()); }
         if !inputs.is_empty() && !(2..=32).contains(&inputs.len()) {
-            sui::callout(ui, "Route comparison needs 2–32 distinct recordings on the timeline.", theme::WARNING);
+            sui::callout(ui, "Route comparison needs 2–32 distinct recordings on the timeline.", theme::WARNING());
         }
         if running {
             ui.horizontal(|ui| { ui.spinner(); sui::hint(ui, "Waiting for Director analysis…"); });
@@ -672,7 +672,7 @@ impl App {
             }
             if players.is_empty() {
                 ui.label(egui::RichText::new("Move the playhead onto demo footage to list its players")
-                    .size(11.5).color(theme::TEXT_FAINT));
+                    .size(11.5).color(theme::TEXT_FAINT()));
             }
         });
     }
@@ -698,7 +698,7 @@ impl App {
                     }
                     if players.is_empty() {
                         ui.label(egui::RichText::new("Move the playhead onto demo footage to list its players")
-                            .size(11.5).color(theme::TEXT_FAINT));
+                            .size(11.5).color(theme::TEXT_FAINT()));
                     }
                 });
         });
@@ -728,14 +728,14 @@ impl App {
                 egui::pos2(xb.min(right), row.bottom() - 4.0));
             if block.width() <= 0.0 { continue; }
             let selected = selection.contains(&shot.id);
-            let color = if shot.enabled { sui::CAMERA } else { theme::TEXT_DISABLED };
+            let color = if shot.enabled { sui::CAMERA() } else { theme::TEXT_DISABLED() };
             painter.rect_filled(block, 3.0, sui::clip_body(color, selected).gamma_multiply(if shot.enabled { 1.0 } else { 0.6 }));
             painter.rect_filled(egui::Rect::from_min_max(block.left_top(), egui::pos2(block.right(), block.top() + 3.0)),
                 egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, color);
             painter.rect_stroke(block, 3.0, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
                 if selected { egui::Color32::WHITE } else { color.gamma_multiply(0.5) }), egui::StrokeKind::Inside);
             if active == Some(shot.id) {
-                painter.circle_filled(egui::pos2(block.right() - 8.0, block.center().y + 1.0), 3.0, theme::ACCENT);
+                painter.circle_filled(egui::pos2(block.right() - 8.0, block.center().y + 1.0), 3.0, theme::ACCENT());
             }
             if block.width() > 40.0 {
                 let stage = self.render_studio.timeline.demo_at(shot.start + shot.duration * 0.5).is_none();
@@ -745,7 +745,7 @@ impl App {
                     else { format!("{} · {}", shot.preset.label(), Self::studio_player_label(&players, shot.client)) };
                 painter.with_clip_rect(block.shrink2(egui::vec2(4.0, 1.0))).text(
                     egui::pos2(block.left() + 7.0, block.center().y + 1.5), egui::Align2::LEFT_CENTER, text,
-                    egui::FontId::proportional(11.0), if shot.enabled { theme::TEXT } else { theme::TEXT_FAINT });
+                    egui::FontId::proportional(11.0), if shot.enabled { theme::TEXT() } else { theme::TEXT_FAINT() });
             }
             if locked { continue; }
             let base = ui.make_persistent_id(("studio_director_span", shot.id));
@@ -887,7 +887,7 @@ impl App {
         let live = self.render_studio.timeline.director_at(now).map(|s| s.id);
         let Some(shot) = self.render_studio.timeline.director_shots.get(index).cloned() else { return };
         if let Some(label)=&shot.comparison_label {
-            sui::inspector_title(ui, sui::CAMERA, "Race camera shot", label,
+            sui::inspector_title(ui, sui::CAMERA(), "Race camera shot", label,
                 &format!("{} – {}{}", sui::timecode(shot.start, fps), sui::timecode(shot.end(), fps),
                     if live == Some(shot.id) { " · live at playhead" } else { "" }));
             sui::hint(ui,"Edit this phase's camera below. It keeps following the indexed runner through pauses and rewinds. Director controls the race timing; regenerating the comparison replaces these edits.");
@@ -909,13 +909,13 @@ impl App {
         }
         let selection = self.studio_director_selected_ids();
         let busy = self.render_studio.director_job.is_some();
-        sui::inspector_title(ui, sui::CAMERA, "Director shot",
+        sui::inspector_title(ui, sui::CAMERA(), "Director shot",
             &format!("{} · {}", shot.preset.label(), Self::studio_player_label(&players, shot.client)),
             &format!("{} – {}{}", sui::timecode(shot.start, fps), sui::timecode(shot.end(), fps),
                 if live == Some(shot.id) { " · live at playhead" } else { "" }));
         if selection.len() > 1 {
             sui::callout(ui, &format!("{} shots selected. Edits below apply to this one; these apply to all:", selection.len()),
-                theme::ACCENT);
+                theme::ACCENT());
             match sui::button_row(ui, &[(None, "Regenerate all", ButtonKind::Primary, !busy),
                 (None, "Delete all", ButtonKind::Danger, true)]) {
                 Some(0) => self.studio_director_action(selection.clone(), ShotAction::Regenerate),
@@ -983,7 +983,7 @@ impl App {
                         }
                     }
                 } else {
-                    sui::callout(ui, "Not placed yet: it orbits the subject until placed in the map.", theme::WARNING);
+                    sui::callout(ui, "Not placed yet: it orbits the subject until placed in the map.", theme::WARNING());
                 }
                 place = sui::button_row(ui, &[(Some(Icon::Camera), if edited.position_override.is_some() { "Re-place" } else { "Place in map" },
                     ButtonKind::Normal, !busy && edited.client < 0)]).is_some();
@@ -1133,7 +1133,7 @@ fn race_camera_editor(ui: &mut egui::Ui, id: u64,
 /// A player name for picker rows: plain, in the readable text colour (game
 /// colour codes such as ^0 black vanish on the dark menu).
 fn player_row_text(name: &str) -> egui::RichText {
-    egui::RichText::new(strip_colors(name)).size(12.0).color(theme::TEXT)
+    egui::RichText::new(strip_colors(name)).size(12.0).color(theme::TEXT())
 }
 
 /// Plain player name for compact labels (drops ^N color codes).

@@ -419,9 +419,11 @@ pub(in crate::scene) fn stage_batch(
         && pipeline.blend == BlendMode::Opaque;
     DrawBatch {
         vertices,
+        competitive_primary_stage: first,
         bsp_shader_index: bsp_shader_index.map_or(u32::MAX, |index| index as u32),
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
+        force_sight_only: material.force_sight_only,
         thermal_lava: material.thermal_lava,
         thermal_emission: material.thermal_emission,
         thermal_source_stage: !material.water && !material.light_filter
@@ -1662,6 +1664,30 @@ mod cloud_composite_order_tests {
             depth_equal: false,
             glow: false,
         }
+    }
+
+    #[test]
+    fn force_sight_visibility_is_preserved_on_every_authored_stage() {
+        let stage = base_stage();
+        let sight = SurfaceMaterial {
+            force_sight_only: true,
+            stages: vec![stage.clone(), stage.clone()],
+            ..Default::default()
+        };
+        let ordinary = SurfaceMaterial {
+            stages: vec![stage.clone()],
+            ..Default::default()
+        };
+        let a = stage_batch(&sight, &sight.stages[0], true, false, 0..3,
+            Some(1), None, None, &[], [0; 4], [0.0; 4], false);
+        let b = stage_batch(&sight, &sight.stages[1], false, false, 0..3,
+            Some(1), None, None, &[], [0; 4], [0.0; 4], false);
+        let c = stage_batch(&ordinary, &ordinary.stages[0], true, false, 0..3,
+            Some(1), None, None, &[], [0; 4], [0.0; 4], false);
+        assert!(a.force_sight_only && b.force_sight_only);
+        assert!(!c.force_sight_only);
+        assert!(!crate::scene::draw_batches_share_state(&a, &c),
+            "normal and forcesight-only geometry must never AUTO-batch together");
     }
 
     #[test]

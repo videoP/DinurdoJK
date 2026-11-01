@@ -525,55 +525,6 @@ pub(in crate::renderer) fn snow_shell_draw_near_center(draw: &SnowShellDraw, cen
     (closest - center).length_squared() <= SNOW_SHELL_DRAW_RADIUS * SNOW_SHELL_DRAW_RADIUS
 }
 
-pub(in crate::renderer) fn draw_snow_shell_fast<'a>(
-    pass: &mut wgpu::RenderPass<'a>,
-    world: &'a WorldGpu,
-    view_proj: Mat4,
-    deform_center: Vec2,
-    draw_bsp_model_surfaces: bool,
-    current_pipeline: &mut Option<PipelineKey>,
-) {
-    if world.snow_shell.chunks.is_empty() {
-        return;
-    }
-    pass.set_vertex_buffer(
-        1,
-        world.snow_shell.legacy_dlight_surface_id_buffer.slice(..),
-    );
-    for chunk in world.snow_shell.chunks.values() {
-        let Some(vertex_buffer) = &chunk.vertex_buffer else {
-            continue;
-        };
-        if !chunk.near_center(deform_center) {
-            continue;
-        }
-        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-        for draw in &chunk.draws {
-            if !snow_shell_draw_near_center(draw, deform_center)
-                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
-            {
-                continue;
-            }
-            let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
-                continue;
-            };
-            if hidden_bsp_model_surface(draw_bsp_model_surfaces, batch, &world.material_debug) {
-                continue;
-            }
-            if *current_pipeline != Some(batch.source.pipeline) {
-                pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
-                *current_pipeline = Some(batch.source.pipeline);
-            }
-            pass.set_bind_group(1, &batch.fast_bind_group, &[]);
-            pass.draw(draw.vertices.clone(), 1..2);
-        }
-    }
-    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
-    pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
-    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-    *current_pipeline = None;
-}
-
 pub(in crate::renderer) fn draw_snow_shell<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     world: &'a WorldGpu,

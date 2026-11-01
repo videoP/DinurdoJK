@@ -209,7 +209,7 @@ impl App {
             theme::banner(
                 ui,
                 "This is a legacy r_we particle-cloud mode. Its compatibility state is preserved; use the Fog section above for DinurdoJK's rendered fog controls.",
-                theme::TEXT_DIM,
+                theme::TEXT_DIM(),
             );
         }
 

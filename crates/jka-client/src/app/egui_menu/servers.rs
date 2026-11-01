@@ -243,9 +243,9 @@ impl App {
     ) {
         let selected = self.server_browser.sort == sort;
         let color = if selected {
-            theme::ACCENT
+            theme::ACCENT()
         } else {
-            theme::TEXT_DIM
+            theme::TEXT_DIM()
         };
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::click());
@@ -284,7 +284,7 @@ impl App {
             };
             painter.add(egui::Shape::convex_polygon(
                 points,
-                theme::ACCENT,
+                theme::ACCENT(),
                 egui::Stroke::NONE,
             ));
         }
@@ -312,9 +312,9 @@ impl App {
                 ),
                 egui::CornerRadius::ZERO,
                 if selected {
-                    theme::ACCENT
+                    theme::ACCENT()
                 } else {
-                    theme::LINE_STRONG
+                    theme::LINE_STRONG()
                 },
             );
         }
@@ -330,6 +330,23 @@ impl App {
             "Jedi Academy protocol 26 discovery with asynchronous Internet/LAN queries, favorites, player search, and visit history.",
         );
 
+        // Split before the search/filters: the details pane starts at the top
+        // of the content, rather than below the tall filter toolbar.
+        let total_width = ui.available_width();
+        let pane_height = ui.available_height().max(380.0);
+        let left_width = (total_width * 0.67).max(560.0)
+            .min((total_width - 290.0).max(360.0));
+        let mut selected_after = None;
+        let mut connect_after = None;
+        let mut refresh_one_after = None;
+        let mut favorite_after = None;
+        let mut autojoin_after = None;
+        let mut get_server_info_after = None;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, pane_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
         // Source selector + refresh.
         ui.horizontal(|ui| {
             for source in [
@@ -379,7 +396,7 @@ impl App {
                     self.request_server_refresh(self.server_browser.source);
                 }
                 if refreshing {
-                    theme::label(ui, theme::plain("REFRESHING…", 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain("REFRESHING…", 10.5, theme::TEXT_FAINT()));
                 }
             });
         });
@@ -419,7 +436,7 @@ impl App {
                     ui.checkbox(&mut enabled, "");
                     theme::label(
                         ui,
-                        theme::plain(&format!("sv_master{}", slot + 1), 10.5, theme::TEXT_DIM),
+                        theme::plain(&format!("sv_master{}", slot + 1), 10.5, theme::TEXT_DIM()),
                     );
                     let edit = ui.add_sized(
                         [320.0, 22.0],
@@ -429,7 +446,7 @@ impl App {
                             "master.example.org[:port]"
                         }),
                     );
-                    theme::label(ui, theme::plain(slot_labels[slot], 10.0, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(slot_labels[slot], 10.0, theme::TEXT_FAINT()));
                     if edit.changed() {
                         self.egui_repaint_requested = true;
                     }
@@ -470,7 +487,7 @@ impl App {
         // Search stays prominent; the boolean filters live in one compact menu
         // rather than consuming most of the toolbar as independent chips.
         ui.horizontal(|ui| {
-            theme::label(ui, theme::plain("SEARCH", 11.5, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain("SEARCH", 11.5, theme::TEXT_FAINT()));
             let search_width = (ui.available_width() - 150.0).clamp(260.0, 440.0);
             let response = ui.add_sized(
                 [search_width, 24.0],
@@ -498,7 +515,7 @@ impl App {
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(230.0);
-                    theme::label(ui, theme::plain("SERVER FILTERS", 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain("SERVER FILTERS", 10.5, theme::TEXT_FAINT()));
                     ui.add_space(3.0);
                     ui.checkbox(&mut self.server_browser.hide_empty, "Hide empty servers");
                     ui.checkbox(&mut self.server_browser.hide_full, "Hide full servers");
@@ -516,7 +533,7 @@ impl App {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        theme::label(ui, theme::plain("MAX PING", 10.5, theme::TEXT_FAINT));
+                        theme::label(ui, theme::plain("MAX PING", 10.5, theme::TEXT_FAINT()));
                         ui.add(
                             egui::DragValue::new(&mut self.server_browser.max_ping)
                                 .range(0..=999)
@@ -539,7 +556,7 @@ impl App {
         });
 
         ui.horizontal(|ui| {
-            theme::label(ui, theme::plain("MODS", 11.5, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain("MODS", 11.5, theme::TEXT_FAINT()));
             let response = ui.add_sized(
                 [360.0, 24.0],
                 egui::TextEdit::singleline(&mut self.server_browser.mod_filter)
@@ -554,7 +571,7 @@ impl App {
             self.mark_config_dirty();
         }
         ui.horizontal(|ui| {
-            theme::label(ui, theme::plain("PLAYERS", 11.5, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain("PLAYERS", 11.5, theme::TEXT_FAINT()));
             let response = ui.add_sized(
                 [360.0, 24.0],
                 egui::TextEdit::singleline(&mut self.server_browser.player_search)
@@ -755,15 +772,8 @@ impl App {
             }
         });
 
-        let browser_height = (ui.available_height() - 78.0).max(220.0);
-        let mut selected_after = None;
-        let mut connect_after = None;
-        let mut refresh_one_after = None;
-        let mut favorite_after = None;
-        let mut autojoin_after = None;
-        let mut get_server_info_after = None;
-        ui.horizontal(|ui| {
-            let list_width = (ui.available_width() * 0.67).max(560.0);
+        let browser_height = (ui.available_height() - 46.0).max(180.0);
+        let list_width = ui.available_width();
             let last_visited_w = 104.0;
             // The name column absorbs whatever the fixed columns leave, so the
             // table always spans its pane instead of hugging the left edge.
@@ -775,7 +785,7 @@ impl App {
                     theme::section(
                         ui,
                         self.server_browser.source.label(),
-                        &format!("{} visible — {}", servers.len(), self.server_browser.status_text),
+                        &format!("{} visible · {}", servers.len(), self.server_browser.status_text),
                     );
                     ui.horizontal(|ui| {
                         self.server_browser_sort_header(ui, server_browser::BrowserSort::Name, name_w);
@@ -814,14 +824,14 @@ impl App {
                                         } else {
                                             hostname
                                         };
-                                        let row_text = theme::TEXT;
+                                        let row_text = theme::TEXT();
                                         let name_hover =
                                             crate::logging::strip_jka_colors(&label);
                                         let name_response = ui.add_sized(
                                             [name_w, 24.0],
                                             egui::Button::selectable(
                                                 selected,
-                                                jka_colored_text(&label, 11.5, theme::TEXT),
+                                                jka_colored_text(&label, 11.5, theme::TEXT()),
                                             )
                                             .truncate(),
                                         );
@@ -835,7 +845,7 @@ impl App {
                                             name_padding,
                                         );
 
-                                        let map = if server.map.is_empty() { "—" } else { &server.map };
+                                        let map = if server.map.is_empty() { "-" } else { &server.map };
                                         let map_response = ui.add_sized(
                                             [118.0, 24.0],
                                             egui::Label::new(theme::plain(map, 11.5, row_text))
@@ -869,7 +879,7 @@ impl App {
 
                                         let visible_clients = self.server_browser.visible_client_count(server);
                                         let players = format!("{}/{}", visible_clients, server.max_clients);
-                                        let player_color = if full { theme::WARNING } else { row_text };
+                                        let player_color = if full { theme::WARNING() } else { row_text };
                                         let players_response = ui.add_sized(
                                             [55.0, 24.0],
                                             egui::Label::new(theme::plain(&players, 11.5, player_color))
@@ -885,13 +895,13 @@ impl App {
                                             0.0,
                                         );
 
-                                        let ping = if server.ping_ms == 0 { "—".to_owned() } else { server.ping_ms.to_string() };
+                                        let ping = if server.ping_ms == 0 { "-".to_owned() } else { server.ping_ms.to_string() };
                                         let ping_color = match server.ping_ms {
-                                            0 => theme::TEXT_FAINT,
+                                            0 => theme::TEXT_FAINT(),
                                             1..=79 => egui::Color32::from_rgb(0x83, 0xD6, 0x8A),
-                                            80..=149 => theme::TEXT,
-                                            150..=249 => theme::WARNING,
-                                            _ => theme::DANGER,
+                                            80..=149 => theme::TEXT(),
+                                            150..=249 => theme::WARNING(),
+                                            _ => theme::DANGER(),
                                         };
                                         let ping_response = ui.add_sized(
                                             [44.0, 24.0],
@@ -920,14 +930,14 @@ impl App {
                                                 )
                                             })
                                             .unwrap_or_else(|| {
-                                                ("—".to_owned(), "This server has not been visited yet.".to_owned())
+                                                ("-".to_owned(), "This server has not been visited yet.".to_owned())
                                             });
                                         let visit_response = ui.add_sized(
                                             [last_visited_w, 24.0],
                                             egui::Label::new(theme::plain(
                                                 &visited,
                                                 10.8,
-                                                theme::TEXT_DIM,
+                                                theme::TEXT_DIM(),
                                             ))
                                             .truncate()
                                             .sense(egui::Sense::click()),
@@ -999,17 +1009,36 @@ impl App {
                 },
             );
 
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            theme::label(ui, theme::plain("DIRECT CONNECT", 11.5, theme::TEXT_FAINT()));
+            let response = ui.add_sized(
+                [300.0, 24.0],
+                egui::TextEdit::singleline(&mut self.server_browser.direct_connect)
+                    .hint_text("hostname or address[:port]"),
+            );
+            let enter =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if (theme::primary_button(ui, "CONNECT").clicked() || enter)
+                && !self.server_browser.direct_connect.trim().is_empty()
+            {
+                let target = self.server_browser.direct_connect.trim().to_owned();
+                self.connect_to_server(&target);
+            }
+        });
+                },
+            );
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(12.0);
 
             ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), browser_height),
+                egui::vec2(ui.available_width(), pane_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     theme::section(ui, "SERVER DETAILS", "Select a server to inspect it.");
                     let Some(address) = self.server_browser.selected else {
-                        theme::label(ui, theme::plain("No server selected.", 12.5, theme::TEXT_FAINT));
+                        theme::label(ui, theme::plain("No server selected.", 12.5, theme::TEXT_FAINT()));
                         return;
                     };
                     let server = self.server_browser.servers.get(&address).cloned()
@@ -1022,7 +1051,7 @@ impl App {
                     let hostname_width = ui.available_width();
                     let hostname_response = ui.add_sized(
                         [hostname_width, 22.0],
-                        egui::Label::new(jka_colored_text(&hostname, 17.0, theme::TEXT))
+                        egui::Label::new(jka_colored_text(&hostname, 17.0, theme::TEXT()))
                             .truncate(),
                     );
                     hover_if_truncated(
@@ -1033,10 +1062,10 @@ impl App {
                         17.0,
                         0.0,
                     );
-                    theme::label(ui, theme::plain(&address.to_string(), 11.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(&address.to_string(), 11.5, theme::TEXT_FAINT()));
                     ui.add_space(8.0);
-                    theme::label(ui, theme::plain(&format!("Map: {}", if server.map.is_empty() { "—" } else { &server.map }), 12.0, theme::TEXT_DIM));
-                    theme::label(ui, theme::plain(&format!("Mode: {}", server.gametype_label()), 12.0, theme::TEXT_DIM));
+                    theme::label(ui, theme::plain(&format!("Map: {}", if server.map.is_empty() { "-" } else { &server.map }), 12.0, theme::TEXT_DIM()));
+                    theme::label(ui, theme::plain(&format!("Mode: {}", server.gametype_label()), 12.0, theme::TEXT_DIM()));
                     let visible_clients = self.server_browser.visible_client_count(&server);
                     let connecting_hidden = if self.server_browser.hide_connecting {
                         self.server_browser
@@ -1061,8 +1090,8 @@ impl App {
                     } else {
                         format!("  •  {}", composition_parts.join("  •  "))
                     };
-                    theme::label(ui, theme::plain(&format!("Players: {}/{}{}  •  Ping: {} ms", visible_clients, server.max_clients, composition, server.ping_ms), 12.0, theme::TEXT_DIM));
-                    theme::label(ui, theme::plain(&format!("Game: {}  •  Protocol: {}", if server.game.is_empty() { "base" } else { &server.game }, server.protocol), 12.0, theme::TEXT_DIM));
+                    theme::label(ui, theme::plain(&format!("Players: {}/{}{}  •  Ping: {} ms", visible_clients, server.max_clients, composition, server.ping_ms), 12.0, theme::TEXT_DIM()));
+                    theme::label(ui, theme::plain(&format!("Game: {}  •  Protocol: {}", if server.game.is_empty() { "base" } else { &server.game }, server.protocol), 12.0, theme::TEXT_DIM()));
                     if let Some(last_visited) = self.server_browser.history_last_visited(address) {
                         theme::label(
                             ui,
@@ -1072,14 +1101,14 @@ impl App {
                                     crate::chat_log::format_local_datetime_minute(last_visited)
                                 ),
                                 12.0,
-                                theme::TEXT_DIM,
+                                theme::TEXT_DIM(),
                             ),
                         );
                     }
                     if server.need_password {
                         ui.add_space(7.0);
                         ui.horizontal(|ui| {
-                            theme::label(ui, theme::plain("PASSWORD", 11.0, theme::TEXT_FAINT));
+                            theme::label(ui, theme::plain("PASSWORD", 11.0, theme::TEXT_FAINT()));
                             ui.add_sized(
                                 [170.0, 23.0],
                                 egui::TextEdit::singleline(&mut self.network.password)
@@ -1129,7 +1158,7 @@ impl App {
                     theme::section(ui, "PLAYERS", "Live getstatus result for the selected server.");
                     if let Some(status) = self.server_browser.details.as_ref().filter(|status| status.address == address) {
                         if let Some((_, version)) = status.fields.iter().find(|(key, _)| key.eq_ignore_ascii_case("version")) {
-                            theme::label(ui, theme::plain(&format!("Server: {version}"), 11.2, theme::TEXT_FAINT));
+                            theme::label(ui, theme::plain(&format!("Server: {version}"), 11.2, theme::TEXT_FAINT()));
                             ui.add_space(4.0);
                         }
                         let visible_players: Vec<_> = status
@@ -1149,11 +1178,11 @@ impl App {
                             } else {
                                 "No player rows returned."
                             };
-                            theme::label(ui, theme::plain(text, 11.5, theme::TEXT_FAINT));
+                            theme::label(ui, theme::plain(text, 11.5, theme::TEXT_FAINT()));
                         } else {
                             egui::ScrollArea::vertical()
                                 .id_salt("jka_server_player_list")
-                                .max_height(180.0)
+                                .max_height(ui.available_height().max(180.0))
                                 .show(ui, |ui| {
                                     for player in visible_players {
                                         ui.horizontal(|ui| {
@@ -1162,7 +1191,7 @@ impl App {
                                                 egui::Label::new(theme::plain(
                                                     &format!("{:>4} ms", player.ping),
                                                     11.5,
-                                                    theme::TEXT_DIM,
+                                                    theme::TEXT_DIM(),
                                                 )),
                                             );
                                             ui.add_sized(
@@ -1170,7 +1199,7 @@ impl App {
                                                 egui::Label::new(theme::plain(
                                                     &format!("{:>4}", player.score),
                                                     11.5,
-                                                    theme::TEXT_DIM,
+                                                    theme::TEXT_DIM(),
                                                 )),
                                             );
                                             let player_name_width = ui.available_width();
@@ -1179,7 +1208,7 @@ impl App {
                                                 egui::Label::new(jka_colored_text(
                                                     &player.name,
                                                     11.5,
-                                                    theme::TEXT,
+                                                    theme::TEXT(),
                                                 ))
                                                 .truncate(),
                                             );
@@ -1196,7 +1225,7 @@ impl App {
                                 });
                         }
                     } else {
-                        theme::label(ui, theme::plain("Querying status…", 11.5, theme::TEXT_FAINT));
+                        theme::label(ui, theme::plain("Querying status…", 11.5, theme::TEXT_FAINT()));
                     }
                 },
             );
@@ -1285,24 +1314,5 @@ impl App {
             return;
         }
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            theme::label(ui, theme::plain("DIRECT CONNECT", 11.5, theme::TEXT_FAINT));
-            let response = ui.add_sized(
-                [300.0, 24.0],
-                egui::TextEdit::singleline(&mut self.server_browser.direct_connect)
-                    .hint_text("hostname or address[:port]"),
-            );
-            let enter =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if (theme::primary_button(ui, "CONNECT").clicked() || enter)
-                && !self.server_browser.direct_connect.trim().is_empty()
-            {
-                let target = self.server_browser.direct_connect.trim().to_owned();
-                self.connect_to_server(&target);
-            }
-        });
     }
 }

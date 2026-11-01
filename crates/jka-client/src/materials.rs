@@ -6,7 +6,7 @@
 use crate::{map_jobs::MapJobPool, thread_activity::Task};
 use image::ImageFormat;
 use jka_assets::{
-    bsp::{MATERIAL_GLASS, MATERIAL_MASK, SURF_NODRAW, SURF_SKY},
+    bsp::{MATERIAL_GLASS, MATERIAL_MASK, SURF_FORCESIGHT, SURF_NODRAW, SURF_SKY},
     pk3::AssetSearchPath,
     shader::{self, AlphaGen, RgbGen, Shader, TcGen, TcMod},
 };
@@ -276,6 +276,8 @@ pub struct SurfaceMaterial {
     pub clamp_time: Option<f32>,
     pub stages: Vec<MaterialStage>,
     pub surface_material: u8,
+    /// Retail SURF_FORCESIGHT: draw this entire material only while seeing is active.
+    pub force_sight_only: bool,
     /// Authored surfaceparm lava (also augmented with compiled BSP CONTENTS_LAVA).
     pub thermal_lava: bool,
     /// Thermal evidence, independent from ordinary JKA Dynamic Glow:
@@ -363,6 +365,7 @@ impl Default for SurfaceMaterial {
             clamp_time: None,
             stages: Vec::new(),
             surface_material: 0,
+            force_sight_only: false,
             thermal_lava: false,
             thermal_emission: 0,
             glass_promotion: false,
@@ -1695,7 +1698,13 @@ fn decode_texture_data_profiled(
     if width == 0 || height == 0 || width > 8192 || height > 8192 {
         return Err(format!("{name}: texture dimensions outside 1..8192"));
     }
-    let base = image.into_raw();
+    let mut base = image.into_raw();
+    // Inferno's smoke1.tga stores white RGB under fully transparent texels,
+    // while every visible texel is black. Linear FX sampling blends those
+    // hidden white RGB values into the cloud edge before alpha blending,
+    // producing the bright outline. Correct the base BEFORE generating mips,
+    // without changing alpha, sampling state, or any other texture.
+    repair_inferno_smoke_transparent_rgb(name, &mut base);
     let mip_started = Instant::now();
     let (rgba, mip_level_count) = if mipmaps {
         build_mip_chain(width, height, base)
@@ -1718,6 +1727,24 @@ fn decode_texture_data_profiled(
         decode_ms,
         mip_ms,
     ))
+}
+
+/// Fix the invalid hidden RGB in the Inferno smoke sprite without changing
+/// its authored alpha or other FX/materials. Other providers may override
+/// this qpath with a colored smoke image, so only alter the original all-black
+/// visible-RGB pattern. Called once per decode, never during rendering.
+fn repair_inferno_smoke_transparent_rgb(name: &str, rgba: &mut [u8]) {
+    if !name.eq_ignore_ascii_case("gfx/inferno/smoke1.tga") {
+        return;
+    }
+    if !rgba.chunks_exact(4).all(|pixel| pixel[3] == 0 || pixel[..3] == [0, 0, 0]) {
+        return;
+    }
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            pixel[..3].fill(0);
+        }
+    }
 }
 
 /// Exact packed storage, including thin/odd mip tails that exceed base / 3.
@@ -3205,6 +3232,9 @@ pub fn describe(
             .and_then(|path| textures.load(assets, path, false))
     } else { None };
     SurfaceMaterial {
+        // Compiled BSP surface flags and authored shader surfaceparms must both
+        // work, including uncompiled .map previews and shader remaps.
+        force_sight_only: (flags | definition.collision_surface_flags_add) & SURF_FORCESIGHT != 0,
         // A model shader (and an uncompiled source-map preview) has no BSP
         // material bits. Prefer its explicit Glass declaration when present.
         thermal_lava: definition.lava,
@@ -3265,6 +3295,32 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inferno_smoke_zero_alpha_rgb_repair_preserves_alpha_and_mips() {
+        // The broken source uses transparent white next to visible black.
+        let original = vec![
+            0, 0, 0, 255, 255, 255, 255, 0,
+            0, 0, 0, 128, 255, 255, 255, 0,
+        ];
+        let mut repaired = original.clone();
+        repair_inferno_smoke_transparent_rgb("GFX/INFERNO/SMOKE1.TGA", &mut repaired);
+        assert_eq!(repaired, vec![
+            0, 0, 0, 255, 0, 0, 0, 0,
+            0, 0, 0, 128, 0, 0, 0, 0,
+        ]);
+        let (mips, count) = build_mip_chain(2, 2, repaired);
+        assert_eq!(count, 2);
+        assert_eq!(&mips[16..], &[0, 0, 0, 95]);
+        // Other images and colored overrides keep their authored pixels.
+        let mut unrelated = original.clone();
+        repair_inferno_smoke_transparent_rgb("gfx/other/smoke1.tga", &mut unrelated);
+        assert_eq!(unrelated, original);
+        let mut override_image = original.clone();
+        override_image[0] = 30;
+        repair_inferno_smoke_transparent_rgb("gfx/inferno/smoke1.tga", &mut override_image);
+        assert_eq!(override_image[4..8], [255, 255, 255, 0]);
+    }
 
     #[test]
     fn implicit_texture_probe_uses_exact_loader_candidate_order() {
@@ -3389,6 +3445,21 @@ mod tests {
 
     fn material(text: &str) -> SurfaceMaterial {
         material_with_environment_policy(text, false)
+    }
+
+    #[test]
+    fn force_sight_material_is_gated_by_authored_surfaceparm() {
+        let hidden = material("test {\nsurfaceparm forcesight\n{\nmap $whiteimage\n}\n}\n");
+        let ordinary = material("test {\n{\nmap $whiteimage\n}\n}\n");
+        assert!(hidden.force_sight_only);
+        assert!(!ordinary.force_sight_only);
+        // A BSP may already carry the compiler-authored bit even when the
+        // corresponding .shader definition is absent from the asset search path.
+        let root = std::env::temp_dir().join("jka-forcesight-surface-test");
+        let mut assets = AssetSearchPath::open(&root).unwrap();
+        let compiled = describe("test", SURF_FORCESIGHT, None, None,
+            &mut assets, &mut Textures::new(), false, false);
+        assert!(compiled.force_sight_only);
     }
 
     #[test]

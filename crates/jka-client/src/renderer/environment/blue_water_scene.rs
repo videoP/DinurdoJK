@@ -243,7 +243,7 @@ impl Scene {
             }),
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::renderer::depth_format(),
                 depth_write_enabled: Some(true),
                 // Reversed-Z: larger is nearer, so Greater keeps the nearer surface.
                 depth_compare: Some(wgpu::CompareFunction::Greater),

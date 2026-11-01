@@ -1,0 +1,4925 @@
+{
+  "material": {
+    "ShadingModel": "MSM_SingleLayerWater",
+    "BlendMode": "BLEND_Masked",
+    "TwoSided": true,
+    "RefractionMethod": "RM_PixelNormalOffset"
+  },
+  "switches": {
+    "Bracketing": true,
+    "SupportFoam": true,
+    "ThreePhase": true,
+    "Use Previous Frame Switch": true,
+    "Use Secondary Foam": false,
+    "Cubic Interpolate Foam Mask": true,
+    "RGB Is Foam Normal": true,
+    "Debug Foam Mask": false,
+    "AdvectWaveHeight": true,
+    "Enable River": true,
+    "Enable Waves": false,
+    "UseVT": false,
+    "DisableDynamicBoundsClip": true
+  },
+  "roots": {
+    "ScatteringCoefficients": 117,
+    "AbsorptionCoefficients": 125,
+    "PhaseG": 126,
+    "ColorScaleBehindWater": 127
+  },
+  "attributes": {
+    "BaseColor": 184,
+    "Metallic": 185,
+    "Specular": 206,
+    "Roughness": 213,
+    "EmissiveColor": 214,
+    "Opacity": 219,
+    "OpacityMask": 295,
+    "Normal": 384,
+    "Refraction": 403,
+    "PixelDepthOffset": 404,
+    "WorldPositionOffset": 518
+  },
+  "nodes": [
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SW_Water_Material#18",
+      "R": 1.0
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SW_Water_Material#16"
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "SW_Water_Material#79",
+      "name": "Scattering",
+      "value": [
+        0.7656229734420776,
+        1.0,
+        0.9241690039634705,
+        0.5
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        2
+      ]
+    },
+    {
+      "op": "VectorParameter",
+      "output": 4,
+      "at": "SW_Water_Material#79",
+      "name": "Scattering",
+      "value": [
+        0.7656229734420776,
+        1.0,
+        0.9241690039634705,
+        0.5
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "a",
+      "inputs": [
+        4
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "SW_Water_Material#45",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 3,
+        "B": 5
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "SW_Water_Material#4",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 1,
+        "B": 6
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#55"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        8
+      ]
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#384",
+      "name": "Foam Scattering Color",
+      "value": [
+        0.42708298563957214,
+        1.0,
+        0.670740008354187,
+        1.0
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        10
+      ]
+    },
+    {
+      "op": "VectorParameter",
+      "output": 4,
+      "at": "MF_ShallowWaterRiver#384",
+      "name": "Foam Scattering Color",
+      "value": [
+        0.42708298563957214,
+        1.0,
+        0.670740008354187,
+        1.0
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "a",
+      "inputs": [
+        12
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#130",
+      "ConstA": 0.0,
+      "ConstB": 0.0010000000474974513,
+      "inputs": {
+        "A": 11,
+        "B": 13
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#280",
+      "name": "Scattering Min Velocity",
+      "value": 100.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#281",
+      "name": "Scattering Max Velocity",
+      "value": 500.0,
+      "overridden": true
+    },
+    {
+      "op": "TextureCoordinate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#355"
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#388"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        18
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#37",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 19
+      }
+    },
+    {
+      "op": "DoubleVectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#79"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        21
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#36",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 22
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#354",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 20,
+        "B": 23
+      }
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#379",
+      "name": "BakedWaterSimSize",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "overridden": false
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        25
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#40",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 26
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#78",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 24,
+        "B": 27
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#7",
+      "ConstA": 0.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 28
+      }
+    },
+    {
+      "op": "Clamp",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#10",
+      "inputs": {
+        "Input": 29
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#265",
+      "name": "UseBakedSimHack",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#61",
+      "Code": "if (RenderSplineMesh > 1-1e-5)\r\n{\r\n    return b;\r\n}\r\nelse\r\n{\r\n    return a;\r\n}",
+      "OutputType": "CMOT_Float2",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 17,
+        "Inputs[1].Input": 30,
+        "Inputs[2].Input": 31
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#356",
+      "name": "BakedWaterSimTex"
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#46"
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver_BilinearInterp#2",
+      "Code": "uint2 NumCells;\r\nuint Levels;\r\nTex.GetDimensions(0, NumCells.x, NumCells.y, Levels);\r\nconst float2 GridPos = UVs.xy * NumCells - .5;\r\n\t\t\t\t\t\t\t\r\n// identify the lower-left-hand corner of the cell\r\n\tconst int2 GridCell = floor(GridPos);\r\nconst float2 InterpV = GridPos - GridCell;\t\t\t\t\r\n\t\t\t\t\r\nfloat4 Value00 = Tex.Load(float4(GridCell, 0, TheMipLevel));\r\nfloat4 Value10 = Tex.Load(float4(GridCell + uint2(1,0), 0, TheMipLevel));\r\nfloat4 Value01 = Tex.Load(float4(GridCell + uint2(0,1), 0, TheMipLevel));\r\nfloat4 Value11 = Tex.Load(float4(GridCell + uint2(1,1), 0, TheMipLevel));\r\n\r\nfloat4 LerpX0 = lerp(Value00, Value10, InterpV.x);\r\nfloat4 LerpX1 = lerp(Value01, Value11, InterpV.x);\r\n\r\nreturn lerp(LerpX0, LerpX1, InterpV.y);\r\n",
+      "OutputType": "CMOT_Float4",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 32,
+        "Inputs[1].Input": 33,
+        "Inputs[2].Input": 34
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat4Components#3",
+      "B": true,
+      "inputs": {
+        "Input": 35
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat4Components#4",
+      "A": true,
+      "inputs": {
+        "Input": 35
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#1",
+      "inputs": {
+        "A": 36,
+        "B": 37
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#47"
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#2",
+      "inputs": {
+        "A": 38,
+        "B": 39
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#41",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 40
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "VectorLength#1"
+    },
+    {
+      "op": "Distance",
+      "output": 0,
+      "at": "VectorLength#3",
+      "inputs": {
+        "A": 41,
+        "B": 42
+      }
+    },
+    {
+      "op": "SmoothStep",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#321",
+      "ConstMin": 250.0,
+      "ConstMax": 10000.0,
+      "ConstValue": 0.0,
+      "inputs": {
+        "Min": 15,
+        "Max": 16,
+        "Value": 43
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#362",
+      "name": "FoamTex"
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "CubicInterpolateTexture#10",
+      "Code": "int2 NumCells;\r\nTexture.GetDimensions(NumCells.x, NumCells.y);\r\n\r\nconst float2 GridPos = UV.xy * NumCells - .5;\r\n\t\t\t\t\t\t\t\t\r\n// identify the lower-left-hand corner of the cell\r\nconst int2 GridCell = floor(GridPos);\r\n\t\t\t\t\t\t\t\t\r\nconst int2 MaxCell = NumCells - int2(2,2);\r\n\r\nif (any(GridCell < int2(1,1)) || any(GridCell >= MaxCell))\r\n{\r\n\t// revert to bilinear hardware sampling at the boundary cells.\r\n\treturn Texture.SampleLevel(View.MaterialTextureBilinearClampedSampler, UV, 0);\r\n}\r\nelse \r\n{\r\n\t// sample point offset from lower left\r\n\tfloat2 delta = GridPos - GridCell;\r\n\t\t\r\n\tfloat4x2 Weights;\r\n\r\n\tWeights[0] = -1./3 * delta + 1./2 * delta * delta - 1./6 * delta * delta * delta;\r\n\tWeights[1] = 1. - delta * delta + 1./2 * (delta * delta * delta - delta);\r\n\tWeights[2] = delta + 1./2 * (delta * delta - delta * delta * delta);\r\n\tWeights[3] = 1./6 * (delta * delta * delta - delta);\t\t\r\n\r\n\tfloat4 minv = 3.402823466e+38;\r\n\tfloat4 maxv = -3.402823466e+38;\r\n\r\n\tfloat4 BiCubicValue = 0;\t\t\r\n\tfor (int j = 0; j < 4; ++j)\r\n\t{\r\n\t\tfloat4 qj = 0;\r\n\t\tfor (int i = 0; i < 4; ++i)\r\n\t\t{\r\n\t\t\tfloat4 Val = Texture.Load(int4(GridCell.x + i - 1, GridCell.y + j - 1, 0, 0)); \r\n\t\t\tqj += Weights[i][0] * Val;\r\n\r\n\t\t\tminv = min(Val, minv);\r\n\t\t\tmaxv = max(Val, maxv);\r\n\t\t}\r\n\r\n\t\tBiCubicValue += Weights[j][1] * qj;\r\n\t}\r\n\r\n    return min(max(BiCubicValue, minv), maxv);\r\n}\r\n\r\n",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 32,
+        "Inputs[1].Input": 45
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#39",
+      "R": true,
+      "inputs": {
+        "Input": 46
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#270",
+      "name": "Foam Scattering Area Fit 0-1",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#117",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 47,
+        "B": 48
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#248",
+      "inputs": {
+        "Input": 49
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#273",
+      "name": "Foam Scattering Area Power",
+      "value": 0.5,
+      "overridden": true
+    },
+    {
+      "op": "Power",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#203",
+      "ConstExponent": 2.0,
+      "inputs": {
+        "Base": 50,
+        "Exponent": 51
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#76",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 52,
+        "B": 48
+      }
+    },
+    {
+      "op": "Max",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#114",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 44,
+        "B": 53
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#89",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 9,
+        "B": 14,
+        "Alpha": 54
+      }
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "WaterBodyData#59"
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "WaterBodyData#4",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 56
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterZoneData#6",
+      "name": "WaterZoneIndex",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterZoneData#1",
+      "Code": "FWaterZoneData ZoneData; ZoneData = GetWaterZoneData(WaterZoneIndex);\r\n\r\nExtent = ZoneData.Extent;\r\nHeightExtent = ZoneData.HeightExtent; \r\nGroundZMin= ZoneData.GroundZMin;\r\n\r\nreturn ZoneData.Location;",
+      "OutputType": "CMOT_Float2",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/GerstnerWaveFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 58
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 1,
+      "at": "WaterZoneData#1",
+      "Code": "FWaterZoneData ZoneData; ZoneData = GetWaterZoneData(WaterZoneIndex);\r\n\r\nExtent = ZoneData.Extent;\r\nHeightExtent = ZoneData.HeightExtent; \r\nGroundZMin= ZoneData.GroundZMin;\r\n\r\nreturn ZoneData.Location;",
+      "OutputType": "CMOT_Float2",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/GerstnerWaveFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 58
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterBodyData#15",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 60
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterBodyData#53",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 59,
+        "B": 61
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterBodyData#51",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 57,
+        "B": 62
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterBodyData#14",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 63,
+        "B": 60
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "WaterBodyData#36",
+      "inputs": {
+        "Input": 64
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "WaterBodyData#55",
+      "name": "WaterVelocityAndHeight",
+      "SamplerType": "SAMPLERTYPE_LinearColor"
+    },
+    {
+      "op": "TextureProperty",
+      "output": 0,
+      "at": "WaterBodyData#56",
+      "inputs": {
+        "TextureObject": 66
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#29",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 65,
+        "B": 67
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#36",
+      "ConstA": 1.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 68
+      }
+    },
+    {
+      "op": "Floor",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#15",
+      "inputs": {
+        "Input": 69
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#1",
+      "ConstA": 0.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 70
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#13",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 71,
+        "B": 67
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#13",
+      "Code": "GetWaterWaveParamIndex(Parameters)",
+      "OutputType": "CMOT_Float1"
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#11",
+      "Code": "return GetWaterBodyData((int)WaterBodyIndex).WaterZoneIndex;",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 73
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#10",
+      "Code": "return GetWaterInfoTextureViewIndex(WaterZoneIndex);",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 74
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#7",
+      "inputs": {
+        "A": 72,
+        "B": 75
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "WaterBodyData#5"
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#39",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 76,
+        "TextureObject": 66,
+        "MipValue": 77
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        78
+      ]
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#14",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "B": 67
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#1",
+      "R": true,
+      "inputs": {
+        "Input": 80
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#11"
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#5",
+      "inputs": {
+        "A": 81,
+        "B": 82
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#2",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 72,
+        "B": 83
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#8",
+      "inputs": {
+        "A": 84,
+        "B": 75
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#40",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 85,
+        "TextureObject": 66,
+        "MipValue": 77
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        86
+      ]
+    },
+    {
+      "op": "Frac",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#16",
+      "inputs": {
+        "Input": 69
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#1",
+      "R": true,
+      "inputs": {
+        "Input": 88
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#24",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 79,
+        "B": 87,
+        "Alpha": 89
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#2",
+      "G": true,
+      "inputs": {
+        "Input": 80
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#6",
+      "inputs": {
+        "A": 82,
+        "B": 91
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#3",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 72,
+        "B": 92
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#9",
+      "inputs": {
+        "A": 93,
+        "B": 75
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#41",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 94,
+        "TextureObject": 66,
+        "MipValue": 77
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        95
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#4",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 72,
+        "B": 80
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#10",
+      "inputs": {
+        "A": 97,
+        "B": 75
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#42",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 98,
+        "TextureObject": 66,
+        "MipValue": 77
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        99
+      ]
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#25",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 96,
+        "B": 100,
+        "Alpha": 89
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#2",
+      "G": true,
+      "inputs": {
+        "Input": 88
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#26",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 90,
+        "B": 101,
+        "Alpha": 102
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterBodyData#38",
+      "name": "MaxFlowVelocity",
+      "value": 1024.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#7",
+      "Code": "return DecodeWaterInfoVelocity(WaterInfoSample, MaxVelocity);",
+      "OutputType": "CMOT_Float2",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 103,
+        "Inputs[1].Input": 104
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "VectorLength#1"
+    },
+    {
+      "op": "Distance",
+      "output": 0,
+      "at": "VectorLength#3",
+      "inputs": {
+        "A": 105,
+        "B": 106
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterBlendTransition#16",
+      "name": "Velocity to Mask waves",
+      "value": 100.0,
+      "overridden": false
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "MF_ShallowWaterBlendTransition#4",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 107,
+        "B": 108
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterBlendTransition#15",
+      "inputs": {
+        "Input": 109
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterBlendTransition#11",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "B": 55,
+        "Alpha": 110
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "SW_Water_Material#3",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 7,
+        "B": 111
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "SW_Water_Material#24",
+      "ConstA": 1.0,
+      "ConstB": 1000.0,
+      "inputs": {
+        "A": 112
+      }
+    },
+    {
+      "op": "TwoSidedSign",
+      "output": 0,
+      "at": "Water_Underside#39"
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "Water_Underside#30",
+      "inputs": {
+        "Input": 114
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "Water_Underside#18",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 113,
+        "B": 115
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterCoefficientMask#7",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 0,
+        "B": 116
+      }
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "SW_Water_Material#80",
+      "name": "Absorption",
+      "value": [
+        20.83333396911621,
+        25.0,
+        24.67391586303711,
+        8.0
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        118
+      ]
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "SW_Water_Material#23",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "B": 119
+      }
+    },
+    {
+      "op": "VectorParameter",
+      "output": 4,
+      "at": "SW_Water_Material#80",
+      "name": "Absorption",
+      "value": [
+        20.83333396911621,
+        25.0,
+        24.67391586303711,
+        8.0
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "a",
+      "inputs": [
+        121
+      ]
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "SW_Water_Material#22",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 120,
+        "B": 122
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "Water_Underside#19",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 123,
+        "B": 115
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterCoefficientMask#8",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 0,
+        "B": 124
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "SW_Water_Material#60",
+      "name": "Anisotropy",
+      "value": 0.10000000149011612,
+      "overridden": false
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SW_Water_Material#17",
+      "R": 1.0
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "WaterAttributes#21",
+      "name": "Water Albedo",
+      "value": [
+        0.08333300054073334,
+        0.08333300054073334,
+        0.08333300054073334,
+        0.5
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        128
+      ]
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "WaterAttributes#1",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "CausticsMaxIntensity",
+      "value": 1.0
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterAttributes#4",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 129,
+        "B": 130
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        131
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        132
+      ]
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#377",
+      "name": "Foam Base Color",
+      "value": [
+        0.3894039988517761,
+        0.7552080154418945,
+        0.5572389960289001,
+        1.0
+      ],
+      "overridden": true
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        134
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#312",
+      "name": "Foam Render Fit 0-1",
+      "value": 0.25,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#256",
+      "name": "Foam Mask Fit 0-1",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#116",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 47,
+        "B": 137
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#246",
+      "inputs": {
+        "Input": 138
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#289",
+      "name": "Foam Mask Power",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Power",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#204",
+      "ConstExponent": 2.0,
+      "inputs": {
+        "Base": 139,
+        "Exponent": 140
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#75",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 141,
+        "B": 137
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#292",
+      "name": "LowVelocityFoamScale",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#294",
+      "name": "FoamAttenMin",
+      "value": 25.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#296",
+      "name": "FoamAttenMax",
+      "value": 100.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#62",
+      "Code": "lerp(1, smoothstep(AttenuationMin, AttenuationMax, vmag), 1. - saturate(lvfs));",
+      "OutputType": "CMOT_Float1",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 43,
+        "Inputs[1].Input": 143,
+        "Inputs[2].Input": 144,
+        "Inputs[3].Input": 145
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#127",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 142,
+        "B": 146
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#252",
+      "inputs": {
+        "Input": 147
+      }
+    },
+    {
+      "op": "OneMinus",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#200",
+      "inputs": {
+        "Input": 148
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#358",
+      "name": "FoamWithNormalTexture",
+      "SamplerType": "SAMPLERTYPE_LinearColor"
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_TextureAdvection#52"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        151
+      ]
+    },
+    {
+      "op": "Time",
+      "output": 0,
+      "at": "MF_TextureAdvection#50"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#261",
+      "name": "FoamSpeed",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_TextureAdvection#1"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#279",
+      "name": "BakedWaterSimDx",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#378",
+      "name": "BakedWaterSimSize",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "overridden": false
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        157
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#262",
+      "name": "FoamWithNormalTextureScale",
+      "value": 0.0010000000474974513,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#269",
+      "name": "PulseLength",
+      "value": 2.0,
+      "overridden": true
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#45"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#276",
+      "name": "BracketAngleDelta",
+      "value": 20.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#277",
+      "name": "BracketMagnitudeDelta",
+      "value": 70.0,
+      "overridden": true
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#360",
+      "name": "BakedWaterSimNormalTex"
+    },
+    {
+      "op": "TextureSample",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#375",
+      "MipValueMode": "TMVM_MipLevel",
+      "inputs": {
+        "Coordinates": 32,
+        "TextureObject": 164
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        165
+      ]
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_TextureAdvection#5",
+      "Code": "const float2 UV = WorldPosition.xy;\r\n\r\n// includes the advection speed scale, which can be spatially varying and is split out for mip calculation\r\nfloat2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nconst float3 FullScaledVelocity3D = float3(FullScaledVelocity, 0);\r\nconst float3 VelocityInPlane = FullScaledVelocity3D - dot(FullScaledVelocity3D, SimNormal) * SimNormal;\r\n\r\n//const float3 PlaneAxisU = -normalize(cross(SimNormal, normalize(float3(0,1,0))));\r\n//const float3 PlaneAxisV = normalize(cross(SimNormal, PlaneAxisU));\r\n//const float2 ProjectedVelocity = float2(dot(VelocityInPlane, PlaneAxisU), dot(VelocityInPlane, PlaneAxisV));\r\n\r\nFullScaledVelocity = VelocityInPlane.xy;\r\n\r\n// bracket velocity based on angle\r\nfloat2 VelocityDir0;\r\nfloat2 VelocityDir1;\r\nfloat VelocityBlendAlpha;\r\nBracketAngle(FullScaledVelocity, BracketAngleDelta, VelocityDir0, VelocityDir1, VelocityBlendAlpha);\r\n\r\n// bracket velocity based on magnitude\r\nfloat VelocityMagnitude = length(FullScaledVelocity);\r\nfloat VelocityMagnitude0;\r\nfloat VelocityMagnitude1;\r\nfloat VelocityMagnitudeBlendAlpha;\r\nBracketValue(VelocityMagnitude, BracketMagnitudeDelta, VelocityMagnitude0, VelocityMagnitude1, VelocityMagnitudeBlendAlpha);\r\n\r\n// store all combinations of bracketed velocity dir and magnitude\r\nfloat2 Velocities[4];\r\nVelocities[0] = VelocityDir0 * VelocityMagnitude0;\r\nVelocities[1] = VelocityDir0 * VelocityMagnitude1; \r\nVelocities[2] = VelocityDir1 * VelocityMagnitude0; \r\nVelocities[3] = VelocityDir1 * VelocityMagnitude1;\r\n\r\n// compute phases\r\nfloat lerp0, lerp1, lerp2, t0, t1, t2;\r\nfloat3 CycleCount;\r\nCompute3Phases(PulseLength, Time, lerp0, lerp1, lerp2, t0, t1, t2, CycleCount);\r\n\r\n// compute advected uv based for two phases based on original velocity\r\nfloat2 AdvectedUV0 = UV - Velocity.xy * t0;\r\nfloat2 AdvectedUV1 = UV - Velocity.xy * t1;\r\nfloat2 AdvectedUV2 = UV - Velocity.xy * t2;\r\n\r\n// scale advected uvs\r\nfloat2 uv0 = AdvectedUV0 * AdvectedTextureScale;\r\nfloat2 uv1 = AdvectedUV1 * AdvectedTextureScale;\r\nfloat2 uv2 = AdvectedUV2 * AdvectedTextureScale;\r\n\r\n// compute mip levels based on the uv from advecting the original velocity\r\n// this avoids seams when mip mapping because of disncontinuities in the bracketed velocities\r\nfloat2 TexDims;\r\nfloat Levels;\r\nTex.GetDimensions(0, TexDims.x, TexDims.y, Levels);\r\n\r\nfloat3 MipLevels;\r\n\r\n#if VERTEXSHADER\r\n    MipLevels = TheMipBias;\r\n#else\r\n    MipLevels.x = ComputeMipLevel(uv0, TexDims);\r\n    MipLevels.y = ComputeMipLevel(uv1, TexDims);\r\n    MipLevels.z = ComputeMipLevel(uv2, TexDims);\r\n    MipLevels = clamp(MipLevels + TheMipBias, 0, Levels);\r\n#endif\r\n\r\n// perform two phase advection for each of the bracketed velocities and interpolate\r\nfloat4 TextureSamples[4];\r\nfor (int i = 0; i < 4; ++i)\r\n{\r\n    TextureSamples[i] = AdvectionInterpolation3(UV, Velocities[i], t0, t1, t2, lerp0, lerp1, lerp2, AdvectedTextureScale, MipLevels, Tex, TexSampler, CycleCount);\r\n}\r\n\r\n// interpolate samples based on bracketing\r\nfloat4 Sample0 = lerp(TextureSamples[0], TextureSamples[1], VelocityMagnitudeBlendAlpha);\r\nfloat4 Sample1 = lerp(TextureSamples[2], TextureSamples[3], VelocityMagnitudeBlendAlpha);\r\n\r\nreturn lerp(Sample0, Sample1, VelocityBlendAlpha);",
+      "OutputType": "CMOT_Float4",
+      "IncludeFilePaths": [
+        "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+      ],
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 150,
+        "Inputs[1].Input": 152,
+        "Inputs[2].Input": 153,
+        "Inputs[3].Input": 154,
+        "Inputs[4].Input": 40,
+        "Inputs[5].Input": 155,
+        "Inputs[6].Input": 156,
+        "Inputs[7].Input": 156,
+        "Inputs[8].Input": 158,
+        "Inputs[9].Input": 159,
+        "Inputs[10].Input": 160,
+        "Inputs[11].Input": 161,
+        "Inputs[12].Input": 162,
+        "Inputs[13].Input": 163,
+        "Inputs[14].Input": 155,
+        "Inputs[15].Input": 166
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#43",
+      "A": true,
+      "inputs": {
+        "Input": 167
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#253",
+      "inputs": {
+        "Input": 168
+      }
+    },
+    {
+      "op": "SmoothStep",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#324",
+      "ConstMin": 0.0,
+      "ConstMax": 1.0,
+      "ConstValue": 0.0,
+      "inputs": {
+        "Min": 149,
+        "Value": 169
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#133",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 147,
+        "B": 168
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#299",
+      "name": "Black Point to Mult Blend",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#93",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 170,
+        "B": 171,
+        "Alpha": 172
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#297",
+      "name": "FoamWithNormalPower",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Power",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#205",
+      "ConstExponent": 4.0,
+      "inputs": {
+        "Base": 173,
+        "Exponent": 174
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#302",
+      "name": "FoamWithNormalGain",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#131",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 175,
+        "B": 176
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#50"
+    },
+    {
+      "op": "Max",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#115",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 177,
+        "B": 178
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#250",
+      "inputs": {
+        "Input": 179
+      }
+    },
+    {
+      "op": "SmoothStep",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#323",
+      "ConstMin": 0.0,
+      "ConstMax": 0.25,
+      "ConstValue": 0.0,
+      "inputs": {
+        "Max": 136,
+        "Value": 180
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#315",
+      "name": "FoamOpacity",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#128",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 181,
+        "B": 182
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#88",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 133,
+        "B": 135,
+        "Alpha": 183
+      }
+    },
+    {
+      "op": "AttributeDefault",
+      "attribute": "Metallic",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#13",
+      "name": "Water Specular",
+      "value": 0.22499999403953552,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#16",
+      "name": "Water Fresnel Specular",
+      "value": 0.22499999403953552,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#19",
+      "name": "Water Fresnel  Exponenth",
+      "value": 5.0,
+      "overridden": false
+    },
+    {
+      "op": "Fresnel",
+      "output": 0,
+      "at": "WaterAttributes#5",
+      "BaseReflectFraction": 0.0,
+      "inputs": {
+        "ExponentIn": 188
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "WaterAttributes#9",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 186,
+        "B": 187,
+        "Alpha": 189
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "Water_Underside#31",
+      "name": "Critical Angle Dot",
+      "value": 0.22499999403953552,
+      "overridden": false
+    },
+    {
+      "op": "PixelNormalWS",
+      "output": 0,
+      "at": "Water_Underside#21"
+    },
+    {
+      "op": "CameraVectorWS",
+      "output": 0,
+      "at": "Water_Underside#1"
+    },
+    {
+      "op": "DotProduct",
+      "output": 0,
+      "at": "Water_Underside#4",
+      "inputs": {
+        "A": 192,
+        "B": 193
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "Water_Underside#37",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 191,
+        "B": 194
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "Water_Underside#32",
+      "name": "Critical Angle Width",
+      "value": 0.009999999776482582,
+      "overridden": false
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "Water_Underside#2",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 195,
+        "B": 196
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "Water_Underside#26",
+      "inputs": {
+        "Input": 197
+      }
+    },
+    {
+      "op": "TwoSidedSign",
+      "output": 0,
+      "at": "Water_Underside#38"
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "Water_Underside#27",
+      "inputs": {
+        "Input": 199
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#14",
+      "ConstA": 0.0,
+      "ConstB": 0.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 198,
+        "Alpha": 200
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#13",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 190,
+        "Alpha": 201
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        202
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        203
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#295",
+      "name": "Foam Specular",
+      "value": 0.5,
+      "overridden": true
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#91",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 204,
+        "B": 205,
+        "Alpha": 183
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#12",
+      "name": "Water Roughness",
+      "value": 0.019999999552965164,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#18",
+      "name": "Water Fresnel Roughness",
+      "value": 0.10000000149011612,
+      "overridden": false
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "WaterAttributes#8",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 207,
+        "B": 208,
+        "Alpha": 189
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        209
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        210
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#293",
+      "name": "Foam Roughness",
+      "value": 0.10000000149011612,
+      "overridden": true
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#90",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 211,
+        "B": 212,
+        "Alpha": 183
+      }
+    },
+    {
+      "op": "AttributeDefault",
+      "attribute": "EmissiveColor",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "WaterAttributes#2"
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#12",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 215,
+        "Alpha": 201
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        216
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        217
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#5",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 218,
+        "B": 183
+      }
+    },
+    {
+      "op": "AttributeDefault",
+      "attribute": "OpacityMask",
+      "value": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        220
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        221
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat4Components#2",
+      "G": true,
+      "inputs": {
+        "Input": 35
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#68",
+      "Code": "a > 1e-8;",
+      "OutputType": "CMOT_Float1",
+      "inputs": {
+        "Inputs[0].Input": 223
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#290",
+      "name": "Opacity",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#126",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 224,
+        "B": 225
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#67",
+      "Code": "a > 1e-8",
+      "OutputType": "CMOT_Float1",
+      "inputs": {
+        "Inputs[0].Input": 226
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#369",
+      "name": "BakedWaterSimTex"
+    },
+    {
+      "op": "TextureProperty",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#372",
+      "inputs": {
+        "TextureObject": 228
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#63",
+      "Code": "float2 UnitDx = 1./sz;\r\n\r\nif (uv.x < UnitDx.x || uv.x > 1.-UnitDx.x || uv.y < UnitDx.y || uv.y > 1.-UnitDx.y)\r\n{\r\n  return 0.;\r\n}\r\nreturn OpacityMask;",
+      "OutputType": "CMOT_Float1",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 227,
+        "Inputs[1].Input": 32,
+        "Inputs[2].Input": 229
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#48",
+      "R": 1.0
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#291",
+      "name": "UseBakedSimHack",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "WaterBodyData#59"
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "WaterBodyData#4",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 233
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterZoneData#6",
+      "name": "WaterZoneIndex",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterZoneData#1",
+      "Code": "FWaterZoneData ZoneData; ZoneData = GetWaterZoneData(WaterZoneIndex);\r\n\r\nExtent = ZoneData.Extent;\r\nHeightExtent = ZoneData.HeightExtent; \r\nGroundZMin= ZoneData.GroundZMin;\r\n\r\nreturn ZoneData.Location;",
+      "OutputType": "CMOT_Float2",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/GerstnerWaveFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 235
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 1,
+      "at": "WaterZoneData#1",
+      "Code": "FWaterZoneData ZoneData; ZoneData = GetWaterZoneData(WaterZoneIndex);\r\n\r\nExtent = ZoneData.Extent;\r\nHeightExtent = ZoneData.HeightExtent; \r\nGroundZMin= ZoneData.GroundZMin;\r\n\r\nreturn ZoneData.Location;",
+      "OutputType": "CMOT_Float2",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/GerstnerWaveFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 235
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterBodyData#15",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 237
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterBodyData#53",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 236,
+        "B": 238
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterBodyData#51",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 234,
+        "B": 239
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterBodyData#14",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 240,
+        "B": 237
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "WaterBodyData#36",
+      "inputs": {
+        "Input": 241
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "WaterBodyData#55",
+      "name": "WaterVelocityAndHeight",
+      "SamplerType": "SAMPLERTYPE_LinearColor"
+    },
+    {
+      "op": "TextureProperty",
+      "output": 0,
+      "at": "WaterBodyData#56",
+      "inputs": {
+        "TextureObject": 243
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#29",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 242,
+        "B": 244
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#36",
+      "ConstA": 1.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 245
+      }
+    },
+    {
+      "op": "Floor",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#15",
+      "inputs": {
+        "Input": 246
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#1",
+      "ConstA": 0.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 247
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#13",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 248,
+        "B": 244
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#13",
+      "Code": "GetWaterWaveParamIndex(Parameters)",
+      "OutputType": "CMOT_Float1"
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#11",
+      "Code": "return GetWaterBodyData((int)WaterBodyIndex).WaterZoneIndex;",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 250
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#10",
+      "Code": "return GetWaterInfoTextureViewIndex(WaterZoneIndex);",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 251
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#7",
+      "inputs": {
+        "A": 249,
+        "B": 252
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "WaterBodyData#5"
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#39",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 253,
+        "TextureObject": 243,
+        "MipValue": 254
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        255
+      ]
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#14",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "B": 244
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#1",
+      "R": true,
+      "inputs": {
+        "Input": 257
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#11"
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#5",
+      "inputs": {
+        "A": 258,
+        "B": 259
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#2",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 249,
+        "B": 260
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#8",
+      "inputs": {
+        "A": 261,
+        "B": 252
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#40",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 262,
+        "TextureObject": 243,
+        "MipValue": 254
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        263
+      ]
+    },
+    {
+      "op": "Frac",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#16",
+      "inputs": {
+        "Input": 246
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#1",
+      "R": true,
+      "inputs": {
+        "Input": 265
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#24",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 256,
+        "B": 264,
+        "Alpha": 266
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#2",
+      "G": true,
+      "inputs": {
+        "Input": 257
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#6",
+      "inputs": {
+        "A": 259,
+        "B": 268
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#3",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 249,
+        "B": 269
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#9",
+      "inputs": {
+        "A": 270,
+        "B": 252
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#41",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 271,
+        "TextureObject": 243,
+        "MipValue": 254
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        272
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#4",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 249,
+        "B": 257
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#10",
+      "inputs": {
+        "A": 274,
+        "B": 252
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 5,
+      "at": "HighQualityTextureFiltering#42",
+      "MipValueMode": "TMVM_MipLevel",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 275,
+        "TextureObject": 243,
+        "MipValue": 254
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        276
+      ]
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#25",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 273,
+        "B": 277,
+        "Alpha": 266
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat2Components#2",
+      "G": true,
+      "inputs": {
+        "Input": 265
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "HighQualityTextureFiltering#26",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 267,
+        "B": 278,
+        "Alpha": 279
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#9",
+      "Code": "return DecodeWaterInfoZHeight(WaterInfoSample, WaterZoneIndex);",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 280,
+        "Inputs[1].Input": 251
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "WaterBodyData#12",
+      "Code": "return DecodeWaterInfoGroundHeight(WaterInfoSample, WaterZoneIndex);",
+      "OutputType": "CMOT_Float1",
+      "IncludeFilePaths": [
+        "/Plugin/Water/Private/WaterDataFunctions.ush"
+      ],
+      "inputs": {
+        "Inputs[0].Input": 280,
+        "Inputs[1].Input": 251
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterBodyData#54",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 281,
+        "B": 282
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#305",
+      "name": "SingleRiverRendering",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#69",
+      "Code": "if (SingleRiverRendering == 0 && RenderSplineMesh > 1-1e-5 && SplineWaterDepth > 1e-5)\r\n{\r\n    return b;\r\n}\r\nelse\r\n{\r\n    return a;\r\n}",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 230,
+        "Inputs[1].Input": 231,
+        "Inputs[2].Input": 232,
+        "Inputs[3].Input": 283,
+        "Inputs[4].Input": 284
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#136",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 222,
+        "B": 285
+      }
+    },
+    {
+      "op": "PixelDepth",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#202"
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        287
+      ]
+    },
+    {
+      "op": "SceneTexture",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#319",
+      "SceneTextureId": "PPI_CustomDepth"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgba",
+      "inputs": [
+        289
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#33",
+      "R": true,
+      "inputs": {
+        "Input": 290
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#44"
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#52",
+      "R": 1.0
+    },
+    {
+      "op": "If",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#85",
+      "ConstB": 0.0,
+      "inputs": {
+        "A": 288,
+        "B": 291,
+        "AGreaterThanB": 292,
+        "AEqualsB": 292,
+        "ALessThanB": 293
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#138",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 286,
+        "B": 294
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#367",
+      "name": "NormalDetailTex"
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_TextureAdvection#52"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        297
+      ]
+    },
+    {
+      "op": "Time",
+      "output": 0,
+      "at": "MF_TextureAdvection#50"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#278",
+      "name": "WaveSpeed",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_TextureAdvection#1"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#309",
+      "name": "BakedWaterSimDx",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#382",
+      "name": "BakedWaterSimSize",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "overridden": false
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        303
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#274",
+      "name": "WPOWaveScale",
+      "value": 0.0005000000237487257,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#306",
+      "name": "PulseLength",
+      "value": 2.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#310",
+      "name": "WPOWaveMIPBias",
+      "value": 2.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#308",
+      "name": "BracketAngleDelta",
+      "value": 20.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#307",
+      "name": "BracketMagnitudeDelta",
+      "value": 70.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_TextureAdvection#5",
+      "Code": "const float2 UV = WorldPosition.xy;\r\n\r\n// includes the advection speed scale, which can be spatially varying and is split out for mip calculation\r\nfloat2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nconst float3 FullScaledVelocity3D = float3(FullScaledVelocity, 0);\r\nconst float3 VelocityInPlane = FullScaledVelocity3D - dot(FullScaledVelocity3D, SimNormal) * SimNormal;\r\n\r\n//const float3 PlaneAxisU = -normalize(cross(SimNormal, normalize(float3(0,1,0))));\r\n//const float3 PlaneAxisV = normalize(cross(SimNormal, PlaneAxisU));\r\n//const float2 ProjectedVelocity = float2(dot(VelocityInPlane, PlaneAxisU), dot(VelocityInPlane, PlaneAxisV));\r\n\r\nFullScaledVelocity = VelocityInPlane.xy;\r\n\r\n// bracket velocity based on angle\r\nfloat2 VelocityDir0;\r\nfloat2 VelocityDir1;\r\nfloat VelocityBlendAlpha;\r\nBracketAngle(FullScaledVelocity, BracketAngleDelta, VelocityDir0, VelocityDir1, VelocityBlendAlpha);\r\n\r\n// bracket velocity based on magnitude\r\nfloat VelocityMagnitude = length(FullScaledVelocity);\r\nfloat VelocityMagnitude0;\r\nfloat VelocityMagnitude1;\r\nfloat VelocityMagnitudeBlendAlpha;\r\nBracketValue(VelocityMagnitude, BracketMagnitudeDelta, VelocityMagnitude0, VelocityMagnitude1, VelocityMagnitudeBlendAlpha);\r\n\r\n// store all combinations of bracketed velocity dir and magnitude\r\nfloat2 Velocities[4];\r\nVelocities[0] = VelocityDir0 * VelocityMagnitude0;\r\nVelocities[1] = VelocityDir0 * VelocityMagnitude1; \r\nVelocities[2] = VelocityDir1 * VelocityMagnitude0; \r\nVelocities[3] = VelocityDir1 * VelocityMagnitude1;\r\n\r\n// compute phases\r\nfloat lerp0, lerp1, lerp2, t0, t1, t2;\r\nfloat3 CycleCount;\r\nCompute3Phases(PulseLength, Time, lerp0, lerp1, lerp2, t0, t1, t2, CycleCount);\r\n\r\n// compute advected uv based for two phases based on original velocity\r\nfloat2 AdvectedUV0 = UV - Velocity.xy * t0;\r\nfloat2 AdvectedUV1 = UV - Velocity.xy * t1;\r\nfloat2 AdvectedUV2 = UV - Velocity.xy * t2;\r\n\r\n// scale advected uvs\r\nfloat2 uv0 = AdvectedUV0 * AdvectedTextureScale;\r\nfloat2 uv1 = AdvectedUV1 * AdvectedTextureScale;\r\nfloat2 uv2 = AdvectedUV2 * AdvectedTextureScale;\r\n\r\n// compute mip levels based on the uv from advecting the original velocity\r\n// this avoids seams when mip mapping because of disncontinuities in the bracketed velocities\r\nfloat2 TexDims;\r\nfloat Levels;\r\nTex.GetDimensions(0, TexDims.x, TexDims.y, Levels);\r\n\r\nfloat3 MipLevels;\r\n\r\n#if VERTEXSHADER\r\n    MipLevels = TheMipBias;\r\n#else\r\n    MipLevels.x = ComputeMipLevel(uv0, TexDims);\r\n    MipLevels.y = ComputeMipLevel(uv1, TexDims);\r\n    MipLevels.z = ComputeMipLevel(uv2, TexDims);\r\n    MipLevels = clamp(MipLevels + TheMipBias, 0, Levels);\r\n#endif\r\n\r\n// perform two phase advection for each of the bracketed velocities and interpolate\r\nfloat4 TextureSamples[4];\r\nfor (int i = 0; i < 4; ++i)\r\n{\r\n    TextureSamples[i] = AdvectionInterpolation3(UV, Velocities[i], t0, t1, t2, lerp0, lerp1, lerp2, AdvectedTextureScale, MipLevels, Tex, TexSampler, CycleCount);\r\n}\r\n\r\n// interpolate samples based on bracketing\r\nfloat4 Sample0 = lerp(TextureSamples[0], TextureSamples[1], VelocityMagnitudeBlendAlpha);\r\nfloat4 Sample1 = lerp(TextureSamples[2], TextureSamples[3], VelocityMagnitudeBlendAlpha);\r\n\r\nreturn lerp(Sample0, Sample1, VelocityBlendAlpha);",
+      "OutputType": "CMOT_Float4",
+      "IncludeFilePaths": [
+        "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+      ],
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 296,
+        "Inputs[1].Input": 298,
+        "Inputs[2].Input": 299,
+        "Inputs[3].Input": 300,
+        "Inputs[4].Input": 40,
+        "Inputs[5].Input": 301,
+        "Inputs[6].Input": 302,
+        "Inputs[7].Input": 302,
+        "Inputs[8].Input": 304,
+        "Inputs[9].Input": 305,
+        "Inputs[10].Input": 306,
+        "Inputs[11].Input": 307,
+        "Inputs[12].Input": 308,
+        "Inputs[13].Input": 309,
+        "Inputs[14].Input": 301,
+        "Inputs[15].Input": 166
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#28",
+      "R": true,
+      "G": true,
+      "B": true,
+      "inputs": {
+        "Input": 310
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_BlendNormals#1",
+      "Code": "// https://blog.selfshadow.com/publications/blending-in-detail/\r\n\r\nfloat a = 1/(1 + n1.z);\r\nfloat b = -n1.x*n1.y*a;\r\n\r\n// Form a basis\r\nfloat3 b1 = float3(1 - n1.x*n1.x*a, b, -n1.x);\r\nfloat3 b2 = float3(b, 1 - n1.y*n1.y*a, -n1.y);\r\nfloat3 b3 = n1;\r\n\r\nif (n1.z < -0.9999999) // Handle the singularity\r\n{\r\n    b1 = float3( 0, -1, 0);\r\n    b2 = float3(-1,  0, 0);\r\n}\r\n\r\n// Rotate n2 via the basis\r\nreturn n2.x*b1 + n2.y*b2 + n2.z*b3;",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 166,
+        "Inputs[1].Input": 311
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#257",
+      "name": "LowVelocityWPOWaveScale",
+      "value": 0.10000000149011612,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#268",
+      "name": "WPOWaveAttenMin",
+      "value": 0.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#311",
+      "name": "WPOWaveAttenMax",
+      "value": 400.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#313",
+      "name": "WPOWaveHeightMult",
+      "value": 5.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#65",
+      "Code": "lerp(1, smoothstep(WaveAttenuationMin, WaveAttenuationMax, vmag), 1. - saturate(lvws));",
+      "OutputType": "CMOT_Float1",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 43,
+        "Inputs[1].Input": 313,
+        "Inputs[2].Input": 314,
+        "Inputs[3].Input": 315,
+        "Inputs[4].Input": 316
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#314",
+      "name": "LowVelocityWPOWaveAttenuationPower",
+      "value": 3.0,
+      "overridden": true
+    },
+    {
+      "op": "Power",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#207",
+      "ConstExponent": 2.0,
+      "inputs": {
+        "Base": 317,
+        "Exponent": 318
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#137",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 319,
+        "B": 316
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#251",
+      "inputs": {
+        "Input": 320
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#86",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 166,
+        "B": 312,
+        "Alpha": 321
+      }
+    },
+    {
+      "op": "TextureObjectParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#366",
+      "name": "NormalDetailTex"
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_TextureAdvection#52"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        324
+      ]
+    },
+    {
+      "op": "Time",
+      "output": 0,
+      "at": "MF_TextureAdvection#50"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#266",
+      "name": "WaveSpeed",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_TextureAdvection#1"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#286",
+      "name": "BakedWaterSimDx",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "VectorParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#381",
+      "name": "BakedWaterSimSize",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "overridden": false
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        330
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#316",
+      "name": "NormalTextureScale",
+      "value": 0.0005000000237487257,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#283",
+      "name": "PulseLength",
+      "value": 2.0,
+      "overridden": true
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#49"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#285",
+      "name": "BracketAngleDelta",
+      "value": 20.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#284",
+      "name": "BracketMagnitudeDelta",
+      "value": 70.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_TextureAdvection#5",
+      "Code": "const float2 UV = WorldPosition.xy;\r\n\r\n// includes the advection speed scale, which can be spatially varying and is split out for mip calculation\r\nfloat2 FullScaledVelocity = Velocity.xy * Speed;\r\n\r\nconst float3 FullScaledVelocity3D = float3(FullScaledVelocity, 0);\r\nconst float3 VelocityInPlane = FullScaledVelocity3D - dot(FullScaledVelocity3D, SimNormal) * SimNormal;\r\n\r\n//const float3 PlaneAxisU = -normalize(cross(SimNormal, normalize(float3(0,1,0))));\r\n//const float3 PlaneAxisV = normalize(cross(SimNormal, PlaneAxisU));\r\n//const float2 ProjectedVelocity = float2(dot(VelocityInPlane, PlaneAxisU), dot(VelocityInPlane, PlaneAxisV));\r\n\r\nFullScaledVelocity = VelocityInPlane.xy;\r\n\r\n// bracket velocity based on angle\r\nfloat2 VelocityDir0;\r\nfloat2 VelocityDir1;\r\nfloat VelocityBlendAlpha;\r\nBracketAngle(FullScaledVelocity, BracketAngleDelta, VelocityDir0, VelocityDir1, VelocityBlendAlpha);\r\n\r\n// bracket velocity based on magnitude\r\nfloat VelocityMagnitude = length(FullScaledVelocity);\r\nfloat VelocityMagnitude0;\r\nfloat VelocityMagnitude1;\r\nfloat VelocityMagnitudeBlendAlpha;\r\nBracketValue(VelocityMagnitude, BracketMagnitudeDelta, VelocityMagnitude0, VelocityMagnitude1, VelocityMagnitudeBlendAlpha);\r\n\r\n// store all combinations of bracketed velocity dir and magnitude\r\nfloat2 Velocities[4];\r\nVelocities[0] = VelocityDir0 * VelocityMagnitude0;\r\nVelocities[1] = VelocityDir0 * VelocityMagnitude1; \r\nVelocities[2] = VelocityDir1 * VelocityMagnitude0; \r\nVelocities[3] = VelocityDir1 * VelocityMagnitude1;\r\n\r\n// compute phases\r\nfloat lerp0, lerp1, lerp2, t0, t1, t2;\r\nfloat3 CycleCount;\r\nCompute3Phases(PulseLength, Time, lerp0, lerp1, lerp2, t0, t1, t2, CycleCount);\r\n\r\n// compute advected uv based for two phases based on original velocity\r\nfloat2 AdvectedUV0 = UV - Velocity.xy * t0;\r\nfloat2 AdvectedUV1 = UV - Velocity.xy * t1;\r\nfloat2 AdvectedUV2 = UV - Velocity.xy * t2;\r\n\r\n// scale advected uvs\r\nfloat2 uv0 = AdvectedUV0 * AdvectedTextureScale;\r\nfloat2 uv1 = AdvectedUV1 * AdvectedTextureScale;\r\nfloat2 uv2 = AdvectedUV2 * AdvectedTextureScale;\r\n\r\n// compute mip levels based on the uv from advecting the original velocity\r\n// this avoids seams when mip mapping because of disncontinuities in the bracketed velocities\r\nfloat2 TexDims;\r\nfloat Levels;\r\nTex.GetDimensions(0, TexDims.x, TexDims.y, Levels);\r\n\r\nfloat3 MipLevels;\r\n\r\n#if VERTEXSHADER\r\n    MipLevels = TheMipBias;\r\n#else\r\n    MipLevels.x = ComputeMipLevel(uv0, TexDims);\r\n    MipLevels.y = ComputeMipLevel(uv1, TexDims);\r\n    MipLevels.z = ComputeMipLevel(uv2, TexDims);\r\n    MipLevels = clamp(MipLevels + TheMipBias, 0, Levels);\r\n#endif\r\n\r\n// perform two phase advection for each of the bracketed velocities and interpolate\r\nfloat4 TextureSamples[4];\r\nfor (int i = 0; i < 4; ++i)\r\n{\r\n    TextureSamples[i] = AdvectionInterpolation3(UV, Velocities[i], t0, t1, t2, lerp0, lerp1, lerp2, AdvectedTextureScale, MipLevels, Tex, TexSampler, CycleCount);\r\n}\r\n\r\n// interpolate samples based on bracketing\r\nfloat4 Sample0 = lerp(TextureSamples[0], TextureSamples[1], VelocityMagnitudeBlendAlpha);\r\nfloat4 Sample1 = lerp(TextureSamples[2], TextureSamples[3], VelocityMagnitudeBlendAlpha);\r\n\r\nreturn lerp(Sample0, Sample1, VelocityBlendAlpha);",
+      "OutputType": "CMOT_Float4",
+      "IncludeFilePaths": [
+        "/Plugin/Experimental/WaterAdvanced/WaterAdvanced.ush"
+      ],
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 323,
+        "Inputs[1].Input": 325,
+        "Inputs[2].Input": 326,
+        "Inputs[3].Input": 327,
+        "Inputs[4].Input": 40,
+        "Inputs[5].Input": 328,
+        "Inputs[6].Input": 329,
+        "Inputs[7].Input": 329,
+        "Inputs[8].Input": 331,
+        "Inputs[9].Input": 332,
+        "Inputs[10].Input": 333,
+        "Inputs[11].Input": 334,
+        "Inputs[12].Input": 335,
+        "Inputs[13].Input": 336,
+        "Inputs[14].Input": 328,
+        "Inputs[15].Input": 166
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#29",
+      "R": true,
+      "G": true,
+      "B": true,
+      "inputs": {
+        "Input": 337
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_BlendNormals#1",
+      "Code": "// https://blog.selfshadow.com/publications/blending-in-detail/\r\n\r\nfloat a = 1/(1 + n1.z);\r\nfloat b = -n1.x*n1.y*a;\r\n\r\n// Form a basis\r\nfloat3 b1 = float3(1 - n1.x*n1.x*a, b, -n1.x);\r\nfloat3 b2 = float3(b, 1 - n1.y*n1.y*a, -n1.y);\r\nfloat3 b3 = n1;\r\n\r\nif (n1.z < -0.9999999) // Handle the singularity\r\n{\r\n    b1 = float3( 0, -1, 0);\r\n    b2 = float3(-1,  0, 0);\r\n}\r\n\r\n// Rotate n2 via the basis\r\nreturn n2.x*b1 + n2.y*b2 + n2.z*b3;",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 322,
+        "Inputs[1].Input": 338
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#258",
+      "name": "LowVelocityWaveScale",
+      "value": 0.10000000149011612,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#259",
+      "name": "WaveAttenMin",
+      "value": 0.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#260",
+      "name": "WaveAttenMax",
+      "value": 200.0,
+      "overridden": true
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#267",
+      "name": "WaveAmount",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#60",
+      "Code": "lerp(1, smoothstep(WaveAttenuationMin, WaveAttenuationMax, vmag), 1. - saturate(lvws)) * WaveScale;",
+      "OutputType": "CMOT_Float1",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 43,
+        "Inputs[1].Input": 340,
+        "Inputs[2].Input": 341,
+        "Inputs[3].Input": 342,
+        "Inputs[4].Input": 343
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#255",
+      "inputs": {
+        "Input": 344
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#87",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 322,
+        "B": 339,
+        "Alpha": 345
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#32",
+      "R": true,
+      "G": true,
+      "B": true,
+      "inputs": {
+        "Input": 167
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "FlattenNormal#1",
+      "Constant": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#301",
+      "name": "Foam Normal Flatness",
+      "value": 0.30000001192092896,
+      "overridden": true
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "FlattenNormal#5",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 347,
+        "B": 348,
+        "Alpha": 349
+      }
+    },
+    {
+      "op": "Normalize",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#199",
+      "inputs": {
+        "VectorInput": 350
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_BlendNormals#1",
+      "Code": "// https://blog.selfshadow.com/publications/blending-in-detail/\r\n\r\nfloat a = 1/(1 + n1.z);\r\nfloat b = -n1.x*n1.y*a;\r\n\r\n// Form a basis\r\nfloat3 b1 = float3(1 - n1.x*n1.x*a, b, -n1.x);\r\nfloat3 b2 = float3(b, 1 - n1.y*n1.y*a, -n1.y);\r\nfloat3 b3 = n1;\r\n\r\nif (n1.z < -0.9999999) // Handle the singularity\r\n{\r\n    b1 = float3( 0, -1, 0);\r\n    b2 = float3(-1,  0, 0);\r\n}\r\n\r\n// Rotate n2 via the basis\r\nreturn n2.x*b1 + n2.y*b2 + n2.z*b3;",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 322,
+        "Inputs[1].Input": 351
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#318",
+      "name": "FoamOpacity",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#134",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 352,
+        "B": 353
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#92",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 346,
+        "B": 354,
+        "Alpha": 181
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#70",
+      "Code": "if (OpacityMask < 1e-8)\r\n{\r\n    return float3(0,0,0);\r\n}\r\nelse\r\n{\r\n    return Normal;\r\n}",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 230,
+        "Inputs[1].Input": 355
+      }
+    },
+    {
+      "op": "DotProduct",
+      "output": 0,
+      "at": "SafeNormalize#8",
+      "inputs": {
+        "A": 356,
+        "B": 356
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SafeNormalize#7",
+      "R": 9.999999974752427e-07
+    },
+    {
+      "op": "Normalize",
+      "output": 0,
+      "at": "SafeNormalize#14",
+      "inputs": {
+        "VectorInput": 356
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SafeNormalize#5"
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "SafeNormalize#1",
+      "inputs": {
+        "A": 359,
+        "B": 360
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#57",
+      "Constant": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        362
+      ]
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SafeNormalize#6",
+      "R": 1.0
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "SafeNormalize#2",
+      "inputs": {
+        "A": 363,
+        "B": 364
+      }
+    },
+    {
+      "op": "If",
+      "output": 0,
+      "at": "SafeNormalize#13",
+      "ConstB": 0.0,
+      "inputs": {
+        "A": 357,
+        "B": 358,
+        "AGreaterThanB": 361,
+        "AEqualsB": 365,
+        "ALessThanB": 365
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "SafeNormalize#3",
+      "R": true,
+      "G": true,
+      "B": true,
+      "inputs": {
+        "Input": 366
+      }
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#31",
+      "WorldPositionShaderOffset": "WPT_ExcludeAllShaderOffsets"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        368
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#4",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 369
+      }
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#3",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "SimLocation",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#5",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 371
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#9",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 370,
+        "B": 372
+      }
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#2",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "FluidSimSize",
+      "value": 2048.0
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#6",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 373,
+        "B": 374
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "Fluidsim_WorldPosition_to_UV#1",
+      "ConstA": 0.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 375
+      }
+    },
+    {
+      "op": "TextureSampleParameter2D",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#30",
+      "name": "NormalAndHeight",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 376
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        377
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#7",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 378
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#28",
+      "name": "Ripple  Normal Strength",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#16",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 379,
+        "B": 380
+      }
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#8"
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#4",
+      "inputs": {
+        "A": 381,
+        "B": 382
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#1",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 367,
+        "B": 383
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#14",
+      "name": "Refraction",
+      "value": 1.149999976158142,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#17",
+      "name": "Refraction Far",
+      "value": 1.0199999809265137,
+      "overridden": false
+    },
+    {
+      "op": "PixelDepth",
+      "output": 0,
+      "at": "WaterAttributes#10"
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        387
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterAttributes#15",
+      "name": "Depth for Min Refraction",
+      "value": 5000.0,
+      "overridden": false
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterAttributes#3",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 388,
+        "B": 389
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "WaterAttributes#11",
+      "inputs": {
+        "Input": 390
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "WaterAttributes#7",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 385,
+        "B": 386,
+        "Alpha": 391
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "Water_Underside#33",
+      "name": "Refraction Bottom Amount",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#16",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "B": 392,
+        "Alpha": 393
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "Water_Underside#35",
+      "name": "Lip Refraction",
+      "value": 0.949999988079071,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "Water_Underside#34",
+      "name": "Critical Angle Bend Width",
+      "value": -0.75,
+      "overridden": false
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "Water_Underside#3",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 195,
+        "B": 396
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "Water_Underside#29",
+      "inputs": {
+        "Input": 397
+      }
+    },
+    {
+      "op": "OneMinus",
+      "output": 0,
+      "at": "Water_Underside#20",
+      "inputs": {
+        "Input": 398
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#17",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 394,
+        "B": 395,
+        "Alpha": 399
+      }
+    },
+    {
+      "op": "TwoSidedSign",
+      "output": 0,
+      "at": "Water_Underside#40"
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "Water_Underside#28",
+      "inputs": {
+        "Input": 401
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "Water_Underside#15",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 400,
+        "B": 392,
+        "Alpha": 402
+      }
+    },
+    {
+      "op": "AttributeDefault",
+      "attribute": "PixelDepthOffset",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Constant",
+      "output": 0,
+      "at": "SW_Water_Material#15"
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "WaterTextureSurface#66",
+      "WorldPositionShaderOffset": "WPT_ExcludeAllShaderOffsets"
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterTextureSurface#49",
+      "name": "Default Near Water Scale",
+      "value": 512.0,
+      "overridden": false
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterTextureSurface#50",
+      "name": "Default Distant Water Scale",
+      "value": 3500.0,
+      "overridden": false
+    },
+    {
+      "op": "PixelDepth",
+      "output": 0,
+      "at": "WaterTextureSurface#40"
+    },
+    {
+      "op": "Mask",
+      "channels": "r",
+      "inputs": [
+        409
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterTextureSurface#56",
+      "name": "Water Distant Normal Offset",
+      "value": 5000.0,
+      "overridden": false
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterTextureSurface#63",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 410,
+        "B": 411
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterTextureSurface#57",
+      "name": "Water Distant Normal Length",
+      "value": 10000.0,
+      "overridden": false
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterTextureSurface#15",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 412,
+        "B": 413
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "WaterTextureSurface#46",
+      "inputs": {
+        "Input": 414
+      }
+    },
+    {
+      "op": "Ceil",
+      "output": 0,
+      "at": "WaterTextureSurface#4",
+      "inputs": {
+        "Input": 415
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "WaterTextureSurface#47",
+      "inputs": {
+        "Input": 416
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "WaterTextureSurface#31",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 407,
+        "B": 408,
+        "Alpha": 417
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterTextureSurface#13",
+      "ConstA": 1.0,
+      "ConstB": 2.0,
+      "inputs": {
+        "A": 406,
+        "B": 418
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "WaterTextureSurface#7",
+      "R": true,
+      "G": true,
+      "inputs": {
+        "Input": 419
+      }
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "GetWaterTime#4",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "Time",
+      "value": 0.0
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "GetWaterTime#3",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "PrevTime",
+      "value": 0.0
+    },
+    {
+      "op": "PreviousFrameSwitch",
+      "output": 0,
+      "at": "GetWaterTime#7",
+      "inputs": {
+        "CurrentFrame": 421,
+        "PreviousFrame": 422
+      }
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "GetWaterTime#2",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "ManualTime",
+      "value": 0.0
+    },
+    {
+      "op": "CollectionParameter",
+      "output": 0,
+      "at": "GetWaterTime#1",
+      "collection": "/Water/Materials/MPC/MPC_Water",
+      "name": "FreezeTime",
+      "value": 0.0
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "GetWaterTime#6",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 423,
+        "B": 424,
+        "Alpha": 425
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "WaterTextureSurface#51",
+      "name": "Default Disant Water Speed",
+      "value": 0.75,
+      "overridden": false
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "TimeWithSpeedVariable#6",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 426,
+        "B": 427
+      }
+    },
+    {
+      "op": "Panner",
+      "output": 0,
+      "at": "WaterTextureWaves#21",
+      "SpeedX": 0.10000000149011612,
+      "SpeedY": 0.10000000149011612,
+      "inputs": {
+        "Coordinate": 420,
+        "Time": 428
+      }
+    },
+    {
+      "op": "TextureObject",
+      "output": 0,
+      "at": "WaterTextureSurface#64",
+      "SamplerType": "SAMPLERTYPE_LinearColor"
+    },
+    {
+      "op": "TextureSample",
+      "output": 0,
+      "at": "WaterTextureWaves#28",
+      "inputs": {
+        "Coordinates": 429,
+        "TextureObject": 430
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        431
+      ]
+    },
+    {
+      "op": "Constant2Vector",
+      "output": 0,
+      "at": "WaterTextureWaves#7",
+      "R": 0.4180999994277954,
+      "G": 0.3547999858856201
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "WaterTextureWaves#1",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 420,
+        "B": 433
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterTextureWaves#10",
+      "ConstA": 1.0,
+      "ConstB": 1.6180000305175781,
+      "inputs": {
+        "A": 434
+      }
+    },
+    {
+      "op": "Panner",
+      "output": 0,
+      "at": "WaterTextureWaves#22",
+      "SpeedX": -0.10000000149011612,
+      "SpeedY": -0.10000000149011612,
+      "inputs": {
+        "Coordinate": 435,
+        "Time": 428
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 0,
+      "at": "WaterTextureWaves#29",
+      "inputs": {
+        "Coordinates": 436,
+        "TextureObject": 430
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        437
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "WaterTextureWaves#4",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 432,
+        "B": 438
+      }
+    },
+    {
+      "op": "Constant2Vector",
+      "output": 0,
+      "at": "WaterTextureWaves#8",
+      "R": 0.864861011505127,
+      "G": 0.1483840048313141
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "WaterTextureWaves#2",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 420,
+        "B": 440
+      }
+    },
+    {
+      "op": "Divide",
+      "output": 0,
+      "at": "WaterTextureWaves#11",
+      "ConstA": 1.0,
+      "ConstB": 1.2360939979553223,
+      "inputs": {
+        "A": 441
+      }
+    },
+    {
+      "op": "Panner",
+      "output": 0,
+      "at": "WaterTextureWaves#23",
+      "SpeedX": -0.10000000149011612,
+      "SpeedY": 0.10000000149011612,
+      "inputs": {
+        "Coordinate": 442,
+        "Time": 428
+      }
+    },
+    {
+      "op": "TextureSample",
+      "output": 0,
+      "at": "WaterTextureWaves#30",
+      "inputs": {
+        "Coordinates": 443,
+        "TextureObject": 430
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        444
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "WaterTextureWaves#6",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 439,
+        "B": 445
+      }
+    },
+    {
+      "op": "Constant",
+      "input": "Divisor",
+      "value": [
+        0.33333298563957214,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterTextureWaves#20",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 446,
+        "B": 447
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "WaterTextureSurface#8",
+      "B": true,
+      "inputs": {
+        "Input": 448
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "WaterTextureSurface#62",
+      "ConstA": 1.0,
+      "ConstB": 0.5,
+      "inputs": {
+        "A": 449
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterTextureSurface#36",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 450,
+        "B": 415
+      }
+    },
+    {
+      "op": "Constant",
+      "input": "Far Displacement",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterTextureSurface#37",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 451,
+        "B": 452
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "WaterTextureSurface#12",
+      "Constant": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "WaterTextureSurface#38",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 453,
+        "B": 454
+      }
+    },
+    {
+      "op": "LinearInterpolate",
+      "output": 0,
+      "at": "WaterTextureSurface#33",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "ConstAlpha": 0.5,
+      "inputs": {
+        "A": 405,
+        "B": 455,
+        "Alpha": 415
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        456
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        457
+      ]
+    },
+    {
+      "op": "Constant",
+      "input": "X",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Constant",
+      "input": "Y",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#1",
+      "inputs": {
+        "A": 459,
+        "B": 460
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#38",
+      "A": true,
+      "inputs": {
+        "Input": 310
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#122",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 462,
+        "B": 320
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#288",
+      "name": "AdvectedWPOWaveCameraFalloff",
+      "value": 200.0,
+      "overridden": false
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#6",
+      "ConstA": 0.0,
+      "ConstB": 50.0,
+      "inputs": {
+        "A": 464
+      }
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#387"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        466
+      ]
+    },
+    {
+      "op": "CameraPositionWS",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#9"
+    },
+    {
+      "op": "Distance",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#74",
+      "inputs": {
+        "A": 467,
+        "B": 468
+      }
+    },
+    {
+      "op": "SmoothStep",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#322",
+      "ConstMin": 200.0,
+      "ConstMax": 300.0,
+      "ConstValue": 0.0,
+      "inputs": {
+        "Min": 464,
+        "Max": 465,
+        "Value": 469
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#118",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 463,
+        "B": 470
+      }
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "BreakOutFloat4Components#1",
+      "R": true,
+      "inputs": {
+        "Input": 35
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#2",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 471,
+        "B": 472
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#2",
+      "inputs": {
+        "A": 461,
+        "B": 473
+      }
+    },
+    {
+      "op": "Transform",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#376",
+      "TransformSourceType": "TRANSFORMSOURCE_Local",
+      "inputs": {
+        "Input": 474
+      }
+    },
+    {
+      "op": "Constant",
+      "input": "X",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Constant",
+      "input": "Y",
+      "value": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#1",
+      "inputs": {
+        "A": 476,
+        "B": 477
+      }
+    },
+    {
+      "op": "DoubleVectorParameter",
+      "output": 3,
+      "at": "MF_ShallowWaterRiver#79"
+    },
+    {
+      "op": "Mask",
+      "channels": "b",
+      "inputs": [
+        479
+      ]
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#1",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 473,
+        "B": 480
+      }
+    },
+    {
+      "op": "WorldPosition",
+      "output": 2,
+      "at": "MF_ShallowWaterRiver#386"
+    },
+    {
+      "op": "Mask",
+      "channels": "b",
+      "inputs": [
+        482
+      ]
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#351",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 481,
+        "B": 483
+      }
+    },
+    {
+      "op": "AppendVector",
+      "output": 0,
+      "at": "MakeFloat3#2",
+      "inputs": {
+        "A": 478,
+        "B": 484
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#287",
+      "name": "UseBakedSimHack",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#64",
+      "Code": "if (RenderSplineMesh > 1-1e-5)\r\n{\r\n    return b;\r\n}\r\nelse\r\n{\r\n    return a;\r\n}",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 475,
+        "Inputs[1].Input": 485,
+        "Inputs[2].Input": 486
+      }
+    },
+    {
+      "op": "DeltaTime",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#72"
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#123",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 40,
+        "B": 488
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#275",
+      "name": "PreviousFrameVelocityMult",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#124",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 489,
+        "B": 490
+      }
+    },
+    {
+      "op": "Saturate",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#247",
+      "inputs": {
+        "Input": 344
+      }
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#119",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 491,
+        "B": 492
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#317",
+      "name": "WaveSpeed",
+      "value": 1.0,
+      "overridden": true
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#135",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 493,
+        "B": 494
+      }
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#71",
+      "Code": "return v - dot(v,n) * n;",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 495,
+        "Inputs[1].Input": 166
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#350",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 487,
+        "B": 496
+      }
+    },
+    {
+      "op": "PreviousFrameSwitch",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#208",
+      "inputs": {
+        "CurrentFrame": 487,
+        "PreviousFrame": 497
+      }
+    },
+    {
+      "op": "WorldPosition",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#385"
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        499
+      ]
+    },
+    {
+      "op": "ComponentMask",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#42",
+      "B": true,
+      "inputs": {
+        "Input": 500
+      }
+    },
+    {
+      "op": "Subtract",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#352",
+      "ConstA": 1.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 281,
+        "B": 501
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#54",
+      "Constant": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Mask",
+      "channels": "rgb",
+      "inputs": [
+        503
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#125",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 502,
+        "B": 504
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#263",
+      "name": "UseBakedSimHack",
+      "value": 0.0,
+      "overridden": false
+    },
+    {
+      "op": "Custom",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#66",
+      "Code": "if (Opacity < 1e-8 && RenderSplineMesh > 1-1e-5 && SplineWaterDepth > 1e-5 && 0)\r\n{\r\n    return WPO_Spline;\r\n}\r\nelse\r\n{\r\n    return WPO_Sim;\r\n}",
+      "ShowCode": true,
+      "inputs": {
+        "Inputs[0].Input": 498,
+        "Inputs[1].Input": 505,
+        "Inputs[2].Input": 230,
+        "Inputs[3].Input": 506,
+        "Inputs[4].Input": 283
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_ShallowWaterRiver#4",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 458,
+        "B": 507
+      }
+    },
+    {
+      "op": "TextureSampleParameter2D",
+      "output": 3,
+      "at": "MF_SampleInteractiveSim#30",
+      "name": "NormalAndHeight",
+      "SamplerType": "SAMPLERTYPE_LinearColor",
+      "inputs": {
+        "Coordinates": 376
+      }
+    },
+    {
+      "op": "Mask",
+      "channels": "b",
+      "inputs": [
+        509
+      ]
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#26",
+      "name": "Ripple Displacement Multiplier",
+      "value": 1.0,
+      "overridden": false
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#17",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 510,
+        "B": 511
+      }
+    },
+    {
+      "op": "ScalarParameter",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#27",
+      "name": "Max Ripple Displacement",
+      "value": 1024.0,
+      "overridden": false
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#18",
+      "ConstA": 0.0,
+      "ConstB": -1.0,
+      "inputs": {
+        "A": 513
+      }
+    },
+    {
+      "op": "Clamp",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#5",
+      "inputs": {
+        "Input": 512,
+        "Min": 514,
+        "Max": 513
+      }
+    },
+    {
+      "op": "Constant3Vector",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#9",
+      "Constant": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "op": "Multiply",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#15",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 515,
+        "B": 516
+      }
+    },
+    {
+      "op": "Add",
+      "output": 0,
+      "at": "MF_SampleInteractiveSim#2",
+      "ConstA": 0.0,
+      "ConstB": 1.0,
+      "inputs": {
+        "A": 508,
+        "B": 517
+      }
+    }
+  ],
+  "sources": {
+    "Engine/Source/Runtime/Engine/Private/Materials/MaterialAttributeDefinitionMap.cpp": "4ad9cabd38cf3c9982770669d331d1ee2bd83b2c97d8c71de37edcc5abcd5a7c",
+    "/WaterAdvanced/Niagara/Materials/SW_Water_Material_River": "6b36cf205664b25d57a8c60dc089b10d2635539c5efa6dee3c485c882ca18fba",
+    "/WaterAdvanced/Niagara/Materials/SW_Water_Material_River_Niagara": "8a493b7ff9b846f2bfd9b13741961672687188950f5858336a3e50d89a5bc296",
+    "/WaterAdvanced/Niagara/Materials/SW_Water_Material": "744ff97ceb4f030ba88186bf3269c0562583ff7333ca7c99baf36fa831728b66",
+    "/Water/Materials/Functions/WaterCoefficientMask": "23d3bc53a605a17b71197982ca69dee1051f8e0ddb8b9a9eb145b3cddb60fd36",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionMultiply.h": "62515b50ab7489bb0da1d7e20b23f194e271b9bf6050282327408819fddb4bc0",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionConstant.h": "dfda49018a4251d0a8a2f2ec29046e192e802fd04ae91e5d8ef532e73f2a6ddb",
+    "/Water/Materials/Functions/Water_Underside": "407baacd3be71f31f0315691c36ce037ad8f45711c3bbebb1d2b530a30b01ddd",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDivide.h": "eb19c4aadef79ebd5423e6261ce7ca4a6c159285f484729fda49203a2e1c05d3",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionAdd.h": "a72c2310951bcd7488c62856eccf173ac2997995f6a59737f76eba2e2011782c",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionVectorParameter.h": "cc97f37791b7659c0d446f76f9660126cee5fe7fe9b3875f28046fb7d7f3c6cb",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_ShallowWaterBlendTransition": "9a5df63df06d7fd445ccc45b559927fde79398ec69d5d7a1837c6ac390dcd4f1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionLinearInterpolate.h": "37de96a57aed02c8365e1102a2d5db8699279382e12115d2464d01d405868c62",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_ShallowWaterRiver": "b6bd65173ab4079a3c15cd99d43e3cc54d637731f10dc2052096dc2cb0cf4d6b",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionConstant3Vector.h": "b46af647bb1dafc9e14f7666eb4a67a45c2f8b5c1b2084e5b6fc191141379832",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionMax.h": "db263dd6ce8dda49a9ce090f92ce9f52f854d86dad812d1e53706ca091469be3",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionSmoothStep.h": "381c260a0d3fefd11c46ce5c8d6f370d2f0e7f43dd2893a1da1ec54f216a7472",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionScalarParameter.h": "1a954544fbe007fd77f01999680815c9f601b3f5201a28131d8bb00dc41c4caa",
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/VectorLength": "34b387bb7542857e0430344f2f2afda24f74f1101bbbc733229254f9b9369fdb",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDistance.h": "5742677b773366bc072cda4db4580885649162119fe5fe0f7e3c7a076668ddd2",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionComponentMask.h": "2e0cb9fef3476c3b93bdd4680bf043a7cd61a6c11eb123325e99cb7567073762",
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/MakeFloat3": "2a6545af56b7c8372148b6676cf6143354ff61a2d53f6633ff8ff30b4bd6b23f",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionAppendVector.h": "a94e6315896783da94433bc55dba98d07cb10f46a9875f4f1444f36d095c2556",
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/BreakOutFloat4Components": "60266027a39025c3e02940fcdcf3d5ae37648559150453e07210a8e8cae0df1a",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_ShallowWaterRiver_BilinearInterp": "4ff3ce9f65a41e77a31e81a5a2c3e33fb19e019fd26ec9a09350dd91a5027a17",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionCustom.h": "4e48ef82e9fb2fffe3734096aa6f104f43754737d68143af6b480997c150ca7d",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureCoordinate.h": "1ecb631f8065d6dbed1b94dc563d2f90972562210c9d60f07b6f860fa3234ab1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionClamp.h": "bcf69564e0646dd9dfaea85693e367dda6b0551602b1bbada5e01f827863f6fb",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionSubtract.h": "857376600fa6b1104d775cfbe2b8829bd972f7afe635bfb678fef5f776cc1b77",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionWorldPosition.h": "2963c7c33b4ceadf8ca2ee8d14cc972e00300565c2144b40b74e37392a61c8dd",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDoubleVectorParameter.h": "a86540ad50adbc7b4264d1c1433b1c210108ee368c64ef6c25740227fd0e39ed",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureObjectParameter.h": "c6e906f1d8e0166d3a5c694e3fe5b1bbdb92a695724c9c217c106e7b207022e1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionPower.h": "149e0792a668be40c91d035b383018060dc91c754048ad5dad1d9f2455285108",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionSaturate.h": "be4c640fb2dc9c61e2daec52c5930e3e8d53cfdf7bb84af8fbe8a4e56de356a0",
+    "/WaterAdvanced/Materials/CubicInterpolateTexture": "5c524a835ddcaa0a8df91fa82d1d4017f2fde7e7c54c565bf05091af1bbbba2b",
+    "/Water/Materials/Functions/WaterBodyData": "1202e8abedc7e03799f5accad95715e150cd85da5311bddda2745aca155f2d17",
+    "/Water/Materials/Functions/HighQualityTextureFiltering": "b790002d4ff13d62a756dbe76b2e09be5a9267d232db65b13702bcf658c7616d",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureSample.h": "afe6e54686c5451f2e907474ac942010934c048818da3b3fe931adaf3d2d779c",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionFloor.h": "5f54df979dc21d5dbea8235d50d6077261ee4e60fa78b7cbd6174d9a4e12c7b0",
+    "/Water/Materials/Functions/WaterZoneData": "02caa158c81fc618b1bedc704b2b1d30a47f8efc7bdb8c3c8ea5ba9ad879430e",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureProperty.h": "7cb46c0ccf71266bab9033559f9ff293aa1d31a8ceb79b79c60e7dc98302c76d",
+    "/Engine/Functions/Engine_MaterialFunctions02/Utility/BreakOutFloat2Components": "972009533740f4f4b74b9ffc323f95fdb787e16a827e9cfcdd2cdb1d6afadadb",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionFrac.h": "8ad27a8361640fe626c175311fab018b940e22c0cb3cb1523d4cce8d1508ee0a",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTwoSidedSign.h": "b17583d73ad7cab63bb87039a866f78e154b2f42ff4073dcb94a7f1e620e72e4",
+    "/Water/Materials/Functions/ClipDynamicBounds": "681d801574f5bbf2b483188083020299a781396a547685c0f99948214e0dfe5f",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_SampleInteractiveSim": "55efc0d586b9f88ca78774fe1d9a786519cd3bb010c7f46044e369e5f021b941",
+    "Engine/Source/Runtime/Engine/Private/Materials/MaterialExpressions.cpp": "9930f4df181e6fec9dc720d2f2968cfaa377c93fc2d7045a950ae08cf7a59371",
+    "/Water/Materials/Functions/SetWaveAttributes": "e63fb6797ba29a6564326c46e0b8abc5b2b7fdffd3a43d77ab5a92086202b5a9",
+    "/Water/Materials/Layers/WaterAttributes": "f7633865fcd992a256bd937bd2c8fd8b145766d4edd4aac108011cf2b8243a98",
+    "/Water/Materials/MPC/MPC_Water": "785ce218aacb5e674c673efd8448d4685699853efbc4965d70809be26b2cf8fb",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionCollectionParameter.h": "ec14dd45d3cf02eb9cd37cac261094d37530d83bbc6d86cb494b2852b7f00e38",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionOneMinus.h": "b3b97792fa8dbb8b7eff2f7d28760b0914bc90c15f44e0b306018b37de2949ce",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_TextureAdvection": "a252dd09e766ffd4e23368b7b26a68922304307704bbb635ecdfa59b2288642b",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTime.h": "d44eaf4bcc04af5fe248d5a87f3604ba5089acf127948242fec365f5f8852844",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionFresnel.h": "76ccab75398e2ad3a4b5aa42d212348f2308a5db003217531ea82fa7ca09b822",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDotProduct.h": "1fc96397cda7a9c2b0ec18e5db22255c809f9f1d4a4d206ec2a775af546ea46f",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionPixelNormalWS.h": "c162a44260e4a3f3bc238051632136ca709ec99fc5fa5af0d98f6e9ef426aa0c",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionCameraVectorWS.h": "b8aa321ed0ad118deebf641d8951099be864dc4586b6541d7886d8009b095195",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionIf.h": "3c765bcc6b25784b470b19d4f18cf1c52b88255ed788b46f7005e7154194d2cb",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionPixelDepth.h": "f4d43a6afbcf52ac528db64938749b41d60afbfd3e46bf63f2700b49da561250",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionSceneTexture.h": "8ebeaff4406f268868a3279e026a16d734176039aed7e49d25c4b464261f8578",
+    "/Engine/Functions/Engine_MaterialFunctions02/SafeNormalize": "a42108b4959b5d30250555283beb596f1ee21208ab36d779b736e76a7d1e4cf3",
+    "/WaterAdvanced/Niagara/Materials/Function/MF_BlendNormals": "7431d34bce204a888ab96f97da005583d9c3c5e09c8fe6f7cd5abc4cd03898ba",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionNormalize.h": "cc9cd880648185c3b6cc3695a42f08a9e392db7337b1dfa601dc1fd03fdcb5d2",
+    "/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal": "a3f648c61142299d35646d60a8cab71e6c36b04c823e5d95698e57875e479b54",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureSampleParameter2D.h": "837d340f9827e76c212e08f9526a4d8628df1381003fed571e16a77b7c7955b8",
+    "/Water/FluidSimulation/Materials/Functions/Fluidsim_WorldPosition_to_UV": "4ea7346e73c96933156789e78360f33fa92905997c5a22a4e7f1de845dae5678",
+    "/Water/Materials/Functions/WaterTextureSurface": "35c7437d97c6578f139bdc10d720a36dbbe0af456c0bfd9047cd8293a6127a70",
+    "/Water/Materials/Functions/WaterTextureWaves": "3003310bf7b4655d19e31ae93af56680b03ce9aee77635a50aaac86f9f0852e1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionPanner.h": "ec9433e3dd5208fdc5c65e27ca3a489c799433d75a035f823ca0831a4fe527e1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionCeil.h": "d2cd75d83ddcce3d48882ceba06de5bdbb3412a8296ef3f24629de222a060710",
+    "/Engine/Functions/Engine_MaterialFunctions02/Math/TimeWithSpeedVariable": "129bb428e9555c3348bfed064fb6e07a7023e38a7063dbe3c9b122212322ef02",
+    "/Water/Materials/Functions/GetWaterTime": "4c436e21f1fb209533b99605a642b54d2697d757aaf0e4f17f7f32f77362b3b6",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionPreviousFrameSwitch.h": "0e6ee10751799ca91caf37a0a5716181568b2cb111c20ded4260c1e76f6c50c4",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTextureObject.h": "3a591a956d42ee341e42999784618c233186ce9e3592fd9ecda9776ef221f7b1",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionConstant2Vector.h": "3da659da530fb7b52f6c7b69e981b9e259f6b14841f44569304771b9648bb5ae",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionTransform.h": "2aab28f1a4447a7bad99a8bafd551dc3cd2e49efab4873ab4b1e899afda782f8",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionCameraPositionWS.h": "b8d6c7822d35e22d5397ee2c604058e71098e5f6d6bb2aa1c51c684b0ee5af31",
+    "Engine/Source/Runtime/Engine/Public/Materials/MaterialExpressionDeltaTime.h": "1ee5c8cd76646172c495ae7d183c845c6be0519f5f8ee6653dd78a2613a29d9d"
+  },
+  "caveat": "Serialized-source expansion with live instance overrides; not a fresh Unreal material compile."
+}

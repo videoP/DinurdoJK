@@ -166,6 +166,10 @@ impl App {
         }
         let favorites_dir = jka_assets::pk3::game_write_directory(&base, None);
         let emote_wheel = super::emote_wheel::EmoteWheel::load(&favorites_dir);
+        let siege_timer_menu = ui::load_mp_timer(&base, game.as_deref());
+        if siege_timer_menu.is_none() {
+            eprintln!("[JKA HUD] ui/hud.menu has no mp_timer frame/deathtimer; stock siege timer art unavailable");
+        }
         let mut app = Self {
             extensions,
             updater: crate::updater::State::load(&settings_dir),
@@ -361,6 +365,8 @@ impl App {
             demo_launch_seek_ms: None,
             demo_view_mode: DemoViewMode::Authoritative,
             demo_free_follow_anchor: None,
+            demo_player_list_scroll: 0,
+            demo_player_list_open: true,
             demo_view_outside_authoritative: false,
             demo_free_speed_index: DEMO_FREE_SPEED_DEFAULT_INDEX,
             server_browser_tx,
@@ -440,6 +446,13 @@ impl App {
             proxy,
             loader_tx,
             map_loader_latest_requested,
+            siege_timer_menu,
+            siege_hud_shown: None,
+            vote_map_preload_mode: 1,
+            vote_map_candidate: None,
+            vote_map_prewarm: None,
+            vote_map_prewarm_token: 0,
+            vote_map_frame_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             window: None,
             render: None,
             combat_ui_was_active: false,
@@ -448,6 +461,8 @@ impl App {
             render_view_latch: ViewLatchMode::Disabled,
             local_server: None,
             map_collision: None,
+            river_collision: None,
+            river_editor: crate::river_authoring::Editor::default(),
             map_mark_surfaces: None,
             map_static_models: Arc::default(),
             map_visibility: None,
@@ -463,6 +478,7 @@ impl App {
             wallrun_camera_mode: 0,
             first_person_lightsaber: presentation.first_person_lightsaber,
             saber_trail: presentation.saber_trail,
+            speed_trail: presentation.speed_trail,
             saber_team_colors: presentation.saber_team_colors,
             saber_staff_multi_color: presentation.saber_staff_multi_color,
             team_overlay: presentation.team_overlay,
@@ -611,6 +627,15 @@ impl App {
             japro_flipkick_frames: 0,
             japro_flipkick_jumps: 0,
             japro_flipkick_moveup: false,
+            killfeed_settings: presentation.killfeed,
+            killfeed: Default::default(),
+            muted_clients: Default::default(),
+            match_stats: Default::default(),
+            scoreboard_settings: presentation.scoreboard,
+            chat_settings: presentation.chat,
+            chat_anim: Default::default(),
+            scoreboard_cursor: Default::default(),
+            session_joined: None,
             vgs_menu: crate::vgs::Menu::Main,
             log_rx,
             console_history: Vec::with_capacity(128),

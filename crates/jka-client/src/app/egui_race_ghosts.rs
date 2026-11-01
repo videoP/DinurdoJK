@@ -77,12 +77,12 @@ impl App {
             match &context {
                 Ok((map, _, style)) => {
                     ui.horizontal(|ui| {
-                        theme::glow_label(ui, "CURRENT", 11.5, theme::TEXT_FAINT);
+                        theme::glow_label(ui, "CURRENT", 11.5, theme::TEXT_FAINT());
                         ui.label(egui::RichText::new(format!("{map}  /  {style}")).strong());
                     });
                 }
                 Err(error) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    ui.colored_label(theme::DANGER(), error);
                 }
             }
 
@@ -124,7 +124,7 @@ impl App {
                 {
                     left.label(
                         egui::RichText::new(format!("Suggested from position: {}", suggested.coursename))
-                            .color(theme::ACCENT)
+                            .color(theme::ACCENT())
                             .small(),
                     );
                 }
@@ -199,7 +199,7 @@ impl App {
                     });
                 }
                 if let Some(error) = self.race_ghost_web_error.as_deref() {
-                    right.colored_label(egui::Color32::LIGHT_RED, error);
+                    right.colored_label(theme::DANGER(), error);
                 }
                 let demos = self.race_ghost_web_demos.clone();
                 if demos.is_empty() && !self.race_ghost_web_demos_pending {

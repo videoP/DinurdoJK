@@ -16,7 +16,7 @@
 //! - 2: the portal pass itself renders into this texture instead of the
 //!   shared depth buffer, so there is no extra draw. Needs a single-sample
 //!   portal pass to be sampled afterwards.
-use super::DEPTH_FORMAT;
+use super::depth_format;
 
 struct PortalDepthTarget {
     size: (u32, u32),
@@ -51,7 +51,7 @@ fn depth_texture(device: &wgpu::Device, label: &'static str, size: (u32, u32)) -
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     })

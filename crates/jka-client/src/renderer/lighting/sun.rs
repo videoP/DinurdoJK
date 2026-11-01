@@ -58,6 +58,24 @@ impl Renderer {
             })
     }
 
+    /// The sun the native river's Single Layer Water follows: Blue Water's
+    /// celestial light while that sky is on (as the Blue Water sea receives
+    /// it), otherwise the classic `active_sun()` the world is lit with.
+    pub(in crate::renderer) fn river_scene_sun(&self) -> Option<crate::river_slw::SceneSun> {
+        if self.sky_backend == 1 {
+            if let Some(atmosphere) = &self.blue_water_sky {
+                let light = atmosphere.sky.light();
+                return crate::river_slw::SceneSun::blue_water(
+                    light.direction.to_array(),
+                    light.color.to_array(),
+                    light.intensity,
+                );
+            }
+        }
+        let sun = self.active_sun();
+        crate::river_slw::SceneSun::classic(sun.direction, sun.color, sun.intensity)
+    }
+
     /// Sun swap for the entity lightgrid: strips the map's baked sun share out of
     /// each probe sample and lights entities with `active_sun()` instead. None
     /// when the setting is off, the entity lightgrid mode isn't in use, or the

@@ -239,6 +239,9 @@ impl GameSession {
                 target: target_name,
                 attacker: None,
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         } else if let Some(attacker_name) = attacker_name {
             let key = match mod_ {
@@ -272,6 +275,9 @@ impl GameSession {
                 target: target_name,
                 attacker: Some(attacker_name),
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         } else {
             let key = match mod_ {
@@ -282,6 +288,9 @@ impl GameSession {
                 target: target_name,
                 attacker: None,
                 key,
+                target_client: target,
+                attacker_client: attacker_client.map(|client| client as i32),
+                mod_,
             }
         };
         self.client_game.push_notice(notice);
@@ -376,22 +385,22 @@ impl GameSession {
         use EntityEvent as E;
         use jka_assets::siege::{SIEGE_TEAM1, SIEGE_TEAM2};
 
-        if self.client_game.gametype() != 7 {
+        // The jaPRO server also sends EV_SIEGESPEC in *non-Siege* games
+        // after a passed vote with >=5 seconds execution delay. Its `time`
+        // is the absolute server-time deadline for the vote-map countdown.
+        // TaystJK's CG_EntityEvent processes it without a Siege gametype gate.
+        if event.event == E::EV_SIEGESPEC {
+            let Some(viewer) = self.client_game.presentation_client_num() else {
+                return;
+            };
+            if event.state.field_i32("owner") == Some(viewer) {
+                self.siege_respawn_time = event.state.field_i32("time").unwrap_or(0);
+            }
             return;
         }
+        if self.client_game.gametype() != 7 { return; }
 
         match event.event {
-            E::EV_SIEGESPEC => {
-                // OpenJK: if (es->owner == cg.predictedPlayerState.clientNum)
-                // cg_siegeDeathTime = es->time. Presentation ownership is the
-                // same slot in live play and intentionally follows the POV in demos.
-                let Some(viewer) = self.client_game.presentation_client_num() else {
-                    return;
-                };
-                if event.state.field_i32("owner") == Some(viewer) {
-                    self.siege_respawn_time = event.state.field_i32("time").unwrap_or(0);
-                }
-            }
             E::EV_SIEGE_OBJECTIVECOMPLETE => {
                 let viewer_team = self.siege_viewer_team();
                 if !matches!(viewer_team, SIEGE_TEAM1 | SIEGE_TEAM2) {

@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 46;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 47;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -96,6 +96,9 @@ pub(in crate::renderer) enum GpuPass {
     // Independent static-cache preparation; dynamic shadows are encoded pre-world.
     LocalShadowStatic = 44,
     LocalShadowMoving = 45,
+    /// Core primary BSP render-pass interval, excluding most model/post tails.
+    /// Nested within World; never add WorldMainPass to World or Frame.
+    WorldMainPass = 46,
 }
 
 impl GpuPass {
@@ -152,6 +155,7 @@ impl GpuPass {
         Self::InlineTransform,
         Self::LocalShadowStatic,
         Self::LocalShadowMoving,
+        Self::WorldMainPass,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -202,6 +206,7 @@ impl GpuPass {
             Self::InlineTransform => "inline_transform",
             Self::LocalShadowStatic => "local_shadow_static",
             Self::LocalShadowMoving => "local_shadow_moving",
+            Self::WorldMainPass => "world_main_pass",
         }
     }
 }
@@ -279,11 +284,12 @@ pub(in crate::renderer) struct GpuProfilerSlot {
     pub(in crate::renderer) resolve_buffer: wgpu::Buffer,
     pub(in crate::renderer) readback_buffer: wgpu::Buffer,
     pub(in crate::renderer) pending: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
-    // Tracks timestamp slots that were genuinely written by the measured frame.
-    // Before resolve we fill any holes with harmless dummy timestamps so Vulkan
-    // never sees an unavailable query in the resolved range. `active` remains
-    // true only for passes with both real endpoints, so dummy values are ignored.
+    // `written` and `query_indices` retain the stable pass/endpoint identity.
+    // Actual GPU queries are allocated contiguously as timestamps are written,
+    // so resolving 0..query_count needs no dummy writes or unaligned offsets.
     pub(in crate::renderer) written: [bool; GPU_PASS_COUNT * 2],
+    pub(in crate::renderer) query_indices: [u32; GPU_PASS_COUNT * 2],
+    pub(in crate::renderer) query_count: u32,
     pub(in crate::renderer) active: [bool; GPU_PASS_COUNT],
     /// `GpuProfiler::frame_tag` of the frame this slot measured.
     pub(in crate::renderer) tag: u32,
@@ -308,6 +314,26 @@ pub(in crate::renderer) struct GpuProfiler {
     /// When `Some`, every resolved readback is appended with its tag, not only
     /// the newest one kept in `latest` (several slots can land in one frame).
     pub(in crate::renderer) completed: Option<Vec<(u32, GpuTiming)>>,
+}
+
+// Returns the dense hardware query index for a pass endpoint. The canonical
+// pass index remains stable in `written`/`query_indices` for readback, while
+// hardware query indices are contiguous for a single aligned resolve.
+fn allocate_query_index(
+    written: &mut [bool; GPU_PASS_COUNT * 2],
+    indices: &mut [u32; GPU_PASS_COUNT * 2],
+    count: &mut u32,
+    canonical_index: usize,
+) -> Option<u32> {
+    if written[canonical_index] {
+        return None;
+    }
+    debug_assert!(*count < GPU_QUERY_COUNT);
+    let index = *count;
+    *count += 1;
+    written[canonical_index] = true;
+    indices[canonical_index] = index;
+    Some(index)
 }
 
 impl GpuProfiler {
@@ -358,6 +384,8 @@ impl GpuProfiler {
                     readback_buffer,
                     pending: None,
                     written: [false; GPU_PASS_COUNT * 2],
+                    query_indices: [0; GPU_PASS_COUNT * 2],
+                    query_count: 0,
                     active: [false; GPU_PASS_COUNT],
                     tag: 0,
                 }
@@ -398,7 +426,14 @@ impl GpuProfiler {
         if !self.enabled() {
             return;
         }
-        let _ = device.poll(wgpu::PollType::Poll);
+        // Mapping callbacks are driven by poll, but polling the device on
+        // every rendered frame forces WGPU/Vulkan maintenance onto the CPU
+        // critical path even while unused query slots remain available.
+        // Only poll when all slots are occupied. The three buffered query
+        // slots tolerate the resulting (at most two-frame) diagnostic delay.
+        if self.slots.iter().all(|slot| slot.pending.is_some()) {
+            let _ = device.poll(wgpu::PollType::Poll);
+        }
 
         for slot in &mut self.slots {
             let completed = {
@@ -413,8 +448,21 @@ impl GpuProfiler {
                             continue;
                         };
                         let values: &[u64] = bytemuck::cast_slice(&bytes);
-                        let timing =
-                            GpuTiming::from_query_data(values, slot.active, self.timestamp_period);
+                        // Resolve data is dense, but timing consumers expect
+                        // stable pass*2 / pass*2+1 indices. Restore those
+                        // positions only for timestamps genuinely written.
+                        let mut pass_values = [0u64; GPU_PASS_COUNT * 2];
+                        for (canonical, &written) in slot.written.iter().enumerate() {
+                            if written {
+                                pass_values[canonical] =
+                                    values[slot.query_indices[canonical] as usize];
+                            }
+                        }
+                        let timing = GpuTiming::from_query_data(
+                            &pass_values,
+                            slot.active,
+                            self.timestamp_period,
+                        );
                         drop(bytes);
                         slot.readback_buffer.unmap();
                         Some(timing)
@@ -436,6 +484,7 @@ impl GpuProfiler {
         self.current = self.slots.iter().position(|slot| slot.pending.is_none());
         if let Some(current) = self.current {
             self.slots[current].written = [false; GPU_PASS_COUNT * 2];
+            self.slots[current].query_count = 0;
             self.slots[current].active = [false; GPU_PASS_COUNT];
             self.slots[current].tag = self.frame_tag;
         }
@@ -458,11 +507,15 @@ impl GpuProfiler {
         let slot = &mut self.slots[current];
         // A query index may only be written once per profiler frame. Guarding
         // this also makes optional/overlapping renderer branches harmless.
-        if slot.written[query_index] {
+        let Some(dense_index) = allocate_query_index(
+            &mut slot.written,
+            &mut slot.query_indices,
+            &mut slot.query_count,
+            query_index,
+        ) else {
             return;
-        }
-        encoder.write_timestamp(&slot.query_set, query_index as u32);
-        slot.written[query_index] = true;
+        };
+        encoder.write_timestamp(&slot.query_set, dense_index);
         slot.active[pass_index] = slot.written[pass_index * 2] && slot.written[pass_index * 2 + 1];
     }
 
@@ -481,11 +534,15 @@ impl GpuProfiler {
         let pass_index = timed_pass.index();
         let query_index = pass_index * 2 + usize::from(end);
         let slot = &mut self.slots[current];
-        if slot.written[query_index] {
+        let Some(dense_index) = allocate_query_index(
+            &mut slot.written,
+            &mut slot.query_indices,
+            &mut slot.query_count,
+            query_index,
+        ) else {
             return;
-        }
-        pass.write_timestamp(&slot.query_set, query_index as u32);
-        slot.written[query_index] = true;
+        };
+        pass.write_timestamp(&slot.query_set, dense_index);
         slot.active[pass_index] = slot.written[pass_index * 2] && slot.written[pass_index * 2 + 1];
     }
 
@@ -493,22 +550,21 @@ impl GpuProfiler {
         let Some(current) = self.current else {
             return;
         };
-        if !self.slots[current].written.iter().any(|written| *written) {
+        let slot = &self.slots[current];
+        if slot.query_count == 0 {
             return;
         }
 
-        let slot = &mut self.slots[current];
-        // WebGPU/Vulkan requires every query in a resolved range to have become
-        // available. Optional renderer passes leave holes in our fixed query set,
-        // so write harmless end-of-frame timestamps into those unused slots before
-        // resolving the whole compact range. These dummy slots are not marked
-        // active and therefore never appear in reported timings.
-        for query_index in 0..GPU_QUERY_COUNT as usize {
-            if !slot.written[query_index] {
-                encoder.write_timestamp(&slot.query_set, query_index as u32);
-            }
-        }
-        encoder.resolve_query_set(&slot.query_set, 0..GPU_QUERY_COUNT, &slot.resolve_buffer, 0);
+        // A single resolve at offset 0 is always aligned to WGPU's
+        // QUERY_RESOLVE_BUFFER_ALIGNMENT (256 bytes). Sparse query indices
+        // used to resolve at 8 * start, which crashed when start was not
+        // a multiple of 32. Dense allocation also avoids dummy timestamps.
+        encoder.resolve_query_set(
+            &slot.query_set,
+            0..slot.query_count,
+            &slot.resolve_buffer,
+            0,
+        );
     }
 
     pub(in crate::renderer) fn encode_readback_copy(
@@ -568,5 +624,43 @@ impl GpuProfiler {
     /// render frames mean both reported the same resolved GPU frame.
     pub(in crate::renderer) fn latest_generation(&self) -> u64 {
         self.latest_generation
+    }
+}
+
+#[cfg(test)]
+mod sparse_gpu_query_tests {
+    use super::{allocate_query_index, GpuPass, GpuTiming, GPU_PASS_COUNT};
+
+    #[test]
+    fn sparse_writes_resolve_as_one_aligned_dense_range() {
+        let mut written = [false; GPU_PASS_COUNT * 2];
+        let mut indices = [0; GPU_PASS_COUNT * 2];
+        let mut count = 0;
+        // A high-numbered pass may start before an earlier-numbered pass.
+        for (canonical, expected) in [(92, 0), (10, 1), (11, 2), (93, 3)] {
+            assert_eq!(
+                allocate_query_index(&mut written, &mut indices, &mut count, canonical),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            allocate_query_index(&mut written, &mut indices, &mut count, 10),
+            None,
+        );
+        assert_eq!(count, 4);
+        // Reconstruct canonical pass timing from resolved dense timestamps.
+        let values = [100u64, 120, 170, 200];
+        let mut canonical_values = [0u64; GPU_PASS_COUNT * 2];
+        for (canonical, &is_written) in written.iter().enumerate() {
+            if is_written {
+                canonical_values[canonical] = values[indices[canonical] as usize];
+            }
+        }
+        let mut active = [false; GPU_PASS_COUNT];
+        active[GpuPass::WorldMainPass.index()] = true;
+        active[GpuPass::World.index()] = true;
+        let timing = GpuTiming::from_query_data(&canonical_values, active, 1.0);
+        assert_eq!(timing.milliseconds[GpuPass::WorldMainPass.index()], Some(0.0001));
+        assert_eq!(timing.milliseconds[GpuPass::World.index()], Some(0.00005));
     }
 }

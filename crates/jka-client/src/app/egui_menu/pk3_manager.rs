@@ -26,10 +26,14 @@ mod apply_tests {
 
 // The pane fills are deliberately subdued, so package status is readable
 // without competing with the blue selection highlight or other Setup pages.
-const DISABLED_PANE: egui::Color32 = egui::Color32::from_rgb(47, 27, 32);
-const ENABLED_PANE: egui::Color32 = egui::Color32::from_rgb(24, 48, 35);
-const DISABLED_ACCENT: egui::Color32 = egui::Color32::from_rgb(234, 120, 115);
-const ENABLED_ACCENT: egui::Color32 = egui::Color32::from_rgb(114, 208, 145);
+#[allow(non_snake_case)]
+fn DISABLED_PANE() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(47, 27, 32), egui::Color32::from_rgb(0x36, 0x24, 0x20)) }
+#[allow(non_snake_case)]
+fn ENABLED_PANE() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(24, 48, 35), egui::Color32::from_rgb(0x26, 0x33, 0x25)) }
+#[allow(non_snake_case)]
+fn DISABLED_ACCENT() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(234, 120, 115), theme::DANGER()) }
+#[allow(non_snake_case)]
+fn ENABLED_ACCENT() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(114, 208, 145), theme::ACCENT()) }
 
 /// A package's selected state is separate from its staged enabled state.
 /// The arrow stages a move, while clicking its filename only changes the
@@ -54,9 +58,9 @@ fn package_pane(
             || p.directory.to_string_lossy().to_ascii_lowercase().contains(search))
     }).count();
     let (color, fill, title) = if is_disabled {
-        (DISABLED_ACCENT, DISABLED_PANE, "DISABLED")
+        (DISABLED_ACCENT(), DISABLED_PANE(), "DISABLED")
     } else {
-        (ENABLED_ACCENT, ENABLED_PANE, "ENABLED")
+        (ENABLED_ACCENT(), ENABLED_PANE(), "ENABLED")
     };
 
     ui.allocate_ui_with_layout(
@@ -83,7 +87,7 @@ fn package_pane(
                         .show(ui, |ui| {
                             if visible_count == 0 {
                                 ui.add_space(12.0);
-                                ui.colored_label(theme::TEXT_FAINT, if search.is_empty() && is_disabled {
+                                ui.colored_label(theme::TEXT_FAINT(), if search.is_empty() && is_disabled {
                                     "No disabled packages"
                                 } else { "No matching packages" });
                             }
@@ -176,8 +180,8 @@ impl App {
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::Frame::new()
-                    .fill(theme::RAIL_FILL)
-                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .fill(theme::RAIL_FILL())
+                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG()))
                     .corner_radius(egui::CornerRadius::same(5))
                     .inner_margin(egui::Margin::symmetric(10, 10))
                     .show(ui, |ui| {
@@ -186,7 +190,7 @@ impl App {
                         ui.separator();
                         let Some(path) = &self.pk3_manager_selected else {
                             ui.add_space(12.0);
-                            ui.colored_label(theme::TEXT_DIM, "Select a PK3 from either pane to inspect its contents.");
+                            ui.colored_label(theme::TEXT_DIM(), "Select a PK3 from either pane to inspect its contents.");
                             return;
                         };
                         let Some((priority, package)) = self.pk3_manager_packages.iter().enumerate()
@@ -196,15 +200,15 @@ impl App {
                         let name = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
                         ui.label(egui::RichText::new(name.as_ref()).strong().size(14.0));
                         ui.horizontal(|ui| {
-                            ui.colored_label(if enabled { ENABLED_ACCENT } else { DISABLED_ACCENT },
+                            ui.colored_label(if enabled { ENABLED_ACCENT() } else { DISABLED_ACCENT() },
                                 if enabled { "ENABLED" } else { "DISABLED" });
-                            if pending { ui.colored_label(theme::WARNING, "PENDING APPLY"); }
-                            if package.stock { ui.colored_label(theme::TEXT_DIM, "STOCK / LOCKED"); }
+                            if pending { ui.colored_label(theme::WARNING(), "PENDING APPLY"); }
+                            if package.stock { ui.colored_label(theme::TEXT_DIM(), "STOCK / LOCKED"); }
                         });
                         ui.label(format!("{:.1} MiB · priority #{} · {}", package.bytes as f64 / (1024.0 * 1024.0),
                             priority + 1, package.directory.display()));
                         ui.add(egui::Label::new(egui::RichText::new(path.display().to_string())
-                            .size(10.5).color(theme::TEXT_FAINT)).wrap());
+                            .size(10.5).color(theme::TEXT_FAINT())).wrap());
                         ui.add_space(4.0);
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -213,7 +217,7 @@ impl App {
                         ui.add(egui::TextEdit::singleline(&mut self.pk3_manager_entries_search)
                             .hint_text("Filter member paths...").desired_width(f32::INFINITY));
                         if let Some(error) = &self.pk3_manager_entries_error {
-                            ui.colored_label(theme::DANGER, error);
+                            ui.colored_label(theme::DANGER(), error);
                         }
                         let search = self.pk3_manager_entries_search.to_ascii_lowercase();
                         let visible = self.pk3_manager_entries.iter().enumerate()
@@ -331,7 +335,7 @@ impl App {
         });
         if let Some(status) = &self.pk3_manager_status { ui.label(status); }
         if self.game_session.is_some() || self.live_cgame_prepared.is_some() {
-            ui.colored_label(theme::TEXT_DIM, "Connected: the full rebuild retains your session, but pure servers may require a reconnect.");
+            ui.colored_label(theme::TEXT_DIM(), "Connected: the full rebuild retains your session, but pure servers may require a reconnect.");
         }
     }
 }

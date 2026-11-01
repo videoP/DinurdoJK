@@ -105,6 +105,51 @@ struct Job {
     run: Box<dyn FnOnce() + Send + 'static>,
 }
 
+/// The coordinator also runs inline preparation, so pacing worker jobs is a
+/// best-effort CPU/memory-bandwidth guard, not a real-time FPS guarantee.
+#[derive(Clone)]
+struct SpeculativeThrottle {
+    mode: u8,
+    cancel: Arc<AtomicBool>,
+    frame_us: Arc<AtomicU32>,
+    baseline_us: u32,
+}
+impl SpeculativeThrottle {
+    fn before_job(&self) -> bool {
+        if self.cancel.load(Ordering::Acquire) { return false; }
+        if self.mode == 3 { return true; }
+        // Don't start the next job while current gameplay's smoothed frame
+        // interval is >25% above the pre-vote reference. A long delay is
+        // preferable to damaging frametimes; authoritative map change cancels
+        // this wait. This cannot preempt a single already-running heavy job.
+        while !self.cancel.load(Ordering::Acquire) {
+            let current = self.frame_us.load(Ordering::Relaxed);
+            let limit = self.baseline_us.saturating_mul(5).saturating_div(4).max(1500);
+            if current == 0 || current <= limit { break; }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if self.cancel.load(Ordering::Acquire) { return false; }
+        true
+    }
+    fn after_job(&self) {
+        if self.mode == 1 { thread::sleep(std::time::Duration::from_millis(75)); }
+        else if self.mode == 2 { thread::sleep(std::time::Duration::from_millis(12)); }
+    }
+}
+
+/// Reduce contention with gameplay/render threads on Windows. A CPU-heavy
+/// map compiler cannot guarantee zero frametime effect, but should never run
+/// at the same scheduling priority as input/render on competitive machines.
+pub fn lower_vote_prewarm_thread_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    }
+}
+
 pub struct MapJobPool {
     sender: Option<mpsc::Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
@@ -113,6 +158,7 @@ pub struct MapJobPool {
     latest_requested: Option<Arc<AtomicU64>>,
     /// Off for requests outside the shared generation (Render Studio ids).
     supersedable: AtomicBool,
+    speculative_cancel: Option<Arc<AtomicBool>>,
 }
 
 pub struct JobHandle<T> {
@@ -147,7 +193,7 @@ impl MapJobPool {
     where
         F: Fn(MapJobProgress) + Send + Sync + 'static,
     {
-        Self::create(Some(Arc::new(reporter)), None)
+        Self::create(Some(Arc::new(reporter)), None, None)
     }
 
     /// Map loader only: current request generation can advance before this
@@ -159,12 +205,26 @@ impl MapJobPool {
     where
         F: Fn(MapJobProgress) + Send + Sync + 'static,
     {
-        Self::create(Some(Arc::new(reporter)), Some(latest_requested))
+        Self::create(Some(Arc::new(reporter)), Some(latest_requested), None)
+    }
+
+    /// A separate pool for a passed map vote. Never borrows the normal map
+    /// loader's workers or emits progress events for the current world.
+    /// Modes 1/2 keep one worker; mode 3 is an intentionally aggressive A/B.
+    pub fn new_vote_prewarm(
+        mode: u8,
+        cancel: Arc<AtomicBool>,
+        frame_us: Arc<AtomicU32>,
+        baseline_us: u32,
+    ) -> Result<Self, String> {
+        let throttle = SpeculativeThrottle { mode, cancel: Arc::clone(&cancel), frame_us, baseline_us };
+        Self::create(None, None, Some(throttle))
     }
 
     fn create(
         reporter: Option<ProgressReporter>,
         latest_requested: Option<Arc<AtomicU64>>,
+        throttle: Option<SpeculativeThrottle>,
     ) -> Result<Self, String> {
         let logical = thread::available_parallelism().map_or(1, |count| count.get());
         // Keep MAIN and RENDER responsive, then use the remaining hardware
@@ -172,17 +232,30 @@ impl MapJobPool {
         // spends most of its time waiting on workers, so it does not need a
         // dedicated reserved hardware thread. Cap at eight so a large machine
         // cannot stampede PK3 IO or create excessive transient work.
-        let worker_count = logical.saturating_sub(2).clamp(1, 8);
+        let worker_count = if throttle.as_ref().is_some_and(|t| t.mode != 3) {
+            1
+        } else {
+            logical.saturating_sub(2).clamp(1, 8)
+        };
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let progress = Arc::new(ProgressState::new(reporter));
         let mut workers = Vec::with_capacity(worker_count);
         for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
-            let slot = ThreadSlot::worker(index).ok_or("too many map workers")?;
+            let worker_throttle = throttle.clone();
+            let slot = if worker_throttle.is_some() {
+                ThreadSlot::BackgroundCpu
+            } else {
+                ThreadSlot::worker(index).ok_or("too many map workers")?
+            };
             let handle = thread::Builder::new()
                 .name(format!("jka-worker-{index}"))
-                .spawn(move || loop {
+                .spawn(move || {
+                    if worker_throttle.is_some() {
+                        lower_vote_prewarm_thread_priority();
+                    }
+                    loop {
                     let job = {
                         let Ok(receiver) = receiver.lock() else {
                             return;
@@ -192,8 +265,15 @@ impl MapJobPool {
                             Err(_) => return,
                         }
                     };
+                    if let Some(pacing) = &worker_throttle {
+                        if !pacing.before_job() { return; }
+                    }
                     let _activity = thread_activity::activity(slot, job.task);
                     (job.run)();
+                    if let Some(pacing) = &worker_throttle {
+                        pacing.after_job();
+                    }
+                    }
                 })
                 .map_err(|error| format!("Could not start map worker {index}: {error}"))?;
             workers.push(handle);
@@ -205,12 +285,14 @@ impl MapJobPool {
             progress,
             latest_requested,
             supersedable: AtomicBool::new(true),
+            speculative_cancel: throttle.map(|t| t.cancel),
         })
     }
 
     /// Pure map-preparation cold-path check. No game-frame work calls this.
     pub fn is_superseded(&self) -> bool {
-        self.supersedable.load(Ordering::Relaxed)
+        self.speculative_cancel.as_ref().is_some_and(|cancel| cancel.load(Ordering::Acquire))
+            || self.supersedable.load(Ordering::Relaxed)
             && self.latest_requested.as_ref().is_some_and(|latest| {
                 latest.load(Ordering::Acquire) != self.progress.request_id.load(Ordering::Acquire)
             })

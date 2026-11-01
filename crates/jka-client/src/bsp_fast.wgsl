@@ -382,6 +382,9 @@ fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
 }
 
 @fragment fn fs_legacy_srgb_three_stage(input: VertexOut) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (1u << 23u)) != 0u) {
+        return competitive_one_stage_lit(input, input.shell_kind >> 1u);
+    }
     let shell_kind = input.shell_kind & 1u;
     if (surface_deformation_should_discard(input.world_position, material.header.w,
         input.world_normal, shell_kind, input.shell_coverage, input.clip_position.xy, true)) {
@@ -552,9 +555,37 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
     if (surface_deformation_should_discard(input.world_position, material.header.w, input.world_normal, input.shell_kind & 1u, input.shell_coverage, input.clip_position.xy, true)) { discard; }
     return additive_fused_contributions(input, 3u);
 }
+// Cheap single-stage BSP lighting, with the classic lighting mode already
+// encoded by the fast vertex shader into shell_kind >> 1.
+fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
+    let texel = textureSample(base_texture, base_sampler, input.uv);
+    let alpha = texel.a * material.color.a;
+    if ((material.params.x > 0.0 && alpha < material.params.x
+        || material.params.x < 0.0 && alpha >= -material.params.x)) { discard; }
+    let flags = material.header.z;
+    let fullbright = (classic & CLASSIC_FULLBRIGHT) != 0u;
+    let vertex_lit = (classic & CLASSIC_VERTEX_LIGHT) != 0u;
+    let debug_lightmap = (classic & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    var light = vec3<f32>(1.0);
+    if (!fullbright) {
+        if (vertex_lit) {
+            light = select(input.color.rgb, vec3<f32>(1.0), debug_lightmap);
+        } else if ((flags & (2u | MATERIAL_HAS_LIGHTMAP)) != 0u && input.lightmap_uv.x >= 0.0) {
+            light = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+        } else if ((flags & 131072u) != 0u) {
+            light = input.color.rgb;
+        }
+    }
+    if (debug_lightmap) { return vec4<f32>(light, alpha); }
+    return vec4<f32>(texel.rgb * select(light, vec3<f32>(1.0), (flags & MATERIAL_EXPLICIT_LIGHTMAP) != 0u), alpha);
+}
+
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let shell_kind = input.shell_kind & 1u;
     let classic_flags = input.shell_kind >> 1u;
+    if ((camera.render_flags.y & (1u << 23u)) != 0u) {
+        return competitive_one_stage_lit(input, classic_flags);
+    }
     if (surface_deformation_should_discard(
         input.world_position, material.header.w, input.world_normal, shell_kind, input.shell_coverage, input.clip_position.xy, true
     )) {

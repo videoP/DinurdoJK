@@ -45,10 +45,10 @@ impl DemoVideoPreset {
 
     pub(in crate::app) fn short_description(self) -> &'static str {
         match self {
-            Self::H264High => "H.264 CRF 18, 4:2:0 — compact high-quality delivery",
-            Self::H264Max => "H.264 CRF 12, 4:2:0 — larger near-transparent delivery",
-            Self::ProRes422 => "ProRes 422 HQ, 10-bit container — edit-friendly master",
-            Self::ProRes444 => "ProRes 4444, 4:4:4 — best chroma retention; source is still 8-bit SDR",
+            Self::H264High => "H.264 CRF 18, 4:2:0: compact high-quality delivery",
+            Self::H264Max => "H.264 CRF 12, 4:2:0: larger near-transparent delivery",
+            Self::ProRes422 => "ProRes 422 HQ, 10-bit container: edit-friendly master",
+            Self::ProRes444 => "ProRes 4444, 4:4:4: best chroma retention; source is still 8-bit SDR",
         }
     }
 
@@ -161,7 +161,7 @@ impl App {
     pub(in crate::app) fn cycle_demo_export_preset(&mut self) {
         self.demo_export_preset = self.demo_export_preset.next();
         self.console_status = format!(
-            "DEMO EXPORT QUALITY: {} — {}",
+            "DEMO EXPORT QUALITY: {}: {}",
             self.demo_export_preset.label(),
             self.demo_export_preset.short_description()
         );
@@ -171,7 +171,7 @@ impl App {
     pub(in crate::app) fn toggle_demo_export_depth(&mut self) {
         self.demo_export_depth = !self.demo_export_depth;
         self.console_status = if self.demo_export_depth {
-            "DEMO EXPORT DEPTH: ON — synchronized 32-bit float EXR sequence".into()
+            "DEMO EXPORT DEPTH: ON: synchronized 32-bit float EXR sequence".into()
         } else {
             "DEMO EXPORT DEPTH: OFF".into()
         };
@@ -340,7 +340,7 @@ impl App {
         self.demo_scrub_fraction = None;
         self.demo_scrub_dragging = false;
         self.console_status = format!(
-            "EXPORTING {total_frames} FRAMES @ {fps} FPS · {}{} — ESC TO CANCEL",
+            "EXPORTING {total_frames} FRAMES @ {fps} FPS · {}{} · ESC TO CANCEL",
             preset.label(),
             if self.demo_export_depth { " · DEPTH EXR" } else { "" }
         );

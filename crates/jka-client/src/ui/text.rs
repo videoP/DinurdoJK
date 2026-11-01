@@ -272,6 +272,8 @@ pub(in crate::ui) fn wrap_proportional_text(
     out
 }
 
+/// Legacy 640x480 anisotropic text. Keep this entry point for call sites which
+/// still explicitly expect that projection (e.g. an offscreen virtual canvas).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn proportional_text(
     out: &mut Vec<UiVertex>,
@@ -285,9 +287,53 @@ pub(in crate::ui) fn proportional_text(
     width: u32,
     height: u32,
 ) {
-    let x_scale = width.max(1) as f32 / 640.0;
+    proportional_text_with_x_scale(out, value, font, x, baseline_y, scale, color, shadow, width, height,
+        width.max(1) as f32 / 640.0, false);
+}
+
+/// HUD text: pixels per virtual unit are the SAME on X and Y. Positions remain
+/// physical screen pixels, so projected labels and right-edge anchors do not move.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn proportional_text_uniform(
+    out: &mut Vec<UiVertex>, value: &str, font: &ProportionalFont,
+    x: f32, baseline_y: f32, scale: f32, color: [f32; 4], shadow: bool,
+    width: u32, height: u32,
+) {
+    proportional_text_with_x_scale(out, value, font, x, baseline_y, scale, color, shadow, width, height,
+        height.max(1) as f32 / 480.0, false);
+}
+
+/// CENTERPRINT is drawn with TaystJK's `ITEM_TEXTSTYLE_SHADOWEDMORE`, which
+/// becomes `STYLE_DROPSHADOW` in `CG_Text_Paint` / `RE_Font_DrawString`.
+/// Keep this separate from the regular HUD/chat font shadow.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn proportional_centerprint_text(
+    out: &mut Vec<UiVertex>,
+    value: &str,
+    font: &ProportionalFont,
+    x: f32,
+    baseline_y: f32,
+    scale: f32,
+    color: [f32; 4],
+    width: u32,
+    height: u32,
+) {
+    proportional_text_with_x_scale(
+        out, value, font, x, baseline_y, scale, color, true, width, height,
+        height.max(1) as f32 / 480.0, true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proportional_text_with_x_scale(
+    out: &mut Vec<UiVertex>, value: &str, font: &ProportionalFont,
+    x: f32, baseline_y: f32, scale: f32, color: [f32; 4], shadow: bool,
+    width: u32, height: u32, glyph_x_scale: f32, tayst_centerprint_shadow: bool,
+) {
+    let x_scale = glyph_x_scale;
     let y_scale = height.max(1) as f32 / 480.0;
     let line_step = 20.0 * scale * y_scale;
+    let centerprint_shadow_offset = (f32::from(font.point_size) * scale * 0.075).round();
 
     let draw_pass = |out: &mut Vec<UiVertex>, shadow_pass: bool| {
         let mut cursor_x = x;
@@ -313,15 +359,23 @@ pub(in crate::ui) fn proportional_text(
 
             let glyph = font.glyphs[byte as usize];
             if glyph.width > 0 && glyph.height > 0 && byte != b' ' {
-                // OpenJK chat uses the font drop-shadow style. Keep this
-                // screen-space tight instead of scaling the offset with the
-                // framebuffer, which made the shadow too far away at 1080p+.
-                let shadow_offset_x = if shadow_pass { 1.0 } else { 0.0 };
-                let shadow_offset_y = if shadow_pass { 1.0 } else { 0.0 };
-                let draw_color = if shadow_pass {
-                    [0.0, 0.0, 0.0, color[3] * 0.72]
+                // Only CENTERPRINT uses TaystJK's actual FONT_MEDIUM drop
+                // shadow (dark gray with the same fade alpha as the text).
+                // Other HUD/chat text retains the existing tight screen-space
+                // black shadow, avoiding unrelated visual regressions.
+                let (shadow_offset_x, shadow_offset_y) = if !shadow_pass {
+                    (0.0, 0.0)
+                } else if tayst_centerprint_shadow {
+                    (centerprint_shadow_offset * x_scale, centerprint_shadow_offset * y_scale)
                 } else {
+                    (1.0, 1.0)
+                };
+                let draw_color = if !shadow_pass {
                     active_color
+                } else if tayst_centerprint_shadow {
+                    [0.15, 0.15, 0.15, color[3]]
+                } else {
+                    [0.0, 0.0, 0.0, color[3] * 0.72]
                 };
                 let draw_x =
                     cursor_x + glyph.horiz_offset as f32 * scale * x_scale + shadow_offset_x;
@@ -363,7 +417,6 @@ pub fn build_world_player_label_vertices(
     width: u32,
     height: u32,
 ) {
-    let sx = width.max(1) as f32 / 640.0;
     let sy = height.max(1) as f32 / 480.0;
     let scale = scale.clamp(0.05, 4.0);
 
@@ -372,9 +425,19 @@ pub fn build_world_player_label_vertices(
         // add a second stats line. Center each line independently instead of
         // letting the generic text drawer inherit the first line's x origin.
         let line_step = 20.0 * scale * sy;
+        if label.crowned {
+            // The crown gets its own box above the first line (and above the
+            // health bar when one is drawn), a third of the name's width.
+            let first = label.text.split('\n').next().unwrap_or_default();
+            let name_w = proportional_text_width(first, font, scale) * sy;
+            let cap = f32::from(font.glyphs[usize::from(b'A')].height.max(1)) * scale * sy;
+            let top = if label.health_fraction.is_some() { (y - 8.0 * sy).min(y - cap) } else { y - cap };
+            let crown = super::glyphs::crown_over([x - name_w * 0.5, top, name_w, cap], height as f32 / 1080.0);
+            super::glyphs::crown(out, crown, 0.9, width, height);
+        }
         for (line, text) in label.text.split('\n').enumerate() {
-            let text_width = proportional_text_width(text, font, scale) * sx;
-            proportional_text(
+            let text_width = proportional_text_width(text, font, scale) * sy;
+            proportional_text_uniform(
                 out,
                 text,
                 font,
@@ -414,9 +477,9 @@ pub fn build_world_player_label_vertices(
     };
     // TaystJK HEALTH_WIDTH/HEIGHT are 50x5 virtual pixels. Keep the same
     // authored size and alpha, but render it at native framebuffer resolution.
-    let bar_w = 50.0 * sx;
+    let bar_w = 50.0 * sy;
     let bar_h = 5.0 * sy;
-    let border = 1.0_f32.max(sx.min(sy));
+    let border = 1.0_f32.max(sy);
     let bar_x = x - bar_w * 0.5;
     let bar_y = y - 7.0 * sy;
     rect(
@@ -610,8 +673,9 @@ pub(in crate::ui) fn color_code(code: char, alpha: f32) -> Option<[f32; 4]> {
         '5' => [0.0, 1.0, 1.0],
         '6' => [1.0, 0.0, 1.0],
         '7' => [1.0, 1.0, 1.0],
-        '8' => [1.0, 0.62, 0.22],
-        '9' => [0.62, 0.62, 0.62],
+        // TaystJK shared/qcommon/q_color.c: g_color_table[8] and [9].
+        '8' => [1.0, 0.5, 0.0],
+        '9' => [0.5, 0.5, 0.5],
         _ => return None,
     };
     Some([rgb[0], rgb[1], rgb[2], alpha])
@@ -807,12 +871,244 @@ pub fn build_studio_label_vertices(
     if alpha <= 0.01 { return; }
     let scale = label.scale.clamp(0.3, 2.0);
     if let Some(font) = font {
-        let sx = width.max(1) as f32 / 640.0;
-        let text_width = proportional_text_width(&label.text, font, scale) * sx;
-        proportional_text(out, &label.text, font, x - text_width * 0.5, y, scale, [label.color[0],label.color[1],label.color[2],alpha], true, width, height);
+        let sy = height.max(1) as f32 / 480.0;
+        let text_width = proportional_text_width(&label.text, font, scale) * sy;
+        proportional_text_uniform(out, &label.text, font, x - text_width * 0.5, y, scale, [label.color[0],label.color[1],label.color[2],alpha], true, width, height);
     } else {
         let fallback = (1.25 * scale).max(0.25);
         let visible = crate::cgame::text_to_jka_bytes(&label.text).iter().filter(|&&c| c != b'^').count() as f32;
         text(out, &label.text, x - visible * 3.0 * fallback, y - 4.0 * fallback, fallback, [label.color[0],label.color[1],label.color[2],alpha], width, height);
+    }
+}
+
+
+/// Texture source of the clean TrueType UI font (`ui.wgsl` binding 8).
+pub(in crate::ui) const CLEAN_FONT_SOURCE: f32 = 8.0;
+
+/// Text for the redesigned surfaces (scoreboard, kill feed, player popup).
+/// Sizes are line heights in physical pixels. With the clean font loaded the
+/// glyphs scale uniformly, so text keeps its proportions on widescreen;
+/// without it, the JKA proportional font and then the charsgrid stand in.
+#[derive(Clone, Copy)]
+pub(in crate::ui) struct UiText<'a> {
+    clean: Option<&'a ProportionalFont>,
+    legacy: Option<&'a ProportionalFont>,
+    w: u32,
+    h: u32,
+}
+
+impl<'a> UiText<'a> {
+    pub(in crate::ui) fn new(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
+        Self { clean: ui.clean_font.as_deref(), legacy, w, h }
+    }
+
+    /// Render redesigned UI geometry with the original JKA small font.
+    pub(in crate::ui) fn legacy_only(legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
+        Self { clean: None, legacy, w, h }
+    }
+
+    fn legacy_scale(&self, font: &ProportionalFont, px: f32) -> f32 {
+        px / (f32::from(font.height.max(1)) * self.h.max(1) as f32 / 480.0)
+    }
+
+    fn charsgrid_scale(px: f32) -> f32 {
+        px / 12.0
+    }
+
+    /// Advance width of `value`, colour codes excluded.
+    pub(in crate::ui) fn width(&self, value: &str, px: f32) -> f32 {
+        if let Some(font) = self.clean {
+            let scale = px / f32::from(font.height.max(1));
+            let bytes = crate::cgame::text_to_jka_bytes(value);
+            let mut width = 0.0;
+            let mut index = 0;
+            while index < bytes.len() {
+                if bytes[index] == b'^' && index + 1 < bytes.len() && color_code(bytes[index + 1] as char, 1.0).is_some() {
+                    index += 2;
+                    continue;
+                }
+                width += f32::from(font.glyphs[bytes[index] as usize].horiz_advance.max(0)) * scale;
+                index += 1;
+            }
+            width
+        } else if let Some(font) = self.legacy {
+            proportional_text_width(value, font, self.legacy_scale(font, px)) * self.h.max(1) as f32 / 480.0
+        } else {
+            crate::ui::visible_jka_chars(value) as f32 * 6.0 * Self::charsgrid_scale(px)
+        }
+    }
+
+    /// Height of a capital letter, for centring a line on a box.
+    pub(in crate::ui) fn cap(&self, px: f32) -> f32 {
+        if let Some(font) = self.clean {
+            let glyph = font.glyphs[usize::from(b'H')];
+            (glyph.baseline as f32 - 2.0).max(1.0) * px / f32::from(font.height.max(1))
+        } else if let Some(font) = self.legacy {
+            f32::from(font.glyphs[usize::from(b'A')].height.max(1)) * self.legacy_scale(font, px) * self.h.max(1) as f32 / 480.0
+        } else {
+            8.0 * Self::charsgrid_scale(px)
+        }
+    }
+
+    /// Baseline that vertically centres capitals in `bounds`.
+    pub(in crate::ui) fn baseline_in(&self, bounds: [f32; 4], px: f32) -> f32 {
+        bounds[1] + (bounds[3] + self.cap(px)) * 0.5
+    }
+
+    pub(in crate::ui) fn draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        let (w, h) = (self.w, self.h);
+        if let Some(font) = self.clean {
+            let scale = px / f32::from(font.height.max(1));
+            let bytes = crate::cgame::text_to_jka_bytes(value);
+            // Soft one-pixel drop shadow, then the glyphs.
+            let shadow = (px / 22.0).clamp(1.0, 2.0);
+            for pass in [true, false] {
+                let mut cursor = x;
+                let mut active = color;
+                let mut index = 0;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    if byte == b'^' && index + 1 < bytes.len() {
+                        if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
+                            active = code;
+                            index += 2;
+                            continue;
+                        }
+                    }
+                    let glyph = font.glyphs[byte as usize];
+                    if glyph.width > 0 && glyph.height > 0 && byte != b' ' {
+                        let offset = if pass { shadow } else { 0.0 };
+                        let tint = if pass { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active };
+                        textured_rect_with_source(
+                            out,
+                            cursor + f32::from(glyph.horiz_offset) * scale + offset,
+                            baseline - glyph.baseline as f32 * scale + offset,
+                            f32::from(glyph.width) * scale,
+                            f32::from(glyph.height) * scale,
+                            [glyph.s, glyph.t],
+                            [glyph.s2, glyph.t2],
+                            tint,
+                            CLEAN_FONT_SOURCE,
+                            w,
+                            h,
+                        );
+                    }
+                    cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
+                    index += 1;
+                }
+            }
+        } else if let Some(font) = self.legacy {
+            proportional_text_uniform(out, value, font, x, baseline, self.legacy_scale(font, px), color, true, w, h);
+        } else {
+            let scale = Self::charsgrid_scale(px);
+            text(out, value, x, baseline - 8.0 * scale, scale, color, w, h);
+        }
+    }
+
+    pub(in crate::ui) fn draw_right(&self, out: &mut Vec<UiVertex>, value: &str, right: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        self.draw(out, value, right - self.width(value, px), baseline, px, color);
+    }
+
+    pub(in crate::ui) fn draw_centered(&self, out: &mut Vec<UiVertex>, value: &str, bounds: [f32; 4], px: f32, color: [f32; 4]) {
+        let x = bounds[0] + (bounds[2] - self.width(value, px)) * 0.5;
+        self.draw(out, value, x, self.baseline_in(bounds, px), px, color);
+    }
+}
+
+#[cfg(test)]
+mod widescreen_font_tests {
+    use super::*;
+
+    fn test_font() -> ProportionalFont {
+        let mut glyphs = [ProportionalGlyph::default(); 256];
+        for glyph in &mut glyphs {
+            glyph.width = 8;
+            glyph.height = 12;
+            glyph.horiz_advance = 9;
+            glyph.baseline = 10;
+            glyph.s2 = 1.0;
+            glyph.t2 = 1.0;
+        }
+        ProportionalFont { glyphs, point_size: 12, height: 12 }
+    }
+
+    fn x_bounds(out: &[UiVertex], w: u32) -> (f32, f32) {
+        let x = |v: &UiVertex| (v.position[0] + 1.0) * w as f32 * 0.5;
+        (out.iter().map(x).fold(f32::INFINITY, f32::min),
+         out.iter().map(x).fold(f32::NEG_INFINITY, f32::max))
+    }
+
+    #[test]
+    fn jka_hud_font_width_tracks_height_not_aspect_ratio() {
+        let font = test_font();
+        // The same glyph at the same height is equally wide on 4:3, 16:9
+        // and ultrawide screens; only its NDC coordinates differ.
+        for (w, h) in [(1280, 960), (1920, 1080), (2560, 1080), (1920, 700)] {
+            let mut out = Vec::new();
+            proportional_text_uniform(&mut out, "A", &font, 100.0, 80.0, 0.75,
+                [1.0; 4], false, w, h);
+            let (x0, x1) = x_bounds(&out, w);
+            let expected = 8.0 * 0.75 * h as f32 / 480.0;
+            assert!(((x1 - x0) - expected).abs() < 0.002, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn projected_player_name_stays_centered_in_widescreen() {
+        let font = test_font();
+        let label = UiWorldPlayerLabel {
+            anchor: [0.0; 3], text: "AA".into(), health_fraction: None,
+            health_color: [1.0; 4], crowned: false,
+        };
+        for (w, h) in [(640, 480), (1920, 1080), (2560, 1080)] {
+            let mut out = Vec::new();
+            build_world_player_label_vertices(&mut out, &label, w as f32 / 2.0, 120.0,
+                0.5, Some(&font), w, h);
+            // The glyph width is slightly smaller than advance. Shadow adds
+            // one pixel to the right; the computed center is advance-based.
+            let (x0, x1) = x_bounds(&out, w);
+            let center = (x0 + x1) / 2.0;
+            assert!((center - w as f32 / 2.0).abs() < 4.0, "{w}x{h}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod centerprint_parity_tests {
+    use super::*;
+
+    #[test]
+    fn color_escapes_match_taystjk_palette() {
+        assert_eq!(color_code('8', 0.4), Some([1.0, 0.5, 0.0, 0.4]));
+        assert_eq!(color_code('9', 0.4), Some([0.5, 0.5, 0.5, 0.4]));
+        assert_eq!(color_code('7', 0.4), Some([1.0, 1.0, 1.0, 0.4]));
+    }
+
+    #[test]
+    fn centerprint_shadow_uses_font_point_size_and_fade_alpha() {
+        let mut font = ProportionalFont {
+            glyphs: [ProportionalGlyph::default(); 256],
+            point_size: 24,
+            height: 24,
+        };
+        font.glyphs[b'A' as usize] = ProportionalGlyph {
+            width: 8,
+            height: 12,
+            horiz_advance: 9,
+            baseline: 12,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        proportional_centerprint_text(
+            &mut out, "^8A^9A", &font, 100.0, 150.0, 1.0,
+            [1.0, 1.0, 1.0, 0.4], 640, 480,
+        );
+        assert_eq!(out.len(), 24); // two glyphs, two passes, six vertices each
+        assert_eq!(out[0].color, [0.15, 0.15, 0.15, 0.4]);
+        assert_eq!(out[12].color, [1.0, 0.5, 0.0, 0.4]);
+        assert_eq!(out[18].color, [0.5, 0.5, 0.5, 0.4]);
+        // Round(24 * 1.0 * .075) = 2 virtual pixels.
+        assert!((out[0].position[0] - out[12].position[0] - (2.0 / 640.0 * 2.0)).abs() < 0.0001);
+        assert!((out[12].position[1] - out[0].position[1] - (2.0 / 480.0 * 2.0)).abs() < 0.0001);
     }
 }

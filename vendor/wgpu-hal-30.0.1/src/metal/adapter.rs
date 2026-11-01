@@ -186,6 +186,7 @@ impl crate::Adapter for super::Adapter {
             | Tfc::MULTISAMPLE_RESOLVE;
 
         let extra = match format {
+            Tf::Rgb565Unorm => Tfc::empty(),
             Tf::R8Unorm | Tf::R16Float | Tf::Rgba8Unorm | Tf::Rgba16Float => {
                 read_write_tier2_if | all_caps
             }
@@ -1618,6 +1619,7 @@ impl super::PrivateTextureFormatCapabilities {
             Tf::R16Snorm => MTL::R16Snorm,
             Tf::R16Float => MTL::R16Float,
             Tf::Rg8Unorm => MTL::RG8Unorm,
+            Tf::Rgb565Unorm => MTL::Invalid, // Metal has no packed RGB565 target.
             Tf::Rg8Snorm => MTL::RG8Snorm,
             Tf::Rg8Uint => MTL::RG8Uint,
             Tf::Rg8Sint => MTL::RG8Sint,

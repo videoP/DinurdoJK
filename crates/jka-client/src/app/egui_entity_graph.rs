@@ -21,12 +21,18 @@ const FLOW_LIMIT: usize = 80;
 const FLOW_COLUMN_W: f32 = 270.0;
 const FLOW_ROW_H: f32 = 64.0;
 const FLOW_NODE: Vec2 = Vec2::new(210.0, 44.0);
-const BLUEPRINT: Color32 = Color32::from_rgb(0x0B, 0x1E, 0x35);
-const GRID_MINOR: Color32 = Color32::from_rgba_premultiplied(0x10, 0x22, 0x36, 0x40);
-const GRID_MAJOR: Color32 = Color32::from_rgba_premultiplied(0x1B, 0x3A, 0x5C, 0x70);
-const LINK_DIM: Color32 = Color32::from_rgba_premultiplied(0x22, 0x36, 0x52, 0x50);
-const LINK_OUT: Color32 = Color32::from_rgb(0xFF, 0xA9, 0x40);
-const LINK_IN: Color32 = Color32::from_rgb(0x4F, 0xE0, 0xF0);
+#[allow(non_snake_case)]
+fn BLUEPRINT() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgb(0x0B, 0x1E, 0x35), Color32::from_rgb(0x17, 0x15, 0x12)) }
+#[allow(non_snake_case)]
+fn GRID_MINOR() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgba_premultiplied(0x10, 0x22, 0x36, 0x40), Color32::from_rgba_premultiplied(0x1C, 0x1A, 0x16, 0x40)) }
+#[allow(non_snake_case)]
+fn GRID_MAJOR() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgba_premultiplied(0x1B, 0x3A, 0x5C, 0x70), Color32::from_rgba_premultiplied(0x2E, 0x2A, 0x23, 0x70)) }
+#[allow(non_snake_case)]
+fn LINK_DIM() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgba_premultiplied(0x22, 0x36, 0x52, 0x50), Color32::from_rgba_premultiplied(0x2E, 0x2A, 0x23, 0x50)) }
+#[allow(non_snake_case)]
+fn LINK_OUT() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgb(0xFF, 0xA9, 0x40), Color32::from_rgb(0xE6, 0xC2, 0x6E)) }
+#[allow(non_snake_case)]
+fn LINK_IN() -> Color32 { crate::app::egui_theme::pick(Color32::from_rgb(0x4F, 0xE0, 0xF0), Color32::from_rgb(0xAF, 0xD5, 0xAA)) }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum GraphMode {
@@ -183,7 +189,7 @@ impl App {
     pub(super) fn egui_entity_graph(&mut self, root: &mut egui::Ui) {
         let Some(graph) = self.entity_graph.clone() else {
             egui::CentralPanel::default().show(root, |ui| {
-                theme::banner(ui, "No entity data for this map.", theme::WARNING);
+                theme::banner(ui, "No entity data for this map.", theme::WARNING());
                 if theme::ghost_button(ui, "CLOSE").clicked() {
                     self.set_overlay(OverlayMode::None);
                 }
@@ -205,7 +211,7 @@ impl App {
         self.entity_graph_list(root, &graph, &mut st);
         self.entity_graph_inspector(root, &graph, &mut st, can_teleport, can_use, &mut actions);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BLUEPRINT).inner_margin(egui::Margin::ZERO))
+            .frame(egui::Frame::new().fill(BLUEPRINT()).inner_margin(egui::Margin::ZERO))
             .show(root, |ui| match st.mode {
                 GraphMode::Plan => plan_canvas(ui, &graph, &mut st, player),
                 GraphMode::Flow => flow_canvas(ui, &graph, &mut st, can_use, &mut actions),
@@ -234,18 +240,18 @@ impl App {
             .exact_size(theme::TOP_BAR_H)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::CHROME)
+                    .fill(theme::CHROME())
                     .inner_margin(egui::Margin::symmetric(16, 0)),
             )
             .show(root, |ui| {
                 ui.horizontal_centered(|ui| {
-                    theme::glow_label(ui, "ENTITY BLUEPRINT", 15.0, theme::TEXT);
+                    theme::glow_label(ui, "ENTITY BLUEPRINT", 15.0, theme::TEXT());
                     theme::label(
                         ui,
                         theme::plain(
                             &format!("{} entities  {} links", graph.entities.len(), graph.links.len()),
                             11.5,
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         ),
                     );
                     ui.separator();
@@ -258,7 +264,7 @@ impl App {
                     match st.mode {
                         GraphMode::Plan => {
                             if let Some(footprint) = graph.footprint.as_ref().filter(|f| f.layers.len() > 1) {
-                                theme::label(ui, theme::plain("FLOOR", 11.0, theme::TEXT_FAINT));
+                                theme::label(ui, theme::plain("FLOOR", 11.0, theme::TEXT_FAINT()));
                                 if theme::chip(ui, "ALL", st.layer == 0).clicked() {
                                     st.layer = 0;
                                 }
@@ -311,7 +317,7 @@ impl App {
             .exact_size(26.0)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::CHROME)
+                    .fill(theme::CHROME())
                     .inner_margin(egui::Margin::symmetric(16, 0)),
             )
             .show(root, |ui| {
@@ -320,10 +326,10 @@ impl App {
                         GraphMode::Plan => "Drag: pan   Wheel: zoom   Click: select   ESC: close",
                         GraphMode::Flow => "Drag: pan   Wheel: zoom   Click: select and re-centre   USE chip: t_use that targetname   ESC: close",
                     };
-                    theme::label(ui, theme::plain(hint, 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(hint, 10.5, theme::TEXT_FAINT()));
                     if !st.status.is_empty() {
                         ui.separator();
-                        theme::label(ui, theme::plain(&st.status, 10.5, theme::ACCENT));
+                        theme::label(ui, theme::plain(&st.status, 10.5, theme::ACCENT()));
                     }
                 });
             });
@@ -335,7 +341,7 @@ impl App {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::SURFACE())
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show(root, |ui| {
@@ -369,7 +375,7 @@ impl App {
                 ui.add_space(6.0);
 
                 let rows = filtered_entities(graph, st);
-                theme::label(ui, theme::plain(&format!("{} shown", rows.len()), 10.5, theme::TEXT_FAINT));
+                theme::label(ui, theme::plain(&format!("{} shown", rows.len()), 10.5, theme::TEXT_FAINT()));
                 let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
                 if let Some(row) = st.scroll_list_to.take().and_then(|entity| rows.iter().position(|&r| r == entity)) {
                     scroll = scroll.vertical_scroll_offset(
@@ -385,8 +391,8 @@ impl App {
                             egui::Sense::click(),
                         );
                         let fill = match (selected, response.hovered()) {
-                            (true, _) => theme::CONTROL_SELECTED,
-                            (false, true) => theme::CONTROL_HOVER,
+                            (true, _) => theme::CONTROL_SELECTED(),
+                            (false, true) => theme::CONTROL_HOVER(),
                             (false, false) => Color32::TRANSPARENT,
                         };
                         let painter = ui.painter();
@@ -398,12 +404,12 @@ impl App {
                         );
                         let font = egui::FontId::proportional(12.0);
                         let class_galley =
-                            painter.layout_no_wrap(entity.classname.clone(), font.clone(), theme::TEXT);
+                            painter.layout_no_wrap(entity.classname.clone(), font.clone(), theme::TEXT());
                         let class_width = class_galley.size().x;
                         painter.galley(
                             Pos2::new(rect.left() + 10.0, rect.center().y - class_galley.size().y * 0.5),
                             class_galley,
-                            theme::TEXT,
+                            theme::TEXT(),
                         );
                         if !entity.targetname.is_empty() {
                             painter.with_clip_rect(rect).text(
@@ -411,7 +417,7 @@ impl App {
                                 egui::Align2::LEFT_CENTER,
                                 &entity.targetname,
                                 font,
-                                theme::TEXT_FAINT,
+                                theme::TEXT_FAINT(),
                             );
                         }
                         if response.clicked() {
@@ -437,21 +443,21 @@ impl App {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::SURFACE())
                     .inner_margin(egui::Margin::symmetric(12, 10)),
             )
             .show(root, |ui| {
                 let Some(index) = st.selected else {
-                    theme::label(ui, theme::plain("Nothing selected", 13.0, theme::TEXT_DIM));
+                    theme::label(ui, theme::plain("Nothing selected", 13.0, theme::TEXT_DIM()));
                     ui.add_space(4.0);
-                    wrapped(ui, "Click an entity on the plan or in the list. Arrows follow target / targetname.", theme::TEXT_FAINT);
+                    wrapped(ui, "Click an entity on the plan or in the list. Arrows follow target / targetname.", theme::TEXT_FAINT());
                     return;
                 };
                 let entity = &graph.entities[index];
                 let color = category_color(entity.category);
                 theme::label(ui, theme::plain(&entity.classname, 15.0, color));
                 if !entity.targetname.is_empty() {
-                    theme::label(ui, theme::plain(&format!("targetname  {}", entity.targetname), 12.5, theme::TEXT));
+                    theme::label(ui, theme::plain(&format!("targetname  {}", entity.targetname), 12.5, theme::TEXT()));
                 }
                 ui.add_space(6.0);
 
@@ -516,19 +522,19 @@ impl App {
                     });
                 });
                 if !can_teleport {
-                    wrapped(ui, "GO TO / LOOK AT need a local game (solo map).", theme::TEXT_FAINT);
+                    wrapped(ui, "GO TO / LOOK AT need a local game (solo map).", theme::TEXT_FAINT());
                 }
                 if !can_use {
                     wrapped(
                         ui,
                         "USE sends t_use to a connected server (cheats must be enabled). The solo shim has no game module to fire targets.",
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     );
                 }
                 ui.add_space(8.0);
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    theme::label(ui, theme::plain("LOCATION", 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain("LOCATION", 10.5, theme::TEXT_FAINT()));
                     if entity.positioned {
                         info_row(
                             ui,
@@ -545,30 +551,30 @@ impl App {
                     ui.add_space(8.0);
 
                     let outgoing = &graph.outgoing[index];
-                    theme::label(ui, theme::plain(&format!("TARGETS  ({})", outgoing.len() + entity.dangling.len()), 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(&format!("TARGETS  ({})", outgoing.len() + entity.dangling.len()), 10.5, theme::TEXT_FAINT()));
                     for &link in outgoing {
                         let link = graph.links[link];
-                        link_row(ui, graph, st, link.to, link.key, LINK_OUT, "->", can_use.then_some(&mut *actions));
+                        link_row(ui, graph, st, link.to, link.key, LINK_OUT(), "->", can_use.then_some(&mut *actions));
                     }
                     for (key, value) in &entity.dangling {
                         theme::label(
                             ui,
-                            theme::plain(&format!("x  {key}  \"{value}\"  (no entity has that targetname)"), 11.5, theme::DANGER),
+                            theme::plain(&format!("x  {key}  \"{value}\"  (no entity has that targetname)"), 11.5, theme::DANGER()),
                         );
                     }
                     ui.add_space(8.0);
 
                     let incoming = &graph.incoming[index];
-                    theme::label(ui, theme::plain(&format!("TARGETED BY  ({})", incoming.len()), 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(&format!("TARGETED BY  ({})", incoming.len()), 10.5, theme::TEXT_FAINT()));
                     for &link in incoming {
                         let link = graph.links[link];
-                        link_row(ui, graph, st, link.from, link.key, LINK_IN, "<-", None);
+                        link_row(ui, graph, st, link.from, link.key, LINK_IN(), "<-", None);
                     }
                     ui.add_space(8.0);
 
                     theme::label(
                         ui,
-                        theme::plain(&format!("KEYS  ({})", entity.properties.len()), 10.5, theme::TEXT_FAINT),
+                        theme::plain(&format!("KEYS  ({})", entity.properties.len()), 10.5, theme::TEXT_FAINT()),
                     );
                     for (key, value) in &entity.properties {
                         info_row(ui, key, value);
@@ -644,8 +650,8 @@ pub(super) fn wrapped(ui: &mut egui::Ui, text: &str, color: Color32) {
 pub(super) fn info_row(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        theme::label(ui, theme::plain(key, 11.5, theme::TEXT_FAINT));
-        theme::label(ui, theme::plain(value, 11.5, theme::TEXT));
+        theme::label(ui, theme::plain(key, 11.5, theme::TEXT_FAINT()));
+        theme::label(ui, theme::plain(value, 11.5, theme::TEXT()));
     });
 }
 
@@ -824,7 +830,7 @@ fn plan_canvas(ui: &mut egui::Ui, graph: &EntityGraph, st: &mut EntityGraphUi, p
     }
     let world_min = view.to_world(rect.left_bottom());
     let world_max = view.to_world(rect.right_top());
-    for (step, color) in [(spacing, GRID_MINOR), (spacing * 4.0, GRID_MAJOR)] {
+    for (step, color) in [(spacing, GRID_MINOR()), (spacing * 4.0, GRID_MAJOR())] {
         let mut x = (world_min[0] / step).floor() * step;
         while x <= world_max[0] {
             let screen = view.to_screen(x, 0.0).x;
@@ -923,11 +929,11 @@ fn plan_canvas(ui: &mut egui::Ui, graph: &EntityGraph, st: &mut EntityGraphUi, p
             continue;
         }
         if touches {
-            let color = if selected == Some(link.from) { LINK_OUT } else { LINK_IN };
+            let color = if selected == Some(link.from) { LINK_OUT() } else { LINK_IN() };
             painter.line_segment([a, b], Stroke::new(1.8_f32, color));
             arrow_head(&painter, a, b, 10.0, color);
         } else {
-            painter.line_segment([a, b], Stroke::new(1.0_f32, LINK_DIM));
+            painter.line_segment([a, b], Stroke::new(1.0_f32, LINK_DIM()));
         }
     }
 
@@ -994,10 +1000,10 @@ fn plan_canvas(ui: &mut egui::Ui, graph: &EntityGraph, st: &mut EntityGraphUi, p
             continue;
         }
         let text = entity_line(entity);
-        let galley = painter.layout_no_wrap(text, font.clone(), theme::TEXT);
+        let galley = painter.layout_no_wrap(text, font.clone(), theme::TEXT());
         let label_rect = Rect::from_min_size(at + egui::vec2(8.0, -7.0), galley.size()).expand2(egui::vec2(3.0, 1.0));
-        painter.rect_filled(label_rect, egui::CornerRadius::ZERO, Color32::from_rgba_unmultiplied(6, 14, 26, 210));
-        painter.galley(label_rect.min + egui::vec2(3.0, 1.0), galley, theme::TEXT);
+        painter.rect_filled(label_rect, egui::CornerRadius::ZERO, crate::app::egui_theme::pick(Color32::from_rgba_unmultiplied(6, 14, 26, 210), Color32::from_rgba_unmultiplied(0x14, 0x12, 0x10, 210)));
+        painter.galley(label_rect.min + egui::vec2(3.0, 1.0), galley, theme::TEXT());
     }
 
     if let Some((at, yaw)) = player {
@@ -1057,7 +1063,7 @@ fn flow_canvas(
             egui::Align2::CENTER_CENTER,
             "Select an entity to see what triggers it and what it triggers.",
             egui::FontId::proportional(14.0),
-            theme::TEXT_DIM,
+            theme::TEXT_DIM(),
         );
         return;
     };
@@ -1068,7 +1074,7 @@ fn flow_canvas(
             egui::Align2::CENTER_CENTER,
             "This entity has no target links.",
             egui::FontId::proportional(14.0),
-            theme::TEXT_DIM,
+            theme::TEXT_DIM(),
         );
         return;
     }
@@ -1120,11 +1126,11 @@ fn flow_canvas(
         let (start, end) = (a.right_center(), b.left_center());
         let touches = link.from == root || link.to == root;
         let color = if link.from == root {
-            LINK_OUT
+            LINK_OUT()
         } else if link.to == root {
-            LINK_IN
+            LINK_IN()
         } else {
-            Color32::from_rgba_unmultiplied(120, 170, 220, 170)
+            crate::app::egui_theme::pick(Color32::from_rgba_unmultiplied(120, 170, 220, 170), Color32::from_rgba_unmultiplied(0xA6, 0x9F, 0x98, 170))
         };
         let reach = ((end.x - start.x).abs() * 0.5).max(40.0 * view.zoom);
         painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
@@ -1163,7 +1169,7 @@ fn flow_canvas(
         painter.rect_filled(
             node,
             egui::CornerRadius::same(3),
-            if over { Color32::from_rgb(0x1A, 0x33, 0x52) } else { Color32::from_rgb(0x10, 0x27, 0x44) },
+            if over { theme::CONTROL_HOVER() } else { theme::CONTROL() },
         );
         painter.rect_stroke(
             node,
@@ -1186,7 +1192,7 @@ fn flow_canvas(
             painter.rect_filled(
                 chip,
                 egui::CornerRadius::same(2),
-                if chip_hot { theme::ACCENT_HOVER } else { theme::ACCENT_DEEP },
+                if chip_hot { theme::ACCENT_HOVER() } else { theme::ACCENT_DEEP() },
             );
             painter.text(
                 chip.center(),
@@ -1210,9 +1216,9 @@ fn flow_canvas(
                 color,
             );
             let (second, second_color) = if entity.targetname.is_empty() {
-                ("(no targetname)", theme::TEXT_DISABLED)
+                ("(no targetname)", theme::TEXT_DISABLED())
             } else {
-                (entity.targetname.as_str(), theme::TEXT)
+                (entity.targetname.as_str(), theme::TEXT())
             };
             clip.text(
                 node.left_top() + Vec2::new(inset, 23.0 * view.zoom),

@@ -30,6 +30,29 @@ pub fn prepare_physics_collision(
     Ok(bsp_physics_collision_mesh(&bsp, &mesh))
 }
 
+/// Riverbed triangles for the developer river source: the current map's
+/// collision geometry (`jka_assets::bsp::river::collision_triangles`).
+/// Re-reads the BSP; callers cache the result per map.
+pub fn river_collision_triangles(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    allow_asset_overrides: bool,
+) -> Result<Vec<jka_assets::bsp::river::CollisionSurface>, String> {
+    let MapSource::Bsp(name) = source else {
+        return Err("river sources need a compiled BSP map".into());
+    };
+    let asset_name = map_asset_name(name, "bsp")?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
+    assets.set_allow_asset_overrides(allow_asset_overrides);
+    let asset = assets
+        .read(&asset_name, MAX_FILE_BYTES)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Map {asset_name} not found on the game/base asset search path"))?;
+    let bsp = Bsp::parse(&asset.bytes).map_err(|error| error.to_string())?;
+    jka_assets::bsp::river::collision_surfaces(&bsp)
+}
+
 pub(in crate::scene) fn bsp_physics_collision_mesh(
     bsp: &Bsp,
     mesh: &jka_assets::bsp::Mesh,

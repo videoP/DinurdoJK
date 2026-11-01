@@ -78,7 +78,7 @@ impl App {
             ui.painter(),
             arrow.center(),
             if open { Icon::ChevronDown } else { Icon::ChevronRight },
-            if hovered { theme::TEXT } else { theme::TEXT_FAINT },
+            if hovered { theme::TEXT() } else { theme::TEXT_FAINT() },
         );
         if !locked
             && ui
@@ -110,7 +110,7 @@ impl App {
             self.render_studio.selected_background = false;
         }
         label.on_hover_text("Select the track to rename, reorder and set its volume in the Inspector");
-        for (letter, at, value, color) in [("M", 50.0, mute, theme::WARNING), ("S", 26.0, solo, sui::AUDIO)] {
+        for (letter, at, value, color) in [("M", 50.0, mute, theme::WARNING()), ("S", 26.0, solo, sui::AUDIO)] {
             let r = egui::Rect::from_center_size(egui::pos2(header_right - at, y + h * 0.5), egui::vec2(20.0, 18.0));
             let hovered = !locked && ui.rect_contains_pointer(r);
             ui.painter().rect_filled(
@@ -119,9 +119,9 @@ impl App {
                 if value {
                     color.gamma_multiply(0.85)
                 } else if hovered {
-                    theme::CONTROL_HOVER
+                    theme::CONTROL_HOVER()
                 } else {
-                    theme::CONTROL
+                    theme::CONTROL()
                 },
             );
             ui.painter().text(
@@ -129,7 +129,7 @@ impl App {
                 egui::Align2::CENTER_CENTER,
                 letter,
                 egui::FontId::proportional(10.5),
-                if value { sui::WELL } else { theme::TEXT_DIM },
+                if value { sui::WELL() } else { theme::TEXT_DIM() },
             );
             if !locked {
                 let response = ui
@@ -199,7 +199,7 @@ impl App {
                         if selected {
                             egui::Color32::WHITE
                         } else {
-                            theme::LINE
+                            theme::LINE()
                         },
                     ),
                     egui::StrokeKind::Inside,

@@ -92,6 +92,7 @@ pub(in crate::renderer) fn fx_runs<'a>(
                     || next.alpha_mode != first.alpha_mode
                     || next.wireframe_class != first.wireframe_class
                     || next.authored_glow != first.authored_glow
+                    || next.lightning != first.lightning
                 {
                     break;
                 }
@@ -221,7 +222,16 @@ mod tests {
             alpha_mode: DynamicModelAlphaMode::Additive,
             wireframe_class: DynamicWireframeClass::Effect,
             authored_glow: false,
+            lightning: false,
         }
+    }
+
+    #[test]
+    fn lightning_never_merges_with_six_vertex_sprites() {
+        let a = sprite(1, 0);
+        let mut b = sprite(1, 2);
+        b.lightning = true;
+        assert_eq!(fx_runs([&a, &b].into_iter(), true).count(), 2);
     }
 
     #[test]

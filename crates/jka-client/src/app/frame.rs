@@ -165,6 +165,9 @@ impl App {
             && self.japro_cg.spec_hud
             && (self.demo_playback_active() || self.live_spec_hud_eligible())
         {
+            // Restriction bits come from live (or recorded demo) CS_SERVERINFO.
+            // Read them once per active specHud snapshot; never when disabled.
+            let restrictions = self.server_restrictions();
             self.game_session.as_ref().map_or_else(
                 || Arc::new(Vec::new()),
                 |session| {
@@ -203,19 +206,22 @@ impl App {
                                     // TaystJK cg_specHud deliberately excludes racers.
                                     && entity.state.field_i32("bolt1").unwrap_or(0) != 2
                             })
-                            .map(|entity| {
+                            .filter_map(|entity| {
                                 let team = session
                                     .client_game
                                     .client_info(usize::from(entity.number), &session.siege_classes)
-                                    .map_or(0, |info| info.team);
-                                SpectatorHighlight {
+                                    .map(|info| info.team);
+                                if !restrictions.allows_spec_hud_team(team) {
+                                    return None;
+                                }
+                                Some(SpectatorHighlight {
                                     entity_num: entity.number,
                                     team: match team {
-                                        crate::cgame::TEAM_RED => SpectatorHighlightTeam::Red,
-                                        crate::cgame::TEAM_BLUE => SpectatorHighlightTeam::Blue,
+                                        Some(crate::cgame::TEAM_RED) => SpectatorHighlightTeam::Red,
+                                        Some(crate::cgame::TEAM_BLUE) => SpectatorHighlightTeam::Blue,
                                         _ => SpectatorHighlightTeam::Yellow,
                                     },
-                                }
+                                })
                             })
                             .collect(),
                     )
@@ -589,6 +595,11 @@ impl App {
         let team_overlay = self.team_overlay_ui();
         let scoreboard = self.visible_scoreboard();
         let scoreboard_focus_client = self.scoreboard_focus_client();
+        let killfeed = if self.overlay == OverlayMode::HudEdit {
+            self.killfeed_ui().or_else(|| self.killfeed_sample_ui())
+        } else {
+            self.killfeed_ui()
+        };
         let force_select = self.force_select_ui(Instant::now());
         let weapon_select = self.weapon_select_ui(Instant::now());
         let inventory_select = self.inventory_select_ui(Instant::now());
@@ -623,8 +634,11 @@ impl App {
             enemy_info: self.enemy_info_ui(),
             race_timer,
             vote_line,
+            siege_hud: self.siege_hud_ui(),
             scoreboard,
             scoreboard_focus_client,
+            killfeed,
+            chat_anim: self.chat_anim_ui(Instant::now()),
             speedometer,
             lagometer: self.current_lagometer_ui(),
             team_overlay,

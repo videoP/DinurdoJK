@@ -17,17 +17,17 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(24))
                     .show(ui, |ui| {
                         ui.set_width(460.0);
                         theme::page_title(ui, "SERVER PASSWORD", "Enter the password to connect.");
                         ui.add_space(8.0);
-                        theme::label(ui, theme::plain(&prompt.target, 11.5, theme::TEXT_DIM));
+                        theme::label(ui, theme::plain(&prompt.target, 11.5, theme::TEXT_DIM()));
                         if let Some(message) = prompt.message.as_deref() {
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new(message).color(theme::WARNING));
+                            ui.label(egui::RichText::new(message).color(theme::WARNING()));
                         }
                         ui.add_space(14.0);
                         let response = ui.add_sized(
@@ -78,16 +78,16 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(24))
                     .show(ui, |ui| {
                         ui.set_width(560.0);
                         theme::page_title(ui, "MAP NOT FOUND", "The server uses a map that is not installed locally.");
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT));
+                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT()));
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM()));
                         ui.add_space(16.0);
                         ui.label("Choose how to continue:");
                         ui.add_space(10.0);
@@ -95,7 +95,7 @@ impl App {
                             if can_auto { choice = Some(Choice::Download); }
                         }
                         if !can_auto {
-                            ui.label(egui::RichText::new("Autodownload is disabled in Setup > Network.").color(theme::WARNING));
+                            ui.label(egui::RichText::new("Autodownload is disabled in Setup > Network.").color(theme::WARNING()));
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -110,7 +110,7 @@ impl App {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new(
                             "HTTP is preferred when advertised by the server; legacy JKA download is the fallback when enabled."
-                        ).small().color(theme::TEXT_DIM));
+                        ).small().color(theme::TEXT_DIM()));
                     });
             });
         match choice {
@@ -136,8 +136,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(24))
                     .show(ui, |ui| {
                         ui.set_width(560.0);
@@ -147,13 +147,13 @@ impl App {
                             "This demo was recorded on a map that is not installed locally.",
                         );
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT));
+                        ui.label(egui::RichText::new(&prompt.map_name).size(22.0).strong().color(theme::TEXT()));
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new(&prompt.reason).color(theme::TEXT_DIM()));
                         ui.add_space(16.0);
                         ui.label(egui::RichText::new(
                             "You can still play the recorded snapshots, but world geometry and map-dependent effects may be missing."
-                        ).color(theme::TEXT));
+                        ).color(theme::TEXT()));
                         ui.add_space(12.0);
                         if theme::primary_button(ui, "CONTINUE ANYWAY").clicked() {
                             choice = Some(Choice::Continue);
@@ -284,8 +284,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(28))
                     .show(ui, |ui| {
                         ui.set_width(620.0);
@@ -299,9 +299,9 @@ impl App {
                             egui::RichText::new(phase)
                                 .size(21.0)
                                 .strong()
-                                .color(theme::TEXT),
+                                .color(theme::TEXT()),
                         );
-                        ui.label(egui::RichText::new(detail).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new(detail).color(theme::TEXT_DIM()));
                         ui.add_space(16.0);
 
                         let overall_text =
@@ -310,7 +310,7 @@ impl App {
 
                         if let Some(line) = package_line {
                             ui.add_space(14.0);
-                            ui.label(egui::RichText::new(line).strong().color(theme::TEXT));
+                            ui.label(egui::RichText::new(line).strong().color(theme::TEXT()));
                         } else {
                             ui.add_space(14.0);
                         }
@@ -331,7 +331,7 @@ impl App {
                                 ["CONTENT", "SYNC", "MAP", "ENTER"].iter().enumerate()
                             {
                                 if index > 0 {
-                                    ui.label(egui::RichText::new("  ›  ").color(theme::TEXT_DIM));
+                                    ui.label(egui::RichText::new("  ›  ").color(theme::TEXT_DIM()));
                                 }
                                 let active = match phase {
                                     "CHECKING CONTENT" | "DOWNLOADING CONTENT" => index == 0,
@@ -342,9 +342,9 @@ impl App {
                                 };
                                 let text = egui::RichText::new(*label).small();
                                 ui.label(if active {
-                                    text.strong().color(theme::TEXT)
+                                    text.strong().color(theme::TEXT())
                                 } else {
-                                    text.color(theme::TEXT_DIM)
+                                    text.color(theme::TEXT_DIM())
                                 });
                             }
                         });
@@ -381,8 +381,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(24))
                     .show(ui, |ui| {
                         ui.set_width(560.0);
@@ -390,7 +390,7 @@ impl App {
                         ui.add_space(10.0);
                         ui.label(egui::RichText::new(format!("Package {file_index} / {file_count}")).strong());
                         ui.label(&file_name);
-                        ui.label(egui::RichText::new(status).small().color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new(status).small().color(theme::TEXT_DIM()));
                         ui.add_space(8.0);
                         let text = if let Some(total) = total {
                             format!("{:.1} / {:.1} MiB", received as f64 / 1_048_576.0, total as f64 / 1_048_576.0)
@@ -401,7 +401,7 @@ impl App {
                         if fraction.is_none() { bar = bar.animate(true); }
                         ui.add(bar);
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new("Downloaded PK3s are installed as dl_*.pk3 and the client requests a fresh gamestate before loading the world.").small().color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("Downloaded PK3s are installed as dl_*.pk3 and the client requests a fresh gamestate before loading the world.").small().color(theme::TEXT_DIM()));
                     });
             });
     }

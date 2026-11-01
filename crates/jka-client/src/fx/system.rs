@@ -10,7 +10,17 @@ use super::{
     template::*,
 };
 use jka_movement::{TraceQuery, TraceWorld};
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, atomic::{AtomicU8, Ordering}}};
+
+/// 0 = stock TaystJK; 1 = GPU-vertex ribbon; 2 = BSP-aware compute ribbons.
+/// Session-local A/B. Only exact force/lightning( wide) effect trees opt in.
+static FORCE_LIGHTNING_STYLE: AtomicU8 = AtomicU8::new(2);
+static FORCE_FX_SAMPLE_FPS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(crate::fx::FX_FPS_DEFAULT);
+pub fn force_fx_sample_fps() -> u32 { FORCE_FX_SAMPLE_FPS.load(Ordering::Relaxed) }
+pub fn set_force_fx_sample_fps(fps: u32) { FORCE_FX_SAMPLE_FPS.store(fps, Ordering::Relaxed); }
+pub fn force_lightning_style() -> u8 { FORCE_LIGHTNING_STYLE.load(Ordering::Relaxed) }
+pub fn set_force_lightning_style(style: u8) { FORCE_LIGHTNING_STYLE.store(style.min(2), Ordering::Relaxed); }
 
 pub type EffectId = u32; // 0 = none, like OpenJK handles
 
@@ -39,6 +49,8 @@ pub enum FxClass {
     #[default]
     General,
     SaberImpact,
+    /// Authored Force Lightning tree; never applied to drain or arbitrary EFX.
+    ForceLightning,
     /// Stable ET_FX source. Descendant/death/emitter effects inherit this class.
     MapRunner(u16),
 }
@@ -78,6 +90,8 @@ struct AutoLightRuntime {
 /// One live primitive (CParticle/CLine/CTail/... state).
 #[derive(Clone, Debug)]
 struct Primitive {
+    /// Stable particle identity for snapshot interpolation (independent of GPU ownership).
+    visual_id: u64,
     /// GPU candidate identity, assigned at birth only for semantically safe sprites.
     gpu_id: Option<u64>,
     /// Immutable birth parameters retained for rare CPU handback after an
@@ -169,6 +183,11 @@ pub enum FxDraw {
     Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
     Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: String },
+    /// GPU-procedural, view-facing electricity ribbon. Its endpoint and authored
+    /// material come from the EFX/trace; only cosmetic intermediate vertices
+    /// are generated in the shader (24 steps, branching, core + corona).
+    Lightning { start: [f32; 3], end: [f32; 3], width: f32, chaos: f32,
+        seed: f32, rgba: [u8; 4], shader: String },
     /// Arbitrary two-sided textured quad. OpenJK saber trails use exactly this
     /// shape to connect the current blade base/tip to the previous sample.
     Quad { positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4], rgba: [u8; 4], shader: String },
@@ -268,7 +287,7 @@ pub struct FxBlade {
     pub radius: f32,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct FxFrame {
     pub draws: Vec<FxDraw>,
     /// Only newly spawned author-written decal primitives, not persistent draws.
@@ -283,6 +302,9 @@ pub struct FxFrame {
     /// `(draw_index, stable_particle_id)` for ordinary CPU sprite fallbacks.
     /// The app promotes these by material and leaves every unaccepted draw intact.
     pub gpu_sprite_draw_indices: Vec<(usize, u64)>,
+    /// Stable IDs for authored CPU particle draws. Indexes refer only to `draws`;
+    /// interpolation must never touch one-shot events or render-frame saber FX.
+    pub particle_draw_ids: Vec<(usize, u64)>,
     pub blades: Vec<FxBlade>,
     pub lights: Vec<FxLight>,
     /// Material-aware second-stage candidates for inferred lights. These are
@@ -419,6 +441,7 @@ pub struct FxSystem {
     gpu_staging: bool,
     gpu_generation: u64,
     gpu_next_id: u64,
+    next_visual_id: u64,
     gpu_pending_reset: bool,
     gpu_pending_spawns: Vec<super::gpu_sparks::GpuSparkSpawn>,
     /// Only IDs accepted by the material resolver AND compiled resident PSOs.
@@ -467,6 +490,7 @@ impl FxSystem {
             gpu_staging: false,
             gpu_generation: 0,
             gpu_next_id: 0,
+            next_visual_id: 0,
             gpu_pending_reset: false,
             gpu_pending_spawns: Vec::new(),
             gpu_owned: HashSet::new(),
@@ -655,6 +679,18 @@ impl FxSystem {
         self.real_time = self.frame_time as f32 * 0.001;
     }
 
+    /// Frame sampling cadence may be slower than AdjustTime's per-event
+    /// clock. Use the last completed FX tick for physics/scheduler integration
+    /// while preserving each PlayEffect command's original timestamp.
+    pub fn set_tick_span(&mut self, previous_tick: Option<i32>) {
+        let previous = previous_tick.unwrap_or(self.time).min(self.time);
+        self.old_time = previous;
+        self.frame_time = self.time.saturating_sub(previous);
+        self.real_time = self.frame_time as f32 * 0.001;
+    }
+
+    pub fn time_ms(&self) -> i32 { self.time }
+
     /// CFxScheduler::PlayEffect(id, origin, forward).
     pub fn play_effect_dir(&mut self, id: EffectId, origin: [f32; 3], forward: [f32; 3]) {
         self.play_effect_dir_class(id, origin, forward, FxClass::General);
@@ -680,6 +716,13 @@ impl FxSystem {
         let Some(effect) = (id as usize).checked_sub(1).and_then(|index| self.effects.get(index)) else {
             return;
         };
+        // Only the named stock Force Lightning roots are upgraded. Child
+        // effects inherit their owner, so modded EFX remain under their
+        // original material, collision and event/trace semantics.
+        let class = if class == FxClass::General && matches!(effect.template.name.as_str(),
+            "force/lightning" | "force/lightningwide") {
+            FxClass::ForceLightning
+        } else { class };
         let lod = self.lod;
         let count_per_prim: Vec<(usize, i32, f32, bool)> = effect
             .template
@@ -695,6 +738,15 @@ impl FxSystem {
                     &mut self.lod_culled,
                     &mut self.lod_saved,
                 )?;
+                // Modern ribbon layers replace authored line populations. Keep
+                // only one geometric conductor per authored source primitive;
+                // additional lines here multiply visually without adding detail.
+                // Do not thin particles, lights, impact FX or stock mode.
+                let count = if class == FxClass::ForceLightning
+                    && force_lightning_style() >= 1
+                    && matches!(prim.kind, PrimType::Line | PrimType::Electricity) {
+                    count.min(1)
+                } else { count };
                 let even = prim.spawn_flags & FX_EVEN_DISTRIBUTION != 0;
                 let factor = if even {
                     (prim.spawn_delay.max - prim.spawn_delay.min).abs() / count.max(1) as f32
@@ -834,7 +886,8 @@ impl FxSystem {
                 }
                 prim.gpu_sleeping = false;
             }
-            let visible = saber_impact_fx || prim.class != FxClass::SaberImpact;
+            let visible = crate::fx::render_enabled()
+                && (saber_impact_fx || prim.class != FxClass::SaberImpact);
             let world = collision.as_deref_mut().map(|world| world as &mut dyn TraceWorld);
             let first_draw = if TRACK_RUNNERS { out.draws.len() } else { 0 };
             let alive = update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible, physics_mode, world);
@@ -1131,6 +1184,7 @@ impl FxSystem {
         let alpha = (fx.alpha_start.get(rng), fx.alpha_end.get(rng), parm(fx.alpha_parm.get(rng), FX_ALPHA_SHIFT));
         let rgb_parm = parm(fx.rgb_parm.get(rng), FX_RGB_SHIFT);
         let mut primitive = Primitive {
+            visual_id: self.next_visual_id,
             gpu_id: None,
             gpu_spawn: None,
             gpu_sleeping: false,
@@ -1175,6 +1229,7 @@ impl FxSystem {
             self.dropped += 1;
             return;
         }
+        self.next_visual_id = self.next_visual_id.wrapping_add(1);
         if self.gpu_staging {
             // No silent promotion yet. This is intentionally a staging stream
             // while the stock FX simulation and drawing remain unchanged.
@@ -1292,7 +1347,7 @@ fn update_primitive(
             }
         }
         _ => {
-            let shader = prim.shader.clone().unwrap_or_default();
+            let shader = if visible { prim.shader.clone().unwrap_or_default() } else { String::new() };
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgba = rgba_at(prim, time, rng);
             if visible && !shader.is_empty() {
@@ -1325,6 +1380,7 @@ fn update_primitive(
                 PrimType::Particle => {
                     rotate(prim, frame_time);
                     if visible {
+                        out.particle_draw_ids.push((out.draws.len(), prim.visual_id));
                         if let Some(id) = prim.gpu_id {
                             out.gpu_sprite_draw_indices.push((out.draws.len(), id));
                         }
@@ -1335,6 +1391,7 @@ fn update_primitive(
                     rotate(prim, frame_time);
                     if visible {
                         let (right, up) = make_normal_vectors(prim.normal);
+                        out.particle_draw_ids.push((out.draws.len(), prim.visual_id));
                         out.draws.push(FxDraw::OrientedQuad {
                             shader_time,
                             origin: prim.origin,
@@ -1343,6 +1400,22 @@ fn update_primitive(
                             rotation: prim.rotation,
                             rgba,
                             shader,
+                        });
+                    }
+                }
+                PrimType::Line | PrimType::Electricity if prim.class == FxClass::ForceLightning
+                    && force_lightning_style() >= 1 => {
+                    // One immutable, authored endpoint pair replaces dozens of
+                    // short CPU-created segments. No gameplay or trace changes.
+                    // Keep seed stable for the primitive's life, not per-frame
+                    // RNG flicker; GPU shader animates the discharge instead.
+                    if visible && distance_squared(prim.origin, prim.origin2) > 1.0 {
+                        out.draws.push(FxDraw::Lightning {
+                            start: prim.origin, end: prim.origin2,
+                            width: radius.max(0.15), chaos: prim.elasticity,
+                            seed: (prim.time_start as f32 * 0.127 + prim.origin[0] * 0.037
+                                + prim.origin[1] * 0.053 + prim.origin[2] * 0.019).fract().abs(),
+                            rgba, shader,
                         });
                     }
                 }
@@ -1708,6 +1781,49 @@ fn angles_to_axis(angles: [f32; 3]) -> Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limited_frame_span_uses_previous_simulation_tick() {
+        let mut fx = FxSystem::new();
+        fx.adjust_time(1000);
+        fx.set_tick_span(None);
+        assert_eq!(fx.frame_time, 0);
+        fx.adjust_time(1001);
+        fx.adjust_time(1004);
+        fx.adjust_time(1011);
+        // Without this override the last AdjustTime would incorrectly leave
+        // only 7 ms of physics integration for an 11 ms sampled FX tick.
+        fx.set_tick_span(Some(1000));
+        assert_eq!(fx.frame_time, 11);
+        assert!((fx.real_time - 0.011).abs() < 1.0e-6);
+        fx.adjust_time(1012);
+        fx.set_tick_span(Some(1011));
+        assert_eq!(fx.frame_time, 1);
+    }
+
+    #[test]
+    fn rate_limited_emitter_still_spawns_after_repeated_display_millisecond() {
+        // Mimic an interactive 90 Hz FX tick while the renderer presents
+        // multiple frames whose integer cg.time happens to be identical.
+        const STEAM: &str = "Particle\n{\nlife 700\nshaders\n[\ngfx/misc/steam\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/steam", &mut read_fixture(&[("effects/test/steam.efx", STEAM)]));
+        assert_ne!(id, 0);
+        fx.adjust_time(1000);
+        fx.set_tick_span(None);
+        fx.frame();
+        fx.adjust_time(1011);
+        fx.set_tick_span(Some(1000));
+        fx.frame();
+        fx.adjust_time(1012);
+        fx.adjust_time(1012);
+        assert_eq!(fx.frame_time, 0, "repeated display millisecond was observed");
+        // This is the worker PlayDir fix: the event uses elapsed time since
+        // the last simulation tick, not the just-repeated display time.
+        fx.set_tick_span(Some(1011));
+        fx.play_effect_dir(id, [0.0; 3], [0.0, 0.0, 1.0]);
+        assert_eq!(fx.active.len(), 1, "repeating map smoke must not be lost");
+    }
 
     fn read_fixture(files: &'static [(&'static str, &'static str)]) -> impl FnMut(&str) -> Option<Vec<u8>> {
         move |path| files.iter().find(|(name, _)| *name == path).map(|(_, body)| body.as_bytes().to_vec())

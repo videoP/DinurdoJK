@@ -1,5 +1,6 @@
 //! Frame draw.
 use crate::renderer::diagnostics::tile_cost;
+use crate::renderer::{competitive_probe as probe, competitive_probe_mask};
 use crate::renderer::{
     wireframe_cull_slot,
     world_stage_probe_excludes, aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
@@ -18,18 +19,97 @@ use crate::renderer::{
     WorldPipelineBinding, is_sky_cloud_stage,
     PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PvsMode, RenderError,
     Renderer, SpectatorHighlight, SunVisibilityMode, TcGen, TransientLight, Vec3, ViewLatchMode, WorldBatch,
-    WorldBatchSet, WorldRenderPath, WorldShaderFamily, CLOUD_INTERLEAVE_GRID, CLUSTER_COUNT,
+    WorldBatchSet, WorldShaderFamily, CLOUD_INTERLEAVE_GRID, CLUSTER_COUNT,
     ENTITY_SHADOW_CAMERAS, PLANAR_REFLECTION_SLOTS, SHADOW_CASCADES,
 };
 use bytemuck::Zeroable;
 use crate::renderer::world::inline_models::sky_portal_inline_eligible;
+use crate::renderer::lighting::local_shadows::ClipFrustum;
 use crate::renderer::lighting::shadow_resources::{CachedStaticCascade, padded_static_shadow_matrix, static_shadow_covers_camera};
+
+/// Return whether the main world color attachment must be loaded instead of
+/// cleared. Mode 2 intentionally permits undefined/HOM-like pixels in void
+/// regions (WGPU swapchain contents are not guaranteed to survive presentation).
+fn skip_world_color_clear(
+    mode: u8,
+    fast_sky: u8,
+    sky_portal_drawn: bool,
+    sky_covers_background: bool,
+) -> bool {
+    mode == 2 || sky_portal_drawn || (mode == 1 && fast_sky == 0 && sky_covers_background)
+}
+
+#[cfg(test)]
+mod world_color_clear_tests {
+    use super::skip_world_color_clear;
+
+    #[test]
+    fn forced_no_clear_is_independent_of_fast_sky_and_sky_coverage() {
+        for fast_sky in [0, 1, 7] {
+            for portal in [false, true] {
+                for coverage in [false, true] {
+                    assert!(skip_world_color_clear(2, fast_sky, portal, coverage));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_modes_remain_unchanged() {
+        assert!(!skip_world_color_clear(0, 0, false, true));
+        assert!(!skip_world_color_clear(0, 1, false, false));
+        assert!(skip_world_color_clear(0, 1, true, false));
+        assert!(skip_world_color_clear(1, 0, false, true));
+        assert!(!skip_world_color_clear(1, 1, false, true));
+        assert!(!skip_world_color_clear(1, 0, false, false));
+    }
+}
 
 /// `JKA_FIXED_SHADER_TIME=<seconds>` freezes the renderer clock so captures from
 /// different shader modes or builds compare without animation (benchmarks only).
 fn fixed_shader_time() -> Option<f32> {
     static FIXED: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     *FIXED.get_or_init(|| std::env::var("JKA_FIXED_SHADER_TIME").ok()?.parse().ok())
+}
+
+/// A map-wide `has_glass_primary` is not sufficient to require a scene
+/// texture this frame. It includes glass in sealed-off BSP clusters, even
+/// though none of those materials can be drawn from this camera.
+///
+/// Be conservative: if there is no trustworthy PVS, or an inline mover
+/// contains glass (movable geometry has separate visibility rules), retain
+/// the sampleable scene. On the normal CPU-culling path we additionally use
+/// the same world-bounds frustum test as the actual world draw. GPU-driven
+/// visibility keeps the broader PVS result to avoid mismatched culled sets.
+fn world_glass_may_be_visible(
+    world: &crate::renderer::WorldGpu,
+    mode: PvsMode,
+    camera: &Camera,
+    view_proj: Mat4,
+    gpu_driven: bool,
+    cached_frustum: Option<&ClipFrustum>,
+) -> bool {
+    if !world.has_glass_primary { return false; }
+    if mode == PvsMode::Off { return true; }
+    let Some(visibility) = world.visibility.as_ref() else { return true; };
+    let Some(cluster) = visibility.cluster_at(scene::jka_position(camera.position.to_array())) else {
+        return true;
+    };
+    let Some(indices) = world.coarse_visible_batches_by_cluster.get(cluster) else { return true; };
+    if indices.iter().any(|&index| world.coarse_batches.get(index)
+        .is_some_and(|batch| batch.source.glass_primary && (gpu_driven
+            || cached_frustum.map_or_else(
+                || aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj),
+                |planes| planes.intersects_aabb(batch.bounds_min, batch.bounds_max),
+            )))) {
+        return true;
+    }
+    // Inline bmodels can move across PVS boundaries, and their visibility
+    // selection is refreshed later in the frame. Never suppress their copy.
+    world.coarse_batches.iter().any(|batch| batch.is_inline_entity && batch.source.glass_primary)
+        // Safety fallback if a special full-resolution batch has no coarse alias.
+        || (world.full_batches.iter().any(|batch| batch.source.glass_primary)
+            && !world.coarse_batches.iter().any(|batch| batch.source.glass_primary))
 }
 
 /// r_fragmentShaderMode diagnostics: which kind of world program a bind selected.
@@ -78,7 +158,21 @@ impl Renderer {
         latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
         let frame_started = Instant::now();
-        // Every frame path (fast baseline, asset preview, full) is entered from
+        // Modes 0..15 retain their existing meanings. Modes 16+ use
+        // independent system-skip bits for diagnosis.
+        let competitive_mask = competitive_probe_mask(self.competitive_ab);
+        let competitive_no_world = self.competitive_ab == 10
+            || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0;
+        // A/B bit 0 disables optional split encoder finishing while preserving
+        // the configured r_encoderFinishThreads mode when the bit is clear.
+        let effective_finish_mode = if self.igpu_ab_mode & 1 != 0 {
+            0
+        } else {
+            self.encoder_finish_threads
+        };
+        // Keep post target selection and model drawing on the same A/B mode.
+        self.dynamic_model_renderer.legacy_blend_mode = crate::renderer::legacy_blend_mode();
+        // Every frame path (asset preview, unified) is entered from
         // here, so one check covers them all. On a dead device the first queue
         // write of the frame fails silently and the panic surfaces wherever that
         // happens to be - historically inside egui's buffer upload, with a
@@ -89,10 +183,54 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameInfo::default());
         }
+        // Rendering-only model kill switch. Simulation and network state live
+        // upstream and are unaffected by this visual diagnostic.
+        let dynamic_models = if self.competitive_ab == 2 || self.competitive_ab == 14
+            || competitive_mask & probe::DYNAMIC_MODELS != 0 {
+            &[][..]
+        } else {
+            dynamic_models
+        };
+        // Real no-render ceiling: bypass all world/model/UI preparation and
+        // composition, but return through normal swapchain acquire/submit/present.
+        // The calling game thread still performs its regular network/input work.
+        if (self.competitive_ab == 15 || competitive_mask & probe::ACQUIRE_ONLY != 0)
+            && !self.egui_active && !self.asset_preview_mode {
+            return self.render_acquire_probe(frame_started);
+        }
+        if let Some(started) = self.acquire_probe_started {
+            let elapsed = started.elapsed();
+            if elapsed.as_secs_f64() < f64::from(self.acquire_probe_seconds) {
+                return self.render_acquire_probe(frame_started);
+            }
+            let frames = self.acquire_probe_frames.max(1) as f64;
+            println!(
+                "[JKA ACQUIRE PROBE] done backend={:?} fps={:.1} acquire={:.3}ms/frame submit={:.3}ms/frame frames={} vsync={:?} mode={:?} latency={}",
+                self.adapter.get_info().backend,
+                frames / elapsed.as_secs_f64().max(0.001),
+                self.acquire_probe_acquire_ms / frames,
+                self.acquire_probe_submit_ms / frames,
+                self.acquire_probe_frames,
+                self.vsync,
+                self.config.present_mode,
+                self.config.desired_maximum_frame_latency,
+            );
+            self.acquire_probe_started = None;
+        }
 
-        self.sync_sun_bake();
-        self.sync_static_sun_lightmaps();
-        self.sync_baked_sun_lightmap_cache();
+        // Renderer equivalent of TaystJK's RDF_ForceSightOn. This is a scene
+        // visibility switch, never a fullscreen effect or shader variant.
+        let force_sight_on = self.ui_state.hud.as_ref().is_some_and(|hud|
+            hud.force_powers_active & (1 << 14) != 0);
+
+        // Late-latch authored HUD icon animation at presentation rate (including
+        // the ordinary in-main UI pass and the streamer composition path).
+        self.prepare_enemy_icon_shader();
+        if competitive_mask & probe::SUN_BAKE_SYNC == 0 {
+            self.sync_sun_bake();
+            self.sync_static_sun_lightmaps();
+            self.sync_baked_sun_lightmap_cache();
+        }
 
         if self.baked_brightness.busy {
             self.tick_baked_brightness();
@@ -108,9 +246,7 @@ impl Renderer {
         self.dynamic_model_renderer
             .set_companion_excluded_entity(companion_scene.map(|view| view.target_entity));
         if companion_scene.is_some() && self.world.is_some() {
-            // The second camera deliberately reuses the low-overhead world PSO
-            // family even when the primary view is on the advanced path. Lazy
-            // compilation means enabling the feature never blocks this frame.
+            // Secondary companion camera uses its own low-cost pipelines.
             let _ = self.ensure_fast_world_pipelines();
         }
         self.build_blob_shadow_marks(dynamic_models);
@@ -165,7 +301,8 @@ impl Renderer {
                 indices.map(|index| world.textures.get(index).map(|image| &image.view)) else { return None; };
             Some([a, b, c, d, e, f])
         }));
-        let native_ocean_ready = if self.ocean_enabled && self.world.as_ref().is_some_and(|world| !world.ocean_surfaces.is_empty()) {
+        let native_ocean_ready = if !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+            && competitive_mask & probe::NATIVE_OCEAN == 0 && self.ocean_enabled && self.world.as_ref().is_some_and(|world| !world.ocean_surfaces.is_empty()) {
             if let Some(ocean) = &mut self.ocean {
                 let was_ready = ocean.original_surface_ready(ocean_target);
                 let ready = ocean.ensure_original_surface(&mut self.pipeline_jobs, &self.device, &self.queue, ocean_target, ocean_sky_faces);
@@ -247,9 +384,35 @@ impl Renderer {
         let crt_everything = self.crt_scope == ui::CrtScope::Everything;
         let crt_before_ui = crt_active && !crt_everything;
 
-        // CGame/FX submits RE_AddLightToScene-style lights at simulation rate.
-        // Keep them in a transient tail of the clustered-light buffer.
-        self.set_transient_lights(transient_lights);
+        // Lazy lightning initialization happens BEFORE the lighting upload so
+        // BSP contact flashes can light actual surfaces in the same frame.
+        if crate::fx::system::force_lightning_style() != 2 {
+            self.dynamic_model_renderer.lightning_gpu = None;
+            self.dynamic_model_renderer.lightning_gpu_attempted = false;
+        } else if !self.dynamic_model_renderer.lightning_gpu_attempted
+            && dynamic_models.iter().any(|surface| surface.fx_gpu_sprites.as_ref()
+                .is_some_and(|fx| fx.lightning))
+        {
+            self.dynamic_model_renderer.lightning_gpu_attempted = true;
+            if let Some(source) = self.world.as_ref().and_then(|world| world.static_ao_source.as_ref()) {
+                self.dynamic_model_renderer.init_lightning_gpu(&self.device, source);
+            }
+        }
+        // CGame/FX submits the original lights. Add at most three true opaque
+        // BSP hit lights from the same lightning sources; ordinary FX and maps
+        // without a compute BVH retain the original fast path.
+        let impact_lights = if self.runtime_transient_lights_enabled() {
+            self.dynamic_model_renderer.lightning_gpu.as_mut()
+                .map(|gpu| gpu.impact_lights(dynamic_models)).unwrap_or_default()
+        } else { Vec::new() };
+        if impact_lights.is_empty() {
+            self.set_transient_lights(transient_lights);
+        } else {
+            let mut combined = Vec::with_capacity(transient_lights.len()+impact_lights.len());
+            combined.extend_from_slice(transient_lights);
+            combined.extend(impact_lights);
+            self.set_transient_lights(&combined);
+        }
 
         // Snowflow state advances only when new brushes/window movement/relaxation
         // require it. This is deliberately before the fast-path early return.
@@ -265,45 +428,8 @@ impl Renderer {
         }
         self.ensure_lazy_scene_pipelines();
 
-        // Pipeline/render-plan selection happens only when settings change. The
-        // hot frame path can therefore jump directly into the known-fast renderer
-        // without walking every advanced feature branch. Surface/frame
-        // diagnostics deliberately use the full path; GPU timestamps are
-        // recorded by both paths so they can be compared.
-        if self.frame_plan.world_path == WorldRenderPath::FastBaseline
-            // The Spout source is intentionally composed in the unified path.
-            // Never switch into a path that cannot supply a filtered stream.
-            && !self.stream_output.enabled()
-            && !dynamic_models.iter().any(|surface| surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass
-                || (surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode)))
-            && self.studio_world_viewport.is_none()
-            && !self.surface_diag_pending
-            && !self.frame_diag_pending
-            && !self.video_depth_capture_requested()
-            // Menu-scene snapshots require the Unified scene-before-egui
-            // capture site below; never cache a UI-composited fast frame.
-            && !matches!(
-                self.screenshot_requested.as_ref(),
-                Some(crate::renderer::ScreenshotDestination::FrontendScene { .. })
-            )
-        {
-            if self.ensure_fast_world_pipelines() {
-                return self.render_fast_baseline(
-                    camera,
-                    player_position,
-                    area_mask,
-                    dynamic_models,
-                    spectator_highlights,
-                    companion_scene,
-                    dynamic_crosshair_world,
-                    view_latch,
-                    latest_view,
-                );
-            }
-            // First selection of FastBaseline compiles its map-specific PSO set
-            // in the background. Keep rendering through the already-hot advanced
-            // path until that set is ready instead of stalling this frame.
-        }
+        // The main view always uses Unified. The lightweight separate-camera
+        // shader remains for the optional companion spectator POV only.
 
         // Keep glow pipeline polling entirely outside the maximum-FPS path.
         self.ensure_bloom_pipelines();
@@ -366,27 +492,6 @@ impl Renderer {
             self.ocean_visibility.begin_frame(&self.device);
         }
         let mut plan = self.frame_plan;
-        let glass_scene_possible = self.world.as_ref().is_some_and(|world| {
-            world.has_glass_primary
-        }) || dynamic_models.iter().any(|surface| surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
-        let legacy_models_possible = dynamic_models.iter().any(|surface|
-            surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode));
-        if (glass_scene_possible || legacy_models_possible) && !plan.use_post {
-            // Scene transmission needs a sampleable color attachment. The
-            // swapchain image does not guarantee TEXTURE_BINDING support.
-            plan.use_post = true;
-            plan.gamma_only_post = true;
-        }
-        // The full post PSO compiles only for a consuming effect. The request is
-        // queued by rebuild_frame_plan, but its worker result must also be
-        // polled while the settings stay unchanged; otherwise the gamma-copy
-        // fallback could remain permanently active after a cold switch to SSR.
-        // Once installed (or in compact mode) this adds no pipeline-manager work.
-        if plan.use_post && !plan.gamma_only_post && !plan.rain_only_post
-            && self.post_pipeline.is_none()
-        {
-            self.ensure_post_pipeline(true);
-        }
         if self.thermal_vision != 0 { self.ensure_thermal_post_pipeline(); }
         let rt_taa_active = self.thermal_vision == 0 && self.rt_taa_active();
         if self.video_depth_capture_requested() {
@@ -414,6 +519,73 @@ impl Renderer {
         } else {
             camera.view_projection(self.config.width, self.config.height)
         };
+        // +16: cache six homogeneous clip planes for the *late-latched* camera.
+        // Unlike a multi-frame cache, this is correct for every subframe view
+        // update. 0/3 retain the reference eight-corner Mat4 test unchanged.
+        let cached_main_frustum = (self.igpu_ab_mode & 16 != 0)
+            .then(|| ClipFrustum::from_view_proj(view_proj));
+        let main_view_aabb_visible = |min: [f32; 3], max: [f32; 3]| {
+            match cached_main_frustum.as_ref() {
+                Some(planes) => planes.intersects_aabb(min, max),
+                None => aabb_intersects_clip_frustum(min, max, view_proj),
+            }
+        };
+        // Decide whether glass forces a sampleable scene using the *current*
+        // camera's PVS, rather than a map-wide flag or last frame's PVS.
+        // This follows the late-latched camera used by the world renderer.
+        let world_glass_possible = self.world.as_ref().is_some_and(|world|
+            world_glass_may_be_visible(world, self.pvs_mode, camera, view_proj,
+                self.gpu_driven_enabled, cached_main_frustum.as_ref()));
+        let dynamic_glass_possible = dynamic_models.iter().any(|surface|
+            surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
+        let glass_scene_possible = world_glass_possible || dynamic_glass_possible;
+        // Mode 4 draws legacy shells into a UNORM view of the same SDR
+        // swapchain image used through its sRGB view. Incompatible paths fall
+        // back to the exact mode-0 transfer path.
+        let requested_mode4 = self.dynamic_model_renderer.legacy_blend_mode == 4;
+        if requested_mode4 {
+            static FORCE_SRGB_SURFACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let force_srgb_surface = *FORCE_SRGB_SURFACE.get_or_init(||
+                std::env::var_os("JKA_SURFACE_SRGB_DIRECT").is_some_and(|v| v == "1"));
+            let compatible = !plan.use_post && !glass_scene_possible
+                && self.msaa_samples == 1 && !self.smaa_enabled
+                && self.hdr_output.is_none() && self.offscreen_output.is_none()
+                && ((self.config.format.is_srgb() && self.surface_linear_present
+                    && !force_srgb_surface) || self.config.format == wgpu::TextureFormat::Rgb565Unorm)
+                && self.gameplay_scene_format() == self.config.format
+                && self.dynamic_model_renderer.fx_sprite_surface_format == self.config.format
+                && !menu_backdrop_active
+                && self.crt_scope == ui::CrtScope::Off
+                && self.studio_world_viewport.is_none()
+                && !self.early_submit_frame(menu_backdrop_active)
+                && !self.present_copy_frame(menu_backdrop_active);
+            self.dynamic_model_renderer.legacy_blend_mode = if compatible { 4 } else { 0 };
+        }
+        // Keep mode 0 as the unmodified, full-frame visual reference. When
+        // requested mode 4 cannot use the SDR swapchain alias, only its
+        // fallback may narrow the HDR/offscreen legacy transfers.
+        let legacy_mode4_fallback = requested_mode4
+            && self.dynamic_model_renderer.legacy_blend_mode == 0;
+        // Modes 0/1 use encoded transfers and force a sampleable target;
+        // mode 2 keeps that resolve, while modes 3/4 skip this legacy force.
+        let legacy_models_possible = !matches!(self.dynamic_model_renderer.legacy_blend_mode, 3 | 4)
+            && dynamic_models.iter().any(|surface|
+            surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode));
+        let forced_scene_copy = !plan.use_post && (glass_scene_possible || legacy_models_possible);
+        if forced_scene_copy {
+            // Scene transmission needs a sampleable color attachment. The
+            // swapchain image does not guarantee TEXTURE_BINDING support.
+            plan.use_post = true;
+            plan.gamma_only_post = true;
+        }
+        // The full post PSO compiles only for a consuming effect. The request is
+        // queued by rebuild_frame_plan, but its worker result must also be
+        // polled while the settings stay unchanged.
+        if plan.use_post && !plan.gamma_only_post && !plan.rain_only_post
+            && self.post_pipeline.is_none()
+        {
+            self.ensure_post_pipeline(true);
+        }
         self.refresh_water_boxes(camera.position);
         let mut optical_volumes = None;
         // Godot receiver caustics only exist within `caustic_max_distance_m` of
@@ -634,7 +806,16 @@ impl Renderer {
             clip_plane: [0.0; 4],
             render_flags: [
                 0,
-                (u32::from(self.static_bsp_ao_enabled)
+                (if (12..=14).contains(&self.competitive_ab)
+                    || competitive_mask & probe::BSP_FLAT != 0 { 1u32 << 25 }
+                 else if self.competitive_ab == 11
+                    || competitive_mask & probe::BSP_ONE_TEXTURE != 0 { 1u32 << 24 }
+                 // Mode 5 retains the single authored stage but evaluates a
+                 // cheap baked lightmap multiplier in the fragment shader.
+                 // Distinct from mode 11's intentionally unlit shortcut.
+                 else if self.competitive_ab == 5 { 1u32 << 23 }
+                 else { 0 })
+                | (u32::from(self.static_bsp_ao_enabled)
                     | (u32::from(self.sky_fractal_override) << 1)
                     | (u32::from(self.temporal_resolve_active() || self.rt_local_cache_wanted()) << 2)
                     | (u32::from(self.sky_perf_probe) << 8)
@@ -660,7 +841,8 @@ impl Renderer {
         let sky_portal_view =
             self.world
                 .as_ref()
-                .filter(|_| self.fast_sky == 0)
+                .filter(|_| !competitive_no_world && self.fast_sky == 0
+                    && competitive_mask & probe::SKY_PORTAL == 0)
                 .and_then(|world| world.sky_portal)
                 .map(|portal| {
                     let position =
@@ -799,9 +981,12 @@ impl Renderer {
             .as_secs_f64()
             * 1000.0;
         let moving_csm = self.cascaded_shadow_mode == DynamicShadowsMode::CascadedShadowMapsEntities;
-        let entity_shadow_frame = (self.cascaded_shadow_mode == DynamicShadowsMode::EntityMap)
+        let entity_shadow_frame = (self.cascaded_shadow_mode == DynamicShadowsMode::EntityMap
+            && competitive_mask & probe::SHADOW_PASSES == 0)
             .then(|| self.prepare_entity_shadow(camera, player_position, frame_delta));
-        let shadow_matrices = if entity_shadow_frame.is_some() {
+        let shadow_matrices = if competitive_mask & probe::SHADOW_PASSES != 0 {
+            None
+        } else if entity_shadow_frame.is_some() {
             // No cascades: the map is entity-only, so froxel fog and the BSP/grass
             // caster loop below correctly see "no cascade matrices". The receiver
             // uniform is written after dynamic models are prepared, because
@@ -880,8 +1065,17 @@ impl Renderer {
         let mut info = FrameInfo {
             world_path: "unified",
             prep_camera_ms,
+            effective_post: plan.use_post,
+            scene_copy_forced: forced_scene_copy,
+            world_glass_pvs: world_glass_possible,
+            dynamic_glass: dynamic_glass_possible,
+            legacy_blend_scene_copy: legacy_models_possible,
             ..FrameInfo::default()
         };
+        info.perf_effective_post = plan.use_post;
+        info.perf_forced_post = forced_scene_copy;
+        info.perf_forced_post_glass = forced_scene_copy && glass_scene_possible;
+        info.perf_forced_post_legacy = forced_scene_copy && legacy_models_possible;
         info.world_shader_programs.requested = self.fragment_shader_mode;
         info.world_shader_programs.active = active_world_variant.map_or(0, crate::renderer::world::programs::active_mode);
         info.world_shader_programs.pending = self.world_variant_pending.is_some();
@@ -905,6 +1099,11 @@ impl Renderer {
         let mut prepared_grass = None;
         let mut prepared_surface_sprite_effects = None;
         let snow_deform_center = self.surface_deformation.field_center();
+        // Mode 10 skips CPU PVS, patch/model LOD, cull-indirect uploads and
+        // grass/sprite preparation, not just raster draws. All world draw
+        // sites are suppressed independently below; switching back repairs
+        // stale visibility on the first normal frame.
+        if self.competitive_ab != 10 && competitive_mask & probe::WORLD_PREP_AND_DRAW == 0 {
         if let Some(world) = &mut self.world {
             // Shell fragments are discarded unless footprints are in 3D mode, so
             // outside it there is nothing to build, hold or draw.
@@ -913,28 +1112,33 @@ impl Renderer {
             } else {
                 world.snow_shell.release();
             }
-            update_visibility(world, camera);
+            if competitive_mask & probe::PVS == 0 { update_visibility(world, camera); }
             let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
-            refresh_auto4_lazy_collapse(
+            if competitive_mask & probe::AUTO4 == 0 { refresh_auto4_lazy_collapse(
                 &self.queue,
                 world,
                 self.pvs_mode,
                 auto4_area_mask,
                 self.cull_debug_mode != CullDebugMode::Off,
-            );
-            crate::renderer::visibility::pvs::refresh_inline_pvs(world, self.pvs_mode, area_mask);
+            ); }
+            if competitive_mask & probe::INLINE_PVS == 0 {
+                crate::renderer::visibility::pvs::refresh_inline_pvs(world, self.pvs_mode, area_mask);
+            }
+            if competitive_mask & probe::PATCH_LOD == 0 {
             info.patch_lod = crate::renderer::world::patch_lod::update(
                 &self.queue, world, camera, self.pvs_mode, area_mask, camera.view_projection(self.config.width,self.config.height),
                 self.patch_curve_error, self.patch_no_curves, self.patch_speeds, self.dynamic_lights_mode == DynamicLightsMode::Legacy,
             );
+            }
             // Compiled model LOD only changes primary raster index selections;
             // static original indices remain available to every other consumer.
-            crate::renderer::world::bsp_model_lod::update(
+            if competitive_mask & probe::BSP_MODEL_LOD == 0 { crate::renderer::world::bsp_model_lod::update(
                 &self.queue, world, camera, self.config.width, self.config.height,
                 self.bsp_model_lod_scale, self.bsp_model_lod_bias, self.bsp_model_lod_debug,
                 self.bsp_model_lod_enabled,
-            );
-            if world.active_pipeline_variant.legacy_dlights {
+            ); }
+            if world.active_pipeline_variant.legacy_dlights
+                && competitive_mask & probe::LEGACY_DLIGHT_LISTS == 0 {
                 crate::renderer::lighting::legacy_dlight_lists::prepare_legacy_dlight_draws(
                     &self.device, &self.queue, world, self.pvs_mode, view_proj,
                 );
@@ -957,7 +1161,8 @@ impl Renderer {
                 )
                 .unwrap_or(u32::MAX);
             }
-            if self.gpu_driven_enabled || self.cull_debug_mode != CullDebugMode::Off {
+            if (self.gpu_driven_enabled || self.cull_debug_mode != CullDebugMode::Off)
+                && competitive_mask & probe::ACTIVE_CULL_UPLOAD == 0 {
                 active_selection_changed = update_active_cull_indices(
                     &self.queue,
                     world,
@@ -966,7 +1171,8 @@ impl Renderer {
                     self.cull_debug_mode != CullDebugMode::Off,
                 );
             }
-            if self.grass_enabled {
+            if self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                && competitive_mask & probe::GRASS == 0 {
                 let pvs_cluster = world.last_cluster.flatten();
                 if let Some(grass) = world.grass.as_ref() {
                     prepared_grass = Some(self.grass_renderer.prepare_draw(
@@ -985,7 +1191,8 @@ impl Renderer {
                     ));
                 }
             }
-            if !world.surface_sprite_effects.is_empty() {
+            if !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                && competitive_mask & probe::SURFACE_SPRITES == 0 && !world.surface_sprite_effects.is_empty() {
                 let pvs_cluster = if matches!(self.pvs_mode, PvsMode::Off) {
                     None
                 } else {
@@ -1009,6 +1216,7 @@ impl Renderer {
                     .as_ref().map(|prepared| prepared.stats).unwrap_or_default();
             }
         }
+        } // End optional world preparation.
         if active_selection_changed {
             self.update_gpu_cull_settings();
         }
@@ -1018,7 +1226,8 @@ impl Renderer {
             .as_secs_f64()
             * 1000.0;
 
-        let planar_views = if self.planar_reflection.active {
+        let planar_views = if self.planar_reflection.active && !competitive_no_world
+            && competitive_mask & probe::PLANAR_REFLECTIONS == 0 {
             self.world
                 .as_ref()
                 .map_or([None; PLANAR_REFLECTION_SLOTS], |world| {
@@ -1196,8 +1405,10 @@ impl Renderer {
             .duration_since(prep_reflection_started)
             .as_secs_f64()
             * 1000.0;
-        self.update_local_shadow_selection(camera,player_position);
-        self.ensure_local_shadow_cache();
+        if competitive_mask & probe::SHADOW_PASSES == 0 {
+            self.update_local_shadow_selection(camera, player_position);
+            self.ensure_local_shadow_cache();
+        }
         self.sync_entity_fixture_lighting();
         prep_shadow_ms += prep_local_shadow_started.elapsed().as_secs_f64() * 1000.0;
         info.prep_shadow_ms = prep_shadow_ms;
@@ -1237,10 +1448,19 @@ impl Renderer {
             ray_traced_shadows && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
             self.glow_mode.authored(),
         );
-        let glass_capture_needed = self.world.as_ref().is_some_and(|world| {
-            world.has_glass_primary
-        }) || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
+        let glass_capture_needed = world_glass_possible
+            || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
             || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
+        // Unlike authored transparent glass, the modern Force shockwave is
+        // composited after the deferred BSP stage queue. The original glass
+        // snapshot is older than that queue and contains only stage 0 of
+        // multi-stage materials (e.g. Korriban's gray environment base).
+        // Refresh only when a live force wave needs the finished scene.
+        let force_shockwave_present = dynamic_models.iter().any(|surface| {
+            surface.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass
+                && surface.vertices.first().is_some_and(|v| v.color[3] <= -6.0)
+        });
+
         if glass_capture_needed && optical_volumes.is_none() {
             let key = (
                 self.config.width.max(1),
@@ -1328,6 +1548,14 @@ impl Renderer {
             let surface_view = self.surface_texture_view(&frame);
             (Some(frame), surface_view)
         };
+        // Direct SDR legacy shell pass uses a second *view*, not a second
+        // texture. Under mode 4 eligibility the frame is acquired normally and
+        // `surface_view` is the sRGB view of this same UNORM swapchain image.
+        let legacy_unorm_view = if self.dynamic_model_renderer.legacy_blend_mode == 4 {
+            frame.as_ref().map(|frame| self.surface_texture_unorm_view(frame))
+        } else {
+            None
+        };
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
         // A Studio world capture must never silently fall back to copying the
@@ -1378,6 +1606,9 @@ impl Renderer {
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
         self.encode_inline_transforms(&mut encoder);
+        // Outputs cosmetic ribbons and surface contacts into the existing
+        // FX instance buffer. Must precede every main/companion render pass.
+        self.dynamic_model_renderer.encode_lightning(&mut encoder, &self.camera_bind_group);
         // Hardware RT skinned casters are deformed once before acceleration
         // structures consume the shared skinned vertex buffer. The following
         // dynamic-caster build then reconstructs deforming BLASes/TLAS before
@@ -1434,8 +1665,8 @@ impl Renderer {
         let ocean_sim_hidden = self.ocean_settings.surface_pixels
             && !self.ocean_settings.simulate_when_hidden
             && self.ocean_hidden_time > OCEAN_SIM_GRACE_SECONDS;
-        let ocean_sim_measured =
-            !ocean_sim_hidden && (self.ocean.is_some() || !self.authored_oceans.is_empty());
+        let ocean_sim_measured = competitive_mask & probe::NATIVE_OCEAN == 0
+            && !ocean_sim_hidden && (self.ocean.is_some() || !self.authored_oceans.is_empty());
         if ocean_sim_measured {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::OceanSim, false);
@@ -1465,6 +1696,7 @@ impl Renderer {
                     self.ocean_settings.updates_per_second, camera.position, &bodies[..body_count], masks);
             }
         }
+        if competitive_mask & probe::NATIVE_OCEAN == 0 {
         if let Some(ocean) = &mut self.ocean {
             if let Some((sky_average, has_skybox, surfaces, masks, promoted, sky_regions)) = ocean_scene_context.as_ref() {
                 ocean.set_sky_extension(&self.queue, self.ocean_sky_extend, self.ocean_sky_infinite, sky_regions);
@@ -1526,6 +1758,12 @@ impl Renderer {
                 );
             }
         }
+        if !self.live_rivers.is_empty() {
+            // The scene pass target: post scene, else the swapchain format.
+            let river_format = if plan.use_post { self.scene_format() } else { self.config.format };
+            let copyable = plan.use_post || self.msaa_samples > 1;
+            self.encode_live_rivers(&mut encoder, frame_delta, camera, river_format, copyable);
+        }
         for (authored, ocean) in &mut self.authored_oceans {
             if let Some((sky_average, has_skybox, _, _, _, _)) = ocean_scene_context.as_ref() {
                 ocean.set_environment(
@@ -1553,6 +1791,7 @@ impl Renderer {
                 ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
             }
         }
+        } // End optional native-ocean wave/river simulation.
         if ocean_sim_measured {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::OceanSim, true);
@@ -1584,7 +1823,8 @@ impl Renderer {
         // nearby blades reuse the prepared wind/trample transform as a cheap
         // one-triangle shadow caster. This is the same compute work the color
         // pass already needed; it is merely scheduled earlier.
-        if self.grass_enabled {
+        if self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                && competitive_mask & probe::GRASS == 0 {
             if let (Some(world), Some(prepared)) = (&self.world, prepared_grass.as_ref()) {
                 if let Some(grass) = world.grass.as_ref() {
                     self.gpu_profiler.write_encoder_timestamp(
@@ -1614,8 +1854,10 @@ impl Renderer {
         }
         // Build the authored-sun static visibility once per BSP, independently
         // of the user's current sun angle and of the four runtime cascades.
-        self.encode_original_sun_shadow(&mut encoder, camera_pos_time);
-        self.encode_baked_local_moving_shadows(&mut encoder, dynamic_models);
+        if competitive_mask & probe::SHADOW_PASSES == 0 {
+            self.encode_original_sun_shadow(&mut encoder, camera_pos_time);
+            self.encode_baked_local_moving_shadows(&mut encoder, dynamic_models);
+        }
         let csm_entity_casters = match shadow_matrices.as_ref() {
             Some(matrices) => self.prepare_entity_cascade_casters(matrices),
             None => false,
@@ -1696,7 +1938,7 @@ impl Renderer {
                             wgpu::IndexFormat::Uint32,
                         );
                         for batch in &world.coarse_batches {
-                            if batch.is_inline_entity || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            if batch.is_inline_entity || (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                 || (batch.is_inline_entity && !self.draw_inline_models)
                                 || hidden_inline_batch(batch, &world.inline_models) {
                                 continue;
@@ -1792,7 +2034,7 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
-                        if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                        if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                             || (batch.is_inline_entity && !self.draw_inline_models)
                             || hidden_inline_batch(batch, &world.inline_models) {
                             continue;
@@ -1890,7 +2132,7 @@ impl Renderer {
                             for batch in &world.coarse_batches {
                                 if (!batch.is_inline_entity && (moving_csm || !crate::renderer::lighting::lightmap_sun::moving_static_material(&batch.source,self.sun_visibility)))
                                     || (batch.is_inline_entity && !self.draw_inline_models)
-                                    || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                                    || (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                     || hidden_inline_batch(batch, &world.inline_models)
                                     || batch.source.pipeline.depth_equal
                                     || (self.tinted_glass_enabled
@@ -2089,7 +2331,7 @@ impl Renderer {
                 let mut mask_pipeline_active = false;
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         || !batch_area_visible(batch, effective_area_mask)
                         || (self.face_plane_cull && batch_face_plane_rejected(batch, camera.position.to_array())) {
                         continue;
@@ -2116,11 +2358,7 @@ impl Renderer {
                         continue;
                     }
                     if batch.source.pipeline.class != DrawClass::Sky
-                        && !aabb_intersects_clip_frustum(
-                            batch.bounds_min,
-                            batch.bounds_max,
-                            view_proj,
-                        )
+                        && !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                     {
                         continue;
                     }
@@ -2243,7 +2481,7 @@ impl Renderer {
                     let mut current_is_mask: Option<bool> = None;
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
-                        if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                        if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                             || !batch_area_visible(batch, effective_area_mask)
                             || (self.face_plane_cull && batch_face_plane_rejected(batch, camera.position.to_array())) {
                             continue;
@@ -2257,11 +2495,7 @@ impl Renderer {
                         if !batch.source.pipeline.depth_write || batch.source.pipeline.depth_equal {
                             continue;
                         }
-                        if !aabb_intersects_clip_frustum(
-                            batch.bounds_min,
-                            batch.bounds_max,
-                            view_proj,
-                        ) {
+                        if !main_view_aabb_visible(batch.bounds_min, batch.bounds_max) {
                             continue;
                         }
                         let is_mask = match batch.source.pipeline.class {
@@ -2332,7 +2566,7 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::HiZ, true);
         }
 
-        if plan.use_gpu_culling {
+        if plan.use_gpu_culling && !competitive_no_world {
             if let Some(world) = &self.world {
                 let debug_culling = self.cull_debug_mode != CullDebugMode::Off;
                 if debug_culling {
@@ -2483,7 +2717,7 @@ impl Renderer {
                     .clone();
                 let reflection_visible = |batch: &WorldBatch| {
                     let sky = batch.source.pipeline.class == DrawClass::Sky;
-                    !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    !(batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         && (!sky || self.fast_sky == 0)
                         && (!batch.is_inline_entity || self.draw_inline_models)
                         && !hidden_inline_batch(batch, &world.inline_models)
@@ -2932,7 +3166,8 @@ impl Renderer {
                 drop(pass);
                 // Per-view world flares use this reflection's just-rendered depth
                 // before the next slot clears the shared depth attachment.
-                if self.world_flares_enabled {
+                if self.world_flares_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                    && competitive_mask & probe::WORLD_FLARES == 0 {
                     let flare_format = self.scene_format();
                     self.world_flares_planar[slot].draw_planar(
                         &self.device,
@@ -3066,17 +3301,31 @@ impl Renderer {
             });
             // Per-surface water culling needs the CPU partial-draw path; the
             // GPU-driven path keeps the whole-batch test in the loop below.
-            let face_cull_cpu = (self.face_plane_cull || water_cull.is_some()) && !self.gpu_driven_enabled;
+            let face_cull_cpu = (self.face_plane_cull || water_cull.is_some()) && !self.gpu_driven_enabled
+                && competitive_mask & probe::FACE_CULL == 0;
             let camera_position = camera.position.to_array();
             let run_cull = RunCull {
                 camera: camera_position,
-                face_planes: self.face_plane_cull,
-                water: if self.gpu_driven_enabled { None } else { water_cull.as_ref() },
+                face_planes: self.face_plane_cull && competitive_mask & probe::FACE_CULL == 0,
+                water: if self.gpu_driven_enabled || competitive_mask & probe::FACE_CULL != 0 {
+                    None
+                } else { water_cull.as_ref() },
             };
-            let selected_indices = if face_cull_cpu {
+            let selected_indices: &[usize] = if competitive_no_world {
+                &[]
+            } else if face_cull_cpu
+                || (world.has_force_sight_surfaces && !force_sight_on)
+            {
                 face_plane_cull_scratch.clear();
                 for &index in original_active.indices {
                     let batch = &original_active.batches[index];
+                    if batch.source.force_sight_only && !force_sight_on {
+                        continue;
+                    }
+                    if !face_cull_cpu {
+                        face_plane_cull_scratch.push(index);
+                        continue;
+                    }
                     let (selection, by_water) = selection_stats(batch, &run_cull);
                     info.world_ocean_culled_triangles += by_water / 3;
                     if selection == FacePlaneSelection::Reject {
@@ -3099,7 +3348,8 @@ impl Renderer {
             // All PVS plans, index ranges, indirect recipes and compact-group
             // identities remain immutable. Every later consumer in this frame
             // (fog, transparency, culling, glow) sees the SAME ordered list.
-            let pipeline_order = (self.world_sort_mode == 1).then(|| {
+            let pipeline_order = (self.world_sort_mode == 1 && !competitive_no_world
+                && competitive_mask & probe::WORLD_SORT == 0).then(|| {
                 super::world_sort::pipeline_order(
                     original_active.batches, selected_indices, active_pipeline_variant,
                 )
@@ -3234,7 +3484,9 @@ impl Renderer {
             // stage opaque/masked survivors into indirect multi-draws. Authored
             // multi-stage and transparent ordering remains on the conservative
             // per-draw path.
-            let use_cpu_compaction = !self.gpu_driven_enabled
+            let use_cpu_compaction = !competitive_no_world
+                && competitive_mask & probe::CPU_COMPACTION == 0
+                && !self.gpu_driven_enabled
                 && !render_ocean
                 && self.gpu_compaction_supported
                 && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
@@ -3255,7 +3507,7 @@ impl Renderer {
 
                 for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                     let batch = &active.batches[batch_index];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) {
                         continue;
                     }
                     let Some(group_index) = batch.compact_group.map(|value| value as usize) else {
@@ -3269,11 +3521,7 @@ impl Renderer {
                     if batch.is_inline_entity
                         || !batch_area_visible(batch, effective_area_mask)
                         || batch.source.pipeline.class == DrawClass::Sky
-                        || !aabb_intersects_clip_frustum(
-                            batch.bounds_min,
-                            batch.bounds_max,
-                            view_proj,
-                        )
+                        || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                     {
                         continue;
                     }
@@ -3401,11 +3649,17 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(if self.fast_sky != 0 {
-                                fast_sky_clear_color(self.fast_sky)
+                            // Mode 2 must also bypass the sky-portal prepass
+                            // clear, not just the later primary world clear.
+                            load: if self.color_clear_mode == 2 {
+                                wgpu::LoadOp::Load
                             } else {
-                                self.weather.fog.clear_color()
-                            }),
+                                wgpu::LoadOp::Clear(if self.fast_sky != 0 {
+                                    fast_sky_clear_color(self.fast_sky)
+                                } else {
+                                    self.weather.fog.clear_color()
+                                })
+                            },
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -3485,7 +3739,7 @@ impl Renderer {
                 let mut portal_depth_candidates: Vec<usize> = Vec::new();
                 for batch_index in portal_candidates {
                     let batch = &portal_batches[batch_index];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         || (batch.is_inline_entity && (
                             !self.draw_inline_models
                             || !world.inline_models.get(batch.inline_model_slot as usize)
@@ -3541,13 +3795,14 @@ impl Renderer {
                     for &index in indices {
                         let batch = &portal_batches[index];
                         if !batch.is_inline_entity && batch.source.pipeline.class == DrawClass::Sky
-                            && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
+                            && !(batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) {
                             draw_world_batch_secondary(&mut sky_pass, batch, 0..1, None);
                         }
                     }
                 }
                 drop(sky_pass);
-                if self.world_flares_enabled {
+                if self.world_flares_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                    && competitive_mask & probe::WORLD_FLARES == 0 {
                     let flare_format = flare_scene_format;
                     self.world_flares_sky.draw_sky(
                         &self.device,
@@ -3629,6 +3884,10 @@ impl Renderer {
             if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             // Keep the cloned QuerySet alive for the full render-pass lifetime.
             let stats_query = self.frame_time_graph.stats_query_set();
+            info.perf_world_skip_clear = skip_world_color_clear(
+                self.color_clear_mode, self.fast_sky, sky_portal_drawn, world.sky_covers_background,
+            );
+            info.perf_world_clear = !info.perf_world_skip_clear;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3636,13 +3895,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        // r_colorClearMode 1: like vanilla/TaystJK, no colour clear
-                        // when the sky box covers everything the world does not.
-                        load: if sky_portal_drawn
-                            || (self.color_clear_mode == 1
-                                && self.fast_sky == 0
-                                && world.sky_covers_background)
-                        {
+                        // Mode 1 conservatively skips beneath authored sky.
+                        // Mode 2 always skips, including fast sky; uncovered
+                        // pixels are intentionally left without a defined fill.
+                        load: if info.perf_world_skip_clear {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(if self.fast_sky != 0 {
@@ -3666,6 +3922,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::WorldMainPass, false);
             tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
             // Opt-in WGPU 30 hardware pipeline stats for the primary BSP pass.
             // This is one draw-pass scope, not a whole-frame texture counter.
@@ -3828,10 +4085,36 @@ impl Renderer {
             }
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
+                // Deliberately destructive competitive renderer experiments:
+                // primary_stage is assigned at map preparation (not a hash set
+                // or per-frame shader-name lookup). A/B 0 does nothing.
+                if self.competitive_ab == 1 || self.competitive_ab == 10
+                    || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0
+                    || (((5..=9).contains(&self.competitive_ab)
+                        || (11..=14).contains(&self.competitive_ab))
+                        && !batch.source.competitive_primary_stage)
+                    || (competitive_mask & probe::BSP_ONE_STAGE != 0
+                        && !batch.source.competitive_primary_stage)
+                    || (((6..=9).contains(&self.competitive_ab)
+                        || (13..=14).contains(&self.competitive_ab))
+                        && hidden_bsp_model_surface(false, batch, &world.material_debug))
+                    || (competitive_mask & probe::HIDE_BSP_PROPS != 0
+                        && hidden_bsp_model_surface(false, batch, &world.material_debug))
+                    || (((8..=9).contains(&self.competitive_ab)
+                        || (13..=14).contains(&self.competitive_ab))
+                        && batch.source.pipeline.class == DrawClass::Transparent
+                        && !batch.source.water
+                        && !batch.source.glass_primary)
+                    || (competitive_mask & probe::HIDE_TRANSPARENT != 0
+                        && batch.source.pipeline.class == DrawClass::Transparent
+                        && !batch.source.water && !batch.source.glass_primary)
+                {
+                    continue;
+                }
                 // Opt-in render-only A/B: no new render pass or GPU readback.
                 // Sky is intentionally retained so the diagnostic preserves the
                 // background; transparent-only lacks authored opaque depth.
-                if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
+                if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) {
                     continue;
                 }
                 if ((self.fast_sky != 0 || sky_box_path || (blue_sky_path && !batch.is_inline_entity))
@@ -3875,7 +4158,7 @@ impl Renderer {
                 // of off-camera draws.
                 if !self.gpu_driven_enabled
                     && batch.source.pipeline.class != DrawClass::Sky
-                    && !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    && !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                 {
                     info.world_frustum_rejected = info.world_frustum_rejected.saturating_add(1);
                     continue;
@@ -4207,21 +4490,10 @@ impl Renderer {
                 // a multi-stage shader share the exact vertex range, so emit the
                 // pass only after the last sibling stage instead of fogging each
                 // stage independently.
-                let next_is_same_surface =
-                    active
-                        .indices
-                        .get(active_pos + 1)
-                        .is_some_and(|&next_index| {
-                            same_world_surface(batch, &active.batches[next_index])
-                        });
-                let surface_writes_depth = active.indices[..=active_pos]
-                    .iter()
-                    .rev()
-                    .map(|&index| &active.batches[index])
-                    .take_while(|sibling| same_world_surface(batch, sibling))
-                    .any(|sibling| sibling.source.pipeline.depth_write);
-                let needs_fog_pass = !next_is_same_surface
-                    && batch.source.pipeline.class != DrawClass::Sky
+                // Do not compare sibling stages (or scan backwards through a
+                // surface's depth-writing stages) when legacy fog is disabled.
+                // The backwards walk is needed only for an actual fog redraw.
+                let needs_fog_pass = batch.source.pipeline.class != DrawClass::Sky
                     // The displaced GodotOcean cannot pass this depth-EQUAL
                     // redraw; it fogs itself (bsp.wgsl apply_ocean_legacy_fog).
                     && !(render_ocean && batch.ocean_clipmap.is_some())
@@ -4231,8 +4503,17 @@ impl Renderer {
                         batch.source.global_fog_post_eligible,
                     )
                     && (batch.source.fog[3] > 0.001
-                        || self.weather.fog.legacy_drawfog_value() == 1);
+                        || self.weather.fog.legacy_drawfog_value() == 1)
+                    && !active.indices.get(active_pos + 1).is_some_and(|&next_index| {
+                        same_world_surface(batch, &active.batches[next_index])
+                    });
                 if needs_fog_pass {
+                    let surface_writes_depth = active.indices[..=active_pos]
+                        .iter()
+                        .rev()
+                        .map(|&index| &active.batches[index])
+                        .take_while(|sibling| same_world_surface(batch, sibling))
+                        .any(|sibling| sibling.source.pipeline.depth_write);
                     if let Some(fog_pipeline) = active_pipeline_variant
                         .fog_pass_pipelines
                         .get(&(batch.source.pipeline, surface_writes_depth))
@@ -4290,7 +4571,8 @@ impl Renderer {
                     &mut current_pipeline,
                 );
             }
-            if !grass_drawn && self.grass_enabled {
+            if !grass_drawn && self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                && competitive_mask & probe::GRASS == 0 {
                 if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
                     self.gpu_profiler
                         .write_render_pass_timestamp(&mut pass, GpuPass::Grass, false);
@@ -4519,7 +4801,7 @@ impl Renderer {
                         let batch = &active.batches[index];
                         if batch.source.pipeline.class != DrawClass::Sky || batch.is_inline_entity
                             || !batch_area_visible(batch, effective_area_mask)
-                            || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) { continue; }
+                            || (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) { continue; }
                         draw_world_batch(&mut pass, batch, 0..1, None);
                         if capture_api_calls {
                             info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1);
@@ -4626,7 +4908,7 @@ impl Renderer {
                         pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                         let mut current_dlight_pipeline = None;
                         let mut bind_batch = |pass: &mut wgpu::RenderPass<'_>, info: &mut FrameInfo, batch: &WorldBatch| -> bool {
-                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                 || !batch_area_visible(batch, effective_area_mask)
                                 || ocean_suppresses_batch(render_ocean, batch)
                             {
@@ -4706,12 +4988,13 @@ impl Renderer {
                 );
                 self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, true);
             }
+            self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::WorldMainPass, true);
             if stats_query.is_some() {
                 pass.end_pipeline_statistics_query();
                 self.frame_time_graph.stats_query_ended(info.world_shader_programs.active);
             }
             if super::finish::eligible(
-                self.encoder_finish_threads, self.msaa_samples, self.ocean_enabled,
+                effective_finish_mode, self.msaa_samples, self.ocean_enabled,
                 optical_volumes.is_some(), ray_traced_shadows,
                 self.planar_reflection_mode, self.planar_reflection_debug_mode,
                 self.gpu_driven_enabled,
@@ -4727,7 +5010,7 @@ impl Renderer {
                         label: Some("JKA model/post tail after world split"),
                     }));
                 info.perf_encoder_split_active = true;
-                if self.encoder_finish_threads == 2 {
+                if effective_finish_mode == 2 {
                     if let Err(error) = self.encoder_finisher.as_mut().expect("mode 2 worker initialized")
                         .dispatch(prefix, perf_timing)
                     {
@@ -5092,14 +5375,10 @@ impl Renderer {
                 let mut water_visible = false;
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         || batch.ocean_clipmap.is_none()
                         || !batch_area_visible(batch, effective_area_mask)
-                        || !aabb_intersects_clip_frustum(
-                            batch.bounds_min,
-                            batch.bounds_max,
-                            view_proj,
-                        )
+                        || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                     {
                         continue;
                     }
@@ -5261,10 +5540,10 @@ impl Renderer {
                     let mut admitted_native = 0u8;
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
-                        if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                        if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                             || batch.ocean_clipmap.is_none()
                             || !batch_area_visible(batch, effective_area_mask)
-                            || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                            || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                         { continue; }
                         claim_ocean_clipmap(&mut admitted_native, batch);
                     }
@@ -5340,7 +5619,7 @@ impl Renderer {
                 let mut ocean_drawn = 0u8;
                 for &batch_index in active.indices {
                     let batch = &active.batches[batch_index];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         || batch.ocean_clipmap.is_none() {
                         continue;
                     }
@@ -5353,7 +5632,7 @@ impl Renderer {
                     // that gets drawn. The clipmap is camera-centred and far
                     // larger than the footprint, so any surviving sliver
                     // submits the whole clipmap for that surface.
-                    if !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                    if !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                     {
                         info.ocean.rejected_frustum =
                             info.ocean.rejected_frustum.saturating_add(1);
@@ -5439,7 +5718,7 @@ impl Renderer {
                             runtime.current_centre[1]-radius];
                         let upper = [runtime.current_centre[0]+radius, plane+512.0,
                             runtime.current_centre[1]+radius];
-                        if !aabb_intersects_clip_frustum(lower, upper, view_proj) { continue; }
+                        if !main_view_aabb_visible(lower, upper) { continue; }
                         let Some(batch) = world.ocean_sky_representatives[slot]
                             .and_then(|index| world.full_batches.get(index))
                         else { continue; };
@@ -5929,6 +6208,67 @@ impl Renderer {
                     self.ocean_spray_pipeline.as_ref(),
                 );
             }
+            // Developer river patches: the Single Layer Water body over a copy of
+            // the scene without the river, after world transparency. The swapchain
+            // (no post, no MSAA) cannot be copied; encode_live_rivers reports it.
+            if let Some(water) = self.river_surface.as_ref().filter(|water| {
+                (plan.use_post || self.msaa_samples > 1)
+                    && water.ready_for(flare_scene_format, self.msaa_samples)
+                    && self.live_rivers.iter().any(|river| river.body_group().is_some())
+            }) {
+                drop(pass);
+                water.capture(&self.device, &mut encoder, color_view, &self.targets.depth_view);
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene after river copy"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
+                });
+                tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
+                let environment = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
+                    .map(|atmosphere| &atmosphere.sky.environment().bind_group);
+                for river in &self.live_rivers {
+                    water.draw(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                }
+                for river in &self.live_rivers {
+                    water.draw_composite(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                }
+                // Restore the world pass's shared bindings for what follows.
+                pass.set_bind_group(0,&self.camera_bind_group,&[]);
+                pass.set_bind_group(2,if enhanced_world_shader {&world.lighting_bind_group}else{&world.lighting_bind_group_lean},&[]);
+                pass.set_bind_group(3,world_shadow_receiver_bind_group,&[]);
+                pass.set_bind_group(4,&self.planar_reflection.bind_group,&[]);
+                if enhanced_world_shader {pass.set_bind_group(5,&self.ocean_optics.bind_group,&[]);}
+                pass.set_vertex_buffer(0,world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1,world.legacy_dlight_surface_id_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..),wgpu::IndexFormat::Uint32);
+            }
+
+            if force_shockwave_present {
+                // The normal Glass capture preceded deferred BSP stages. A
+                // replacement-color effect sampling it would repaint authored
+                // overlays/lightmaps with stage-0 gray. Re-capture the *finished*
+                // BSP scene immediately before the dynamic FX that sample it.
+                // Force casts last only 500ms; zero extra pass otherwise.
+                drop(pass);
+                self.ocean_optics.capture(
+                    &self.device, &mut encoder, color_view, &self.targets.depth_view,
+                    &self.ocean_inert_bind_group, None,
+                );
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA force shockwave over completed BSP materials"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view, depth_slice: None, resolve_target,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
+            }
 
             // In the ordinary path this phase used to run immediately after
             // opaque models, before transparent BSP water. Match the ocean path:
@@ -6100,17 +6440,13 @@ impl Renderer {
                                 // World wireframe must follow the resolved remap, not
                                 // resurrect framebuffer/depth no-op shaders (e.g. clear).
                                 && batch.source.contributes_to_world_wireframe()
-                                && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                                && !(batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                 // Replacement ownership includes sibling stages and overlays,
                                 // even when they do not carry the primary face's clipmap.
                                 && !ocean_suppresses_batch(render_ocean, batch)
                                 && batch.source.pipeline.class != DrawClass::Sky
                                 && batch_area_visible(batch, effective_area_mask)
-                                && aabb_intersects_clip_frustum(
-                                    batch.bounds_min,
-                                    batch.bounds_max,
-                                    view_proj,
-                                )
+                                && main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                             {
                                 let slot = wireframe_cull_slot(batch.source.pipeline.cull);
                                 if bound_cull != Some(slot) {
@@ -6177,14 +6513,10 @@ impl Renderer {
                         let mut ocean_drawn = 0u8;
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
-                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                 || batch.ocean_clipmap.is_none()
                                 || !batch_area_visible(batch, effective_area_mask)
-                                || !aabb_intersects_clip_frustum(
-                                    batch.bounds_min,
-                                    batch.bounds_max,
-                                    view_proj,
-                                )
+                                || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                                 || !claim_ocean_clipmap(&mut ocean_drawn, batch)
                             {
                                 continue;
@@ -6229,7 +6561,7 @@ impl Renderer {
                                     runtime.current_centre[1] - radius];
                                 let upper = [runtime.current_centre[0] + radius, plane + 512.0,
                                     runtime.current_centre[1] + radius];
-                                if !aabb_intersects_clip_frustum(lower, upper, view_proj) { continue; }
+                                if !main_view_aabb_visible(lower, upper) { continue; }
                                 let Some(batch) = world.ocean_sky_representatives[slot]
                                     .and_then(|index| world.full_batches.get(index))
                                 else { continue; };
@@ -6282,11 +6614,7 @@ impl Renderer {
                             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                             for draw in &chunk.draws {
                                 if !snow_shell_draw_near_center(draw, snow_deform_center)
-                                    || !aabb_intersects_clip_frustum(
-                                        draw.bounds_min,
-                                        draw.bounds_max,
-                                        view_proj,
-                                    )
+                                    || !main_view_aabb_visible(draw.bounds_min, draw.bounds_max)
                                 {
                                     continue;
                                 }
@@ -6294,7 +6622,7 @@ impl Renderer {
                                 else {
                                     continue;
                                 };
-                                if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
+                                if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) {
                                     continue;
                                 }
                                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -6330,10 +6658,10 @@ impl Renderer {
                             let mut ocean_drawn = 0u8;
                             for &batch_index in active.indices {
                                 let batch = &active.batches[batch_index];
-                                if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                                if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                     || batch.ocean_clipmap.is_none()
                                     || !batch_area_visible(batch, effective_area_mask)
-                                    || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                                    || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                                 {
                                     continue;
                                 }
@@ -6365,10 +6693,10 @@ impl Renderer {
                         let mut pools = [None; 8];
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
-                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                                 || batch.ocean_clipmap.is_none()
                                 || !batch_area_visible(batch, effective_area_mask)
-                                || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                                || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                                 || !claim_ocean_clipmap(&mut ocean_drawn, batch)
                             {
                                 continue;
@@ -6484,7 +6812,7 @@ impl Renderer {
                 let overlay_count = if hiz_only { active.indices.len() } else { active.batches.len() };
                 for index in 0..overlay_count {
                     let batch = &active.batches[if hiz_only { active.indices[index] } else { index }];
-                    if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                         || batch.source.pipeline.class == DrawClass::Sky {
                         continue;
                     }
@@ -6580,7 +6908,7 @@ impl Renderer {
                     let mut current_glow_pipeline = None;
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
-                        if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                        if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
                             || !(batch.source.authored_glow || (self.thermal_vision != 0 && batch.source.thermal_source_stage))
                             || (self.fast_sky != 0 && batch.source.pipeline.class == DrawClass::Sky)
                             || batch.is_inline_entity
@@ -6590,11 +6918,7 @@ impl Renderer {
                             continue;
                         }
                         if batch.source.pipeline.class != DrawClass::Sky
-                            && !aabb_intersects_clip_frustum(
-                                batch.bounds_min,
-                                batch.bounds_max,
-                                view_proj,
-                            )
+                            && !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                         {
                             continue;
                         }
@@ -6804,7 +7128,7 @@ impl Renderer {
                         let mut last_key = None;
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
-                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) { continue; }
+                            if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)) { continue; }
                             if ocean_suppresses_batch(render_ocean, batch)
                                 || world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water)
                                 || batch.source.pipeline.class == DrawClass::Sky
@@ -6812,7 +7136,7 @@ impl Renderer {
                                 || (!self.draw_inline_models && batch.is_inline_entity)
                                 || hidden_inline_batch(batch, &world.inline_models)
                                 || !batch_area_visible(batch, effective_area_mask)
-                                || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                                || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
                             { continue; }
                             if last_key != Some(batch.source.pipeline) {
                                 let Some(pipeline) = pipelines.get(&batch.source.pipeline) else { continue; };
@@ -6844,11 +7168,21 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(if self.fast_sky != 0 {
+                        // A frontend still waiting for its menu BSP has no
+                        // authored sky or fog yet. Its safe fallback is black,
+                        // not the gameplay fog color (nor undefined no-clear
+                        // contents). Worldless live/demo modes keep their A/B.
+                        load: if self.ui_state.frontend_main_scene {
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                        } else if self.color_clear_mode == 2 {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(if self.fast_sky != 0 {
                                 fast_sky_clear_color(self.fast_sky)
                             } else {
                                 self.weather.fog.clear_color()
-                            }),
+                            })
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -6929,8 +7263,29 @@ impl Renderer {
                 }
             }
         }
+        // The HDR/offscreen fallback normally encodes and decodes every
+        // framebuffer pixel just to blend a few legacy shells. For geometry
+        // with trustworthy CPU world positions, limit BOTH transfer draws to
+        // the conservatively projected bounds. An uncertain bound (GPU
+        // skinning, foliage deformation, camera-plane crossing, etc.) keeps
+        // the original full-frame path. MSAA remains full-frame because its
+        // attachment resolve is not scissor-limited.
+        let legacy_transfer_rect = if legacy_mode4_fallback
+            && self.msaa_samples == 1 && self.studio_world_viewport.is_none()
+        {
+            crate::renderer::models::legacy_blend::bounded_legacy_transfer_rect(
+                dynamic_models, view_proj, self.config.width, self.config.height)
+        } else {
+            None
+        };
+        info.legacy_transfer_rect = if self.dynamic_model_renderer.legacy_blend_active() {
+            legacy_transfer_rect
+        } else {
+            None
+        };
         self.dynamic_model_renderer.composite_legacy_blend(&self.device,&mut encoder,
-            scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group);
+            scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group,
+            legacy_unorm_view.as_ref(),legacy_transfer_rect);
         // In non-threaded mode, resolve after the last main scene pass closes.
         // Threaded mode already resolved in the prefix before handing it off.
         self.frame_time_graph.resolve_stats(&mut encoder);
@@ -6939,7 +7294,9 @@ impl Renderer {
             .write_encoder_timestamp(&mut encoder, GpuPass::World, true);
         // World flares are separate from BSP material geometry; sample the
         // completed opaque depth before screen-space post processing.
-        if self.world_flares_enabled && self.world.is_some() {
+        if !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+            && competitive_mask & probe::WORLD_FLARES == 0
+            && self.world_flares_enabled && self.world.is_some() {
             let (flare_color_view, flare_resolve) = if let Some(view) = &self.targets.msaa_view {
                 (view, Some(scene_output))
             } else {
@@ -6977,7 +7334,7 @@ impl Renderer {
         if let Some(started) = perf_scene_started {
             // The serial split's prefix finish is reported in finish, rather
             // than double-counted in this mutually exclusive scene interval.
-            let prefix_block = if self.encoder_finish_threads == 1 { info.perf_encoder_prefix_finish_ms } else { 0.0 };
+            let prefix_block = if effective_finish_mode == 1 { info.perf_encoder_prefix_finish_ms } else { 0.0 };
             info.perf_encode_scene_ms = (started.elapsed().as_secs_f64() * 1000.0 - prefix_block).max(0.0);
         }
         let perf_post_ui_started = perf_timing.then(Instant::now);
@@ -7039,7 +7396,7 @@ impl Renderer {
                 let history_write_index = 1 - self.ssao_history_read_index;
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("JKA half-resolution temporal SSAO"),
+                    label: Some("JKA temporal SSAO"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &history.views[history_write_index],
                         depth_slice: None,
@@ -7642,7 +7999,10 @@ impl Renderer {
                 || (studio_composite.is_some() && !self.asset_preview_mode
                     && matches!(readback.destination, crate::renderer::ScreenshotDestination::VideoFrame { .. }))
         });
-        let native_ui_in_main = !self.stream_output.enabled()
+        let competitive_hide_hud = (self.competitive_ab == 4 || self.competitive_ab == 9 || self.competitive_ab == 14
+            || competitive_mask & probe::HUD != 0)
+            && !self.egui_active && self.ui_state.mode != ui::OverlayMode::Console;
+        let native_ui_in_main = !competitive_hide_hud && !self.stream_output.enabled()
             && !menu_backdrop_active
             && !scene_snapshot_requested
             && match self.crt_scope {
@@ -7657,7 +8017,7 @@ impl Renderer {
         let tile_cost_overlay_ready = !self.egui_active
             && self.tile_cost_overlay.as_ref().is_some_and(|overlay| overlay.draw_ready());
         if native_ui_in_main
-            && (self.screen_fx_vertex_count != 0
+            && (self.enemy_icon_vertex_count != 0 || self.screen_fx_vertex_count != 0
                 || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
                 || self.ui_transient_vertex_count != 0
@@ -7698,16 +8058,28 @@ impl Renderer {
             if let Some(resources) = ui_gamma {
                 pass.set_bind_group(1, &resources.group, &[]);
             }
-            Self::draw_ui_batches(
+            Self::draw_ui_batches_shadered(
                 &mut pass,
                 ui_pipeline,
                 &self.ui_bind_group,
+                ui_gamma.map(|r| &r.group),
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
                 &self.ui_transient_vertex_buffer,
                 self.ui_transient_vertex_count,
                 &self.ui_vertex_buffer,
                 self.ui_vertex_count,
+                &self.ui_icon_shader_buffer,
+                &self.ui_icon_shader_batches,
+                &self.screen_fx_pipelines,
+                &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
+            );
+            Self::draw_screen_fx_batches(
+                &mut pass, &self.enemy_icon_vertex_buffer,
+                self.enemy_icon_vertex_count, &self.enemy_icon_batches,
+                &self.screen_fx_pipelines, &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group,
             );
             if !self.egui_active {
                 self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
@@ -7967,7 +8339,7 @@ impl Renderer {
         }
         // Streaming kept this HUD out of the first CRT resolve so the stream
         // could copy a clean scene. Restore local Scene+HUD layering before egui.
-        let stream_scene_hud_crt = self.stream_output.enabled()
+        let stream_scene_hud_crt = !competitive_hide_hud && self.stream_output.enabled()
             && self.crt_scope == ui::CrtScope::SceneHud && !menu_backdrop_active
             && (self.studio_world_viewport.is_none() || self.ui_state.mode == ui::OverlayMode::Console);
         if stream_scene_hud_crt {
@@ -7975,7 +8347,7 @@ impl Renderer {
             self.submit_crt(&frame_view);
         }
         self.submit_egui(ui_composite_target);
-        let late_native_ui = !native_ui_in_main && !stream_scene_hud_crt
+        let late_native_ui = !competitive_hide_hud && !native_ui_in_main && !stream_scene_hud_crt
             && (menu_backdrop_active
                 || self.egui_active
                 || scene_snapshot_requested

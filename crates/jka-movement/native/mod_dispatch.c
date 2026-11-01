@@ -7,6 +7,13 @@ typedef struct mod_player_s {
     jka_predict_settings settings;
 } mod_player;
 static int last_backend;
+extern void japro_player_roll_debug(const void *, jka_roll_debug *);
+void jka_player_roll_debug(const void *player, jka_roll_debug *out) {
+    const mod_player *p = player;
+    memset(out, 0, sizeof(*out));
+    if (p->settings.backend == 1 && p->settings.roll_debug)
+        japro_player_roll_debug(p->japro, out);
+}
 extern int japro_set_entities(void *, const jka_prediction_entity *, int);
 extern int japro_clip_entity(const void *, const jka_prediction_entity *);
 int jka_player_set_entities(void *player, const jka_prediction_entity *entities, int count) {

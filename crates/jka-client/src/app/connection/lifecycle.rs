@@ -48,6 +48,8 @@ impl App {
             self.latest_request_id,
             std::sync::atomic::Ordering::Release,
         );
+        self.cancel_vote_map_prewarm();
+        self.vote_map_candidate = None;
         self.pending_frontend_map_launch = false;
         self.frontend_background_request_id = None;
         self.frontend_cinematic = None;

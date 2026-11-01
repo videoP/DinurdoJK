@@ -485,8 +485,8 @@ impl App {
         value: impl AsRef<str>,
     ) {
         ui.horizontal_wrapped(|ui| {
-            theme::label(ui, theme::plain(label, 8.5, theme::TEXT_FAINT));
-            theme::label(ui, theme::plain(value.as_ref(), 9.5, theme::TEXT));
+            theme::label(ui, theme::plain(label, 8.5, theme::TEXT_FAINT()));
+            theme::label(ui, theme::plain(value.as_ref(), 9.5, theme::TEXT()));
         });
     }
 }

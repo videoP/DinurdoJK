@@ -992,14 +992,14 @@ app_cvars! {
     }
 
     APP_R_FRAGMENTSHADERMODE {
-        runtime: CvarDef::new("r_fragmentShaderMode", "", "0..4", "World shaders: 0 general; 1 material specialization; 2 specialization plus minimal entries; 3 shared basic/enhanced families; 4 generated minimal vertex/fragment pairs per encountered stage recipe. Modes 3/4 target Minimal Unified, Low and Medium, with reported fallbacks for other features. Switches after background compilation; quality settings are preserved.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_fragmentShaderMode", "", "0..5", "World shaders: 0 general; 1 material specialization; 2 material + minimal entries; 3 shared families; 4 generated recipes; 5 hybrid: compact common stages, generated complex recipes, specialized compatibility fallbacks. Switches after background compilation; preserves quality settings.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.fragment_shader_mode.to_string()),
             |app, value| App::cvar_set_r_fragmentshadermode(app, APP_R_FRAGMENTSHADERMODE.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_r_fragmentshadermode, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(mode) = value.trim().parse::<u8>() {
-                    settings.fragment_shader_mode = mode.min(4);
+                    settings.fragment_shader_mode = mode.min(5);
                 }
             }),
             archive: Some((428, |state| format!("{}", state.video.fragment_shader_mode))),
@@ -1012,8 +1012,8 @@ app_cvars! {
                         .trim()
                         .parse::<u8>()
                         .ok()
-                        .filter(|mode| *mode <= 4)
-                        .ok_or_else(|| format!("{name}: expected 0..4"))?;
+                        .filter(|mode| *mode <= 5)
+                        .ok_or_else(|| format!("{name}: expected 0..5"))?;
                     if self.video.fragment_shader_mode != mode {
                         self.video.fragment_shader_mode = mode;
                         self.render_command(RenderCommand::SetFragmentShaderMode(mode));
@@ -1025,6 +1025,7 @@ app_cvars! {
                         2 => "SPECIALIZED + MINIMAL ENTRIES",
                         3 => "SHARED FAMILIES",
                         4 => "GENERATED STAGE PROGRAMS",
+                        5 => "HYBRID MATERIAL PROGRAMS",
                         _ => "GENERAL",
                     });
                     Ok(())
@@ -1033,15 +1034,41 @@ app_cvars! {
         ]
     }
 
+    APP_R_SHADERINPUTMODE {
+        runtime: CvarDef::new("r_shaderInputMode", "", "0..1", "BSP world shader A/B: 0 WGSL; 1 round-trip validated SPIR-V through WGPU, with per-stage WGSL fallback. Native passthrough (2) disabled after NVIDIA crash. Independent of r_fragmentShaderMode 0..5; session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.shader_input_mode.to_string()),
+            |app, value| App::cvar_set_r_shaderinputmode(app, APP_R_SHADERINPUTMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_shaderinputmode, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_r_shaderinputmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 1)
+                        .ok_or_else(|| format!("{name}: expected 0 or 1 (native passthrough mode 2 is disabled after a driver crash)"))?;
+                    if self.video.shader_input_mode != mode {
+                        self.video.shader_input_mode = mode;
+                        self.render_command(RenderCommand::SetShaderInputMode(mode));
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("SHADER INPUT: {} (WORLD STAGES)", match mode {
+                        1 => "SPIR-V (WGPU VALIDATED)",
+                        _ => "WGSL",
+                    });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_COLORCLEARMODE {
-        runtime: CvarDef::new("r_colorClearMode", "", "0..1", "World colour clear: 0 clear every frame, 1 skip it when every sky on the map draws a sky box or the map has no sky (vanilla/TaystJK behaviour; holes into the void then show the previous frame). Fastsky always clears.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_colorClearMode", "", "0..2", "World colour clear: 0 always clear; 1 skip only when safe (authored sky covers background; fast sky still clears); 2 never clear the main world color target, including fast sky (HOM/undefined pixels are acceptable). Does not disable required depth clears or offscreen-effect clears.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.color_clear_mode.to_string()),
             |app, value| App::cvar_set_r_colorclearmode(app, APP_R_COLORCLEARMODE.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_r_colorclearmode, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(mode) = value.trim().parse::<u8>() {
-                    settings.color_clear_mode = mode.min(1);
+                    settings.color_clear_mode = mode.min(2);
                 }
             }),
             archive: Some((429, |state| format!("{}", state.video.color_clear_mode))),
@@ -1054,15 +1081,19 @@ app_cvars! {
                         .trim()
                         .parse::<u8>()
                         .ok()
-                        .filter(|mode| *mode <= 1)
-                        .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
+                        .filter(|mode| *mode <= 2)
+                        .ok_or_else(|| format!("{name}: expected 0, 1, or 2"))?;
                     if self.video.color_clear_mode != mode {
                         self.video.color_clear_mode = mode;
                         self.render_command(RenderCommand::SetColorClearMode(mode));
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
-                    self.console_status = format!("WORLD COLOUR CLEAR: {}", if mode == 1 { "SKIP UNDER SKY BOX" } else { "ALWAYS" });
+                    self.console_status = format!("WORLD COLOUR CLEAR: {}", match mode {
+                        0 => "ALWAYS",
+                        1 => "SKIP UNDER AUTHORED SKY",
+                        _ => "NEVER (HOM/UNDEFINED PIXELS ALLOWED)",
+                    });
                     Ok(())
                 }
             }
@@ -1100,7 +1131,7 @@ app_cvars! {
     }
 
     APP_R_FASTSKY {
-        runtime: CvarDef::new("r_fastsky", "", "0..10", "TaystJK fast sky: 0 authored skybox/cloud stages; 1 black; 2 green; 3 yellow; 4 blue; 5 cyan; 6 magenta; 7 white; 8 orange; 9 grey; 10 red. Skips sky drawing in Unified, without adding a rendering pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_fastsky", "", "0..10", "TaystJK fast sky: 0 authored skybox/cloud stages; 1 pale sky blue; 2 green; 3 yellow; 4 blue; 5 cyan; 6 magenta; 7 white; 8 orange; 9 grey; 10 red. Skips sky drawing in Unified, without adding a rendering pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.fast_sky.to_string()),
             |app, value| App::cvar_set_fast_sky(app, APP_R_FASTSKY.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_fast_sky, None),
@@ -1132,6 +1163,50 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_R_RGB565 {
+        runtime: CvarDef::new("r_rgb565", "", "0..1", "Native Vulkan packed RGB565 color A/B: 0 original 32bpp swapchain; 1 request real 16bpp R5G6B5 swapchain with fixed-function blending. Unsupported drivers fall back visibly; no offscreen conversion. Session-only; latched until Apply Video Settings or vid_restart.", CvarType::String, CvarFlags::NONE, LatchScope::VidRestart,
+            |_app: &App| CvarValue::String(crate::renderer::rgb565_requested().to_string()),
+            |app, value| App::cvar_set_rgb565(app, APP_R_RGB565.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_rgb565, Some(|name, value| {
+            value.trim().parse::<u8>().ok().filter(|v| *v <= 1)
+                .map(|v| v.to_string())
+                .ok_or_else(|| format!("{name}: expected 0 or 1"))
+        })),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_rgb565(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode: u8 = value.trim().parse().map_err(|_| format!("{name}: expected 0 or 1"))?;
+                if mode > 1 { return Err(format!("{name}: expected 0 or 1")); }
+                if mode == crate::renderer::rgb565_requested() { return Ok(()); }
+                // Called by the existing video-apply / vid_restart latch drain.
+                // Do not independently restart; other format latches must be
+                // committed together before renderer initialization.
+                crate::renderer::set_rgb565_requested(mode);
+                self.push_console_line(format!("[RGB565] requested={mode}; renderer format chosen during video apply"));
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_COMPETITIVE_AB {
+        runtime: CvarDef::new("r_competitiveAB", "", "0..2147483663", "Experimental stripped competitive renderer: 0 original; 1 no main BSP world; 2 no dynamic models; 3 no client FX; 4 hide native HUD (console retained); 5 one stage + cheap baked lightmaps + fast sky; 6 additionally omit BSP model-path props; 7 additionally stop client FX; 8 additionally omit non-water transparent world surfaces; 9 omit HUD; 10 no world preparation/drawing; 11 one-texture world (no lightmaps or fused stages); 12 flat-color world; 13 flat world without extra transparent BSP; 14 flat world without models/FX/HUD; 15 acquire/submit-only render ceiling (normal client continues). 16+ = independent skip-bitmask: mask=value-16, bits documented in competitive_ab_probes.md; e.g. 17 PVS, 24 patch LOD, 4112 no world draw, 8208 no world prep and draw. Session only; 0 and 16 are baselines.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.competitive_ab.to_string()),
+            |app, value| App::cvar_set_competitive_ab(app, APP_R_COMPETITIVE_AB.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_competitive_ab, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_competitive_ab(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let mode: u32 = value.trim().parse().map_err(|_| "r_competitiveAB expects a decimal mode/bitmask (see competitive_ab_probes.md)".to_owned())?;
+                if mode > crate::renderer::competitive_probe::MAX_MODE { return Err("r_competitiveAB mode out of range".to_owned()); }
+                self.video.competitive_ab = mode;
+                crate::renderer::set_competitive_ab_mode(mode);
+                self.render_command(RenderCommand::SetCompetitiveAb(mode));
+                self.console_status = format!("COMPETITIVE A/B: mode={mode} mask=0x{:06x} (0/16 = original; see competitive_ab_probes.md)", crate::renderer::competitive_probe_mask(mode));
+                Ok(())
+            }
+        }]
     }
 
     APP_R_WORLDSTAGEPROBE {
@@ -3020,6 +3095,62 @@ app_cvars! {
         }]
     }
 
+    APP_R_IGPU_MEMORY_AB {
+        runtime: CvarDef::new("r_igpuMemoryAB", "", "0..1", "Real GPU depth buffer A/B: 0 original Depth32Float (32 bits/pixel), 1 Depth16Unorm (16 bits/pixel). Recreates renderer and pipelines on Apply Video Settings or vid_restart; no resolution changes or color conversion. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::VidRestart,
+            |app| CvarValue::String(crate::renderer::igpu_depth_requested().to_string()),
+            |app, value| App::cvar_set_igpu_memory_ab(app, APP_R_IGPU_MEMORY_AB.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_igpu_memory_ab, Some(|name, value| {
+            value.trim().parse::<u8>().ok().filter(|v| *v <= 1)
+                .map(|v| v.to_string())
+                .ok_or_else(|| format!("{name}: expected 0 (D32) or 1 (D16)"))
+        })),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_igpu_memory_ab(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 1)
+                    .ok_or_else(|| format!("{name}: expected 0 (D32) or 1 (D16)"))?;
+                if mode == crate::renderer::igpu_depth_requested() { return Ok(()); }
+                // Executed by the shared video-apply latch drain. The video
+                // state machine owns the single renderer restart.
+                crate::renderer::set_igpu_depth_requested(mode);
+                self.push_console_line(format!(
+                    "[IGPU DEPTH A/B] requested={} ({}); depth format chosen during video apply",
+                    mode,
+                    match mode { 1 => "Depth16Unorm", _ => "Depth32Float" },
+                ));
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_IGPUAB {
+        runtime: CvarDef::new("r_igpuAB", "", "0..31", "CPU-throughput A/B bitmask (session-only, 0=unchanged): +1 single encoder (disable optional world split); +2 cache repeated model bind groups; +4 eligible opaque/alpha-test model render bundles; +8 alternate Ghoul2 bone/draw staging write_buffer_with; +16 cached main-view clip planes (8-corner AABB cull replacement). Combine by addition; compare 3 vs 19. Does not change shader/visual quality, renderer preset, post, or legacy blending.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_igpuab(app)),
+            |app, value| App::cvar_set_r_igpuab(app, APP_R_IGPUAB.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_igpuab, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_get_r_igpuab(&self) -> String {
+                crate::renderer::igpu_ab_mode().to_string()
+            }
+            fn cvar_set_r_igpuab(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 31)
+                    .ok_or_else(|| format!("{name}: expected 0..31 (bitmask +1 encoder, +2 state, +4 bundles, +8 staging, +16 clip planes)"))?;
+                crate::renderer::set_igpu_ab_mode(mode);
+                self.render_command(RenderCommand::SetIgpuAbMode(mode));
+                self.console_status = format!(
+                    "iGPU CPU A/B {mode}: encoder={} bind-cache={} model-bundles={} Ghoul2-staging={} cached-frustum={} (0=original)",
+                    if mode & 1 != 0 { "single" } else { "configured" },
+                    if mode & 2 != 0 { "forced" } else { "configured" },
+                    if mode & 4 != 0 { "forced" } else { "configured" },
+                    if mode & 8 != 0 { "write_buffer_with" } else { "write_buffer" },
+                    if mode & 16 != 0 { "on" } else { "off" },
+                );
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_ENCODERFINISHTHREADS {
         runtime: CvarDef::new("r_encoderFinishThreads", "", "0|1|2", "A/B finalization: 0 original encoder; 1 split world/model-post encoders finished serially; 2 finish world on a persistent worker concurrently with remaining recording/finish (default). Same-frame ordered submit. Unified MSAA1 CPU raster, no ocean/optics/RT/planar views. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.encoder_finish_threads.to_string()),
@@ -3055,7 +3186,7 @@ app_cvars! {
     }
 
     APP_R_MD3AUTOLOD {
-        runtime: CvarDef::new("r_md3AutoLod", "", "0..1", "Shared automatic LOD switch: 0 authored MD3 LODs only and full-detail baked BSP models; 1 (default) generate/use missing MD3 LODs and simplify eligible baked BSP models. Authored MD3 LODs always take priority.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_md3AutoLod", "0", "0..1", "Generate missing model LODs (default 0): 0 uses authored MD3 LODs and leaves compiled BSP models full-detail; 1 generates missing MD3 LODs and prepares eligible BSP simplifications at the next map load. Authored MD3 LODs always take priority. Graphics presets never change this switch.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.md3_auto_lod)),
             |app, value| App::cvar_set_r_md3autolod(app, APP_R_MD3AUTOLOD.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_md3autolod, None),
@@ -3074,7 +3205,7 @@ app_cvars! {
                     debug: self.video.md3_lod_debug,
                     enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
                 });
-                self.console_status = format!("AUTOMATIC MODEL LODS: {}", if self.video.md3_auto_lod { "ON (ENTITY MD3 + BSP)" } else { "OFF (AUTHORED MD3 ONLY)" });
+                self.console_status = format!("AUTOMATIC MODEL LODS: {}", if self.video.md3_auto_lod { "ON (ENTITY MD3; BSP AT NEXT MAP LOAD)" } else { "OFF (AUTHORED MD3 ONLY)" });
                 self.mark_config_dirty();
                 self.publish_ui();
                 Ok(())
@@ -4411,6 +4542,63 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_R_LEGACYBLENDTRANSFER {
+        runtime: CvarDef::new(
+            "r_legacyBlendTransfer", "4", "0..4",
+            "Model-blend mode (default 4, session-only): 0 exact 16-bit encoded intermediate+resolve (reference); 1 8-bit encoded intermediate; 2 native blend+resolve; 3 native blend without forced resolve; 4 direct encoded-space blend into the SDR swapchain UNORM alias (no transfers; automatically falls back to mode 0 for HDR/MSAA/offscreen/post).",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(crate::renderer::legacy_blend_mode().to_string()),
+            |app, value| App::cvar_set_r_legacyblendtransfer(app, APP_R_LEGACYBLENDTRANSFER.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_legacyblendtransfer, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_legacyblendtransfer(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .map_err(|_| format!("{name} expects 0, 1, 2, 3 or 4"))?;
+                if mode > 4 { return Err(format!("{name} expects 0, 1, 2, 3 or 4")); }
+                crate::renderer::set_legacy_blend_mode(mode);
+                self.console_status = format!("LEGACY MODEL TRANSFERS: {}", match mode {
+                    0 => "16-bit encoded reference",
+                    1 => "8-bit encoded A/B",
+                    2 => "native blend with resolve",
+                    3 => "native blend without legacy-forced resolve",
+                    _ => "direct SDR UNORM alias (unsupported targets fall back to mode 0)",
+                });
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_ACQUIREPROBE {
+        runtime: CvarDef::new(
+            "r_acquireProbe", "0", "0..10",
+            "One-shot in-game present-only A/B diagnostic, in seconds (1..10). Draws just a clear, then automatically resumes rendering; reports FPS/acquire/submit. 0 does nothing. Session-only.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String("0".to_owned()),
+            |app, value| App::cvar_set_r_acquireprobe(app, APP_R_ACQUIREPROBE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_acquireprobe, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_acquireprobe(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let seconds = value.parse::<u32>()
+                    .map_err(|_| format!("{name}: expected seconds 0..10"))?;
+                if seconds > 10 {
+                    return Err(format!("{name}: expected seconds 0..10"));
+                }
+                if seconds != 0 {
+                    if self.front_end {
+                        return Err(format!("{name}: run while in-game, not on the main menu"));
+                    }
+                    self.render_command(RenderCommand::RunAcquireProbe(seconds));
+                    self.push_console_line(format!(
+                        "^3Swapchain-only A/B for {seconds} seconds: screen goes black briefly and returns automatically"
+                    ));
+                }
+                Ok(())
+            }
+        }]
     }
 
     APP_R_EARLYSUBMIT {
@@ -5816,50 +6004,20 @@ app_cvars! {
     }
 
     APP_R_WORLDPATH {
-        runtime: CvarDef::new("r_worldPath", "", "auto|unified", "World renderer: auto keeps the FastBaseline path when eligible; unified forces the general renderer (Minimal (Unified) preset).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_worldpath(app)), |app, value| App::cvar_set_r_worldpath(app, APP_R_WORLDPATH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_worldpath, None),
+        runtime: CvarDef::new("r_worldPath", "unified", "unified", "Compatibility alias; the main renderer always uses Unified. Old 'auto' values are accepted but do not select another path.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_worldpath(app)), |app, value| App::cvar_set_r_worldpath(app, APP_R_WORLDPATH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_worldpath, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    settings.force_unified_world = value.trim().eq_ignore_ascii_case("unified");
-                }),
-                archive: Some((22, |state| {
-                    let settings = state.video;
-                    format!(
-                        "{}",
-                        if settings.force_unified_world {
-                            "unified"
-                        } else {
-                            "auto"
-                        }
-                    )
-                })),
-                ..CvarBinding::NONE
-            },
-        implementations: [
-            impl App {
-                fn cvar_get_r_worldpath(&self) -> String {
-                    if self.video.force_unified_world {
-                        "unified"
-                    } else {
-                        "auto"
-                    }
-                    .to_owned()
-                }
-                fn cvar_set_r_worldpath(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.video.force_unified_world = match value.trim().to_ascii_lowercase().as_str() {
-                            "auto" => false,
-                            "unified" => true,
-                            _ => return Err(format!("{name}: expected auto|unified")),
-                        };
-                        self.render_command(RenderCommand::SetForceUnifiedWorld(
-                            self.video.force_unified_world,
-                        ));
-                        self.mark_config_dirty();
-                        self.publish_ui();
-                    }
-                    Ok(())
+            load_video: Some(|_settings, _name, _value, _context| {}),
+            archive: Some((22, |_state| "unified".to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_get_r_worldpath(&self) -> String { "unified".to_owned() }
+            fn cvar_set_r_worldpath(&mut self, name: &str, value: &str) -> Result<(), String> {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "unified" | "auto" => Ok(()),
+                    _ => Err(format!("{name}: expected unified (legacy auto accepted)")),
                 }
             }
-        ]
+        }]
     }
 }

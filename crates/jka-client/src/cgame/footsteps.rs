@@ -15,7 +15,8 @@ use jka_assets::{
     animation::AnimationSet,
     animevents::{AnimEvent, AnimEventType, FootstepType},
 };
-use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE};
+use jka_movement::{CollisionWorld, TraceQuery, TraceResult, TraceWorld, ENTITY_NONE};
+use crate::net::{PredictionWorld, SolidEntity};
 
 // surfaceflags.h material ids.
 const MATERIAL_SOLIDWOOD: u32 = 1;
@@ -251,6 +252,41 @@ pub fn trace_footstep(world: &mut impl TraceWorld, foot_bolt: [f32; 3]) -> Optio
     let ground = world.trace(query(MASK_PLAYERSOLID));
     // "no shadow if too high"
     (ground.fraction < 1.0).then_some((ground.end, ground.normal, ground.surface_flags))
+}
+
+/// Apply the TaystJK `CG_Trace` footstep fix to the *ground* probe alone.
+/// The initial MASK_WATER test remains the legacy world CM trace, matching
+/// `_PlayerFootStep`'s original first trace. The player's own entity number is
+/// excluded from the solid list, like `CG_Trace(..., cent->currentState.number)`.
+pub struct FootstepEntityTrace<'a> {
+    world: &'a mut CollisionWorld,
+    solids: &'a [SolidEntity],
+    viewer_client: i32,
+    skip_entity: i32,
+}
+
+impl<'a> FootstepEntityTrace<'a> {
+    pub fn new(world: &'a mut CollisionWorld, solids: &'a [SolidEntity], viewer_client: i32, skip_entity: i32) -> Self {
+        Self { world, solids, viewer_client, skip_entity }
+    }
+}
+
+impl TraceWorld for FootstepEntityTrace<'_> {
+    fn trace(&mut self, mut query: TraceQuery) -> TraceResult {
+        if query.mask != MASK_PLAYERSOLID {
+            return self.world.trace(query);
+        }
+        query.pass_entity = self.skip_entity;
+        PredictionWorld {
+            world: &mut *self.world,
+            solids: self.solids,
+            client_num: self.viewer_client,
+        }.trace(query)
+    }
+
+    fn point_contents(&mut self, point: [f32; 3], pass_entity: i32) -> i32 {
+        self.world.point_contents(point, pass_entity)
+    }
 }
 
 /// Traces each of `steps` (the feet that fell this frame) from the bolt

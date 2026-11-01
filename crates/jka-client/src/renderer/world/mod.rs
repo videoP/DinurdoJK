@@ -12,6 +12,7 @@ pub(in crate::renderer) mod lifecycle;
 pub(in crate::renderer) mod material_remap;
 pub(in crate::renderer) mod pipelines;
 pub(in crate::renderer) mod programs;
+pub(in crate::renderer) mod shader_input;
 pub(in crate::renderer) mod settings;
 pub(in crate::renderer) mod types;
 pub(in crate::renderer) mod upload;

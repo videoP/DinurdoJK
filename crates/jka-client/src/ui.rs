@@ -15,10 +15,11 @@ mod chat;
 mod compose;
 mod studio_race;
 pub use studio_race::{StudioRaceUi,StudioRaceRunnerUi};
+pub(crate) use hud::siege::{append_mp_timer_image, load_mp_timer};
 pub(crate) use studio_race::leaderboard_bounds;
 mod ttf_font;
 pub(crate) use ttf_font::{
-    list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
+    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
     STUDIO_PACKAGED_FONTS,
 };
 pub(crate) use studio_race::draw_labels as draw_studio_labels;
@@ -39,6 +40,11 @@ pub(crate) mod movement_components;
 mod inspector;
 mod loading;
 mod scoreboard;
+pub(crate) mod flex;
+mod glyphs;
+mod killfeed;
+mod chat_dock;
+pub use killfeed::{KillfeedSettings, KillfeedStyle, UiKillfeed, UiKillfeedEntry};
 mod settings;
 mod text;
 use chat::{
@@ -74,7 +80,7 @@ pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
-pub(crate) use hud::layout::{hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
+pub(crate) use hud::layout::{apply_hud_layout, hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
 pub(crate) use hud::movement::visible_jka_chars;
 use hud::movement::{
     build_lagometer, build_movement_keys, build_race_timer, build_speedometer, build_strafe_helper,
@@ -82,6 +88,7 @@ use hud::movement::{
     ICON_TEXTURE_SOURCE, TEAM_ICON_TEXTURE_SOURCE,
 };
 pub use hud::movement::{ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub(crate) const ICON_SHADER_SOURCE_BASE: f32 = hud::movement::ICON_SHADER_SOURCE_BASE;
 pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF, ICON_INVENTORY_BASE};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
 use hud::scores::{build_enemy_info, build_game_timer, build_hud_score, build_mini_scores};
@@ -90,6 +97,7 @@ use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_ce
 use inspector::surface_inspector_frame;
 use loading::{build_background_progress, build_loading_screen, build_shader_compile_progress, build_splash_background};
 use scoreboard::build_scoreboard;
+pub(crate) use scoreboard::{hit_test as scoreboard_hit_test, max_scroll as scoreboard_max_scroll};
 pub use settings::environment::{
     CloudRenderResolution, CloudType, FogMode, FootprintMode, PuddleQuality, RainIntensity,
     SaberMarkMode, CLOUD_HEIGHT_MAX, CLOUD_HEIGHT_MIN, CLOUD_ROW_AERIAL, CLOUD_ROW_BASE_VARIATION,
@@ -162,7 +170,7 @@ pub use text::{
     UiVertex,
 };
 use text::{
-    color_code, console_text, fixed_charset_text, proportional_text, proportional_text_width, text,
+    color_code, console_text, fixed_charset_text, proportional_centerprint_text, proportional_text, proportional_text_uniform, proportional_text_width, text,
     truncate_jka_text, wrap_proportional_text,
 };
 
@@ -226,10 +234,48 @@ pub enum ChatMode {
     Direct(u8),
 }
 
+/// `cg_chat*` presentation settings for the DinurdoJK chat box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChatSettings {
+    /// 0 = classic top bar; 1 = docked with modern font; 2 = docked with JKA font.
+    pub style: u8,
+    /// Messages shown at full strength while typing.
+    pub history_lines: u8,
+    /// Seconds a message stays on screen before it fades.
+    pub fade_time: f32,
+    /// Seconds a message is kept for the typing view.
+    pub history_time: f32,
+    /// Silence chat sounds this many seconds after you attack (0 = never).
+    pub mute_after_attack: f32,
+}
+
+impl ChatSettings {
+    pub fn docked(&self) -> bool { self.style != 0 }
+}
+
+impl Default for ChatSettings {
+    fn default() -> Self {
+        Self { style: 1, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
+    }
+}
+
+/// Animation state of the docked typing field, recomputed while it moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UiChatAnim {
+    /// 0 closed .. 1 fully open (eased).
+    pub open: f32,
+    /// Milliseconds since the last edit to the typed text.
+    pub idle_ms: u32,
+    /// Caret blink phase.
+    pub caret: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiChatLine {
     pub text: String,
     pub alpha: f32,
+    /// 0 just arrived .. 1 settled; drives the slide-in.
+    pub enter: f32,
     /// Received as `tchat` / `ltchat`, not guessed from the rendered text.
     pub team: bool,
 }
@@ -273,6 +319,24 @@ pub struct UiScoreEntry {
     /// changing ping for three consecutive distinct samples, which is how
     /// legacy JKA follow spectators can reveal their likely target.
     pub spectating_you: bool,
+    /// DinurdoJK client-side mute: chat from this client is dropped locally.
+    pub muted: bool,
+    /// Current score leader; gets the crown over their name.
+    pub crowned: bool,
+    /// `model/skin`, for the avatar (`AvatarAtlas`).
+    pub model: String,
+    /// What the game draws when `model` is not installed (kyle or jan), whose
+    /// icon stands in, dimmed, as CG_LoadClientInfo's fallback does.
+    pub model_fallback: String,
+    /// Viewer's head-to-head against this player: (you killed them, they killed you).
+    pub h2h: Option<(u16, u16)>,
+    /// Server-counted `scores` fields: accuracy percent, Excellent awards
+    /// (two kills within three seconds) and stun-baton kills.
+    pub accuracy: i32,
+    pub excellent: i32,
+    pub gauntlet: i32,
+    /// Server-reported perfect award (rank 0 without a death).
+    pub perfect: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +359,183 @@ pub struct UiScoreboard {
     /// Siege class/carrier cells following the team overlay and duel icons in the atlas.
     pub icon_paths: Vec<String>,
     pub entries: Vec<UiScoreEntry>,
+    /// DinurdoJK header/footer text and pointer state around the board.
+    pub chrome: ScoreboardChrome,
+}
+
+/// Everything the DinurdoJK scoreboard draws that the TaystJK board did not:
+/// the server banner, session clock and the clickable player menu.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreboardChrome {
+    /// `sv_hostname`, colour codes intact.
+    pub server_name: String,
+    /// Game type and map, e.g. "FREE FOR ALL  ·  mp/ffa3".
+    pub subtitle: String,
+    /// Local wall-clock time this session joined, "21:04".
+    pub joined: Option<String>,
+    /// Time in this session, "12:34" or "1:02:03".
+    pub playtime: Option<String>,
+    /// The open vote's summary; shows YES/NO buttons in the footer.
+    pub vote: Option<String>,
+    /// Present while the scoreboard owns a mouse cursor (M2/M3 on the board).
+    pub cursor: Option<ScoreboardCursorUi>,
+    /// jaPRO servers also accept `callvote forcespec`.
+    pub japro: bool,
+    /// First visible line of a board too long for the screen.
+    pub scroll: u16,
+    /// `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    pub avatars: bool,
+    pub head_to_head: bool,
+    /// Personal match statistics; shown instead of the player list while
+    /// `stats_open` (always at intermission).
+    pub stats: Option<UiMatchStats>,
+    pub stats_open: bool,
+}
+
+/// `cg_scoreboard*` presentation switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreboardSettings {
+    /// Player avatars beside the centre divider.
+    pub avatars: bool,
+    /// Your kills/deaths against each player, by the divider.
+    pub head_to_head: bool,
+}
+
+impl Default for ScoreboardSettings {
+    fn default() -> Self {
+        Self { avatars: true, head_to_head: true }
+    }
+}
+
+/// One opponent in the personal match breakdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiMatchup {
+    pub name: String,
+    pub team: i32,
+    pub kills: u16,
+    pub deaths: u16,
+    pub damage_taken: u32,
+}
+
+/// What this client measured about its own match (see `app::match_stats`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiMatchStats {
+    pub kills: u32,
+    pub deaths: u32,
+    pub suicides: u32,
+    pub aerial_kills: u32,
+    pub saber_kills: u32,
+    pub best_streak: u32,
+    pub hits: u32,
+    pub damage_taken: u32,
+    pub avg_force_per_kill: Option<u32>,
+    pub avg_ttk_ms: Option<u32>,
+    pub avg_damage_per_death: Option<u32>,
+    /// Red, blue.
+    pub team_kills: [u32; 2],
+    pub team_deaths: [u32; 2],
+    pub best: Option<String>,
+    pub nemesis: Option<String>,
+    pub matchups: Vec<UiMatchup>,
+    /// From the server's `scores` row for us, when it reports them.
+    pub accuracy: Option<i32>,
+    pub excellent: i32,
+    pub gauntlet: i32,
+}
+
+/// Every player icon (`icon_<skin>` of every model), packed once into one
+/// texture (binding 9) so the scoreboard's avatars cost a single texture and
+/// no reloads.
+#[derive(Debug, Clone, Default)]
+pub struct AvatarAtlas {
+    pub columns: u32,
+    pub rows: u32,
+    /// Lower-case `model/skin` -> cell index.
+    pub cells: std::collections::HashMap<String, u32>,
+}
+
+impl AvatarAtlas {
+    /// The cell for `model/skin`, falling back to the model's default skin.
+    pub fn cell(&self, key: &str) -> Option<u32> {
+        let key = key.to_ascii_lowercase();
+        if let Some(&cell) = self.cells.get(&key) {
+            return Some(cell);
+        }
+        // Composite skins ("head|torso|legs") use the head's icon, as cgame does.
+        let (model, skin) = key.split_once('/').unwrap_or((key.as_str(), "default"));
+        let head = skin.split('|').next().unwrap_or("default");
+        self.cells.get(&format!("{model}/{head}")).or_else(|| self.cells.get(&format!("{model}/default"))).copied()
+    }
+
+    pub fn uv(&self, key: &str) -> Option<([f32; 2], [f32; 2])> {
+        let cell = self.cell(key)?;
+        let (columns, rows) = (self.columns.max(1) as f32, self.rows.max(1) as f32);
+        let (col, row) = ((cell % self.columns.max(1)) as f32, (cell / self.columns.max(1)) as f32);
+        let inset = 0.5 / 48.0;
+        Some((
+            [(col + inset) / columns, (row + inset) / rows],
+            [(col + 1.0 - inset) / columns, (row + 1.0 - inset) / rows],
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreboardCursorUi {
+    /// Pointer in physical pixels.
+    pub pointer: Option<[i32; 2]>,
+    pub hovered: Option<ScoreboardHit>,
+    pub menu: Option<ScoreboardMenuUi>,
+}
+
+/// The per-player action popup opened by clicking a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreboardMenuUi {
+    pub client: i32,
+    pub name: String,
+    /// Where the click landed, physical pixels; the popup is clamped on screen.
+    pub anchor: [i32; 2],
+    pub actions: Vec<ScoreAction>,
+    /// Confirmation replaces the regular actions; a kick vote cannot be sent
+    /// directly from the first click.
+    pub confirm_kick: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreAction {
+    Follow,
+    Mute,
+    Unmute,
+    VoteKick,
+    ConfirmVoteKick,
+    CancelVoteKick,
+    ForceSpectate,
+}
+
+impl ScoreAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Follow => "FOLLOW",
+            Self::Mute => "MUTE",
+            Self::Unmute => "UNMUTE",
+            Self::VoteKick => "VOTE KICK",
+            Self::ConfirmVoteKick => "YES, CALL KICK VOTE",
+            Self::CancelVoteKick => "CANCEL",
+            Self::ForceSpectate => "VOTE SPECTATE",
+        }
+    }
+}
+
+/// What the scoreboard pointer is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreboardHit {
+    /// A player row, by client number.
+    Row(i32),
+    /// An entry in the open player menu, by index into its `actions`.
+    Action(usize),
+    VoteYes,
+    VoteNo,
+    /// Footer button switching between players and personal stats.
+    StatsToggle,
 }
 
 pub(in crate::ui) fn shared_player_icon_count(ui: &UiSnapshot) -> usize {
@@ -308,9 +549,6 @@ pub(in crate) fn shared_player_icon_paths(ui: &UiSnapshot) -> Vec<String> {
     }
     if let Some(UiMiniScores::Duel { icon_paths, .. }) = ui.mini_scores.as_ref() {
         paths.extend(icon_paths.iter().cloned());
-    }
-    if let Some(enemy) = ui.enemy_info.as_ref() {
-        paths.extend(enemy.icon_paths.iter().cloned());
     }
     if let Some(board) = ui.scoreboard.as_ref() {
         paths.extend(board.icon_paths.iter().cloned());
@@ -332,7 +570,6 @@ pub(in crate::ui) fn enemy_icon_atlas_offset(ui: &UiSnapshot) -> usize {
 
 pub(in crate::ui) fn scoreboard_icon_atlas_offset(ui: &UiSnapshot) -> usize {
     enemy_icon_atlas_offset(ui)
-        + ui.enemy_info.as_ref().map_or(0, |enemy| enemy.icon_paths.len())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -346,71 +583,153 @@ pub struct DemoKillMarkerUi {
 }
 
 #[derive(Debug, Clone)]
+pub struct DemoPlayerUi {
+    pub client: i32,
+    pub name: String,
+    pub recorded: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct DemoTimelineUi {
     pub elapsed_ms: f64,
     pub duration_ms: i32,
-    pub export_in_ms: Option<i32>,
-    pub export_out_ms: Option<i32>,
-    pub export_available: bool,
-    pub export_preset_label: String,
-    pub export_fps: u32,
-    pub export_depth: bool,
-    pub hover_text: Option<String>,
-    /// Selected playback speed. When paused this is the resume speed.
     pub playback_rate: f64,
     pub paused: bool,
-    /// While dragging, render the thumb/time at this pending seek position.
+    /// While dragging, render the thumb at the pending seek position.
     pub scrub_fraction: Option<f32>,
     pub kill_markers: Vec<DemoKillMarkerUi>,
     pub camera_label: String,
     pub outside_authoritative_view: bool,
+    /// Only exposed while the +speed cursor modifier is held.
+    pub hover_point: Option<[f32; 2]>,
+    pub players: Vec<DemoPlayerUi>,
+    pub free_view: bool,
+    pub player_scroll: usize,
+    pub player_open: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Taffy is the single source of truth for both the draw pass and hit testing.
+/// Bounds are physical pixels, including window scaling, and never guessed by
+/// the input code independently of the renderer.
+#[derive(Debug, Clone)]
 pub struct DemoTimelineLayout {
-    pub play: [f32; 4],
+    pub panel: [f32; 4],
+    pub title: [f32; 4],
+    pub camera: [f32; 4],
+    pub current: [f32; 4],
+    pub total: [f32; 4],
     pub track: [f32; 4],
-    pub mark_in: [f32; 4],
-    pub mark_out: [f32; 4],
-    pub export: [f32; 4],
-    pub export_preset: [f32; 4],
-    pub export_fps: [f32; 4],
-    pub export_depth: [f32; 4],
+    pub back: [f32; 4],
+    pub play: [f32; 4],
+    pub forward: [f32; 4],
+    pub recorded: [f32; 4],
+    pub free: [f32; 4],
     pub speed: [f32; 4],
+    pub player_panel: Option<[f32; 4]>,
+    pub player_header: Option<[f32; 4]>,
+    pub player_footer: Option<[f32; 4]>,
+    pub player_rows: Vec<[f32; 4]>,
+    pub player_start: usize,
 }
 
-pub fn demo_timeline_layout(width: u32, height: u32) -> Option<DemoTimelineLayout> {
-    if width < 620 || height < 120 {
-        return None;
+/// Compact Render Studio-inspired browser and transport. The Taffy geometry
+/// is also consumed by hit testing (including the header collapse target).
+pub fn demo_timeline_layout(
+    width: u32, height: u32, player_count: usize, scroll: usize, player_open: bool,
+) -> Option<DemoTimelineLayout> {
+    use self::flex::{Container, Flex};
+    let (w, h) = (width as f32, height as f32);
+    if w < 740.0 || h < 300.0 { return None; }
+    let s = (h / 900.0).clamp(0.85, 1.08).min((w / 950.0).clamp(0.78, 1.08));
+    let margin = 8.0 * s;
+    let panel_h = 92.0 * s;
+    let panel_w = w - margin * 2.0;
+    let panel_y = h - margin - panel_h;
+    let pad_x = 11.0 * s;
+    let inner_w = panel_w - 2.0 * pad_x;
+    let mut flex = Flex::new();
+
+    let title = flex.leaf(78.0 * s, 23.0 * s);
+    let camera = flex.leaf(0.0, 23.0 * s);
+    flex.set_grow(camera, 1.0);
+    let current = flex.leaf(72.0 * s, 23.0 * s);
+    let total = flex.leaf(79.0 * s, 23.0 * s);
+    let header = flex.node(Container::row().width(inner_w).height(23.0 * s).gap(7.0 * s),
+        &[title, camera, current, total]);
+
+    let track = flex.leaf(0.0, 18.0 * s);
+    flex.set_grow(track, 1.0);
+    let track_row = flex.node(Container::row().width(inner_w).height(18.0 * s), &[track]);
+
+    let back = flex.leaf(48.0 * s, 30.0 * s);
+    let play = flex.leaf(80.0 * s, 30.0 * s);
+    let forward = flex.leaf(48.0 * s, 30.0 * s);
+    let spring = flex.spring();
+    let recorded = flex.leaf(111.0 * s, 30.0 * s);
+    let free = flex.leaf(99.0 * s, 30.0 * s);
+    let speed = flex.leaf(64.0 * s, 30.0 * s);
+    let controls = flex.node(Container::row().width(inner_w).height(30.0 * s).gap(5.0 * s),
+        &[back, play, forward, spring, recorded, free, speed]);
+    let timeline = flex.absolute(
+        Container::column().width(panel_w).height(panel_h).pad(pad_x, 6.5 * s).gap(3.5 * s),
+        margin, panel_y, &[header, track_row, controls],
+    );
+
+    // Render Studio's thin pane header + flat 28-pixel browser rows. The roster
+    // is deliberately capped; more clients are accessible by mouse wheel.
+    let mut list_node = None;
+    let mut player_header = None;
+    let mut player_footer = None;
+    let mut player_rows = Vec::new();
+    let mut list = None;
+    let mut player_start = 0;
+    if player_count > 0 {
+        let left = 12.0 * s;
+        let top = 51.0 * s;
+        let list_w = (264.0 * s).min(w - 2.0 * left);
+        let header_h = 30.0 * s;
+        let row_h = 28.0 * s;
+        let footer_h = 22.0 * s;
+        let max_rows = ((panel_y - top - header_h - footer_h - 12.0 * s) / row_h)
+            .floor().max(0.0) as usize;
+        let shown = if player_open { player_count.min(max_rows.min(9)) } else { 0 };
+        player_start = scroll.min(player_count.saturating_sub(shown));
+        let list_h = header_h + if player_open { shown as f32 * row_h + footer_h + 4.0 * s } else { 0.0 };
+        let header_node = flex.leaf(list_w, header_h);
+        let mut children = vec![header_node];
+        let mut rows = Vec::with_capacity(shown);
+        for _ in 0..shown {
+            let row = flex.leaf(list_w, row_h);
+            children.push(row);
+            rows.push(row);
+        }
+        let footer_node = if player_open {
+            let foot = flex.leaf(list_w, footer_h);
+            children.push(foot);
+            Some(foot)
+        } else { None };
+        let panel = flex.absolute(
+            Container::column().width(list_w).height(list_h), left, top, &children,
+        );
+        list_node = Some((panel, header_node, rows, footer_node));
     }
-    let w = width as f32;
-    let h = height as f32;
-    // Two rows: the entire first row belongs to the scrub track, while export
-    // controls live below it. This keeps the timeline readable even after adding
-    // quality/FPS controls instead of squeezing the useful track to nothing.
-    let panel_y = h - 72.0;
-    let controls_y = panel_y + 39.0;
-    let play = [16.0, controls_y, 30.0, 26.0];
-    let speed = [w - 82.0, controls_y, 66.0, 26.0];
-    let export = [w - 168.0, controls_y, 76.0, 26.0];
-    let export_preset = [w - 278.0, controls_y, 102.0, 26.0];
-    let export_depth = [w - 356.0, controls_y, 72.0, 26.0];
-    let export_fps = [w - 414.0, controls_y, 52.0, 26.0];
-    let mark_out = [w - 466.0, controls_y, 46.0, 26.0];
-    let mark_in = [w - 514.0, controls_y, 42.0, 26.0];
-    let track_x = 116.0;
-    let track_w = (w - track_x - 92.0).max(120.0);
-    let track = [track_x, panel_y + 8.0, track_w, 20.0];
+    let mut children = vec![timeline];
+    if let Some((node, _, _, _)) = &list_node { children.push(*node); }
+    let root = flex.node(Container::column().width(w).height(h), &children);
+    flex.compute(root, w, h);
+    if let Some((node, head, rows, foot)) = list_node {
+        list = Some(flex.bounds(node));
+        player_header = Some(flex.bounds(head));
+        player_footer = foot.map(|node| flex.bounds(node));
+        player_rows = rows.into_iter().map(|node| flex.bounds(node)).collect();
+    }
     Some(DemoTimelineLayout {
-        play,
-        track,
-        mark_in,
-        mark_out,
-        export,
-        export_preset,
-        export_fps,
-        export_depth,
-        speed,
+        panel: flex.bounds(timeline), title: flex.bounds(title), camera: flex.bounds(camera),
+        current: flex.bounds(current), total: flex.bounds(total), track: flex.bounds(track),
+        back: flex.bounds(back), play: flex.bounds(play), forward: flex.bounds(forward),
+        recorded: flex.bounds(recorded), free: flex.bounds(free), speed: flex.bounds(speed),
+        player_panel: list, player_header, player_footer, player_rows, player_start,
     })
 }
 
@@ -488,6 +807,14 @@ pub struct HudState {
     pub saber_active_style: i32,
     /// The force bar is in the red half of its "no force / out of ammo" flash.
     pub force_flash: bool,
+    /// Snapshot fd.forcePowersActive; not force-energy (fd.forcePower).
+    pub force_powers_active: i32,
+    /// Server timestamp at which Force Rage recovery ends.
+    pub rage_recovery_until_ms: i32,
+    /// Current client game/snapshot time in server milliseconds.
+    pub time_ms: i32,
+    /// Force icons are suppressed for zoomed and spectator POVs (TaystJK).
+    pub force_icons_hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -607,6 +934,8 @@ pub struct UiWorldPlayerLabel {
     pub text: String,
     pub health_fraction: Option<f32>,
     pub health_color: [f32; 4],
+    /// Score leader: draw the crown above the name.
+    pub crowned: bool,
 }
 
 /// A Render Studio player name, already projected through the shot camera:
@@ -1059,8 +1388,23 @@ pub struct UiSiegeStatViewer {
     pub ammo_max: i32,
 }
 
+/// Authored `mp_timer` layout from the active JKA `ui/hud.menu`.
+/// Matches TaystJK's CG_DrawSiegeDeathTimer: `frame` shader/rect and
+/// `deathtimer` text origin/color, never a synthetic substitute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiSiegeTimerMenu {
+    pub frame_rect: [f32; 4],
+    pub frame_shader: String,
+    pub frame_color: [f32; 4],
+    pub text_rect: [f32; 4],
+    pub text_color: [f32; 4],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiSiegeHud {
+    /// jaPRO reuses the Siege death timer for passed-vote execution delays.
+    pub vote_delay: bool,
+    pub mp_timer: Option<UiSiegeTimerMenu>,
     pub banner: Option<String>,
     pub timer: Option<String>,
     pub timer_color: [f32; 4],
@@ -1110,6 +1454,8 @@ pub struct UiSnapshot {
     pub chat_mode: ChatMode,
     pub chat_input: String,
     pub chat_lines: Vec<UiChatLine>,
+    pub chat_settings: ChatSettings,
+    pub chat_anim: UiChatAnim,
     pub console_notify_lines: Vec<UiConsoleNotifyLine>,
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
@@ -1127,6 +1473,8 @@ pub struct UiSnapshot {
     /// `CG_DrawVote`: the open vote's summary line (colour codes included).
     pub vote_line: Option<String>,
     pub scoreboard: Option<UiScoreboard>,
+    /// DinurdoJK kill feed (top right), newest line first.
+    pub killfeed: Option<UiKillfeed>,
     /// TaystJK scoreboard ownership: `cg.snap->ps.clientNum`. While following
     /// another player this is the followed client, so their row is highlighted
     /// instead of the spectator's own row.
@@ -1162,6 +1510,14 @@ pub struct UiSnapshot {
     /// Render-thread-owned UV coordinates for native-resolution icons. Kept
     /// across incoming app snapshots; empty until the atlas is lazily loaded.
     pub(crate) icon_atlas_uvs: Vec<([f32; 2], [f32; 2])>,
+    /// Renderer-owned: explicit .shader/.oshader icon names bypass the bitmap
+    /// atlas and are submitted as authored, time-varying material stages.
+    pub(crate) icon_shader_flags: Vec<bool>,
+    /// Render-thread-owned clean TrueType font (texture binding 8), kept
+    /// across app snapshots like `icon_atlas_uvs`.
+    pub(crate) clean_font: Option<std::sync::Arc<ProportionalFont>>,
+    /// Render-thread-owned avatar atlas (texture binding 9).
+    pub(crate) avatar_atlas: Option<std::sync::Arc<AvatarAtlas>>,
     pub movement_keys: MovementKeysSettings,
     pub strafe_helper: StrafeHelperSettings,
     pub movement_hud: MovementHudState,
@@ -1224,6 +1580,8 @@ impl Default for UiSnapshot {
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_lines: Vec::new(),
+            chat_settings: ChatSettings::default(),
+            chat_anim: UiChatAnim::default(),
             console_notify_lines: Vec::new(),
             center_print: None,
             follow_name: None,
@@ -1236,6 +1594,7 @@ impl Default for UiSnapshot {
             race_components: [false; 2],
             vote_line: None,
             scoreboard: None,
+            killfeed: None,
             scoreboard_focus_client: None,
             demo_timeline: None,
             prediction_debug: None,
@@ -1257,6 +1616,9 @@ impl Default for UiSnapshot {
             zoom_scope: None,
             rocket_lock: None,
             icon_atlas_uvs: Vec::new(),
+            icon_shader_flags: Vec::new(),
+            clean_font: None,
+            avatar_atlas: None,
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),
             movement_hud: MovementHudState::default(),
@@ -1293,9 +1655,23 @@ mod siege_tests;
 impl UiSnapshot {
     /// Resolve atlas UVs from the renderer's packing result. The legacy
     /// fixed-grid fallback supports builds/tests before the lazy atlas loads.
-    pub(in crate::ui) fn icon_uv(&self, index: usize) -> ([f32; 2], [f32; 2]) {
+    pub(crate) fn icon_uv(&self, index: usize) -> ([f32; 2], [f32; 2]) {
+        if self.icon_shader_flags.get(index).copied().unwrap_or(false) {
+            // Standalone material stages always use the full authored UV range.
+            return ([0.0, 0.0], [1.0, 1.0]);
+        }
         self.icon_atlas_uvs.get(index).copied()
             .unwrap_or_else(|| hud::movement::icon_cell_uv(index))
+    }
+
+    pub(crate) fn icon_texture_source(&self, index: usize) -> f32 {
+        if self.icon_shader_flags.get(index).copied().unwrap_or(false) {
+            // Distinct and exactly representable in f32. The native UI pass
+            // never draws these vertices; the screen-FX shader stages do.
+            hud::movement::ICON_SHADER_SOURCE_BASE + index as f32
+        } else {
+            hud::movement::ICON_TEXTURE_SOURCE
+        }
     }
 }
 

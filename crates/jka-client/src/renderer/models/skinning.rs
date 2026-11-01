@@ -681,10 +681,10 @@ impl DynamicModelRenderer {
             self.perf_prepare.index_upload_bytes = index_bytes.len() as u64;
         }
         if !bone_bytes.is_empty() {
-            queue.write_buffer(&self.skin_bone_buffer, 0, bone_bytes);
+            crate::renderer::igpu_ab_model_upload(queue, &self.skin_bone_buffer, bone_bytes, self.igpu_ab_mode);
         }
         if !draw_bytes.is_empty() {
-            queue.write_buffer(&self.skin_draw_buffer, 0, draw_bytes);
+            crate::renderer::igpu_ab_model_upload(queue, &self.skin_draw_buffer, draw_bytes, self.igpu_ab_mode);
         }
 
         rt.batches.clear();

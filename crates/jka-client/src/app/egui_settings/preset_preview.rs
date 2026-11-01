@@ -26,7 +26,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
         "r_colorLutStrength" => Reset::Video(ui::VIDEO_ROW_LUT_STRENGTH),
         "r_glow" => Reset::Video(ui::VIDEO_ROW_GLOW),
         "r_halation" => Reset::Video(ui::VIDEO_ROW_HALATION),
-        "r_ssao" | "r_staticBspAo" => Reset::Video(ui::VIDEO_ROW_AMBIENT_OCCLUSION),
+        "r_ssao" | "r_ssaoResolution" | "r_staticBspAo" => Reset::Video(ui::VIDEO_ROW_AMBIENT_OCCLUSION),
         "r_staticBspAoSamples" => Reset::Video(ui::VIDEO_ROW_BAKED_AO_SAMPLES),
         "r_staticBspAoResolution" => Reset::Video(ui::VIDEO_ROW_BAKED_AO_RESOLUTION),
         "r_contactShadows" => Reset::Video(ui::VIDEO_ROW_CONTACT_SHADOWS),
@@ -79,7 +79,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
 }
 
 /// The section that actually owns a preset cvar's visible setting.
-/// Cvars without an editable row (notably r_worldPath) are deliberately not
+/// Cvars without an editable row (including throughput-only Shitter overrides) are deliberately not
 /// eligible for a page-only application, but remain in Apply To All.
 pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
     use VideoSection as S;
@@ -89,7 +89,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
         | "r_texturemode" | "r_ext_texture_filter_anisotropic" | "r_detailTextures" => S::Display,
         "r_distanceCullScale" | "r_subdivisions" | "r_lodCurveError" | "r_patchStitching"
         | "r_lodScale" | "r_lodbias" => S::Geometry,
-        "r_ssao" | "r_staticBspAo" | "r_staticBspAoSamples" | "r_staticBspAoResolution"
+        "r_ssao" | "r_ssaoResolution" | "r_staticBspAo" | "r_staticBspAoSamples" | "r_staticBspAoResolution"
         | "r_entityAmbientLighting" | "r_dynamicLights" | "r_promoteFxLights"
         | "r_voxelProbeGI"
         | "r_contactShadows" | "r_localLightShadows" | "r_dynamicShadows" => S::Lighting,
@@ -216,7 +216,11 @@ fn preview_target_label_for_row(preset: QualityPreset, reset: theme::Reset) -> O
         },
         Reset::Video(ui::VIDEO_ROW_AMBIENT_OCCLUSION) => {
             if preset_value(preset, "r_ssao") == Some("1") {
-                "Realtime".to_owned()
+                if preset_value(preset, "r_ssaoResolution") == Some("1") {
+                    "Full res".to_owned()
+                } else {
+                    "Half res".to_owned()
+                }
             } else if preset_value(preset, "r_staticBspAo") == Some("1") {
                 "Baked".to_owned()
             } else {
@@ -347,7 +351,7 @@ mod tests {
     fn scoped_mapping_matches_visible_rows() {
         for preset in QualityPreset::ALL {
             for (name, _) in preset.settings() {
-                if name == "r_worldPath" {
+                if ["r_pvsMode", "r_igpuAB", "r_igpuMemoryAB", "r_fragmentShaderMode", "r_competitiveAB", "r_colorClearMode", "r_legacyBlendTransfer", "r_fullbright", "r_vertexLight", "r_lightmap"].contains(&name) {
                     assert_eq!(preset_cvar_section(name), None);
                 } else {
                     assert!(preset_cvar_section(name).is_some(), "unmapped preset cvar: {name}");
@@ -361,6 +365,16 @@ mod tests {
         assert_eq!(preset_cvar_section("r_ocean"), Some(VideoSection::Water));
         assert_eq!(preset_cvar_section("r_cloudQuality"), Some(VideoSection::Clouds));
         assert_eq!(preset_cvar_section("r_reflectionQuality"), Some(VideoSection::Effects));
+    }
+
+    #[test]
+    fn preview_skips_unchanged_detail_textures() {
+        // Getters return "0" for disabled. Using "off" in the preset table
+        // incorrectly showed a change and painted the checkbox as a preview.
+        for preset in [QualityPreset::Shitter, QualityPreset::Minimal, QualityPreset::Low] {
+            let target = preset_value(preset, "r_detailTextures").unwrap();
+            assert!(cvar_values_match("0", target), "{} highlights unchanged detail textures", preset.label());
+        }
     }
 
     #[test]

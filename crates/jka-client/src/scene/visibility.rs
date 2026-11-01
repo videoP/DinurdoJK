@@ -154,6 +154,7 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         return false;
     }
     a.authored_sort_priority == b.authored_sort_priority
+        && a.force_sight_only == b.force_sight_only
         && a.pipeline == b.pipeline
         && a.foliage_wind == b.foliage_wind
         && a.texture == b.texture

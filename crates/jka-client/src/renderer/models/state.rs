@@ -178,7 +178,7 @@ impl DynamicModelRenderer {
         let fx_sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA GPU FX sprite instance buffer"),
             size: fx_sprite_instance_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let skin_bone_capacity = 4096;
@@ -309,6 +309,8 @@ impl DynamicModelRenderer {
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
+            legacy_blend_mode: 0,
+            legacy_blend_pipeline_format: wgpu::TextureFormat::Rgba16Float,
             legacy_blend: None,
             legacy_model_pipelines: Default::default(),
             legacy_skin_pipelines: Default::default(),
@@ -363,6 +365,8 @@ impl DynamicModelRenderer {
             fx_sprite_instance_buffer,
             fx_sprite_instance_capacity,
             fx_sprite_draws: Vec::new(),
+            lightning_gpu: None,
+            lightning_gpu_attempted: false,
             resident_fx: None,
             resident_fx_frame: None,
             resident_fx_requested_modes: 0,
@@ -389,6 +393,7 @@ impl DynamicModelRenderer {
             cpu_pack_pool: None,
             scratch_cpu_pack_jobs: Vec::new(),
             model_render_bundles: false,
+            igpu_ab_mode: 0,
             model_bundles: Default::default(),
             perf_bundles: Default::default(),
             md3_geometry_cache: true,
@@ -728,7 +733,7 @@ impl DynamicModelRenderer {
         self.fx_sprite_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA GPU FX sprite instance buffer"),
             size: self.fx_sprite_instance_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
     }

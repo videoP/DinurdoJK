@@ -20,7 +20,7 @@ impl App {
             theme::banner(
                 ui,
                 "Glass promotion needs Apply Video Settings or a map reload.",
-                theme::WARNING,
+                theme::WARNING(),
             );
         }
         const STYLES: [(Style, &str); 4] = [
@@ -38,7 +38,7 @@ impl App {
             ui.label(
                 egui::RichText::new("Tuning updates live. Changing style restores its preset.")
                     .small()
-                    .color(theme::TEXT_FAINT),
+                    .color(theme::TEXT_FAINT()),
             );
             if theme::ghost_button(ui, "RESET STYLE TUNING").clicked() {
                 self.set_glass_menu_cvar("r_glassStyle", crate::glass::settings().style.name());

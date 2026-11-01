@@ -1,0 +1,146 @@
+{
+  "asset_sha1": "ef7c1d07a697489503a4a5819e5a5074711e09a1",
+  "cached_shader_sha256": "2ac6b0f66d4b276ddc725793d8c5ce385721a2e5ce936463bee58b112034fc30",
+  "bindings": {
+    "FoamRT": {
+      "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceRenderTarget2D_29",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceRenderTarget2D",
+      "template_index": 0,
+      "properties": {
+        "OverrideRenderTargetFormat": "RTF_R16f",
+        "bOverrideFormat": true
+      }
+    },
+    "FoamGrid": {
+      "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollection_49",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollection",
+      "template_index": 0,
+      "properties": {}
+    },
+    "WaterReader": {
+      "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollectionReader_57",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollectionReader",
+      "template_index": 0,
+      "properties": {
+        "EmitterName": "ShallowWaterRiverEmitter",
+        "DIName": "WaterGrid"
+      }
+    },
+    "VelocityReader": {
+      "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollectionReader_58",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollectionReader",
+      "template_index": 0,
+      "properties": {
+        "EmitterName": "ShallowWaterRiverEmitter",
+        "DIName": "VelocityGrid"
+      }
+    },
+    "NormalReader": {
+      "data_interface": "Grid2D_SW_River.SystemSpawnScript.NiagaraDataInterfaceGrid2DCollectionReader_59",
+      "native_class": "/Script/Niagara.NiagaraDataInterfaceGrid2DCollectionReader",
+      "template_index": 0,
+      "properties": {
+        "EmitterName": "ShallowWaterRiverEmitter",
+        "DIName": "NormalGrid"
+      }
+    }
+  },
+  "foam_grid": {
+    "format": "ENiagaraGpuBufferFormat::HalfFloat (UNiagaraSettings default; no override)",
+    "resolution": {
+      "module": "Grid2D_SetResolution005",
+      "method": "NewEnumerator3",
+      "method_name": "Other Grid",
+      "inputs": {
+        "OtherGrid": [
+          "Emitter.GridCollection"
+        ],
+        "WorldGridExtents": [
+          "Emitter.Grid2D_SetResolution.WorldGridExtents"
+        ],
+        "Grid": [
+          "Emitter.FoamGrid"
+        ]
+      },
+      "resolution_mult": 1.0,
+      "arithmetic": "NumCells=max(GetNumCells(OtherGrid)*Mult,1); WorldCellSize=WorldGridExtents/NumCells"
+    }
+  },
+  "foam_dx": {
+    "function": "MakeFloatFromVector2d016",
+    "input": "Emitter.Grid2D_SetResolution005.WorldCellSize",
+    "channel": "NewEnumerator0",
+    "channel_name": "X"
+  },
+  "foam_rt": {
+    "module": "Grid2D_InitRT003",
+    "inputs": {
+      "SimRT": [
+        "Emitter.FoamRT"
+      ],
+      "Grid": [
+        "Emitter.FoamGrid"
+      ]
+    },
+    "set_num_cells": false,
+    "format": "RTF_R16f"
+  },
+  "unit_to_world": {
+    "inputs": {
+      "Offset": [
+        "Engine.Owner.Position"
+      ],
+      "WorldGridExtents": [
+        "Emitter.Grid2D_SetResolution.WorldGridExtents"
+      ],
+      "Rotation": [
+        "Engine.Owner.Rotation"
+      ]
+    },
+    "local_pivot": [
+      0.5,
+      0.5
+    ],
+    "composition": "TLocal(-pivot.x,-pivot.y,-pivot.y)*S(extents.x,extents.y,1)*RLocal(I)*R(quat)*T(offset)",
+    "lwc_tile": "floor(location/2097152+0.5); zero for |location| < 1048576 cm"
+  },
+  "user": {
+    "FoamDissipationRate": 2.5,
+    "parameter_offset": 40,
+    "DebugRenderFoam": "false unless RenderState==DebugRenderFoam"
+  },
+  "stage16_constants": {
+    "Constant253": "1",
+    "Constant254": "60",
+    "Constant255": "0.004",
+    "Constant256": "1",
+    "Constant257": "1",
+    "Constant258": "60",
+    "Constant259": "0.004",
+    "Constant260": "1",
+    "Constant277": "1",
+    "Constant280": "float2(1,3)",
+    "Constant281": "1",
+    "Constant282": "float2(800,1000)",
+    "Constant283": "0",
+    "Constant284": "float2(0.002,0.05)",
+    "Constant285": "5",
+    "Constant286": "float2(150,500)",
+    "Constant287": "float2(50,200)",
+    "Constant288": "1",
+    "Constant289": "0",
+    "Constant290": "float2(0,0)",
+    "Constant291": "1",
+    "Constant292": "0",
+    "Constant293": "0"
+  },
+  "sources": {
+    "actor": "e413ba4cf55f7d51e4ed18aece852d28a42792a3166bb8c5489d5031d7df30b2",
+    "instance": "6c808a051b372f75f09a44b1a0008cd21d5b176d275265e3855e05f421e08f73",
+    "lwc": "e13ecfd497ecfdcd9b50616cb4322ad120a72862b5afce030e66a3bd078c2cc2",
+    "settings": "1fb34499addf3f2f52712b667829c79856e0fa2f3a0a8a4dd6d9349a7e9d296a",
+    "grid": "82c46da38fe42173ab9288bbd64de6bd399cb3f5265f8da84ae39b7d591a6ffa",
+    "curl": "4e70f5336f0b7e5d87cdc4a6732c0797eac7c9bd795585a03b7a8561d7db5fc3"
+  },
+  "caveat": "Saved-asset/native-source evidence for the foam field producer; not an executing Niagara instance, cooked asset or project override."
+}

@@ -34,6 +34,8 @@ mod reset;
 mod shadows;
 mod sun;
 mod water;
+mod river;
+mod river_sources;
 mod weather;
 mod widgets;
 
@@ -311,7 +313,7 @@ fn color_row(
             ui,
             &format!("{:.2}  {:.2}  {:.2}", values[0], values[1], values[2]),
             12.5,
-            theme::TEXT_FAINT,
+            theme::TEXT_FAINT(),
         );
     });
 }

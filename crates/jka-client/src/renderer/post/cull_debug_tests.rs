@@ -1,5 +1,5 @@
 use super::create_cull_debug_pipeline;
-use crate::renderer::{GpuVertex, DEPTH_FORMAT};
+use crate::renderer::{GpuVertex, depth_format};
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
@@ -105,7 +105,7 @@ fn cull_debug_gpu_overdraw_is_bounded_and_hiz_filter_excludes_pvs() {
             format,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
-        let depth = texture(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = texture(depth_format(), wgpu::TextureUsages::RENDER_ATTACHMENT);
         let output_view = output.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
         let readback = device.create_buffer(&wgpu::BufferDescriptor {

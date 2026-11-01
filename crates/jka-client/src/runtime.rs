@@ -266,6 +266,7 @@ pub enum UserEvent {
     WaterSplashes(Vec<crate::weather::wake::WaterSplash>),
     RenderStats(RenderStats),
     RendererError(String),
+    RiverUpdated {id:crate::river_authoring::Id,result:Result<crate::river_runtime::LocalSource,String>},
     SurfaceInspected(Option<SurfaceInspectorInfo>),
     MapLoadProgress {
         request_id: u64,
@@ -303,6 +304,12 @@ pub enum UserEvent {
         name: String,
         base_texture_count: usize,
         result: Result<Box<crate::scene::PreparedRemapPlan>, String>,
+    },
+    /// CPU-only vote prewarm result. Never touches the live renderer or CGame.
+    VoteMapPrewarmed {
+        token: u64,
+        result: Result<Box<PreparedMap>, String>,
+        elapsed_ms: f64,
     },
     MapPrepared {
         request_id: u64,

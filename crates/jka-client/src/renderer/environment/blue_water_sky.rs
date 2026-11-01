@@ -179,7 +179,7 @@ impl AtmosphereRenderer {
             quality,
             ::blue_water_clouds::Targets {
                 color: wgpu::TextureFormat::Rgba16Float,
-                depth: Some(wgpu::TextureFormat::Depth32Float),
+                depth: Some(crate::renderer::depth_format()),
             },
             &placeholders,
         );
@@ -393,7 +393,7 @@ impl AtmosphereRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::renderer::depth_format(),
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),

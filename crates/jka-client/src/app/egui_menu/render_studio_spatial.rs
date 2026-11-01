@@ -129,7 +129,7 @@ impl App {
             let tint=color(marker.lane);
             painter.circle_filled(anchor,3.,tint);
             painter.line_segment([anchor,rect.left_center()],egui::Stroke::new(1.,tint.gamma_multiply(0.6)));
-            painter.rect_filled(rect,4.,if selected {egui::Color32::from_rgb(48,63,72)}else{egui::Color32::from_black_alpha(210)});
+            painter.rect_filled(rect,4.,if selected {theme::CONTROL_SELECTED()}else{egui::Color32::from_black_alpha(210)});
             painter.rect_stroke(rect,4.,egui::Stroke::new(if selected{2.}else{1.},if selected {egui::Color32::WHITE}else{tint}),egui::StrokeKind::Inside);
             let icon=rect.left_center()+egui::vec2(11.,0.);
             painter.add(egui::Shape::convex_polygon(vec![icon+egui::vec2(0.,-6.),icon+egui::vec2(6.,0.),
@@ -224,9 +224,9 @@ impl App {
         use super::render_studio_ui::{self as sui,ButtonKind,Icon};
         ui.spacing_mut().item_spacing.x=4.0;
         if let Some(preview)=self.render_studio.cinematic_preview.as_ref() {
-            ui.add(egui::Label::new(egui::RichText::new(&preview.clip.label).size(12.5).color(theme::TEXT)).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(&preview.clip.label).size(12.5).color(theme::TEXT())).truncate());
             ui.label(egui::RichText::new(format!("frames {}–{} · {:.2} fps",preview.clip.first_frame,
-                preview.clip.end_frame()-1,preview.clip.fps)).size(11.5).color(theme::TEXT_FAINT));
+                preview.clip.end_frame()-1,preview.clip.fps)).size(11.5).color(theme::TEXT_FAINT()));
             return;
         }
         if demo {
@@ -253,7 +253,7 @@ impl App {
             }
             let time=self.render_studio.timeline_time();
             if let Some(shot)=self.render_studio.timeline.director_at(time) {
-                ui.label(egui::RichText::new(format!("Director · {}",shot.preset.label())).size(12.0).color(sui::CAMERA))
+                ui.label(egui::RichText::new(format!("Director · {}",shot.preset.label())).size(12.0).color(sui::CAMERA()))
                     .on_hover_text("A live Director shot drives the camera here (see the Camera track)");
             } else {
                 use crate::app::render_studio_timeline::{StudioCameraSource,StudioDemoPov,StudioFollowPerspective};

@@ -139,7 +139,7 @@ impl Renderer {
             self.studio_race_font=Some((choice,None));
             if let Some(metrics)=metrics {
                 let image=crate::renderer::textures::upload_cached_texture(&self.device,&self.queue,&data);
-                let views=[&self._ui_font.view,&image.view,&self._ui_splash.view,&self._ui_keys.view,&self._ui_icons.view,&self._ui_team_icons.view,&self._ui_ext_images.view];
+                let views=[&self._ui_font.view,&image.view,&self._ui_splash.view,&self._ui_keys.view,&self._ui_icons.view,&self._ui_team_icons.view,&self._ui_ext_images.view,&self._ui_clean_font.view,&self._ui_avatars.view];
                 let mut entries=Vec::new();
                 for (index,view) in views.iter().enumerate() {
                     entries.push(wgpu::BindGroupEntry {binding:if index==0 {0}else{index as u32+1},resource:wgpu::BindingResource::TextureView(view)});

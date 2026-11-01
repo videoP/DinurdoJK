@@ -24,7 +24,7 @@ impl App {
             ui.horizontal(|ui|{ui.spinner();sui::hint(ui,"Reading cinematic animation sets…");});
             return;
         };
-        let catalog=match result {Ok(catalog)=>catalog,Err(error)=>{sui::callout(ui,&error,theme::DANGER);return;}};
+        let catalog=match result {Ok(catalog)=>catalog,Err(error)=>{sui::callout(ui,&error,theme::DANGER());return;}};
         let needle=self.render_studio.cinematics.search.trim().to_ascii_lowercase();
         let mut groups:BTreeMap<String,Vec<_>>=BTreeMap::new();
         for clip in &catalog.clips {
@@ -44,13 +44,13 @@ impl App {
             let open=state.is_open();
             state.store(ui.ctx());
             let p=ui.painter();
-            p.rect_filled(rect,3.0,if r.hovered() {theme::CONTROL} else {egui::Color32::TRANSPARENT});
+            p.rect_filled(rect,3.0,if r.hovered() {theme::CONTROL()} else {egui::Color32::TRANSPARENT});
             sui::paint_icon(p,egui::pos2(rect.left()+10.0,rect.center().y),
-                if open {Icon::ChevronDown} else {Icon::ChevronRight},theme::TEXT_FAINT);
+                if open {Icon::ChevronDown} else {Icon::ChevronRight},theme::TEXT_FAINT());
             p.with_clip_rect(rect).text(egui::pos2(rect.left()+22.0,rect.center().y),egui::Align2::LEFT_CENTER,
-                &group,egui::FontId::proportional(12.0),theme::TEXT_DIM);
+                &group,egui::FontId::proportional(12.0),theme::TEXT_DIM());
             p.text(egui::pos2(rect.right()-8.0,rect.center().y),egui::Align2::RIGHT_CENTER,
-                clips.len().to_string(),egui::FontId::proportional(11.0),theme::TEXT_FAINT);
+                clips.len().to_string(),egui::FontId::proportional(11.0),theme::TEXT_FAINT());
             if open {
                 ui.spacing_mut().item_spacing.y=1.0;
                 for clip in clips {

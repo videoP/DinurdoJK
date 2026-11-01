@@ -7,7 +7,7 @@ use crate::renderer::{
     MaterialUniform,
     OnceLock, Ordering, PipelineJobKey, PipelineKey, Renderer, RgbGen, TcGen, TcMod, Vec3,
     WorldBatch, WorldPipelineCompilePlan, WorldPipelineVariant, WorldShaderFamily,
-    WorldShaderVariantKey, DEPTH_FORMAT, SHADOW_CASTER_CULL, VERTEX_ATTRIBUTES,
+    WorldShaderVariantKey, depth_format, SHADOW_CASTER_CULL, VERTEX_ATTRIBUTES,
 };
 
 impl Renderer {
@@ -240,9 +240,8 @@ impl Renderer {
             world.active_pipeline_variant = key;
             world.refresh_pso_slots();
             // MSAA/scene-format changed: drop the fast set, it is recompiled on
-            // demand the next time the frame plan selects FastBaseline.
+            // demand for the next companion-camera frame.
             world.fast_pipelines.clear();
-            world.fast_complexity_pipelines.clear();
             world.complexity_pipelines.clear();
         }
         rverbose!(1, "Synchronous world format/MSAA fallback compiled in {:.1} ms (RT requested: {rt_requested})",
@@ -252,9 +251,8 @@ impl Renderer {
         }
     }
 
-    /// The known-fast baseline pipelines only serve `WorldRenderPath::FastBaseline`.
-    /// They are compiled the first frame that path runs instead of alongside every
-    /// advanced variant at map load and on every scene rebuild.
+    /// Lazy lightweight BSP pipelines serve the optional companion camera only.
+    /// They are not selected by the primary gameplay view.
     pub(in crate::renderer) fn ensure_fast_world_pipelines(&mut self) -> bool {
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
@@ -272,7 +270,7 @@ impl Renderer {
             .into_iter()
             .collect::<Vec<_>>();
         let key = PipelineJobKey::new(
-            "fast-world",
+            "companion-world",
             0,
             pipeline_hash(&(scene_format, samples, &unique_keys)),
         );
@@ -288,7 +286,7 @@ impl Renderer {
         let shader = self.fast_world_shader.clone();
         let batches = world.coarse_batches.clone();
         self.pipeline_jobs
-            .request(key, "fast-baseline world set", move || {
+            .request(key, "companion-world set", move || {
                 create_world_pipelines(
                     &device,
                     &layout,
@@ -356,6 +354,7 @@ impl Renderer {
             self.glow_mode.authored(),
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
+            self.ssao_resolution,
             self.ssr_enabled,
             self.needs_resolved_depth_target(),
             self.taa_enabled || self.rt_taa_mode > 0,
@@ -430,7 +429,6 @@ impl Renderer {
             self.cull_debug_pipeline = None;
             self.wireframe_pipeline = Default::default();
             self.world_wireframe_pipelines.clear();
-            self.fast_world_wireframe_pipeline = None;
             self.debug_volumes.clear_pipelines();
             self.surface_inspector_pipeline = None;
             // Commit compatibility only after every format-sensitive pipeline
@@ -947,7 +945,7 @@ pub(in crate::renderer) fn create_ocean_far_pipeline(
             cull_mode: None, ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -1043,7 +1041,7 @@ pub(in crate::renderer) fn create_ocean_native_mesh_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(!wireframe),
             depth_compare: Some(if wireframe { wgpu::CompareFunction::Always } else { camera_depth_compare() }),
             stencil: wgpu::StencilState::default(),
@@ -1139,7 +1137,7 @@ pub(in crate::renderer) fn create_sky_box_pipelines(
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
+                format: depth_format(),
                 depth_write_enabled: Some(false),
                 depth_compare: Some(camera_depth_compare()),
                 stencil: wgpu::StencilState::default(),
@@ -1201,7 +1199,7 @@ pub(in crate::renderer) fn create_sky_cloud_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -1360,6 +1358,16 @@ pub(in crate::renderer) fn create_specialized_world_pipelines(
         modules.pipeline(device, layout, shader, lean_shader, surface_format, msaa_samples, variant, key, material)
     });
     log_material_specialization(jobs, &unique, variant, started);
+    if variant.shader_input_mode != 0 {
+        let (hits, misses, fallbacks) = super::shader_input::counters();
+        eprintln!("[SHADER INPUT] mode={} (BSP world) stage-cache hits={} misses={} WGSL fallbacks={} [session totals]",
+            variant.shader_input_mode, hits, misses, fallbacks);
+    }
+    if matches!(variant.program_mode, super::programs::WorldProgramMode::Generated | super::programs::WorldProgramMode::Hybrid) {
+        let (shapes, modules_count) = modules.module_count();
+        println!("[WORLD SHADER MODULES] mode={} structural_shapes={} unique_wgsl_modules={} specialized_psos={}",
+            super::programs::active_mode(variant), shapes, modules_count, unique.len());
+    }
     specialized_pipeline_map(jobs, &unique, &slots, pipelines)
 }
 
@@ -1381,7 +1389,16 @@ fn log_material_specialization(
             let choice = program_key(variant, pipeline, raw);
             *families.entry(choice.program).or_default() += 1;
             if matches!(choice.program, StageProgram::Specialized | StageProgram::SpecializedLean) {
-                *fallbacks.entry(super::programs::fallback_reason(variant, pipeline, raw)).or_default() += 1;
+                // In mode 5 reusing a specialized program can be a deliberate
+                // choice, not a compatibility failure.
+                let reason = if variant.program_mode == WorldProgramMode::Hybrid
+                    && super::programs::stage_rejection_reasons(variant, pipeline, raw, 5).is_empty()
+                {
+                    "hybrid policy: reusable material-specialized program"
+                } else {
+                    super::programs::fallback_reason(variant, pipeline, raw)
+                };
+                *fallbacks.entry(reason).or_default() += 1;
             }
         }
         let programs = pipelines.iter().map(|&(pipeline, material)| (
@@ -1626,6 +1643,11 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(key, material)| modules.pipeline(
                 device, layout, shader, lean_shader, surface_format, msaa_samples, shader_variant, key, material))?;
         log_material_specialization(&plan.material_jobs, &unique, shader_variant, started);
+        if matches!(shader_variant.program_mode, super::programs::WorldProgramMode::Generated | super::programs::WorldProgramMode::Hybrid) {
+            let (shapes, modules_count) = modules.module_count();
+            println!("[WORLD SHADER MODULES] mode={} structural_shapes={} unique_wgsl_modules={} specialized_psos={}",
+                super::programs::active_mode(shader_variant), shapes, modules_count, unique.len());
+        }
         specialized_pipeline_map(&plan.material_jobs, &unique, &slots, compiled)
     } else {
         Default::default()
@@ -2075,7 +2097,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2141,7 +2163,7 @@ pub(in crate::renderer) fn create_rain_depth_prepass_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2194,7 +2216,7 @@ pub(in crate::renderer) fn create_hiz_prepass_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2237,7 +2259,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2296,7 +2318,7 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2360,7 +2382,7 @@ pub(in crate::renderer) fn create_entity_rain_prepass_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -2421,7 +2443,7 @@ pub(in crate::renderer) fn create_entity_shadow_pipeline(
         // Same depth convention and bias as `create_shadow_pipeline`, so entities
         // and BSP casters agree inside one cascade layer.
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(if reverse_z {
                 wgpu::CompareFunction::GreaterEqual

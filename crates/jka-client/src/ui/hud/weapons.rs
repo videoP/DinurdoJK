@@ -2,7 +2,7 @@
 //! This is deliberately separate from the status/ammo HUD; it uses the original
 //! JKA weapon art already packed into the shared UI icon atlas.
 use crate::ui::{
-    fixed_charset_text, proportional_text, proportional_text_width,
+    fixed_charset_text, proportional_text_uniform, proportional_text_width,
     textured_rect_with_source, ProportionalFont, UiSnapshot, UiVertex, UiWeaponSelect,
     ICON_TEXTURE_SOURCE,
 };
@@ -94,7 +94,7 @@ pub(in crate::ui) fn build_weapon_select(
         let (uv0, uv1) = ui.icon_uv(weapon_icon_cell(selector, weapon));
         textured_rect_with_source(
             out, x, y, size * s, size * s,
-            uv0, uv1, [1.0; 4], ICON_TEXTURE_SOURCE, w, h,
+            uv0, uv1, [1.0; 4], ui.icon_texture_source(weapon_icon_cell(selector, weapon)), w, h,
         );
     };
 
@@ -121,8 +121,8 @@ pub(in crate::ui) fn build_weapon_select(
     let text_y = 455.0 * s;
     if let Some(font) = small_font {
         let scale = 0.55;
-        let width = proportional_text_width(name, font, scale) * w as f32 / 640.0;
-        proportional_text(out, name, font, cx - width / 2.0, text_y, scale, color, true, w, h);
+        let width = proportional_text_width(name, font, scale) * h as f32 / 480.0;
+        proportional_text_uniform(out, name, font, cx - width / 2.0, text_y, scale, color, true, w, h);
     } else {
         let glyph_width = 8.0 * s;
         let x = cx - name.len() as f32 * glyph_width * 0.5;

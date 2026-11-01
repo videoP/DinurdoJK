@@ -512,6 +512,8 @@ pub(in crate::renderer) struct WorldGpu {
     /// Any batch carries a promoted glass primary stage. Fixed at upload so the
     /// frame path does not scan every batch to decide whether post is needed.
     pub(in crate::renderer) has_glass_primary: bool,
+    /// Map-local fast guard for the Force Seeing surface visibility filter.
+    pub(in crate::renderer) has_force_sight_surfaces: bool,
     /// Static compiled CONTENTS_WATER/LAVA volumes, for thermal camera medium.
     pub(in crate::renderer) thermal_liquids: Vec<scene::ThermalLiquidVolume>,
     /// Batches whose material has an animMap. Sources and batch sets never
@@ -641,7 +643,6 @@ pub(in crate::renderer) struct WorldGpu {
     /// Distinct `(pipeline, fragment)` keys; `WorldBatch::pso_slot` indexes it.
     pub(in crate::renderer) pso_slot_keys: Vec<(PipelineKey, MaterialFragmentKey)>,
     pub(in crate::renderer) fast_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
-    pub(in crate::renderer) fast_complexity_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     pub(in crate::renderer) complexity_pipelines: BTreeMap<WorldShaderVariantKey, BTreeMap<PipelineKey, wgpu::RenderPipeline>>,
     pub(in crate::renderer) planar_reflectors: Vec<PlanarReflector>,
     /// Original material/lightmap-first batches. OFF draws all of these; MINIMAL

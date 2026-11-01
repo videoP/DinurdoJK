@@ -17,6 +17,8 @@ pub(crate) struct VideoLoadState {
     pub anisotropy: Option<f32>,
     pub dynamic_shadows_mode_seen: bool,
     pub static_world_csm_seen: bool,
+    pub legacy_split_toning_enabled: Option<bool>,
+    pub split_toning_strength_seen: bool,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct CvarBinding {

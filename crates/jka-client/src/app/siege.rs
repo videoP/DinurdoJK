@@ -210,10 +210,29 @@ impl App {
 
     pub(in crate::app) fn siege_hud_ui(&self) -> Option<crate::app::UiSiegeHud> {
         let session = self.game_session.as_ref()?;
+        // TaystJK's cg.time is the predicted/interpolated current server clock,
+        // not the timestamp captured when the UI snapshot was constructed.
+        let now = self.net.as_ref()
+            .filter(|_| session.live)
+            .map(|net| net.session().server_time())
+            .unwrap_or(session.cgame_time);
+        // CG_DrawSiegeDeathTimer is deliberately called outside the Siege
+        // gametype guard in TaystJK. jaPRO sends this same deadline event
+        // for a passed map vote on ordinary FFA/race servers.
         if session.client_game.gametype() != 7 {
-            return None;
+            let ms = session.siege_respawn_time.saturating_sub(now);
+            if session.siege_respawn_time <= 0 || ms <= 0 { return None; }
+            let seconds = ms / 1000;
+            return Some(crate::app::UiSiegeHud {
+                vote_delay: true,
+                mp_timer: self.siege_timer_menu.clone(),
+                banner: None,
+                timer: None,
+                timer_color: [1.0; 4],
+                respawn: Some(format!("{}:{:02}", seconds / 60, seconds % 60)),
+                stat_viewer: None,
+            });
         }
-        let now = session.cgame_time;
         let round = session.client_game.siege_round_state(now);
         let banner = match round.state {
             1 => Some("WAITING FOR PLAYERS".to_owned()),
@@ -266,7 +285,7 @@ impl App {
         });
 
         let stat_viewer = self.siege_stat_viewer_ui();
-        Some(crate::app::UiSiegeHud { banner, timer, timer_color, respawn, stat_viewer })
+        Some(crate::app::UiSiegeHud { vote_delay: false, mp_timer: self.siege_timer_menu.clone(), banner, timer, timer_color, respawn, stat_viewer })
     }
 
     fn siege_stat_viewer_ui(&self) -> Option<crate::app::UiSiegeStatViewer> {
@@ -492,7 +511,7 @@ mod tests {
             client: 1, name: "Player".into(), score: 0, powerups: 0,
             captures: 0, assists: 0, defends: 0, deaths: None,
             ping: 20, time: 1, team: 1, siege_class: "rebel tech".into(),
-            siege_icon: None, spectating_you: false,
+            siege_icon: None, spectating_you: false, muted: false, crowned: false, model: String::new(), model_fallback: String::new(), h2h: None, accuracy: 0, excellent: 0, gauntlet: 0, perfect: 0,
         };
         let mut rows = vec![row.clone(), row.clone(), row.clone(), row];
         rows[1].powerups = 1 << PW_REDFLAG;

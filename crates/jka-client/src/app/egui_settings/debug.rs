@@ -43,6 +43,22 @@ impl App {
             },
         );
 
+        const HIDE_FX: [(u8, &str); 3] = [
+            (0, "Normal"),
+            (1, "Hide visuals"),
+            (2, "Disable FX"),
+        ];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Hide client FX (A/B)",
+            "r_hidefx: 0 normal (default); 1 hide client FX geometry, trails, decals and FX lights while retaining FX simulation/sounds/shake; 2 also skip client FX worker simulation and per-frame geometry generation. Mode 2 suppresses FX-authored sounds/shake but not gameplay or normal audio. Session-only.",
+            theme::Reset::None,
+            crate::fx::hide_mode(),
+            &HIDE_FX,
+        ) {
+            let _ = self.set_console_cvar("r_hidefx", &mode.to_string());
+        }
+
         self.egui_toggle_row(
             ui,
             "Lightmap-only debug view",
@@ -68,7 +84,7 @@ impl App {
             theme::hint(
                 ui,
                 "Wireframe categories are unavailable on this adapter (non-solid polygon fill unsupported).",
-                theme::TEXT_DISABLED,
+                theme::TEXT_DISABLED(),
             );
         }
 
@@ -268,7 +284,7 @@ impl App {
             theme::hint(
                 ui,
                 "cg_noPredict is enabled, so the live predictor and its ground traces are inactive.",
-                theme::TEXT_DISABLED,
+                theme::TEXT_DISABLED(),
             );
         }
 

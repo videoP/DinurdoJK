@@ -34,11 +34,11 @@ impl App {
     /// renderer reports `mode` both requested and active with no world variant
     /// still compiling, so scripted measurements never sample a compile.
     pub(in crate::app) fn begin_shader_mode_wait(&mut self, arguments: &[&str]) {
-        let mode = arguments.first().and_then(|text| text.parse::<u8>().ok()).filter(|mode| *mode <= 4);
+        let mode = arguments.first().and_then(|text| text.parse::<u8>().ok()).filter(|mode| *mode <= 5);
         let timeout = arguments.get(1).map_or(Some(120.0), |text| text.parse::<f64>().ok())
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
         let (Some(mode), Some(timeout)) = (mode, timeout) else {
-            self.push_console_line("usage: waitshadermode <0-4> [timeout_seconds]".to_owned());
+            self.push_console_line("usage: waitshadermode <0-5> [timeout_seconds]".to_owned());
             return;
         };
         self.perf_sample = Some(PerfSample {

@@ -209,7 +209,6 @@ fn add_chroma_gamut_safe(rgb: [f64; 3], delta: [f64; 3]) -> [f64; 3] {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplitToningSettings {
-    pub enabled: bool,
     pub strength: f32,
     pub shadow_hue: f32,
     pub shadow_saturation: f32,
@@ -221,8 +220,7 @@ pub struct SplitToningSettings {
 impl Default for SplitToningSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            strength: 0.5,
+            strength: 0.0,
             shadow_hue: 210.0,
             shadow_saturation: 0.3,
             highlight_hue: 42.0,
@@ -243,7 +241,6 @@ impl SplitToningSettings {
             }
         };
         Self {
-            enabled: self.enabled,
             strength: finite(self.strength, defaults.strength, 0.0, 1.0),
             shadow_hue: finite(self.shadow_hue, defaults.shadow_hue, 0.0, 360.0),
             shadow_saturation: finite(self.shadow_saturation, defaults.shadow_saturation, 0.0, 1.0),
@@ -259,8 +256,7 @@ impl SplitToningSettings {
     }
 
     pub fn active(self) -> bool {
-        self.enabled
-            && self.strength > 0.001
+        self.strength > 0.0
             && (self.shadow_saturation > 0.0 || self.highlight_saturation > 0.0)
     }
 
@@ -483,17 +479,18 @@ mod tests {
     }
 
     #[test]
-    fn disabled_zero_strength_and_zero_saturation_are_identity() {
+    fn zero_strength_and_zero_saturation_are_identity() {
         let rgb = [0.12, 0.4, 0.85];
         for settings in [
             SplitToningSettings::default(),
             SplitToningSettings {
-                enabled: true,
                 strength: 0.0,
+                shadow_saturation: 1.0,
+                highlight_saturation: 1.0,
                 ..Default::default()
             },
             SplitToningSettings {
-                enabled: true,
+                strength: 0.5,
                 shadow_saturation: 0.0,
                 highlight_saturation: 0.0,
                 ..Default::default()
@@ -505,7 +502,6 @@ mod tests {
     #[test]
     fn shadows_and_highlights_get_different_hues() {
         let settings = SplitToningSettings {
-            enabled: true,
             strength: 0.5,
             shadow_hue: 240.0,
             shadow_saturation: 1.0,
@@ -521,7 +517,6 @@ mod tests {
     #[test]
     fn tint_preserves_luma_including_gamut_limits() {
         let settings = SplitToningSettings {
-            enabled: true,
             strength: 1.0,
             shadow_saturation: 1.0,
             highlight_saturation: 1.0,
@@ -543,7 +538,6 @@ mod tests {
     #[test]
     fn black_and_white_stay_neutral() {
         let settings = SplitToningSettings {
-            enabled: true,
             strength: 1.0,
             shadow_saturation: 1.0,
             highlight_saturation: 1.0,
@@ -556,7 +550,7 @@ mod tests {
     #[test]
     fn visibly_bright_linear_grey_receives_highlight_tint() {
         let settings = SplitToningSettings {
-            enabled: true,
+            strength: 0.5,
             ..Default::default()
         };
         // 65% on an sRGB display is only 38% in linear light. The former
@@ -574,7 +568,7 @@ mod tests {
     #[test]
     fn balance_moves_ranges_and_masks_follow_the_original_scene() {
         let settings = SplitToningSettings {
-            enabled: true,
+            strength: 0.5,
             ..Default::default()
         };
         let grey = [srgb_to_linear(0.5); 3];
@@ -599,7 +593,6 @@ mod tests {
     #[test]
     fn invalid_parameters_are_finite_and_bounded() {
         let settings = SplitToningSettings {
-            enabled: true,
             strength: f32::NAN,
             shadow_hue: f32::INFINITY,
             shadow_saturation: -1.0,
@@ -608,7 +601,7 @@ mod tests {
             balance: f32::NEG_INFINITY,
         }
         .sanitize();
-        assert_eq!(settings.strength, 0.5);
+        assert_eq!(settings.strength, 0.0);
         assert_eq!(settings.shadow_hue, 210.0);
         assert_eq!(settings.shadow_saturation, 0.0);
         assert_eq!(settings.highlight_hue, 0.0);

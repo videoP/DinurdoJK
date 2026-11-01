@@ -103,9 +103,9 @@ impl App {
                 });
                 ui.add_space(10.0);
                 let (text, color) = if changed == 0 {
-                    ("All at defaults".to_owned(), theme::TEXT_FAINT)
+                    ("All at defaults".to_owned(), theme::TEXT_FAINT())
                 } else {
-                    (format!("{changed} changed from default"), theme::WARNING)
+                    (format!("{changed} changed from default"), theme::WARNING())
                 };
                 theme::glow_label(ui, &text, 12.5, color);
             },
@@ -170,7 +170,7 @@ impl App {
             theme::hint(
                 ui,
                 "Enable Relight map on the Relighting page to edit the sun.",
-                theme::TEXT_DIM,
+                theme::TEXT_DIM(),
             );
             if let Some((yaw, pitch, intensity, color)) = authored {
                 theme::banner(
@@ -179,13 +179,13 @@ impl App {
                         "MAP SUN  yaw {:.1}°   pitch {:.1}°   intensity {:.0}   rgb {:.2} {:.2} {:.2}",
                         yaw, pitch, intensity, color[0], color[1], color[2]
                     ),
-                    theme::TEXT_FAINT,
+                    theme::TEXT_FAINT(),
                 );
             } else {
                 theme::banner(
                     ui,
                     "No referenced q3 shader sun on this map; renderer fallback sun is active.",
-                    theme::TEXT_FAINT,
+                    theme::TEXT_FAINT(),
                 );
             }
         } else {

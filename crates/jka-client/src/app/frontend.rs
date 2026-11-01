@@ -632,7 +632,7 @@ pub(super) fn inspect_asset(
             let mut items = model
                 .surfaces
                 .iter()
-                .map(|surface| format!("{} — {} tris, {} verts — {}", surface.name, surface.indices.len() / 3, surface.vertices.len(), if surface.shader.is_empty() { "<no shader>" } else { &surface.shader }))
+                .map(|surface| format!("{} · {} tris, {} verts · {}", surface.name, surface.indices.len() / 3, surface.vertices.len(), if surface.shader.is_empty() { "<no shader>" } else { &surface.shader }))
                 .collect::<Vec<_>>();
             if items.is_empty() {
                 items.push("No renderable surfaces".to_owned());
@@ -742,7 +742,7 @@ pub(super) fn inspect_asset(
                     let geometry = first_lod
                         .and_then(|lod| lod.surfaces.iter().find(|candidate| candidate.surface_index == index));
                     format!(
-                        "{} — {} tris, {} verts — {}",
+                        "{} · {} tris, {} verts · {}",
                         surface.name,
                         geometry.map_or(0, |surface| surface.triangles.len()),
                         geometry.map_or(0, |surface| surface.vertices.len()),
@@ -794,7 +794,7 @@ pub(super) fn inspect_asset(
                 .enumerate()
                 .map(|(index, primitive)| {
                     format!(
-                        "#{:02} {:?} — media {} — life {:.0}..{:.0} ms — count {:.1}..{:.1}",
+                        "#{:02} {:?} · media {} · life {:.0}..{:.0} ms · count {:.1}..{:.1}",
                         index + 1,
                         primitive.kind,
                         primitive.media.len(),
@@ -851,14 +851,14 @@ pub(super) fn inspect_asset(
                 .enumerate()
                 .map(|(index, stage)| {
                     format!(
-                        "Stage {} — image {} — blend {}{}",
+                        "Stage {} · image {} · blend {}{}",
                         index + 1,
                         if stage.image.is_empty() { "<none>" } else { stage.image.as_str() },
                         if stage.blend.is_empty() { "opaque" } else { stage.blend.as_str() },
                         if stage.alpha_test.trim().is_empty() {
                             String::new()
                         } else {
-                            format!(" — alpha {}", stage.alpha_test)
+                            format!(" · alpha {}", stage.alpha_test)
                         },
                     )
                 })
@@ -1107,6 +1107,10 @@ pub(super) struct DemoScoreEntry {
     pub captures: i32,
     pub assists: i32,
     pub defends: i32,
+    pub accuracy: i32,
+    pub excellent: i32,
+    pub gauntlet: i32,
+    pub perfect: i32,
     pub deaths: Option<i32>,
     pub ping: i32,
     pub time: i32,
@@ -1439,6 +1443,10 @@ fn parse_scoreboard(
             captures: atoi(&args[base + 13]),
             assists: atoi(&args[base + 11]),
             defends: atoi(&args[base + 10]),
+            accuracy: atoi(&args[base + 6]),
+            excellent: atoi(&args[base + 8]),
+            gauntlet: atoi(&args[base + 9]),
+            perfect: atoi(&args[base + 12]),
             deaths: (stride == 15).then(|| atoi(&args[base + 14])),
             ping: atoi(&args[base + 2]),
             time: atoi(&args[base + 3]),

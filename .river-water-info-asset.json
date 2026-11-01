@@ -1,0 +1,20 @@
+{
+  "summary": {
+    "manifest_sha256": "c00d24b84a80772b7c82c517044e80e8316166c109297722fa767162c5ee746c",
+    "selected_files": 1,
+    "missing_files": 1,
+    "missing_bytes": 14873,
+    "download_bytes": 8046,
+    "free_bytes": 11812614144
+  },
+  "files": [
+    {
+      "Name": "Engine/Plugins/Experimental/Water/Content/Materials/WaterInfo/DrawWaterInfo.uasset",
+      "Hash": "3b04ef02def973adb7472e1c08330a25a0dac7b9",
+      "Size": "14873",
+      "PackHash": "089784865653fbe0afc2db942c1bb50758f75c0f",
+      "PackOffset": "8",
+      "exists": false
+    }
+  ]
+}

@@ -65,6 +65,60 @@ const PS_WEAPON_READY: i32 = 0;
 const MAX_SOUND_CONFIG_BYTES: usize = 4096;
 const MAX_ENTITY_LOOPS: usize = 16; // MAX_CG_LOOPSOUNDS
 const MAX_AMBIENT_SET_BYTES: usize = 4 * 1024 * 1024;
+const PMF_FOLLOW: i32 = 4096;
+const TEAM_SPECTATOR: i32 = 3;
+
+/// `CG_CheckPlayerG2Weapons` remembers the *equipped* weapon, not the selected
+/// weapon or EV_CHANGE_WEAPON. Its saber-on/off sounds are independent of the
+/// generic weapon-select event and the EV_SABER_UNHOLSTER animation event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalEquippedWeapon {
+    client: u16,
+    spawn_count: i32,
+    weapon: i32,
+    saber_holstered: i32,
+    saber_in_flight: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaberWeaponSound { On, Off }
+
+fn saber_weapon_transition(previous: LocalEquippedWeapon, current: LocalEquippedWeapon) -> Option<SaberWeaponSound> {
+    if previous.client != current.client || previous.spawn_count != current.spawn_count {
+        return None;
+    }
+    if previous.weapon != WP_SABER && current.weapon == WP_SABER
+        && !previous.saber_in_flight && !current.saber_in_flight
+    {
+        Some(SaberWeaponSound::On)
+    } else if previous.weapon == WP_SABER && current.weapon != WP_SABER
+        && current.saber_holstered == 0
+    {
+        Some(SaberWeaponSound::Off)
+    } else {
+        None
+    }
+}
+
+fn saber_weapon_sound_paths(
+    definitions: &SaberDefinitions,
+    info: &super::ClientInfo,
+    effect: SaberWeaponSound,
+) -> Vec<String> {
+    let path = |name: &str| {
+        let definition = definitions.definition_or_default(name);
+        match effect {
+            SaberWeaponSound::On => definition.sound_on,
+            SaberWeaponSound::Off => definition.sound_off,
+        }
+    };
+    let mut sounds = vec![path(&info.saber_name)];
+    // Both authored sabers light on equip; a removed secondary is silent.
+    if !info.saber2_name.is_empty() && !saber_name_is_removed(&info.saber2_name) {
+        sounds.push(path(&info.saber2_name));
+    }
+    sounds
+}
 
 #[derive(Clone, Debug)]
 struct CustomSoundProfile {
@@ -219,6 +273,7 @@ pub struct SoundPresenter {
     prep: SoundPrepData,
     /// `cg_entities[item].weapon` pickup debounce (item entity -> expiry time).
     item_pickup_until: HashMap<i32, i32>,
+    last_local_equipped_weapon: Option<LocalEquippedWeapon>,
     /// `cent->loopingSound[]` from CG_S_AddRealLoopingSound: persistent
     /// per-entity loops (resolved qpath) until EV_STOPLOOPINGSOUND / EV_MUTE_SOUND.
     event_loops: HashMap<u16, Vec<String>>,
@@ -305,6 +360,7 @@ impl SoundPresenter {
                 connection_client_num: None,
             },
             item_pickup_until: HashMap::new(),
+            last_local_equipped_weapon: None,
             event_loops: HashMap::new(),
             killed_loop_entities: HashSet::new(),
             inline_model_midpoints: Arc::from(Vec::new()),
@@ -443,6 +499,60 @@ impl SoundPresenter {
         Ok(retried)
     }
 
+    /// OpenJK/TaystJK `CG_CheckPlayerG2Weapons`: play a saber's authored
+    /// soundOn/soundOff when the locally equipped weapon changes. The generic
+    /// EV_CHANGE_WEAPON deliberately does not emit a saber selection sound.
+    /// Only presented, living, non-follow playerStates own this side effect.
+    fn update_local_saber_weapon_sound(
+        &mut self,
+        ps: Option<&jka_protocol::server::PlayerState>,
+        player: Option<&PresentedEntity>,
+        game: &ClientGameState,
+        siege_classes: &[SiegeClassVisual],
+        reset: bool,
+    ) {
+        let Some((ps, player)) = ps.zip(player).filter(|(ps, player)| {
+            ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
+                && ps.persistant[3] != TEAM_SPECTATOR
+                && player.entity_type == ET_PLAYER
+                && player.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD == 0
+                && ps.field_i32("clientNum") == Some(i32::from(player.number))
+        }) else {
+            self.last_local_equipped_weapon = None;
+            return;
+        };
+        let current = LocalEquippedWeapon {
+            client: player.number,
+            spawn_count: ps.persistant[4], // PERS_SPAWN_COUNT
+            weapon: player.state.field_i32("weapon").unwrap_or(0),
+            saber_holstered: player.state.field_i32("saberHolstered").unwrap_or(0),
+            saber_in_flight: player.state.field_i32("saberInFlight").unwrap_or(0) != 0,
+        };
+        let previous = self.last_local_equipped_weapon.replace(current);
+        if reset { return; } // new spawn/teleport/seek must not manufacture ignition
+        let Some(effect) = previous.and_then(|previous| saber_weapon_transition(previous, current)) else {
+            return;
+        };
+        let Some(info) = game.client_info(usize::from(current.client), siege_classes) else {
+            return;
+        };
+        for qpath in saber_weapon_sound_paths(&self.prep.saber_definitions, &info, effect) {
+            match self.assets.register(&qpath) {
+                Ok(sound) => {
+                    if let Some(backend) = &mut self.backend {
+                        backend.play(SoundRequest {
+                            qpath,
+                            entity: current.client,
+                            channel: CHAN_AUTO,
+                            origin: SoundOrigin::Entity(player.origin),
+                        }, sound);
+                    }
+                }
+                Err(error) => self.warn_once(&qpath, &error),
+            }
+        }
+    }
+
     /// This frame's looping sounds, as CGame submits them from CG_AddCEntity:
     /// the CG_EntityEffects `loopSound` pass for every entity plus CG_Player's
     /// saber hum. The backend merges and spatializes them per sfx.
@@ -455,8 +565,11 @@ impl SoundPresenter {
         listener_entity: u16,
         listener_origin: [f32; 3],
         server_time: i32,
+        local_ps: Option<&jka_protocol::server::PlayerState>,
+        reset_local_weapon: bool,
     ) {
         if self.backend.is_none() { return; }
+        self.update_local_saber_weapon_sound(local_ps, followed_entity, game, siege_classes, reset_local_weapon);
         let mut requests = Vec::new();
         let ambient = self.update_ambient(game, entities, followed_entity, listener_origin, server_time);
         requests.extend(ambient.loops.into_iter().map(|looped| LoopRequest { emitter: looped.emitter,
@@ -1031,6 +1144,7 @@ impl SoundPresenter {
         self.killed_loop_entities.clear();
         self.pain_times.clear();
         self.item_pickup_until.clear();
+        self.last_local_equipped_weapon = None;
         self.announcer = Announcer::default();
         self.map_music = None;
         self.music_mult = 1.0;
@@ -2844,6 +2958,34 @@ mod tests {
         prepare_sound_event(event, &game, &[], &SoundPrepData::default())
             .unwrap()
             .expect("event should prepare a sound")
+    }
+
+    #[test]
+    fn equipped_saber_change_plays_once_not_on_weapon_selection_or_respawn() {
+        let gun = LocalEquippedWeapon { client: 2, spawn_count: 7, weapon: WP_BLASTER,
+            saber_holstered: 0, saber_in_flight: false };
+        let saber = LocalEquippedWeapon { weapon: WP_SABER, ..gun };
+        assert_eq!(saber_weapon_transition(gun, saber), Some(SaberWeaponSound::On));
+        assert_eq!(saber_weapon_transition(saber, saber), None);
+        assert_eq!(saber_weapon_transition(saber, gun), Some(SaberWeaponSound::Off));
+        assert_eq!(saber_weapon_transition(gun, gun), None);
+        assert_eq!(saber_weapon_transition(gun, LocalEquippedWeapon { spawn_count: 8, ..saber }), None);
+        assert_eq!(saber_weapon_transition(gun, LocalEquippedWeapon { client: 3, ..saber }), None);
+        assert_eq!(saber_weapon_transition(LocalEquippedWeapon { saber_in_flight: true, ..gun }, saber), None);
+        assert_eq!(saber_weapon_transition(saber, LocalEquippedWeapon { saber_holstered: 2, ..gun }), None);
+    }
+
+    #[test]
+    fn equipped_saber_sound_uses_authored_hilt_sounds_for_single_and_dual() {
+        let definitions = SaberDefinitions::default();
+        let mut info = super::super::ClientInfo::solo_kyle();
+        info.saber_name = "single_1".into();
+        assert_eq!(saber_weapon_sound_paths(&definitions, &info, SaberWeaponSound::On),
+            vec!["sound/weapons/saber/enemy_saber_on.wav"]);
+        info.saber2_name = "single_2".into();
+        assert_eq!(saber_weapon_sound_paths(&definitions, &info, SaberWeaponSound::On).len(), 2);
+        info.saber2_name = "none".into();
+        assert_eq!(saber_weapon_sound_paths(&definitions, &info, SaberWeaponSound::On).len(), 1);
     }
 
     #[test]

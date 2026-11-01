@@ -42,8 +42,108 @@ impl GameSession {
         let error = prediction.map_or([0.0; 3], |prediction| prediction.error);
         let mut sample = sample_player_state(&ps, server_time, teleported, error)?;
         sample.presentation_time_ms = presentation_time_ms;
+        // TaystJK CG_TransitionPlayerState / CG_OffsetFirstPersonView:
+        // viewheight changes instantly in Pmove, but the first-person eye
+        // eases over DUCK_TIME (100 ms). Never modify the predicted PS or
+        // the discrete view_height used by third-person camera collision.
+        self.duck_view_height.apply(
+            &ps,
+            &mut sample,
+            presentation_time_ms,
+            teleported || self.seeking_demo,
+        );
         self.presented_player_state = Some(ps);
         Some(sample)
+    }
+}
+
+// TaystJK cg_playerstate.c CG_TransitionPlayerState records changes to
+// playerState.viewheight; cg_view.c CG_OffsetFirstPersonView interpolates
+// those changes for DUCK_TIME. Keep this separate from network/player state
+// and the third-person viewheight, so Pmove and collision stay authoritative.
+const DUCK_TIME_MS: f64 = 100.0;
+
+#[derive(Clone, Copy, Debug)]
+struct TrackedDuckHeight {
+    client_num: i32,
+    following: bool,
+    pm_type: i32,
+    team: i32,
+    spawn_count: i32,
+    target: i32,
+    from: f32,
+    changed_at_ms: f64,
+    sampled_at_ms: f64,
+}
+
+impl TrackedDuckHeight {
+    fn height_at(self, time_ms: f64) -> f32 {
+        let fraction = ((time_ms - self.changed_at_ms) / DUCK_TIME_MS).clamp(0.0, 1.0) as f32;
+        self.from + (self.target as f32 - self.from) * fraction
+    }
+}
+
+#[derive(Default)]
+pub(in crate::app) struct DuckViewHeight {
+    last: Option<TrackedDuckHeight>,
+}
+
+impl DuckViewHeight {
+    fn height(&mut self, ps: &jka_protocol::server::PlayerState, time_ms: f64, reset: bool) -> f32 {
+        const PMF_FOLLOW: i32 = 4096;
+        let height = ps.field_i32("viewheight").unwrap_or(0);
+        let client_num = ps.field_i32("clientNum").unwrap_or(0);
+        let following = ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0;
+        let pm_type = ps.field_i32("pm_type").unwrap_or(0);
+        let team = ps.persistant[3]; // PERS_TEAM
+        let spawn_count = ps.persistant[4]; // PERS_SPAWN_COUNT
+        let last = self.last;
+        // Never blend two POVs, a respawn, a teleport, or a demo seek.
+        // The large time-gap check also protects resumed/suspended sessions.
+        let discontinuity = reset || !time_ms.is_finite() || last.is_none_or(|last| {
+            client_num != last.client_num
+                || following != last.following
+                || pm_type != last.pm_type
+                || team != last.team
+                || spawn_count != last.spawn_count
+                || time_ms < last.sampled_at_ms
+                || time_ms - last.sampled_at_ms > 250.0
+        });
+        if discontinuity {
+            self.last = Some(TrackedDuckHeight {
+                client_num, following, pm_type, team, spawn_count,
+                target: height, from: height as f32,
+                changed_at_ms: time_ms, sampled_at_ms: time_ms,
+            });
+            return height as f32;
+        }
+        let mut last = last.expect("duck height continuity checked");
+        if last.target != height {
+            // A quick crouch tap can reverse an unfinished transition. Start
+            // from the *visible* eye height, not the old target, to avoid pops.
+            last.from = last.height_at(time_ms);
+            last.target = height;
+            last.changed_at_ms = time_ms;
+        }
+        last.sampled_at_ms = time_ms;
+        let presented = last.height_at(time_ms);
+        self.last = Some(last);
+        presented
+    }
+
+    fn apply(
+        &mut self,
+        ps: &jka_protocol::server::PlayerState,
+        sample: &mut DemoCameraSample,
+        presentation_time_ms: f64,
+        reset: bool,
+    ) {
+        let displayed_height = self.height(ps, presentation_time_ms, reset);
+        if sample.policy.pm_type != crate::cgame::PM_INTERMISSION {
+            let mut eye = sample.native_origin;
+            eye[2] += displayed_height;
+            sample.eye_position = scene::render_position(eye);
+        }
     }
 }
 
@@ -255,6 +355,72 @@ mod tests {
     use super::*;
     use crate::app::LivePredictionFrame;
     use jka_protocol::server::PlayerState;
+
+    #[test]
+    fn spectator_crouch_and_stand_ease_camera_over_tayst_duck_time_only() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("pm_type", jka_movement::PM_SPECTATOR as u32);
+        ps.set_field_bits("viewheight", 26);
+        let mut smoothing = DuckViewHeight::default();
+        let mut eye_at = |time: f64, height: i32| {
+            ps.set_field_bits("viewheight", height as u32);
+            let mut sample = sample_player_state(&ps, time as i32, false, [0.0; 3]).unwrap();
+            smoothing.apply(&ps, &mut sample, time, false);
+            assert_eq!(sample.view_height, height); // raw PS/third-person is untouched
+            assert_eq!(ps.field_i32("viewheight"), Some(height));
+            scene::jka_position(sample.eye_position)[2]
+        };
+        assert_eq!(eye_at(1000.0, 26), 26.0);
+        assert_eq!(eye_at(1010.0, 12), 26.0); // no pop at the crouch edge
+        assert_eq!(eye_at(1060.0, 12), 19.0);
+        assert_eq!(eye_at(1110.0, 12), 12.0);
+        assert_eq!(eye_at(1120.0, 26), 12.0); // stand up also eases
+        assert_eq!(eye_at(1170.0, 26), 19.0);
+        assert_eq!(eye_at(1220.0, 26), 26.0);
+    }
+
+    #[test]
+    fn interrupted_crouch_reverses_from_visible_height_without_jump() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("viewheight", 26);
+        let mut smoothing = DuckViewHeight::default();
+        assert_eq!(smoothing.height(&ps, 1000.0, false), 26.0);
+        ps.set_field_bits("viewheight", 12);
+        assert_eq!(smoothing.height(&ps, 1010.0, false), 26.0);
+        assert_eq!(smoothing.height(&ps, 1060.0, false), 19.0);
+        ps.set_field_bits("viewheight", 26);
+        assert_eq!(smoothing.height(&ps, 1060.0, false), 19.0);
+        assert_eq!(smoothing.height(&ps, 1110.0, false), 22.5);
+        assert_eq!(smoothing.height(&ps, 1160.0, false), 26.0);
+    }
+
+    #[test]
+    fn duck_smoothing_resets_on_follow_switch_respawn_teleport_and_seek() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("viewheight", 26);
+        let mut smoothing = DuckViewHeight::default();
+        smoothing.height(&ps, 1000.0, false);
+        ps.set_field_bits("viewheight", 12);
+        assert_eq!(smoothing.height(&ps, 1010.0, false), 26.0);
+        ps.set_field_bits("clientNum", 3);
+        assert_eq!(smoothing.height(&ps, 1020.0, false), 12.0);
+        ps.set_field_bits("viewheight", 26);
+        assert_eq!(smoothing.height(&ps, 1030.0, false), 12.0);
+        ps.set_field_bits("pm_flags", 4096);
+        assert_eq!(smoothing.height(&ps, 1040.0, false), 26.0);
+        ps.set_field_bits("viewheight", 12);
+        assert_eq!(smoothing.height(&ps, 1050.0, false), 26.0);
+        ps.persistant[4] += 1; // PERS_SPAWN_COUNT
+        assert_eq!(smoothing.height(&ps, 1060.0, false), 12.0);
+        ps.set_field_bits("viewheight", 26);
+        smoothing.height(&ps, 1070.0, false);
+        assert_eq!(smoothing.height(&ps, 1080.0, true), 26.0); // teleport
+        ps.set_field_bits("viewheight", 12);
+        smoothing.height(&ps, 1090.0, false);
+        assert_eq!(smoothing.height(&ps, 800.0, false), 12.0); // rewind
+        ps.set_field_bits("viewheight", 26);
+        assert_eq!(smoothing.height(&ps, 810.0, true), 26.0); // seek
+    }
 
     #[test]
     fn non_finite_snapshot_presentation_holds_last_position_and_recovers_on_respawn() {

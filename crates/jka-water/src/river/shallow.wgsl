@@ -23,7 +23,7 @@ struct Parameters {
 struct SourceBox { position_angle: vec4<f32>, size_sink: vec4<f32> }
 struct Boundary {
     times: vec4<f32>,  // Engine.DeltaTime, sink rate, height-match amount, outside removal rate
-    origin: vec4<f32>, // first grid corner relative to simulation origin
+    origin: vec4<f32>, // xyz first grid corner; w: optional CFS max source-cell rise per solver frame (cm)
     flags: vec4<u32>,  // box count, match spline, unused, unused
 }
 @group(0) @binding(8) var<storage, read> water_info: array<vec4<f32>>; // local height, depth, flow XY
@@ -130,8 +130,19 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
             let rotated = local + cross(axis, local) * 2.0 * rotation_w
                 + cross(axis, cross(axis, local) * 2.0);
             if sink == 0u && all(rotated >= -0.5 * box.size_sink.xyz) && all(rotated <= 0.5 * box.size_sink.xyz) {
-                water.x = box.position_angle.z + 0.5 * box.size_sink.z;
-                water.y = water.x - geo.x;
+                let source_height = box.position_angle.z + 0.5 * box.size_sink.z;
+                if boundary.origin.w > 0.0 {
+                    // Height+CFS: only add water up to the target level, at a
+                    // bounded volume per solver frame. Never remove overflow.
+                    let current_depth = max(water.y, 0.0);
+                    let available = max(source_height - (geo.x + current_depth), 0.0);
+                    water.y = current_depth + min(available, boundary.origin.w);
+                    water.x = geo.x + water.y;
+                } else {
+                    // Existing native height mode: unlimited instantaneous fill.
+                    water.x = source_height;
+                    water.y = water.x - geo.x;
+                }
                 // Cached source velocity is zero and nonadditive: never replaces
                 // an existing velocity under the source's magnitude comparison.
             }

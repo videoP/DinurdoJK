@@ -30,6 +30,9 @@ pub struct Controls {
     pub remove_outside_amount: f32,
     /// Location of the first grid corner relative to the simulation origin.
     pub grid_min: [f32; 3],
+    /// 0 = exact native height clamp (unlimited source). Positive values
+    /// limit water added to each source cell per solver frame in centimetres.
+    pub source_rise_limit_cm: f32,
 }
 
 impl Controls {
@@ -41,6 +44,7 @@ impl Controls {
             height_matching_amount: 2.0,
             remove_outside_amount: 50.0,
             grid_min,
+            source_rise_limit_cm: 0.0,
         }
     }
 }
@@ -76,8 +80,16 @@ pub fn apply(
                     rotated[i] >= -0.5 * source.size[i] && rotated[i] <= 0.5 * source.size[i]
                 })
             {
-                water.height = source.position[2] + 0.5 * source.size[2];
-                water.depth = water.height - geo.bottom;
+                let target = source.position[2] + 0.5 * source.size[2];
+                if controls.source_rise_limit_cm > 0.0 {
+                    let current_depth = water.depth.max(0.0);
+                    let available = (target - (geo.bottom + current_depth)).max(0.0);
+                    water.depth = current_depth + available.min(controls.source_rise_limit_cm);
+                    water.height = geo.bottom + water.depth;
+                } else {
+                    water.height = target;
+                    water.depth = water.height - geo.bottom;
+                }
                 // In this cached graph, the source's added velocity is (0,0),
                 // nonadditive, and only replaces a smaller input magnitude.
             }
@@ -172,6 +184,28 @@ mod tests {
             ),
             water
         );
+    }
+
+    #[test]
+    fn height_cfs_is_a_supply_cap_not_an_instantaneous_height_reset() {
+        let source = SourceBox { position: [0.0; 3], size: [20.0, 20.0, 100.0], angle: 0.0, sink: false };
+        let mut controls = Controls::cached_river_variant(1.0 / 60.0, [0.0; 3]);
+        controls.source_rise_limit_cm = 4.0;
+        let geo = Geometry { bottom: 10.0, ..Geometry::default() };
+        let first = apply(Water::default(), geo, WaterInfo::default(), [0.0; 3], &[source], controls);
+        assert_eq!((first.height, first.depth), (14.0, 4.0));
+        let second = apply(first, geo, WaterInfo::default(), [0.0; 3], &[source], controls);
+        assert_eq!((second.height, second.depth), (18.0, 8.0));
+        let almost_full = Water { height: 48.0, depth: 38.0, ..Water::default() };
+        let full = apply(almost_full, geo, WaterInfo::default(), [0.0; 3], &[source], controls);
+        assert_eq!((full.height, full.depth), (50.0, 40.0));
+        // Unlike the unlimited height clamp, an overflow is not drained.
+        let overfull = Water { height: 65.0, depth: 55.0, ..Water::default() };
+        let preserved = apply(overfull, geo, WaterInfo::default(), [0.0; 3], &[source], controls);
+        assert_eq!((preserved.height, preserved.depth), (65.0, 55.0));
+        controls.source_rise_limit_cm = 0.0;
+        let legacy = apply(Water::default(), geo, WaterInfo::default(), [0.0; 3], &[source], controls);
+        assert_eq!((legacy.height, legacy.depth), (50.0, 40.0));
     }
 
     #[test]

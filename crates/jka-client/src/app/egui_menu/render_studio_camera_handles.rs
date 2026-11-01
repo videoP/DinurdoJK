@@ -99,10 +99,10 @@ impl App {
             .map(|p|viewport.min+p.to_vec2());
         let painter=ui.painter().with_clip_rect(viewport);
         if let (Some(a),Some(b))=(project(eye),project(aim)) {
-            painter.line_segment([a,b],egui::Stroke::new(1.5,sui::CAMERA));
+            painter.line_segment([a,b],egui::Stroke::new(1.5,sui::CAMERA()));
         }
         let mut busy=false;
-        for (target,origin,label,tint) in [(false,eye,"Camera position",sui::CAMERA),(true,aim,"Target / focus",theme::ACCENT)] {
+        for (target,origin,label,tint) in [(false,eye,"Camera position",sui::CAMERA()),(true,aim,"Target / focus",theme::ACCENT())] {
             let Some(center)=project(origin).filter(|p|viewport.shrink(12.0).contains(*p)) else{continue};
             painter.circle_stroke(center,8.0,egui::Stroke::new(2.0,tint));
             painter.line_segment([center-egui::vec2(11.0,0.0),center+egui::vec2(11.0,0.0)],egui::Stroke::new(1.0,tint));

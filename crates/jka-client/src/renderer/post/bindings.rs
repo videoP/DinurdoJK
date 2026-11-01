@@ -110,32 +110,7 @@ pub(in crate::renderer) fn create_ssr_temporal_bind_groups(
     }))
 }
 
-pub(in crate::renderer) fn create_fast_post_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    scene_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    buffer: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("JKA known-fast gamma post bind group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(scene_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffer.as_entire_binding(),
-            },
-        ],
-    })
-}
+
 
 pub(in crate::renderer) fn create_gamma_post_bind_group(
     device: &wgpu::Device,

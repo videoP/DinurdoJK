@@ -241,6 +241,8 @@ impl App {
             console_help_hover: self.console_help_hover && self.overlay == OverlayMode::Console,
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
+            chat_settings: self.chat_settings,
+            chat_anim: self.chat_anim_ui(Instant::now()),
             chat_lines,
             console_notify_lines,
             center_print,
@@ -254,6 +256,7 @@ impl App {
             race_components: [self.japro_cg.race_timer != 0, self.japro_cg.race_start],
             vote_line,
             scoreboard,
+            killfeed: self.killfeed_ui(),
             scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
             prediction_debug,
@@ -265,7 +268,11 @@ impl App {
             studio_crosshair_name: false,
             extension_hud: self.extensions.placed_widgets(),
             native_hidden: self.extensions.native_hidden,
-            extension_images: self.extensions.hud_images.clone(),
+            extension_images: {
+                let mut images = self.extensions.hud_images.clone();
+                ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
+                images
+            },
             crosshair: if in_studio || (self.model_placement.active && self.overlay == OverlayMode::None) {
                 crate::ui::CrosshairSettings { style: 0, ..self.crosshair }
             } else { self.crosshair },
@@ -276,6 +283,9 @@ impl App {
             zoom_scope,
             rocket_lock,
             icon_atlas_uvs: Vec::new(),
+            icon_shader_flags: Vec::new(),
+            clean_font: None,
+            avatar_atlas: None,
             movement_keys: self.movement_keys_hud,
             strafe_helper: if in_studio {
                 let mut helper=self.strafe_helper;
@@ -345,6 +355,7 @@ impl App {
                 text: text.to_owned(),
                 team: false,
                 alpha: 1.0,
+                enter: 1.0,
             })
             .into();
         }
@@ -1109,6 +1120,7 @@ impl App {
                 show_deaths: false,
                 icon_paths: Vec::new(),
                 entries: Vec::new(),
+                chrome: Default::default(),
             }
         });
 
@@ -1125,6 +1137,7 @@ impl App {
                 snapshot.player_state.stats[jka_protocol::server::STAT_CLIENTS_READY] as u16
             })
             .unwrap_or(0);
+        self.decorate_scoreboard(&mut board);
 
         Some(board)
     }
@@ -1175,6 +1188,10 @@ impl App {
             saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
             saber_active_style: ps.field_i32("fd.saberAnimLevel").unwrap_or(0),
             force_flash: self.force_flash_active(),
+            force_powers_active: ps.field_i32("fd.forcePowersActive").unwrap_or(0),
+            rage_recovery_until_ms: ps.field_i32("fd.forceRageRecoveryTime").unwrap_or(0),
+            time_ms: self.game_session.as_ref().map_or(0, |session| session.cgame_time),
+            force_icons_hidden: ps.field_i32("zoomMode").unwrap_or(0) != 0 || ps.persistant[3] == 3,
         }
     }
 
@@ -1232,6 +1249,7 @@ impl App {
             saber_style: 0,
             saber_active_style: 0,
             force_flash: false,
+            ..Default::default()
         })
     }
 
@@ -1319,6 +1337,10 @@ impl App {
                     saber_style: player.saber_style(),
                     saber_active_style: player.saber_active_style(),
                     force_flash: self.force_flash_active(),
+                    force_powers_active: view.active_powers,
+                    rage_recovery_until_ms: view.rage_recovery,
+                    time_ms: view.command_time,
+                    ..Default::default()
                 }
             })
         })
@@ -1767,6 +1789,7 @@ impl App {
         }
 
         let mut labels = Vec::new();
+        let leaders = self.score_leaders();
         if normal_active {
             let snapshot = session.client_game.current_snapshot()?;
             let viewer_team = snapshot.player_state.persistant[3];
@@ -1818,6 +1841,7 @@ impl App {
                     text: name,
                     health_fraction,
                     health_color,
+                    crowned: leaders.contains(&(client as i32)),
                 });
             }
         }
@@ -1871,6 +1895,7 @@ impl App {
                     text: first_line,
                     health_fraction: None,
                     health_color: [1.0, 1.0, 1.0, 0.0],
+                    crowned: false,
                 });
             }
         }
@@ -1909,6 +1934,7 @@ pub(in crate::app) fn generic_timer_bar(
         shader_time_offset: 0.0,
         shader_clamp_time: None,
         authored_glow: false,
+        alpha_test: 0.0,
     };
     let mut rect = |rect: [f32; 4], color: [f32; 4]| {
         draws.push(ScreenFxDraw {

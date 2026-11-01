@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn stream_only_snapshot_does_not_modify_source() {
         let original = crate::ui::UiSnapshot {
-            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: false }],
+            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: false, enter: 1.0 }],
             console_lines: vec!["/connect secret.server".into(), "^5Luke^7]: ^6secret".into()],
             console_input: "rcon password".into(),
             console_status: "secret.server".into(),
@@ -187,8 +187,8 @@ mod tests {
             chat_mode: crate::ui::ChatMode::Team,
             chat_input: "secret tactic".into(),
             chat_lines: vec![
-                crate::ui::UiChatLine { text: "^5Teammate^7: ^5rush left".into(), alpha: 1.0, team: true },
-                crate::ui::UiChatLine { text: "Public: let's talk team tactics".into(), alpha: 1.0, team: false },
+                crate::ui::UiChatLine { text: "^5Teammate^7: ^5rush left".into(), alpha: 1.0, team: true, enter: 1.0 },
+                crate::ui::UiChatLine { text: "Public: let's talk team tactics".into(), alpha: 1.0, team: false, enter: 1.0 },
             ],
             console_lines: vec![
                 "^5Teammate^7: ^5rush left".into(),
@@ -240,7 +240,7 @@ mod tests {
         let mut snapshot = UiSnapshot {
             chat_mode: crate::ui::ChatMode::Team,
             chat_input: "private team input".into(),
-            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: true }],
+            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: true, enter: 1.0 }],
             console_notify_lines: vec![crate::ui::UiConsoleNotifyLine { text: "team secret".into(), team: true }],
             console_lines: vec!["rcon password".into()],
             console_input: "tell 2 secret".into(),

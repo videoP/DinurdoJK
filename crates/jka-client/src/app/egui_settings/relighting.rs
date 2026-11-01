@@ -45,7 +45,7 @@ impl App {
             self.reset_relighting_page();
         }
         if !self.video.sun_override {
-            theme::banner(ui, "Relighting is off. Your settings are retained; the map uses its authored lighting. Lamp shadows remain available in Lighting.", theme::TEXT_DIM);
+            theme::banner(ui, "Relighting is off. Your settings are retained; the map uses its authored lighting. Lamp shadows remain available in Lighting.", theme::TEXT_DIM());
         }
         ui.add_enabled_ui(self.video.sun_override, |ui| {
             let authored = self.map_sun_editor_values();
@@ -104,13 +104,13 @@ impl App {
                 theme::banner(
                     ui,
                     "Inactive: this map has no authored sun to remove from its baked lighting.",
-                    theme::WARNING,
+                    theme::WARNING(),
                 );
             } else {
                 theme::banner(
                     ui,
                     "When compiler settings are available, removal projects the authored sun into the lightmap and subtracts before exposure and filtering. Other maps use an estimated fallback.",
-                    theme::TEXT_DIM,
+                    theme::TEXT_DIM(),
                 );
                 if let Some((yaw, pitch, intensity, color)) = authored {
                     theme::banner(
@@ -119,7 +119,7 @@ impl App {
                             "MAP SUN  azimuth {yaw:.1}°  elevation {pitch:.1}°  intensity {intensity:.0}  RGB {:.2} {:.2} {:.2}  | live beam uses this direction and hue",
                             color[0], color[1], color[2]
                         ),
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     );
                 }
             }
@@ -127,7 +127,7 @@ impl App {
                 theme::banner(
                     ui,
                     "Legacy fallback ignores occlusion and can subtract inside baked shadows on uncalibrated surfaces. Choose Shadow map for occlusion in the fallback.",
-                    theme::WARNING,
+                    theme::WARNING(),
                 );
             }
             ui.add_enabled_ui(baked_sun_ready, |ui| {

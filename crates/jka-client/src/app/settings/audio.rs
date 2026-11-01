@@ -80,6 +80,7 @@ impl App {
             playback
                 .player_presenter
                 .set_footstep_level(options.footsteps, footprints != FootprintMode::Off);
+            playback.player_presenter.set_footstep_trace(options.footstep_trace);
             if let Some(sound) = &mut playback.sound_presenter {
                 sound.set_game_sounds(options);
             }

@@ -7,7 +7,7 @@ impl App {
         if self.ui_catalog.pending.screenshots && self.screenshot_entries.is_empty() {
             theme::label(
                 ui,
-                theme::plain("Scanning screenshot folders...", 12.0, theme::TEXT_FAINT),
+                theme::plain("Scanning screenshot folders...", 12.0, theme::TEXT_FAINT()),
             );
             return;
         }
@@ -15,7 +15,7 @@ impl App {
             theme::banner(
                 ui,
                 &format!("Screenshot scan failed: {error}"),
-                theme::WARNING,
+                theme::WARNING(),
             );
             return;
         }
@@ -109,8 +109,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::RAIL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::RAIL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(9, 9))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -158,7 +158,7 @@ impl App {
                                             self.screenshot_entries.len()
                                         ),
                                         9.5,
-                                        theme::TEXT_FAINT,
+                                        theme::TEXT_FAINT(),
                                     ),
                                 );
                                 ui.with_layout(
@@ -169,7 +169,7 @@ impl App {
                                             theme::plain(
                                                 "base + mod screenshot folders",
                                                 8.5,
-                                                theme::TEXT_FAINT,
+                                                theme::TEXT_FAINT(),
                                             ),
                                         );
                                     },
@@ -205,7 +205,7 @@ impl App {
                                             theme::plain(
                                                 "No screenshots match this filter.",
                                                 10.0,
-                                                theme::TEXT_FAINT,
+                                                theme::TEXT_FAINT(),
                                             ),
                                         );
                                     }
@@ -219,8 +219,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::PANEL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::PANEL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -230,7 +230,7 @@ impl App {
                             if let Some(entry) = &selected_entry {
                                 theme::label(
                                     ui,
-                                    theme::plain(&entry.file_name, 11.0, theme::TEXT_DIM),
+                                    theme::plain(&entry.file_name, 11.0, theme::TEXT_DIM()),
                                 );
                                 ui.separator();
                             }
@@ -239,12 +239,12 @@ impl App {
                                 ui.centered_and_justified(|ui| {
                                     theme::label(
                                         ui,
-                                        theme::plain("Decoding screenshot...", 11.0, theme::TEXT_FAINT),
+                                        theme::plain("Decoding screenshot...", 11.0, theme::TEXT_FAINT()),
                                     );
                                 });
                             } else if let Some(error) = &self.screenshot_preview_error {
                                 ui.centered_and_justified(|ui| {
-                                    theme::label(ui, theme::plain(error, 10.5, theme::WARNING));
+                                    theme::label(ui, theme::plain(error, 10.5, theme::WARNING()));
                                 });
                             } else if let Some(texture) = &self.screenshot_preview_texture {
                                 let source = texture.size_vec2();
@@ -262,7 +262,7 @@ impl App {
                                 ui.centered_and_justified(|ui| {
                                     theme::label(
                                         ui,
-                                        theme::plain("Select a screenshot.", 11.0, theme::TEXT_FAINT),
+                                        theme::plain("Select a screenshot.", 11.0, theme::TEXT_FAINT()),
                                     );
                                 });
                             }
@@ -275,8 +275,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::RAIL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::RAIL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(10, 9))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -287,7 +287,7 @@ impl App {
                             let Some(entry) = &selected_entry else {
                                 theme::label(
                                     ui,
-                                    theme::plain("No screenshot selected.", 10.0, theme::TEXT_FAINT),
+                                    theme::plain("No screenshot selected.", 10.0, theme::TEXT_FAINT()),
                                 );
                                 return;
                             };
@@ -296,7 +296,7 @@ impl App {
                                 theme::plain(
                                     &format!("MOD  {}", entry.game),
                                     10.0,
-                                    theme::TEXT_DIM,
+                                    theme::TEXT_DIM(),
                                 ),
                             );
                             theme::label(
@@ -304,7 +304,7 @@ impl App {
                                 theme::plain(
                                     &entry.relative_name,
                                     9.0,
-                                    theme::TEXT_FAINT,
+                                    theme::TEXT_FAINT(),
                                 ),
                             );
                             ui.add_space(5.0);
@@ -325,7 +325,7 @@ impl App {
                                         theme::plain(
                                             "Loads the saved map/mod and restores the saved position + view in the local free camera.",
                                             8.5,
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         ),
                                     );
                                 }
@@ -341,7 +341,7 @@ impl App {
                                             metadata
                                                 .map_name
                                                 .clone()
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(
                                             ui,
@@ -349,7 +349,7 @@ impl App {
                                             metadata
                                                 .map_time_ms
                                                 .map(Self::format_demo_time)
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(
                                             ui,
@@ -365,7 +365,7 @@ impl App {
                                             metadata
                                                 .server_address
                                                 .clone()
-                                                .unwrap_or_else(|| "—".into()),
+                                                .unwrap_or_else(|| "-".into()),
                                         );
                                         Self::screenshot_metadata_row(ui, "PLAYER", metadata.player_name.clone());
                                         Self::screenshot_metadata_row(ui, "FOV", format!("{:.1}", metadata.fov));
@@ -444,7 +444,7 @@ impl App {
                                                 theme::plain(
                                                     &format!("{}{}{}", player.name, score, ping),
                                                     9.0,
-                                                    theme::TEXT_DIM,
+                                                    theme::TEXT_DIM(),
                                                 ),
                                             );
                                         }
@@ -453,13 +453,13 @@ impl App {
                                 theme::banner(
                                     ui,
                                     "Legacy/plain screenshot: no DinurdoJK capture metadata is embedded. Preview is still available.",
-                                    theme::TEXT_FAINT,
+                                    theme::TEXT_FAINT(),
                                 );
                                 if let Some(error) = &entry.metadata_error {
                                     ui.add_space(5.0);
                                     theme::label(
                                         ui,
-                                        theme::plain(error, 9.0, theme::WARNING),
+                                        theme::plain(error, 9.0, theme::WARNING()),
                                     );
                                 }
                             }

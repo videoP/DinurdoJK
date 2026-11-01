@@ -4,7 +4,7 @@
 //! be wrong when shells overlap or have more than one shader stage.
 use crate::renderer::{
     pipeline_hash, sampler_entry, texture_entry, DynamicModelAlphaMode as Mode,
-    DynamicModelRenderer, PipelineJobKey, PipelineJobManager, DEPTH_FORMAT,
+    DynamicModelRenderer, DynamicModelSurface, Mat4, PipelineJobKey, PipelineJobManager, depth_format,
 };
 
 pub(in crate::renderer) fn eligible(mode: Mode) -> bool {
@@ -14,8 +14,88 @@ pub(in crate::renderer) fn eligible(mode: Mode) -> bool {
     )
 }
 
+/// Rectangle shared by the encoded-scene draw and the return-to-linear draw.
+/// Both operate in absolute framebuffer coordinates (`textureLoad`), so an
+/// ordinary scissor preserves their original samples and blend equations.
+pub(in crate::renderer) type LegacyTransferRect = (u32, u32, u32, u32);
+
+/// Conservative CPU-world-geometry bounds for legacy HDR/offscreen blending.
+///
+/// Only the fallback from requested mode 4 uses this. Explicit mode 0 stays
+/// completely full-frame as an image-correctness reference. A failed proof
+/// deliberately returns None (full-frame), never a guessed rectangle.
+/// This never changes the format or dimensions of the FP16 scene/encoded target.
+pub(in crate::renderer) fn bounded_legacy_transfer_rect(
+    surfaces: &[DynamicModelSurface], view_proj: Mat4, width: u32, height: u32,
+) -> Option<LegacyTransferRect> {
+    if width == 0 || height == 0 { return None; }
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut seen = false;
+    let mut total_vertices = 0usize;
+    for surface in surfaces.iter().filter(|s| eligible(s.alpha_mode)) {
+        // Eligible GPU-skinned shells can move anywhere within their pose;
+        // source vertices/bind-pose bounds are NOT world-space bounds. FX
+        // instance/partial blob buffers likewise differ from source vertices.
+        if surface.ghoul2_gpu.is_some() || surface.fx_gpu_sprites.is_some() {
+            return None;
+        }
+        if surface.indices.is_empty() { continue; }
+        if surface.vertices.is_empty() { return None; }
+        total_vertices = total_vertices.saturating_add(surface.vertices.len());
+        // Avoid spending a large CPU budget scanning a crowded character scene
+        // just to save a pair of GPU fullscreen transfer draws.
+        if total_vertices > 24_000 { return None; }
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for vertex in surface.vertices.iter() {
+            // WGSL foliage_model_position changes vertex positions in the VS.
+            // We cannot bound it from the undeformed source without its wind.
+            if vertex.foliage_wind != 0.0 { return None; }
+            for axis in 0..3 {
+                let v = vertex.position[axis];
+                if !v.is_finite() { return None; }
+                lo[axis] = lo[axis].min(v);
+                hi[axis] = hi[axis].max(v);
+            }
+        }
+        let (x0, y0, x1, y1) =
+            crate::renderer::aabb_screen_rect(lo, hi, view_proj, width, height)?;
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) { return None; }
+        min_x = min_x.min(x0);
+        min_y = min_y.min(y0);
+        max_x = max_x.max(x1);
+        max_y = max_y.max(y1);
+        seen = true;
+    }
+    if !seen { return None; }
+    padded_transfer_rect((min_x, min_y, max_x, max_y), width, height)
+}
+
+/// Extra pixels cover raster precision and the small projection/vertex math
+/// differences between the CPU and WGSL. If the union is nearly fullscreen,
+/// avoid the extra CPU/encoder state: use the original unscissored path.
+fn padded_transfer_rect(
+    (x0, y0, x1, y1): (f32, f32, f32, f32), width: u32, height: u32,
+) -> Option<LegacyTransferRect> {
+    if width == 0 || height == 0 || ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let x0 = (x0.floor() - 4.0).clamp(0.0, width as f32) as u32;
+    let y0 = (y0.floor() - 4.0).clamp(0.0, height as f32) as u32;
+    let x1 = (x1.ceil() + 4.0).clamp(0.0, width as f32) as u32;
+    let y1 = (y1.ceil() + 4.0).clamp(0.0, height as f32) as u32;
+    if x1 <= x0 || y1 <= y0 { return None; }
+    let area = u64::from(x1 - x0) * u64::from(y1 - y0);
+    let full = u64::from(width) * u64::from(height);
+    if area.saturating_mul(10) >= full.saturating_mul(9) { return None; }
+    Some((x0, y0, x1 - x0, y1 - y0))
+}
+
 pub(in crate::renderer) struct LegacyModelBlend {
-    size: (u32, u32, u32, wgpu::TextureFormat),
+    size: (u32, u32, u32, wgpu::TextureFormat, wgpu::TextureFormat),
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     msaa_texture: Option<wgpu::Texture>,
@@ -27,9 +107,14 @@ pub(in crate::renderer) struct LegacyModelBlend {
 }
 
 impl LegacyModelBlend {
-    pub(in crate::renderer) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+    // SDR output can still have a 16-bit FLOAT encoded intermediate. Mode 1
+    // intentionally tests quantization + bandwidth without dropping transfers.
+    pub(in crate::renderer) fn intermediate_format(mode: u8) -> wgpu::TextureFormat {
+        if mode == 1 { wgpu::TextureFormat::Rgba8Unorm }
+        else { wgpu::TextureFormat::Rgba16Float }
+    }
 
-    fn new(device: &wgpu::Device, size: (u32, u32, u32, wgpu::TextureFormat)) -> Self {
+    fn new(device: &wgpu::Device, size: (u32, u32, u32, wgpu::TextureFormat, wgpu::TextureFormat)) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("legacy model colour transfer"),
             entries: &[texture_entry(0), sampler_entry(1)],
@@ -63,7 +148,7 @@ impl LegacyModelBlend {
                 },
                 primitive: Default::default(),
                 depth_stencil: depth.then_some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
+                    format: depth_format(),
                     depth_write_enabled: Some(false),
                     depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: Default::default(),
@@ -87,7 +172,7 @@ impl LegacyModelBlend {
                 cache: crate::pipeline_cache::get().as_ref(),
             })
         };
-        let encode = pipeline("encode", Self::FORMAT, true);
+        let encode = pipeline("encode", size.4, true);
         let decode = pipeline("decode", size.3, false);
         let make_texture = |samples| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -100,7 +185,7 @@ impl LegacyModelBlend {
                 mip_level_count: 1,
                 sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
-                format: Self::FORMAT,
+                format: size.4,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
@@ -153,7 +238,10 @@ impl LegacyModelBlend {
 
 impl DynamicModelRenderer {
     pub(in crate::renderer) fn legacy_blend_active(&self) -> bool {
-        self.legacy_blend.is_some()
+        (self.legacy_blend_mode == 4 ||
+            (self.legacy_blend_mode <= 1 && self.legacy_blend.is_some()))
+            && (self.draws.iter().any(|d| eligible(d.alpha_mode))
+                || self.skin_draws.iter().any(|d| eligible(d.alpha_mode)))
             && self
                 .draws
                 .iter()
@@ -173,8 +261,21 @@ impl DynamicModelRenderer {
         model_mask: u16,
         skin_mask: u16,
     ) {
+        if self.legacy_blend_mode > 1 && self.legacy_blend_mode != 4 { return; }
+        // Mode 4 draws encoded model colors into a UNORM alias of the SDR
+        // surface, whose ordinary scene view is sRGB.
+        let format = if self.legacy_blend_mode == 4 {
+            self.fx_sprite_surface_format.remove_srgb_suffix()
+        } else {
+            LegacyModelBlend::intermediate_format(self.legacy_blend_mode)
+        };
+        if format != self.legacy_blend_pipeline_format {
+            self.legacy_model_pipelines.fill(None);
+            self.legacy_skin_pipelines.fill(None);
+            self.legacy_blend_pipeline_format = format;
+        }
         let samples = self.fx_sprite_samples;
-        let config = pipeline_hash(&(samples, self.legacy_fog_compiled, self.model_wet_compiled));
+        let config = pipeline_hash(&(format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         for mode in crate::renderer::DYNAMIC_MODEL_ALPHA_ORDER
             .into_iter()
             .filter(|m| eligible(*m))
@@ -207,6 +308,7 @@ impl DynamicModelRenderer {
                 } else {
                     self.pipeline_layout.clone()
                 };
+                let format = format;
                 let fog = self.legacy_fog_compiled;
                 let wet = self.model_wet_compiled;
                 jobs.request(key, "legacy model display-space blend", move || {
@@ -231,7 +333,7 @@ impl DynamicModelRenderer {
                             &device,
                             &layout,
                             &shader,
-                            LegacyModelBlend::FORMAT,
+                            format,
                             samples,
                             mode,
                             fog,
@@ -244,7 +346,7 @@ impl DynamicModelRenderer {
                             &device,
                             &layout,
                             &shader,
-                            LegacyModelBlend::FORMAT,
+                            format,
                             samples,
                             mode,
                             fog,
@@ -264,13 +366,15 @@ impl DynamicModelRenderer {
         samples: u32,
         format: wgpu::TextureFormat,
     ) {
-        let needed = self.draws.iter().any(|d| eligible(d.alpha_mode))
-            || self.skin_draws.iter().any(|d| eligible(d.alpha_mode));
+        let needed = self.legacy_blend_mode <= 1
+            && (self.draws.iter().any(|d| eligible(d.alpha_mode))
+                || self.skin_draws.iter().any(|d| eligible(d.alpha_mode)));
         if !needed {
             self.legacy_blend = None;
             return;
         }
-        let size = (width, height, samples, format);
+        let size = (width, height, samples, format,
+            LegacyModelBlend::intermediate_format(self.legacy_blend_mode));
         if self.legacy_blend.as_ref().is_none_or(|b| b.size != size) {
             self.legacy_blend = Some(LegacyModelBlend::new(device, size));
         }
@@ -284,22 +388,25 @@ impl DynamicModelRenderer {
         msaa: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
         camera: &wgpu::BindGroup,
+        native_unorm_view: Option<&wgpu::TextureView>,
+        transfer_rect: Option<LegacyTransferRect>,
     ) {
         if !self.legacy_blend_active() {
             return;
         }
-        let blend = self.legacy_blend.as_ref().unwrap();
-        let encode_source = blend.bind(device, scene);
-        let decode_source = blend.bind(device, &blend.view);
-        {
+        if self.legacy_blend_mode == 4 {
+            // Direct SDR route: no offscreen HDR texture, no scene sampling,
+            // no fullscreen encode/decode and no forced post resolve. Only the
+            // eligible geometry is redrawn into the encoded UNORM attachment.
+            let Some(view) = native_unorm_view else { return; };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("legacy model encoded blending"),
+                label: Some("legacy model direct display-space blend (UNORM alias)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: blend.msaa_view.as_ref().unwrap_or(&blend.view),
+                    view,
                     depth_slice: None,
-                    resolve_target: blend.msaa_view.as_ref().map(|_| &blend.view),
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -313,6 +420,44 @@ impl DynamicModelRenderer {
                 }),
                 ..Default::default()
             });
+            self.draw_encoded_legacy_models(&mut pass, camera);
+            return;
+        }
+        let blend = self.legacy_blend.as_ref().unwrap();
+        let encode_source = blend.bind(device, scene);
+        let decode_source = blend.bind(device, &blend.view);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("legacy model encoded blending"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: blend.msaa_view.as_ref().unwrap_or(&blend.view),
+                    depth_slice: None,
+                    resolve_target: blend.msaa_view.as_ref().map(|_| &blend.view),
+                    ops: wgpu::Operations {
+                        // In the bounded case the encode triangle overwrites
+                        // every pixel subsequently decoded; a full-image
+                        // clear would negate much of the bandwidth saving.
+                        load: if transfer_rect.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            if let Some((x, y, w, h)) = transfer_rect {
+                pass.set_scissor_rect(x, y, w, h);
+            }
             pass.set_pipeline(&blend.encode);
             pass.set_bind_group(0, &encode_source, &[]);
             pass.draw(0..3, 0..1);
@@ -331,6 +476,9 @@ impl DynamicModelRenderer {
             })],
             ..Default::default()
         });
+        if let Some((x, y, w, h)) = transfer_rect {
+            pass.set_scissor_rect(x, y, w, h);
+        }
         pass.set_pipeline(&blend.decode);
         pass.set_bind_group(0, &decode_source, &[]);
         pass.draw(0..3, 0..1);
@@ -357,3 +505,24 @@ const TRANSFER: &str = r#"
 #[cfg(test)]
 #[path = "legacy_blend_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod transfer_rect_tests {
+    use super::padded_transfer_rect;
+
+    #[test]
+    fn rect_is_padded_and_clamped_to_attachment() {
+        assert_eq!(padded_transfer_rect((10.4, 20.1, 80.2, 45.8), 200, 100),
+            Some((6, 16, 79, 34)));
+        assert_eq!(padded_transfer_rect((-10.0, 90.0, 40.0, 150.0), 200, 100),
+            Some((0, 86, 44, 14)));
+    }
+
+    #[test]
+    fn unbounded_and_fullscreen_rects_use_reference_path() {
+        assert_eq!(padded_transfer_rect((0.0, 0.0, 1920.0, 1080.0), 1920, 1080), None);
+        assert_eq!(padded_transfer_rect((10.0, 10.0, 10.0, 10.0), 0, 100), None);
+        assert_eq!(padded_transfer_rect((f32::NAN, 0.0, 20.0, 20.0), 200, 100), None);
+        assert_eq!(padded_transfer_rect((-100.0, -100.0, -10.0, -10.0), 200, 100), None);
+    }
+}

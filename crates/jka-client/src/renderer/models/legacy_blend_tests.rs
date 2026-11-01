@@ -134,7 +134,8 @@ fn fogged(c:vec4<f32>,p:vec3<f32>,b:bool)->vec4<f32>{{return c;}}
             wgpu::TextureFormat::Rgba16Float,
         ] {
             for samples in [1, 4] {
-                let blend = LegacyModelBlend::new(&device, (1, 1, samples, format));
+                let intermediate = LegacyModelBlend::intermediate_format(0);
+                let blend = LegacyModelBlend::new(&device, (1, 1, samples, format, intermediate));
                 let make = |format, samples| {
                     device.create_texture(&wgpu::TextureDescriptor {
                         label: None,
@@ -153,7 +154,7 @@ fn fogged(c:vec4<f32>,p:vec3<f32>,b:bool)->vec4<f32>{{return c;}}
                 let scene_view = scene.create_view(&Default::default());
                 let msaa = (samples > 1).then(|| make(format, samples));
                 let msaa_view = msaa.as_ref().map(|t| t.create_view(&Default::default()));
-                let depth = make(DEPTH_FORMAT, samples);
+                let depth = make(depth_format(), samples);
                 let depth_view = depth.create_view(&Default::default());
                 let encode_source = blend.bind(&device, &scene_view);
                 let decode_source = blend.bind(&device, &blend.view);
@@ -166,7 +167,7 @@ fn fogged(c:vec4<f32>,p:vec3<f32>,b:bool)->vec4<f32>{{return c;}}
                         &device,
                         &layout,
                         &shader,
-                        LegacyModelBlend::FORMAT,
+                        intermediate,
                         samples,
                         mode,
                         false,

@@ -11,8 +11,8 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(12, 17, 24, 242))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::WARNING))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(12, 17, 24, 242), theme::PANEL_FILL()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::WARNING()))
                     .inner_margin(egui::Margin::symmetric(12, 7))
                     .show(ui, |ui| {
                         theme::label(
@@ -20,7 +20,7 @@ impl App {
                             theme::plain(
                                 "Press any key, mouse button or wheel direction…  ESC cancels.",
                                 12.5,
-                                theme::WARNING,
+                                theme::WARNING(),
                             ),
                         );
                     });
@@ -56,7 +56,7 @@ impl App {
         let mouse_tab = groups.len();
         self.controls_section = self.controls_section.min(mouse_tab);
         let mut picked_tab = None;
-        egui::Frame::new().fill(theme::SURFACE_ALT).show(ui, |ui| {
+        egui::Frame::new().fill(theme::SURFACE_ALT()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (index, label) in groups.iter().copied().chain(["Mouse"]).enumerate() {
@@ -124,11 +124,11 @@ impl App {
                         );
                         theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
                             let (text, color) = if waiting {
-                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                                ("PRESS A KEY…".to_owned(), theme::WARNING())
                             } else if binding == "INHERIT NORMAL" {
-                                ("Inherit normal".to_owned(), theme::TEXT_DISABLED)
+                                ("Inherit normal".to_owned(), theme::TEXT_DISABLED())
                             } else {
-                                (binding.clone(), theme::ACCENT)
+                                (binding.clone(), theme::ACCENT())
                             };
                             let response = binding_slot(ui, &text, color, waiting);
                             if response.clicked() {
@@ -147,11 +147,11 @@ impl App {
                         let tip = format!("Bound to the \"{}\" command.", action.command);
                         theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
                             let (text, color) = if waiting {
-                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                                ("PRESS A KEY…".to_owned(), theme::WARNING())
                             } else if binding == "UNBOUND" {
-                                ("Unbound".to_owned(), theme::TEXT_DISABLED)
+                                ("Unbound".to_owned(), theme::TEXT_DISABLED())
                             } else {
-                                (binding.clone(), theme::ACCENT)
+                                (binding.clone(), theme::ACCENT())
                             };
                             let response = binding_slot(ui, &text, color, waiting);
                             if response.clicked() {
@@ -172,11 +172,11 @@ impl App {
                         let tip = format!("Bound to the \"{}\" command.", action.command);
                         theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
                             let (text, color) = if waiting {
-                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                                ("PRESS A KEY…".to_owned(), theme::WARNING())
                             } else if binding == "UNBOUND" {
-                                ("Unbound".to_owned(), theme::TEXT_DISABLED)
+                                ("Unbound".to_owned(), theme::TEXT_DISABLED())
                             } else {
-                                (binding.clone(), theme::ACCENT)
+                                (binding.clone(), theme::ACCENT())
                             };
                             let response = binding_slot(ui, &text, color, waiting);
                             if response.clicked() {

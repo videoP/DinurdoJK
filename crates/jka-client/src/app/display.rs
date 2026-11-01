@@ -594,14 +594,25 @@ impl App {
             || requested.allow_asset_overrides != prepared.allow_asset_overrides
     }
 
-    /// The only staged changes that genuinely need the renderer torn down and
-    /// rebuilt: the graphics backend and the display mode/resolution.
+    /// Display-related changes that require a new renderer or surface.
+    /// Framebuffer-format latches are checked separately at Apply time.
     pub(in crate::app) fn display_restart_required(&self) -> bool {
         self.video.fullscreen != self.applied_fullscreen
             || self.video.renderer_backend != self.applied_renderer_backend
             || self.video.gpu_adapter != self.applied_gpu_adapter
             || self.video.hdr_output != self.applied_hdr_output
             || self.video.resolution != self.applied_resolution
+    }
+
+    /// The two framebuffer-format A/Bs require a new renderer (surface and/or
+    /// depth pipelines), not just a map reprepare. Console and preset changes
+    /// remain staged until the standard Apply / vid_restart boundary.
+    pub(in crate::app) fn framebuffer_format_restart_pending(&self) -> bool {
+        self.latched_console_cvars.iter().any(|(name, value)| match name.as_str() {
+            "r_rgb565" => value.parse::<u8>().ok() != Some(crate::renderer::rgb565_requested()),
+            "r_igpumemoryab" => value.parse::<u8>().ok() != Some(crate::renderer::igpu_depth_requested()),
+            _ => false,
+        })
     }
 
     /// Staged options whose only effect is on CPU-prepared map data.
@@ -1001,8 +1012,14 @@ impl App {
             self.publish_ui();
             return None;
         }
+        // Snapshot the required restart path before consuming the latches:
+        // they update the requested format atomics, but the active swapchain
+        // and depth pipeline must be rebuilt once to use the new formats.
+        let framebuffer_restart = self.framebuffer_format_restart_pending();
         self.apply_latched_console_cvars(ApplyLatchedScope::VidRestart);
-        Some(if !self.display_restart_required() {
+        Some(if framebuffer_restart {
+            ApplyVideoPath::RestartRenderer
+        } else if !self.display_restart_required() {
             ApplyVideoPath::ReprepareMap
         } else if self.live_display_change_possible() {
             ApplyVideoPath::LiveDisplay
@@ -1012,8 +1029,9 @@ impl App {
     }
 
     /// Apply Video Settings. Unlike `vid_restart`, this only tears the renderer
-    /// down for a backend change or a real exclusive-mode switch. Windowed and
-    /// borderless changes resize the running renderer; everything else staged is
+    /// down for a backend change, an actual framebuffer-format change or a real
+    /// exclusive-mode switch. Windowed and borderless changes resize the running
+    /// renderer; everything else staged is
     /// prepared map data rebuilt on the map worker.
     pub(in crate::app) fn apply_video_settings(&mut self) {
         match self.begin_apply_video_settings() {

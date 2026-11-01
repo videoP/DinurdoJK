@@ -2,16 +2,6 @@
 use crate::renderer::Hash;
 use super::programs::{StageProgram, VertexRecipe, WorldProgramMode};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::renderer) enum WorldRenderPath {
-    /// Exact low-overhead renderer used by the known-fast pre-enhancement build.
-    /// It has only camera + surface bind groups and records the simple direct
-    /// draw loop without consulting advanced renderer state per draw.
-    FastBaseline,
-    #[default]
-    Advanced,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::renderer) enum WorldShaderFamily {
     Lean,
@@ -24,6 +14,9 @@ pub(in crate::renderer) enum WorldShaderFamily {
 /// or creates it once; steady-state frames never compile pipelines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::renderer) struct WorldShaderVariantKey {
+    /// World shader *input format* (0 WGSL, 1 round-trip validated SPIR-V).
+    /// Included in all pipeline identity keys so different inputs never alias.
+    pub(in crate::renderer) shader_input_mode: u8,
     pub(in crate::renderer) pbr: bool,
     pub(in crate::renderer) pom: bool,
     pub(in crate::renderer) pbr_shared_material_eval: bool,
@@ -435,6 +428,10 @@ impl WorldShaderVariantKey {
 
     pub(in crate::renderer) fn short_label(self) -> String {
         let mut enabled = Vec::new();
+        match self.shader_input_mode {
+            1 => enabled.push("spv"),
+            _ => {}
+        }
         if self.pbr {
             enabled.push("pbr");
         }
@@ -538,6 +535,7 @@ impl WorldShaderVariantKey {
             enabled.push(match self.program_mode {
                 WorldProgramMode::Shared => "shared-families",
                 WorldProgramMode::Generated => "generated-stages",
+                WorldProgramMode::Hybrid => "hybrid-material",
                 WorldProgramMode::Specialized if self.minimal_entries => "mat-spec+minimal",
                 WorldProgramMode::Specialized => "mat-spec",
             });

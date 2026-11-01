@@ -2,7 +2,7 @@
 //! how many ray-query traversals the fragment inlines, and which RT features
 //! drive the native cost. Windowless Vulkan; run with --ignored --nocapture.
 use super::*;
-use crate::renderer::{GpuVertex, MaterialFragmentKey, WorldShaderVariantKey, DEPTH_FORMAT, VERTEX_ATTRIBUTES};
+use crate::renderer::{GpuVertex, MaterialFragmentKey, WorldShaderVariantKey, depth_format, VERTEX_ATTRIBUTES};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -253,7 +253,7 @@ fn rt_world_pipeline_compile_probe() {
                 },
                 primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                    format: depth_format(), depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(), bias: Default::default(),
                 }),
@@ -312,7 +312,7 @@ fn rt_world_pipeline_levers_probe() {
                     compilation_options: wgpu::PipelineCompilationOptions { constants: &vertex_constants, ..Default::default() },
                     buffers: &buffers },
                 primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                depth_stencil: Some(wgpu::DepthStencilState { format: depth_format(), depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_main"),
@@ -413,7 +413,7 @@ fn rt_world_pipeline_disk_cache_probe() {
                     compilation_options: wgpu::PipelineCompilationOptions { constants: &vertex_constants, ..Default::default() },
                     buffers: &buffers },
                 primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                depth_stencil: Some(wgpu::DepthStencilState { format: depth_format(), depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_main"),
@@ -514,7 +514,7 @@ fn rt_user_variant_feature_cost_probe() {
                     compilation_options: wgpu::PipelineCompilationOptions { constants: &vertex_constants, ..Default::default() },
                     buffers: &buffers },
                 primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                depth_stencil: Some(wgpu::DepthStencilState { format: depth_format(), depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_main"),

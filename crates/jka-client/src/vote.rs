@@ -81,6 +81,112 @@ pub fn read(get: impl Fn(u16) -> Option<String>, now_ms: i32) -> Option<VoteUi> 
     })
 }
 
+/// Only literal `map <name>` votes can be prepared without the server's
+/// command interpreter. Display names like `map mp/ffa3 (Death Star)` are not
+/// part of the BSP qpath. In particular never guess what `vstr nextmap` runs.
+pub fn proposed_map(vote_string: &str) -> Option<String> {
+    // jaPRO's stock map callvote includes an appended nextmap reset:
+    // `map racepack8; set nextmap map_restart 0`. The semicolon belongs
+    // to the console command separator, not the BSP qpath.
+    let (first_command, suffix) = match vote_string.split_once(';') {
+        Some((map, suffix)) => (map.trim(), Some(suffix.trim())),
+        None => (vote_string.trim(), None),
+    };
+    // A jaPRO map vote appends exactly this harmless nextmap reset. Never
+    // extrapolate its destination from an arbitrary compound server command.
+    if let Some(suffix) = suffix {
+        if !suffix.eq_ignore_ascii_case("set nextmap map_restart 0")
+            && !suffix.trim_end_matches([')', ',', '"', ' ', '\n']).eq_ignore_ascii_case("set nextmap map_restart 0")
+        {
+            return None;
+        }
+    }
+    let mut words = first_command.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("map") { return None; }
+    let name = words.next()?;
+    // Ignore only the known optional display name `(Map Title)`; reject
+    // additional commands/arguments in the first segment.
+    if let Some(tail) = words.next() {
+        if !tail.starts_with('(') { return None; }
+    }
+    let name = name.strip_prefix("maps/").unwrap_or(name);
+    let name = name.strip_suffix(".bsp").unwrap_or(name);
+    if name.is_empty() || name.len() >= 60 || name.starts_with('/')
+        || name.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/'))
+    { return None; }
+    Some(name.to_owned())
+}
+
+/// Observe an incremental CS_VOTE_STRING (index 9) reliable command.
+/// The protocol gamestate decoder's configstring map is only the initial
+/// snapshot; later `cs` commands reach CGame separately. Return None for
+/// unrelated commands, but Some((text, None)) when an unrelated vote begins,
+/// so a previous map-vote candidate can be invalidated.
+pub fn vote_map_cs9_update(command: &[u8]) -> Option<(String, Option<String>)> {
+    let args = jka_protocol::commands::tokenize(command);
+    if args.len() < 3 || !args[0].eq_ignore_ascii_case(b"cs")
+        || args[1].as_slice() != b"9" { return None; }
+    let text = String::from_utf8_lossy(&args[2]).into_owned();
+    let target = proposed_map(&text);
+    Some((text, target))
+}
+
+/// Match the *server* `print` command, never a player `chat`, so an ordinary
+/// player cannot manufacture a successful map vote by saying "Vote passed".
+/// Quake 3, OpenJK and TaystJK announce this before delayed execution.
+pub fn is_passed_vote_print(command: &[u8]) -> bool {
+    server_print_text(command).is_some_and(|text| {
+        let lowercase = text.to_ascii_lowercase();
+        // Don't interpret arbitrary server prints that merely quote the phrase.
+        lowercase.starts_with("vote passed") || lowercase.starts_with("vote succeeded")
+    })
+}
+
+/// A trusted, successful vote print often contains the command itself:
+/// `print "Vote passed. (map racepack8; set nextmap map_restart 0), ..."`.
+/// Unlike CS_VOTE_TIME, this survives even when the server clears the vote
+/// configstring in the same packet. Never evaluate the command, only extract
+/// its first, explicitly named map target.
+pub fn passed_vote_map(command: &[u8]) -> Option<String> {
+    let text = server_print_text(command)?;
+    if !is_passed_vote_print(command) { return None; }
+
+    // TaystJK g_main.c VotePassed prints:
+    //   Vote passed. (map racepack6; set nextmap map_restart 0^7),
+    //   command will be executed in 7 seconds.
+    // The ^7 is the server's appended color reset, not part of the command.
+    // Isolate the balanced (...) before checking the vote itself.
+    let start = text.find('(')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 { close = Some(start + offset); break; }
+            }
+            _ => {}
+        }
+    }
+    let mut command_text = text.get(start + 1..close?)?.trim_end();
+    if let Some(without_color_reset) = command_text.strip_suffix("^7") {
+        command_text = without_color_reset.trim_end();
+    }
+    proposed_map(command_text)
+}
+
+fn server_print_text(command: &[u8]) -> Option<String> {
+    // Match only a reliable server print, not chat or local console text.
+    let raw = command.trim_ascii_start();
+    let boundary = raw.iter().position(|b| b.is_ascii_whitespace())?;
+    if !raw[..boundary].eq_ignore_ascii_case(b"print") { return None; }
+    let payload = raw[boundary..].trim_ascii_start();
+    let payload = payload.strip_prefix(b"\"").unwrap_or(payload);
+    Some(String::from_utf8_lossy(payload).into_owned())
+}
+
 /// Game types the menu offers, `(number, label)`. Single player is not votable.
 pub const GAME_TYPES: &[(u8, &str)] = &[
     (0, "Free For All"),
@@ -201,6 +307,45 @@ mod tests {
     fn hud_line_includes_the_argument() {
         let vote = VoteUi { seconds_left: 9, label: "New Map".into(), param: Some("mp/ffa3".into()), yes: 0, no: 2 };
         assert_eq!(vote.hud_line(), "^7Vote(9):<New Map mp/ffa3^7> Yes:0 No:2");
+    }
+
+    #[test]
+    fn reliable_cs9_vote_map_is_available_before_vote_passes() {
+        let raw = b"cs 9 \"map Racepack8 (racepack8)\"\n";
+        let (text, map) = vote_map_cs9_update(raw).expect("CS9 update");
+        assert_eq!(text, "map Racepack8 (racepack8)");
+        assert_eq!(map.as_deref(), Some("Racepack8"));
+        assert_eq!(vote_map_cs9_update(b"cs 8 \"51225\"\n"), None);
+        assert_eq!(vote_map_cs9_update(b"cs 8 \"\"\n"), None);
+        assert_eq!(vote_map_cs9_update(b"print \"Vote passed.\""), None);
+        assert_eq!(vote_map_cs9_update(b"cs 9 \"vstr nextmap\""), Some(("vstr nextmap".into(), None)));
+    }
+
+    #[test]
+    fn prewarm_only_on_literal_map_vote_and_authoritative_print() {
+        assert_eq!(proposed_map("map mp/ffa3 (The Pit)"), Some("mp/ffa3".into()));
+        assert_eq!(proposed_map("MAP maps/mp/ffa3.bsp"), Some("mp/ffa3".into()));
+        assert_eq!(proposed_map("map racepack8; set nextmap map_restart 0"), Some("racepack8".into()));
+        assert_eq!(proposed_map("map racepack8 (Race Pack); set nextmap map_restart 0"), Some("racepack8".into()));
+        for vote in ["map_restart", "vstr nextmap", "map ../bad", "map a;b", "map", "map foo\\bar"] {
+            assert_eq!(proposed_map(vote), None, "{vote}");
+        }
+        assert!(is_passed_vote_print(b"print \"Vote passed.\n\""));
+        assert!(!is_passed_vote_print(b"chat \"Vote passed.\""));
+        assert!(!is_passed_vote_print(b"print \"Vote failed.\""));
+        let passed = b"print \"Vote passed. (map racepack8; set nextmap map_restart 0), command will be executed in 60 seconds.\n\"";
+        assert!(is_passed_vote_print(passed));
+        assert_eq!(passed_vote_map(passed).as_deref(), Some("racepack8"));
+        // Exact jaPRO `VotePassed()` reliable print, including ^7 inside the
+        // vote parentheses and the delay sentence after the command.
+        let japro = b"print \"Vote passed. (map racepack6; set nextmap map_restart 0^7), command will be executed in 7 seconds.\n\"";
+        assert!(is_passed_vote_print(japro));
+        assert_eq!(passed_vote_map(japro).as_deref(), Some("racepack6"));
+        assert_eq!(passed_vote_map(b"print \"Vote passed. (map mp/ffa3 (The Pit)^7), command will be executed in 60 seconds.\"").as_deref(), Some("mp/ffa3"));
+        assert_eq!(passed_vote_map(b"print \"Vote passed. (map racepack6; quit^7), command will be executed in 7 seconds.\""), None);
+        assert_eq!(passed_vote_map(b"chat \"Vote passed. (map racepack6^7)\""), None);
+
+        assert_eq!(passed_vote_map(b"print \"Vote passed. (vstr nextmap), command will be executed in 60 seconds.\""), None);
     }
 
     #[test]

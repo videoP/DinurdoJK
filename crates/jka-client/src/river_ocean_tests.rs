@@ -392,6 +392,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
     assert!(ocean.logical_bytes() < 8 * 1024 * 1024);
     super::wave_tests::check_native_texture(device, queue, &ocean.texture);
     super::surface_tests::check_native_texture(device, queue, &ocean.texture);
+    super::foam_tests::check_native_texture(device, queue, &ocean.texture);
     // Reset after animation must clear old amplitudes, not merely creation data.
     let mut encoder = device.create_command_encoder(&Default::default());
     ocean.encode_reset(&mut encoder);

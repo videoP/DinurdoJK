@@ -2,7 +2,7 @@
 use crate::cgame::player_presenter::{
     model_bolt_matrix, transform_jka_model_point, transform_jka_model_vector, Arc, CosmeticDraw,
     DynamicModelSurface, Ghoul2PerfStats, GlaAnimation, GlmModel, Instant, Matrix3x4,
-    PlayerModelAsset, SaberModelAsset, Vec3,
+    PlayerModelAsset, SaberDefinition, SaberModelAsset, Vec3,
 };
 
 /// This frame's animated vehicle pose, also used by the *driver rider tag.
@@ -31,6 +31,26 @@ pub(in crate::cgame::player_presenter) fn model_bolt_matrix_timed(
     perf.bolt_ms += started.elapsed().as_secs_f64() * 1000.0;
     perf.bolt_queries = perf.bolt_queries.saturating_add(1);
     result
+}
+
+/// TaystJK CG_InitG2SaberData: the Ghoul2 model's SetBoltInfo is normally
+/// (0, saberNum), but SFL_BOLT_TO_WRIST changes it to (0, 3+saberNum).
+/// The player always registers *r_hand, *l_hand, *chestg, then the two wrist
+/// cap bolts, in that order. Resolve by NAME rather than depending on bolt
+/// insertion indices, which may differ on custom GLMs/Source conversions.
+/// A wrist saber must not be rotated around the ordinary grip as a workaround.
+pub(in crate::cgame::player_presenter) fn saber_attachment_bolt_name(
+    saber_num: usize,
+    definition: &SaberDefinition,
+) -> &'static str {
+    let wrist = definition.saber_flags & jka_assets::saber::SFL_BOLT_TO_WRIST != 0;
+    match (saber_num, wrist) {
+        (0, false) => "*r_hand",
+        (1, false) => "*l_hand",
+        (0, true) => "*r_hand_cap_r_arm",
+        (1, true) => "*l_hand_cap_l_arm",
+        _ => "*r_hand", // Ghoul2 saberInfo_t has only two saber slots.
+    }
 }
 
 /// Source/UE character hand-tag transfer currently leaves the secondary grip
@@ -67,6 +87,16 @@ pub(in crate::cgame::player_presenter) fn saber_hand_bolt_matrix_timed(
 #[cfg(test)]
 mod imported_saber_hand_tests {
     use super::*;
+
+    #[test]
+    fn wrist_attachment_matches_taystjk_bolt_slots_for_both_hands() {
+        let mut definition = SaberDefinition::openjk_default("example");
+        assert_eq!(saber_attachment_bolt_name(0, &definition), "*r_hand");
+        assert_eq!(saber_attachment_bolt_name(1, &definition), "*l_hand");
+        definition.saber_flags |= jka_assets::saber::SFL_BOLT_TO_WRIST;
+        assert_eq!(saber_attachment_bolt_name(0, &definition), "*r_hand_cap_r_arm");
+        assert_eq!(saber_attachment_bolt_name(1, &definition), "*l_hand_cap_l_arm");
+    }
 
     #[test]
     fn secondary_grip_roll_keeps_the_hilt_in_the_wrist() {

@@ -23,6 +23,7 @@ fn inactive_targets_shrink_and_reenable_at_viewport_size() {
                     false,
                     false,
                     false,
+                    0,
                     ssr,
                     resolved_depth,
                     temporal,
@@ -105,6 +106,7 @@ fn depth_resolve_rebinds_replaced_targets_without_rebuilding_pipeline() {
                     false,
                     false,
                     false,
+                    0,
                     true,
                     true,
                     false,
@@ -211,5 +213,25 @@ fn depth_resolve_rebinds_replaced_targets_without_rebuilding_pipeline() {
             }
         }
         assert!(scope.pop().await.is_none(), "depth resolve GPU validation");
+    });
+}
+
+#[test]
+fn ssao_history_tracks_selected_resolution() {
+    futures_lite::future::block_on(async {
+        let instance = wgpu::Instance::default();
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device, _queue) = adapter.request_device(&Default::default()).await.unwrap();
+        for (mode, expected) in [(0, (32, 16)), (1, (64, 32))] {
+            let targets = create_targets(
+                &device, 64, 32, wgpu::TextureFormat::Rgba8Unorm, 1,
+                false, false, false, true, mode, false, false, false, false,
+                Default::default(),
+            );
+            let history = targets.ssao_history.as_ref().unwrap();
+            for texture in &history._textures {
+                assert_eq!((texture.width(), texture.height()), expected);
+            }
+        }
     });
 }

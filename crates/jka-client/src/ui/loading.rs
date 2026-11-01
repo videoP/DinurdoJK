@@ -89,10 +89,10 @@ pub(in crate::ui) fn build_background_progress(
         y,
         panel_w,
         panel_h,
-        HUD_INK_TOP,
-        HUD_INK_TOP,
-        HUD_INK_BOTTOM,
-        HUD_INK_BOTTOM,
+        HUD_INK_TOP(),
+        HUD_INK_TOP(),
+        HUD_INK_BOTTOM(),
+        HUD_INK_BOTTOM(),
         w,
         h,
     );
@@ -119,7 +119,7 @@ pub(in crate::ui) fn build_background_progress(
         x + panel_w - 12.0 - percent_w,
         y + 8.0,
         1.3,
-        HUD_VALUE,
+        HUD_VALUE(),
         w,
         h,
     );
@@ -388,7 +388,7 @@ pub(in crate::ui) fn build_shader_compile_progress(
     text(out, progress.label, x + 12.0, y + 9.0, 1.0, LOAD_LABEL, w, h);
     let value = format!("{}/{}", progress.completed, progress.total);
     let value_w = value.len() as f32 * 6.0 * 1.1;
-    text(out, &value, x + panel_w - 12.0 - value_w, y + 9.0, 1.1, HUD_VALUE, w, h);
+    text(out, &value, x + panel_w - 12.0 - value_w, y + 9.0, 1.1, HUD_VALUE(), w, h);
     if let Some(stage) = stage {
         // Width-limited so diagnostic labels cannot run into the game view.
         let short = stage.chars().take(52).collect::<String>();

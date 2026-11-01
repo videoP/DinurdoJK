@@ -9,6 +9,9 @@ pub(in crate::renderer) enum WorldProgramMode {
     Specialized,
     Shared,
     Generated,
+    /// Adaptive hybrid: compact common stages, generated structural effects,
+    /// and specialized fallback for everything else.
+    Hybrid,
 }
 
 impl WorldProgramMode {
@@ -16,6 +19,7 @@ impl WorldProgramMode {
         match mode {
             3 => Self::Shared,
             4 => Self::Generated,
+            5 => Self::Hybrid,
             _ => Self::Specialized,
         }
     }
@@ -149,6 +153,47 @@ fn basic(v: WorldShaderVariantKey) -> bool {
         && !v.baked_sun_relight
 }
 
+/// Classify the actual work of a BSP stage, NOT its texture name or numeric
+/// parameters. Done once per stage/pipeline job, never in a frame or fragment.
+///
+/// Normal opaque/masked/blended stages share the compact shader whenever all
+/// active global features permit it. Structural tcGen/tcMod/wave work or a
+/// genuinely live enhanced material feature justifies generating a pair. For
+/// other stages, mode-1 specialization avoids generating many near-identical
+/// programs without losing material-constant folding.
+fn hybrid_program(
+    v: WorldShaderVariantKey,
+    m: MaterialFragmentKey,
+) -> StageProgram {
+    // Keep source-generated programs for work that they actually simplify:
+    // dynamic tcMod interpretation, nonstandard UV generation, vertex waves,
+    // and expensive live material effects. Numeric parameters remain uniforms.
+    let structural = m.tc_gen == 2 || m.tc_gen == 3
+        || m.vertex_recipe.tc_mods.iter().any(|&op| op != 0)
+        || m.flags & (134217728 | 268435456) != 0;
+    let enhanced = !basic(effective_stage_variant(v, m));
+    if structural || enhanced {
+        if enhanced {
+            StageProgram::GeneratedEnhanced
+        } else {
+            StageProgram::GeneratedBasic
+        }
+    } else {
+        // Mode 2's compact-entry eligibility describes shader semantics, not
+        // the selected menu mode. Evaluate it without selecting mode 2.
+        let minimal_variant = WorldShaderVariantKey {
+            material_specialization: true,
+            minimal_entries: true,
+            ..v
+        };
+        if minimal_variant.minimal_entry_compatible() {
+            StageProgram::Minimal
+        } else {
+            StageProgram::Specialized
+        }
+    }
+}
+
 pub(in crate::renderer) fn program_key(
     v: WorldShaderVariantKey,
     p: PipelineKey,
@@ -180,6 +225,8 @@ pub(in crate::renderer) fn program_key(
         return key;
     }
     let effective = effective_stage_variant(v, m);
+    let hybrid = (v.program_mode == WorldProgramMode::Hybrid)
+        .then(|| hybrid_program(v, m));
     match v.program_mode {
         WorldProgramMode::Shared => MaterialFragmentKey {
             // Zero masks leave every material option uniform-driven. Families
@@ -192,18 +239,30 @@ pub(in crate::renderer) fn program_key(
             },
             ..MaterialFragmentKey::default()
         },
-        WorldProgramMode::Generated => {
-            let mut key = m.for_variant(effective, alpha);
-            key.tc_gen = m.tc_gen;
-            key.vertex_recipe = m.vertex_recipe;
-            if !effective.surface_deformation {
-                key.vertex_recipe.surface_material = 0;
-            }
-            key.program = if basic(effective) {
+        WorldProgramMode::Generated | WorldProgramMode::Hybrid => {
+            let choice = hybrid.unwrap_or_else(|| if basic(effective) {
                 StageProgram::GeneratedBasic
             } else {
                 StageProgram::GeneratedEnhanced
-            };
+            });
+            // Specialized/minimal fallback must retain mode-1 material masks
+            // from the *full* variant, not the reduced generated variant.
+            let mut key = m.for_variant(
+                if matches!(choice, StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced) {
+                    effective
+                } else {
+                    v
+                },
+                alpha,
+            );
+            if matches!(choice, StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced) {
+                key.tc_gen = m.tc_gen;
+                key.vertex_recipe = m.vertex_recipe;
+                if !effective.surface_deformation {
+                    key.vertex_recipe.surface_material = 0;
+                }
+            }
+            key.program = choice;
             key
         }
         WorldProgramMode::Specialized => unreachable!(),
@@ -213,8 +272,8 @@ pub(in crate::renderer) fn program_key(
 /// Diagnostic counterpart to the actual mode selection predicates. This runs
 /// only for `/trace` and the opt-in FPS graph, never in the pixel/draw hot path.
 /// All applicable blockers are returned, rather than the first generic reason.
-/// `mode` is an explicit hypothetical 2/3/4; the caller may inspect eligibility
-/// for all three without recompiling or changing the active renderer state.
+/// `mode` is an explicit hypothetical 2/3/4/5; the caller may inspect eligibility
+/// for all four without recompiling or changing the active renderer state.
 pub(in crate::renderer) fn stage_rejection_reasons(
     v: WorldShaderVariantKey,
     p: PipelineKey,
@@ -222,7 +281,7 @@ pub(in crate::renderer) fn stage_rejection_reasons(
     mode: u8,
 ) -> Vec<&'static str> {
     let mut reasons = Vec::new();
-    if !matches!(mode, 2..=4) {
+    if !matches!(mode, 2..=5) {
         return reasons;
     }
     // Same delegation as program_key: dry stages are judged without the ocean.
@@ -328,7 +387,7 @@ pub(in crate::renderer) fn map_eligibility_counts(
 ) -> Option<[u32; 11]> {
     let variant = world.active_pipeline_variant;
     let mode = active_mode(variant);
-    if !(2..=4).contains(&mode) { return None; }
+    if !(2..=5).contains(&mode) { return None; }
     let mut counts = [0_u32; 11];
     for batch in &world.coarse_batches {
         counts[0] += 1;
@@ -369,6 +428,7 @@ pub(in crate::renderer) fn active_mode(v: WorldShaderVariantKey) -> u8 {
         match v.program_mode {
             WorldProgramMode::Shared => 3,
             WorldProgramMode::Generated => 4,
+            WorldProgramMode::Hybrid => 5,
             _ => 1,
         }
     }
@@ -681,11 +741,44 @@ pub(in crate::renderer) fn generated_source(
     source
 }
 
+/// Source-shape key: exactly the properties `generated_source` reads. This
+/// allows cheap reuse before formatting the complete ~world WGSL module for
+/// another material that differs only in uniforms/PSO override constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GeneratedShape {
+    variant: WorldShaderVariantKey,
+    program: StageProgram,
+    tc_gen: u32,
+    vertex_recipe: VertexRecipe,
+    wave: bool,
+    vertex_color: bool,
+    lightmap_uv: bool,
+}
+
+impl GeneratedShape {
+    fn new(variant: WorldShaderVariantKey, material: MaterialFragmentKey) -> Self {
+        let flags = material.flags;
+        let enhanced = material.program == StageProgram::GeneratedEnhanced;
+        Self {
+            variant,
+            program: material.program,
+            tc_gen: material.tc_gen,
+            vertex_recipe: material.vertex_recipe,
+            wave: flags & (134217728 | 268435456) != 0,
+            vertex_color: (flags & (1 | 524288) != 0 && flags & 134217728 == 0)
+                || (flags & (1048576 | 2097152) != 0 && flags & 268435456 == 0),
+            lightmap_uv: enhanced || flags & 2 != 0,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(in crate::renderer) struct ProgramModules {
-    modules: std::sync::Mutex<
-        std::collections::HashMap<(WorldShaderVariantKey, MaterialFragmentKey), wgpu::ShaderModule>,
-    >,
+    /// Stage 1: structural cache, avoids rebuilding WGSL source altogether.
+    shapes: std::sync::Mutex<std::collections::HashMap<GeneratedShape, wgpu::ShaderModule>>,
+    /// Stage 2: *exact* generated WGSL. Different structural keys can still
+    /// produce byte-identical source. Only the PSO has distinct constants.
+    modules: std::sync::Mutex<std::collections::HashMap<String, wgpu::ShaderModule>>,
 }
 
 impl ProgramModules {
@@ -705,16 +798,32 @@ impl ProgramModules {
             StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced => {}
             _ => return lean.clone(),
         }
+        // This only runs on the world-pipeline compilation path, never when
+        // submitting draws. Serialize a module miss so concurrent PSO workers
+        // cannot redundantly parse/compile one shader module.
+        let shape = GeneratedShape::new(v, m);
+        let mut shapes = self.shapes.lock().unwrap();
+        if let Some(existing) = shapes.get(&shape) {
+            return existing.clone();
+        }
+        let source = generated_source(v, m);
         let mut modules = self.modules.lock().unwrap();
-        modules
-            .entry((v, m))
-            .or_insert_with(|| {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("JKA generated world stage recipe"),
-                    source: wgpu::ShaderSource::Wgsl(generated_source(v, m).into()),
-                })
-            })
-            .clone()
+        let module = if let Some(existing) = modules.get(source.as_str()) {
+            existing.clone()
+        } else {
+            let compiled = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("JKA canonical generated world stage recipe"),
+                source: wgpu::ShaderSource::Wgsl(source.clone().into()),
+            });
+            modules.insert(source, compiled.clone());
+            compiled
+        };
+        shapes.insert(shape, module.clone());
+        module
+    }
+
+    pub fn module_count(&self) -> (usize, usize) {
+        (self.shapes.lock().unwrap().len(), self.modules.lock().unwrap().len())
     }
 
     pub fn pipeline(
@@ -753,3 +862,35 @@ impl ProgramModules {
 #[cfg(test)]
 #[path = "program_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod generated_shape_tests {
+    use super::*;
+
+    #[test]
+    fn structural_identity_matches_every_source_affecting_material_bit() {
+        // If this property breaks, the two-tier cache could accidentally
+        // associate different WGSL with the same module. Exhaust the material
+        // flags that generated_source reads for interface/source decisions.
+        let variant = WorldShaderVariantKey::default();
+        let flags = [0_u32, 1, 2, 524288, 1048576, 2097152, 134217728, 268435456];
+        let mut seen = std::collections::HashMap::<GeneratedShape, String>::new();
+        for bits in 0..(1_u32 << flags.len()) {
+            let combined = flags.iter().enumerate().filter(|(i, _)| bits & (1_u32 << *i) != 0)
+                .fold(0_u32, |a, (_, &bit)| a | bit);
+            let material = MaterialFragmentKey {
+                flags: combined,
+                tc_gen: 0,
+                program: StageProgram::GeneratedBasic,
+                ..Default::default()
+            };
+            let shape = GeneratedShape::new(variant, material);
+            let src = generated_source(variant, material);
+            if let Some(previous) = seen.get(&shape) {
+                assert_eq!(&src, previous, "source cache alias for flags={combined:#x}");
+            } else {
+                seen.insert(shape, src);
+            }
+        }
+    }
+}

@@ -410,7 +410,7 @@ impl StreamOutput {
             resources.color.as_image_copy(),
             extent,
         );
-        if !vertices.is_empty() || renderer.screen_fx_vertex_count != 0 {
+        if !vertices.is_empty() || renderer.screen_fx_vertex_count != 0 || renderer.enemy_icon_vertex_count != 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA streamer filtered 2D only"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -434,6 +434,12 @@ impl StreamOutput {
                 &renderer.screen_fx_batches,
                 &renderer.screen_fx_pipelines,
                 &renderer.screen_fx_textures,
+                &renderer.screen_fx_white_bind_group,
+            );
+            Renderer::draw_screen_fx_batches(
+                &mut pass, &renderer.enemy_icon_vertex_buffer,
+                renderer.enemy_icon_vertex_count, &renderer.enemy_icon_batches,
+                &renderer.screen_fx_pipelines, &renderer.screen_fx_textures,
                 &renderer.screen_fx_white_bind_group,
             );
             if !vertices.is_empty() {

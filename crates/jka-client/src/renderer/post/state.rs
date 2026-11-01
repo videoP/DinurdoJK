@@ -1,7 +1,7 @@
 //! Post state.
 use crate::renderer::{
     cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
-    create_cloud_resolve_bind_group, create_dof_bind_group, create_fast_post_bind_group,
+    create_cloud_resolve_bind_group, create_dof_bind_group,
     create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline, create_post_pipeline_for,
     create_cloud_shadow_opaque_pipeline,
     create_rain_post_pipeline,
@@ -785,13 +785,6 @@ impl Renderer {
             &self.post_sampler,
             &self.dof_buffer,
             self.targets.dof.as_ref(),
-        );
-        self.fast_post_bind_group = create_fast_post_bind_group(
-            &self.device,
-            &self.fast_post_layout,
-            &self.targets.scene_view,
-            &self.post_sampler,
-            &self.gamma_post_buffer,
         );
     }
 

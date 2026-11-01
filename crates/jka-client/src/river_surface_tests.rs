@@ -9,7 +9,7 @@ use jka_water::river::{
 };
 use wgpu::util::DeviceExt;
 
-const COMMON: &str = r#"
+pub(super) const COMMON: &str = r#"
 fn motion()->RiverMotion {return RiverMotion(vec4<f32>(0.1,0.0,200.0,1.0),vec4<f32>(1.0,1.0,0.033,0.0));}
 fn height()->RiverWaveHeight {return RiverWaveHeight(vec4<f32>(0.1,0.0,400.0,3.0),vec4<f32>(5.0,200.0,0.0,0.0));}
 "#;

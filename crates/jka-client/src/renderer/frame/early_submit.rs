@@ -16,6 +16,54 @@ pub(in crate::renderer) struct EarlyPresentTarget {
 }
 
 impl Renderer {
+    /// A timed A/B probe isolating the WGPU surface from all game render work.
+    /// One clear, one submit, one present per frame. The normal loop, window,
+    /// surface format, present mode, and frame limiter remain unchanged.
+    /// The black screen automatically restores after the requested interval.
+    pub(in crate::renderer) fn render_acquire_probe(
+        &mut self,
+        frame_started: Instant,
+    ) -> Result<FrameInfo, RenderError> {
+        let mut info = FrameInfo::default();
+        info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        let frame = self.acquire_render_frame(&mut info)?;
+        let view = self.surface_texture_view(&frame);
+        let encode_started = Instant::now();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("JKA acquire-only diagnostic clear"),
+        });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("JKA acquire-only clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        let submit_started = Instant::now();
+        self.queue.submit([encoder.finish()]);
+        info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let present_started = Instant::now();
+        self.present_render_frame(frame);
+        info.cpu_present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
+        info.frame_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+        self.acquire_probe_frames += 1;
+        self.acquire_probe_acquire_ms += info.cpu_acquire_ms;
+        self.acquire_probe_submit_ms += info.cpu_submit_ms;
+        Ok(info)
+    }
+
     /// True when this frame's final image is produced entirely by the main frame
     /// encoder. Menus, CRT, SMAA and HDR output all touch the swapchain image
     /// after that encoder, so those frames keep the acquire-first order.

@@ -26,6 +26,8 @@ pub const CONTENTS_TERRAIN: u32 = 0x0000_1000;
 pub const SURF_SKY: u32 = 0x0000_2000;
 pub const SURF_NODRAW: u32 = 0x0020_0000;
 pub const SURF_NODLIGHT: u32 = 0x0080_0000;
+/// JKA: material is visible only while RDF_ForceSightOn is active.
+pub const SURF_FORCESIGHT: u32 = 0x0200_0000;
 const HEADER_BYTES: usize = 152;
 const MAX_MESH_VERTICES: usize = 2_097_152;
 const MAX_MESH_INDICES: usize = 6_291_456;

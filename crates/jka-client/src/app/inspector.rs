@@ -73,7 +73,80 @@ pub(in crate::app) fn ray_aabb_distance(
     (tmin > 0.0).then_some(tmin)
 }
 
+/// Normalize an EFX resource for matching BSP `fxFile` against CS_EFFECTS.
+/// Both sources legitimately use paths with or without `effects/` / `.efx`.
+fn trace_effect_resource_key(value: &str) -> String {
+    let mut key = value.trim().replace('\\', "/").to_ascii_lowercase();
+    if !key.ends_with(".efx") { key.push_str(".efx"); }
+    if !key.starts_with("effects/") { key.insert_str(0, "effects/"); }
+    key
+}
+
 impl App {
+    /// Augment server `trace <entityNum>` with information actually available
+    /// in the client snapshot and (when matched) the original BSP entity lump.
+    /// This does not presume that a BSP entity index equals a network entity
+    /// number; map FX runners are matched by their effect path and origin.
+    pub(in crate::app) fn trace_entity_number_details(&mut self, number: u16) {
+        let mut lines = Vec::new();
+        {
+            let Some(session) = self.game_session.as_ref() else { return; };
+            let Some(entity) = session.presented_entities.iter().find(|entity| entity.number == number) else {
+                self.push_console_line(format!("[TRACE CLIENT] Entity {number} is not present in the current client snapshot; server trace may contain more information."));
+                return;
+            };
+            let state = &entity.state;
+            let is_fx = entity.presentation_kind() == EntityPresentationKind::Fx;
+            let effect_index = state.field_i32("modelindex").unwrap_or(0);
+            let effect = is_fx.then(|| session.client_game.effect_qpath(effect_index)).flatten();
+            lines.push(format!("[TRACE CLIENT] Entity {number}: {} (eType {})", Self::trace_entity_kind_label(entity.presentation_kind()), entity.entity_type));
+            lines.push(format!("  Origin: {:.2} {:.2} {:.2}  Angles: {:.2} {:.2} {:.2}",
+                entity.origin[0], entity.origin[1], entity.origin[2], entity.angles[0], entity.angles[1], entity.angles[2]));
+            if is_fx {
+                lines.push(format!("  fxFile / CS_EFFECTS[{effect_index}]: {}",
+                    effect.as_deref().unwrap_or("<unresolved configstring>")));
+                lines.push(format!("  FX state (modelindex2): {}  delay (speed): {:.3}  random (time): {}",
+                    state.field_i32("modelindex2").unwrap_or(0),
+                    state.field_f32("speed").unwrap_or(0.0),
+                    state.field_i32("time").unwrap_or(0)));
+            }
+            lines.push("  Nonzero network fields (raw entityState_t):".to_owned());
+            for ((name, bits), value) in jka_protocol::gamestate::ENTITY_FIELDS.iter().zip(state.fields.iter()) {
+                if *value != 0 {
+                    if *bits == 0 {
+                        lines.push(format!("    {name} = {} (float {:.4})", *value as i32, f32::from_bits(*value)));
+                    } else {
+                        lines.push(format!("    {name} = {}", *value as i32));
+                    }
+                }
+            }
+            // The graph contains *BSP-lump* entity indices, not server entity
+            // numbers. Only report authored keys for a spatial + qpath match.
+            if is_fx {
+                if let (Some(graph), Some(effect)) = (self.entity_graph.as_deref(), effect.as_deref()) {
+                    let key = trace_effect_resource_key(effect);
+                    let found = graph.entities.iter().filter(|candidate| {
+                        candidate.classname.eq_ignore_ascii_case("fx_runner")
+                            && candidate.property("fxFile").is_some_and(|path| trace_effect_resource_key(path) == key)
+                    }).map(|candidate| {
+                        let distance_squared = (0..3).map(|i| (candidate.origin[i] - entity.origin[i]).powi(2)).sum::<f32>();
+                        (distance_squared, candidate)
+                    }).filter(|(distance_squared, _)| *distance_squared <= 64.0 * 64.0)
+                        .min_by(|a, b| a.0.total_cmp(&b.0));
+                    if let Some((_, source)) = found {
+                        lines.push(format!("  BSP fx_runner entity #{} authored key/value pairs:", source.bsp_index));
+                        for (key, value) in &source.properties {
+                            lines.push(format!("    {key}: {value}"));
+                        }
+                    } else {
+                        lines.push("  BSP fx_runner: no reliable origin + fxFile match (remote or moving runner)".to_owned());
+                    }
+                }
+            }
+        }
+        for line in lines { self.push_console_line(line); }
+    }
+
     /// Live snapshot entity backing a brush `graph_entity` (`inline_model`),
     /// identified the same SOLID_BMODEL/modelindex way `enrich_surface_inspector`
     /// identifies the entity under the crosshair. `None` for point entities
@@ -1355,5 +1428,17 @@ impl App {
             }
         }
         self.publish_ui();
+    }
+}
+
+#[cfg(test)]
+mod trace_fx_tests {
+    use super::trace_effect_resource_key;
+
+    #[test]
+    fn fxfile_matches_registered_effect_qpath() {
+        for value in ["fire/smoke", "effects/fire/smoke", "effects/fire/smoke.efx", "EFFECTS\\FIRE\\SMOKE.EFX"] {
+            assert_eq!(trace_effect_resource_key(value), "effects/fire/smoke.efx");
+        }
     }
 }

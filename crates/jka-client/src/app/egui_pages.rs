@@ -69,7 +69,7 @@ impl App {
                             "Available once you are in a game or Solo Game."
                         },
                         11.5,
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     ),
                 );
 
@@ -221,12 +221,12 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236), theme::PANEL_FILL()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG()))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            theme::glow_label(ui, "CAMERA", 13.0, theme::TEXT);
+                            theme::glow_label(ui, "CAMERA", 13.0, theme::TEXT());
                             ui.separator();
                             for (label, value) in [
                                 ("Range", format!("{:.0}", third.range)),
@@ -235,8 +235,8 @@ impl App {
                                 ("Angle", format!("{:.0}°", third.angle)),
                                 ("Pitch", format!("{:.0}°", third.pitch_offset)),
                             ] {
-                                theme::label(ui, theme::plain(label, 11.0, theme::TEXT_FAINT));
-                                theme::label(ui, theme::plain(&value, 12.5, theme::TEXT));
+                                theme::label(ui, theme::plain(label, 11.0, theme::TEXT_FAINT()));
+                                theme::label(ui, theme::plain(&value, 12.5, theme::TEXT()));
                                 ui.add_space(6.0);
                             }
                             ui.separator();
@@ -255,7 +255,7 @@ impl App {
                             theme::plain(
                                 "Scroll: zoom  ·  Drag: move the camera  ·  Hold right mouse: aim  ·  Enter: save  ·  Esc: cancel",
                                 10.5,
-                                theme::TEXT_FAINT,
+                                theme::TEXT_FAINT(),
                             ),
                         );
                     });
@@ -435,7 +435,7 @@ impl App {
     pub(super) fn egui_vote_page(&mut self, ui: &mut egui::Ui) {
         theme::page_title(ui, "VOTE", "Vote on the running vote or call a new one.");
         if !self.live_connected() {
-            theme::banner(ui, "Voting is only available while connected to a server.", theme::WARNING);
+            theme::banner(ui, "Voting is only available while connected to a server.", theme::WARNING());
             return;
         }
         let vote = self.game_session.as_ref().and_then(|session| session.vote_ui.clone());
@@ -469,7 +469,7 @@ impl App {
                             Some(param) => format!("{}: {param}", vote.label),
                             None => vote.label.clone(),
                         };
-                        ui.label(jka_colored_text(&title, 15.0, theme::TEXT));
+                        ui.label(jka_colored_text(&title, 15.0, theme::TEXT()));
                         ui.add_space(2.0);
                         theme::label(
                             ui,
@@ -479,7 +479,7 @@ impl App {
                                     vote.seconds_left, vote.yes, vote.no
                                 ),
                                 12.0,
-                                theme::TEXT_DIM,
+                                theme::TEXT_DIM(),
                             ),
                         );
                         ui.add_space(8.0);
@@ -494,7 +494,7 @@ impl App {
                         });
                     }
                     None => {
-                        theme::label(ui, theme::plain("No vote is running.", 12.5, theme::TEXT_FAINT));
+                        theme::label(ui, theme::plain("No vote is running.", 12.5, theme::TEXT_FAINT()));
                     }
                 }
 
@@ -589,7 +589,7 @@ impl App {
 
                 theme::section(ui, "PLAYERS", "Vote to remove a player from the game or the server.");
                 if players.is_empty() {
-                    theme::label(ui, theme::plain("No players are listed yet.", 12.0, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain("No players are listed yet.", 12.0, theme::TEXT_FAINT()));
                 }
                 let own = self
                     .game_session
@@ -600,9 +600,9 @@ impl App {
                 for (client, name) in &players {
                     ui.horizontal(|ui| {
                         ui.set_min_height(26.0);
-                        theme::label(ui, theme::plain(&format!("{client:>2}"), 11.5, theme::TEXT_FAINT));
+                        theme::label(ui, theme::plain(&format!("{client:>2}"), 11.5, theme::TEXT_FAINT()));
                         ui.add_space(6.0);
-                        ui.label(jka_colored_text(name, 13.0, theme::TEXT));
+                        ui.label(jka_colored_text(name, 13.0, theme::TEXT()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let is_self = Some(*client) == own;
                             ui.add_enabled_ui(!is_self, |ui| {

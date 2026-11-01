@@ -40,7 +40,7 @@ fn pixels(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -242,7 +242,7 @@ fn model_bundles_preserve_pixels_live_updates_and_resource_invalidation() {
                 },
                 primitive: Default::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
+                    format: depth_format(),
                     depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(),

@@ -113,6 +113,8 @@ pub(in crate::app) struct GameSession {
     /// once per presentation frame from prediction's provisional display state
     /// or snapshot interpolation, with input-owned view angles applied.
     pub(in crate::app) presented_player_state: Option<jka_protocol::server::PlayerState>,
+    /// TaystJK-style 100 ms crouch eye-height transition, presentation only.
+    pub(in crate::app) duck_view_height: super::sampling::DuckViewHeight,
     pub(in crate::app) client_game: ClientGameState,
     pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,

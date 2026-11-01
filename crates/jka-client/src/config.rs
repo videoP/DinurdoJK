@@ -73,6 +73,8 @@ pub struct ClientPresentationSettings {
     /// OpenJK cg_saberTrail: 0 disables saber swing trails, 1 is normal,
     /// 2 requests the legacy special/high-frequency mode.
     pub saber_trail: i32,
+    /// TaystJK cg_speedTrail: player-model afterimages while Force Speed is active.
+    pub speed_trail: bool,
     /// TaystJK cg_saberTeamColors: force red/blue saber colors in ordinary team games.
     pub saber_team_colors: bool,
     /// TaystJK cg_saberStaffMultiColor: primary staff blades after blade 0 use c2.
@@ -103,6 +105,12 @@ pub struct ClientPresentationSettings {
     pub fk_duration: i32,
     pub fk_first_jump_duration: i32,
     pub fk_second_jump_delay: i32,
+    /// DinurdoJK `cg_killfeed*`.
+    pub killfeed: crate::ui::KillfeedSettings,
+    /// DinurdoJK `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    pub scoreboard: crate::ui::ScoreboardSettings,
+    /// DinurdoJK `cg_chat*` chat box settings.
+    pub chat: crate::ui::ChatSettings,
     pub model: String,
     /// DinurdoJK compact forced-player-model cvar: 0=off, model=all other players, ally,enemy=team split.
     pub force_model: String,
@@ -216,6 +224,9 @@ pub struct GameOptions {
     /// jaPRO `cg_footsteps`: 0 off, 1 sounds, 2 + material effects, 3 + prints
     /// (how they look is `r_footprints`), 4 the debugging "always" level.
     pub footsteps: u8,
+    /// Runtime-only A/B: 0 BSP world-only footsteps, 1 CG_Trace-style solid entities.
+    /// Deliberately not serialized to the config or sent to servers.
+    pub footstep_trace: bool,
 }
 
 impl Default for GameOptions {
@@ -238,6 +249,7 @@ impl Default for GameOptions {
             race_sounds: 1,
             chat_sounds: 0,
             footsteps: 3,
+            footstep_trace: false,
         }
     }
 }
@@ -358,6 +370,7 @@ impl Default for ClientPresentationSettings {
             spectator_camera: SpectatorCameraSettings::default(),
             first_person_lightsaber: true,
             saber_trail: 1,
+            speed_trail: true,
             saber_team_colors: true,
             saber_staff_multi_color: false,
             team_overlay: crate::ui::TeamOverlaySettings::default(),
@@ -375,6 +388,9 @@ impl Default for ClientPresentationSettings {
             fk_duration: 50,
             fk_first_jump_duration: 0,
             fk_second_jump_delay: 0,
+            killfeed: crate::ui::KillfeedSettings::default(),
+            scoreboard: crate::ui::ScoreboardSettings::default(),
+            chat: crate::ui::ChatSettings::default(),
             model: "kyle".to_owned(),
             force_model: "0".to_owned(),
             crosshair: CrosshairSettings::default(),
@@ -488,6 +504,16 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
         };
 
         if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_video) { load(&mut settings, name, value, &mut context); }
+    }
+    // Legacy configs saved a separate on/off flag followed by a nonzero
+    // strength even when disabled. Preserve that OFF state during migration,
+    // irrespective of config-line order. New configs archive strength only.
+    match context.legacy_split_toning_enabled {
+        Some(false) => settings.split_toning.strength = 0.0,
+        Some(true) if !context.split_toning_strength_seen => {
+            settings.split_toning.strength = 0.5;
+        }
+        _ => {}
     }
     // Linked brightness sliders always mirror the master, whatever order the
     // config lines were read in.
@@ -1120,9 +1146,8 @@ mod tests {
             std::thread::current().id()
         ));
         let mut settings = VideoSettings::default();
-        assert!(!settings.split_toning.enabled);
+        assert_eq!(settings.split_toning.strength, 0.0);
         settings.split_toning = crate::color_grading::SplitToningSettings {
-            enabled: true,
             strength: 0.375,
             shadow_hue: 225.0,
             shadow_saturation: 0.625,
@@ -1150,6 +1175,9 @@ mod tests {
             &AudioSettings::default(),
         )
         .expect("save");
+        let archived = std::fs::read_to_string(&path).unwrap();
+        assert!(archived.contains("seta r_splitToningStrength "));
+        assert!(!archived.contains("seta r_splitToning \""));
         let loaded = load_video_settings(&path);
         assert_eq!(loaded.split_toning, settings.split_toning);
         assert_eq!(loaded.color_lut, settings.color_lut);
@@ -1162,6 +1190,23 @@ mod tests {
         .unwrap();
         let loaded = load_video_settings(&path);
         assert_eq!(loaded.split_toning, VideoSettings::default().split_toning);
+
+        // Older configs stored toggle=0 even though strength was nonzero.
+        // The new slider must correctly show OFF, regardless of line order.
+        for legacy_off in [
+            "seta r_splitToning \"0\"\nseta r_splitToningStrength \"0.5\"\n",
+            "seta r_splitToningStrength \"0.5\"\nseta r_splitToning \"0\"\n",
+        ] {
+            std::fs::write(&path, legacy_off).unwrap();
+            let loaded = load_video_settings(&path);
+            assert_eq!(loaded.split_toning.strength, 0.0);
+        }
+        std::fs::write(&path, "seta r_splitToning \"1\"\nseta r_splitToningStrength \"0.375\"\n").unwrap();
+        assert_eq!(load_video_settings(&path).split_toning.strength, 0.375);
+        std::fs::write(&path, "seta r_splitToning \"1\"\n").unwrap();
+        assert_eq!(load_video_settings(&path).split_toning.strength, 0.5);
+        std::fs::write(&path, "seta r_splitToningStrength \"0.25\"\n").unwrap();
+        assert_eq!(load_video_settings(&path).split_toning.strength, 0.25);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1374,6 +1419,7 @@ mod tests {
                 race_sounds: 0,
                 chat_sounds: 2,
                 footsteps: 1,
+                footstep_trace: false,
             },
             ..AudioSettings::default()
         };
@@ -1966,6 +2012,22 @@ mod tests {
             .set(&mut settings, "cg_drawHud", "-1")
             .is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn river_material_archive_roundtrip_preserves_authored_colors_and_constants() {
+        let path=std::env::temp_dir().join(format!("river-material-{}.cfg",std::process::id()));
+        let mut settings=VideoSettings::default();
+        settings.river_settings.water.scattering=[0.2,0.4,0.7,1.25];
+        settings.river_settings.water.absorption=[12.0,30.0,70.0,15.0];
+        settings.river_settings.foam.base_color=[0.9,0.8,0.7];
+        settings.river_settings.water.refraction=1.4;
+        settings.river_settings.wave_amount=2.5;
+        settings.river_settings.foam.gain=0.5;
+        save_video_settings(&path,settings,&crate::keybinds::Bindings::default(),&ClientPresentationSettings::default(),&AudioSettings::default()).unwrap();
+        let loaded=load_video_settings(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.river_settings.uniform(),settings.river_settings.uniform());
     }
 
 }

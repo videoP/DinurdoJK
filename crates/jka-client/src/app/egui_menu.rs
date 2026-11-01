@@ -9,6 +9,9 @@ mod demos;
 mod dialogs;
 mod editors;
 mod frontend_pages;
+pub(in crate::app) mod holo;
+mod force_page;
+mod shell_layout;
 mod maps;
 mod movement;
 mod neon_main;
@@ -344,6 +347,7 @@ pub(super) enum VideoSection {
     Weather,
     Surface,
     Water,
+    River,
     Glass,
     Optimizations,
 }
@@ -360,12 +364,13 @@ impl VideoSection {
         (Self::PostProcessing, "Post processing"),
         (Self::Physics, "Physics"),
     ];
-    const ENVIRONMENT: [(Self, &'static str); 6] = [
+    const ENVIRONMENT: [(Self, &'static str); 7] = [
         (Self::Sun, "Sky"),
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),
         (Self::Water, "Ocean"),
+        (Self::River, "River"),
         (Self::Glass, "Glass"),
     ];
     const OPTIMIZATIONS: [(Self, &'static str); 1] = [(Self::Optimizations, "Optimizations")];
@@ -400,23 +405,27 @@ fn rail_group(ui: &mut egui::Ui, title: &str) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     let painter = ui.painter().clone();
-    theme::glow_text(
-        &painter,
-        egui::pos2(rect.left() + GUTTER - 12.0, rect.center().y + 2.0),
-        egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::proportional(14.0),
-        theme::TEXT,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_size(
-            egui::pos2(rect.left() + GUTTER - 12.0, rect.bottom() - 1.0),
-            egui::vec2(rect.width() - (GUTTER - 12.0) - 12.0, 1.0),
-        ),
-        egui::CornerRadius::ZERO,
-        theme::LINE,
-    );
-    ui.add_space(4.0);
+    let left = rect.left() + GUTTER - 12.0;
+    let galley = painter.layout_no_wrap(title.to_owned(), egui::FontId::proportional(12.0), theme::ACCENT());
+    let text_w = galley.size().x;
+    painter.galley(egui::pos2(left, rect.center().y - galley.size().y * 0.5 + 2.0), galley, theme::ACCENT());
+    // A hairline that fades out to the right of the caption.
+    let start = left + text_w + 10.0;
+    let end = rect.right() - 12.0;
+    if end > start {
+        let y = rect.center().y + 2.0;
+        let mut mesh = egui::Mesh::default();
+        let solid = theme::LINE_STRONG();
+        let clear = egui::Color32::TRANSPARENT;
+        mesh.colored_vertex(egui::pos2(start, y), solid);
+        mesh.colored_vertex(egui::pos2(end, y), clear);
+        mesh.colored_vertex(egui::pos2(start, y + 1.0), solid);
+        mesh.colored_vertex(egui::pos2(end, y + 1.0), clear);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(1, 3, 2);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    ui.add_space(2.0);
 }
 
 fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
@@ -426,9 +435,9 @@ fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
         rect,
         egui::CornerRadius::ZERO,
         if response.hovered() {
-            theme::CONTROL_HOVER
+            theme::CONTROL_HOVER()
         } else {
-            theme::CONTROL
+            theme::CONTROL()
         },
     );
     painter.rect_stroke(
@@ -437,9 +446,9 @@ fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
         egui::Stroke::new(
             1.0_f32,
             if response.hovered() {
-                theme::ACCENT
+                theme::ACCENT()
             } else {
-                theme::LINE_STRONG
+                theme::LINE_STRONG()
             },
         ),
         egui::StrokeKind::Inside,
@@ -450,9 +459,9 @@ fn refresh_icon(ui: &mut egui::Ui, tooltip: &str) -> bool {
         "↻",
         egui::FontId::proportional(16.0),
         if response.hovered() {
-            theme::TEXT
+            theme::TEXT()
         } else {
-            theme::TEXT_DIM
+            theme::TEXT_DIM()
         },
     );
     response.on_hover_text(tooltip).clicked()
@@ -486,7 +495,7 @@ fn jka_ui_color(code: char, fallback: egui::Color32) -> egui::Color32 {
         '4' => egui::Color32::from_rgb(0x6E, 0x9C, 0xFF),
         '5' => egui::Color32::from_rgb(0x63, 0xD7, 0xE8),
         '6' => egui::Color32::from_rgb(0xD9, 0x78, 0xE8),
-        '7' => theme::TEXT,
+        '7' => theme::TEXT(),
         '8' => egui::Color32::from_rgb(0xFF, 0x9A, 0x45),
         '9' => egui::Color32::from_rgb(0xB8, 0xBE, 0xC8),
         _ => fallback,
@@ -552,33 +561,7 @@ fn asset_size_label(bytes: usize) -> String {
 }
 
 fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 27.0), egui::Sense::click());
-    let painter = ui.painter().clone();
-    if selected {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL_SELECTED);
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
-            egui::CornerRadius::ZERO,
-            theme::ACCENT,
-        );
-    } else if response.hovered() {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL);
-    }
-    painter.text(
-        egui::pos2(rect.left() + GUTTER, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(13.0),
-        if selected {
-            theme::TEXT
-        } else if response.hovered() {
-            theme::TEXT
-        } else {
-            theme::TEXT_DIM
-        },
-    );
-    response
+    holo::rail_item(ui, label, selected, GUTTER)
 }
 
 /// A wide, flat action row used by the Resume page.
@@ -597,16 +580,16 @@ fn menu_action(ui: &mut egui::Ui, label: &str, detail: &str, enabled: bool) -> b
         rect,
         egui::CornerRadius::ZERO,
         if hovered {
-            theme::CONTROL_HOVER
+            theme::CONTROL_HOVER()
         } else {
-            theme::CONTROL
+            theme::CONTROL()
         },
     );
     if hovered {
         painter.rect_filled(
             egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
             egui::CornerRadius::ZERO,
-            theme::ACCENT,
+            theme::ACCENT(),
         );
     }
     painter.text(
@@ -615,9 +598,9 @@ fn menu_action(ui: &mut egui::Ui, label: &str, detail: &str, enabled: bool) -> b
         label,
         egui::FontId::proportional(14.5),
         if enabled {
-            theme::TEXT
+            theme::TEXT()
         } else {
-            theme::TEXT_DISABLED
+            theme::TEXT_DISABLED()
         },
     );
     painter.text(
@@ -625,7 +608,7 @@ fn menu_action(ui: &mut egui::Ui, label: &str, detail: &str, enabled: bool) -> b
         egui::Align2::LEFT_CENTER,
         detail,
         egui::FontId::proportional(11.5),
-        theme::TEXT_FAINT,
+        theme::TEXT_FAINT(),
     );
     ui.add_space(6.0);
     enabled && response.clicked()
@@ -641,17 +624,17 @@ pub(super) fn binding_slot(
         ui.allocate_exact_size(egui::vec2(190.0, 24.0), egui::Sense::click_and_drag());
     let painter = ui.painter().clone();
     let fill = if waiting {
-        theme::CONTROL_SELECTED
+        theme::CONTROL_SELECTED()
     } else if response.hovered() {
-        theme::CONTROL_HOVER
+        theme::CONTROL_HOVER()
     } else {
-        theme::CONTROL
+        theme::CONTROL()
     };
     painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
     painter.rect_stroke(
         rect,
         egui::CornerRadius::ZERO,
-        egui::Stroke::new(1.0_f32, if waiting { theme::WARNING } else { theme::LINE }),
+        egui::Stroke::new(1.0_f32, if waiting { theme::WARNING() } else { theme::LINE() }),
         egui::StrokeKind::Inside,
     );
     painter.text(
@@ -687,14 +670,14 @@ fn confirmation_dialog(ctx: &egui::Context, seconds: u32) -> Option<bool> {
         ))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(theme::SURFACE)
-                .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                .fill(theme::SURFACE())
+                .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG()))
                 .inner_margin(egui::Margin::same(22))
                 .show(ui, |ui| {
                     ui.set_width(456.0);
                     theme::label(
                         ui,
-                        theme::plain("KEEP THESE DISPLAY SETTINGS?", 17.0, theme::TEXT).strong(),
+                        theme::plain("KEEP THESE DISPLAY SETTINGS?", 17.0, theme::TEXT()).strong(),
                     );
                     ui.add_space(8.0);
                     theme::label(
@@ -702,14 +685,14 @@ fn confirmation_dialog(ctx: &egui::Context, seconds: u32) -> Option<bool> {
                         theme::plain(
                             "The previous display mode is restored automatically if you do nothing.",
                             12.5,
-                            theme::TEXT_DIM,
+                            theme::TEXT_DIM(),
                         ),
                     );
                     ui.add_space(12.0);
                     theme::banner(
                         ui,
                         &format!("Reverting in {seconds} second{}", if seconds == 1 { "" } else { "s" }),
-                        theme::WARNING,
+                        theme::WARNING(),
                     );
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {

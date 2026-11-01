@@ -108,6 +108,58 @@ settings_cvars! { JaproCgame;
         ]
     }
 
+    APP_CG_FORCEPUSHDISTORTION {
+        runtime: CvarDef::new("cg_forcePushDistortion", "1", "0 | 1",
+            "Force Push/Pull: 0 original TaystJK screen-copy half-shield, 1 depth-aware screen-space shockwave with animated concentric refraction and chromatic fringe. cg_renderToTextureFX 0 still disables refraction.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_cg_forcepushdistortion(app)),
+            |app, value| App::cvar_set_cg_forcepushdistortion(app, APP_CG_FORCEPUSHDISTORTION.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_cg_forcepushdistortion, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, name, value| {
+                let _ = settings.japro.set_cvar(name, value);
+            }),
+            archive: Some((3591, |state| state.presentation.japro.force_push_distortion.to_string())),
+            ..CvarBinding::NONE
+        },
+        settings: SETTINGS_CG_FORCEPUSHDISTORTION = APP_CG_FORCEPUSHDISTORTION
+            .bind(
+                |state: &JaproCgame| CvarValue::String(state.force_push_distortion.to_string()),
+                |state, value| JaproCgame::cvar_set_cg_forcepushdistortion(state, APP_CG_FORCEPUSHDISTORTION.entry.name, &value.to_string()),
+            ).with_text_setter(JaproCgame::cvar_set_cg_forcepushdistortion, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_forcepushdistortion(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let value = japro_integer(name, value)?;
+                    if (0..=1).contains(&value) {
+                        self.force_push_distortion = value as u8;
+                        Ok(())
+                    } else {
+                        Err(format!("{name} accepts 0..1 (got {value})"))
+                    }
+                }
+            }
+            impl App {
+                fn cvar_get_cg_forcepushdistortion(&self) -> String {
+                    (SETTINGS_CG_FORCEPUSHDISTORTION.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cg_forcepushdistortion(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_FORCEPUSHDISTORTION.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.apply_client_options(
+                            self.screen_shake, self.audio.game, self.video.footprints,
+                            self.japro_cg, self.network.plugin_disable,
+                        );
+                    }
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_RENDERTOTEXTUREFX {
         runtime: CvarDef::new("cg_renderToTextureFX", "", "0 | 1 | 2 | 3 | 4 | 5", "0 TaystJK blue cloak; 1 TaystJK refraction; 2 Predator UV grid; 3 Predator object-space rings; 4 Predator world-space rings; 5 Predator view-space rings. Predator modes use experimental WGPU optics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_rendertotexturefx(app)), |app, value| App::cvar_set_cg_rendertotexturefx(app, APP_CG_RENDERTOTEXTUREFX.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_rendertotexturefx, None),
         config: CvarBinding {

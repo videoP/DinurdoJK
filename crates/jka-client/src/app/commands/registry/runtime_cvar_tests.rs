@@ -52,6 +52,35 @@ fn cg_remaps_sets_immediately_without_latching_or_archiving() {
 }
 
 #[test]
+fn footstep_ground_trace_ab_is_live_and_not_archived() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+        false, event_loop.create_proxy()).unwrap();
+    assert_eq!(app.console_cvar_value("cg_footstepTrace").as_deref(), Some("0"));
+    assert_eq!(crate::app::cvar_registry().find("cg_footstepTrace").unwrap().entry.latch,
+        crate::console::LatchScope::None);
+    app.config_dirty = false;
+    assert!(matches!(app.set_console_cvar_from_console("cg_footstepTrace", "1").unwrap(),
+        crate::app::ConsoleCvarSetResult::Applied));
+    assert!(app.audio.game.footstep_trace);
+    assert!(app.latched_console_cvars.is_empty());
+    assert!(!app.config_dirty);
+    assert_eq!(app.console_cvar_value("cg_footstepTrace").as_deref(), Some("1"));
+    for invalid in ["2", "-1", "NaN"] {
+        assert!(app.set_console_cvar("cg_footstepTrace", invalid).is_err());
+    }
+    app.flush_config();
+    assert!(!fs::read_to_string(path).unwrap().contains("cg_footstepTrace"));
+    app.set_console_cvar("cg_footstepTrace", "0").unwrap();
+    assert!(!app.audio.game.footstep_trace);
+}
+
+#[test]
 fn blue_cloud_experiments_apply_live_validate_and_stay_out_of_archives() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
@@ -734,4 +763,51 @@ fn relighting_master_preserves_edits_and_round_trips_through_canonical_cvar() {
             assert!(!matches!(name, "r_relightMap" | "r_sunOverride" | "r_bakedSunRemoval" | "r_sunLighting" | "r_bakedLocalLights" | "r_promoteShaderLights" | "r_emissiveAreaLights"));
         }
     }
+}
+
+#[test]
+fn packed_color_and_depth_are_video_latched_without_immediate_restart() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("DinurdoJK.cfg"), "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None,
+        crate::scene::MapSource::Bsp("mp/ffa3".into()), false, event_loop.create_proxy()).unwrap();
+    let old_rgb = crate::renderer::rgb565_requested();
+    let old_depth = crate::renderer::igpu_depth_requested();
+    let rgb_target = (old_rgb ^ 1).to_string();
+    let depth_target = (old_depth ^ 1).to_string();
+
+    for (name, target) in [("r_rgb565", rgb_target.as_str()),
+                           ("r_igpuMemoryAB", depth_target.as_str())] {
+        assert_eq!(crate::console::find(name).unwrap().latch,
+            crate::console::LatchScope::VidRestart);
+        assert!(matches!(app.set_console_cvar_from_console(name, target).unwrap(),
+            crate::app::ConsoleCvarSetResult::Latched));
+        assert_eq!(app.latched_console_cvars.get(&name.to_ascii_lowercase()).map(String::as_str),
+            Some(target));
+    }
+    // The live renderer format globals must not change when a cvar is typed.
+    assert_eq!(crate::renderer::rgb565_requested(), old_rgb);
+    assert_eq!(crate::renderer::igpu_depth_requested(), old_depth);
+    assert!(app.framebuffer_format_restart_pending());
+    assert!(app.video_restart_required());
+    let changes = app.pending_video_changes();
+    assert!(changes.iter().any(|c| c.key == "cvar:r_rgb565"));
+    assert!(changes.iter().any(|c| c.key == "cvar:r_igpumemoryab"));
+
+    // Invalid input is rejected *before* Apply, and changing back to the live
+    // value cancels each pending latch, just like other OpenJK cvars.
+    for name in ["r_rgb565", "r_igpuMemoryAB"] {
+        assert!(app.set_console_cvar_from_console(name, "2").is_err());
+        assert!(app.set_console_cvar_from_console(name, "-1").is_err());
+    }
+    assert!(matches!(app.set_console_cvar_from_console("r_rgb565", &old_rgb.to_string()).unwrap(),
+        crate::app::ConsoleCvarSetResult::Unchanged));
+    assert!(matches!(app.set_console_cvar_from_console("r_igpuMemoryAB", &old_depth.to_string()).unwrap(),
+        crate::app::ConsoleCvarSetResult::Unchanged));
+    assert!(!app.framebuffer_format_restart_pending());
+    assert!(!app.latched_console_cvars.contains_key("r_rgb565"));
+    assert!(!app.latched_console_cvars.contains_key("r_igpumemoryab"));
 }

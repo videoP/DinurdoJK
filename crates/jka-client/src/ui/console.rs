@@ -108,21 +108,29 @@ pub(in crate::ui) fn tail_chars(value: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
-// Console palette: rain-slick Tokyo night. Indigo asphalt for the body, cyan and
-// magenta neon for structure, tungsten amber for anything the user is driving.
-pub(in crate::ui) const CON_CYAN: [f32; 4] = [0.28, 0.86, 0.95, 1.0];
+// Console palette, from `crate::palette` (Setup -> Interface -> PALETTE).
+// Classic: indigo asphalt, cyan and magenta neon, tungsten amber. Celadon: warm Stone Brown ink, Celadon and Smoky Rose, gold.
+// The CON_* names predate the palette and are kept for the call sites.
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_CYAN() -> [f32; 4] { crate::palette::hud::CONSOLE_CYAN() }
 
-pub(in crate::ui) const CON_MAGENTA: [f32; 4] = [1.0, 0.30, 0.56, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_MAGENTA() -> [f32; 4] { crate::palette::hud::CONSOLE_MAGENTA() }
 
-pub(in crate::ui) const CON_AMBER: [f32; 4] = [1.0, 0.72, 0.28, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_AMBER() -> [f32; 4] { crate::palette::hud::CONSOLE_AMBER() }
 
-pub(in crate::ui) const CON_TEXT: [f32; 4] = [0.80, 0.86, 0.93, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_TEXT() -> [f32; 4] { crate::palette::hud::CONSOLE_TEXT() }
 
-pub(in crate::ui) const CON_BRIGHT: [f32; 4] = [0.95, 0.97, 1.0, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_BRIGHT() -> [f32; 4] { crate::palette::hud::CONSOLE_BRIGHT() }
 
-pub(in crate::ui) const CON_DIM: [f32; 4] = [0.50, 0.60, 0.73, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_DIM() -> [f32; 4] { crate::palette::hud::CONSOLE_DIM() }
 
-pub(in crate::ui) const CON_FAINT: [f32; 4] = [0.32, 0.40, 0.52, 1.0];
+#[allow(non_snake_case)]
+pub(in crate::ui) fn CON_FAINT() -> [f32; 4] { crate::palette::hud::CONSOLE_FAINT() }
 
 pub(in crate::ui) const SUGGEST_ROW_H: f32 = 20.0;
 
@@ -261,9 +269,9 @@ pub(in crate::ui) fn console_keycaps(
         if cursor + need > max_x {
             break;
         }
-        console_plain(out, key, cursor, y, CON_AMBER, w, h);
+        console_plain(out, key, cursor, y, CON_AMBER(), w, h);
         cursor += (key.len() + 1) as f32 * CONSOLE_CHAR_WIDTH;
-        console_plain(out, label, cursor, y, CON_DIM, w, h);
+        console_plain(out, label, cursor, y, CON_DIM(), w, h);
         cursor += (label.len() + 3) as f32 * CONSOLE_CHAR_WIDTH;
     }
 }
@@ -277,9 +285,9 @@ pub(in crate::ui) fn console_line_tone(
     use crate::logging::ConsoleLineKind;
     match kind {
         ConsoleLineKind::Normal => None,
-        ConsoleLineKind::CommandEcho | ConsoleLineKind::TeamChatCommandEcho => Some(CON_AMBER),
-        ConsoleLineKind::Error => Some(CON_MAGENTA),
-        ConsoleLineKind::NotifyMention | ConsoleLineKind::TeamChatMention => Some(CON_CYAN),
+        ConsoleLineKind::CommandEcho | ConsoleLineKind::TeamChatCommandEcho => Some(CON_AMBER()),
+        ConsoleLineKind::Error => Some(CON_MAGENTA()),
+        ConsoleLineKind::NotifyMention | ConsoleLineKind::TeamChatMention => Some(CON_CYAN()),
         ConsoleLineKind::TeamChat => None,
         ConsoleLineKind::NotifyConnect => Some([0.96, 0.84, 0.30, 1.0]),
         ConsoleLineKind::NotifyVote => Some([1.0, 0.56, 0.20, 1.0]),
@@ -411,20 +419,20 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         0.0,
         wf,
         ph,
-        [0.012, 0.016, 0.036, 0.975],
-        [0.012, 0.016, 0.036, 0.975],
-        [0.024, 0.030, 0.066, 0.965],
-        [0.024, 0.030, 0.066, 0.965],
+        crate::palette::hud::CONSOLE_BODY_TOP(),
+        crate::palette::hud::CONSOLE_BODY_TOP(),
+        crate::palette::hud::CONSOLE_BODY_BOTTOM(),
+        crate::palette::hud::CONSOLE_BODY_BOTTOM(),
         w,
         h,
     );
     // Header band and hairline.
     rect(out, 0.0, 0.0, wf, 40.0, [0.0, 0.0, 0.02, 0.30], w, h);
-    rect(out, 0.0, 40.0, wf, 1.0, with_alpha(CON_CYAN, 0.14), w, h);
+    rect(out, 0.0, 40.0, wf, 1.0, with_alpha(CON_CYAN(), 0.14), w, h);
 
     // Neon edge along the bottom of the panel, with a soft glow bleeding onto the world below.
-    let edge_l = with_alpha(CON_CYAN, 0.95);
-    let edge_r = with_alpha(CON_MAGENTA, 0.95);
+    let edge_l = with_alpha(CON_CYAN(), 0.95);
+    let edge_r = with_alpha(CON_MAGENTA(), 0.95);
     rect_gradient(
         out,
         0.0,
@@ -439,21 +447,21 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         h,
     );
     for (dy, height, alpha) in [(0.0, 3.0, 0.17), (3.0, 4.0, 0.07), (7.0, 6.0, 0.025)] {
-        let l = with_alpha(CON_CYAN, alpha);
-        let r = with_alpha(CON_MAGENTA, alpha);
+        let l = with_alpha(CON_CYAN(), alpha);
+        let r = with_alpha(CON_MAGENTA(), alpha);
         rect_gradient(out, 0.0, ph + dy, wf, height, l, r, l, r, w, h);
     }
 
     // Title.
-    rect(out, 20.0, 9.0, 3.0, 22.0, CON_MAGENTA, w, h);
-    text(out, "CONSOLE", 32.0, 12.0, 2.0, CON_BRIGHT, w, h);
+    rect(out, 20.0, 9.0, 3.0, 22.0, CON_MAGENTA(), w, h);
+    text(out, "CONSOLE", 32.0, 12.0, 2.0, CON_BRIGHT(), w, h);
     if !ui.console_status.is_empty() && !ui.console_search_open {
         console_text(
             out,
             &ui.console_status,
             32.0 + 7.0 * 12.0 + 16.0,
             16.0,
-            CON_DIM,
+            CON_DIM(),
             w,
             h,
         );
@@ -467,14 +475,14 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         chip_y,
         chip_w,
         chip_h,
-        [0.04, 0.07, 0.13, 0.92],
+        crate::palette::hud::CONSOLE_CHIP(),
         w,
         h,
     );
     let chip_edge = if ui.console_suggest_enabled {
-        with_alpha(CON_CYAN, 0.45)
+        with_alpha(CON_CYAN(), 0.45)
     } else {
-        with_alpha(CON_FAINT, 0.7)
+        with_alpha(CON_FAINT(), 0.7)
     };
     rect_outline(out, chip_x, chip_y, chip_w, chip_h, 1.0, chip_edge, w, h);
     disc(
@@ -484,9 +492,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         3.5,
         12,
         if ui.console_suggest_enabled {
-            CON_CYAN
+            CON_CYAN()
         } else {
-            CON_FAINT
+            CON_FAINT()
         },
         w,
         h,
@@ -501,9 +509,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         chip_x + 24.0,
         chip_y + 4.0,
         if ui.console_suggest_enabled {
-            CON_BRIGHT
+            CON_BRIGHT()
         } else {
-            CON_DIM
+            CON_DIM()
         },
         w,
         h,
@@ -511,7 +519,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
     let count_label = format!("{} LINES", ui.console_total_lines);
     let count_x = chip_x - 14.0 - count_label.len() as f32 * CONSOLE_CHAR_WIDTH;
     if !ui.console_search_open && count_x > 32.0 + 7.0 * 12.0 + 140.0 {
-        console_plain(out, &count_label, count_x, chip_y + 4.0, CON_FAINT, w, h);
+        console_plain(out, &count_label, count_x, chip_y + 4.0, CON_FAINT(), w, h);
     }
 
     // Help button; the shortcut card appears while it is hovered.
@@ -525,7 +533,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         if ui.console_help_hover {
             [0.10, 0.16, 0.26, 0.98]
         } else {
-            [0.04, 0.07, 0.13, 0.92]
+            crate::palette::hud::CONSOLE_CHIP()
         },
         w,
         h,
@@ -538,9 +546,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         help_h,
         1.0,
         if ui.console_help_hover {
-            with_alpha(CON_AMBER, 0.9)
+            with_alpha(CON_AMBER(), 0.9)
         } else {
-            with_alpha(CON_CYAN, 0.45)
+            with_alpha(CON_CYAN(), 0.45)
         },
         w,
         h,
@@ -551,9 +559,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         help_x + (help_w - CONSOLE_CHAR_WIDTH) * 0.5,
         help_y + 4.0,
         if ui.console_help_hover {
-            CON_AMBER
+            CON_AMBER()
         } else {
-            CON_DIM
+            CON_DIM()
         },
         w,
         h,
@@ -571,25 +579,25 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             field_y,
             field_w,
             28.0,
-            [0.03, 0.05, 0.10, 0.98],
+            crate::palette::hud::CONSOLE_FIELD(),
             w,
             h,
         );
-        rect(out, field_x, field_y + 26.0, field_w, 2.0, CON_AMBER, w, h);
+        rect(out, field_x, field_y + 26.0, field_w, 2.0, CON_AMBER(), w, h);
         let max_query_chars = ((field_w - 72.0) / CONSOLE_CHAR_WIDTH) as usize;
         let query = tail_chars(&ui.console_search_query, max_query_chars.max(1));
-        console_plain(out, "FIND", field_x + 8.0, field_y + 6.0, CON_AMBER, w, h);
+        console_plain(out, "FIND", field_x + 8.0, field_y + 6.0, CON_AMBER(), w, h);
         console_plain(
             out,
             &query,
             field_x + 8.0 + 5.0 * CONSOLE_CHAR_WIDTH,
             field_y + 6.0,
-            CON_BRIGHT,
+            CON_BRIGHT(),
             w,
             h,
         );
         let caret_x = field_x + 8.0 + (5 + query.chars().count()) as f32 * CONSOLE_CHAR_WIDTH;
-        rect(out, caret_x, field_y + 5.0, 2.0, 18.0, CON_AMBER, w, h);
+        rect(out, caret_x, field_y + 5.0, 2.0, 18.0, CON_AMBER(), w, h);
 
         let counter = if ui.console_search_query.is_empty() {
             "TYPE TO SEARCH".to_owned()
@@ -608,9 +616,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             field_x + field_w + 12.0,
             field_y + 6.0,
             if ui.console_search_total == 0 && !ui.console_search_query.is_empty() {
-                CON_MAGENTA
+                CON_MAGENTA()
             } else {
-                CON_AMBER
+                CON_AMBER()
             },
             w,
             h,
@@ -722,7 +730,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                 }
             }
         }
-        super::text::console_text_sized(out, line, 20.0, line_y, char_width, line_step, CON_TEXT, w, h);
+        super::text::console_text_sized(out, line, 20.0, line_y, char_width, line_step, CON_TEXT(), w, h);
 
         // Trusted engine-authored local paths get conventional hyperlink
         // treatment. Draw this *after* the normal colored console text so a
@@ -746,7 +754,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                     .collect();
                 console_plain_sized(
                     out, &linked_text, 20.0 + link.start_col as f32 * char_width,
-                    line_y, char_width, line_step, CON_CYAN, w, h,
+                    line_y, char_width, line_step, CON_CYAN(), w, h,
                 );
                 rect(
                     out,
@@ -754,7 +762,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                     line_y + line_step - 2.0,
                     (link.end_col - link.start_col) as f32 * char_width,
                     1.0,
-                    with_alpha(CON_CYAN, 0.95),
+                    with_alpha(CON_CYAN(), 0.95),
                     w,
                     h,
                 );
@@ -763,7 +771,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         line_y += line_step;
     }
     if ui.console_lines.is_empty() && !ui.console_status.is_empty() {
-        console_plain_sized(out, "NO OUTPUT YET", 20.0, first_y, char_width, line_step, CON_FAINT, w, h);
+        console_plain_sized(out, "NO OUTPUT YET", 20.0, first_y, char_width, line_step, CON_FAINT(), w, h);
     }
 
     // Scroll position: a thin rail on the right plus a "newer output below" pill.
@@ -781,7 +789,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             rail_top,
             2.0,
             rail_h,
-            with_alpha(CON_CYAN, 0.07),
+            with_alpha(CON_CYAN(), 0.07),
             w,
             h,
         );
@@ -793,9 +801,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             thumb_h,
             with_alpha(
                 if ui.console_scrolled > 0 {
-                    CON_MAGENTA
+                    CON_MAGENTA()
                 } else {
-                    CON_CYAN
+                    CON_CYAN()
                 },
                 0.55,
             ),
@@ -825,11 +833,11 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             pill_w,
             22.0,
             1.0,
-            with_alpha(CON_MAGENTA, 0.7),
+            with_alpha(CON_MAGENTA(), 0.7),
             w,
             h,
         );
-        console_plain(out, &label, pill_x + 10.0, pill_y + 3.0, CON_MAGENTA, w, h);
+        console_plain(out, &label, pill_x + 10.0, pill_y + 3.0, CON_MAGENTA(), w, h);
     }
 
     // Input bar.
@@ -840,12 +848,12 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         bar_y,
         wf,
         (ph - 2.0) - bar_y,
-        [0.045, 0.065, 0.125, 0.94],
+        crate::palette::hud::CONSOLE_BAR(),
         w,
         h,
     );
-    rect(out, 0.0, bar_y, wf, 1.0, with_alpha(CON_CYAN, 0.18), w, h);
-    console_plain_sized(out, ">", 20.0, input_y, char_width, line_step, CON_AMBER, w, h);
+    rect(out, 0.0, bar_y, wf, 1.0, with_alpha(CON_CYAN(), 0.18), w, h);
+    console_plain_sized(out, ">", 20.0, input_y, char_width, line_step, CON_AMBER(), w, h);
     let text_x = 30.0 + char_width;
     let cursor = ui.console_cursor.min(ui.console_input.len());
     let cursor = if ui.console_input.is_char_boundary(cursor) {
@@ -856,11 +864,11 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
     if ui.console_input.is_empty() {
         console_plain_sized(
             out, "type a command or cvar", text_x + 6.0, input_y,
-            char_width, line_step, CON_FAINT, w, h,
+            char_width, line_step, CON_FAINT(), w, h,
         );
     } else {
         super::text::console_text_sized(
-            out, &ui.console_input, text_x, input_y, char_width, line_step, CON_BRIGHT, w, h,
+            out, &ui.console_input, text_x, input_y, char_width, line_step, CON_BRIGHT(), w, h,
         );
         // Ghost completion: the rest of the highlighted suggestion, dimmed.
         if !ui.console_suggest_hint && cursor == ui.console_input.len() {
@@ -883,7 +891,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                         text_x + visible_text_len(&ui.console_input) as f32 * char_width;
                     console_plain_sized(
                         out, &name[fragment.len()..], end_x, input_y,
-                        char_width, line_step, with_alpha(CON_CYAN, 0.42), w, h,
+                        char_width, line_step, with_alpha(CON_CYAN(), 0.42), w, h,
                     );
                 }
             }
@@ -897,7 +905,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         input_y - 1.0,
         2.0,
         line_step + 2.0,
-        CON_AMBER,
+        CON_AMBER(),
         w,
         h,
     );
@@ -950,9 +958,9 @@ pub(in crate::ui) fn build_console_help(out: &mut Vec<UiVertex>, w: u32, h: u32)
         w,
         h,
     );
-    rect(out, x, y, card_w, card_h, [0.020, 0.028, 0.056, 0.99], w, h);
-    let edge_l = with_alpha(CON_CYAN, 0.6);
-    let edge_r = with_alpha(CON_MAGENTA, 0.6);
+    rect(out, x, y, card_w, card_h, crate::palette::hud::CONSOLE_CARD(), w, h);
+    let edge_l = with_alpha(CON_CYAN(), 0.6);
+    let edge_r = with_alpha(CON_MAGENTA(), 0.6);
     rect_gradient(out, x, y, card_w, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
     rect_gradient(
         out,
@@ -973,7 +981,7 @@ pub(in crate::ui) fn build_console_help(out: &mut Vec<UiVertex>, w: u32, h: u32)
     for (i, (key, label)) in ROWS.iter().enumerate() {
         let ry = y + 10.0 + i as f32 * ROW_H;
         if key.is_empty() {
-            console_plain(out, label, x + 14.0, ry, CON_CYAN, w, h);
+            console_plain(out, label, x + 14.0, ry, CON_CYAN(), w, h);
             let rule_x = x + 14.0 + (label.len() as f32 + 1.0) * CONSOLE_CHAR_WIDTH;
             rect(
                 out,
@@ -981,18 +989,18 @@ pub(in crate::ui) fn build_console_help(out: &mut Vec<UiVertex>, w: u32, h: u32)
                 ry + 8.0,
                 x + card_w - 14.0 - rule_x,
                 1.0,
-                with_alpha(CON_CYAN, 0.16),
+                with_alpha(CON_CYAN(), 0.16),
                 w,
                 h,
             );
         } else {
-            console_plain(out, key, x + 14.0, ry, CON_AMBER, w, h);
+            console_plain(out, key, x + 14.0, ry, CON_AMBER(), w, h);
             console_plain(
                 out,
                 &ellipsize(label, label_chars),
                 x + 14.0 + key_col,
                 ry,
-                CON_TEXT,
+                CON_TEXT(),
                 w,
                 h,
             );
@@ -1020,9 +1028,9 @@ pub(in crate::ui) fn build_console_suggestions(
 
     // Lift off the console/world, then the card itself.
     rect(out, x + 3.0, y + 5.0, pw, g.h, [0.0, 0.0, 0.0, 0.38], w, h);
-    rect(out, x, y, pw, g.h, [0.020, 0.028, 0.056, 0.985], w, h);
-    let edge_l = with_alpha(CON_CYAN, 0.55);
-    let edge_r = with_alpha(CON_MAGENTA, 0.55);
+    rect(out, x, y, pw, g.h, crate::palette::hud::CONSOLE_SUGGEST_CARD(), w, h);
+    let edge_l = with_alpha(CON_CYAN(), 0.55);
+    let edge_r = with_alpha(CON_MAGENTA(), 0.55);
     rect_gradient(out, x, y, pw, 1.0, edge_l, edge_r, edge_l, edge_r, w, h);
     rect_gradient(
         out,
@@ -1037,14 +1045,14 @@ pub(in crate::ui) fn build_console_suggestions(
         w,
         h,
     );
-    rect(out, x, y, 1.0, g.h, with_alpha(CON_CYAN, 0.55), w, h);
+    rect(out, x, y, 1.0, g.h, with_alpha(CON_CYAN(), 0.55), w, h);
     rect(
         out,
         x + pw - 1.0,
         y,
         1.0,
         g.h,
-        with_alpha(CON_MAGENTA, 0.55),
+        with_alpha(CON_MAGENTA(), 0.55),
         w,
         h,
     );
@@ -1071,15 +1079,15 @@ pub(in crate::ui) fn build_console_suggestions(
                 w,
                 h,
             );
-            rect(out, x + 1.0, ry, 3.0, SUGGEST_ROW_H, CON_CYAN, w, h);
+            rect(out, x + 1.0, ry, 3.0, SUGGEST_ROW_H, CON_CYAN(), w, h);
         }
         let text_y = ry + (SUGGEST_ROW_H - CONSOLE_CHAR_HEIGHT) * 0.5;
         let (badge, badge_color) = match item.kind {
-            ConsoleSuggestKind::Cvar => ("VAR", CON_CYAN),
-            ConsoleSuggestKind::Command => ("CMD", CON_AMBER),
-            ConsoleSuggestKind::Server => ("SRV", CON_MAGENTA),
-            ConsoleSuggestKind::Map => ("MAP", CON_CYAN),
-            ConsoleSuggestKind::Argument => ("ARG", CON_CYAN),
+            ConsoleSuggestKind::Cvar => ("VAR", CON_CYAN()),
+            ConsoleSuggestKind::Command => ("CMD", CON_AMBER()),
+            ConsoleSuggestKind::Server => ("SRV", CON_MAGENTA()),
+            ConsoleSuggestKind::Map => ("MAP", CON_CYAN()),
+            ConsoleSuggestKind::Argument => ("ARG", CON_CYAN()),
         };
         console_plain(
             out,
@@ -1102,11 +1110,11 @@ pub(in crate::ui) fn build_console_suggestions(
         for (i, byte) in item.name.bytes().take(name_room).enumerate() {
             let matched = i < 64 && item.mask >> i & 1 == 1;
             let color = if matched {
-                CON_AMBER
+                CON_AMBER()
             } else if is_selected {
-                CON_BRIGHT
+                CON_BRIGHT()
             } else {
-                CON_TEXT
+                CON_TEXT()
             };
             glyph_quad_sized(
                 out,
@@ -1126,7 +1134,7 @@ pub(in crate::ui) fn build_console_suggestions(
                     text_y + CONSOLE_CHAR_HEIGHT - 1.0,
                     CONSOLE_CHAR_WIDTH,
                     1.0,
-                    with_alpha(CON_AMBER, 0.6),
+                    with_alpha(CON_AMBER(), 0.6),
                     w,
                     h,
                 );
@@ -1137,9 +1145,9 @@ pub(in crate::ui) fn build_console_suggestions(
             let value = ellipsize(&item.value, value_room);
             let vx = x + pw - 14.0 - value.chars().count() as f32 * CONSOLE_CHAR_WIDTH;
             let color = if item.modified {
-                CON_AMBER
+                CON_AMBER()
             } else {
-                with_alpha(CON_CYAN, 0.62)
+                with_alpha(CON_CYAN(), 0.62)
             };
             console_plain(out, &value, vx, text_y, color, w, h);
         }
@@ -1153,7 +1161,7 @@ pub(in crate::ui) fn build_console_suggestions(
         detail_y,
         pw - 20.0,
         1.0,
-        with_alpha(CON_CYAN, 0.16),
+        with_alpha(CON_CYAN(), 0.16),
         w,
         h,
     );
@@ -1165,7 +1173,7 @@ pub(in crate::ui) fn build_console_suggestions(
                 line,
                 x + 14.0,
                 detail_y + 6.0 + i as f32 * 18.0,
-                CON_TEXT,
+                CON_TEXT(),
                 w,
                 h,
             );
@@ -1178,22 +1186,22 @@ pub(in crate::ui) fn build_console_suggestions(
             }
             let room = ((x + pw - 14.0 - mx) / CONSOLE_CHAR_WIDTH) as usize;
             let value = ellipsize(value, room.saturating_sub(label.len() + 1).max(4));
-            console_plain(out, label, mx, meta_y, CON_FAINT, w, h);
+            console_plain(out, label, mx, meta_y, CON_FAINT(), w, h);
             mx += (label.len() + 1) as f32 * CONSOLE_CHAR_WIDTH;
             console_plain(out, &value, mx, meta_y, color, w, h);
             mx += (value.chars().count() + 3) as f32 * CONSOLE_CHAR_WIDTH;
         };
         match item.kind {
             ConsoleSuggestKind::Cvar => {
-                meta("DEFAULT", item.default_value, CON_DIM, out);
-                meta("RANGE", item.range, CON_DIM, out);
+                meta("DEFAULT", item.default_value, CON_DIM(), out);
+                meta("RANGE", item.range, CON_DIM(), out);
             }
-            ConsoleSuggestKind::Command => meta("COMMAND", "runs locally", CON_DIM, out),
+            ConsoleSuggestKind::Command => meta("COMMAND", "runs locally", CON_DIM(), out),
             ConsoleSuggestKind::Server => {
-                meta("SERVER COMMAND", "sent to the server", CON_DIM, out)
+                meta("SERVER COMMAND", "sent to the server", CON_DIM(), out)
             }
-            ConsoleSuggestKind::Map => meta("MAP", "available in active fs_game", CON_DIM, out),
-            ConsoleSuggestKind::Argument => meta("ARGUMENT", "from the current command", CON_DIM, out),
+            ConsoleSuggestKind::Map => meta("MAP", "available in active fs_game", CON_DIM(), out),
+            ConsoleSuggestKind::Argument => meta("ARGUMENT", "from the current command", CON_DIM(), out),
         }
     }
 
@@ -1216,7 +1224,7 @@ pub(in crate::ui) fn build_console_suggestions(
     } else {
         format!("{} OF {} MATCHES", selected + 1, count)
     };
-    console_plain(out, &summary, x + 14.0, footer_y + 3.0, CON_CYAN, w, h);
+    console_plain(out, &summary, x + 14.0, footer_y + 3.0, CON_CYAN(), w, h);
     let keys_x = x + 14.0 + (summary.len() + 3) as f32 * CONSOLE_CHAR_WIDTH;
     if hint {
         console_keycaps(

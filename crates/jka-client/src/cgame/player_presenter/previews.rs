@@ -2,8 +2,8 @@
 use crate::cgame::player_presenter::{
     animation_index, apply_profile_studio_light, blade_color, cosmetic_draws_for_mask,
     model_bolt_matrix_timed, normalize_vec3, record_pose_eval, saber_blade_fx_request,
-    saber_hand_bolt_matrix_timed,
-    saber_name_is_removed, sibling_default_skin_qpath, transform_jka_model_point,
+    saber_attachment_bolt_name, saber_hand_bolt_matrix_timed,
+    sibling_default_skin_qpath, transform_jka_model_point,
     transform_jka_model_vector, Arc, DynamicModelSurface, Ghoul2Animator, Instant, PlayerPresenter,
     BONE_ANIM_OVERRIDE_FREEZE, BONE_ANIM_OVERRIDE_LOOP,
 };
@@ -637,14 +637,12 @@ impl PlayerPresenter {
                 info.saber_name, info.saber2_name)]
         } else { Vec::new() };
         if with_sabers {
-            for (saber_num, saber_name, hand_name) in [
-                (0usize, info.saber_name.as_str(), "*r_hand"),
-                (1usize, info.saber2_name.as_str(), "*l_hand"),
-            ] {
-                if saber_name.is_empty() || saber_name_is_removed(saber_name) {
-                    continue;
-                }
-                let definition = self.saber_definitions.definition_or_default(saber_name);
+            // Use the same WP_SetSaber loadout as live CG_Player: rejected
+            // notInMP definitions and incompatible two-handed secondary hilts
+            // must not silently reappear in the Profile/Studio preview.
+            for (saber_num, definition) in self.equipped_sabers(info).into_iter().enumerate() {
+                let Some(definition) = definition else { continue; };
+                let hand_name = saber_attachment_bolt_name(saber_num, &definition);
                 let Some(hand_bolt) = saber_hand_bolt_matrix_timed(
                     &mut self.perf,
                     &model,

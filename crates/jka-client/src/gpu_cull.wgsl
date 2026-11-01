@@ -138,13 +138,15 @@ fn occluded_by_hiz(record: CullRecord) -> bool {
 
 // draw.w bits: 0 inline mover, 1 explicitly absent, 2 static models/ shader,
 // 3 transparent stage, bits 5..7 = resolved blend bucket (0 none,
-// 1 multiply, 2 additive, 3 alpha composite, 4 other), bit 8 = water.
+// 1 multiply, 2 additive, 3 alpha composite, 4 other), bit 8 = water, bit 9 = force-sight-only.
 // Viewport flags: bit1 hide inline, bit2 hide static models/ shaders,
 // bit3 omit transparent, bit4 omit opaque/masked, bit5 fast sky,
+// bit7 hide Force-Sight-only materials when seeing is inactive,
 // bits 8..11 probe 0..8.
 fn excluded_inline(record: CullRecord) -> bool {
     let flags = settings.viewport_mips_flags.w;
     return (record.draw.w & 2u) != 0u ||
+        (((flags & 128u) != 0u) && ((record.draw.w & 512u) != 0u)) ||
         (((flags & 2u) != 0u) && ((record.draw.w & 1u) != 0u)) ||
         (((flags & 4u) != 0u) && ((record.draw.w & 4u) != 0u)) ||
         (((flags & 8u) != 0u) && ((record.draw.w & 8u) != 0u)) ||

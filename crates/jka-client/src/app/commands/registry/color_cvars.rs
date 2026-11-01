@@ -513,14 +513,16 @@ app_cvars! {
         ]
     }
 
+    // Compatibility alias for older configs/console binds. New configs save only
+    // r_splitToningStrength, and zero is the sole OFF state.
     APP_R_SPLITTONING {
         runtime: CvarDef::new(
                 "r_splitToning",
                 "",
                 "0..1",
-                "Enable separate shadow and highlight color tints.",
+                "Legacy split-toning toggle alias; use r_splitToningStrength (0=off).",
                 CvarType::String,
-                CvarFlags::ARCHIVE,
+                CvarFlags::NONE,
                 LatchScope::None,
                 |app| CvarValue::String(App::cvar_get_r_splittoning(app)),
                 |app, value| {
@@ -529,30 +531,26 @@ app_cvars! {
             )
             .with_text_setter(App::cvar_set_r_splittoning, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    {
-                        settings.split_toning.enabled =
-                            parse_bool(value).unwrap_or(settings.split_toning.enabled)
-                    }
+                load_video: Some(|_settings, _name, value, context| {
+                    context.legacy_split_toning_enabled = parse_bool(value);
                 }),
-                archive: Some((156, |state| {
-                    let settings = state.video;
-                    format!("{}", u8::from(settings.split_toning.enabled))
-                })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_splittoning(&self) -> String {
-                    u8::from(self.video.split_toning.enabled).to_string()
+                    u8::from(self.video.split_toning.strength > 0.0).to_string()
                 }
                 fn cvar_set_r_splittoning(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.video.split_toning.enabled = Self::parse_cvar_bool(name, value)?;
-                        self.sync_post_effects();
-                        self.mark_config_dirty();
-                        self.publish_ui();
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if !enabled {
+                        self.video.split_toning.strength = 0.0;
+                    } else if self.video.split_toning.strength == 0.0 {
+                        self.video.split_toning.strength = 0.5;
                     }
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -870,14 +868,14 @@ app_cvars! {
             )
             .with_text_setter(App::cvar_set_r_splittoningstrength, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
+                load_video: Some(|settings, _name, value, context| {
+                    if let Some(strength) = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
                     {
-                        settings.split_toning.strength = value
-                            .parse::<f32>()
-                            .ok()
-                            .filter(|v| v.is_finite())
-                            .map(|v| v.clamp(0.0, 1.0))
-                            .unwrap_or(settings.split_toning.strength)
+                        settings.split_toning.strength = strength.clamp(0.0, 1.0);
+                        context.split_toning_strength_seen = true;
                     }
                 }),
                 archive: Some((157, |state| {

@@ -102,17 +102,21 @@ pub struct VideoSettings {
     /// r_fragmentShaderMode: 0 general world fragment program, 1 TaystJK-style
     /// per-material specialized programs (MaterialFragmentKey).
     pub fragment_shader_mode: u8,
+    /// Session-only shader input A/B: 0 WGSL, 1 round-trip validated SPIR-V (WGSL fallback).
+    pub shader_input_mode: u8,
     /// Session-only world submission ordering: 0 authored-sort baseline, 1 safe pipeline-first.
     pub world_sort_mode: u8,
     /// r_postSpecialize: full post runs a pipeline built for the enabled effects.
     pub post_specialize: bool,
-    /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
+    /// r_colorClearMode: 0 always clear, 1 skip under authored sky, 2 never clear the main world color.
     pub color_clear_mode: u8,
     /// Render-only heuristic: keep BSP-authored stages whose shader qpath starts with models/.
     pub draw_bsp_model_surfaces: bool,
     /// Session diagnostic. 0 full, 1 opaque+masked only, 2 transparent only (no opaque depth).
     pub world_stage_probe: u8,
-    /// TaystJK `r_fastsky`: 0 normal textured sky, 1 black, 2..9 palette, 10 red.
+    /// Session-only aggressive competitive renderer experiment (0 = stock).
+    pub competitive_ab: u32,
+    /// `r_fastsky`: 0 normal textured sky, 1 pale sky blue, 2..9 TaystJK palette, 10 red.
     pub fast_sky: u8,
     /// Debug overlays for trigger volumes and clip/collision-only brushes.
     /// Session-only: never written to the config.
@@ -136,10 +140,6 @@ pub struct VideoSettings {
     /// Session-only: log queued jobs and in-flight native BSP/RT PSOs.
     pub pipeline_trace: bool,
     pub perf_trace: bool,
-    /// World renderer choice (`r_worldPath unified`): keeps the world on
-    /// the unified renderer even when the FastBaseline feature envelope matches,
-    /// so "minimal unified" can be timed against the untouched baseline.
-    pub force_unified_world: bool,
     /// Session-only: parallax occlusion on top of `r_pbr` (`r_pom`, default on).
     pub pom: bool,
     /// Session-only GPU profiler switch; always starts disabled.
@@ -319,6 +319,8 @@ pub struct VideoSettings {
     pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
+    /// 0 = half-resolution realtime AO, 1 = full-resolution realtime AO.
+    pub ssao_resolution: u8,
     pub static_bsp_ao: bool,
     /// false = cached per-vertex AO, true = cached lightmap-space AO.
     pub static_bsp_ao_lightmap: bool,
@@ -439,6 +441,7 @@ pub struct VideoSettings {
     /// cg_waterwake: 0 off, 1 TaystJK/JKA quad, 2 enhanced quad plus Godot interaction.
     pub water_wake: u8,
     pub ocean_settings: crate::ocean::OceanSettings,
+    pub river_settings: crate::river_settings::Settings,
     pub cloud_render_resolution: CloudRenderResolution,
     pub cloud_temporal: bool,
     pub cloud_temporal_depth_fix: bool,
@@ -708,11 +711,13 @@ impl Default for VideoSettings {
             draw_inline_models: true,
             inline_transform_mode: crate::ui::InlineTransformMode::Gpu,
             fragment_shader_mode: 1,
+            shader_input_mode: 0,
             world_sort_mode: 0,
             post_specialize: true,
             color_clear_mode: 1,
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
+            competitive_ab: 0,
             fast_sky: 0,
             draw_triggers: false,
             draw_clip_brushes: false,
@@ -725,7 +730,6 @@ impl Default for VideoSettings {
             renderer_verbose: 0,
             pipeline_trace: false,
             perf_trace: false,
-            force_unified_world: false,
             pom: true,
             gpu_timings: false,
             ghoul2_skinning: Ghoul2SkinningMode::Gpu,
@@ -746,7 +750,7 @@ impl Default for VideoSettings {
             surface_sprites_gpu: true,
             surface_sprites: true,
             foliage_wind: true,
-            md3_auto_lod: true,
+            md3_auto_lod: false,
             bsp_model_lod: true,
             md3_lod_debug: false,
             model_render_bundles: false,
@@ -848,6 +852,7 @@ impl Default for VideoSettings {
             glow: GlowMode::Off,
             halation: false,
             ssao: false,
+            ssao_resolution: 0,
             static_bsp_ao: false,
             static_bsp_ao_lightmap: true,
             static_bsp_ao_samples: 32,
@@ -926,6 +931,7 @@ impl Default for VideoSettings {
             ssr_debug: 0,
             ocean: true,
             water_wake: 1,
+            river_settings: crate::river_settings::Settings::default(),
             ocean_settings: crate::ocean::OceanSettings {
                 // New promoted water uses Cheapwater; keep the unused FFT
                 // allocations at the saved preset's minimum size.

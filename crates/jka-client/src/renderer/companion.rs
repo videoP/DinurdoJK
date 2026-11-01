@@ -5,7 +5,7 @@ use crate::renderer::{
     CompanionId, CompanionSceneSlot, CompanionSceneTarget, CompanionSceneView, DrawClass, Duration,
     EguiRenderData, EventLoopProxy, Instant, JoinHandle, Mutex, Ordering, PhysicalSize, Receiver,
     Renderer, UserEvent, VecDeque, Window, COMPANION_SCENE_FRAME_INTERVAL,
-    COMPANION_SCENE_RING_SIZE, DEPTH_FORMAT,
+    COMPANION_SCENE_RING_SIZE, depth_format,
 };
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
@@ -763,7 +763,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -813,7 +813,7 @@ impl Renderer {
         let classic_flags = self.classic_world_render_flags();
         let time = self.frame_time();
 
-        // A mapped world requires its known-fast PSO set. If it is still being
+        // A mapped world requires its companion-view PSO set. If it is still being
         // compiled in the background, skip this secondary frame rather than
         // stalling or drawing a misleading worldless POV.
         if self

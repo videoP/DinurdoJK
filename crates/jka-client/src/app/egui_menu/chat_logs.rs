@@ -12,7 +12,7 @@ impl App {
             theme::page_title(ui, "CHAT LOGS", "Browse saved chat by day and server (including older session logs).");
             theme::label(
                 ui,
-                theme::plain("Scanning chat logs...", 12.0, theme::TEXT_FAINT),
+                theme::plain("Scanning chat logs...", 12.0, theme::TEXT_FAINT()),
             );
             return;
         }
@@ -21,7 +21,7 @@ impl App {
             theme::banner(
                 ui,
                 &format!("Chat log scan failed: {error}"),
-                theme::WARNING,
+                theme::WARNING(),
             );
             if theme::ghost_button(ui, "RETRY").clicked() {
                 self.refresh_chat_log_browser_catalog();
@@ -138,8 +138,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::RAIL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::RAIL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(10, 10))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -148,7 +148,7 @@ impl App {
                             ));
 
                             ui.horizontal(|ui| {
-                                theme::label(ui, theme::plain("LOG FILES", 11.0, theme::TEXT_DIM));
+                                theme::label(ui, theme::plain("LOG FILES", 11.0, theme::TEXT_DIM()));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     refresh_requested |= refresh_icon(ui, "Rescan chat log folders");
                                     if theme::ghost_button(ui, "CLEAR").clicked() {
@@ -256,7 +256,7 @@ impl App {
                                     theme::plain(
                                         &format!("{} / {} logs", filtered.len(), self.chat_log_browser_entries.len()),
                                         9.5,
-                                        theme::TEXT_FAINT,
+                                        theme::TEXT_FAINT(),
                                     ),
                                 );
                                 if self.ui_catalog.pending.chat_logs {
@@ -276,7 +276,7 @@ impl App {
                                         ui.add_space(8.0);
                                         theme::label(
                                             ui,
-                                            theme::plain("No chat logs match these filters.", 11.0, theme::TEXT_FAINT),
+                                            theme::plain("No chat logs match these filters.", 11.0, theme::TEXT_FAINT()),
                                         );
                                     }
                                     for &index in &filtered {
@@ -289,14 +289,14 @@ impl App {
                                         );
                                         let painter = ui.painter().with_clip_rect(rect);
                                         if selected {
-                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL_SELECTED);
+                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL_SELECTED());
                                             painter.rect_filled(
                                                 egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
                                                 egui::CornerRadius::ZERO,
-                                                theme::ACCENT,
+                                                theme::ACCENT(),
                                             );
                                         } else if response.hovered() {
-                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL);
+                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL());
                                         }
 
                                         let inset = rect.shrink2(egui::vec2(8.0, 5.0));
@@ -306,14 +306,14 @@ impl App {
                                             egui::Align2::LEFT_TOP,
                                             when,
                                             egui::FontId::monospace(9.5),
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         );
                                         painter.text(
                                             egui::pos2(inset.right(), inset.top()),
                                             egui::Align2::RIGHT_TOP,
                                             &entry.mod_name,
                                             egui::FontId::monospace(9.0),
-                                            if selected { theme::ACCENT } else { theme::TEXT_FAINT },
+                                            if selected { theme::ACCENT() } else { theme::TEXT_FAINT() },
                                         );
                                         let server = if entry.server.is_empty() { &entry.address } else { &entry.server };
                                         painter.text(
@@ -321,7 +321,7 @@ impl App {
                                             egui::Align2::LEFT_TOP,
                                             server,
                                             egui::FontId::proportional(12.0),
-                                            if selected { theme::TEXT } else { theme::TEXT_DIM },
+                                            if selected { theme::TEXT() } else { theme::TEXT_DIM() },
                                         );
                                         let bottom = format!(
                                             "{}{}{} msg{}{}",
@@ -336,7 +336,7 @@ impl App {
                                             egui::Align2::LEFT_TOP,
                                             bottom,
                                             egui::FontId::monospace(9.0),
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         );
 
                                         let response = response.on_hover_text(entry.path.display().to_string());
@@ -369,8 +369,8 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::Frame::new()
-                        .fill(theme::PANEL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::PANEL_FILL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::symmetric(14, 12))
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -381,9 +381,9 @@ impl App {
                             let Some(detail) = detail else {
                                 if self.ui_catalog.pending.chat_log_detail {
                                     ui.spinner();
-                                    theme::label(ui, theme::plain("Loading transcript...", 11.0, theme::TEXT_FAINT));
+                                    theme::label(ui, theme::plain("Loading transcript...", 11.0, theme::TEXT_FAINT()));
                                 } else if let Some(error) = detail_error {
-                                    theme::banner(ui, &format!("Could not read chat log: {error}"), theme::WARNING);
+                                    theme::banner(ui, &format!("Could not read chat log: {error}"), theme::WARNING());
                                 } else {
                                     theme::page_title(ui, "CHAT LOGS", "Select a saved session to read its transcript.");
                                     theme::label(
@@ -391,7 +391,7 @@ impl App {
                                         theme::plain(
                                             "Search on the left scans message contents across every mod and server.",
                                             11.0,
-                                            theme::TEXT_FAINT,
+                                            theme::TEXT_FAINT(),
                                         ),
                                     );
                                 }
@@ -405,13 +405,13 @@ impl App {
                                     } else {
                                         detail.server.as_str()
                                     };
-                                    theme::label(ui, theme::plain(title, 17.0, theme::TEXT));
+                                    theme::label(ui, theme::plain(title, 17.0, theme::TEXT()));
                                     let mut subtitle = detail.started_label.clone();
                                     if !detail.address.is_empty() {
                                         subtitle.push_str("  ·  ");
                                         subtitle.push_str(&detail.address);
                                     }
-                                    theme::label(ui, theme::plain(&subtitle, 10.5, theme::TEXT_FAINT));
+                                    theme::label(ui, theme::plain(&subtitle, 10.5, theme::TEXT_FAINT()));
                                 });
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let state = if detail.cleanly_closed { "CLOSED" } else { "INCOMPLETE" };
@@ -420,7 +420,7 @@ impl App {
                                         theme::plain(
                                             state,
                                             9.0,
-                                            if detail.cleanly_closed { theme::TEXT_FAINT } else { theme::WARNING },
+                                            if detail.cleanly_closed { theme::TEXT_FAINT() } else { theme::WARNING() },
                                         ),
                                     );
                                 });
@@ -429,15 +429,15 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 for text in [
                                     format!("Mod: {}", detail.mod_name),
-                                    format!("Player: {}", if detail.player.is_empty() { "—" } else { detail.player.as_str() }),
-                                    format!("Initial map: {}", if detail.initial_map.is_empty() { "—" } else { detail.initial_map.as_str() }),
+                                    format!("Player: {}", if detail.player.is_empty() { "-" } else { detail.player.as_str() }),
+                                    format!("Initial map: {}", if detail.initial_map.is_empty() { "-" } else { detail.initial_map.as_str() }),
                                     format!("Time span: {}", chat_log_duration_label(detail.started_unix_ms, detail.ended_unix_ms)),
                                 ] {
                                     egui::Frame::new()
-                                        .fill(theme::CONTROL)
+                                        .fill(theme::CONTROL())
                                         .inner_margin(egui::Margin::symmetric(6, 3))
                                         .show(ui, |ui| {
-                                            theme::label(ui, theme::plain(&text, 9.5, theme::TEXT_DIM));
+                                            theme::label(ui, theme::plain(&text, 9.5, theme::TEXT_DIM()));
                                         });
                                 }
                             });
@@ -453,7 +453,7 @@ impl App {
                                 if !self.chat_log_browser_search.trim().is_empty() {
                                     theme::label(
                                         ui,
-                                        theme::plain("search active", 9.0, theme::ACCENT),
+                                        theme::plain("search active", 9.0, theme::ACCENT()),
                                     );
                                 }
                             });
@@ -482,13 +482,13 @@ impl App {
                                     theme::plain(
                                         &format!("{} / {} entries", visible.len(), detail.entries.len()),
                                         9.5,
-                                        theme::TEXT_FAINT,
+                                        theme::TEXT_FAINT(),
                                     ),
                                 );
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     theme::label(
                                         ui,
-                                        theme::plain(&detail.path.display().to_string(), 8.5, theme::TEXT_FAINT),
+                                        theme::plain(&detail.path.display().to_string(), 8.5, theme::TEXT_FAINT()),
                                     );
                                 });
                             });
@@ -504,7 +504,7 @@ impl App {
                                         ui.add_space(10.0);
                                         theme::label(
                                             ui,
-                                            theme::plain("No transcript entries match the current search/type filters.", 11.0, theme::TEXT_FAINT),
+                                            theme::plain("No transcript entries match the current search/type filters.", 11.0, theme::TEXT_FAINT()),
                                         );
                                     }
                                     for entry in visible {
@@ -513,11 +513,11 @@ impl App {
                                             ui.horizontal(|ui| {
                                                 ui.add_sized(
                                                     [88.0, 18.0],
-                                                    egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT)),
+                                                    egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT())),
                                                 );
                                                 theme::label(
                                                     ui,
-                                                    theme::plain(&entry.text, 10.5, theme::TEXT_DIM),
+                                                    theme::plain(&entry.text, 10.5, theme::TEXT_DIM()),
                                                 );
                                             });
                                             ui.add_space(3.0);
@@ -527,21 +527,21 @@ impl App {
                                         let response = ui.horizontal(|ui| {
                                             ui.add_sized(
                                                 [88.0, 20.0],
-                                                egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT)),
+                                                egui::Label::new(theme::plain(&entry.timestamp, 9.0, theme::TEXT_FAINT())),
                                             );
                                             let badge_color = match entry.kind {
                                                 crate::chat_log::BrowserEntryKind::Team => egui::Color32::from_rgb(0x70, 0xD8, 0x78),
-                                                crate::chat_log::BrowserEntryKind::Located => theme::ACCENT,
-                                                crate::chat_log::BrowserEntryKind::Voice => theme::WARNING,
-                                                crate::chat_log::BrowserEntryKind::Say => theme::TEXT_FAINT,
-                                                crate::chat_log::BrowserEntryKind::Session => theme::TEXT_FAINT,
+                                                crate::chat_log::BrowserEntryKind::Located => theme::ACCENT(),
+                                                crate::chat_log::BrowserEntryKind::Voice => theme::WARNING(),
+                                                crate::chat_log::BrowserEntryKind::Say => theme::TEXT_FAINT(),
+                                                crate::chat_log::BrowserEntryKind::Session => theme::TEXT_FAINT(),
                                             };
                                             ui.add_sized(
                                                 [62.0, 20.0],
                                                 egui::Label::new(theme::plain(entry.kind.label(), 8.5, badge_color)),
                                             );
                                             ui.add(
-                                                egui::Label::new(jka_colored_text(&entry.text, 11.5, theme::TEXT))
+                                                egui::Label::new(jka_colored_text(&entry.text, 11.5, theme::TEXT()))
                                                     .wrap(),
                                             );
                                         });

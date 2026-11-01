@@ -141,9 +141,9 @@ impl App {
                 }
                 ui.add_space(10.0);
                 let (text, color) = if differing == 0 {
-                    ("All at defaults".to_owned(), theme::TEXT_FAINT)
+                    ("All at defaults".to_owned(), theme::TEXT_FAINT())
                 } else {
-                    (format!("{differing} differ from default"), theme::WARNING)
+                    (format!("{differing} differ from default"), theme::WARNING())
                 };
                 theme::glow_label(ui, &text, 12.5, color);
             },
@@ -195,15 +195,23 @@ impl App {
         self.cvar_choice_row(
             ui,
             "Fragment shader mode",
-            "World shaders: 0 general; 1 material specialization (default); 2 specialization plus minimal entries; 3 shared basic/enhanced families; 4 generated minimal vertex/fragment pairs per encountered stage recipe. Modes 3 and 4 target Minimal Unified, Low and Medium, with reported fallbacks for other features. Switches after background compilation; quality settings are preserved.",
+            "World shaders: 0 general; 1 material specialization (default); 2 material + minimal entries; 3 shared families; 4 generated stage recipes; 5 hybrid: compact common stages, generated complex operations, specialized compatibility fallback. Mode changes compile in the background and preserve quality settings.",
             "r_fragmentShaderMode",
-            &[("0", "General"), ("1", "Material"), ("2", "Material + minimal"), ("3", "Shared families"), ("4", "Generated pairs")],
+            &[("0", "General"), ("1", "Material"), ("2", "Material + minimal"), ("3", "Shared families"), ("4", "Generated pairs"), ("5", "Hybrid")],
         );
-        self.cvar_switch_row(
+        self.cvar_choice_row(
             ui,
-            "Skip colour clear",
-            "r_colorClearMode: skips the per-frame world colour clear when every sky on the map draws a sky box or the map has no sky (vanilla/TaystJK behaviour; holes into the void then show the previous frame). Fastsky always clears.",
+            "Shader input (A/B)",
+            "r_shaderInputMode: 0 WGSL; 1 SPIR-V via WGPU after Naga round-trip validation; invalid converted stages use WGSL fallback. Native passthrough disabled after a driver crash. BSP world stages only; other passes remain WGSL. Independent of fragment modes 0–5. Session only.",
+            "r_shaderInputMode",
+            &[("0", "WGSL"), ("1", "SPIR-V (validated)")],
+        );
+        self.cvar_choice_row(
+            ui,
+            "World colour clear",
+            "r_colorClearMode: 0 always clears; 1 skips under authored sky when safe; 2 never clears the main world color attachment, even with fast sky. Mode 2 permits HOM/undefined pixels and may not reproduce old OpenGL framebuffer persistence on every WGPU backend. Depth and offscreen-effect clears are unchanged.",
             "r_colorClearMode",
+            &[("0", "Always"), ("1", "Auto"), ("2", "Never (HOM)")],
         );
         self.cvar_switch_row(
             ui,
@@ -775,7 +783,7 @@ impl App {
             theme::hint(
                 ui,
                 "r_showtris 32 draws the native ocean mesh; render_perf_capture reports ocean GPU pass timings.",
-                theme::TEXT_FAINT,
+                theme::TEXT_FAINT(),
             );
         }
 

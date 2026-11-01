@@ -432,6 +432,7 @@ impl Renderer {
                 };
                 if source.pipeline.class == DrawClass::Transparent { record.draw[3] |= 8; }
                 if source.water { record.draw[3] |= 1 << 8; }
+                if source.force_sight_only { record.draw[3] |= 1 << 9; }
                 if !inline && map.base.material_debug.entries.get(source.material_debug_index as usize)
                     .is_some_and(|entry| entry.name.starts_with("models/")) { record.draw[3] |= 4; }
                 record.draw[3] |= crate::renderer::world_blend_probe_bucket(source.pipeline) << 5;
@@ -730,6 +731,7 @@ impl Renderer {
                 if batch.source.pipeline.class == DrawClass::Transparent { record.draw[3] |= 8; }
                 record.draw[3] |= crate::renderer::world_blend_probe_bucket(batch.source.pipeline) << 5;
                 record.draw[3] |= u32::from(batch.source.water) << 8;
+                record.draw[3] |= u32::from(batch.source.force_sight_only) << 9;
             }
         }
         // Patch / compiled-model LOD may have replaced indexed ranges after
@@ -762,6 +764,9 @@ impl Renderer {
                 Err(e) => rverbose!(1, "[SHADER REMAP] AUTO4 cold collapse unavailable: {e}"),
             }
         }
+        world.has_force_sight_surfaces = world.coarse_batches.iter()
+            .chain(&world.full_batches)
+            .any(|batch| batch.source.force_sight_only);
         world.has_glass_primary = world.coarse_batches.iter().any(|b| b.source.glass_primary);
         world.material_debug = map.base.material_debug.clone();
         let mut sun_textures=map.base.textures.as_ref().clone();

@@ -57,7 +57,7 @@ use bodies::dismemberment::{
 };
 pub use cosmetics::apply_profile_studio_light;
 use cosmetics::{cosmetic_draws_for_mask, global_cosmetic_draw, model_bolt_matrix_timed,
-    saber_hand_bolt_matrix_timed, VehicleSnap};
+    saber_attachment_bolt_name, saber_hand_bolt_matrix_timed, VehicleSnap};
 pub use diagnostics::Ghoul2PerfStats;
 use diagnostics::{record_motion_pose_eval, record_pose_eval};
 #[cfg(test)]
@@ -222,6 +222,10 @@ pub struct PlayerPresenter {
     anim_events: jka_assets::animevents::AnimEvents,
     /// Which `cg_footsteps` stages are on; nothing is traced while all are off.
     footstep_stages: FootstepStages,
+    /// Opt-in CG_Trace for ground footfalls (no changes to movement prediction).
+    footstep_trace: bool,
+    /// Rebuilt once per presentation pass only when cg_footstepTrace is enabled.
+    footstep_solids: Vec<crate::net::SolidEntity>,
     /// This frame's footfalls that found ground (drained by the caller).
     footsteps: Vec<FootstepImpact>,
     /// `Q_irand(0, 99)` for footsteps that only play some of the time.
@@ -289,6 +293,10 @@ pub struct PlayerPresenter {
     saber_team_colors: bool,
     /// TaystJK cg_saberStaffMultiColor (archive, default 0).
     saber_staff_multi_color: bool,
+    /// TaystJK cg_speedTrail default 1; cosmetic only, never affects networking.
+    speed_trail: bool,
+    /// Per-player frame-minus-one/two entity origins; none until consecutive frames.
+    speed_trail_history: HashMap<u16, ([f32; 3], Option<[f32; 3]>, i32)>,
     /// Glow brightness (0..1) of the private-duel shell while the viewer duels.
     duel_shell_gray: Option<f32>,
     /// Cosmetic MD3s bolted to players this frame (drained by the caller).

@@ -16,9 +16,36 @@ pub(in crate::cgame::player_presenter) struct Ghoul2GpuMeshSource {
     pub(in crate::cgame::player_presenter) indices: Arc<Vec<u32>>,
 }
 
+/// Textures for an authored shader `animMap`/`oneShotAnimMap`, decoded once
+/// during model registration. The normal single-image path remains unchanged.
+#[derive(Clone)]
+pub(in crate::cgame::player_presenter) struct ResolvedAnimation {
+    pub(in crate::cgame::player_presenter) fps: f32,
+    pub(in crate::cgame::player_presenter) textures: Vec<Option<Arc<TextureData>>>,
+    pub(in crate::cgame::player_presenter) one_shot: bool,
+}
+
+impl ResolvedAnimation {
+    pub(in crate::cgame::player_presenter) fn texture_at(
+        &self, seconds: f32,
+    ) -> Option<Arc<TextureData>> {
+        let count = self.textures.len();
+        if count == 0 { return None; }
+        self.textures[self.frame_index(seconds)].clone()
+    }
+
+    fn frame_index(&self, seconds: f32) -> usize {
+        let count = self.textures.len();
+        if count == 0 { return 0; }
+        let frame = (seconds.max(0.0) * self.fps).floor() as usize;
+        if self.one_shot { frame.min(count - 1) } else { frame % count }
+    }
+}
+
 #[derive(Clone)]
 pub(in crate::cgame::player_presenter) struct SurfaceOverlay {
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
+    pub(in crate::cgame::player_presenter) animation: Option<ResolvedAnimation>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::cgame::player_presenter) authored_glow: bool,
 }
@@ -29,6 +56,7 @@ pub(in crate::cgame::player_presenter) struct SurfaceOverlay {
 #[derive(Clone)]
 pub(in crate::cgame::player_presenter) struct ResolvedStage {
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
+    pub(in crate::cgame::player_presenter) animation: Option<ResolvedAnimation>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
     /// `rgbGen const` colour (white otherwise) and `alphaGen const` alpha.
     pub(in crate::cgame::player_presenter) rgb: [f32; 3],
@@ -52,6 +80,7 @@ pub(in crate::cgame::player_presenter) struct ResolvedStage {
 /// A surface's resolved material: the primary stage plus the entity-tint layers.
 pub(in crate::cgame::player_presenter) struct ResolvedMaterial {
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
+    pub(in crate::cgame::player_presenter) animation: Option<ResolvedAnimation>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::cgame::player_presenter) entity_tint: bool,
     pub(in crate::cgame::player_presenter) overlay: Option<SurfaceOverlay>,
@@ -79,6 +108,7 @@ pub(in crate::cgame::player_presenter) struct PlayerSurfaceAsset {
     /// TaystJK cg_fpls can be applied without rebuilding the model.
     pub(in crate::cgame::player_presenter) surface_name: String,
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
+    pub(in crate::cgame::player_presenter) animation: Option<ResolvedAnimation>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::cgame::player_presenter) authored_glow: bool,
     /// OpenJK renderer `shader->timeOffset`, in seconds.
@@ -358,5 +388,21 @@ impl SaberModelAsset {
             Some(plan) => plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose)),
             None => Ok(pose),
         }
+    }
+}
+
+#[cfg(test)]
+mod authored_texture_animation_tests {
+    use super::*;
+    #[test]
+    fn looping_and_one_shot_frames_follow_shader_time() {
+        // No image data needed: these are absent-image sentinel frames. Confirm
+        // frame selection using the index for transparent array members.
+        let frames = ResolvedAnimation { fps: 2.0, textures: vec![None; 3], one_shot: false };
+        assert_eq!(frames.frame_index(0.49), 0);
+        assert_eq!(frames.frame_index(0.51), 1);
+        assert_eq!(frames.frame_index(1.51), 0);
+        let frozen = ResolvedAnimation { one_shot: true, ..frames };
+        assert_eq!(frozen.frame_index(9.0), 2);
     }
 }

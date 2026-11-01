@@ -486,6 +486,21 @@ app_cvars! {
         ]
     }
 
+    APP_CG_FOOTSTEPTRACE {
+        runtime: CvarDef::new("cg_footstepTrace", "0", "0|1", "Footstep ground-trace A/B: 0 existing BSP/world-only trace, 1 TaystJK CG_Trace-style solid entity trace (including func_door/func_static). Water probe stays world-only. Live and not archived.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.audio.game.footstep_trace),
+            |app, value| App::cvar_set_cg_footsteptrace(app, APP_CG_FOOTSTEPTRACE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_cg_footsteptrace, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_cg_footsteptrace(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.game.footstep_trace = Self::parse_cvar_bool(name, value)?;
+                self.apply_game_sounds();
+                Ok(())
+            }
+        }]
+    }
+
     APP_CG_GHOUL2MARKS {
         runtime: CvarDef::new("cg_ghoul2Marks", "", "0..64", "Burn marks kept on each player model by blaster/rocket hits (0 disables). Needs GPU Ghoul2 skinning.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_ghoul2marks(app)), |app, value| App::cvar_set_cg_ghoul2marks(app, APP_CG_GHOUL2MARKS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_ghoul2marks, None),
         config: CvarBinding {

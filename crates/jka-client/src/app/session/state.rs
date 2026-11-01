@@ -31,6 +31,7 @@ impl GameSession {
             .set_gore_limit(usize::from(game.g2_marks));
         self.player_presenter
             .set_footstep_level(game.footsteps, footprints != FootprintMode::Off);
+        self.player_presenter.set_footstep_trace(game.footstep_trace);
         self.player_presenter.set_japro_options(japro);
         self.client_game.set_plugin_disable(plugin_disable);
         self.japro_cg = japro;
@@ -164,6 +165,7 @@ impl GameSession {
             water_wake_mode: 1,
             water_wake: super::water_wake::WaterWakeTracker::default(),
             presented_player_state: None,
+            duck_view_height: super::sampling::DuckViewHeight::default(),
             client_game: ClientGameState::new(),
             siege_catalog,
             siege_classes,

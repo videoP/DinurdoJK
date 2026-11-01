@@ -81,6 +81,8 @@ impl Renderer {
     fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>, resident: Option<StudioCachedWorld>, shared: Option<&crate::renderer::WorldGpu>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
         self.dynamic_model_renderer.fixture_lighting = None;
+        self.dynamic_model_renderer.lightning_gpu = None;
+        self.dynamic_model_renderer.lightning_gpu_attempted = false;
         self.promoted_ocean_overrides.clear();
         self.ocean_interaction.clear(&self.queue);
         // A new world must not inherit transient RE_AddLightToScene submissions
@@ -260,6 +262,7 @@ impl Renderer {
             self.picmip,
             if self.bc_compression_supported { self.texture_compression } else { 0 },
             &mutable_images,
+            self.bsp_model_lod_enabled,
             map,
             if reuse.is_some() { self.world.as_ref() } else { shared },
             reuse.unwrap_or(if shared.is_some() { shared_texture_count } else { 0 }),
@@ -521,6 +524,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn unload_map(&mut self) {
+        self.clear_live_rivers();
         self.studio_active_world = None;
         self.studio_cached_worlds.clear();
         // BLAS/TLAS resources refer to the current world's static geometry.
@@ -533,6 +537,8 @@ impl Renderer {
         self.shadow_resources.last_csm_mode = None;
         self.shadow_resources.sky_snapshot = None;
         self.world = None;
+        self.dynamic_model_renderer.lightning_gpu = None;
+        self.dynamic_model_renderer.lightning_gpu_attempted = false;
         self.coastal_atlas = None;
         self.world_flares.load(&[]);
         self.world_flares_sky.load(&[]);

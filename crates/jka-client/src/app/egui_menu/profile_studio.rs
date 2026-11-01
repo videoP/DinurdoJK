@@ -5,13 +5,20 @@ use crate::app::egui_menu::{
     PROFILE_EMOTES, PROFILE_FORCE, PROFILE_MODEL,
 };
 
-const INK: egui::Color32 = egui::Color32::from_rgb(10, 15, 23);
-const PLATE: egui::Color32 = egui::Color32::from_rgb(17, 24, 35);
-const PLATE_LIFT: egui::Color32 = egui::Color32::from_rgb(25, 34, 48);
-const EDGE: egui::Color32 = egui::Color32::from_rgb(48, 66, 86);
-const SKY: egui::Color32 = theme::ACCENT;
-const SKY_SOFT: egui::Color32 = egui::Color32::from_rgb(125, 199, 255);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(142, 162, 183);
+#[allow(non_snake_case)]
+fn INK() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(10, 15, 23), theme::CHROME()) }
+#[allow(non_snake_case)]
+fn PLATE() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(17, 24, 35), theme::SURFACE()) }
+#[allow(non_snake_case)]
+fn PLATE_LIFT() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(25, 34, 48), theme::SURFACE_ALT()) }
+#[allow(non_snake_case)]
+fn EDGE() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(48, 66, 86), theme::LINE()) }
+#[allow(non_snake_case)]
+fn SKY() -> egui::Color32 { theme::ACCENT() }
+#[allow(non_snake_case)]
+fn SKY_SOFT() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(125, 199, 255), theme::ACCENT_HOVER()) }
+#[allow(non_snake_case)]
+fn MUTED() -> egui::Color32 { crate::app::egui_theme::pick(egui::Color32::from_rgb(142, 162, 183), theme::TEXT_FAINT()) }
 const STUDIO_NAV: [(usize, &str); 3] = [
     (PROFILE_MODEL, "LOOK"),
     (PROFILE_FORCE, "FORCE"),
@@ -176,10 +183,10 @@ fn label(ui: &mut egui::Ui, content: impl Into<String>, size: f32, color: egui::
 
 fn cap(ui: &mut egui::Ui, title: &str, note: &str) {
     ui.horizontal(|ui| {
-        label(ui, title, 11.0, SKY_SOFT);
+        label(ui, title, 11.0, SKY_SOFT());
         if !note.is_empty() {
             ui.add_space(5.0);
-            label(ui, note, 10.0, MUTED);
+            label(ui, note, 10.0, MUTED());
         }
     });
     ui.add_space(6.0);
@@ -191,22 +198,22 @@ fn studio_button(ui: &mut egui::Ui, text: &str, selected: bool, primary: bool, w
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 35.0), egui::Sense::click());
     let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered(), 0.16);
     let fill = if primary {
-        SKY
+        SKY()
     } else if selected {
-        PLATE_LIFT
+        PLATE_LIFT()
     } else {
-        INK
+        INK()
     };
-    let fill = fill.lerp_to_gamma(PLATE_LIFT, if primary { hover * 0.17 } else { hover * 0.55 });
-    let outline = if selected || primary { SKY } else { EDGE };
+    let fill = fill.lerp_to_gamma(PLATE_LIFT(), if primary { hover * 0.17 } else { hover * 0.55 });
+    let outline = if selected || primary { SKY() } else { EDGE() };
     let painter = ui.painter();
     painter.rect_filled(rect, egui::CornerRadius::same(5), fill);
     painter.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(1.0, outline), egui::StrokeKind::Inside);
     if selected && !primary {
-        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 1.0, SKY);
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 1.0, SKY());
     }
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, text,
-        egui::FontId::proportional(11.0), if primary { INK } else { theme::TEXT });
+        egui::FontId::proportional(11.0), if primary { INK() } else { theme::TEXT() });
     response.on_hover_text(text).clicked()
 }
 
@@ -243,17 +250,16 @@ impl App {
     }
 
     fn studio_control_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
-        egui::Frame::new().fill(PLATE).corner_radius(egui::CornerRadius::same(6))
-            .stroke(egui::Stroke::new(1.0, EDGE)).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+        egui::Frame::new().fill(PLATE()).corner_radius(egui::CornerRadius::same(6))
+            .stroke(egui::Stroke::new(1.0, EDGE())).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
                 ui.set_width((width - 28.0).max(1.0));
                 ui.set_min_height((height - 28.0).max(1.0));
                 // The tabs and search remain fixed; catalog and the optional
                 // other-player appearance group own bounded scroll regions.
-                let nav_w = (ui.available_width() - 12.0) / STUDIO_NAV.len() as f32;
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (section, title) in STUDIO_NAV {
-                        if studio_button(ui, title, self.profile_selected_section == section, false, nav_w) {
+                        if super::holo::tab(ui, title, 15.0, 38.0, self.profile_selected_section == section).clicked() {
                             self.profile_selected_section = section;
                             if section != PROFILE_MODEL { self.profile_studio_cosmetic_group = 0; }
                             let group = if section == PROFILE_MODEL {
@@ -284,7 +290,7 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
                 let pending = self.profile_has_pending_changes();
-                if studio_button(ui, if pending { "APPLY CHANGES" } else { "APPLIED ✓" },
+                if studio_button(ui, if pending { "APPLY CHANGES" } else { "APPLIED" },
                     pending, pending, (ui.available_width() * 0.6).max(125.0)) && pending {
                     self.apply_profile_changes();
                 }
@@ -297,7 +303,7 @@ impl App {
     fn studio_model_workshop(&mut self, ui: &mut egui::Ui, available_h: f32) {
         cap(ui, "CHARACTERS", "");
         if let Some(error) = self.profile_catalog_error.clone() {
-            theme::banner(ui, &error, theme::WARNING);
+            theme::banner(ui, &error, theme::WARNING());
         }
         let current = self.profile_model_staged.clone()
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
@@ -354,9 +360,9 @@ impl App {
                 })
         });
         if self.ui_catalog.pending.profile {
-            label(ui, "Scanning game and mod asset archives…", 11.0, MUTED);
+            label(ui, "Scanning game and mod asset archives…", 11.0, MUTED());
         } else if models.is_empty() {
-            label(ui, "No characters match this search.", 11.0, MUTED);
+            label(ui, "No characters match this search.", 11.0, MUTED());
         }
         // A single continuously scrollable library (no pagination). egui
         // virtualizes rows so thumbnails below the viewport are not requested.
@@ -426,9 +432,9 @@ impl App {
             ("BLUE", egui::Color32::from_rgb(103, 163, 239))
         } else if crate::app::frontend::profile_is_rgb_skin(&entry.model_name, &entry.skin_name)
             || entry.skin_name.eq_ignore_ascii_case("sp") {
-            ("RGB", SKY_SOFT)
+            ("RGB", SKY_SOFT())
         } else {
-            ("◈", MUTED)
+            ("◈", MUTED())
         }
     }
 
@@ -438,9 +444,9 @@ impl App {
         let h = w * 1.22;
         let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
         let hovered = ui.ctx().animate_bool_with_time(response.id, response.hovered(), 0.12);
-        let color = if selected { SKY } else { EDGE.lerp_to_gamma(SKY, hovered * 0.6) };
+        let color = if selected { SKY() } else { EDGE().lerp_to_gamma(SKY(), hovered * 0.6) };
         let p = ui.painter();
-        p.rect_filled(rect, 4.0, if selected { PLATE_LIFT } else { INK });
+        p.rect_filled(rect, 4.0, if selected { PLATE_LIFT() } else { INK() });
         p.rect_stroke(rect, 4.0, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color), egui::StrokeKind::Inside);
         let image = egui::Rect::from_min_max(rect.min + egui::vec2(4.0, 4.0),
             egui::pos2(rect.max.x - 4.0, rect.max.y - 24.0));
@@ -455,13 +461,13 @@ impl App {
                 egui::FontId::proportional(17.0), color);
         }
         ui.painter().text(egui::pos2(rect.center().x, rect.bottom() - 12.0), egui::Align2::CENTER_CENTER,
-            &entry.model_name, egui::FontId::proportional(10.5), if selected { theme::TEXT } else { MUTED });
+            &entry.model_name, egui::FontId::proportional(10.5), if selected { theme::TEXT() } else { MUTED() });
         if variant_count > 1 {
             let badge = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-24.0, 3.0), egui::vec2(20.0, 17.0));
-            ui.painter().rect_filled(badge, 3.0, PLATE_LIFT);
-            ui.painter().rect_stroke(badge, 3.0, egui::Stroke::new(1.0, SKY), egui::StrokeKind::Inside);
+            ui.painter().rect_filled(badge, 3.0, PLATE_LIFT());
+            ui.painter().rect_stroke(badge, 3.0, egui::Stroke::new(1.0, SKY()), egui::StrokeKind::Inside);
             ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, variant_count.to_string(),
-                egui::FontId::proportional(10.0), theme::TEXT);
+                egui::FontId::proportional(10.0), theme::TEXT());
         }
         response.context_menu(|ui| {
             studio_model_source_popup(ui, &self.base, self.game.as_deref(), self.video.allow_asset_overrides, entry);
@@ -495,7 +501,7 @@ impl App {
                 let cell_width = cell_height * 0.765;
                 let popup_w = cols as f32 * (cell_width + 5.0) + 12.0;
                 ui.set_min_width(popup_w.max(215.0));
-                label(ui, entry.model_name.as_str(), 13.0, theme::TEXT);
+                label(ui, entry.model_name.as_str(), 13.0, theme::TEXT());
                 ui.add_space(5.0);
                 egui::Grid::new(("studio_skin_variants", &entry.model_name))
                     .num_columns(cols).spacing(egui::vec2(5.0, 7.0)).show(ui, |ui| {
@@ -506,7 +512,7 @@ impl App {
                                 self.profile_model_staged.as_deref()
                                     .unwrap_or(&self.solo_client_info.model_cvar()));
                             ui.painter().rect_stroke(tile, 3.0, egui::Stroke::new(1.0,
-                                if chosen { SKY } else { EDGE }), egui::StrokeKind::Inside);
+                                if chosen { SKY() } else { EDGE() }), egui::StrokeKind::Inside);
                             if let Some(tex) = self.profile_model_icon_texture(skin) {
                                 let image = egui::Rect::from_min_max(tile.min + egui::vec2(2.0,2.0),
                                     egui::pos2(tile.right()-2.0, (tile.bottom()-20.0).max(tile.top()+3.0)));
@@ -520,7 +526,7 @@ impl App {
                             }
                             ui.painter().text(egui::pos2(tile.center().x, tile.bottom()-10.0),
                                 egui::Align2::CENTER_CENTER, &skin.skin_name,
-                                egui::FontId::proportional(if cell_width < 40.0 { 7.0 } else { 9.0 }), theme::TEXT);
+                                egui::FontId::proportional(if cell_width < 40.0 { 7.0 } else { 9.0 }), theme::TEXT());
                             if click.clicked() { pick = Some(skin.value.clone()); }
                             click.context_menu(|ui| {
                                 studio_model_source_popup(ui, &self.base, self.game.as_deref(), self.video.allow_asset_overrides, skin);
@@ -561,7 +567,7 @@ impl App {
         let mut changed = false;
         for (i, title) in ["HEAD", "TORSO", "LEGS"].into_iter().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(title).size(10.0).color(MUTED));
+                ui.label(egui::RichText::new(title).size(10.0).color(MUTED()));
                 let dropdown = egui::ComboBox::from_id_salt(("studio_multipart", i))
                     .selected_text(&selected[i])
                     .width((ui.available_width()-75.0).max(110.0))
@@ -617,7 +623,7 @@ impl App {
         if mode != 0 {
             let selector = |ui: &mut egui::Ui, id: &str, title: &str, picked: &mut String| {
                 ui.horizontal(|ui| {
-                    label(ui, title, 11.0, MUTED);
+                    label(ui, title, 11.0, MUTED());
                     let response = egui::ComboBox::from_id_salt(id)
                         .selected_text(picked.as_str()).width(190.0).show_ui(ui, |ui| {
                             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -690,7 +696,7 @@ impl App {
         let mut rgb = active.map(|v| v as f32 / 255.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 7.0;
-            label(ui, "MODEL COLOR", 10.0, MUTED);
+            label(ui, "MODEL COLOR", 10.0, MUTED());
             let picker = ui.color_edit_button_rgb(&mut rgb)
                 .on_hover_text("Model RGB tint · middle-click for original white");
             let chosen = if picker.clicked_by(egui::PointerButton::Middle) {
@@ -723,7 +729,7 @@ impl App {
              self.video.jiggle_breast_size,
              "Peak chest mass in JKA units; negative reduces. Double-click or middle-click to reset.")
         };
-        let reset_label = studio_deformation_reset_label(ui, egui::RichText::new(title).size(10.0).color(SKY_SOFT));
+        let reset_label = studio_deformation_reset_label(ui, egui::RichText::new(title).size(10.0).color(SKY_SOFT()));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             let mut size = current;
@@ -734,7 +740,7 @@ impl App {
             if reset_label.clicked() || studio_deformation_slider_reset(&response) {
                 size = 0.0;
             }
-            label(ui, format!("{size:+.1} u"), 10.0, theme::TEXT);
+            label(ui, format!("{size:+.1} u"), 10.0, theme::TEXT());
             if size != current {
                 if let Err(error) = self.set_console_cvar(cvar, &size.to_string()) {
                     self.console_status = error;
@@ -766,7 +772,7 @@ impl App {
             }
         }
         if !available {
-            label(ui, "Anny shaping needs a mapped humanoid skeleton.", 10.0, MUTED);
+            label(ui, "Anny shaping needs a mapped humanoid skeleton.", 10.0, MUTED());
             ui.ctx().data_mut(|d| d.insert_temp(body_editor_id(), editor));
             return;
         }
@@ -843,7 +849,7 @@ impl App {
             if show_global && (!searching || ["african", "asian", "caucasian", "blend", "ancestry"]
                 .iter().any(|name| name.contains(needle.as_str()))) {
                 cap(ui, "ANNY APPEARANCE BLEND", "2 controls");
-                label(ui, "Artistic morph presets; not a measure of ancestry or identity.", 10.0, MUTED);
+                label(ui, "Artistic morph presets; not a measure of ancestry or identity.", 10.0, MUTED());
                 Self::studio_anny_ancestry_slider(ui, &mut details, 0);
                 Self::studio_anny_ancestry_slider(ui, &mut details, 1);
             }
@@ -1049,7 +1055,7 @@ impl App {
             entry.name.eq_ignore_ascii_case(&self.network.saber1)
                 && Self::profile_saber_is_staff(entry));
         ui.set_min_width(216.0);
-        label(ui, if hand == 0 { "RIGHT HAND" } else { "LEFT HAND" }, 10.0, SKY_SOFT);
+        label(ui, if hand == 0 { "RIGHT HAND" } else { "LEFT HAND" }, 10.0, SKY_SOFT());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let cvar = if hand == 0 { "saber1" } else { "saber2" };
@@ -1068,7 +1074,7 @@ impl App {
             let combo = egui::ComboBox::from_id_salt(("studio_saber_hilt", hand))
                 .selected_text(jka_colored_text(
                     if hand == 1 && !dual { "None" } else { &entry_label },
-                    12.0, theme::TEXT))
+                    12.0, theme::TEXT()))
                 .width(141.0).show_ui(ui, |ui| {
                     if hand == 1 {
                         ui.selectable_value(&mut selected, "none".to_owned(), "None");
@@ -1076,7 +1082,7 @@ impl App {
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for saber in &available {
                             ui.selectable_value(&mut selected, saber.name.clone(),
-                                jka_colored_text(Self::profile_saber_label(saber), 12.0, theme::TEXT));
+                                jka_colored_text(Self::profile_saber_label(saber), 12.0, theme::TEXT()));
                         }
                     });
                 }).response;
@@ -1216,13 +1222,13 @@ impl App {
         }
         let p = ui.painter().clone();
         let frame = rect.shrink(5.0);
-        p.rect_stroke(frame, 5.0, egui::Stroke::new(1.0, EDGE), egui::StrokeKind::Inside);
+        p.rect_stroke(frame, 5.0, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
         let display = self.profile_model_staged.clone()
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
         let model_name = display.split('/').next().unwrap_or(&display);
         p.text(frame.left_bottom() + egui::vec2(18.0, -18.0),
             egui::Align2::LEFT_BOTTOM, model_name.to_ascii_uppercase(),
-            egui::FontId::proportional(19.0), theme::TEXT);
+            egui::FontId::proportional(19.0), theme::TEXT());
 
         // Keep the animated stage interactive; character editors belong to
         // their dedicated tabs and never cover the emote preview.
@@ -1276,7 +1282,7 @@ impl App {
             let hint = if !editor.group.is_empty() { format!("Editing: {} · click empty space for Global",editor.group) }
                 else { "Click a body part to edit · empty space = Global".to_owned() };
             p.text(frame.left_bottom()+egui::vec2(18.0,-43.0),egui::Align2::LEFT_BOTTOM,
-                hint,egui::FontId::proportional(11.0),SKY_SOFT);
+                hint,egui::FontId::proportional(11.0),SKY_SOFT());
         } else { self.profile_body_highlight = None; }
 
         // Name editing lives in the stage header, not a separate navigation tab.
@@ -1284,7 +1290,7 @@ impl App {
             egui::vec2(235.0, 58.0));
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio_stage_name")
             .max_rect(name_area), |ui| {
-            label(ui, "PLAYER NAME", 10.0, MUTED);
+            label(ui, "PLAYER NAME", 10.0, MUTED());
             ui.add_sized([215.0, 27.0], egui::TextEdit::singleline(&mut self.profile_name_input)
                 .hint_text("Player name"));
         });
@@ -1295,9 +1301,9 @@ impl App {
             frame.left_top() + egui::vec2(17.0, 77.0), egui::vec2(204.0, 36.0));
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio_stage_tint")
             .max_rect(tint_area), |ui| {
-            egui::Frame::new().fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 235))
+            egui::Frame::new().fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 235), theme::PANEL_FILL()))
                 .corner_radius(egui::CornerRadius::same(5))
-                .stroke(egui::Stroke::new(1.0, EDGE))
+                .stroke(egui::Stroke::new(1.0, EDGE()))
                 .inner_margin(egui::Margin::same(7))
                 .show(ui, |ui| self.studio_character_tint(ui));
         });
@@ -1336,12 +1342,12 @@ impl App {
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt("studio_saber_attachment_debug").max_rect(panel), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(8, 16, 24, 240))
-                    .stroke(egui::Stroke::new(1.0, SKY))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(8, 16, 24, 240), theme::PANEL_FILL()))
+                    .stroke(egui::Stroke::new(1.0, SKY()))
                     .inner_margin(egui::Margin::same(9))
                     .show(ui, |ui| {
                         ui.set_width((panel.width() - 18.0).max(1.0));
-                        label(ui, "SABER BOLT -> HILT -> BLADE (WORLD SPACE)", 11.0, SKY_SOFT);
+                        label(ui, "SABER BOLT -> HILT -> BLADE (WORLD SPACE)", 11.0, SKY_SOFT());
                         egui::ScrollArea::both().max_height(175.0).show(ui, |ui| {
                             ui.monospace(if report.is_empty() {
                                 "Waiting for the next preview frame…"
@@ -1366,14 +1372,19 @@ impl App {
                 egui::vec2(123.0, 28.0));
             if let Some(anchor) = self.studio_project_anchor(rect, joint) {
                 p.line_segment([btn.right_center(), anchor],
-                    egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
-                p.circle_filled(anchor, 3.0, SKY);
+                    egui::Stroke::new(1.1, SKY().linear_multiply(0.8)));
+                p.circle_filled(anchor, 3.0, SKY());
             }
             let button = ui.put(btn, egui::Button::new(
-                egui::RichText::new(format!("{title}  ▾")).size(10.0))
-                .fill(egui::Color32::from_rgba_premultiplied(15, 22, 32, 235))
-                .stroke(egui::Stroke::new(1.0, EDGE)))
+                egui::RichText::new(format!("{title}    ")).size(10.0))
+                .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(15, 22, 32, 235), theme::PANEL_FILL()))
+                .stroke(egui::Stroke::new(1.0, EDGE())))
                 .on_hover_text("Middle-click to remove");
+            // Drawn chevron: the UI font has no down-pointing triangle glyph.
+            let c = egui::pos2(button.rect.right() - 12.0, button.rect.center().y);
+            p.add(egui::Shape::convex_polygon(
+                vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(3.5, -1.5), c + egui::vec2(0.0, 2.5)],
+                MUTED(), egui::Stroke::NONE));
             if button.clicked_by(egui::PointerButton::Middle) {
                 self.focus_profile_studio_camera(match group {
                     1 => "cosmetic:head", 2 => "cosmetic:face", _ => "cosmetic:back",
@@ -1407,17 +1418,17 @@ impl App {
                 if !selected { continue; }
                 if let Some(anchor) = self.studio_project_anchor(rect, joint) {
                     let endpoint = egui::pos2(shape_panel.left(), shape_panel.top() + 47.0 + row as f32 * 39.0);
-                    p.line_segment([anchor, endpoint], egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
-                    p.circle_filled(anchor, 3.0, SKY);
+                    p.line_segment([anchor, endpoint], egui::Stroke::new(1.1, SKY().linear_multiply(0.8)));
+                    p.circle_filled(anchor, 3.0, SKY());
                 }
             }
             let current = display.clone();
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt("studio_anny_stage_panel").max_rect(shape_panel), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245), theme::PANEL_FILL()))
                     .corner_radius(egui::CornerRadius::same(5))
-                    .stroke(egui::Stroke::new(1.0, EDGE))
+                    .stroke(egui::Stroke::new(1.0, EDGE()))
                     .inner_margin(egui::Margin::same(9))
                     .show(ui, |ui| {
                         ui.set_width((shape_panel.width() - 18.0).max(1.0));
@@ -1434,14 +1445,14 @@ impl App {
                     rect.bottom() - 111.0), egui::vec2(227.0, 70.0));
             if let Some(anchor) = self.studio_project_anchor(rect, joint) {
                 let start = egui::pos2(panel.center().x, panel.top());
-                p.line_segment([start, anchor], egui::Stroke::new(1.1, SKY.linear_multiply(0.8)));
-                p.circle_filled(anchor, 3.0, SKY);
+                p.line_segment([start, anchor], egui::Stroke::new(1.1, SKY().linear_multiply(0.8)));
+                p.circle_filled(anchor, 3.0, SKY());
             }
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt(("studio_stage_saber", hand)).max_rect(panel), |ui| {
-                egui::Frame::new().fill(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245))
+                egui::Frame::new().fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245), theme::PANEL_FILL()))
                     .corner_radius(egui::CornerRadius::same(5))
-                    .stroke(egui::Stroke::new(1.0, EDGE))
+                    .stroke(egui::Stroke::new(1.0, EDGE()))
                     .inner_margin(egui::Margin::same(7))
                     .show(ui, |ui| self.studio_saber_editor(ui, hand));
             });
@@ -1569,7 +1580,7 @@ mod profile_selector_tests {
 
     #[test]
     fn saber_colored_label_hides_caret_tokens_but_preserves_spans() {
-        let job = jka_colored_text("^0(^8HALLOWEEN^0) ^7Knife", 12.0, theme::TEXT);
+        let job = jka_colored_text("^0(^8HALLOWEEN^0) ^7Knife", 12.0, theme::TEXT());
         assert_eq!(job.text, "(HALLOWEEN) Knife");
         assert!(job.sections.len() >= 3);
     }

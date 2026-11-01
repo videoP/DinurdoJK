@@ -1,6 +1,6 @@
 //! Hud scores.
 use crate::ui::{
-    duel_icon_atlas_offset, enemy_icon_atlas_offset, fixed_charset_text, player_icon_atlas_cell, rect,
+    duel_icon_atlas_offset, fixed_charset_text, player_icon_atlas_cell, rect,
     shared_player_icon_count, text, visible_jka_chars, ProportionalFont, UiMiniScores, UiSnapshot,
     UiVertex,
 };
@@ -71,7 +71,8 @@ fn enemy_info_extent(ui: &UiSnapshot) -> f32 {
 }
 
 /// CG_DrawEnemyInfo, drawn below the upper-right FPS/timer rows and before
-/// CG_DrawMiniScoreboard. Uses the same lazy player icon atlas as Duel HUD.
+/// CG_DrawMiniScoreboard. Its model-icon shader is drawn separately at native
+/// resolution by the renderer; this batch contains just the panel text/bar.
 pub(in crate::ui) fn build_enemy_info(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let Some(enemy) = ui.enemy_info.as_ref() else { return; };
     let sy = h as f32 / 480.0;
@@ -80,17 +81,12 @@ pub(in crate::ui) fn build_enemy_info(out: &mut Vec<UiVertex>, ui: &UiSnapshot, 
     let rows = (ui.video.draw_fps != 0) as usize + ui.game_timer.is_some() as usize;
     let mut y = (12.0 + rows as f32 * 22.0 + 5.0) * sy;
     let icon_size = 40.0 * sy;
-    let icon_x = w as f32 - (40.0 + 5.0) * sx;
-    let absolute_cell = u16::try_from(enemy_icon_atlas_offset(ui)).ok();
-    player_icon_atlas_cell(out, shared_player_icon_count(ui), absolute_cell,
-        icon_x, y, 40.0 * sx, icon_size, w, h);
     y += icon_size;
     let paint_right = |out: &mut Vec<UiVertex>, label: &str, ypos: f32| {
         let glyph_w = 5.0 * sy;
         let x = w as f32 - 5.0 * sx - visible_jka_chars(label) as f32 * glyph_w;
         fixed_charset_text(out, label, x, ypos, glyph_w, 9.0 * sy, glyph_w, [1.0; 4], false, w, h);
-    };
-    if let Some(name) = &enemy.name {
+    };    if let Some(name) = &enemy.name {
         paint_right(out, name, y);
         y += 15.0 * sy;
         paint_right(out, &enemy.title, y);

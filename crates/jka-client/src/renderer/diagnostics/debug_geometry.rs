@@ -1,7 +1,7 @@
 //! Diagnostics debug geometry.
 use crate::renderer::{
     camera_depth_compare, pipeline_hash, scene, Arc, FxBlend, GpuVertex, PipelineJobKey,
-    PipelineJobManager, Pod, UiVertex, Vec3, Zeroable, DEPTH_FORMAT, UI_VERTEX_ATTRIBUTES,
+    PipelineJobManager, Pod, UiVertex, Vec3, Zeroable, depth_format, UI_VERTEX_ATTRIBUTES,
     VERTEX_ATTRIBUTES,
 };
 use wgpu::util::DeviceExt;
@@ -446,7 +446,7 @@ pub(in crate::renderer) fn create_debug_volume_pipeline(
         },
         // The shader pulls clip z toward the camera; wgpu forbids depth bias on lines.
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),
@@ -504,7 +504,7 @@ pub(in crate::renderer) fn create_sun_ray_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(if ghost {
                 wgpu::CompareFunction::Always
@@ -563,7 +563,7 @@ pub(in crate::renderer) fn create_surface_inspector_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(camera_depth_compare()),
             stencil: wgpu::StencilState::default(),

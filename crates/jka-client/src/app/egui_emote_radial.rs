@@ -464,8 +464,8 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_unmultiplied(16, 23, 33, 238))
-                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(16, 23, 33, 238), egui::Color32::from_rgba_unmultiplied(26, 24, 20, 238)))
+                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG()))
                     .corner_radius(egui::CornerRadius::same(9))
                     .inner_margin(10.0)
                     .show(ui, |ui| {
@@ -745,19 +745,19 @@ impl App {
                     let end = angle + step * 0.5 - visual_gap;
                     let highlighted = selected_ring == Some(i) && choice.enabled();
                     let fill = if highlighted {
-                        egui::Color32::from_rgba_unmultiplied(38, 94, 151, 242)
+                        crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(38, 94, 151, 242), egui::Color32::from_rgba_unmultiplied(70, 102, 68, 242))
                     } else if choice.enabled() {
-                        egui::Color32::from_rgba_unmultiplied(17, 25, 37, 235)
+                        crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(17, 25, 37, 235), egui::Color32::from_rgba_unmultiplied(27, 24, 21, 235))
                     } else {
-                        egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                        crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219), egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219))
                     };
                     paint_annular_sector(painter, center, inner, ring_outer, start, end, fill);
                     paint_arc(painter, center, ring_outer, start, end,
-                        egui::Stroke::new(1.5, if highlighted { theme::ACCENT } else { theme::LINE_STRONG }));
-                    paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE));
+                        egui::Stroke::new(1.5, if highlighted { theme::ACCENT() } else { theme::LINE_STRONG() }));
+                    paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE()));
                     let color = if highlighted { egui::Color32::WHITE }
-                        else if choice.enabled() { theme::TEXT }
-                        else { theme::TEXT_DISABLED };
+                        else if choice.enabled() { theme::TEXT() }
+                        else { theme::TEXT_DISABLED() };
                     let max_length = width - 18.0;
                     let size = emote_font_size(painter, &choice.label, max_length);
                     paint_radial_label(painter, center, angle, label_radius, &choice.label, size, color);
@@ -778,29 +778,29 @@ impl App {
             let highlighted = selected_inner == Some(i) && choice.enabled();
             let dimmed = chosen_category.is_some();
             let fill = if highlighted {
-                egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240), egui::Color32::from_rgba_unmultiplied(70, 102, 68, 240))
             } else if dimmed {
-                egui::Color32::from_rgba_unmultiplied(13, 20, 28, 195)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(13, 20, 28, 195), egui::Color32::from_rgba_unmultiplied(20, 18, 15, 195))
             } else if !choice.enabled() {
-                egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219), egui::Color32::from_rgba_unmultiplied(36, 33, 28, 219))
             } else {
-                egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234), egui::Color32::from_rgba_unmultiplied(27, 24, 21, 234))
             };
             paint_annular_sector(painter, center, ring_inner, ring_outer, start, end, fill);
             paint_arc(painter, center, ring_outer, start, end,
-                egui::Stroke::new(1.3, if highlighted { theme::ACCENT } else { theme::LINE }));
+                egui::Stroke::new(1.3, if highlighted { theme::ACCENT() } else { theme::LINE() }));
             let fg = if highlighted { egui::Color32::WHITE }
-                else if dimmed || !choice.enabled() { theme::TEXT_DISABLED }
-                else { theme::TEXT };
+                else if dimmed || !choice.enabled() { theme::TEXT_DISABLED() }
+                else { theme::TEXT() };
             let label_radius = (ring_inner + ring_outer) * 0.5;
             let size = emote_font_size(painter, &choice.label, (ring_outer - ring_inner - 12.0).max(12.0));
             paint_radial_label(painter, center, angle, label_radius, &choice.label, size, fg);
         }
 
-        painter.circle_filled(center, ring_inner - 3.0, theme::CHROME);
-        painter.circle_stroke(center, ring_inner - 2.0, egui::Stroke::new(1.0, theme::LINE_STRONG));
+        painter.circle_filled(center, ring_inner - 3.0, theme::CHROME());
+        painter.circle_stroke(center, ring_inner - 2.0, egui::Stroke::new(1.0, theme::LINE_STRONG()));
         painter.text(center, egui::Align2::CENTER_CENTER, "EMOTE",
-            egui::FontId::proportional(if outer > 300.0 { 15.0 } else { 10.0 }), theme::TEXT);
+            egui::FontId::proportional(if outer > 300.0 { 15.0 } else { 10.0 }), theme::TEXT());
 
         let heading = match chosen_category {
             Some(EmoteCategory::Library) => "LIBRARY / CATEGORIES".to_owned(),
@@ -814,7 +814,7 @@ impl App {
             _ => String::new(),
         };
         painter.text(center - egui::vec2(0.0, outer + 18.0), egui::Align2::CENTER_CENTER,
-            heading, egui::FontId::proportional(12.0), theme::TEXT);
+            heading, egui::FontId::proportional(12.0), theme::TEXT());
 
         // Full selected command below the rings assists reading tiny slices.
         let footer = if let (Some(_category), Some(items), Some(index)) =
@@ -831,11 +831,11 @@ impl App {
             "LEFT CLICK CATEGORY".to_owned()
         };
         painter.text(center + egui::vec2(0.0, outer + 17.0), egui::Align2::CENTER_CENTER,
-            footer, egui::FontId::proportional(12.0), theme::TEXT);
+            footer, egui::FontId::proportional(12.0), theme::TEXT());
         painter.text(center + egui::vec2(0.0, outer + 33.0), egui::Align2::CENTER_CENTER,
             if chosen_category.is_some() { "LEFT CLICK SELECT  ·  RIGHT CLICK BACK  ·  TAB PIN + SEARCH  ·  RELEASE CANCELS" }
             else { "LEFT CLICK OPEN  ·  TAB PIN + SEARCH  ·  RELEASE CANCELS" },
-            egui::FontId::proportional(9.0), theme::TEXT_DIM);
+            egui::FontId::proportional(9.0), theme::TEXT_DIM());
     }
 }
 

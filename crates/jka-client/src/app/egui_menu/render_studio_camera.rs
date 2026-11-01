@@ -201,7 +201,7 @@ impl App {
                                 });
                                 if changed {orbit_edit=Some((edit_key.time,orbit));orbit.apply(&mut editor_binding,frame,[0.;3]);}
                                 let offset_before=editor_binding.offset;
-                                egui::CollapsingHeader::new(egui::RichText::new("Advanced XYZ offset (this key)").size(11.5).color(theme::TEXT_DIM))
+                                egui::CollapsingHeader::new(egui::RichText::new("Advanced XYZ offset (this key)").size(11.5).color(theme::TEXT_DIM()))
                                     .id_salt("xyz_offset").show(ui,|ui| {
                                     sui::prop_vec3(ui,"Offset",&mut editor_binding.offset,0.25,["X","Y","Z"],true);
                                     if sui::button_row(ui,&[(None,"Zero offset",ButtonKind::Ghost,true)]).is_some() {editor_binding.offset=[0.;3];}
@@ -228,7 +228,7 @@ impl App {
                             }
                         });
                         if let Some(message)=self.render_studio.camera_rig_runtime.messages[i].as_ref() {
-                            sui::callout(ui,message,theme::WARNING);
+                            sui::callout(ui,message,theme::WARNING());
                         }
                     });
                 }

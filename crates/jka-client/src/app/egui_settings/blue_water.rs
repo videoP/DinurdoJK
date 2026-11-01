@@ -183,7 +183,7 @@ impl App {
                 });
                 let status=self.prepared_map_cache.as_ref().and_then(|c|c.map.coastal_bathymetry.as_ref())
                     .map_or("Load a BSP map with water promotion enabled to prepare its shores.",|j|j.upstream_shore.status());
-                theme::banner(ui,status,theme::TEXT_DIM);
+                theme::banner(ui,status,theme::TEXT_DIM());
             }
         }
         theme::section(ui, "REFLECTIONS & OPTICS", "Screen-space reflections, caustics, refraction and underwater effects. Each change applies live.");
@@ -286,6 +286,6 @@ impl App {
             self.commit_ocean_settings();
         }
 
-        theme::banner(ui, "Use render_perf_capture for ocean GPU pass timings. r_showtris 32 draws this backend's actual mesh. Sky/cloud backends live in Clouds.", theme::TEXT_DIM);
+        theme::banner(ui, "Use render_perf_capture for ocean GPU pass timings. r_showtris 32 draws this backend's actual mesh. Sky/cloud backends live in Clouds.", theme::TEXT_DIM());
     }
 }

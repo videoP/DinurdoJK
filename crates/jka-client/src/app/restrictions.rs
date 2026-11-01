@@ -9,6 +9,11 @@ pub(in crate::app) const FLIPKICK: i32 = 1 << 7; // 128
 pub(in crate::app) const STRAFE_TRAILS: i32 = 1 << 8; // 256
 pub(in crate::app) const DO: i32 = 1 << 9; // 512
 pub(in crate::app) const THIRD_PERSON_ANGLE: i32 = 1 << 10; // 1024
+pub(in crate::app) const RESTRICT_SPECHUD_FREE: i32 = 1 << 11; // 2048
+pub(in crate::app) const RESTRICT_SPECHUD_RED: i32 = 1 << 12; // 4096
+pub(in crate::app) const RESTRICT_SPECHUD_BLUE: i32 = 1 << 13; // 8192
+const RESTRICT_SPECHUD_ALL: i32 =
+    RESTRICT_SPECHUD_FREE | RESTRICT_SPECHUD_RED | RESTRICT_SPECHUD_BLUE;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::app) struct ServerRestrictions(i32);
@@ -23,6 +28,20 @@ impl ServerRestrictions {
 
     pub(in crate::app) fn contains(self, bit: i32) -> bool {
         self.0 & bit != 0
+    }
+
+    /// jaPRO restricts: do not submit through-wall spectator silhouettes for
+    /// teams whose visibility is forbidden by the server. If team information
+    /// is still unavailable, hide the silhouette when any specHud restriction
+    /// is active rather than accidentally revealing a restricted player.
+    pub(in crate::app) fn allows_spec_hud_team(self, team: Option<i32>) -> bool {
+        match team {
+            Some(0) => !self.contains(RESTRICT_SPECHUD_FREE),
+            Some(1) => !self.contains(RESTRICT_SPECHUD_RED),
+            Some(2) => !self.contains(RESTRICT_SPECHUD_BLUE),
+            Some(_) => true,
+            None => self.0 & RESTRICT_SPECHUD_ALL == 0,
+        }
     }
 
     /// TaystJK cg_view.c: only a live jaPRO race player's moving, non-BOTCPM
@@ -59,6 +78,37 @@ mod tests {
         assert!(!flags.contains(FLIPKICK));
         assert_eq!(ServerRestrictions::from_server_info(br"\restricts\0"), ServerRestrictions::default());
         assert_eq!(ServerRestrictions::from_server_info(br"\restricts\invalid"), ServerRestrictions::default());
+    }
+
+    #[test]
+    fn spec_hud_team_restrictions_are_independent_and_combinable() {
+        assert_eq!(RESTRICT_SPECHUD_FREE, 2048);
+        assert_eq!(RESTRICT_SPECHUD_RED, 4096);
+        assert_eq!(RESTRICT_SPECHUD_BLUE, 8192);
+        let unrestricted = ServerRestrictions::default();
+        for team in [None, Some(0), Some(1), Some(2), Some(3)] {
+            assert!(unrestricted.allows_spec_hud_team(team));
+        }
+        let all = ServerRestrictions::from_server_info(br"\restricts\14336");
+        assert!(!all.allows_spec_hud_team(Some(0)));
+        assert!(!all.allows_spec_hud_team(Some(1)));
+        assert!(!all.allows_spec_hud_team(Some(2)));
+        assert!(!all.allows_spec_hud_team(None));
+        assert!(all.allows_spec_hud_team(Some(3)));
+
+        for (bit, hidden_team) in [
+            (RESTRICT_SPECHUD_FREE, 0),
+            (RESTRICT_SPECHUD_RED, 1),
+            (RESTRICT_SPECHUD_BLUE, 2),
+        ] {
+            let flags = ServerRestrictions(bit);
+            for team in 0..=2 {
+                assert_eq!(flags.allows_spec_hud_team(Some(team)), team != hidden_team);
+            }
+            assert!(!flags.allows_spec_hud_team(None));
+        }
+        // Other restriction bits do not affect spectator HUD team visibility.
+        assert!(ServerRestrictions(THIRD_PERSON_ANGLE).allows_spec_hud_team(None));
     }
 
     #[test]

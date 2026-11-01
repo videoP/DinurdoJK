@@ -134,6 +134,7 @@ pub(in crate::renderer) fn build_world(
     picmip: u32,
     texture_compression: u8,
     mutable_images: &[usize],
+    prepare_bsp_model_lod: bool,
     map: PreparedMap,
     reuse_world: Option<&WorldGpu>,
     requested_base_texture_count: usize,
@@ -356,7 +357,7 @@ pub(in crate::renderer) fn build_world(
     let snow_shell = create_snow_shell_gpu(device, &vertices, &coarse_sources);
     let snow_shell_ms = snow_started.elapsed().as_secs_f64() * 1000.0;
     let prelude_started = Instant::now();
-    let inspector_vertices = vertices
+    let mut inspector_vertices = vertices
         .iter()
         .map(|vertex| InspectorVertex {
             position: vertex.position,
@@ -726,6 +727,20 @@ pub(in crate::renderer) fn build_world(
         }
         inline_gpu_starts.push(gpu_start);
     }
+    // Inline BSP surfaces occupy their own decoded vertex array, with batch
+    // source ranges offset by the static world count below. The inspector
+    // needs the same concatenation, or /trace cannot hit a func_static patch
+    // such as costadelsol's nonsolid waterfall and falls through to terrain.
+    // Keep compiled/local vertices; inspect_surface applies mover poses only
+    // when a trace is requested, without adding per-frame work.
+    debug_assert_eq!(inspector_vertices.len(), vertices.len());
+    inspector_vertices.extend(inline_vertices.iter().map(|vertex| InspectorVertex {
+        position: vertex.position,
+        normal: vertex.normal,
+        uv: vertex.uv,
+        lightmap_uv: vertex.lightmap_uv,
+        color: vertex.color,
+    }));
     let mut world_vertex_usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
         | wgpu::BufferUsages::STORAGE;
     if ray_tracing_supported {
@@ -763,7 +778,7 @@ pub(in crate::renderer) fn build_world(
         &mut indexed_builder,
         &coarse_sources, &coarse_index_ranges,
         &full_sources, &full_index_ranges,
-        &bsp_compiled_model_surfaces, &patch_draws,
+        &bsp_compiled_model_surfaces, &patch_draws, prepare_bsp_model_lod,
     );
     let auto4_source_indices = Arc::new(std::mem::take(&mut indexed_builder.indices));
     patch_lod.finish(Arc::clone(&auto4_source_indices));
@@ -1798,6 +1813,7 @@ pub(in crate::renderer) fn build_world(
             // Bit 8 identifies authored water. Keep independent from material
             // name, so an ocean with textures/ or models/ qpaths still works.
             record.draw[3] |= u32::from(batch.source.water) << 8;
+            record.draw[3] |= u32::from(batch.source.force_sight_only) << 9;
         }
     }
     let cull_started = Instant::now();
@@ -2065,8 +2081,7 @@ pub(in crate::renderer) fn build_world(
         } else {
             BTreeMap::new()
         };
-        // The known-fast baseline pipelines are compiled on first use by
-        // `ensure_fast_world_pipelines`; most sessions never leave the advanced path.
+        // Companion-camera pipelines compile only when that view is requested.
         let fast_pipelines = BTreeMap::new();
         let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
         {
@@ -2347,6 +2362,8 @@ pub(in crate::renderer) fn build_world(
             remap_pbr_compression: compress_pbr_companions,
             remap_scene_format: surface_format,
             remap_msaa_samples: msaa_samples,
+            has_force_sight_surfaces: coarse_batches.iter().chain(&full_batches)
+                .any(|batch| batch.source.force_sight_only),
             has_glass_primary: coarse_batches
                 .iter()
                 .chain(&full_batches)
@@ -2438,7 +2455,6 @@ pub(in crate::renderer) fn build_world(
             pipeline_variants,
             pso_slot_keys: Vec::new(),
             fast_pipelines,
-            fast_complexity_pipelines: BTreeMap::new(),
             complexity_pipelines: BTreeMap::new(),
             planar_reflectors,
             coarse_batches,

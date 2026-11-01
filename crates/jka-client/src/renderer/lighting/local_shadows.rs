@@ -2,7 +2,7 @@
 use crate::renderer::{
     hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode,
     GpuPointLight, LocalShadowCacheEntry, LocalShadowResources, Mat4, Renderer,
-    ShadowCasterUniform, Vec3, WorldGpu, GpuPass, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
+    ShadowCasterUniform, Vec3, WorldGpu, GpuPass, depth_format, LOCAL_SHADOW_CACHE_SLOTS,
     LOCAL_SHADOW_HYSTERESIS, LOCAL_SHADOW_MAP_SIZE, LOCAL_SHADOW_NEAR,
     LOCAL_SHADOW_RESELECT_DISTANCE, MAX_LOCAL_SHADOW_LIGHTS,
 };
@@ -625,13 +625,13 @@ fn create_local_shadow_cache(device: &wgpu::Device, size: u32)
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let cube_view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("JKA local-light shadow cache cube-array view"),
-        format: Some(DEPTH_FORMAT),
+        format: Some(depth_format()),
         dimension: Some(wgpu::TextureViewDimension::CubeArray),
         base_mip_level: 0,
         mip_level_count: Some(1),
@@ -643,7 +643,7 @@ fn create_local_shadow_cache(device: &wgpu::Device, size: u32)
     let layer_views = (0..layer_count)
         .map(|layer| texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("JKA local-light cached shadow face"),
-            format: Some(DEPTH_FORMAT),
+            format: Some(depth_format()),
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_mip_level: 0,
             mip_level_count: Some(1),
@@ -792,6 +792,69 @@ pub(in crate::renderer) fn aabb_behind_plane(
         })
         .sum();
     farthest + plane[3] < -1.0
+}
+
+/// The six homogeneous clip half-spaces for one view-projection matrix.
+///
+/// Reusing these planes for BSP AABBs avoids transforming eight corners with a
+/// Mat4 for every culling candidate. This uses wgpu's z=[0,w] clip convention.
+/// It is intentionally opt-in through r_igpuAB, leaving the historical
+/// eight-corner test available for direct A/B testing.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct ClipFrustum {
+    planes: [[f32; 4]; 6],
+}
+
+impl ClipFrustum {
+    pub(in crate::renderer) fn from_view_proj(matrix: Mat4) -> Self {
+        // Mat4::to_cols_array_2d is column-major; derive its clip-space rows.
+        let columns = matrix.to_cols_array_2d();
+        let rows: [[f32; 4]; 4] = std::array::from_fn(|row| {
+            std::array::from_fn(|col| columns[col][row])
+        });
+        let combine = |a: usize, b: usize, subtract: bool| -> [f32; 4] {
+            std::array::from_fn(|col| {
+                if subtract { rows[a][col] - rows[b][col] }
+                else { rows[a][col] + rows[b][col] }
+            })
+        };
+        Self {
+            planes: [
+                combine(3, 0, false), // x >= -w
+                combine(3, 0, true),  // x <=  w
+                combine(3, 1, false), // y >= -w
+                combine(3, 1, true),  // y <=  w
+                rows[2],             // z >=  0
+                combine(3, 2, true),  // z <=  w
+            ],
+        }
+    }
+
+    #[inline]
+    pub(in crate::renderer) fn intersects_aabb(
+        &self,
+        minimum: [f32; 3],
+        maximum: [f32; 3],
+    ) -> bool {
+        for plane in &self.planes {
+            // The extremal corner maximizes this plane's signed distance.
+            // If even that corner lies behind the plane, all eight are outside.
+            let x = if plane[0] >= 0.0 { maximum[0] } else { minimum[0] };
+            let y = if plane[1] >= 0.0 { maximum[1] } else { minimum[1] };
+            let z = if plane[2] >= 0.0 { maximum[2] } else { minimum[2] };
+            let distance = plane[0] * x + plane[1] * y + plane[2] * z + plane[3];
+            // Preserve borderline geometry. A strict edge cull with differently
+            // associated floating-point operations can otherwise hide a face.
+            let tolerance = f32::EPSILON * 16.0 * (
+                (plane[0] * x).abs() + (plane[1] * y).abs()
+                + (plane[2] * z).abs() + plane[3].abs()
+            );
+            if distance < -tolerance {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub(in crate::renderer) fn aabb_intersects_clip_frustum(
@@ -1060,5 +1123,40 @@ impl Renderer {
         if let Some(world) = &mut self.world {
             world.local_shadows.ab_last_cpu_ms = elapsed_ms;
         }
+    }
+}
+
+#[cfg(test)]
+mod clip_frustum_fast_tests {
+    use super::*;
+
+    #[test]
+    fn cached_planes_agree_with_corners_for_clear_inside_and_outside_boxes() {
+        let eye = Vec3::new(67.0, 12.0, -39.0);
+        let view = Mat4::look_at_rh(eye, Vec3::new(67.0, 12.0, -40.0), Vec3::Y);
+        let proj = Mat4::perspective_rh(1.1, 1.6, 0.1, 500.0);
+        let vp = proj * view;
+        let planes = ClipFrustum::from_view_proj(vp);
+        for x in -32..32 {
+            for y in -16..16 {
+                for z in -24..24 {
+                    let min = [67.0 + x as f32 * 7.0, 12.0 + y as f32 * 7.0, -40.0 + z as f32 * 7.0];
+                    let max = [min[0] + 2.0, min[1] + 2.0, min[2] + 2.0];
+                    let original = aabb_intersects_clip_frustum(min, max, vp);
+                    let optimized = planes.intersects_aabb(min, max);
+                    // Near an exact clip boundary, the optimized version can
+                    // conservatively include a surface, but never exclude one.
+                    assert!(!original || optimized, "culled visible AABB: {min:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn behind_camera_is_rejected() {
+        let vp = Mat4::perspective_rh(1.0, 1.0, 0.1, 1000.0);
+        let frustum = ClipFrustum::from_view_proj(vp);
+        assert!(frustum.intersects_aabb([-1.0, -1.0, -5.0], [1.0, 1.0, -3.0]));
+        assert!(!frustum.intersects_aabb([-1.0, -1.0, 3.0], [1.0, 1.0, 5.0]));
     }
 }

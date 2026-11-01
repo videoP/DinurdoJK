@@ -66,7 +66,7 @@ fn pipeline(
         }),
         primitive: Default::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: crate::renderer::DEPTH_FORMAT,
+            format: crate::renderer::depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: Default::default(),
@@ -292,7 +292,7 @@ mod tests {
                 });
                 let msaa_view = msaa.as_ref().map(|t| t.create_view(&Default::default()));
                 let depth = device.create_texture(&wgpu::TextureDescriptor {
-                    format: crate::renderer::DEPTH_FORMAT,
+                    format: crate::renderer::depth_format(),
                     sample_count: samples,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     ..desc

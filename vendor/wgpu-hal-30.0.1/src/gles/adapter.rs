@@ -1254,6 +1254,7 @@ impl crate::Adapter for super::Adapter {
             Tf::R16Snorm => norm16_snorm | norm16_storage,
             Tf::R16Float => filterable | half_float_renderable,
             Tf::Rg8Unorm => filterable_renderable,
+            Tf::Rgb565Unorm => empty, // Not used/advertised for this Vulkan-only experiment.
             Tf::Rg8Snorm => filterable,
             Tf::Rg8Uint => renderable,
             Tf::Rg8Sint => renderable,

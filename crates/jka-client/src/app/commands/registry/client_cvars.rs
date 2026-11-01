@@ -739,6 +739,30 @@ app_cvars! {
         ]
     }
 
+    APP_CG_SPEEDTRAIL {
+        runtime: CvarDef::new(
+            "cg_speedTrail", "1", "0|1",
+            "TaystJK Force Speed player-model afterimages: 0 off, 1 on.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(i32::from(app.speed_trail).to_string()),
+            |app, value| {
+                app.speed_trail = App::parse_cvar_bool("cg_speedTrail", &value.to_string())?;
+                if let Some(session) = app.game_session.as_mut() {
+                    session.player_presenter.set_speed_trail(app.speed_trail);
+                }
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                settings.speed_trail = value.trim() != "0";
+            }),
+            archive: Some((28005, |state| i32::from(state.presentation.speed_trail).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_CG_SABERTRAIL {
         runtime: CvarDef::new("cg_saberTrail", "", "0|1|2", "OpenJK saber swing trail: 0 off, 1 normal authored saberBlur trail, 2 legacy special/high-frequency mode.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_sabertrail(app)), |app, value| App::cvar_set_cg_sabertrail(app, APP_CG_SABERTRAIL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_sabertrail, None),
         config: CvarBinding {

@@ -22,6 +22,9 @@ pub(in crate::app) struct MapLoadRequest {
     /// The already-prepared copy of this same map (the restart cache), lent so
     /// the loader can copy unchanged stages instead of recomputing them.
     pub(in crate::app) seed: Option<Arc<scene::PreparedMap>>,
+    /// Only set for an authoritative, same-map vote handoff. The map worker
+    /// must revalidate the VFS snapshot and BSP hash before taking this path.
+    pub(in crate::app) vote_fast_adopt: bool,
 }
 
 #[derive(Clone)]
@@ -194,6 +197,11 @@ impl MapLoadingState {
         completed: u32,
         total: u32,
     ) {
+        // Worker notifications may arrive after MapPrepared. They must not
+        // regress completed/prewarmed rows back to 0/0 or partial progress.
+        if self.preparation_finished {
+            return;
+        }
         if let Some(bar) = self.bars.iter_mut().find(|bar| bar.task == task) {
             bar.completed = completed.min(total);
             bar.total = total;
@@ -203,6 +211,22 @@ impl MapLoadingState {
 
     pub(in crate::app) fn begin_upload(&mut self) {
         self.preparation_finished = true;
+        // A vote-prewarmed (or restart-cached) map can reach MapPrepared without
+        // emitting MapLoadProgress for this request. Its rows still have 0/0,
+        // and build_loading_screen used to hide them as soon as upload began.
+        // MapPrepared guarantees that CPU preparation has finished, regardless
+        // of whether the stages ran now or during the vote delay. Preserve the
+        // rows as completed while the separate, indeterminate RENDERER SETUP
+        // row tracks the remaining GPU/upload/first-frame work.
+        for bar in &mut self.bars {
+            if bar.skipped {
+                continue; // Disabled or absent optional stages stay hidden.
+            }
+            if bar.total == 0 {
+                bar.total = 1;
+            }
+            bar.completed = bar.total;
+        }
     }
 
     /// Show a stage as finished when its result came from the prepared-map cache.
@@ -481,6 +505,7 @@ impl App {
                 analyze_fx_light_profiles: false,
                 supersedable: true,
                 seed: None,
+                vote_fast_adopt: false,
                 sub_bsp_names: Vec::new(),
             })
             .is_err()
@@ -763,6 +788,37 @@ impl App {
             .filter(|cache| cache.label == label)
             .or_else(|| self.cross_game_map_seed.as_ref().filter(|cache| cache.label == label))
             .map(|cache| Arc::clone(&cache.map));
+        if self.vote_map_preload_mode == 3 && purpose == MapLoadPurpose::Gameplay {
+            self.push_console_line(format!(
+                "[VOTE PREWARM DBG] authoritative request map={label:?} pending={:?} token={} ordinary_seed={} prepare_options_match={:?}",
+                self.vote_map_prewarm.as_ref().map(|p| format!("{} ready={}", p.name, p.prepared.is_some())),
+                self.vote_map_prewarm_token, seed.is_some(),
+                self.vote_map_prewarm.as_ref().map(|p| p.options == prepare_options),
+            ));
+        }
+        // Completed vote preparation is a CPU-only seed. Its stage keys and
+        // BSP hash are rechecked by the authoritative loader. Server FX and
+        // shader remaps still use the normal gamestate path.
+        let vote_seed = self.vote_map_prewarm.take().and_then(|prewarm| {
+            prewarm.cancel.store(true, std::sync::atomic::Ordering::Release);
+            if Self::normalized_bsp_name(&prewarm.name) != Self::normalized_bsp_name(&label) {
+                self.push_console_line(format!("[VOTE PREWARM] not adopting {}: server selected {label}", prewarm.name));
+                return None;
+            }
+            if prewarm.game != self.game || prewarm.options != prepare_options {
+                self.push_console_line(format!("[VOTE PREWARM] not adopting {label}: fs_game or prepare options changed"));
+                return None;
+            }
+            if prewarm.prepared.is_none() {
+                self.push_console_line(format!("[VOTE PREWARM] {label} prewarm not finished at map change; normal loader takes over"));
+            }
+            prewarm.prepared
+        });
+        if vote_seed.is_some() {
+            self.push_console_line(format!("[VOTE PREWARM] adopting prepared CPU seed for {label}"));
+        }
+        let vote_fast_adopt = vote_seed.is_some();
+        let seed = vote_seed.or(seed);
         // A cross-mod seed is only useful for the very next map preparation.
         // Its BSP hash, texture bytes and per-stage fingerprints are checked
         // on the worker before any portion is reused. External lightmaps are
@@ -779,6 +835,7 @@ impl App {
                 analyze_fx_light_profiles: purpose != MapLoadPurpose::FrontendBackground,
                 supersedable: true,
                 seed,
+                vote_fast_adopt,
                 sub_bsp_names,
             })
             .is_err()
@@ -1179,7 +1236,7 @@ pub(in crate::app) fn spawn_map_loader(
                 FxCatalogKey,
                 Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
             )> = None;
-            while let Ok(request) = rx.recv() {
+            while let Ok(mut request) = rx.recv() {
                 if request.supersedable
                     && request.request_id != latest_requested.load(std::sync::atomic::Ordering::Acquire)
                 {
@@ -1192,15 +1249,53 @@ pub(in crate::app) fn spawn_map_loader(
                     crate::thread_activity::ThreadSlot::MapLoader,
                     crate::thread_activity::Task::MapPrepare,
                 );
-                match scene::prepare_source_with_sub_bsps(
-                    &base,
-                    request.game.as_deref(),
-                    &request.source,
-                    &jobs,
-                    request.prepare_options,
-                    request.seed.as_ref(),
-                    &request.sub_bsp_names,
-                ) {
+                // The original vote prewarm path submitted its entire map as
+                // a *seed*, then reparsed/rebuilt the map after the server
+                // switched. On a verified VFS+BSP match we can take the whole
+                // immutable CPU map without doing that second preparation.
+                // Never bypass the normal path for sub-BSP servers, modified
+                // assets, incomplete prewarm, or non-vote map requests.
+                let prepare_started = Instant::now();
+                let fast_adopt = request.vote_fast_adopt
+                    && request.sub_bsp_names.is_empty()
+                    && request.seed.as_ref().is_some_and(|seed| {
+                        match scene::vote_prepared_map_still_current(
+                            &base, request.game.as_deref(), &request.source,
+                            request.prepare_options, seed,
+                        ) {
+                            Ok(current) => current,
+                            Err(error) => {
+                                eprintln!("[VOTE PREWARM] validation failed for {name}: {error}; using ordinary map loader");
+                                false
+                            }
+                        }
+                    });
+                let prepared = if fast_adopt {
+                    let seed = request.seed.take().expect("validated vote seed exists");
+                    let mut map = Arc::try_unwrap(seed)
+                        .unwrap_or_else(|shared| shared.as_ref().clone());
+                    // These timings refer to this authoritative request,
+                    // not to the speculative job that ran while playing.
+                    map.load_timings = scene::MapLoadTimings::default();
+                    map.load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+                    println!("[VOTE PREWARM] verified fast adoption of {name}: skipped duplicate BSP, collision, shader, geometry and texture preparation ({:.1} ms handoff)",
+                        map.load_timings.prepare_wall_ms);
+                    Ok(map)
+                } else {
+                    if request.vote_fast_adopt {
+                        println!("[VOTE PREWARM] fast adoption rejected for {name}: VFS, BSP hash or sub-BSP mismatch; validating individual seed stages");
+                    }
+                    scene::prepare_source_with_sub_bsps(
+                        &base,
+                        request.game.as_deref(),
+                        &request.source,
+                        &jobs,
+                        request.prepare_options,
+                        request.seed.as_ref(),
+                        &request.sub_bsp_names,
+                    )
+                };
+                match prepared {
                     Ok(mut map) => {
                         if jobs.is_superseded() {
                             continue;
@@ -1426,4 +1521,282 @@ pub(in crate::app) fn spawn_map_loader(
         })
         .map_err(|e| format!("Could not start map loader: {e}"))?;
     Ok(tx)
+}
+
+
+/// A map vote is only a *hint*; the renderer and CGame must never see this
+/// prepared world until a later, authoritative map-load request adopts it.
+pub(in crate::app) struct VoteMapPrewarm {
+    pub token: u64,
+    pub name: String,
+    pub game: Option<PathBuf>,
+    pub options: scene::MapPrepareOptions,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub prepared: Option<Arc<scene::PreparedMap>>,
+}
+
+impl App {
+    pub(in crate::app) fn cancel_vote_map_prewarm(&mut self) {
+        if let Some(pending) = self.vote_map_prewarm.take() {
+            pending.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Snapshot the actual client-side network knowledge BEFORE attempting
+    /// any preload. One-shot debug points only, never printed per frame.
+    /// These configstrings are decoded from the server, not inferred from
+    /// the command typed by the local player.
+    pub(in crate::app) fn trace_vote_map_network_state(&mut self, at: &str) {
+        if self.vote_map_preload_mode != 3 { return; }
+        let (vote_time, vote_string) = if let Some(net) = self.net.as_ref() {
+            let cs = &net.session().decoder().configstrings;
+            (
+                cs.get(&crate::vote::CS_VOTE_TIME).map(|v| String::from_utf8_lossy(v).into_owned()),
+                cs.get(&crate::vote::CS_VOTE_STRING).map(|v| String::from_utf8_lossy(v).into_owned()),
+            )
+        } else { (None, None) };
+        let parsed = vote_string.as_deref().and_then(crate::vote::proposed_map);
+        let cached = self.vote_map_candidate.as_ref().map(|(name, time)| {
+            format!("{name} (last seen {:.1}s ago)", time.elapsed().as_secs_f32())
+        });
+        let pending = self.vote_map_prewarm.as_ref().map(|p| {
+            format!("{} ready={} token={}", p.name, p.prepared.is_some(), p.token)
+        });
+        self.push_console_line(format!(
+            "[VOTE PREWARM DBG] {at}: mode={} cs8_vote_time={vote_time:?} cs9_vote_string={vote_string:?} parsed_map={parsed:?} cached_candidate={cached:?} pending={pending:?}",
+            self.vote_map_preload_mode,
+        ));
+    }
+
+    /// The protocol decoder stores the GAMSTATE configstring snapshot, but
+    /// subsequent reliable `cs` updates are applied by CGame when the next
+    /// snapshot reaches their server-command sequence. Watch the actual wire
+    /// command here; do not query the stale gamestate map for a new vote.
+    pub(in crate::app) fn observe_live_map_vote_command(&mut self, raw: &[u8]) {
+        if self.vote_map_preload_mode == 0 { return; }
+        let Some((text, parsed)) = crate::vote::vote_map_cs9_update(raw) else { return; };
+        if self.vote_map_preload_mode == 3 {
+            self.push_console_line(format!(
+                "[VOTE PREWARM DBG] CS9 live update raw={text:?} parsed={parsed:?} (source=reliable cs, not gamestate cache)"
+            ));
+        }
+        // No current map is inferred from a display name. Keep the exact
+        // direct-vote qpath only, and discard it when an unrelated vote begins.
+        self.vote_map_candidate = parsed.map(|name| (name, Instant::now()));
+    }
+
+    /// jaPRO's VotePassed() sends EV_SIEGESPEC with the authoritative
+    /// execution deadline for delayed votes >= 5 seconds. It does this in
+    /// non-Siege gametypes even if the localized server `print` did not match
+    /// our textual vote-pass recognizer. This event authenticates a pass; the
+    /// separate CS9 candidate supplies its map name. Never guess from a
+    /// timer event alone (or in Siege, where the event means respawn).
+    pub(in crate::app) fn on_live_map_vote_deadline(&mut self) {
+        let mode = self.vote_map_preload_mode;
+        if mode == 0 { return; }
+        let Some((name, started)) = self.vote_map_candidate.take() else { return; };
+        if started.elapsed() > Duration::from_secs(35) {
+            if mode == 3 {
+                self.push_console_line(format!("[VOTE PREWARM DBG] EV_SIEGESPEC ignored stale candidate={name:?}"));
+            }
+            return;
+        }
+        self.push_console_line(format!(
+            "[VOTE PREWARM] passed-vote deadline event, direct CS9 target={name:?}"
+        ));
+        self.start_vote_map_prewarm(name, mode);
+    }
+
+    /// Track the direct BSP argument while the vote is open. The proposed vote
+    /// string can remain in CS_VOTE_STRING after CS_VOTE_TIME has been cleared.
+    pub(in crate::app) fn observe_live_map_vote(&mut self) {
+        if self.vote_map_preload_mode == 0 { return; }
+        let Some(decoder) = self.net.as_ref().map(|net| net.session().decoder()) else { return; };
+        let active = decoder.configstrings.get(&crate::vote::CS_VOTE_TIME)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .is_some_and(|value| value.trim().parse::<i64>().is_ok_and(|time| time != 0));
+        if !active { return; }
+        let name = decoder.configstrings.get(&crate::vote::CS_VOTE_STRING)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(crate::vote::proposed_map);
+        if self.vote_map_candidate.as_ref().map(|(map, _)| map) != name.as_ref() {
+            if self.vote_map_preload_mode == 3 {
+                self.push_console_line(format!(
+                    "[VOTE PREWARM DBG] CS_VOTE_STRING changed direct target: {:?} -> {:?}",
+                    self.vote_map_candidate.as_ref().map(|(map, _)| map), name,
+                ));
+            }
+            self.vote_map_candidate = name.map(|map| (map, Instant::now()));
+        }
+    }
+
+    pub(in crate::app) fn on_live_map_vote_passed(&mut self, command: &[u8]) {
+        let mode = self.vote_map_preload_mode;
+        if mode == 3 {
+            self.push_console_line(format!("[VOTE PREWARM DBG] pass raw reliable command={:?}",
+                String::from_utf8_lossy(command)));
+            self.trace_vote_map_network_state("vote-pass received");
+        }
+        if mode == 0 {
+            self.push_console_line(format!("[VOTE PREWARM] vote passed, disabled (cl_voteMapPreload=0)"));
+            return;
+        }
+        if self.net.is_none() {
+            self.push_console_line(format!("[VOTE PREWARM] vote passed but no active network session"));
+            return;
+        }
+        // The server can clear CS_VOTE_TIME before net.pump() returns; on a
+        // one-person server the entire vote may pass within a single packet.
+        // The authoritative pass print contains the map command, so prefer
+        // that target and fall back to the active configstring candidate.
+        let announced = crate::vote::passed_vote_map(command);
+        let observed = self.vote_map_candidate.take().and_then(|(map, started)| {
+            (started.elapsed() <= Duration::from_secs(35)).then_some(map)
+        });
+        if mode == 3 {
+            self.push_console_line(format!(
+                "[VOTE PREWARM DBG] parsed pass map={announced:?} cached vote candidate={observed:?} source={}",
+                if announced.is_some() { "server pass announcement" } else if observed.is_some() { "CS_VOTE_STRING fallback" } else { "NONE" },
+            ));
+        }
+        let Some(name) = announced.or(observed) else {
+            self.push_console_line(format!("[VOTE PREWARM] vote passed; skipped: no unambiguous direct map target"));
+            return;
+        };
+        self.start_vote_map_prewarm(name, mode);
+    }
+
+    fn start_vote_map_prewarm(&mut self, name: String, mode: u8) {
+        self.push_console_line(format!("[VOTE PREWARM] passed vote target={name} mode={mode}"));
+        if self.loaded_map_matches(&name) {
+            self.push_console_line(format!("[VOTE PREWARM] skipped {name}: current map already loaded; normal reuse path applies"));
+            return;
+        }
+        if self.loading_map_matches(&name) {
+            self.push_console_line(format!("[VOTE PREWARM] skipped {name}: map is already being loaded"));
+            return;
+        }
+        if self.vote_map_prewarm.as_ref().is_some_and(|p| p.name == name && p.game == self.game) {
+            self.push_console_line(format!("[VOTE PREWARM] skipped {name}: speculative preparation already in flight/ready"));
+            return;
+        }
+        self.cancel_vote_map_prewarm();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.vote_map_prewarm_token = self.vote_map_prewarm_token.wrapping_add(1);
+        let token = self.vote_map_prewarm_token;
+        let options = self.current_map_prepare_options();
+        if mode == 3 {
+            self.push_console_line(format!(
+                "[VOTE PREWARM DBG] spawn request map={name:?} token={token} active_mod={:?} root={:?} main_world_current={} worker_budget=unrestricted",
+                self.game, self.base, self.loaded_map_matches(&name),
+            ));
+        }
+        let root = self.base.clone();
+        let game = self.game.clone();
+        let proxy = self.proxy.clone();
+        let frame_us = Arc::clone(&self.vote_map_frame_us);
+        let baseline_us = frame_us.load(std::sync::atomic::Ordering::Relaxed).max(1000);
+        let source = scene::MapSource::Bsp(name.clone());
+        let worker_cancel = Arc::clone(&cancel);
+        match thread::Builder::new().name("jka-vote-prewarm".into()).spawn(move || {
+            // Always use a dedicated pool. A real map change cancels speculative
+            // work and wins without waiting for this background thread.
+            crate::map_jobs::lower_vote_prewarm_thread_priority();
+            let started = Instant::now();
+            let result = (|| -> Result<Box<scene::PreparedMap>, String> {
+                scene::verify_map_source_exists(&root, game.as_deref(), &source)?;
+                if worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("cancelled".into());
+                }
+                let jobs = crate::map_jobs::MapJobPool::new_vote_prewarm(
+                    mode, Arc::clone(&worker_cancel), frame_us, baseline_us,
+                )?;
+                jobs.begin_request(token);
+                // Record the VFS snapshot before preparing the candidate. A
+                // later fs_refresh/PK3 change invalidates direct map adoption.
+                let vote_vfs = jka_assets::pk3::AssetSearchPath::open_game(
+                    &root, game.as_deref(),
+                ).map_err(|e| e.to_string())?.index_token();
+                let mut map = scene::prepare_source_with_sub_bsps(
+                    &root, game.as_deref(), &source, &jobs, options, None, &[],
+                )?;
+                if jobs.is_superseded() { return Err("cancelled".into()); }
+                // A changed asset index *during* speculative preparation also
+                // invalidates fast adoption; stage-key seed reuse remains safe.
+                let vote_vfs_after = jka_assets::pk3::AssetSearchPath::open_game(
+                    &root, game.as_deref(),
+                ).map_err(|e| e.to_string())?.index_token();
+                if vote_vfs == vote_vfs_after {
+                    map.vote_prepared_vfs = Some(vote_vfs);
+                }
+                // A second large CPU world may push laptops into paging. Do
+                // not retain oversized speculative maps. This is a *lower
+                // bound* on resident bytes, not a hard cap on prep peak RAM.
+                let texture_bytes = map.textures.iter()
+                    .chain(map.lightmaps.iter()).chain(map.deluxemaps.iter())
+                    .map(crate::materials::TextureData::pixel_storage_bytes)
+                    .sum::<usize>();
+                let geometry_bytes = map.vertices.len() * std::mem::size_of::<scene::GpuVertex>()
+                    + map.inline_vertices.len() * std::mem::size_of::<scene::GpuVertex>()
+                    + map.batches.len() * std::mem::size_of::<scene::DrawBatch>()
+                    + map.pvs_batches.len() * std::mem::size_of::<scene::DrawBatch>();
+                let budget_mib = if mode == 1 { 192 } else if mode == 2 { 384 } else { usize::MAX };
+                if texture_bytes.saturating_add(geometry_bytes) / (1024 * 1024) > budget_mib {
+                    return Err(format!("speculative CPU map exceeds {budget_mib} MiB retention budget"));
+                }
+                Ok(Box::new(map))
+            })();
+            if !worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = proxy.send_event(UserEvent::VoteMapPrewarmed {
+                    token, result, elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                });
+            }
+        }) {
+            Ok(_) => {
+                self.vote_map_prewarm = Some(VoteMapPrewarm {
+                    token, name: name.clone(), game: self.game.clone(), options,
+                    cancel, prepared: None,
+                });
+                self.push_console_line(format!("[VOTE PREWARM] mode={mode} CPU preparation started for {name}"));
+            }
+            Err(error) => {
+                self.push_console_line(format!("[VOTE PREWARM] worker could not start: {error}"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod loading_row_tests {
+    use super::MapLoadingState;
+    use crate::thread_activity::Task;
+
+    #[test]
+    fn upload_keeps_prepared_rows_complete_after_a_vote_cache_hit() {
+        let mut loading = MapLoadingState::new(1, "racepack7.bsp".into(), None);
+        // Fast adoption sends no per-task progress for the authoritative load.
+        assert!(loading.bars.iter().all(|row| row.total == 0));
+        loading.skip_task(Task::MapGrass);
+        loading.update_worker(Task::MapShaderParse, 2, 3);
+        loading.begin_upload();
+        // A late reliable progress notification must not hide these rows again.
+        loading.update_worker(Task::MapBspParse, 0, 0);
+
+        assert!(loading.preparation_finished);
+        assert!(loading.bars.iter().filter(|row| !row.skipped)
+            .all(|row| row.total > 0 && row.completed == row.total));
+        assert!(loading.ui().bars.iter()
+            .find(|bar| bar.label == "GRASS")
+            .is_some_and(|bar| bar.skipped));
+        assert!(loading.ui().bars.iter()
+            .find(|bar| bar.label == "BSP PARSE")
+            .is_some_and(|bar| bar.completed == 1 && bar.total == 1 && !bar.skipped));
+    }
+
+    #[test]
+    fn entering_upload_does_not_finish_rows_before_preparation_is_done() {
+        let loading = MapLoadingState::new(2, "racepack8.bsp".into(), None);
+        assert!(!loading.preparation_finished);
+        assert_eq!(loading.ui().bars[0].total, 0);
+    }
 }

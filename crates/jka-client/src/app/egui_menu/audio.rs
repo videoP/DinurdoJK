@@ -312,18 +312,18 @@ impl App {
             theme::Reset::None,
             |ui| {
                 let (state, color) = if !self.audio.eal_enabled {
-                    ("Off".to_owned(), theme::TEXT_FAINT)
+                    ("Off".to_owned(), theme::TEXT_FAINT())
                 } else if let Some(info) = &info {
                     if let Some(error) = &info.eal_effects_error {
-                        (format!("Unavailable: {error}"), theme::WARNING)
+                        (format!("Unavailable: {error}"), theme::WARNING())
                     } else if let Some(path) = &info.eal_file {
                         (format!("{}: {} | {}", if info.eal_effects_active { "Active" } else { "Inactive" },
-                            path, info.eal_environment.as_deref().unwrap_or("waiting for listener position")), theme::TEXT)
+                            path, info.eal_environment.as_deref().unwrap_or("waiting for listener position")), theme::TEXT())
                     } else {
-                        ("No EAL data loaded for this map".to_owned(), theme::TEXT_DIM)
+                        ("No EAL data loaded for this map".to_owned(), theme::TEXT_DIM())
                     }
                 } else {
-                    ("Enabled: load a map to hear its acoustics".to_owned(), theme::TEXT_DIM)
+                    ("Enabled: load a map to hear its acoustics".to_owned(), theme::TEXT_DIM())
                 };
                 theme::hint(ui, &state, color);
             },
@@ -336,25 +336,25 @@ impl App {
             theme::Reset::None,
             |ui| {
                 let (state, color) = if !self.audio.eal_enabled {
-                    ("EAL disabled", theme::TEXT_FAINT)
+                    ("EAL disabled", theme::TEXT_FAINT())
                 } else if let Some(info) = &info {
                     if info.eal_effects_error.is_some() {
-                        ("Unavailable", theme::WARNING)
+                        ("Unavailable", theme::WARNING())
                     } else if info.eal_hrtf {
-                        ("Active", theme::TEXT)
+                        ("Active", theme::TEXT())
                     } else if !self.audio.eal_hrtf {
-                        ("Off", theme::TEXT_DIM)
+                        ("Off", theme::TEXT_DIM())
                     } else if info.eal_effects_active {
-                        (match info.eal_hrtf_status { 2 => "Denied by device", 5 => "Unsupported output format", _ => "Requested; device HRTF is off" }, theme::WARNING)
+                        (match info.eal_hrtf_status { 2 => "Denied by device", 5 => "Unsupported output format", _ => "Requested; device HRTF is off" }, theme::WARNING())
                     } else if info.eal_file.is_none() {
-                        ("No EAL map loaded", theme::TEXT_DIM)
+                        ("No EAL map loaded", theme::TEXT_DIM())
                     } else {
-                        ("Requested · awaiting worker", theme::TEXT_DIM)
+                        ("Requested · awaiting worker", theme::TEXT_DIM())
                     }
                 } else if !self.audio.eal_hrtf {
-                    ("Off", theme::TEXT_DIM)
+                    ("Off", theme::TEXT_DIM())
                 } else {
-                    ("Waiting for map", theme::TEXT_DIM)
+                    ("Waiting for map", theme::TEXT_DIM())
                 };
                 theme::hint(ui, state, color);
             },
@@ -433,7 +433,7 @@ impl App {
                     theme::hint(
                         ui,
                         &format!("{}ch · {} Hz · {}", info.channels, info.sample_rate, info.sample_format),
-                        theme::TEXT,
+                        theme::TEXT(),
                     );
                 },
             );
@@ -442,7 +442,7 @@ impl App {
                 "Buffer",
                 "CPAL/Rodio output buffer selected for the current device.",
                 theme::Reset::None,
-                |ui| theme::hint(ui, &info.buffer_size, theme::TEXT_DIM),
+                |ui| theme::hint(ui, &info.buffer_size, theme::TEXT_DIM()),
             );
             let overload = info.overload_samples > 0;
             theme::row(
@@ -460,7 +460,7 @@ impl App {
                             if info.overload_samples == 1 { "" } else { "s" },
                             info.active_voices
                         ),
-                        if overload { theme::WARNING } else { theme::TEXT_DIM },
+                        if overload { theme::WARNING() } else { theme::TEXT_DIM() },
                     );
                 },
             );
@@ -480,7 +480,7 @@ impl App {
                     theme::hint(
                         ui,
                         &state,
-                        if info.steam_audio_enabled { theme::TEXT } else { theme::TEXT_FAINT },
+                        if info.steam_audio_enabled { theme::TEXT() } else { theme::TEXT_FAINT() },
                     );
                 },
             );
@@ -491,11 +491,11 @@ impl App {
                 theme::Reset::None,
                 |ui| {
                     let (state, color) = if !info.steam_audio_enabled {
-                        ("Disabled".to_string(), theme::TEXT_FAINT)
+                        ("Disabled".to_string(), theme::TEXT_FAINT())
                     } else if let Some(progress) = self.steam_audio_bake_progress {
-                        (format!("Baking in background · {:.0}%", progress * 100.0), theme::TEXT)
+                        (format!("Baking in background · {:.0}%", progress * 100.0), theme::TEXT())
                     } else if let Some(error) = &self.steam_audio_bake_error {
-                        (format!("Bake failed · {error}"), theme::WARNING)
+                        (format!("Bake failed · {error}"), theme::WARNING())
                     } else if info.steam_audio_bake_ready {
                         (
                             format!(
@@ -505,12 +505,12 @@ impl App {
                                 if info.steam_audio_runtime_validated { "validated" } else { "not validated" },
                                 if info.steam_audio_bake_cache_hit { " · cache hit" } else { " · freshly baked" },
                             ),
-                            theme::TEXT,
+                            theme::TEXT(),
                         )
                     } else if info.steam_audio_scene_triangles > 0 {
-                        ("Geometry ready · bake queued/not yet attached".to_string(), theme::TEXT_DIM)
+                        ("Geometry ready · bake queued/not yet attached".to_string(), theme::TEXT_DIM())
                     } else {
-                        ("Waiting for map load".to_string(), theme::TEXT_DIM)
+                        ("Waiting for map load".to_string(), theme::TEXT_DIM())
                     };
                     theme::hint(ui, &state, color);
                 },
@@ -522,17 +522,17 @@ impl App {
                 theme::Reset::None,
                 |ui| {
                     let (state, color) = if !info.steam_audio_enabled {
-                        ("Disabled by Steam Audio master gate".to_owned(), theme::TEXT_FAINT)
+                        ("Disabled by Steam Audio master gate".to_owned(), theme::TEXT_FAINT())
                     } else if !info.steam_audio_environmental_enabled {
-                        ("Off · direct sound unchanged".to_owned(), theme::TEXT_DIM)
+                        ("Off · direct sound unchanged".to_owned(), theme::TEXT_DIM())
                     } else if let Some(error) = &info.steam_audio_environmental_error {
-                        (format!("Unavailable · {error}"), theme::WARNING)
+                        (format!("Unavailable · {error}"), theme::WARNING())
                     } else if info.steam_audio_environmental_active {
-                        (format!("Active · {} sources · {} updates · last {:.2} ms", info.steam_audio_environment_voice_count, info.steam_audio_environment_updates, info.steam_audio_environment_last_ms), theme::TEXT)
+                        (format!("Active · {} sources · {} updates · last {:.2} ms", info.steam_audio_environment_voice_count, info.steam_audio_environment_updates, info.steam_audio_environment_last_ms), theme::TEXT())
                     } else if info.steam_audio_scene_triangles > 0 {
-                        ("Initializing direct simulator…".to_owned(), theme::TEXT_DIM)
+                        ("Initializing direct simulator…".to_owned(), theme::TEXT_DIM())
                     } else {
-                        ("Waiting for map acoustic scene".to_owned(), theme::TEXT_DIM)
+                        ("Waiting for map acoustic scene".to_owned(), theme::TEXT_DIM())
                     };
                     theme::hint(ui, &state, color);
                 },
@@ -543,7 +543,7 @@ impl App {
                 "Probe-baked reflections, reverb, and pathing are reported separately from live direct occlusion and transmission.",
                 theme::Reset::None,
                 |ui| {
-                    theme::hint(ui, if info.steam_audio_bake_ready { "Pending · baked probe data ready" } else { "Pending · waiting for acoustic bake" }, theme::TEXT_DIM);
+                    theme::hint(ui, if info.steam_audio_bake_ready { "Pending · baked probe data ready" } else { "Pending · waiting for acoustic bake" }, theme::TEXT_DIM());
                 },
             );
             theme::row(
@@ -568,9 +568,9 @@ impl App {
                         ui,
                         &state,
                         if info.steam_audio_binaural_active {
-                            theme::TEXT
+                            theme::TEXT()
                         } else {
-                            theme::TEXT_DIM
+                            theme::TEXT_DIM()
                         },
                     );
                 },
@@ -581,7 +581,7 @@ impl App {
                 "Device format",
                 "Audio output has not been opened by the active CGame/demo presenter yet.",
                 theme::Reset::None,
-                |ui| theme::hint(ui, "Not active", theme::TEXT_FAINT),
+                |ui| theme::hint(ui, "Not active", theme::TEXT_FAINT()),
             );
         }
     }

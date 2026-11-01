@@ -736,7 +736,13 @@ pub enum CgameNotice {
     /// `print`: console text (may contain @@@ StringEd references).
     Print(Vec<u8>),
     /// `chat`/`tchat`/`lchat`/`ltchat`: a chat-box line.
-    Chat { team: bool, kind: ChatKind, text: Vec<u8> },
+    Chat {
+        team: bool,
+        kind: ChatKind,
+        text: Vec<u8>,
+        /// Sending client, when the server named it (client-side mutes).
+        sender: Option<i32>,
+    },
     /// `cp`: CG_CenterPrint.
     CenterPrint(Vec<u8>),
     /// `CG_DrawSiegeMessageNonMenu`: a Siege-authored objective message. A
@@ -761,6 +767,10 @@ pub enum CgameNotice {
         target: String,
         attacker: Option<String>,
         key: &'static str,
+        /// Client numbers and means of death, for the kill feed.
+        target_client: i32,
+        attacker_client: Option<i32>,
+        mod_: i32,
     },
     /// JKA/TaystJK playerState reward counter transition. The app chooses
     /// cg_drawRewards mode assets and owns the visual FIFO.
@@ -796,7 +806,69 @@ pub enum PresentationViewer {
     None,
 }
 
+/// Prediction state accepted from authoritative snapshots, independent of audio/FX queues.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrivateDuelState {
+    pub client_num: i32,
+    pub duel_type: i32,
+    pub message_num: i32,
+    pub raw_event: i32,
+    pub source_entity: i32,
+    pub source: &'static str,
+}
+
+impl PrivateDuelState {
+    fn accept(&mut self, client: i32, raw: i32, parm: i32, source: &'static str,
+              source_entity: i32, message_num: i32) {
+        if client == self.client_num && raw & !EV_EVENT_BITS == EntityEvent::EV_PRIVATE_DUEL.as_i32()
+            && (0..=255).contains(&parm)
+        {
+            *self = Self { client_num: client, duel_type: parm, message_num, raw_event: raw,
+                source_entity, source };
+        }
+    }
+
+    fn observe_snapshot(&mut self, snapshot: &Snapshot, previous: Option<&Snapshot>) {
+        let ps = &snapshot.player_state;
+        let client = ps.field_i32("clientNum").unwrap_or(-1);
+        let previous = previous.filter(|old| {
+            old.player_state.field_i32("clientNum") == Some(client)
+                && (old.snap_flags ^ snapshot.snap_flags) & SNAPFLAG_SERVERCOUNT == 0
+        });
+        if previous.is_none() {
+            *self = Self { client_num: client, message_num: snapshot.message_num,
+                source_entity: client, source: "reset", ..Self::default() };
+        } else if previous.is_some_and(|old| old.player_state.field_i32("duelInProgress") == Some(1))
+            && ps.field_i32("duelInProgress").unwrap_or(0) == 0
+        {
+            self.duel_type = 0;
+            self.message_num = snapshot.message_num;
+            self.raw_event = 0;
+            self.source_entity = client;
+            self.source = "duel-ended";
+        }
+        // Preserve the predictable route, but G_AddEvent(client, ...) actually writes
+        // externalEvent, not this ring (TaystJK g_utils.c).
+        let sequence = ps.field_i32("eventSequence").unwrap_or(0);
+        let old_sequence = previous.map_or(0, |old| old.player_state.field_i32("eventSequence").unwrap_or(0));
+        for index in old_sequence.max(sequence.saturating_sub(2)).max(0)..sequence {
+            let slot = index & 1;
+            self.accept(client, ps.field_i32(if slot == 0 { "events[0]" } else { "events[1]" }).unwrap_or(0),
+                ps.field_i32(if slot == 0 { "eventParms[0]" } else { "eventParms[1]" }).unwrap_or(0),
+                "ps-ring", client, snapshot.message_num);
+        }
+        let external = ps.field_i32("externalEvent").unwrap_or(0);
+        let old_external = previous.map_or(0, |old| old.player_state.field_i32("externalEvent").unwrap_or(0));
+        // Compare the raw ID including uniqueness bits, as CG_CheckPlayerstateEvents does.
+        if external != 0 && external != old_external {
+            self.accept(client, external, ps.field_i32("externalEventParm").unwrap_or(0),
+                "ps-external", client, snapshot.message_num);
+        }
+    }
+}
+
 pub struct ClientGameState {
+    private_duel: PrivateDuelState,
     entities: Vec<CEntity>,
     /// jaPRO `cg_entities[client].vChatTime`: until when a client's voice-chat
     /// icon shows (`EV_VOICECMD_SOUND` time + 1000).
@@ -866,6 +938,7 @@ fn breath_weather_command_enables_cold(command: &str) -> bool {
 impl Default for ClientGameState {
     fn default() -> Self {
         Self {
+            private_duel: PrivateDuelState::default(),
             entities: vec![CEntity::default(); MAX_GENTITIES],
             vchat_until: [0; MAX_CLIENTS],
             notices: VecDeque::new(),
@@ -948,6 +1021,7 @@ impl ClientGameState {
         configstrings: &BTreeMap<u16, Vec<u8>>,
         server_command_sequence: i32,
     ) {
+        self.private_duel = PrivateDuelState::default();
         self.entities.fill(CEntity::default());
         self.vchat_until = [0; MAX_CLIENTS];
         self.big_config = jka_protocol::commands::BigConfigString::default();
@@ -1518,11 +1592,27 @@ impl ClientGameState {
         text.extend_from_slice(speaker_name);
         text.extend_from_slice(b"^7: ");
         text.extend_from_slice(description.as_bytes());
-        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text })
+        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text, sender: i32::try_from(speaker).ok() })
     }
 
     pub fn presentation_event_count(&self) -> usize {
         self.presentation_events.events.len()
+    }
+
+    /// Current connection state, or a preview for nextSnap when prediction uses it.
+    /// Previewing never commits a future event to the current snapshot's state.
+    pub fn private_duel_state_for_snapshot(&self, snapshot: &Snapshot) -> PrivateDuelState {
+        let mut state = self.private_duel;
+        if self.current_snapshot.as_ref().is_none_or(|current| current.message_num != snapshot.message_num) {
+            state.observe_snapshot(snapshot, self.current_snapshot.as_ref());
+        }
+        state
+    }
+
+    fn retain_private_duel_entity_event(&mut self, event: &PresentationEvent, message_num: i32) {
+        self.private_duel.accept(i32::from(event.entity_num), event.raw_event, event.parm,
+            if event.event_only_entity { "event-entity" } else { "entity" },
+            i32::from(event.source_entity_num), message_num);
     }
 
     /// Pop one accepted event from the client receive queue in discovery order.
@@ -1987,6 +2077,7 @@ impl ClientGameState {
     /// OpenJK `CG_SetInitialSnapshot`, limited to the snapshot/entity responsibilities that exist
     /// in this Rust client today. Rendering/Ghoul2 side effects are deliberately not fabricated.
     pub fn set_initial_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), String> {
+        self.private_duel.observe_snapshot(snapshot, None);
         self.reward_baseline = Some(RewardBaseline::from_player_state(&snapshot.player_state));
         self.current_snapshot = Some(snapshot.clone());
         self.next_snapshot = None;
@@ -2004,6 +2095,7 @@ impl ClientGameState {
             };
             self.pending_event_traces.push_back(outcome.trace);
             if let Some(event) = outcome.event {
+                self.retain_private_duel_entity_event(&event, snapshot.message_num);
                 self.presentation_events.push(event);
             }
         }
@@ -2053,6 +2145,7 @@ impl ClientGameState {
 
         self.execute_server_commands(next.server_command_num)?;
         self.check_reward_notices(&next.player_state);
+        self.private_duel.observe_snapshot(&next, Some(&current));
 
         // OpenJK clears currentValid for every entity in the old snapshot first.
         for entity in &current.entities {
@@ -2080,6 +2173,7 @@ impl ClientGameState {
             };
             self.pending_event_traces.push_back(outcome.trace);
             if let Some(event) = outcome.event {
+                self.retain_private_duel_entity_event(&event, next.message_num);
                 self.presentation_events.push(event);
             }
         }
@@ -2265,7 +2359,9 @@ impl ClientGameState {
         if name.eq_ignore_ascii_case(b"chat") || name.eq_ignore_ascii_case(b"tchat") {
             let team = name.eq_ignore_ascii_case(b"tchat");
             let kind = if team { ChatKind::Team } else { ChatKind::Say };
-            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)) });
+            // OpenJK G_SayTo appends the sender's client number after the text.
+            let sender = parts.get(2).copied().and_then(parse_i32_ascii);
+            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)), sender });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"lchat") || name.eq_ignore_ascii_case(b"ltchat") {
@@ -2275,7 +2371,8 @@ impl ClientGameState {
             // "%s^7<%s> ^%s%s": name, location, colour, message.
             let text = [arg(1), b"^7<".to_vec(), arg(2), b"> ^".to_vec(), arg(3), arg(4)].concat();
             let team = name.eq_ignore_ascii_case(b"ltchat");
-            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text) });
+            let sender = parts.get(5).copied().and_then(parse_i32_ascii);
+            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text), sender });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"cps") {
@@ -4089,6 +4186,103 @@ mod tests {
         assert_eq!(second.source_entity_num, 71);
         assert_eq!(second.event, EntityEvent::EV_ROLL);
         assert!(game.pop_presentation_event().is_none());
+    }
+
+    fn duel_snapshot(message: i32, raw: i32, parm: i32) -> Snapshot {
+        let mut ps = PlayerState::default();
+        for (name, value) in [("clientNum", 3), ("duelInProgress", 1), ("duelIndex", 4),
+            ("externalEvent", raw), ("externalEventParm", parm)]
+        {
+            assert!(ps.set_field_bits(name, value as u32));
+        }
+        Snapshot { server_time: message * 50, message_num: message, delta_num: -1,
+            snap_flags: 0, ping: 0, server_command_num: 0, area_mask: [0; 32],
+            player_state: ps, vehicle_player_state: None, entities: Vec::new() }
+    }
+
+    #[test]
+    fn private_duel_external_event_survives_queue_drain_and_intermediate_snapshots() {
+        let mut game = ClientGameState::new();
+        let first = duel_snapshot(1, 0, 0);
+        game.set_initial_snapshot(&first).unwrap();
+        // Actual G_AddEvent(client) shape: externalEvent, empty ring, no local entity.
+        let opening = duel_snapshot(2, 0x100 | EntityEvent::EV_PRIVATE_DUEL.as_i32(), 1);
+        game.set_next_snapshot(Some(&opening)).unwrap();
+        assert_eq!(game.private_duel_state_for_snapshot(&opening).duel_type, 1);
+        assert_eq!(game.private_duel_state_for_snapshot(&first).duel_type, 0, "nextSnap preview must not commit");
+        game.transition_snapshot(100).unwrap();
+        game.drain_presentation_events();
+        // No predictor ran while these snapshots were consumed; external event has expired.
+        let later = duel_snapshot(3, 0, 0);
+        game.set_next_snapshot(Some(&later)).unwrap();
+        game.transition_snapshot(150).unwrap();
+        let state = game.private_duel_state_for_snapshot(&later);
+        assert_eq!((state.client_num, state.duel_type, state.source, state.message_num), (3, 1, "ps-external", 2));
+        assert_eq!(state.raw_event, 0x10f);
+        assert_eq!(later.player_state.field_i32("eventSequence"), Some(0));
+        // A new FF duel can change only the uniqueness bits and eventParm.
+        let ff = duel_snapshot(4, 0x200 | EntityEvent::EV_PRIVATE_DUEL.as_i32(), 2);
+        game.set_next_snapshot(Some(&ff)).unwrap();
+        assert_eq!(game.private_duel_state_for_snapshot(&ff).duel_type, 2);
+        assert_eq!(game.private_duel_state_for_snapshot(&later).duel_type, 1);
+        game.transition_snapshot(200).unwrap();
+        assert_eq!(game.private_duel_state_for_snapshot(&ff).duel_type, 2);
+    }
+
+    #[test]
+    fn private_duel_end_and_connection_boundaries_clear_retained_type() {
+        let mut game = ClientGameState::new();
+        let opening = duel_snapshot(1, 0x10f, 1);
+        game.set_initial_snapshot(&opening).unwrap();
+        let mut ended = duel_snapshot(2, 0x10f, 1); // old opening still in externalEvent
+        assert!(ended.player_state.set_field_bits("duelInProgress", 0));
+        game.set_next_snapshot(Some(&ended)).unwrap();
+        game.transition_snapshot(100).unwrap();
+        assert_eq!(game.private_duel_state_for_snapshot(&ended).duel_type, 0, "stale event must not revive ended duel");
+        let cancelled = duel_snapshot(3, 0x20f, 0);
+        game.set_next_snapshot(Some(&cancelled)).unwrap();
+        game.transition_snapshot(150).unwrap();
+        assert_eq!(game.private_duel_state_for_snapshot(&cancelled).duel_type, 0);
+        game.set_initial_snapshot(&opening).unwrap();
+        let mut followed = duel_snapshot(2, 0, 0);
+        assert!(followed.player_state.set_field_bits("clientNum", 4));
+        assert_eq!(game.private_duel_state_for_snapshot(&followed).duel_type, 0);
+        let mut restarted = duel_snapshot(2, 0, 0);
+        restarted.snap_flags ^= SNAPFLAG_SERVERCOUNT;
+        assert_eq!(game.private_duel_state_for_snapshot(&restarted).duel_type, 0);
+        game.reset_gamestate(&BTreeMap::new(), 0);
+        game.set_initial_snapshot(&duel_snapshot(1, 0, 0)).unwrap();
+        assert_eq!(game.private_duel.duel_type, 0);
+    }
+
+    #[test]
+    fn private_duel_countdown_and_player_event_entity_use_authoritative_owner() {
+        let mut game = ClientGameState::new();
+        let mut opening = duel_snapshot(1, 0x10f, 1);
+        assert!(opening.player_state.set_field_bits("duelInProgress", 0));
+        game.set_initial_snapshot(&opening).unwrap();
+        let mut countdown = duel_snapshot(2, 0, 0);
+        assert!(countdown.player_state.set_field_bits("duelInProgress", 0));
+        game.set_next_snapshot(Some(&countdown)).unwrap();
+        game.transition_snapshot(100).unwrap();
+        assert_eq!(game.private_duel.duel_type, 1);
+        let mut snapshot = duel_snapshot(3, 0, 0);
+        snapshot.entities = vec![entity(70, &[
+            ("eType", (ET_EVENTS + EntityEvent::EV_PRIVATE_DUEL.as_i32()) as u32),
+            ("eFlags", EF_PLAYER_EVENT as u32), ("otherEntityNum", 3), ("eventParm", 2),
+        ])];
+        game.set_next_snapshot(Some(&snapshot)).unwrap();
+        game.transition_snapshot(150).unwrap();
+        game.drain_presentation_events();
+        assert_eq!((game.private_duel.duel_type, game.private_duel.source_entity), (2, 70));
+        let mut other = duel_snapshot(4, 0, 0);
+        other.entities = vec![entity(71, &[
+            ("eType", (ET_EVENTS + EntityEvent::EV_PRIVATE_DUEL.as_i32()) as u32),
+            ("eFlags", EF_PLAYER_EVENT as u32), ("otherEntityNum", 4), ("eventParm", 1),
+        ])];
+        game.set_next_snapshot(Some(&other)).unwrap();
+        game.transition_snapshot(200).unwrap();
+        assert_eq!(game.private_duel.duel_type, 2, "other player's duel cannot change local prediction");
     }
 
     #[test]

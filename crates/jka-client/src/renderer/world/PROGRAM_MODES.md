@@ -1,6 +1,6 @@
 # World shader program modes
 
-The console control is `r_fragmentShaderMode 0..4`. Changes compile in the
+The console control is `r_fragmentShaderMode 0..5`. Changes compile in the
 background and activate a complete pipeline set without a map reload. Mode 1
 remains the default; quality presets leave this experiment control alone.
 
@@ -11,8 +11,9 @@ remains the default; quality presets leave this experiment control alone.
 | 2 | Existing specialization plus globally compatible compact entry points. |
 | 3 | Shared basic/enhanced families, each with alpha-tested and untested variants. |
 | 4 | Generated vertex/fragment pairs for normalized stage recipes encountered by the map. |
+| **5** | **Hybrid:** mode-2-style compact specialized shaders for eligible common stages, structural generation for tcMods, nonstandard tcGen, waves, and live enhanced operations; mode-1-style specialization for remaining stages and unsupported effects. |
 
-Modes 3 and 4 target Minimal Unified, Low and Medium. Their eligibility follows
+Modes 3, 4 and 5 target Minimal Unified, Low and Medium. Their eligibility follows
 effective renderer features rather than a preset name. Unhandled configurations,
 autosprite2, special tcGen and three-stage legacy RGB composites use the existing
 specialized program. Sky and fused effect programs retain their dedicated paths.
@@ -35,6 +36,7 @@ Select Minimal Unified, Low or Medium and keep a stationary view. Enter:
 ```
 r_fragmentShaderMode 3
 r_fragmentShaderMode 4
+r_fragmentShaderMode 5
 ```
 
 Wait until the requested mode is active before interpreting performance. For a
@@ -59,7 +61,7 @@ Program tag and vertex recipe participate in compilation, reuse and binding
 identities. Existing reflection/fog/dlight/glow redraw implementations remain in use.
 
 The final renderer regression run passed 113 tests, with 24 hardware tests
-ignored. The explicit Vulkan image test passed 85 renders across modes 0..4,
+ignored. The previously recorded Vulkan image test passed 85 renders across modes 0..4,
 including alpha tests, vertex colours, tcGen/tcMods, all six wave types, active fog
 and Medium feature combinations. Maximum compared 8-bit channel difference was
 at most one. Hardware validation used an RTX 3060, not an iGPU.
@@ -156,3 +158,29 @@ launch (e.g. `--modes 0,1,0,1`) before reading a difference.
 `frame_interval_ms` (present-to-present), `world_variant_pending`, active PSO
 counts and the latest primary-BSP pipeline statistics (vertex/clipped/fragment
 invocations; first world pass only, ~10 Hz, asynchronous).
+
+## Mode 5: hybrid material policy (new, not yet hardware benchmarked)
+
+Mode 5 selects programs at map/variant compilation time, never while shading or
+inside the frame draw loop. It reuses the existing compact material-specialized
+entry points for globally compatible stages, uses the existing exact normalized
+generated recipe for structural UV/wave operations and live enhanced material
+features, and retains the material-specialized general program for the rest.
+Unusual tcGen, glass, autosprite2, legacy three-stage composites, unsupported
+global feature families, sky and fused passes remain on their existing correct
+paths. Blend/depth/sort semantics are unchanged. Existing optional additive stage
+fusion remains independently configured; switching mode 5 does not turn it on.
+
+Generated modules use two cache tiers: structural source-shape identities
+that skip source generation and exact WGSL identities that deduplicate across
+shape keys. WGSL is no longer cached by the full material/variant key. Numerically distinct materials, or different PSO
+overrides generating the same WGSL, reuse one `ShaderModule`; pipeline identities
+still include their own compile-time specialization constants and fixed state.
+The canonical cache is local to one pipeline compilation job. It does not store
+render-pass results or upload shader code during frame rendering.
+
+The expanded Vulkan image-regression loop includes mode 5, but has not been
+executed for this patch (no local build or hardware run). No frame time gain is claimed without device-side A/B measurement. Compare
+`r_fragmentShaderMode 1`, `2`, `4`, and `5` using `waitshadermode`,
+`render_perf_capture` and identical static cameras; compare map-load compile
+time and `world` program counts separately from GPU shading time.

@@ -173,6 +173,13 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.color.a <= -6.0) {
+        return force_shockwave_shade(input.clip_position, input.uv, input.color.rgb,
+            camera.view_proj, camera.camera_pos_time.xyz,
+            camera.camera_forward.xyz, -input.color.a - 6.0,
+            input.predator_local.y > 0.5, input.predator_local.x,
+            camera.camera_pos_time.w);
+    }
     if (input.color.a <= -3.0) {
         return predator_shade(input.clip_position, input.uv, input.normal, input.world_position,
             input.predator_local, predator_position_view(input.world_position),

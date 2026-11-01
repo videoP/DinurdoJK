@@ -1,7 +1,7 @@
 //! Hud movement.
 use crate::extensions::NativeHud;
 use crate::ui::{
-    color_code, draw_placed, fixed_charset_text, hud_line, proportional_text,
+    color_code, draw_placed, fixed_charset_text, hud_line, proportional_text, proportional_text_uniform,
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
     MovementKeysSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_IMAGE_NAMES, KEY_ART_SIZE, KEY_ATLAS_COLUMNS, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
@@ -218,8 +218,9 @@ pub const COMBAT_ICON_NAMES: [&str; 12] = [
 ];
 // Maintain the old atlas indices for crosshair/force icons, so existing HUD
 // paths don't change; NA cells use the corresponding qpath + "_na" at load time.
-pub const ICON_NAMES: [&str; ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len()] = {
-    let mut names = [""; ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len()];
+pub(crate) const ICON_RAGE_RECOVERY: usize = ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len();
+pub const ICON_NAMES: [&str; ICON_RAGE_RECOVERY + 1] = {
+    let mut names = [""; ICON_RAGE_RECOVERY + 1];
     names[0] = "gfx/2d/lag";
     names[1] = "gfx/2d/net";
     let mut i = 0;
@@ -250,6 +251,7 @@ pub const ICON_NAMES: [&str; ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len()] = {
         names[ICON_COMBAT_BASE + i] = COMBAT_ICON_NAMES[i];
         i += 1;
     }
+    names[ICON_RAGE_RECOVERY] = "gfx/mp/f_icon_ragerec";
     names
 };
 
@@ -271,6 +273,9 @@ pub const ICON_ROWS: u32 = (ICON_NAMES.len() as u32 + ICON_COLUMNS - 1) / ICON_C
 
 /// Texture source id of the icon atlas in `ui.wgsl`.
 pub(in crate::ui) const ICON_TEXTURE_SOURCE: f32 = 5.0;
+/// Per-icon source tag. Kept outside the native UI shader's source range.
+/// No dynamic shader pipelines are created unless tagged quads are visible.
+pub(in crate::ui) const ICON_SHADER_SOURCE_BASE: f32 = 1024.0;
 
 /// Lazily rebuilt team-overlay icon atlas (`ui.wgsl` texture source 6).
 pub const TEAM_ICON_CELL: u32 = 64;
@@ -317,7 +322,7 @@ pub(in crate::ui) fn lagometer_pic(
         uv0,
         uv1,
         [1.0; 4],
-        ICON_TEXTURE_SOURCE,
+        ui.icon_texture_source(index),
         w,
         h,
     );
@@ -336,15 +341,15 @@ pub(in crate::ui) fn lagometer_text(
     let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
     if let Some(font) = small_font {
         let x = if item.right {
-            item.x - proportional_text_width(&item.text, font, SCALE)
+            item.x * sx - proportional_text_width(&item.text, font, SCALE) * sy
         } else {
-            item.x
+            item.x * sx
         };
-        proportional_text(
+        proportional_text_uniform(
             out,
             &item.text,
             font,
-            x * sx,
+            x,
             item.y * sy,
             SCALE,
             [1.0; 4],
@@ -356,18 +361,18 @@ pub(in crate::ui) fn lagometer_text(
         // Asset fallback only (see build_chat_history): the fixed charset at a small size.
         const GLYPH_W: f32 = 5.0;
         let x = if item.right {
-            item.x - visible_jka_chars(&item.text) as f32 * GLYPH_W
+            item.x * sx - visible_jka_chars(&item.text) as f32 * GLYPH_W * sy
         } else {
-            item.x
+            item.x * sx
         };
         fixed_charset_text(
             out,
             &item.text,
-            x * sx,
+            x,
             item.y * sy,
-            GLYPH_W * sx,
+            GLYPH_W * sy,
             8.0 * sy,
-            GLYPH_W * sx,
+            GLYPH_W * sy,
             [1.0; 4],
             true,
             w,
@@ -467,7 +472,7 @@ pub(in crate::ui) fn build_race_timer(
         let py = y * h as f32 / 480.0;
         if let Some(font) = small_font {
             // 0.78 maps the medium-font role onto the shared OCR font (see build_center_print).
-            proportional_text(
+            proportional_text_uniform(
                 out,
                 value,
                 font,
@@ -1036,6 +1041,34 @@ mod native_lagometer_icon_uv_tests {
                 assert!(vertex.uv[1] == min[1] || vertex.uv[1] == max[1]);
                 assert_eq!(vertex.textured, ICON_TEXTURE_SOURCE);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod widescreen_lagometer_tests {
+    use super::*;
+
+    #[test]
+    fn right_aligned_lagometer_numbers_keep_aspect_and_anchor() {
+        let mut glyphs = [crate::ui::ProportionalGlyph::default(); 256];
+        for glyph in &mut glyphs {
+            glyph.width = 8; glyph.height = 12; glyph.horiz_advance = 8;
+            glyph.baseline = 10; glyph.s2 = 1.0; glyph.t2 = 1.0;
+        }
+        let font = ProportionalFont { glyphs, point_size: 12, height: 12 };
+        let item = crate::lagometer::Text {
+            text: "100".into(), x: 620.0, y: 200.0, right: true,
+        };
+        for (w, h) in [(640, 480), (1920, 1080), (2560, 1080), (1920, 700)] {
+            let mut out = Vec::new();
+            lagometer_text(&mut out, &item, Some(&font), w, h);
+            let x = |v: &UiVertex| (v.position[0] + 1.0) * w as f32 * 0.5;
+            let left = out.iter().map(x).fold(f32::INFINITY, f32::min);
+            let right = out.iter().map(x).fold(f32::NEG_INFINITY, f32::max);
+            let sy = h as f32 / 480.0;
+            assert!((right - 620.0 * w as f32 / 640.0 - 1.0).abs() < 0.003);
+            assert!(((right - left) - 24.0 * 0.5 * sy - 1.0).abs() < 0.003);
         }
     }
 }

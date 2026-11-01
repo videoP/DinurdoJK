@@ -34,11 +34,26 @@ pub enum PlayerFxRequest {
         origin: [f32; 3],
         axis: [[f32; 3]; 3],
     },
+    /// Continuously presented Force power effect. `cg_fxFPS` samples its emission
+    /// per owner, independently of other players and ordinary one-shot EFX.
+    ForceEffect {
+        entity_num: u16,
+        name: &'static str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+    },
     /// An authored effect (by name) played along `dir` (vehicle muzzle flashes).
     EffectDir {
         name: String,
         origin: [f32; 3],
         dir: [f32; 3],
+    },
+    /// TaystJK CG_AddSaberBlade -> FX_PlayBoltedEffectID: preserve the
+    /// blade bolt orientation rather than approximating it from world up.
+    AuthoredBladeEffect {
+        name: String,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
     },
     /// CG_DoSaber blade presentation. The FX layer owns the view-facing geometry
     /// so authored saber shaders go through the same material path as other FX.

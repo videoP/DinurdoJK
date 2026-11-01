@@ -92,7 +92,7 @@ impl App {
         theme::row(
             ui,
             "Generate missing model LODs",
-            "Automatic LOD for both entity MD3 models and eligible map-compiled BSP model surfaces (default On). MD3s generate missing levels on a cached worker; authored _1/_2.md3 variants always take priority. BSP simplification uses separate index ranges prepared at map load. Off draws full-detail baked models while retaining authored MD3 LODs. r_bspModelLod is a separate developer A/B override.",
+            "Generate missing MD3 LODs and eligible compiled BSP-model LODs (default Off; independent of graphics presets). Authored _1/_2.md3 variants are always used. Disabled means no BSP simplification work is performed when loading a map. Enabling BSP LODs for an already loaded map takes effect on the next map load. r_bspModelLod is a separate developer A/B override.",
             theme::Reset::None,
             |ui| {
                 let mut enabled = self.video.md3_auto_lod;

@@ -344,7 +344,7 @@ pub(super) fn bmodel_pivot(map: &scene::PreparedMap, model: u32) -> Option<([f32
 fn paint_bmodel_thumbnail(ui: &mut egui::Ui, map: &scene::PreparedMap,
     model: &scene::InlineModelGeometry, bounds: ([f32; 3], [f32; 3])) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 42.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, theme::CONTROL);
+    ui.painter().rect_filled(rect, 3.0, theme::CONTROL());
     let midpoint: [f32; 3] = std::array::from_fn(|i| (bounds.0[i] + bounds.1[i]) * 0.5);
     let span = (0..3).map(|i| (bounds.1[i] - bounds.0[i]).abs())
         .fold(1.0_f32, f32::max);
@@ -366,7 +366,7 @@ fn paint_bmodel_thumbnail(ui: &mut egui::Ui, map: &scene::PreparedMap,
         let points = [project(tri[0].position), project(tri[1].position), project(tri[2].position)];
         for k in 0..3 {
             ui.painter().line_segment([points[k], points[(k + 1) % 3]],
-                egui::Stroke::new(0.65, theme::TEXT_DIM));
+                egui::Stroke::new(0.65, theme::TEXT_DIM()));
         }
     }
 }
@@ -897,7 +897,7 @@ impl App {
                 self.model_placement.editor_selected = None;
             }
             self.model_placement.editor_mouse_owned = None;
-            self.model_placement.status = "Editing — select another object, or exit explicitly".into();
+            self.model_placement.status = "Editing: select another object, or exit explicitly".into();
             return;
         }
         self.exit_map_editing();
@@ -1503,7 +1503,7 @@ impl App {
                     return;
                 }
                 if let Some(error) = &self.asset_viewer_catalog_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    ui.colored_label(theme::DANGER(), error);
                     return;
                 }
                 let query = state.search.trim().to_ascii_lowercase();
@@ -1533,22 +1533,22 @@ impl App {
                                 if kind == AssetKind::Efx {
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(60.0, 60.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL);
+                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL());
                                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                                        "▶ FX", egui::FontId::monospace(12.0), theme::TEXT_DIM);
+                                        "▶ FX", egui::FontId::monospace(12.0), theme::TEXT_DIM());
                                 } else if let Some(texture) = state.thumbnails.get(qpath) {
                                     ui.add(egui::Image::new(texture)
                                         .fit_to_exact_size(egui::vec2(60.0, 60.0)));
                                 } else {
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(60.0, 60.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL);
+                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL());
                                     if !state.thumbnails_missing.contains(qpath)
                                         && state.thumbnails_pending.insert(qpath.clone()) {
                                         image_requests.push(qpath.clone());
                                     }
                                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                                        "MD3", egui::FontId::monospace(12.0), theme::TEXT_DIM);
+                                        "MD3", egui::FontId::monospace(12.0), theme::TEXT_DIM());
                                 }
                                 ui.vertical(|ui| {
                                     ui.label(qpath.as_str());
@@ -1719,7 +1719,7 @@ impl App {
                 let screen_center = egui::pos2(size.width as f32 / pixels_per_point * 0.5,
                     size.height as f32 / pixels_per_point * 0.5);
                 painter.text(screen_center + egui::vec2(20.0, 20.0),
-                    egui::Align2::LEFT_TOP, name, egui::FontId::monospace(11.0), theme::ACCENT);
+                    egui::Align2::LEFT_TOP, name, egui::FontId::monospace(11.0), theme::ACCENT());
             }
         }
         let bounds = root.max_rect();
@@ -1758,7 +1758,7 @@ impl App {
                 PlacementKind::Fx if state.edit_mode => format!("FX EDIT   holding   {}", state.fx_selection.as_deref().unwrap_or("")),
                 PlacementKind::Fx => format!("FX PLACEMENT   {}", state.fx_selection.as_deref().unwrap_or("")),
             },
-            egui::FontId::monospace(12.0), theme::TEXT);
+            egui::FontId::monospace(12.0), theme::TEXT());
         painter.text(top + egui::vec2(12.0, 34.0), egui::Align2::LEFT_TOP,
             if let Some((_, placement)) = hovered_fx {
                 format!("Origin {:.0} {:.0} {:.0}   Pitch {:.0}°  Yaw {:.0}°  Roll {:.0}°   Delay {} ms   {} fx",
@@ -1784,7 +1784,7 @@ impl App {
                     state.angles[0], state.angles[1], state.angles[2],
                     if !state.hit_valid { "NO SURFACE" } else if state.rotating { "ROTATE" } else { "READY" })
             },
-            egui::FontId::monospace(11.0), theme::ACCENT);
+            egui::FontId::monospace(11.0), theme::ACCENT());
         painter.text(top + egui::vec2(12.0, 56.0), egui::Align2::LEFT_TOP,
             if edit_idle {
                 "Ctrl+LMB empty: ADD · LMB drag · Ctrl+drag vertical · MMB yaw/pitch · RMB local roll · Esc: Menu"
@@ -1797,7 +1797,7 @@ impl App {
             } else {
                 "LMB Place · RMB Yaw · Shift Pitch · Alt Local Roll · Tab Browser · Ctrl+Z Undo (scale locked)"
             },
-            egui::FontId::monospace(9.0), theme::TEXT_DIM);
+            egui::FontId::monospace(9.0), theme::TEXT_DIM());
     }
 }
 

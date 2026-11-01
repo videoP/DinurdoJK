@@ -1,7 +1,7 @@
 //! Sabers draw.
 use crate::cgame::player_presenter::{
     angles_to_axis, blade_angles, blade_color, is_asset_pending, model_bolt_matrix_timed,
-    saber_hand_bolt_matrix_timed,
+    saber_attachment_bolt_name, saber_hand_bolt_matrix_timed, PlayerFxRequest,
     normalize_vec3, record_pose_eval, saber_blade_fx_request, transform_jka_model_point,
     transform_jka_model_vector, Arc, ClientGameState, DynamicModelSurface, Ghoul2Animator, Instant,
     Matrix3x4, PlayerModelAsset, PlayerPresenter, PresentedEntity, SaberBladeLengthKey,
@@ -108,7 +108,6 @@ impl PlayerPresenter {
                 0usize,
                 info.saber_name.as_str(),
                 info.saber_color,
-                "*r_hand",
                 definition,
             ));
         }
@@ -117,12 +116,12 @@ impl PlayerPresenter {
                 1usize,
                 info.saber2_name.as_str(),
                 info.saber2_color,
-                "*l_hand",
                 definition,
             ));
         }
 
-        for (saber_num, saber_name, saber_color, hand_name, definition) in sabers {
+        for (saber_num, saber_name, saber_color, definition) in sabers {
+            let hand_name = saber_attachment_bolt_name(saber_num, &definition);
             let Some(hand_bolt) = saber_hand_bolt_matrix_timed(
                 &mut self.perf,
                 player_model,
@@ -283,6 +282,29 @@ impl PlayerPresenter {
                     );
                     0.0
                 };
+                // TaystJK CG_AddSaberBlade / FX_PlayBoltedEffectID: the .sab
+                // bladeEffect and bladeEffect2 are independent from noBlade.
+                // A full Ghoul2 bolt basis preserves authored particle roll.
+                let effect_name = if definition.blade_uses_second_style(blade_index) {
+                    definition.blade_effect2.as_ref()
+                } else {
+                    definition.blade_effect.as_ref()
+                };
+                if process_blades && weapon == WP_SABER && !dead && holstered < 2
+                    && !(holstered == 1 && (saber_num > 0 || blade_index > 0))
+                    && entity_alpha >= 8.0 / 255.0
+                {
+                    if let Some(name) = effect_name {
+                        let dir = dir_world;
+                        let right_model = [blade_bolt[0][1], blade_bolt[1][1], blade_bolt[2][1]];
+                        let up_model = [-blade_bolt[0][2], -blade_bolt[1][2], -blade_bolt[2][2]];
+                        let right = normalize_vec3(transform_jka_model_vector(right_model, player_axis));
+                        let up = normalize_vec3(transform_jka_model_vector(up_model, player_axis));
+                        self.fx_requests.push(PlayerFxRequest::AuthoredBladeEffect {
+                            name: name.clone(), origin: origin_world, axis: [dir, right, up],
+                        });
+                    }
+                }
                 let client_color =
                     if saber_num == 0 && self.saber_staff_multi_color && blade_index >= 1 {
                         info.saber2_color
@@ -298,7 +320,7 @@ impl PlayerPresenter {
                             Some(std::array::from_fn(|i| origin_world[i] - dir_world[i]));
                         debug.blade_length[saber_num][blade_index] = presented_length;
                         debug.blade_submitted[saber_num][blade_index] =
-                            process_blades && !definition.no_blade && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
+                            process_blades && !definition.blade_hidden(blade_index) && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
                     }
                 }
                 let secondary_style = definition.blade_style2_start > 0
@@ -329,8 +351,8 @@ impl PlayerPresenter {
                     in_flight,
                     trail_style,
                     definition.num_blades as u8,
-                    definition.no_dlight,
-                    definition.no_blade,
+                    definition.blade_no_dlight(blade_index),
+                    definition.blade_hidden(blade_index),
                     no_wall_marks,
                 ) {
                     self.fx_requests.push(request);
@@ -556,6 +578,24 @@ impl PlayerPresenter {
                 -1.0,
                 current_time,
             );
+            // CG_AddSaberBlade also submits bolted blade effects on thrown hilts.
+            if presented_length > 0.0 && entity_alpha >= 8.0 / 255.0 {
+                let effect_name = if definition.blade_uses_second_style(blade_index) {
+                    definition.blade_effect2.as_ref()
+                } else {
+                    definition.blade_effect.as_ref()
+                };
+                if let Some(name) = effect_name {
+                    let right_model = [blade_bolt[0][1], blade_bolt[1][1], blade_bolt[2][1]];
+                    let up_model = [-blade_bolt[0][2], -blade_bolt[1][2], -blade_bolt[2][2]];
+                    self.fx_requests.push(PlayerFxRequest::AuthoredBladeEffect {
+                        name: name.clone(), origin: origin_world,
+                        axis: [dir_world,
+                            normalize_vec3(transform_jka_model_vector(right_model, blade_axis)),
+                            normalize_vec3(transform_jka_model_vector(up_model, blade_axis))],
+                    });
+                }
+            }
             let client_color = if self.saber_staff_multi_color && blade_index >= 1 {
                 info.saber2_color
             } else {
@@ -569,7 +609,7 @@ impl PlayerPresenter {
                         Some(std::array::from_fn(|i| origin_world[i] - dir_world[i]));
                     debug.blade_length[0][blade_index] = presented_length;
                     debug.blade_submitted[0][blade_index] =
-                        !definition.no_blade && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
+                        !definition.blade_hidden(blade_index) && presented_length > 0.0 && entity_alpha >= 8.0 / 255.0;
                 }
             }
             let secondary_style =
@@ -600,8 +640,8 @@ impl PlayerPresenter {
                 true,
                 trail_style,
                 definition.num_blades as u8,
-                definition.no_dlight,
-                definition.no_blade,
+                definition.blade_no_dlight(blade_index),
+                definition.blade_hidden(blade_index),
                 no_wall_marks,
             ) {
                 self.fx_requests.push(request);

@@ -305,7 +305,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
             fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None,
                 instances: Arc::new(vec![FxGpuSpriteInstance::zeroed(); 2]),
-                blob_shadow: false,
+                blob_shadow: false, lightning: false,
             }),
             texture: None,
             alpha_mode: DynamicModelAlphaMode::AdditiveOne,

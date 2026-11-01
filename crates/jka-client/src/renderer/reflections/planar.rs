@@ -3,7 +3,7 @@ use crate::renderer::{
     aabb_intersects_clip_frustum, batch_area_visible, effective_area_mask, scene, Camera, CullMode,
     GpuVertex, Mat4, PlanarReflectionMode, PlanarReflectionResources, PlanarReflectionUniform,
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, PvsMode, ReflectionQuality,
-    Renderer, Vec2, Vec3, Vec4, WorldBatch, WorldGpu, DEPTH_FORMAT, PLANAR_AUTHORED_SCALE_DIVISOR,
+    Renderer, Vec2, Vec3, Vec4, WorldBatch, WorldGpu, depth_format, PLANAR_AUTHORED_SCALE_DIVISOR,
     PLANAR_ENVIRONMENT_SCALE_DIVISOR, PLANAR_REFLECTION_HYSTERESIS, PLANAR_REFLECTION_SLOTS,
 };
 use wgpu::util::DeviceExt;
@@ -817,7 +817,7 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });

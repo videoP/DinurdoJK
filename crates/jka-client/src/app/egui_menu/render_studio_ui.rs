@@ -1,58 +1,91 @@
 //! Render Studio's editor chrome: panes, sections, property rows and vector
 //! icons. Layout follows NLE conventions (Premiere / Resolve: media browser,
 //! program viewer with a transport bar, inspector, timeline with a fixed
-//! ruler). Colors follow the console and the neon main menu: indigo asphalt
-//! surfaces, neon cyan as the primary accent, magenta as the secondary.
+//! ruler). Colors come from `crate::palette`: warm Stone Brown surfaces,
+//! Celadon as the primary accent, Smoky Rose as the secondary.
 use self::palette as theme;
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui};
 
 /// Studio palette. Same token names as the global menu theme, so Studio
-/// files import it as `theme`. Lifted indigo surfaces keep the editor readable;
-/// accents come from the console and the neon menu gas colors.
+/// files import it as `theme`; a shade darker than the menus so footage in
+/// the viewer stays the brightest thing on screen.
 pub(super) mod palette {
+    use crate::palette::{mix, Scheme, CELADON, INK, SILVER, SMOKY_ROSE, STONE_BROWN, WHITE_SMOKE};
     use egui::Color32;
-    const fn rgb(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
-    /// Editor background between panes.
-    pub(in crate::app::egui_menu) const CHROME: Color32 = rgb(15, 18, 28);
-    pub(in crate::app::egui_menu) const SURFACE: Color32 = rgb(23, 27, 42);
-    pub(in crate::app::egui_menu) const SURFACE_ALT: Color32 = rgb(30, 35, 53);
-    pub(in crate::app::egui_menu) const INSET: Color32 = rgb(17, 21, 34);
-    pub(in crate::app::egui_menu) const CONTROL: Color32 = rgb(35, 42, 64);
-    pub(in crate::app::egui_menu) const CONTROL_HOVER: Color32 = rgb(46, 56, 82);
-    /// Console suggestion highlight: deep teal.
-    pub(in crate::app::egui_menu) const CONTROL_SELECTED: Color32 = rgb(24, 76, 100);
-    pub(in crate::app::egui_menu) const HAIRLINE: Color32 = rgb(39, 46, 66);
-    pub(in crate::app::egui_menu) const LINE: Color32 = rgb(48, 58, 86);
-    pub(in crate::app::egui_menu) const LINE_STRONG: Color32 = rgb(63, 76, 112);
-    /// CON_CYAN / neon Primary.
-    pub(in crate::app::egui_menu) const ACCENT: Color32 = rgb(71, 219, 242);
-    pub(in crate::app::egui_menu) const ACCENT_DEEP: Color32 = rgb(13, 92, 116);
-    pub(in crate::app::egui_menu) const ACCENT_HOVER: Color32 = rgb(19, 122, 150);
-    /// CON_MAGENTA / neon Hero: secondary accent (title ticks, playhead).
-    pub(in crate::app::egui_menu) const MAGENTA: Color32 = rgb(255, 77, 143);
-    pub(in crate::app::egui_menu) const TEXT: Color32 = rgb(214, 226, 240);
-    pub(in crate::app::egui_menu) const TEXT_BRIGHT: Color32 = rgb(242, 247, 255);
-    pub(in crate::app::egui_menu) const TEXT_DIM: Color32 = rgb(140, 162, 192);
-    pub(in crate::app::egui_menu) const TEXT_FAINT: Color32 = rgb(108, 128, 160);
-    pub(in crate::app::egui_menu) const TEXT_DISABLED: Color32 = rgb(74, 85, 110);
-    /// CON_AMBER / neon Utility.
-    pub(in crate::app::egui_menu) const WARNING: Color32 = rgb(255, 184, 71);
-    pub(in crate::app::egui_menu) const DANGER: Color32 = rgb(255, 84, 112);
+    const fn rgb(c: [u8; 3]) -> Color32 { Color32::from_rgb(c[0], c[1], c[2]) }
+    const fn px(r: u8, g: u8, b: u8) -> [u8; 3] { [r, g, b] }
+
+    /// One token: its Classic value (indigo asphalt, neon cyan and magenta)
+    /// and its Celadon value (Stone Brown, Celadon, Smoky Rose).
+    macro_rules! tokens {
+        ($($(#[$doc:meta])* $name:ident => $classic:expr, $celadon:expr;)*) => {
+            $(
+                $(#[$doc])*
+                #[allow(non_snake_case)]
+                pub(in crate::app::egui_menu) fn $name() -> Color32 {
+                    match crate::palette::active() {
+                        Scheme::Classic => rgb($classic),
+                        Scheme::Celadon => rgb($celadon),
+                    }
+                }
+            )*
+        };
+    }
+
+    tokens! {
+        /// Editor background between panes.
+        CHROME => px(15, 18, 28), mix(INK, [0, 0, 0], 0.15);
+        SURFACE => px(23, 27, 42), mix(INK, STONE_BROWN, 0.14);
+        SURFACE_ALT => px(30, 35, 53), mix(INK, STONE_BROWN, 0.26);
+        INSET => px(17, 21, 34), mix(INK, [0, 0, 0], 0.30);
+        CONTROL => px(35, 42, 64), mix(INK, STONE_BROWN, 0.40);
+        CONTROL_HOVER => px(46, 56, 82), mix(INK, STONE_BROWN, 0.60);
+        /// Selected rows and clips: deep teal (Classic) or deep Celadon.
+        CONTROL_SELECTED => px(24, 76, 100), mix(INK, CELADON, 0.30);
+        HAIRLINE => px(39, 46, 66), mix(INK, STONE_BROWN, 0.36);
+        LINE => px(48, 58, 86), mix(INK, STONE_BROWN, 0.62);
+        LINE_STRONG => px(63, 76, 112), STONE_BROWN;
+        /// CON_CYAN / neon Primary, or Celadon.
+        ACCENT => px(71, 219, 242), CELADON;
+        ACCENT_DEEP => px(13, 92, 116), mix(CELADON, INK, 0.55);
+        ACCENT_HOVER => px(19, 122, 150), mix(CELADON, INK, 0.35);
+        /// Secondary accent (title ticks, playhead): CON_MAGENTA / neon Hero,
+        /// or Smoky Rose lifted for contrast.
+        MAGENTA => px(255, 77, 143), mix(SMOKY_ROSE, WHITE_SMOKE, 0.25);
+        TEXT => px(214, 226, 240), mix(WHITE_SMOKE, SILVER, 0.25);
+        TEXT_BRIGHT => px(242, 247, 255), WHITE_SMOKE;
+        TEXT_DIM => px(140, 162, 192), SILVER;
+        TEXT_FAINT => px(108, 128, 160), mix(SILVER, INK, 0.30);
+        TEXT_DISABLED => px(74, 85, 110), mix(SILVER, INK, 0.55);
+        /// CON_AMBER / neon Utility.
+        WARNING => px(255, 184, 71), [0xE6, 0xC2, 0x6E];
+        DANGER => px(255, 84, 112), mix(SMOKY_ROSE, WHITE_SMOKE, 0.30);
+        LANE_A => px(28, 33, 49), px(0x2A, 0x26, 0x21);
+        LANE_B => px(23, 27, 43), px(0x22, 0x1F, 0x1B);
+    }
 }
 
 /// Editor background; shows as the thin gutters between panes.
-pub(super) const GUTTER: Color32 = theme::CHROME;
-pub(super) const PANE: Color32 = theme::SURFACE;
-pub(super) const PANE_HEADER: Color32 = theme::SURFACE_ALT;
+#[allow(non_snake_case)]
+pub(super) fn GUTTER() -> Color32 { theme::CHROME() }
+#[allow(non_snake_case)]
+pub(super) fn PANE() -> Color32 { theme::SURFACE() }
+#[allow(non_snake_case)]
+pub(super) fn PANE_HEADER() -> Color32 { theme::SURFACE_ALT() }
 /// Recessed wells: viewer letterbox, ruler, track lanes, text fields.
-pub(super) const WELL: Color32 = theme::INSET;
-pub(super) const LANE_A: Color32 = Color32::from_rgb(28, 33, 49);
-pub(super) const LANE_B: Color32 = Color32::from_rgb(23, 27, 43);
-pub(super) const PLAYHEAD: Color32 = theme::MAGENTA;
+#[allow(non_snake_case)]
+pub(super) fn WELL() -> Color32 { theme::INSET() }
+#[allow(non_snake_case)]
+pub(super) fn LANE_A() -> Color32 { theme::LANE_A() }
+#[allow(non_snake_case)]
+pub(super) fn LANE_B() -> Color32 { theme::LANE_B() }
+#[allow(non_snake_case)]
+pub(super) fn PLAYHEAD() -> Color32 { theme::MAGENTA() }
 pub(super) const DEMO: Color32 = Color32::from_rgb(168, 124, 255);
 pub(super) const AUDIO: Color32 = Color32::from_rgb(78, 226, 168);
 pub(super) const SPEED: Color32 = Color32::from_rgb(255, 104, 196);
-pub(super) const CAMERA: Color32 = theme::WARNING;
+#[allow(non_snake_case)]
+pub(super) fn CAMERA() -> Color32 { theme::WARNING() }
 pub(super) const SCENE: Color32 = Color32::from_rgb(110, 106, 214);
 pub(super) const AXIS: [Color32; 3] = [
     Color32::from_rgb(255, 92, 112),
@@ -78,7 +111,7 @@ pub(super) const LANE_H: f32 = 34.0;
 /// Darkened clip body for a track color; the saturated color is kept for the
 /// clip's top band, so clips read by type without glaring.
 pub(super) fn clip_body(color: Color32, selected: bool) -> Color32 {
-    WELL.lerp_to_gamma(color, if selected { 0.62 } else { 0.40 })
+    WELL().lerp_to_gamma(color, if selected { 0.62 } else { 0.40 })
 }
 
 /// Studio panes use slightly rounded controls and wrapped text. Called once
@@ -114,26 +147,26 @@ fn widget(fill: Color32, stroke: Color32, text: Color32) -> egui::style::WidgetV
 
 /// Console / neon palette for every egui widget inside a Studio scope.
 pub(super) fn apply_palette(v: &mut egui::Visuals) {
-    v.panel_fill = theme::SURFACE;
-    v.window_fill = theme::SURFACE;
-    v.window_stroke = Stroke::new(1.0, theme::LINE_STRONG);
-    v.extreme_bg_color = WELL;
-    v.faint_bg_color = theme::SURFACE_ALT;
-    v.code_bg_color = WELL;
-    v.hyperlink_color = theme::ACCENT;
-    v.warn_fg_color = theme::WARNING;
-    v.error_fg_color = theme::DANGER;
-    v.weak_text_color = Some(theme::TEXT_FAINT);
-    v.selection.bg_fill = theme::CONTROL_SELECTED;
-    v.selection.stroke = Stroke::new(1.0, theme::ACCENT);
-    v.widgets.noninteractive = widget(theme::SURFACE, theme::HAIRLINE, theme::TEXT_DIM);
-    v.widgets.inactive = widget(theme::CONTROL, theme::LINE, theme::TEXT_DIM);
-    v.widgets.hovered = widget(theme::CONTROL_HOVER, theme::LINE_STRONG, theme::TEXT);
-    v.widgets.active = widget(theme::CONTROL_SELECTED, theme::ACCENT, theme::TEXT_BRIGHT);
-    v.widgets.open = widget(theme::CONTROL_HOVER, theme::LINE_STRONG, theme::TEXT);
+    v.panel_fill = theme::SURFACE();
+    v.window_fill = theme::SURFACE();
+    v.window_stroke = Stroke::new(1.0, theme::LINE_STRONG());
+    v.extreme_bg_color = WELL();
+    v.faint_bg_color = theme::SURFACE_ALT();
+    v.code_bg_color = WELL();
+    v.hyperlink_color = theme::ACCENT();
+    v.warn_fg_color = theme::WARNING();
+    v.error_fg_color = theme::DANGER();
+    v.weak_text_color = Some(theme::TEXT_FAINT());
+    v.selection.bg_fill = theme::CONTROL_SELECTED();
+    v.selection.stroke = Stroke::new(1.0, theme::ACCENT());
+    v.widgets.noninteractive = widget(theme::SURFACE(), theme::HAIRLINE(), theme::TEXT_DIM());
+    v.widgets.inactive = widget(theme::CONTROL(), theme::LINE(), theme::TEXT_DIM());
+    v.widgets.hovered = widget(theme::CONTROL_HOVER(), theme::LINE_STRONG(), theme::TEXT());
+    v.widgets.active = widget(theme::CONTROL_SELECTED(), theme::ACCENT(), theme::TEXT_BRIGHT());
+    v.widgets.open = widget(theme::CONTROL_HOVER(), theme::LINE_STRONG(), theme::TEXT());
     // Slider rails and check boxes read inactive / hovered bg_fill.
-    v.widgets.inactive.bg_fill = theme::LINE;
-    v.widgets.hovered.bg_fill = theme::LINE_STRONG;
+    v.widgets.inactive.bg_fill = theme::LINE();
+    v.widgets.hovered.bg_fill = theme::LINE_STRONG();
 }
 
 /// Popup / combo style with the Studio palette (popups otherwise take the
@@ -177,7 +210,7 @@ pub(super) fn settings_popup<R>(button:&egui::Response,open:&mut bool,content:im
 /// Console-style neon edge: a cyan-to-magenta gradient strip.
 pub(super) fn neon_edge(p: &egui::Painter, rect: Rect) {
     let mut mesh = egui::Mesh::default();
-    let (l, r) = (theme::ACCENT.gamma_multiply(0.9), theme::MAGENTA.gamma_multiply(0.9));
+    let (l, r) = (theme::ACCENT().gamma_multiply(0.9), theme::MAGENTA().gamma_multiply(0.9));
     mesh.colored_vertex(rect.left_top(), l);
     mesh.colored_vertex(rect.right_top(), r);
     mesh.colored_vertex(rect.right_bottom(), r);
@@ -453,23 +486,23 @@ pub(super) fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, active: bool, 
     let (rect, r) = ui.allocate_exact_size(vec2(26.0, 26.0), if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     let fill = if active {
-        theme::CONTROL_SELECTED
+        theme::CONTROL_SELECTED()
     } else if enabled && r.is_pointer_button_down_on() {
-        theme::CONTROL_HOVER
+        theme::CONTROL_HOVER()
     } else if enabled && r.hovered() {
-        theme::CONTROL
+        theme::CONTROL()
     } else {
         Color32::TRANSPARENT
     };
     p.rect_filled(rect, 3.0, fill);
     let color = if !enabled {
-        theme::TEXT_DISABLED
+        theme::TEXT_DISABLED()
     } else if active {
-        theme::ACCENT
+        theme::ACCENT()
     } else if r.hovered() {
-        theme::TEXT
+        theme::TEXT()
     } else {
-        theme::TEXT_DIM
+        theme::TEXT_DIM()
     };
     paint_icon(p, rect.center(), icon, color);
     r.on_hover_text(tip)
@@ -487,7 +520,7 @@ pub(super) fn button(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: ButtonK
 pub(super) fn button_sized(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: ButtonKind,
     enabled: bool, width: Option<f32>) -> egui::Response {
     let font = FontId::proportional(12.5);
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT());
     let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
     let natural = galley.size().x + icon_w + 20.0;
     let w = width.unwrap_or(natural).max(26.0);
@@ -496,30 +529,30 @@ pub(super) fn button_sized(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: B
     let pressed = enabled && r.is_pointer_button_down_on();
     let (fill, stroke, text) = match kind {
         ButtonKind::Primary => (
-            if pressed { theme::ACCENT_DEEP } else if hovered { theme::ACCENT_HOVER } else { theme::ACCENT_DEEP },
-            if hovered { theme::ACCENT } else { theme::ACCENT.gamma_multiply(0.55) },
-            theme::TEXT_BRIGHT,
+            if pressed { theme::ACCENT_DEEP() } else if hovered { theme::ACCENT_HOVER() } else { theme::ACCENT_DEEP() },
+            if hovered { theme::ACCENT() } else { theme::ACCENT().gamma_multiply(0.55) },
+            theme::TEXT_BRIGHT(),
         ),
         ButtonKind::Danger => (
-            if hovered { Color32::from_rgb(70, 18, 38) } else { theme::CONTROL },
-            if hovered { theme::DANGER } else { theme::LINE },
-            theme::DANGER,
+            if hovered { Color32::from_rgb(0x5A, 0x34, 0x2F) } else { theme::CONTROL() },
+            if hovered { theme::DANGER() } else { theme::LINE() },
+            theme::DANGER(),
         ),
         ButtonKind::Ghost => (
-            if hovered { theme::CONTROL } else { Color32::TRANSPARENT },
-            if hovered { theme::LINE } else { Color32::TRANSPARENT },
-            if hovered { theme::TEXT } else { theme::TEXT_DIM },
+            if hovered { theme::CONTROL() } else { Color32::TRANSPARENT },
+            if hovered { theme::LINE() } else { Color32::TRANSPARENT },
+            if hovered { theme::TEXT() } else { theme::TEXT_DIM() },
         ),
         ButtonKind::Normal => (
-            if pressed { theme::CONTROL_SELECTED } else if hovered { theme::CONTROL_HOVER } else { theme::CONTROL },
-            if hovered { theme::LINE_STRONG } else { theme::LINE },
-            if hovered { theme::TEXT } else { theme::TEXT_DIM },
+            if pressed { theme::CONTROL_SELECTED() } else if hovered { theme::CONTROL_HOVER() } else { theme::CONTROL() },
+            if hovered { theme::LINE_STRONG() } else { theme::LINE() },
+            if hovered { theme::TEXT() } else { theme::TEXT_DIM() },
         ),
     };
     let (fill, stroke, text) = if enabled {
         (fill, stroke, text)
     } else {
-        (theme::CONTROL.gamma_multiply(0.6), theme::HAIRLINE, theme::TEXT_DISABLED)
+        (theme::CONTROL().gamma_multiply(0.6), theme::HAIRLINE(), theme::TEXT_DISABLED())
     };
     let p = ui.painter();
     p.rect_filled(rect, 3.0, fill);
@@ -560,33 +593,33 @@ pub(super) fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         r.mark_changed();
     }
     let t = ui.ctx().animate_bool(r.id, *on);
-    let track = theme::LINE.lerp_to_gamma(theme::ACCENT_DEEP, t);
+    let track = theme::LINE().lerp_to_gamma(theme::ACCENT_DEEP(), t);
     let p = ui.painter();
     p.rect_filled(rect, 8.0, if r.hovered() { track.gamma_multiply(1.25) } else { track });
     let knob = pos2(egui::lerp(rect.left() + 8.0..=rect.right() - 8.0, t), rect.center().y);
-    p.circle_filled(knob, 5.5, if *on { theme::TEXT } else { theme::TEXT_FAINT });
+    p.circle_filled(knob, 5.5, if *on { theme::TEXT() } else { theme::TEXT_FAINT() });
     r
 }
 
 // ----------------------------------------------------------------- panes --
 
 pub(super) fn paint_pane(p: &egui::Painter, rect: Rect) {
-    p.rect_filled(rect, 2.0, PANE);
+    p.rect_filled(rect, 2.0, PANE());
 }
 
 /// Paints a pane header strip with its caption. Returns the rectangle to the
 /// right of the caption, for tabs / tools laid out by the caller.
 pub(super) fn pane_header(p: &egui::Painter, rect: Rect, title: &str) -> Rect {
-    p.rect_filled(rect, egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, PANE_HEADER);
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+    p.rect_filled(rect, egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, PANE_HEADER());
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::HAIRLINE()));
     if title.is_empty() {
         return rect.shrink2(vec2(6.0, 0.0));
     }
     // Magenta tick before the caption, as on the console title bar.
-    p.rect_filled(Rect::from_center_size(pos2(rect.left() + PAD + 1.5, rect.center().y), vec2(3.0, 13.0)), 1.0, theme::MAGENTA);
-    let galley = p.layout_no_wrap(title.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM);
+    p.rect_filled(Rect::from_center_size(pos2(rect.left() + PAD + 1.5, rect.center().y), vec2(3.0, 13.0)), 1.0, theme::MAGENTA());
+    let galley = p.layout_no_wrap(title.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM());
     let width = galley.size().x;
-    p.galley(pos2(rect.left() + PAD + 9.0, rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_DIM);
+    p.galley(pos2(rect.left() + PAD + 9.0, rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_DIM());
     Rect::from_min_max(pos2(rect.left() + PAD + 9.0 + width + 12.0, rect.top()), pos2(rect.right() - 4.0, rect.bottom()))
 }
 
@@ -606,7 +639,7 @@ pub(super) fn divider(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 9.0), Sense::hover());
     ui.painter().line_segment(
         [pos2(rect.left(), rect.center().y), pos2(rect.right(), rect.center().y)],
-        Stroke::new(1.0, theme::HAIRLINE),
+        Stroke::new(1.0, theme::HAIRLINE()),
     );
 }
 
@@ -620,9 +653,9 @@ pub(super) fn inspector_title(ui: &mut Ui, color: Color32, kind: &str, title: &s
         ui.painter().rect_filled(sw, 2.0, color);
         ui.label(egui::RichText::new(kind.to_ascii_uppercase()).size(10.5).color(color).strong());
     });
-    ui.add(egui::Label::new(egui::RichText::new(title).size(15.5).color(theme::TEXT)).truncate());
+    ui.add(egui::Label::new(egui::RichText::new(title).size(15.5).color(theme::TEXT())).truncate());
     if !detail.is_empty() {
-        ui.add(egui::Label::new(egui::RichText::new(detail).size(11.5).color(theme::TEXT_FAINT)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(detail).size(11.5).color(theme::TEXT_FAINT())).truncate());
     }
     ui.add_space(4.0);
 }
@@ -639,16 +672,16 @@ pub(super) fn section<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug
     }
     let open = state.is_open();
     let p = ui.painter();
-    p.rect_filled(rect, 2.0, if r.hovered() { theme::CONTROL } else { PANE_HEADER });
+    p.rect_filled(rect, 2.0, if r.hovered() { theme::CONTROL() } else { PANE_HEADER() });
     paint_icon(p, pos2(rect.left() + 11.0, rect.center().y),
-        if open { Icon::ChevronDown } else { Icon::ChevronRight }, theme::TEXT_FAINT);
+        if open { Icon::ChevronDown } else { Icon::ChevronRight }, theme::TEXT_FAINT());
     p.with_clip_rect(rect.shrink(2.0)).text(pos2(rect.left() + 22.0, rect.center().y), Align2::LEFT_CENTER,
         title.to_ascii_uppercase(), FontId::proportional(11.0),
-        if r.hovered() { theme::TEXT } else { theme::TEXT_DIM });
+        if r.hovered() { theme::TEXT() } else { theme::TEXT_DIM() });
     if let Some(help) = help {
         let icon = Rect::from_center_size(pos2(rect.right() - 13.0, rect.center().y), vec2(18.0, 18.0));
         let hr = ui.interact(icon, id.with("help"), Sense::hover());
-        paint_icon(ui.painter(), icon.center(), Icon::Help, if hr.hovered() { theme::ACCENT } else { theme::TEXT_FAINT });
+        paint_icon(ui.painter(), icon.center(), Icon::Help, if hr.hovered() { theme::ACCENT() } else { theme::TEXT_FAINT() });
         hr.on_hover_text(help);
     }
     state.store(ui.ctx());
@@ -676,10 +709,10 @@ pub(super) fn prop_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) ->
     ui.horizontal(|ui| {
         ui.set_min_height(ROW_H);
         let (rect, r) = ui.allocate_exact_size(vec2(lw, ROW_H), Sense::hover());
-        let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(12.0), theme::TEXT_DIM);
+        let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(12.0), theme::TEXT_DIM());
         let clipped = galley.size().x > rect.width();
         ui.painter().with_clip_rect(rect).galley(
-            pos2(rect.left(), rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_DIM);
+            pos2(rect.left(), rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_DIM());
         if clipped {
             r.on_hover_text(label);
         }
@@ -693,7 +726,7 @@ pub(super) fn prop_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) ->
 
 pub(super) fn prop_value(ui: &mut Ui, label: &str, value: &str) {
     prop_row(ui, label, |ui| {
-        ui.add(egui::Label::new(egui::RichText::new(value).size(12.0).color(theme::TEXT)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(value).size(12.0).color(theme::TEXT())).truncate());
     });
 }
 
@@ -724,7 +757,7 @@ pub(super) fn prop_combo<T: PartialEq + Clone>(ui: &mut Ui, label: &str, id: imp
 pub(super) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, value: &mut T,
     options: &[(T, &str)]) -> bool {
     let before = value.clone();
-    let current = options.iter().find(|(v, _)| v == value).map_or("—", |(_, l)| *l);
+    let current = options.iter().find(|(v, _)| v == value).map_or("-", |(_, l)| *l);
     combo_box(id)
         .width(ui.available_width())
         .wrap_mode(egui::TextWrapMode::Truncate)
@@ -764,8 +797,8 @@ pub(super) fn segmented<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
     let h = 24.0;
     let (rect, base) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let p = ui.painter().clone();
-    p.rect_filled(rect, 3.0, WELL);
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+    p.rect_filled(rect, 3.0, WELL());
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
     let n = options.len().max(1) as f32;
     let cell = rect.width() / n;
     let mut changed = false;
@@ -774,19 +807,19 @@ pub(super) fn segmented<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
         let resp = ui.interact(r, base.id.with(i), if ui.is_enabled() { Sense::click() } else { Sense::hover() });
         let selected = v == value;
         let fill = if selected {
-            theme::CONTROL_SELECTED
+            theme::CONTROL_SELECTED()
         } else if resp.hovered() && ui.is_enabled() {
-            theme::CONTROL
+            theme::CONTROL()
         } else {
             Color32::TRANSPARENT
         };
         p.rect_filled(r, 2.0, fill);
         let color = if !ui.is_enabled() {
-            theme::TEXT_DISABLED
+            theme::TEXT_DISABLED()
         } else if selected {
-            theme::TEXT
+            theme::TEXT()
         } else {
-            theme::TEXT_DIM
+            theme::TEXT_DIM()
         };
         p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.0), color);
         if resp.clicked() && !selected {
@@ -805,7 +838,7 @@ pub(super) fn prop_segmented<T: PartialEq + Clone>(ui: &mut Ui, label: &str, val
 /// Faint wrapped note. Reserve for state the user must know right now;
 /// background explanations belong in a section's (?) help.
 pub(super) fn hint(ui: &mut Ui, text: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::TEXT_FAINT)).wrap());
+    ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::TEXT_FAINT())).wrap());
 }
 
 /// Callout with a colored left bar (warnings, blocked states).
@@ -814,7 +847,7 @@ pub(super) fn callout(ui: &mut Ui, text: &str, color: Color32) {
         .inner_margin(egui::Margin { left: 10, right: 8, top: 6, bottom: 6 });
     let r = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::TEXT_DIM)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::TEXT_DIM())).wrap());
     }).response;
     ui.painter().rect_filled(Rect::from_min_size(r.rect.left_top(), vec2(3.0, r.rect.height())), 1.0, color);
 }
@@ -826,7 +859,7 @@ pub(super) fn tab_strip<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
     let h = 28.0;
     let (rect, base) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let p = ui.painter().clone();
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::LINE));
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::LINE()));
     let cell = rect.width() / options.len().max(1) as f32;
     let mut changed = false;
     for (i, (v, label)) in options.iter().enumerate() {
@@ -834,13 +867,13 @@ pub(super) fn tab_strip<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
         let resp = ui.interact(r, base.id.with(i), Sense::click());
         let selected = v == value;
         if resp.hovered() && !selected {
-            p.rect_filled(r.shrink2(vec2(1.0, 3.0)), 3.0, theme::CONTROL);
+            p.rect_filled(r.shrink2(vec2(1.0, 3.0)), 3.0, theme::CONTROL());
         }
-        let color = if selected { theme::TEXT } else if resp.hovered() { theme::TEXT_DIM } else { theme::TEXT_FAINT };
+        let color = if selected { theme::TEXT() } else if resp.hovered() { theme::TEXT_DIM() } else { theme::TEXT_FAINT() };
         p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.0), color);
         if selected {
             p.rect_filled(Rect::from_min_max(pos2(r.left() + 6.0, r.bottom() - 2.0), pos2(r.right() - 6.0, r.bottom())),
-                1.0, theme::ACCENT);
+                1.0, theme::ACCENT());
         }
         if resp.clicked() && !selected {
             *value = v.clone();
@@ -854,19 +887,19 @@ pub(super) fn tab_strip<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
 pub(super) fn search_field(ui: &mut Ui, text: &mut String, hint_text: &str) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
     // Fill first: the text edit paints over it, the border and icons after.
-    ui.painter().rect_filled(rect, 3.0, WELL);
+    ui.painter().rect_filled(rect, 3.0, WELL());
     let inner = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top()),
         pos2(rect.right() - if text.is_empty() { 6.0 } else { 24.0 }, rect.bottom()));
     let r = ui.put(inner, egui::TextEdit::singleline(text).frame(egui::Frame::NONE).hint_text(hint_text)
         .vertical_align(egui::Align::Center).desired_width(inner.width()));
     let focused = r.has_focus();
     let p = ui.painter();
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, if focused { theme::ACCENT_DEEP } else { theme::LINE }), egui::StrokeKind::Inside);
-    paint_icon(p, pos2(rect.left() + 13.0, rect.center().y), Icon::Search, theme::TEXT_FAINT);
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0, if focused { theme::ACCENT_DEEP() } else { theme::LINE() }), egui::StrokeKind::Inside);
+    paint_icon(p, pos2(rect.left() + 13.0, rect.center().y), Icon::Search, theme::TEXT_FAINT());
     if !text.is_empty() {
         let clear = Rect::from_center_size(pos2(rect.right() - 12.0, rect.center().y), vec2(18.0, 18.0));
         let c = ui.interact(clear, r.id.with("clear"), Sense::click());
-        paint_icon(ui.painter(), clear.center(), Icon::Close, if c.hovered() { theme::TEXT } else { theme::TEXT_FAINT });
+        paint_icon(ui.painter(), clear.center(), Icon::Close, if c.hovered() { theme::TEXT() } else { theme::TEXT_FAINT() });
         if c.clicked() {
             text.clear();
         }
@@ -880,9 +913,9 @@ pub(super) fn list_row(ui: &mut Ui, icon: Icon, tint: Color32, title: &str, meta
     let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), sense);
     let p = ui.painter();
     let fill = if selected {
-        theme::CONTROL_SELECTED
+        theme::CONTROL_SELECTED()
     } else if r.hovered() {
-        theme::CONTROL
+        theme::CONTROL()
     } else {
         Color32::TRANSPARENT
     };
@@ -891,21 +924,21 @@ pub(super) fn list_row(ui: &mut Ui, icon: Icon, tint: Color32, title: &str, meta
     let meta_w = if meta.is_empty() {
         0.0
     } else {
-        let g = p.layout_no_wrap(meta.to_owned(), FontId::proportional(11.0), theme::TEXT_FAINT);
+        let g = p.layout_no_wrap(meta.to_owned(), FontId::proportional(11.0), theme::TEXT_FAINT());
         let w = g.size().x;
-        p.galley(pos2(rect.right() - 8.0 - w, rect.center().y - g.size().y * 0.5), g, theme::TEXT_FAINT);
+        p.galley(pos2(rect.right() - 8.0 - w, rect.center().y - g.size().y * 0.5), g, theme::TEXT_FAINT());
         w + 12.0
     };
     let text_rect = Rect::from_min_max(pos2(rect.left() + 30.0, rect.top()), pos2(rect.right() - 6.0 - meta_w, rect.bottom()));
     p.with_clip_rect(text_rect).text(pos2(text_rect.left(), rect.center().y), Align2::LEFT_CENTER, title,
-        FontId::proportional(12.5), if r.hovered() || selected { theme::TEXT } else { theme::TEXT_DIM });
+        FontId::proportional(12.5), if r.hovered() || selected { theme::TEXT() } else { theme::TEXT_DIM() });
     r
 }
 
 /// Small caps group label inside a browser list.
 pub(super) fn group_label(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(text.to_ascii_uppercase()).size(10.5).color(theme::TEXT_FAINT).strong());
+    ui.label(egui::RichText::new(text.to_ascii_uppercase()).size(10.5).color(theme::TEXT_FAINT()).strong());
 }
 
 // ------------------------------------------------------------- overlays --
@@ -921,12 +954,12 @@ pub(super) fn overlay_pill(p: &egui::Painter, anchor: Pos2, align: Align2, text:
 
 /// Paint the shared empty-state chrome into a caller-sized card.
 fn empty_state_card(p: &egui::Painter, card: Rect, icon: Icon, title: &str, detail: &str) {
-    p.rect_filled(card, 6.0, PANE.gamma_multiply(0.94));
-    p.rect_stroke(card, 6.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
-    paint_icon(p, card.center_top() + vec2(0.0, 20.0), icon, theme::TEXT_DIM);
-    p.text(card.center_top() + vec2(0.0, 44.0), Align2::CENTER_CENTER, title, FontId::proportional(14.0), theme::TEXT);
-    let galley = p.layout(detail.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM, card.width() - 28.0);
-    p.galley(pos2(card.center().x - galley.size().x * 0.5, card.top() + 58.0), galley, theme::TEXT_DIM);
+    p.rect_filled(card, 6.0, PANE().gamma_multiply(0.94));
+    p.rect_stroke(card, 6.0, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
+    paint_icon(p, card.center_top() + vec2(0.0, 20.0), icon, theme::TEXT_DIM());
+    p.text(card.center_top() + vec2(0.0, 44.0), Align2::CENTER_CENTER, title, FontId::proportional(14.0), theme::TEXT());
+    let galley = p.layout(detail.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM(), card.width() - 28.0);
+    p.galley(pos2(card.center().x - galley.size().x * 0.5, card.top() + 58.0), galley, theme::TEXT_DIM());
 }
 
 /// Centered two-line empty state.
@@ -942,7 +975,7 @@ pub(super) fn loading_state(ui: &mut Ui, viewport: Rect, icon: Icon, title: &str
     let painter = ui.painter().with_clip_rect(viewport);
     let card_width = (viewport.width().min(440.0) - 24.0).max(80.0);
     let detail_height = painter.layout(detail.to_owned(), FontId::proportional(11.5),
-        theme::TEXT_DIM, (card_width - 28.0).max(1.0)).size().y;
+        theme::TEXT_DIM(), (card_width - 28.0).max(1.0)).size().y;
     let bar_top = 58.0 + detail_height + 12.0;
     let card_height = (bar_top + 22.0 + 14.0).max(132.0);
     let card = Rect::from_center_size(viewport.center(), vec2(card_width, card_height));

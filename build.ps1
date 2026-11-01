@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [switch]$Check,
@@ -62,8 +62,8 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 # Build modes ---------------------------------------------------------------
 # (no flag)  Cargo 'release' profile: fat LTO, codegen-units=1. Use it for final FPS
 #            numbers and shipping. A one-line change costs ~6.5 min (the LTO step).
-# -Fast      Cargo 'fast' profile: ThinLTO + incremental. ~1 min per change and
-#            about 2% below release FPS; fine for day-to-day FPS checks.
+# -Fast      Cargo 'fast' profile: ThinLTO with persistent incremental compilation.
+#            Keeps cached local/path crate outputs for faster small edits.
 # The fast profile keeps its own target\fast cache (see Cargo.toml), so switching
 # modes never recompiles every dependency. -Fast copies the exe, .pdb and
 # runtime DLLs into target\release, where the base folder lives, so the game is
@@ -87,6 +87,10 @@ $runtimeDirectory = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInva
 $executable = Join-Path $runtimeDirectory 'DinurdoJK.exe'
 $previousExecutable = "$executable.prev"
 
+# Cache reporter is read-only; it never deletes or truncates build artifacts.
+. (Join-Path $PSScriptRoot 'scripts\build-cache-ntfs.ps1')
+. (Join-Path $PSScriptRoot 'scripts\build-cache-report.ps1')
+
 # Restore upstream SMAA 0.21 with WGPU default backends disabled.
 . (Join-Path $PSScriptRoot 'scripts\ensure-smaa-vendor.ps1')
 . (Join-Path $PSScriptRoot 'scripts\ensure-openal-runtime.ps1')
@@ -95,10 +99,28 @@ $previousExecutable = "$executable.prev"
 # so a game that is already open keeps using the old image while the new
 # DinurdoJK.exe is written beside it.
 function Preserve-RunningExecutable {
-    if (Test-Path -LiteralPath $executable) {
-        Move-Item -LiteralPath $executable -Destination $previousExecutable -Force
-        Write-Host "Preserved current executable: $previousExecutable"
+    if (-not (Test-Path -LiteralPath $executable)) { return }
+
+    # Clean up old backups once their game processes have exited. Locked
+    # executables are kept and never have to be deleted for a build to succeed.
+    Get-ChildItem -LiteralPath $runtimeDirectory -Filter 'DinurdoJK.exe.prev.inuse-*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
     }
+
+    # Move-Item -Force does not replace an existing .prev on Windows.
+    # An in-use older backup gets a unique name, so we can preserve the
+    # current executable as .prev without breaking the running game.
+    if (Test-Path -LiteralPath $previousExecutable) {
+        try {
+            Remove-Item -LiteralPath $previousExecutable -Force -ErrorAction Stop
+        } catch {
+            $parked = "$previousExecutable.inuse-$([guid]::NewGuid().ToString('N'))"
+            Move-Item -LiteralPath $previousExecutable -Destination $parked -ErrorAction Stop
+            Write-Host "Older executable still in use; preserved: $parked" -ForegroundColor DarkYellow
+        }
+    }
+    Move-Item -LiteralPath $executable -Destination $previousExecutable -ErrorAction Stop
+    Write-Host "Preserved current executable: $previousExecutable"
 }
 
 # Copy a build output into the runtime folder unless an identical file is already
@@ -118,8 +140,29 @@ function Sync-RuntimeFile([string]$Source) {
     }
 }
 
+# Preserve identical support files: Copy-Item -Force always rewrites them.
+function Sync-IfDifferent([string]$Source, [string]$Destination) {
+    if (-not (Test-Path -LiteralPath $Source)) { throw "Missing build support file: $Source" }
+    if (Test-Path -LiteralPath $Destination) {
+        $sourceInfo = Get-Item -LiteralPath $Source
+        $destinationInfo = Get-Item -LiteralPath $Destination
+        if ($sourceInfo.Length -eq $destinationInfo.Length -and
+            (Get-FileHash -LiteralPath $Source).Hash -eq (Get-FileHash -LiteralPath $Destination).Hash) {
+            return
+        }
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
+# The fast profile must be incremental even when an inherited Cargo setting
+# disables it. Restore the caller's environment after the build.
+$previousCargoIncremental = $env:CARGO_INCREMENTAL
+if ($Fast) { $env:CARGO_INCREMENTAL = '1' }
+$cacheReport = New-CargoArtifactReport
+$cacheSnapshot = $null
 Push-Location $PSScriptRoot
 try {
+    $cacheSnapshot = Get-BuildOutputSnapshot -BuildDirectory $buildDirectory -RuntimeDirectory $runtimeDirectory
     Ensure-PatchedSmaaVendor -WorkspaceRoot $PSScriptRoot
     $openalRuntime = Ensure-OpenALRuntime -WorkspaceRoot $PSScriptRoot
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
@@ -129,9 +172,10 @@ try {
     }
     $runtimeLicenses = Join-Path $runtimeDirectory 'licenses'
     New-Item -ItemType Directory -Force -Path $runtimeLicenses | Out-Null
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination $runtimeLicenses -Force
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt') -Force
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\bevy-solari-ris\LICENSE-MIT') -Destination (Join-Path $runtimeLicenses 'Bevy-Solari-MIT.txt') -Force
+    # These licenses do not change between normal builds. Avoid rewriting them.
+    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination (Join-Path $runtimeLicenses 'OpenAL-Soft-LGPL-2.0.txt')
+    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt')
+    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\bevy-solari-ris\LICENSE-MIT') -Destination (Join-Path $runtimeLicenses 'Bevy-Solari-MIT.txt')
     # Refresh the dependency graph once when upgrading an older checkout.
     $lockfile = Join-Path $PSScriptRoot 'Cargo.lock'
     $lockText = if (Test-Path -LiteralPath $lockfile) { [System.IO.File]::ReadAllText($lockfile) } else { '' }
@@ -154,9 +198,36 @@ try {
     # -Fast builds elsewhere and replaces the exe only after a successful build.
     $buildsInPlace = $buildDirectory -eq $runtimeDirectory
     if ($buildsInPlace) { Preserve-RunningExecutable }
-    $cargoArguments = @('build', '--workspace', '--offline', '--locked') + $profileArguments
-    & $cargoPath @cargoArguments
-    if ($LASTEXITCODE -ne 0) {
+    # Keep JSON artifact accounting, but let Cargo render rustc diagnostics to its
+    # own stderr. The previous plain-JSON rendering lost the normal error/warning
+    # colors when PowerShell reprinted it. stderr is not part of this pipeline.
+    $cargoArguments = @('build', '--package', 'DinurdoJK', '--offline', '--locked') + $profileArguments + @('--message-format=json,json-render-diagnostics')
+    & $cargoPath @cargoArguments | ForEach-Object {
+        $line = [string]$_
+        if (-not $line.StartsWith('{')) { Write-Host $line; return }
+        try { $msg = $line | ConvertFrom-Json -ErrorAction Stop } catch {
+            Write-Host $line
+            return
+        }
+        switch ($msg.reason) {
+            'compiler-artifact' {
+                # Reporting must never turn a successful Cargo build into a failed one.
+                try {
+                    Add-CargoArtifactMessage -Report $cacheReport -Message $msg
+                } catch {
+                    Write-Warning "Could not process Cargo artifact metadata: $($_.Exception.Message)"
+                }
+            }
+            # json-render-diagnostics already prints diagnostics via Cargo's stderr;
+            # never echo the JSON copies or warnings/errors would appear twice.
+            'compiler-message' { }
+            'build-finished' { }
+            'build-script-executed' { }
+            default { Write-Host $line }
+        }
+    }
+    $cargoExitCode = $LASTEXITCODE
+    if ($cargoExitCode -ne 0) {
         if ($buildsInPlace -and -not (Test-Path -LiteralPath $executable) -and (Test-Path -LiteralPath $previousExecutable)) {
             Move-Item -LiteralPath $previousExecutable -Destination $executable
             Write-Host 'Build failed; restored the previous executable.'
@@ -194,14 +265,17 @@ try {
         Copy-Item -LiteralPath $shaderModes -Destination $runtimeShaderModes -Force
     }
     Write-Host "`nBuilt ($buildMode): $executable"
-    if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }
-    Write-Host 'Place a GameData-style base folder beside the executable. Assets may be loose files or live in any .pk3.'
-    Write-Host 'Launch the client for mp/ffa3. Choose Join Game or Join Spectate; Escape opens the menu.'
-    Write-Host 'WASD moves; Space jumps; hold Space for Force jump; Ctrl crouches/rolls; Shift walks.'
-    Write-Host 'Offline OpenJK movement with compiled BSP collision. Multiplayer connections are not implemented yet.'
-    Write-Host "jka-probe.exe remains available in $buildDirectory for protocol and map diagnostics."
+    if ($Fast) { Write-Host '(-Fast: ThinLTO; persistent incremental compilation enabled)' }
 } finally {
+    if ($null -ne $cacheSnapshot) {
+        try {
+            Show-BuildCacheReport -BuildDirectory $buildDirectory -RuntimeDirectory $runtimeDirectory -Before $cacheSnapshot -Artifacts $cacheReport
+        } catch {
+            Write-Warning "Build-cache reporting failed (build artifacts are unaffected): $($_.Exception.Message)"
+        }
+    }
     Pop-Location
     $env:CARGO_ENCODED_RUSTFLAGS = $existingEncoded
     $env:Path = $existingPath
+    $env:CARGO_INCREMENTAL = $previousCargoIncremental
 }

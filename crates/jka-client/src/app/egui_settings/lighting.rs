@@ -174,20 +174,26 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        // Ordered quality meter: Off / cached baked AO / realtime quarter
+        // pixel count / realtime full pixel count. Keep r_ssao as the master
+        // switch and r_staticBspAo mutually exclusive with realtime AO.
         let ao_mode = if self.video.ssao {
-            1usize
+            if self.video.ssao_resolution == 1 { 3 } else { 2 }
         } else if self.video.static_bsp_ao {
-            2
+            1
         } else {
             0
         };
-        const AO_OPTIONS: [(usize, &str); 3] = [(0, "Off"), (1, "Realtime"), (2, "Baked")];
-        if let Some(target) = segmented_row(
+        const AO_OPTIONS: [(usize, &str, &str); 4] = [
+            (0, "Off", "Disable ambient occlusion."),
+            (1, "Baked", "Compute static BSP ambient occlusion per map; no realtime SSAO pass."),
+            (2, "Half res", "Realtime SSAO at half width and height (one quarter of the pixels), with temporal accumulation and bilateral upsampling."),
+            (3, "Full res", "Realtime SSAO at native scene resolution with temporal accumulation and no bilateral upsampling."),
+        ];
+        if let Some(target) = mode_row(
             ui,
             "Ambient occlusion",
-            "Contact darkening where surfaces meet. Realtime computes it every \
-             frame from depth; Baked precomputes it per map and costs nothing \
-             at runtime but misses moving objects.",
+            "Off / Baked / Half res realtime / Full res realtime. Baked misses moving objects; half and full compute AO from scene depth each frame.",
             theme::Reset::Video(ui::VIDEO_ROW_AMBIENT_OCCLUSION),
             ao_mode,
             &AO_OPTIONS,
@@ -195,7 +201,7 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_AMBIENT_OCCLUSION;
             self.change_video_setting(target as i32 - ao_mode as i32);
         }
-        if ao_mode == 2 {
+        if ao_mode == 1 {
             self.egui_baked_ao(ui);
         }
         self.egui_toggle_row(

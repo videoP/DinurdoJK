@@ -67,7 +67,7 @@ impl App {
                     theme::plain(
                         "No client-side movement preferences are available for this mod yet.",
                         11.5,
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     ),
                 );
             }
@@ -128,7 +128,7 @@ impl App {
                         theme::plain(
                             "No client-side settings are available for this mod yet.",
                             11.5,
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         ),
                     );
                 }
@@ -139,7 +139,7 @@ impl App {
                         theme::plain(
                             "Connect to a server or start a local game to expose its mod-specific settings.",
                             11.5,
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         ),
                     );
                 }

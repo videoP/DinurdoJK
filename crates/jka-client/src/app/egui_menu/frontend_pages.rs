@@ -105,14 +105,14 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                     .inner_margin(egui::Margin::same(24))
                     .show(ui, |ui| {
                         ui.set_width(480.0);
                         theme::page_title(ui, "DISCONNECTED", "The server closed the connection.");
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new(&reason).color(theme::TEXT));
+                        ui.label(egui::RichText::new(&reason).color(theme::TEXT()));
                         ui.add_space(16.0);
                         if theme::primary_button(ui, "OK").clicked() {
                             dismiss = true;
@@ -133,11 +133,12 @@ impl App {
     /// * `darkness` is the startup brightness. With a cached image it follows the
     ///   presentation-driven stage clock; with none (cold start) the live scene
     ///   itself fades in from black on the same handoff.
-    /// The scrim is painted after the image and the live scene, before the chrome.
+    /// On Main/Play the initial curtain covers the entire presented page,
+    /// including the neon/footer; other pages retain their stage-only scrim.
     pub(in crate::app::egui_menu) fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
         if matches!(
             self.frontend_page,
-            FrontendPage::DeveloperTools | FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::RenderStudio | FrontendPage::Screenshots
+            FrontendPage::Profile | FrontendPage::AssetViewer | FrontendPage::RenderStudio | FrontendPage::Screenshots
         ) {
             return;
         }
@@ -145,10 +146,16 @@ impl App {
         let handoff = self.frontend_scene_handoff(now);
         let image_expected =
             self.frontend_scene_texture.is_some() || self.frontend_stage.cache_pending;
-        // Main displays the art-directed scene without artificial darkening.
-        // Retain the cached still -> live-3D handoff, not the old black scrim.
-        let darkness = if matches!(self.frontend_page, FrontendPage::Main | FrontendPage::Play | FrontendPage::DeveloperTools) {
-            0.0
+        // Main/Play must obey the same presentation-driven startup reveal as
+        // the other frontend pages. Skipping it exposes the worldless scene's
+        // fog-colored clear while the BSP or cached photo is still loading.
+        // A cache hit fades black -> still; a cold start stays black until the
+        // live 3D scene is ready to fade in. Fully revealed Main is unmodified.
+        let darkness = if self.frontend_stage.cache_pending {
+            // A valid on-disk cache must never reveal the live world or fog
+            // while its image is still decoding, even if a stale stage ack or
+            // decoder timeout arrives. Reveal only after the image is ready.
+            1.0
         } else if image_expected {
             1.0 - self.frontend_stage.brightness(now, FRONTEND_STAGE_FADE_IN_SECS)
         } else {
@@ -156,8 +163,8 @@ impl App {
         };
         let image_alpha = 1.0 - handoff;
         let full = root.max_rect();
-        // Scene-stage photographs and scrims must never cover the GPU footer,
-        // which is drawn underneath egui in the shared UI composite.
+        // The photograph is clipped above the GPU footer. The initial Main
+        // curtain below deliberately covers the footer as well.
         let rect = egui::Rect::from_min_max(full.min, egui::pos2(full.right(),
             (full.bottom()-crate::neon_menu::footer::HEIGHT).max(full.top())));
         let painter = root.painter().with_clip_rect(rect);
@@ -188,10 +195,18 @@ impl App {
             }
         }
         if darkness > 0.001 {
-            painter.rect_filled(
-                rect, egui::CornerRadius::ZERO,
-                egui::Color32::from_black_alpha((darkness * 255.0).round() as u8),
-            );
+            let black = egui::Color32::from_black_alpha((darkness * 255.0).round() as u8);
+            if matches!(self.frontend_page, FrontendPage::Main | FrontendPage::Play | FrontendPage::DeveloperTools) {
+                // This is a *startup* curtain, not permanent menu grading.
+                // Paint it above GPU neon/footer and egui chrome so the first
+                // presented frame is actually black, with no colored edges.
+                root.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("frontend_initial_scene_curtain"),
+                )).rect_filled(root.ctx().content_rect(), egui::CornerRadius::ZERO, black);
+            } else {
+                painter.rect_filled(rect, egui::CornerRadius::ZERO, black);
+            }
         }
         if darkness > 0.001 || painted_image && handoff > 0.0 && handoff < 1.0 {
             root.ctx().request_repaint();
@@ -199,19 +214,11 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_header(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("jka_frontend_header")
-            .exact_size(theme::TOP_BAR_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin::symmetric(GUTTER as i8, 0)),
-            )
-            .show(root, |ui| {
+        let shell = self.menu_shell(root.ctx());
+        super::shell_layout::region(root, "jka_frontend_header", shell.header, |ui| {
+                super::holo::header_backdrop(ui.painter(), ui.max_rect());
                 ui.horizontal_centered(|ui| {
-                    if self.frontend_page != FrontendPage::Profile {
-                        theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
-                        ui.add_space(14.0);
-                    }
+                    ui.add_space(GUTTER);
                     let page = if self.egui_display_overlay() == OverlayMode::Video {
                         "SETTINGS"
                     } else {
@@ -232,7 +239,21 @@ impl App {
                             FrontendPage::RenderStudio => "RENDER STUDIO",
                         }
                     };
-                    theme::glow_label(ui, page, 12.5, theme::TEXT_DIM);
+                    // The page name in neon tube lettering, like the
+                    // Main page's signs it was reached from.
+                    let cap = 22.0;
+                    let (title, _) = ui.allocate_exact_size(
+                        egui::vec2(super::holo::neon_width(page, cap) + 6.0, cap * 1.8),
+                        egui::Sense::hover(),
+                    );
+                    super::holo::neon_text(
+                        ui.painter(),
+                        egui::pos2(title.left() + 3.0, title.center().y + cap * 0.5),
+                        page,
+                        cap,
+                        theme::ACCENT(),
+                        1.0,
+                    );
                     // Submenus use the persistent footer for BACK / QUIT.
                     // Render Studio's dedicated header tools stay here.
                     if self.frontend_page == FrontendPage::RenderStudio
@@ -293,10 +314,10 @@ impl App {
                 .on_hover_ui(|ui| {
                     ui.set_max_width(420.0);
                     theme::glow_label(ui,&format!("{} pending video changes",pending_video_changes.len()),
-                        12.5,theme::WARNING);
+                        12.5,theme::WARNING());
                     for change in &pending_video_changes {
                         theme::glow_label(ui,&format!("{} - {}",change.label,change.detail),
-                            11.5,theme::TEXT_DIM);
+                            11.5,theme::TEXT_DIM());
                     }
                 });
             apply_hovered=response.hovered(); activate_apply=response.clicked();
@@ -348,14 +369,14 @@ impl App {
         let mut decision=0;
         let response=egui::Modal::new(egui::Id::new("frontend_quit_confirmation"))
             .backdrop_color(egui::Color32::from_black_alpha(175))
-            .frame(egui::Frame::new().fill(theme::CHROME)
-                .stroke(egui::Stroke::new(1.0,theme::ACCENT_DEEP))
+            .frame(egui::Frame::new().fill(theme::CHROME())
+                .stroke(egui::Stroke::new(1.0,theme::ACCENT_DEEP()))
                 .inner_margin(egui::Margin::same(22)))
             .show(root.ctx(), |ui| {
                 ui.set_width(380.0);
-                theme::glow_label(ui,"QUIT DINURDOJK?",22.0,theme::TEXT);
+                theme::glow_label(ui,"QUIT DINURDOJK?",22.0,theme::TEXT());
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new("Are you sure you want to exit to desktop?").color(theme::TEXT_DIM));
+                ui.label(egui::RichText::new("Are you sure you want to exit to desktop?").color(theme::TEXT_DIM()));
                 ui.add_space(22.0);
                 ui.horizontal(|ui| {
                     if theme::primary_button(ui,"QUIT GAME").clicked() { decision=1; }
@@ -371,21 +392,14 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_footer(&mut self, root: &mut egui::Ui) {
-        // Reserve workspace space; the footer itself is WGPU signage.
-        egui::Panel::bottom("jka_frontend_footer")
-            .exact_size(crate::neon_menu::footer::HEIGHT)
-            .frame(egui::Frame::NONE)
-            .show(root, |_ui| {});
+        // The shell reserves the footer strip; the footer itself is WGPU
+        // signage (`egui_frontend_neon_footer`).
+        let _ = root;
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_body(&mut self, root: &mut egui::Ui) {
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(root, |ui| {
+        let body = self.menu_shell(root.ctx()).body;
+        super::shell_layout::region(root, "jka_frontend_body_region", body, |ui| {
                 let max_w = if matches!(
                     self.frontend_page,
                     FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo
@@ -423,19 +437,10 @@ impl App {
                             // renderer-owned 3D viewport, while the controls pane
                             // paints its own opaque surface.
                             egui::Frame::new().fill(egui::Color32::TRANSPARENT)
+                        } else if matches!(self.frontend_page, FrontendPage::AssetViewer | FrontendPage::Screenshots) {
+                            egui::Frame::new().stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         } else {
-                            egui::Frame::new()
-                                .fill(
-                                    if matches!(
-                                        self.frontend_page,
-                                        FrontendPage::AssetViewer | FrontendPage::Screenshots | FrontendPage::RenderStudio
-                                    ) {
-                                        egui::Color32::TRANSPARENT
-                                    } else {
-                                        theme::PANEL_FILL
-                                    },
-                                )
-                                .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                            super::holo::glass()
                         };
                         let studio = self.frontend_page == FrontendPage::RenderStudio;
                         let margin = if studio { egui::Margin::ZERO }

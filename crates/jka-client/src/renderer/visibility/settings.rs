@@ -1,5 +1,6 @@
 //! Visibility settings.
 use crate::renderer::{
+    competitive_probe as probe, competitive_probe_mask,
     create_gpu_cull_bind_group, create_hiz_build_bind_group, create_hiz_reduce_bind_groups,
     BlendFactor, BlendMode, CullDebugMode, DrawClass, GpuCullSettings, PipelineKey, Renderer,
 };
@@ -47,10 +48,12 @@ pub(in crate::renderer) fn world_stage_probe_excludes(mode: u8, key: PipelineKey
     }
 }
 
-/// Fast-sky clear colors follow TaystJK's r_fastsky == 1..10 convention.
+/// Fast-sky clear colors retain TaystJK's palette for modes 2..10;
+/// mode 1 is a pale blue sky instead of TaystJK's black.
 /// The plain color replaces authored sky drawing instead of shading a sky fragment.
 pub(in crate::renderer) fn fast_sky_clear_color(mode: u8) -> wgpu::Color {
     let rgb = match mode {
+        1 => [0.60, 0.76, 0.90], // pale, slightly whitish sky blue (linear RGB)
         2 => [0.0, 1.0, 0.0], // ^2 green
         3 => [1.0, 1.0, 0.0], // ^3 yellow
         4 => [0.0, 0.0, 1.0], // ^4 blue
@@ -60,7 +63,7 @@ pub(in crate::renderer) fn fast_sky_clear_color(mode: u8) -> wgpu::Color {
         8 => [1.0, 0.5, 0.0], // ^8 orange
         9 => [0.5, 0.5, 0.5], // ^9 grey
         10 => [1.0, 0.0, 0.0], // TaystJK special-case red
-        _ => [0.0, 0.0, 0.0], // 1 black
+        _ => [0.0, 0.0, 0.0], // unused / disabled
     };
     wgpu::Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
 }
@@ -71,7 +74,13 @@ impl Renderer {
         gpu_driven: bool,
         hiz_occlusion: bool,
     ) {
-        self.gpu_driven_enabled = gpu_driven && self.indirect_supported;
+        self.configured_gpu_driven = gpu_driven;
+        self.configured_hiz_occlusion = hiz_occlusion;
+        self.gpu_driven_enabled = gpu_driven && self.indirect_supported
+            && !(5..=14).contains(&self.competitive_ab)
+            && competitive_probe_mask(self.competitive_ab)
+                & (probe::CPU_VISIBILITY_ONLY | probe::BSP_ONE_STAGE
+                    | probe::HIDE_BSP_PROPS | probe::HIDE_TRANSPARENT) == 0;
         self.hiz_occlusion_enabled = hiz_occlusion && self.gpu_driven_enabled;
         self.rebuild_frame_plan();
         self.update_gpu_cull_settings();
@@ -99,7 +108,32 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn set_fast_sky(&mut self, mode: u8) {
-        let mode = mode.min(10);
+        self.configured_fast_sky = mode.min(10);
+        self.apply_fast_sky();
+    }
+
+    pub(in crate::renderer) fn set_competitive_ab(&mut self, mode: u32) {
+        let mode = mode.min(probe::MAX_MODE);
+        if self.competitive_ab == mode { return; }
+        self.competitive_ab = mode;
+        self.apply_fast_sky();
+        // GPU indirect draws use separate cull masks; they cannot use the CPU
+        // single-stage selection, so temporarily select the normal CPU draw
+        // path. Restore the requested GPU mode when the experiment ends.
+        self.set_gpu_visibility(self.configured_gpu_driven, self.configured_hiz_occlusion);
+        // Changing an active surface set invalidates replay/compaction caches.
+        // The original map and its prepared stages remain untouched.
+        self.deferred_world_bundles.clear();
+        self.update_gpu_cull_settings();
+    }
+
+    fn apply_fast_sky(&mut self) {
+        let mode = if (5..=14).contains(&self.competitive_ab)
+            || competitive_probe_mask(self.competitive_ab) & probe::FORCE_FAST_SKY != 0 {
+            self.configured_fast_sky.max(1)
+        } else {
+            self.configured_fast_sky
+        };
         if self.fast_sky == mode { return; }
         self.fast_sky = mode;
         // GPU visibility and cached draw bundles must agree on sky exclusion.
@@ -138,6 +172,8 @@ impl Renderer {
                     | (u32::from(self.world_stage_probe == 2) << 4)
                     | (u32::from(self.fast_sky != 0) << 5)
                     | (u32::from(self.face_plane_cull) << 6)
+                    | (u32::from(!self.ui_state.hud.as_ref().is_some_and(|hud|
+                        hud.force_powers_active & (1 << 14) != 0)) << 7)
                     // Bits 8..11 encode selective blend and water/non-water A/B.
                     | (u32::from(self.world_stage_probe) << 8),
             ],
@@ -248,9 +284,9 @@ mod fast_sky_tests {
     use super::fast_sky_clear_color;
 
     #[test]
-    fn taystjk_fast_sky_palette_and_red_special_case() {
+    fn fast_sky_palette_and_red_special_case() {
         let cases = [
-            (1, [0.0, 0.0, 0.0]),
+            (1, [0.60, 0.76, 0.90]),
             (2, [0.0, 1.0, 0.0]),
             (3, [1.0, 1.0, 0.0]),
             (4, [0.0, 0.0, 1.0]),

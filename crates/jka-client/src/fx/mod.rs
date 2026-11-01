@@ -92,6 +92,35 @@ pub fn lod_density(px: f32) -> f32 {
     FLOOR + (1.0 - FLOOR) * t * t * (3.0 - 2.0 * t)
 }
 
+// Session-only diagnostic levels. 0=stock, 1=hide client FX output while
+// simulating normally, 2=skip client FX scheduling/update and output.
+// No render or simulation branches are affected at mode 0.
+static HIDE_FX_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
+pub fn hide_mode() -> u8 {
+    let user = HIDE_FX_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let competitive = crate::renderer::competitive_ab_mode();
+    if competitive == 3 || (7..=9).contains(&competitive) || competitive == 14
+        || crate::renderer::competitive_probe_mask(competitive) & crate::renderer::competitive_probe::CLIENT_FX != 0
+    { user.max(2) } else { user }
+}
+
+#[inline]
+pub fn render_enabled() -> bool {
+    hide_mode() == 0
+}
+
+#[inline]
+pub fn simulation_enabled() -> bool {
+    hide_mode() < 2
+}
+
+pub fn set_hide_mode(mode: u8) {
+    HIDE_FX_MODE.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
 pub mod runner_cull;
 pub mod draw;
 pub mod gpu_sparks;

@@ -60,3 +60,29 @@ All linked base/redraw position outputs must agree for depth-equal rendering.
 program binds. Cold `[WORLD STAGE RECIPES]` logs report recipe/program-pair/PSO
 counts and fallback reasons. These counts distinguish prepared recipes, bound
 programs and GPU execution; none is a measurement of shader speed.
+
+## Shader input format A/B (r_shaderInputMode 0/1/2)
+
+This is independent of r_fragmentShaderMode. Each shader-input choice is
+part of WorldShaderVariantKey and hence PSO reuse/cold-compile identity.
+
+- 0 = unchanged WGSL + per-pipeline WGSL override values.
+- 1 = on-demand WGSL-to-SPIR-V compilation, persistent stage binary cache,
+  **mandatory re-import and validation of emitted and cached SPIR-V**, and
+  per-pipeline WGSL fallback when the round-trip fails. Rejected variants are
+  cached in memory to prevent repeated bad imports during a session.
+- 2 = **disabled**. The original native passthrough path fed emitted SPIR-V
+  directly to the NVIDIA driver, which raised an `0xC0000005` access violation.
+  WGPU explicitly makes no safety guarantees for passthrough inputs. The
+  runtime now refuses mode 2 rather than reporting a misleading successful A/B.
+
+The stage cache key was bumped from `v1` to `validated-v2`; older binaries
+are never loaded. Mode 1 still compiles its WGSL on first use and does not
+ship SPIR-V offline. Shader input mode and material program mode are independent.
+
+Other render subsystems (models/post/compute, RT BSP, sky-box/cloud/ocean
+extra passes) remain WGSL. Compilation/conversion happens on the existing
+pipeline worker on a mode change. Console output explicitly reports fallbacks.
+
+Benchmark cold versus warm native PSO cache separately: this A/B compares
+shader input formats, not the driver-generated native pipeline cache.

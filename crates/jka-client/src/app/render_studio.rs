@@ -1989,6 +1989,7 @@ impl App {
                 source: crate::scene::MapSource::Bsp(selection), sub_bsp_names: Vec::new(),
                 prepare_options: self.current_map_prepare_options(),
                 analyze_fx_light_profiles: false, supersedable: false, seed: None,
+                vote_fast_adopt: false,
             }).is_err() {
                 self.render_studio.status = "Could not queue BSP background map loading".into();
                 self.render_studio.bsp_world = None;

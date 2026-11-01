@@ -377,6 +377,9 @@ pub(in crate::renderer) fn encode_screenshot_job(
                 &path, is_neutral, captured_gamma, job.width, job.height,
             )?;
             std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
+            // A saved menu photo replaces the oldest of eight. This is the
+            // screenshot encode worker, never the frame/render thread.
+            crate::frontend_cache_color::maintain_frontend_scene_cache(&path, true);
             Ok(ScreenshotOutput::FrontendSceneSaved(path))
         }
         ScreenshotDestination::VideoFrame { frame_index, alpha, sdr_unpremultiply, received, .. } => {

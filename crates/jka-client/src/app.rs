@@ -2,6 +2,10 @@
 // Retain the existing facade API, including entry points used by external callers or tests.
 #[allow(unused_imports)]
 pub(crate) use display::AntiAliasingChoice;
+mod killfeed;
+mod match_stats;
+mod chat_anim;
+mod scoreboard_cursor;
 mod capture;
 mod chat;
 mod commands;
@@ -482,6 +486,10 @@ pub struct App {
     /// POV we detached from when entering demo Free Spec. Attack/alt-attack
     /// cycle relative to this client, matching normal spectator expectations.
     demo_free_follow_anchor: Option<i32>,
+    /// First visible row in the demo POV directory (mouse-wheel scroll).
+    demo_player_list_scroll: usize,
+    /// Compact Render Studio-style browser can be collapsed during playback.
+    demo_player_list_open: bool,
     demo_view_outside_authoritative: bool,
     /// Demo-only noclip speed. weapnext/weapprev step this like a 3D editor wheel.
     demo_free_speed_index: usize,
@@ -626,6 +634,13 @@ pub struct App {
     /// Let the map worker stop a stale browser-map guess at stage boundaries.
     /// Updated only when a new map request is submitted or invalidated.
     map_loader_latest_requested: Arc<std::sync::atomic::AtomicU64>,
+    siege_timer_menu: Option<ui::UiSiegeTimerMenu>,
+    siege_hud_shown: Option<ui::UiSiegeHud>,
+    vote_map_preload_mode: u8,
+    vote_map_candidate: Option<(String, Instant)>,
+    vote_map_prewarm: Option<map_loading::VoteMapPrewarm>,
+    vote_map_prewarm_token: u64,
+    vote_map_frame_us: Arc<std::sync::atomic::AtomicU32>,
     window: Option<Arc<Window>>,
     render: Option<RenderThread>,
     /// Avoid enqueuing empty combat HUD updates every gameplay tick.
@@ -637,6 +652,9 @@ pub struct App {
     render_view_latch: ViewLatchMode,
     local_server: Option<LocalServer>,
     map_collision: Option<CollisionWorld>,
+    /// Developer river source: collision triangles of the map they came from.
+    river_editor: crate::river_authoring::Editor,
+    river_collision: Option<(String, std::sync::Arc<Vec<jka_assets::bsp::river::CollisionSurface>>)>, 
     /// Drawn/markable world surfaces for OpenJK-style R_MarkFragments marks.
     map_mark_surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>,
     /// The map's `misc_model_static` props (client-placed MD3s, jaPRO cgame).
@@ -655,6 +673,7 @@ pub struct App {
     wallrun_camera_mode: u8,
     first_person_lightsaber: bool,
     saber_trail: i32,
+    speed_trail: bool,
     saber_team_colors: bool,
     saber_staff_multi_color: bool,
     team_overlay: ui::TeamOverlaySettings,
@@ -857,6 +876,22 @@ pub struct App {
     japro_flipkick_frames: i32,
     japro_flipkick_jumps: i32,
     japro_flipkick_moveup: bool,
+    /// `cg_killfeed*` and the obituaries currently in the feed, oldest first.
+    killfeed_settings: crate::ui::KillfeedSettings,
+    killfeed: killfeed::Feed,
+    /// Personal match statistics (head-to-head, end-of-game breakdown).
+    match_stats: match_stats::MatchStats,
+    /// `cg_scoreboardAvatars` / `cg_scoreboardHeadToHead`.
+    scoreboard_settings: crate::ui::ScoreboardSettings,
+    /// `cg_chat*` and the docked chat field's animation clock.
+    chat_settings: crate::ui::ChatSettings,
+    chat_anim: chat_anim::State,
+    /// Client-side mutes from the scoreboard: client number -> name when muted.
+    muted_clients: std::collections::HashMap<i32, String>,
+    /// M2/M3 on the scoreboard: free cursor, hover and the player popup.
+    scoreboard_cursor: scoreboard_cursor::ScoreboardCursor,
+    /// When the current session reached the game (wall clock, monotonic).
+    session_joined: Option<(String, Instant)>,
     vgs_menu: crate::vgs::Menu,
     log_rx: Receiver<crate::logging::LogRecord>,
     console_history: Vec<String>,

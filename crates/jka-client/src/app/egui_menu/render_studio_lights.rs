@@ -200,8 +200,8 @@ impl App {
             let visible=self.render_studio.timeline.light_layers[layer].enabled;
             let chevron=egui::Rect::from_center_size(head.left_center()+egui::vec2(24.0,0.0),egui::vec2(18.0,22.0));
             let eye=egui::Rect::from_center_size(head.left_center()+egui::vec2(45.0,0.0),egui::vec2(18.0,22.0));
-            sui::paint_icon(p,chevron.center(),if expanded{Icon::ChevronDown}else{Icon::ChevronRight},theme::TEXT_DIM);
-            sui::paint_icon(p,eye.center(),if visible{Icon::Eye}else{Icon::EyeOff},theme::TEXT_DIM);
+            sui::paint_icon(p,chevron.center(),if expanded{Icon::ChevronDown}else{Icon::ChevronRight},theme::TEXT_DIM());
+            sui::paint_icon(p,eye.center(),if visible{Icon::Eye}else{Icon::EyeOff},theme::TEXT_DIM());
             if !locked {
                 if ui.interact(chevron,ui.make_persistent_id(("studio_light_expand",layer)),egui::Sense::click()).clicked(){
                     self.render_studio.timeline.light_layers[layer].expanded=!expanded;
@@ -228,7 +228,7 @@ impl App {
             let block=egui::Rect::from_min_max(egui::pos2(to_x(light.start).max(x0),top+4.0),egui::pos2(to_x(light.end()).min(right),top+lane_h-4.0));
             if block.width()<=0.0 {continue;}
             let selected=self.render_studio.light_ui.selection.is_some_and(|s|s.layer==layer&&s.light==Some(i));
-            super::render_studio::studio_paint_clip(&paint,block,if group_enabled&&light.enabled{LIGHT}else{theme::TEXT_DISABLED},selected,&light.name,light.kind.label());
+            super::render_studio::studio_paint_clip(&paint,block,if group_enabled&&light.enabled{LIGHT}else{theme::TEXT_DISABLED()},selected,&light.name,light.kind.label());
             if !locked {
                 let response=ui.interact(block,ui.make_persistent_id(("studio_light_span",layer,i)),egui::Sense::click_and_drag());
                 if response.clicked(){self.studio_select_light(StudioLightSelection{layer,light:Some(i),key:None});}
@@ -246,7 +246,7 @@ impl App {
                 if center.x<x0||center.x>right {continue;}
                 let selected_key=selected&&self.render_studio.light_ui.selection.is_some_and(|s|s.key==Some(key_index));
                 paint.add(egui::Shape::convex_polygon(vec![center+egui::vec2(0.0,-7.0),center+egui::vec2(7.0,0.0),center+egui::vec2(0.0,7.0),center+egui::vec2(-7.0,0.0)],
-                    if selected_key{egui::Color32::WHITE}else{LIGHT},egui::Stroke::new(1.0,theme::SURFACE)));
+                    if selected_key{egui::Color32::WHITE}else{LIGHT},egui::Stroke::new(1.0,theme::SURFACE())));
                 if !locked {
                     let response=ui.interact(egui::Rect::from_center_size(center,egui::vec2(17.0,20.0)).intersect(lane),
                         ui.make_persistent_id(("studio_light_key",layer,i,key_index)),egui::Sense::click_and_drag());

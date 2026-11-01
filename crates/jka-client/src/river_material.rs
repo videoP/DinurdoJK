@@ -35,6 +35,7 @@ struct Pass {
 /// scratch; pending commands keep their own references without a blocking wait.
 pub struct Presentation {
     textures: Textures,
+    grid: wgpu::Texture,
     passes: Vec<Pass>,
     ready: bool,
 }
@@ -205,6 +206,7 @@ impl Presentation {
                 normals,
                 normal_sampler,
             },
+            grid,
             passes,
             ready: false,
         })
@@ -224,6 +226,11 @@ impl Presentation {
     }
     pub fn textures(&self) -> Option<&Textures> {
         self.ready.then_some(&self.textures)
+    }
+    /// Pre-blur half NormalGrid written by `write_fields`, as stage 16 reads it
+    /// (stage 17 runs after the foam stage). A foam owner retains its own handle.
+    pub fn normal_grid(&self) -> &wgpu::Texture {
+        &self.grid
     }
     pub fn freeze(self) -> Result<Textures, Self> {
         if self.ready {

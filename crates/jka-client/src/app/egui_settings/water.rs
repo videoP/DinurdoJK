@@ -60,7 +60,7 @@ impl App {
             theme::banner(
                 ui,
                 "Grass needs Apply: this map was prepared without grass resources.",
-                theme::WARNING,
+                theme::WARNING(),
             );
         }
     }
@@ -77,11 +77,11 @@ impl App {
             }
         });
         if !self.video.ocean {
-            theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM);
+            theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM());
             return;
         }
         if self.video.ocean && !self.applied_ocean {
-            theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING);
+            theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING());
         }
 
         if self.video.ocean_settings.backend == 3 {
@@ -184,9 +184,9 @@ impl App {
         if let Some(index) = promoted_index {
             let pool = &self.promoted_oceans[index];
             theme::banner(ui, &format!("Local pool tuning / image variation {:.0}% / amplitude default {:.1}u. Manual changes override these estimates.",
-                pool.heuristic.variation*100.0, pool.heuristic.amplitude), theme::TEXT_DIM);
+                pool.heuristic.variation*100.0, pool.heuristic.amplitude), theme::TEXT_DIM());
         } else {
-            theme::banner(ui, "FFT spectrum, quality and underwater optics are shared. Select a pool to edit its wave height, chop, foam and surface appearance.", theme::TEXT_DIM);
+            theme::banner(ui, "FFT spectrum, quality and underwater optics are shared. Select a pool to edit its wave height, chop, foam and surface appearance.", theme::TEXT_DIM());
         }
         if self.ocean_settings_target <= -2 && !self.authored_oceans.is_empty() {
             self.authored_ocean_selected = self.authored_ocean_selected.min(self.authored_oceans.len()-1);
@@ -383,7 +383,7 @@ impl App {
                 }
             },
         );
-        theme::banner(ui, "FFT resolution, mesh quality and update rate apply to all oceans.", theme::TEXT_FAINT);
+        theme::banner(ui, "FFT resolution, mesh quality and update rate apply to all oceans.", theme::TEXT_FAINT());
         ui.add_enabled_ui(promoted_index.is_none(), |ui| {
         const MAP_SIZES: [(u32, &str); 4] =
             [(128, "128"), (256, "256"), (512, "512"), (1024, "1024")];
@@ -578,11 +578,11 @@ impl App {
                 _ => ("FINE WIND CHOP", "Small-scale weather-driven detail; mainly normals/foam with only a small displacement contribution."),
             };
             let title = format!("CASCADE {}  ·  {role}", cascade_index + 1);
-            egui::CollapsingHeader::new(theme::plain(&title, 13.0, theme::TEXT))
+            egui::CollapsingHeader::new(theme::plain(&title, 13.0, theme::TEXT()))
                 .id_salt(("ocean_cascade", cascade_index))
                 .default_open(false)
                 .show(ui, |ui| {
-                    theme::banner(ui, detail, theme::TEXT_DIM);
+                    theme::banner(ui, detail, theme::TEXT_DIM());
                     let cascade = &mut settings.cascades[cascade_index];
                     ocean_slider(ui, "Tile length X", "Repeat size of this FFT cascade along X, in metres. Larger values carry broader waves and repeat less often.", reset(theme::Reset::OceanCascade(cascade_index as u8, 0)), &mut cascade.tile_length[0], 1.0..=2000.0, &mut changed);
                     ocean_slider(ui, "Tile length Y", "Repeat size of this FFT cascade along Y, in metres. Keeping X/Y different can make repetition less obvious.", reset(theme::Reset::OceanCascade(cascade_index as u8, 1)), &mut cascade.tile_length[1], 1.0..=2000.0, &mut changed);
@@ -595,7 +595,7 @@ impl App {
                         theme::banner(
                             ui,
                             "This cascade follows the weather wind speed and direction.",
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         );
                     }
                     ocean_slider(ui, "Fetch length", "Distance from shoreline / wind fetch, in kilometres. Longer fetch shifts the TMA/JONSWAP sea state toward more developed waves.", reset(theme::Reset::OceanCascade(cascade_index as u8, 6)), &mut cascade.fetch_length, 0.1..=1000.0, &mut changed);
@@ -608,14 +608,14 @@ impl App {
                         theme::banner(
                             ui,
                             "Displacement is 0: this cascade can still affect normals/foam, but not the mesh silhouette.",
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         );
                     }
                     if cascade.foam_amount <= 0.001 {
                         theme::banner(
                             ui,
                             "Foam amount is 0: Whitecap changes in this cascade will not visibly add foam until Foam amount is raised.",
-                            theme::TEXT_FAINT,
+                            theme::TEXT_FAINT(),
                         );
                     }
                 });

@@ -662,7 +662,7 @@ fn world_program_modes_gpu_images_match() {
                 usage: wgpu::BufferUsages::UNIFORM,
             });
             let mut reference: Option<Vec<u8>> = None;
-            for mode in 0..5 {
+            for mode in 0..6 {
                 let variant = WorldShaderVariantKey {
                     material_specialization: mode > 0,
                     minimal_entries: mode == 2,
@@ -875,7 +875,7 @@ fn world_program_modes_gpu_images_match() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn deferred_world_bundle_fp16_and_program_counts_gpu() {
-    use crate::renderer::{block_on, DEPTH_FORMAT};
+    use crate::renderer::{block_on, depth_format};
     use super::super::deferred_bundles::{DeferredCommand, DeferredResources, DeferredWorldBundles};
     use wgpu::util::DeviceExt;
     block_on(async {
@@ -895,7 +895,7 @@ fn deferred_world_bundle_fp16_and_program_counts_gpu() {
             label: None, layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
             primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(false),
+            depth_stencil: Some(wgpu::DepthStencilState { format: depth_format(), depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(), fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"),
                 compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float,
@@ -930,7 +930,7 @@ fn trace_stage_eligibility_matches_program_selection() {
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
     pipeline.class = crate::renderer::DrawClass::Opaque;
     let plain = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
-    for mode in 2..=4 {
+    for mode in 2..=5 {
         let variant = WorldShaderVariantKey {
             material_specialization: true,
             minimal_entries: mode == 2,
@@ -1033,4 +1033,83 @@ fn baked_relight_specializes_only_lightmap_stages() {
     assert!(stage_rejection_reasons(shared, pipeline, lightmapped, 3).iter().any(|why| why.contains("baked")));
     assert_eq!(program_key(shared, pipeline, texture).program, StageProgram::SharedBasic);
     assert!(stage_rejection_reasons(shared, pipeline, texture, 3).is_empty());
+}
+
+
+#[test]
+fn hybrid_mode_five_selects_work_not_material_names() {
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Opaque;
+    let variant = WorldShaderVariantKey {
+        material_specialization: true,
+        program_mode: WorldProgramMode::Hybrid,
+        ..Default::default()
+    };
+    assert_eq!(WorldProgramMode::from_console(5), WorldProgramMode::Hybrid);
+    assert_eq!(active_mode(variant), 5);
+
+    // Ordinary texture, baked lightmap and vertex-color stages all use a
+    // compact *specialized* entry: alpha and material constants remain fixed.
+    for flags in [0, 2, 1, 131072 | 1, 8388608] {
+        let key = MaterialFragmentKey::from_material([0, 0, flags, 0], 0.0);
+        assert_eq!(program_key(variant, pipeline, key).program, StageProgram::Minimal);
+    }
+    let cutout = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.4);
+    let mut masked = pipeline;
+    masked.class = crate::renderer::DrawClass::Mask;
+    let key = program_key(variant, masked, cutout);
+    assert_eq!(key.program, StageProgram::Minimal);
+    assert_eq!(key.alpha_func, 2, "masked alpha cutoff remains specialized");
+
+    // Structural UV work must use generated code even in Minimal Unified;
+    // numerical speed/amplitude values never enter the key.
+    for tc_gen in [2, 3] {
+        let key = MaterialFragmentKey::from_material([tc_gen, 0, 0, 0], 0.0);
+        assert_eq!(program_key(variant, pipeline, key).program, StageProgram::GeneratedBasic);
+    }
+    let mut scroll = MaterialFragmentKey::from_material([0, 0, 0, 0], 0.0);
+    scroll.vertex_recipe.tc_mods = [1, 0, 0, 0];
+    assert_eq!(program_key(variant, pipeline, scroll).program, StageProgram::GeneratedBasic);
+    let wave = MaterialFragmentKey::from_material([0, 0, 134217728, 0], 0.0);
+    assert_eq!(program_key(variant, pipeline, wave).program, StageProgram::GeneratedBasic);
+
+    // Enhanced equations remain live where they actually affect the material.
+    let pbr = WorldShaderVariantKey { pbr: true, ..variant };
+    let pbr_stage = MaterialFragmentKey::from_material([0, 0, 8, 0], 0.0);
+    assert_eq!(program_key(pbr, pipeline, pbr_stage).program, StageProgram::GeneratedEnhanced);
+    let plain = MaterialFragmentKey::from_material([0, 0, 0, 0], 0.0);
+    assert_eq!(program_key(pbr, pipeline, plain).program, StageProgram::Specialized);
+
+    // Never reinterpret unsupported authored effects as a plain shader.
+    let glass = MaterialFragmentKey::from_material([0, 0, 0, 1 << 17], 0.0);
+    assert_eq!(program_key(variant, pipeline, glass).program, StageProgram::Specialized);
+    let special_tc = MaterialFragmentKey::from_material([5, 0, 0, 0], 0.0);
+    assert_eq!(program_key(variant, pipeline, special_tc).program, StageProgram::Specialized);
+    let blocked = WorldShaderVariantKey { point_lights: true, ..variant };
+    assert_eq!(program_key(blocked, pipeline, plain).program, StageProgram::Specialized);
+}
+
+#[test]
+fn hybrid_generated_wgsl_source_is_shared_without_merging_pipeline_constants() {
+    let mut pipeline = super::super::pipelines::ocean_pipeline_key();
+    pipeline.class = crate::renderer::DrawClass::Opaque;
+    let variant = WorldShaderVariantKey {
+        material_specialization: true,
+        program_mode: WorldProgramMode::Hybrid,
+        ..Default::default()
+    };
+    let mut a = MaterialFragmentKey::from_material([2, 0, 0, 0], 0.0);
+    let mut b = MaterialFragmentKey::from_material([2, 0, 33554432, 0], 0.0);
+    a.vertex_recipe.tc_mods[0] = 1;
+    b.vertex_recipe.tc_mods[0] = 1;
+    let ka = program_key(variant, pipeline, a);
+    let kb = program_key(variant, pipeline, b);
+    assert_eq!(ka.program, StageProgram::GeneratedBasic);
+    assert_eq!(kb.program, StageProgram::GeneratedBasic);
+    let sa = generated_source(program_variant(variant, ka), ka);
+    let sb = generated_source(program_variant(variant, kb), kb);
+    assert_eq!(sa, sb, "material flags not used by the generated source should share one shader module");
+    // Material/pipeline identity is *not* derived from the module-source cache.
+    // When a kept flag differs, the per-pipeline constants can still differ.
+    assert_eq!(ka.compilation_constants()[4], kb.compilation_constants()[4]);
 }

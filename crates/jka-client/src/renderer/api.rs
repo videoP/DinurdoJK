@@ -389,6 +389,8 @@ pub struct FxGpuSprites {
     /// dynamic mesh. origin = center on the collision plane (w = shade), left/up =
     /// in-plane half axes of length `radius` (left.w = entity number).
     pub blob_shadow: bool,
+    /// Segmented 24-step bolt; vs_main expands each instance into a ribbon.
+    pub lightning: bool,
 }
 
 /// One material-stage draw against stable resident slot IDs. Each surface
@@ -574,7 +576,20 @@ pub struct ClientFramePerf {
     pub player_present_ms: f64,
     pub followed_player_ms: f64,
     pub fx_ms: f64,
+    /// Main-thread frame send+wait, including queued FX worker commands.
+    pub fx_worker_wait_ms: f64,
+    /// Actual worker thread FX frame simulation/output work.
+    pub fx_worker_update_ms: f64,
+    pub fx_worker_ticks: u64,
+    pub fx_worker_deferred: u64,
+    pub fx_worker_age_ms: i32,
+    pub fx_worker_in_flight: bool,
+    pub fx_snapshot_clone_ms: f64,
     pub fx_tessellate_ms: f64,
+    /// Isolated FX geometry build; fx_tessellate_ms also includes HUD prep.
+    pub fx_geometry_ms: f64,
+    pub fx_trail_draws: u32,
+    pub fx_ghost_trail_draws: u32,
     pub fx_draws: u32,
     pub fx_sprites: u32,
     pub fx_oriented_quads: u32,
@@ -823,6 +838,8 @@ pub struct PostEffects {
     pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
+    /// 0 = half resolution, 1 = full resolution.
+    pub ssao_resolution: u8,
     pub static_bsp_ao: bool,
     pub static_bsp_ao_lightmap: bool,
     pub static_bsp_ao_samples: u32,
@@ -1077,6 +1094,9 @@ pub enum RenderCommand {
     /// Arm a bounded, off-by-default per-frame command-encoding capture.
     /// `seconds` makes the capture time-bounded (frames is then only a cap).
     StartPerfCapture { stem: PathBuf, frames: usize, seconds: Option<f64> },
+    /// One command: capture the complete CPU/GPU frame breakdown over a
+    /// sequence of automatically restored, diagnostic-only world A/B cases.
+    StartPerfAudit { stem: PathBuf },
     /// One-command six-phase GPU sky sweep on the existing Unified renderer.
     StartSkyPerfSweep { stem: PathBuf, frames: usize },
     TileCost(TileCostCommand),
@@ -1085,6 +1105,8 @@ pub enum RenderCommand {
     SetMaxFrameLatency(u32),
     SetEarlySubmit(bool),
     SetPresentCopy(bool),
+    /// Run a bounded, clear-only surface acquisition/presentation diagnostic.
+    RunAcquireProbe(u32),
     SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
@@ -1128,13 +1150,15 @@ pub enum RenderCommand {
     SetInlineTransformMode(ui::InlineTransformMode),
     /// r_fragmentShaderMode: 0 general world fragment program, 1 per-material specialized.
     SetFragmentShaderMode(u8),
+    SetShaderInputMode(u8),
     SetWorldSortMode(u8),
     SetPostSpecialize(bool),
-    /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
+    /// r_colorClearMode: 0 always clear, 1 skip under authored sky, 2 force no main-world color clear.
     SetColorClearMode(u8),
     /// Render-only controls for compiled model-path world stages and GPU A/B stage isolation.
     SetWorldStageDebug { draw_bsp_model_surfaces: bool, probe: u8 },
     SetFastSky(u8),
+    SetCompetitiveAb(u32),
     SetFpsCap(u32),
     SetGamma(f32),
     SetGammaMethod(crate::gamma::GammaMethod),
@@ -1169,11 +1193,15 @@ pub enum RenderCommand {
     SetOceanSettings(crate::ocean::OceanSettings),
     /// Blue Water ship wake input (hulls, strikes, demo ships); ignored unless `r_oceanWake` is on.
     OceanWake(crate::ocean::WakeCommand),
+    /// Developer river patch: source spec plus the map's collision triangles.
+    RiverMaterial(crate::river_authoring::Id, crate::river_settings::Settings),
+    RiverRemove(crate::river_authoring::Id),
+    RiverSpawn(crate::river_authoring::Definition, std::sync::Arc<Vec<jka_assets::bsp::river::CollisionSurface>>),
+    RiverClear,
     SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
     SetOceanTime(f32),
     SetPerfTrace(bool),
-    SetForceUnifiedWorld(bool),
     SetFoliageWind(bool),
     SetPom(bool),
     SetGpuTimings(bool),
@@ -1195,6 +1223,8 @@ pub enum RenderCommand {
     SetSurfaceSpritesGpu(bool),
     SetSurfaceSprites(bool),
     SetEncoderFinishThreads(u32),
+    /// Session-only CPU throughput A/B bitmask; zero retains existing settings.
+    SetIgpuAbMode(u8),
     SetModelIndexUploadCache(bool),
     SetGhoul2BatchKeyCache(bool),
     SetGpuVisibility {
@@ -1292,8 +1322,11 @@ pub enum RenderCommand {
         enemy_info: Option<ui::UiEnemyInfo>,
         race_timer: Option<crate::japro_cg::RaceTimerUi>,
         vote_line: Option<String>,
+        siege_hud: Option<ui::UiSiegeHud>,
         scoreboard: Option<ui::UiScoreboard>,
         scoreboard_focus_client: Option<i32>,
+        killfeed: Option<ui::UiKillfeed>,
+        chat_anim: ui::UiChatAnim,
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,
@@ -1425,9 +1458,25 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) cpu_encode_ms: f64,
     pub(in crate::renderer) cpu_submit_ms: f64,
     pub(in crate::renderer) cpu_present_ms: f64,
+    /// Actual frame presentation plan, including glass/legacy overrides.
+    pub(in crate::renderer) effective_post: bool,
+    pub(in crate::renderer) scene_copy_forced: bool,
+    pub(in crate::renderer) world_glass_pvs: bool,
+    pub(in crate::renderer) dynamic_glass: bool,
+    pub(in crate::renderer) legacy_blend_scene_copy: bool,
+    /// The executed bounded HDR/offscreen legacy encode/decode region, if any.
+    /// None means the reference full-frame transfer or no legacy transfer.
+    pub(in crate::renderer) legacy_transfer_rect: Option<(u32, u32, u32, u32)>,
     /// Opt-in diagnostic. Mutually exclusive encoder intervals; they do not
     /// measure GPU execution. `encode_pre_world` can include RT, shadows,
     /// reflections, and environment work on the unified path.
+    /// Actual effective post path, after per-frame glass/model overrides.
+    pub(in crate::renderer) perf_effective_post: bool,
+    pub(in crate::renderer) perf_forced_post: bool,
+    pub(in crate::renderer) perf_forced_post_glass: bool,
+    pub(in crate::renderer) perf_forced_post_legacy: bool,
+    pub(in crate::renderer) perf_world_clear: bool,
+    pub(in crate::renderer) perf_world_skip_clear: bool,
     pub(in crate::renderer) perf_encode_setup_ms: f64,
     pub(in crate::renderer) perf_encode_pre_world_ms: f64,
     /// First-use profiling subdivisions within pre-world command encoding.
@@ -1463,9 +1512,9 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_face_plane_partial_batches: u32,
     pub(in crate::renderer) world_face_plane_rejected_triangles: u32,
     pub(in crate::renderer) world_face_plane_direct_draws: u32,
-    /// Which world renderer produced this frame ("fast-baseline" / "unified").
+    /// Gameplay world renderer (always "unified").
     pub(in crate::renderer) world_path: &'static str,
-    /// Advanced-path breakdown of `cpu_prepare_ms`. All zero on FastBaseline,
+    /// Unified-path breakdown of `cpu_prepare_ms`.
     /// whose prepare stage is not split (it stays free of extra timers).
     pub(in crate::renderer) prep_camera_ms: f64,
     pub(in crate::renderer) prep_shadow_ms: f64,
@@ -1475,7 +1524,7 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) present_call_completed_at: Option<Instant>,
     pub(in crate::renderer) late_latch: Option<ViewSampleMeasurement>,
     /// True when the late-latch sample was intentionally taken after surface
-    /// acquisition (fast baseline without camera-dependent early preparation).
+    /// acquisition (camera-dependent early preparation is excluded).
     pub(in crate::renderer) late_latch_after_acquire: bool,
     /// r_earlySubmit applied: recorded offscreen, submitted before acquire.
     pub(in crate::renderer) early_submit: bool,

@@ -1,7 +1,7 @@
 //! Reuse the *exact ordered* main-view transparent BSP command stream when it
 //! stays unchanged. Unlike shader fusion or sorting by material, this preserves
 //! framebuffer blending, depth tests and authored stage ordering verbatim.
-use crate::renderer::DEPTH_FORMAT;
+use crate::renderer::depth_format;
 use std::ops::Range;
 
 const MIN_COMMANDS: usize = 48;
@@ -79,7 +79,7 @@ impl DeferredWorldBundles {
             label: Some("JKA cached ordered transparent BSP"),
             color_formats: &colors,
             depth_stencil: Some(wgpu::RenderBundleDepthStencil {
-                format: DEPTH_FORMAT,
+                format: depth_format(),
                 depth_read_only: false,
                 stencil_read_only: true,
             }),

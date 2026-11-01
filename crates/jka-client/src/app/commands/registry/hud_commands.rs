@@ -267,6 +267,11 @@ commands! {
         if self.execute_input_button_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
     }
 
+    cmd_scoreboard_stats ["scoreboardstats", ] ("scoreboardstats", "Switch the scoreboard between the player list and your match breakdown.", CommandScope::Always) |self, _command| {
+        self.toggle_scoreboard_stats();
+        CommandResult::Handled
+    }
+
     cmd_messagemode ["messagemode", ] ("messagemode", "Open global chat input.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

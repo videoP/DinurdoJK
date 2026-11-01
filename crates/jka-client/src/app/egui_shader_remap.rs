@@ -51,11 +51,11 @@ fn show_remap_thumbnail(
     }
 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL);
+    ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL());
     if state.thumbnails_missing.contains(shader_name) {
         ui.painter().text(
             rect.center(), egui::Align2::CENTER_CENTER, "NO IMAGE",
-            egui::FontId::proportional(10.0), theme::TEXT_FAINT,
+            egui::FontId::proportional(10.0), theme::TEXT_FAINT(),
         );
     } else if state.thumbnails_pending.insert(shader_name.to_owned()) {
         requests.push((shader_name.to_owned(), image_path.to_owned()));
@@ -244,7 +244,7 @@ impl App {
             .collapsible(false)
             .show(root.ctx(), |ui| {
                 ui.horizontal(|ui| {
-                    theme::label(ui, theme::plain("MAP MATERIALS", 15.0, theme::TEXT));
+                    theme::label(ui, theme::plain("MAP MATERIALS", 15.0, theme::TEXT()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::ghost_button(ui, "CLOSE").clicked() {
                             action = Some(RemapAction::Close);
@@ -299,7 +299,7 @@ impl App {
                                             Some(to) if active => format!("→ {to}"),
                                             Some(to) => format!("OFF → {to}"),
                                             None => "Original (not remapped)".to_owned(),
-                                        }).small().color(theme::TEXT_FAINT));
+                                        }).small().color(theme::TEXT_FAINT()));
                                     });
                                     if to.is_some() {
                                         let mut enabled = active;
@@ -313,10 +313,10 @@ impl App {
                         });
                     columns[1].vertical(|ui| {
                         if let Some(source) = state.selected.clone() {
-                            theme::label(ui, theme::plain("SOURCE SHADER", 11.0, theme::TEXT_FAINT));
+                            theme::label(ui, theme::plain("SOURCE SHADER", 11.0, theme::TEXT_FAINT()));
                             ui.label(egui::RichText::new(&source).monospace().strong());
                             ui.add_space(11.0);
-                            theme::label(ui, theme::plain("REPLACEMENT SHADER", 11.0, theme::TEXT_FAINT));
+                            theme::label(ui, theme::plain("REPLACEMENT SHADER", 11.0, theme::TEXT_FAINT()));
                             ui.add_sized([ui.available_width(), 29.0],
                                 egui::TextEdit::singleline(&mut state.target)
                                     .hint_text("Start typing any loaded shader…"));
@@ -331,7 +331,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new("ORIGINAL").small()
-                                        .color(theme::TEXT_FAINT));
+                                        .color(theme::TEXT_FAINT()));
                                     let path = thumbnail_path(&source);
                                     show_remap_thumbnail(ui, state, &source, &path, 96.0,
                                         &mut request_images);
@@ -339,7 +339,7 @@ impl App {
                                 ui.add_space(12.0);
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new("REPLACEMENT PREVIEW").small()
-                                        .color(theme::TEXT_FAINT));
+                                        .color(theme::TEXT_FAINT()));
                                     if target_is_known {
                                         let path = thumbnail_path(&typed);
                                         show_remap_thumbnail(ui, state, &typed, &path, 112.0,
@@ -347,16 +347,16 @@ impl App {
                                     } else {
                                         let (rect, _) = ui.allocate_exact_size(
                                             egui::vec2(112.0, 112.0), egui::Sense::hover());
-                                        ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL);
+                                        ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL());
                                         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                                             "SELECT SHADER", egui::FontId::proportional(10.0),
-                                            theme::TEXT_FAINT);
+                                            theme::TEXT_FAINT());
                                     }
                                 });
                             });
                             ui.label(egui::RichText::new(
                                 "Static preview: editor image or first texture stage."
-                            ).small().color(theme::TEXT_FAINT));
+                            ).small().color(theme::TEXT_FAINT()));
                             if !typed.is_empty() {
                                 // Prefix matches first, then substring matches. No
                                 // shader-specific hacks or runtime renderer lookups.
@@ -391,7 +391,7 @@ impl App {
                             ui.label(egui::RichText::new(
                                 "Changes use the existing local /remapShader path. \
                                  Remapping changes appearance, not BSP collision or geometry."
-                            ).small().color(theme::TEXT_FAINT));
+                            ).small().color(theme::TEXT_FAINT()));
                         } else {
                             ui.label("Select a map material to edit its replacement.");
                         }

@@ -13,6 +13,20 @@ use super::prepare::{pack_jobs, CpuPackJob, PreparePerf};
 use std::time::Instant;
 
 impl DynamicModelRenderer {
+    pub(in crate::renderer) fn init_lightning_gpu(
+        &mut self, device: &wgpu::Device, source: &crate::renderer::StaticAoWorldSource,
+    ) {
+        self.lightning_gpu = super::lightning_gpu::LightningGpu::new(device, &self.camera_layout, source);
+    }
+
+    pub(in crate::renderer) fn encode_lightning(
+        &self, encoder: &mut wgpu::CommandEncoder, camera: &wgpu::BindGroup,
+    ) {
+        if let Some(gpu) = self.lightning_gpu.as_ref() {
+            gpu.encode(encoder, camera);
+        }
+    }
+
     /// Preserve the same packed FX and clipped blob streams in raster and RT preparation.
     pub(in crate::renderer) fn prepare_fx_surface(
         &mut self,
@@ -92,6 +106,7 @@ impl DynamicModelRenderer {
             alpha_mode: surface.alpha_mode,
             wireframe_class: surface.wireframe_class,
             authored_glow: surface.authored_glow,
+            lightning: sprites.lightning,
         });
         return true;
     }
@@ -144,10 +159,19 @@ impl DynamicModelRenderer {
                 }
             }
         }
+        let total_instances = if let Some(gpu) = self.lightning_gpu.as_mut() {
+            gpu.collect(&mut self.fx_sprite_draws, fx_sprite_instances)
+        } else {
+            fx_sprite_instances.len()
+        };
         let fx_sprite_bytes = bytemuck::cast_slice(fx_sprite_instances);
-        self.ensure_fx_sprite_instance_capacity(device, fx_sprite_bytes.len() as u64);
+        self.ensure_fx_sprite_instance_capacity(device,
+            (total_instances * std::mem::size_of::<crate::renderer::FxGpuSpriteInstance>()) as u64);
         if !fx_sprite_bytes.is_empty() {
             queue.write_buffer(&self.fx_sprite_instance_buffer, 0, fx_sprite_bytes);
+        }
+        if let Some(gpu) = self.lightning_gpu.as_mut() {
+            gpu.upload(device, queue, &self.fx_sprite_instance_buffer);
         }
     }
     pub(in crate::renderer) fn prepare(
@@ -720,10 +744,10 @@ impl DynamicModelRenderer {
         let draw_bytes = bytemuck::cast_slice(gpu_draw_data.as_slice());
         self.ensure_skin_capacity(device, bone_bytes.len() as u64, draw_bytes.len() as u64);
         if !bone_bytes.is_empty() {
-            queue.write_buffer(&self.skin_bone_buffer, 0, bone_bytes);
+            crate::renderer::igpu_ab_model_upload(queue, &self.skin_bone_buffer, bone_bytes, self.igpu_ab_mode);
         }
         if !draw_bytes.is_empty() {
-            queue.write_buffer(&self.skin_draw_buffer, 0, draw_bytes);
+            crate::renderer::igpu_ab_model_upload(queue, &self.skin_draw_buffer, draw_bytes, self.igpu_ab_mode);
         }
 
         self.scratch_vertices = vertices;
@@ -816,7 +840,7 @@ impl DynamicModelRenderer {
                 let fixture = self.fixture_lighting.as_ref().filter(|f|
                     legacy_effects != Some(true) && !studio_capture && !authored_glow_only && !self.rt_prepared
                         && f.pipeline(alpha_mode,false,false).is_some());
-                if legacy_effects != Some(true) && !studio_capture && fixture.is_none() && alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
+                if legacy_effects != Some(true) && !studio_capture && fixture.is_none() && alpha_mode != DynamicModelAlphaMode::Glass && (self.model_render_bundles || self.igpu_ab_mode & 4 != 0) && !preserve_order
                     && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
                 {
                     if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
@@ -905,7 +929,7 @@ impl DynamicModelRenderer {
                         .as_ref()
                         .and_then(|key| self.textures.get(key))
                         .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                    if !self.model_state_cache
+                    if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
                         || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
                     {
                         if capture_calls { calls.set_bind_group += 1; }
@@ -976,7 +1000,7 @@ impl DynamicModelRenderer {
                             .as_ref()
                             .and_then(|key| self.textures.get(key))
                             .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                        if !self.model_state_cache
+                        if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
                             || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
                         {
                             if capture_calls { calls.set_bind_group += 1; }
@@ -984,7 +1008,7 @@ impl DynamicModelRenderer {
                             current_texture = Some(bind_group);
                         }
                         if capture_calls { calls.fx_draw += 1; }
-                        pass.draw(0..6, instances);
+                        pass.draw(0..if draw.lightning { 144 } else { 6 }, instances);
                     }
                 }
                 if let Some(profiler) = gpu_profiler.as_deref_mut() {
@@ -1025,7 +1049,7 @@ impl DynamicModelRenderer {
                         let bind_group = draw.texture_key.as_ref()
                             .and_then(|key| self.textures.get(key))
                             .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                        if !self.model_state_cache
+                        if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
                             || !last_texture.is_some_and(|prior| std::ptr::eq(prior, bind_group))
                         {
                             pass.set_bind_group(1, bind_group, &[]);
@@ -1104,7 +1128,7 @@ impl DynamicModelRenderer {
                             .as_ref()
                             .and_then(|key| self.textures.get(key))
                             .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                        if !self.model_state_cache
+                        if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
                             || !current_mesh.is_some_and(|current| std::ptr::eq(current, mesh))
                         {
                             if capture_calls { calls.set_vertex_buffer += 1; }
@@ -1116,7 +1140,7 @@ impl DynamicModelRenderer {
                             );
                             current_mesh = Some(mesh);
                         }
-                        if !self.model_state_cache
+                        if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
                             || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
                         {
                             if capture_calls { calls.set_bind_group += 1; }
@@ -1242,7 +1266,7 @@ impl DynamicModelRenderer {
                     bound = true;
                 }
                 pass.draw(
-                    0..6,
+                    0..if draw.lightning { 144 } else { 6 },
                     draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
                 );
             }

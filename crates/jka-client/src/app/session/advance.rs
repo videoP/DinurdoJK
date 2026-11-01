@@ -9,6 +9,61 @@ use crate::app::{
     TransientLight,
 };
 
+// Only used while r_fxCpuTrace=1. This runs on the client presentation thread;
+// reporting is aggregated so println! cannot turn each 3,000-FPS frame into an
+// I/O benchmark. All timings cover the actual FX client interval, not GPU FX.
+#[derive(Default)]
+struct FxCpuTraceWindow {
+    since: Option<Instant>,
+    frames: u32,
+    sum: [f64; 9],
+    max: [f64; 9],
+    draw_count: u64,
+    light_count: u64,
+    mesh_count: u64,
+    end_frame_draw_count: u64,
+    extras_draw_count: u64,
+}
+
+std::thread_local! {
+    static FX_CPU_WINDOW: std::cell::RefCell<FxCpuTraceWindow> =
+        std::cell::RefCell::new(FxCpuTraceWindow::default());
+}
+
+fn report_fx_cpu_trace(times: [f64; 9], draws: usize, lights: usize, meshes: usize, end_frame_draws: usize, extras_draws: usize) {
+    FX_CPU_WINDOW.with(|slot| {
+        let mut window = slot.borrow_mut();
+        window.frames += 1;
+        for (i, elapsed) in times.into_iter().enumerate() {
+            window.sum[i] += elapsed;
+            window.max[i] = window.max[i].max(elapsed);
+        }
+        window.draw_count += draws as u64;
+        window.light_count += lights as u64;
+        window.mesh_count += meshes as u64;
+        window.end_frame_draw_count += end_frame_draws as u64;
+        window.extras_draw_count += extras_draws as u64;
+        let elapsed = window.since.get_or_insert_with(Instant::now).elapsed();
+        if elapsed < std::time::Duration::from_secs(1) { return; }
+        let frames = f64::from(window.frames);
+        println!(
+            "[JKA FX CPU] frames={} avg_ms[present={:.4} requests={:.4} end_frame={:.4} extras={:.4} promotion={:.4} output={:.4}] inner_avg_ms[tick={:.4} marks={:.4} immediate={:.4}] max_ms[present={:.4} requests={:.4} end_frame={:.4} extras={:.4} promotion={:.4} output={:.4}] avg_draws={:.2} avg_lights={:.2} avg_meshes={:.2} source_draws[end_frame={:.2} extras={:.2}]",
+            window.frames,
+            window.sum[0]/frames, window.sum[1]/frames, window.sum[2]/frames,
+            window.sum[3]/frames, window.sum[4]/frames, window.sum[5]/frames,
+            window.sum[6]/frames, window.sum[7]/frames, window.sum[8]/frames,
+            window.max[0], window.max[1], window.max[2],
+            window.max[3], window.max[4], window.max[5],
+            window.draw_count as f64 / frames,
+            window.light_count as f64 / frames,
+            window.mesh_count as f64 / frames,
+            window.end_frame_draw_count as f64 / frames,
+            window.extras_draw_count as f64 / frames,
+        );
+        *window = FxCpuTraceWindow::default();
+    });
+}
+
 impl GameSession {
     pub(in crate::app) fn advance(
         &mut self,
@@ -97,6 +152,7 @@ impl GameSession {
                 &ProtocolSnapshot,
                 Option<&ProtocolSnapshot>,
                 &[PresentedEntity],
+                [crate::cgame::PrivateDuelState; 2], // retained snap/nextSnap duel state
             ) -> Result<Option<LivePredictionFrame>, String>,
         >,
         input: Option<PlayerPresentationInput>,
@@ -230,11 +286,15 @@ impl GameSession {
             self.presented_entities.retain(|e| e.entity_type != crate::cgame::ET_PLAYER
                 || usize::from(e.number) >= crate::strafe_trail::MAX_CLIENTS || keep.contains(&e.number));
         }
+        let duel_states = [self.current_snapshot.as_ref(), self.next_snapshot.as_ref()]
+            .map(|snapshot| snapshot.map_or_else(crate::cgame::PrivateDuelState::default,
+                |snapshot| self.client_game.private_duel_state_for_snapshot(snapshot)));
         let predicted = match (predict, self.current_snapshot.as_ref()) {
             (Some(predict), Some(current)) => predict(
                 current,
                 self.next_snapshot.as_ref(),
                 &self.presented_entities,
+                duel_states,
             )?,
             _ => None,
         };
@@ -324,6 +384,8 @@ impl GameSession {
                     sample.client_num as u16,
                     scene::jka_position(sample.eye_position),
                     target_server_time,
+                    self.presented_player_state.as_ref(),
+                    sample.teleported || self.seeking_demo,
                 );
                 let yaw = sample.view_angles[1].to_radians();
                 sound.frame(
@@ -981,12 +1043,19 @@ impl GameSession {
             dynamic_models.push(blob_shadows);
         }
         let fx_started = Instant::now();
+        let fx_cpu_trace = crate::cgame::weapon_fx::fx_cpu_trace_enabled();
+        let mut fx_cpu_times = [0.0; 9];
+        let mut fx_cpu_stage = fx_started;
         dynamic_models.extend(self.event_presenter.present(target_server_time));
         self.view_offset_z = self
             .event_presenter
             .view_kick()
             .offset(target_server_time, !render_followed_body);
         self.dynamic_models = Arc::new(dynamic_models);
+        if fx_cpu_trace {
+            fx_cpu_times[0] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            fx_cpu_stage = Instant::now();
+        }
         // Force-power visuals CG_Player queued for this frame.
         for request in self.player_presenter.drain_fx_requests() {
             self.weapon_fx.player_fx(&request);
@@ -1012,10 +1081,28 @@ impl GameSession {
         }
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
         self.weapon_fx.set_fx_light_promotion_level(self.promote_fx_lights);
+        if fx_cpu_trace {
+            fx_cpu_times[1] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            fx_cpu_stage = Instant::now();
+        }
         let mut fx_frame = self.weapon_fx.end_frame();
+        let fx_end_frame_draws = if fx_cpu_trace { fx_frame.draws.len() } else { 0 };
+        if fx_cpu_trace {
+            fx_cpu_times[2] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            fx_cpu_times[6..9].copy_from_slice(&self.weapon_fx.end_frame_cpu_ms());
+            fx_cpu_stage = Instant::now();
+        }
+        (self.client_perf.fx_worker_wait_ms, self.client_perf.fx_worker_update_ms) =
+            self.weapon_fx.worker_frame_timings_ms();
+        (self.client_perf.fx_worker_ticks, self.client_perf.fx_worker_deferred,
+         self.client_perf.fx_worker_age_ms, self.client_perf.fx_worker_in_flight,
+         self.client_perf.fx_snapshot_clone_ms) =
+            self.weapon_fx.worker_cadence_stats();
         // A Decal{} with ghoul2decals may also mark an animated character.
         // This is a model-space projection, not an extra billboard in the FX pass.
-        self.player_presenter.add_authored_ghoul2_decals(&fx_frame.ghoul2_decals, target_server_time);
+        if crate::fx::render_enabled() {
+            self.player_presenter.add_authored_ghoul2_decals(&fx_frame.ghoul2_decals, target_server_time);
+        }
 
         let (emote_draws, emote_lights) = self.player_presenter.drain_emote_fx();
         fx_frame.draws.extend(emote_draws);
@@ -1037,6 +1124,13 @@ impl GameSession {
                     shake.time_ms,
                 );
             }
+        }
+        let fx_extras_draws = if fx_cpu_trace {
+            fx_frame.draws.len().saturating_sub(fx_end_frame_draws)
+        } else { 0 };
+        if fx_cpu_trace {
+            fx_cpu_times[3] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            fx_cpu_stage = Instant::now();
         }
         let projectile_emitters = self.weapon_fx.take_projectile_light_requests();
         if self.promote_fx_lights == 2 {
@@ -1077,28 +1171,49 @@ impl GameSession {
                 .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Line { .. })).count() as u64);
             diag::report_if_due();
         }
+        if !crate::fx::render_enabled() {
+            // Presentation-only A/B: preserve FX scheduler state, authored
+            // audio/camera shakes and persistent marks while suppressing ALL
+            // output that reaches the renderer, including FX-derived lighting.
+            fx_frame.draws.clear();
+            fx_frame.blades.clear();
+            fx_frame.lights.clear();
+            fx_frame.auto_light_candidates.clear();
+            fx_frame.gpu_sprite_draw_indices.clear();
+            fx_frame.gpu_sparks = None;
+            fx_frame.runner_draws.clear();
+        }
+        if fx_cpu_trace {
+            fx_cpu_times[4] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            fx_cpu_stage = Instant::now();
+        }
+        let fx_draw_count = fx_frame.draws.len();
+        let fx_light_count = fx_frame.lights.len();
+        let fx_mesh_count = if fx_cpu_trace {
+            fx_frame.draws.iter().filter(|draw| matches!(draw, crate::fx::system::FxDraw::Mesh { .. })).count()
+        } else { 0 };
         self.gpu_commands = fx_frame.gpu_sparks.take();
         self.gpu_draw_indices = std::mem::take(&mut fx_frame.gpu_sprite_draw_indices);
         self.fx_runner_draws = fx_frame.runner_draws;
         self.fx_draws = fx_frame.draws;
-        self.fx_blades = Arc::new(
-            fx_frame
-                .blades
-                .iter()
-                .map(|blade| crate::renderer::CloudForegroundBlade {
+        // At very high frame rates an idle map was allocating/dropping two
+        // Arc<Vec<..>> headers on every client frame even with no saber blades
+        // or FX lights. Existing snapshots may still own the prior Arc; keep
+        // that same immutable empty Arc instead of allocating a new one.
+        if !fx_frame.blades.is_empty() || !self.fx_blades.is_empty() {
+            self.fx_blades = Arc::new(
+                fx_frame.blades.iter().map(|blade| crate::renderer::CloudForegroundBlade {
                     start: scene::render_position(blade.start),
                     end: scene::render_position(blade.end),
                     radius: blade.radius,
-                })
-                .collect(),
-        );
-        self.fx_lights = Arc::new(
-            fx_frame
-                .lights
-                .iter()
-                .filter_map(TransientLight::from_fx)
-                .collect(),
-        );
+                }).collect(),
+            );
+        }
+        if !fx_frame.lights.is_empty() || !self.fx_lights.is_empty() {
+            self.fx_lights = Arc::new(
+                fx_frame.lights.iter().filter_map(TransientLight::from_fx).collect(),
+            );
+        }
         if !self.suppress_audio {
             if let Some(sound) = &mut self.sound_presenter {
                 for fx_sound in &fx_frame.sounds {
@@ -1107,6 +1222,11 @@ impl GameSession {
             }
         }
         self.client_perf.fx_ms = fx_started.elapsed().as_secs_f64() * 1000.0;
+        if fx_cpu_trace {
+            fx_cpu_times[5] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
+            report_fx_cpu_trace(fx_cpu_times, fx_draw_count, fx_light_count, fx_mesh_count,
+                fx_end_frame_draws, fx_extras_draws);
+        }
         let ghoul2 = self.player_presenter.perf_stats();
         self.client_perf.ghoul2_pose_ms = ghoul2.pose_ms;
         self.client_perf.ghoul2_motion_pose_ms = ghoul2.motion_pose_ms;

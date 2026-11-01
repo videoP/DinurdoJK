@@ -196,6 +196,10 @@ pub struct SaberDefinition {
     pub hit2_sounds: [Option<String>; 3],
     pub block_sounds: [Option<String>; 3],
     pub block2_sounds: [Option<String>; 3],
+    /// TaystJK saberInfo_t bladeEffect / bladeEffect2; a bolted .efx is
+    /// submitted at the blade tag while that blade is active, even if noBlade.
+    pub blade_effect: Option<String>,
+    pub blade_effect2: Option<String>,
     pub block_effect: Option<String>,
     pub block_effect2: Option<String>,
     pub hit_person_effect: Option<String>,
@@ -255,6 +259,8 @@ impl SaberDefinition {
             hit2_sounds: [None, None, None],
             block_sounds: [None, None, None],
             block2_sounds: [None, None, None],
+            blade_effect: None,
+            blade_effect2: None,
             block_effect: None,
             block_effect2: None,
             hit_person_effect: None,
@@ -726,6 +732,8 @@ fn parse_saber_file(
                     }
                     parser.skip_rest_of_line();
                 }
+                "bladeeffect" => definition.blade_effect = parse_optional_qpath(&mut parser)?,
+                "bladeeffect2" => definition.blade_effect2 = parse_optional_qpath(&mut parser)?,
                 "blockeffect" => definition.block_effect = parse_optional_qpath(&mut parser)?,
                 "blockeffect2" => definition.block_effect2 = parse_optional_qpath(&mut parser)?,
                 "hitpersoneffect" => definition.hit_person_effect = parse_optional_qpath(&mut parser)?,
@@ -1077,6 +1085,8 @@ mod tests {
                     hit2Sound2 sound/weapons/custom/hit2_2.wav
                     blockSound3 sound/weapons/custom/block3.wav
                     block2Sound1 sound/weapons/custom/block2_1.wav
+                    bladeEffect saber/custom_blade.efx
+                    bladeEffect2 saber/custom_blade2.efx
                     blockEffect saber/custom_block.efx
                     blockEffect2 saber/custom_block2.efx
                     hitPersonEffect saber/custom_person.efx
@@ -1129,6 +1139,8 @@ mod tests {
         assert_eq!(def.hit2_sounds[1].as_deref(), Some("sound/weapons/custom/hit2_2.wav"));
         assert_eq!(def.block_sounds[2].as_deref(), Some("sound/weapons/custom/block3.wav"));
         assert_eq!(def.block2_sounds[0].as_deref(), Some("sound/weapons/custom/block2_1.wav"));
+        assert_eq!(def.blade_effect.as_deref(), Some("saber/custom_blade.efx"));
+        assert_eq!(def.blade_effect2.as_deref(), Some("saber/custom_blade2.efx"));
         assert_eq!(def.block_effect.as_deref(), Some("saber/custom_block.efx"));
         assert_eq!(def.block_effect2.as_deref(), Some("saber/custom_block2.efx"));
         assert_eq!(def.hit_person_effect.as_deref(), Some("saber/custom_person.efx"));

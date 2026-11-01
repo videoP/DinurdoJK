@@ -230,6 +230,150 @@ fn sink(entity: &Entity, models: &[Model], entity_index: usize) -> Result<Sink, 
     })
 }
 
+/// Riverbed geometry: what players collide with, not what is textured.
+/// Candidate faces are every side polygon of the world model's solid/terrain
+/// brushes (exact brush-plane clipping, so caulk/nodraw faces count), solid
+/// curved patches (eight segments per quadratic span, as the coastal
+/// bathymetry samples them) and solid triangle soups. Liquid and clip-only
+/// brushes are not bed. A face is kept only if it can be ground:
+///  - its outward normal points up (a ceiling's underside never is), and
+///  - the point one unit in front of it is in a playable BSP cluster, so the
+///    outside of the skybox and faces buried between brushes are dropped.
+///    Maps compiled without vis keep the up-facing test only.
+/// Sky flags are honoured when the BSP carries them (Tsangpo's does not).
+/// Z-up JKA map units; returned triangles face up.
+/// Up-facing collision surface with the bottom of its parent solid brush.
+/// The brush support height distinguishes a box standing in the water from a
+/// roof suspended above it. Mesh terrain (patches/triangle soups) has no
+/// parent solid, so it is clipped to the requested water level instead.
+#[derive(Clone, Copy, Debug)]
+pub struct CollisionSurface {
+    pub triangle: [[f32; 3]; 3],
+    pub solid_bottom_z: Option<f32>,
+}
+
+/// Preserve the original unclassified triangle API for generic/map captures.
+pub fn collision_triangles(bsp: &Bsp) -> Result<Vec<[[f32; 3]; 3]>, String> {
+    Ok(collision_surfaces(bsp)?.into_iter().map(|s| s.triangle).collect())
+}
+
+/// Detailed developer-river collision, built once per map and reused by each
+/// `riversource` placement without touching collision on the render loop.
+pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
+    use super::{brush_side_polygon, patch_vertex, SurfaceKind, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
+    const LIQUIDS: u32 = super::bathymetry::CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
+    const UP: f32 = 1e-3;
+    let solid = |contents: u32| contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) != 0 && contents & LIQUIDS == 0;
+    let world = bsp.models.first().ok_or("BSP has no world model")?;
+    let extent = world.mins.iter().chain(&world.maxs).map(|v| v.abs()).fold(1024.0, f32::max) * 2.0;
+    let in_air = |points: &[[f32; 3]], normal: [f32; 3]| -> bool {
+        let Some(vis) = bsp.visibility.as_ref() else { return true };
+        let n = points.len() as f32;
+        let probe = std::array::from_fn(|a| points.iter().map(|p| p[a]).sum::<f32>() / n + normal[a]);
+        vis.cluster_at(probe).is_some()
+    };
+    let mut out = Vec::new();
+    for id in world.brushes.clone() {
+        let brush = bsp.brushes.get(id).ok_or("invalid world brush index")?;
+        let contents = bsp.shaders.get(brush.shader).ok_or("invalid brush shader")?.contents;
+        if !solid(contents) {
+            continue;
+        }
+        let start = out.len();
+        let mut bottom_z = f32::INFINITY;
+        for side in brush.sides.clone() {
+            let bside = bsp.brush_sides.get(side).ok_or("invalid brush side")?;
+            let flags = bsp.shaders.get(bside.shader).map_or(0, |s| s.surface_flags);
+            let plane = bsp.planes.get(bside.plane).ok_or("invalid brush plane")?;
+            // All sides contribute to the brush's lowest occupied height, not
+            // just its upward top. A floating roof has its bottom above water;
+            // a standing box has its bottom below the water surface.
+            let polygon = brush_side_polygon(bsp, brush, side, extent).map_err(|e| e.to_string())?;
+            for point in &polygon {
+                bottom_z = bottom_z.min(point[2]);
+            }
+            if plane.normal[2] <= UP || flags & SURF_SKY != 0
+                || polygon.len() < 3 || !in_air(&polygon, plane.normal)
+            {
+                continue;
+            }
+            for k in 2..polygon.len() {
+                out.push(CollisionSurface {
+                    triangle: [polygon[0], polygon[k - 1], polygon[k]],
+                    solid_bottom_z: None,
+                });
+            }
+        }
+        // Assign once after scanning every side. This also handles sloped and
+        // non-axis-aligned brushes; no guessed brush height or threshold.
+        if bottom_z.is_finite() {
+            for surface in &mut out[start..] {
+                surface.solid_bottom_z = Some(bottom_z);
+            }
+        }
+    }
+    for id in world.surfaces.clone() {
+        let surface = bsp.surfaces.get(id).ok_or("invalid world surface index")?;
+        let shader = bsp.shaders.get(surface.shader).ok_or("invalid surface shader")?;
+        if !solid(shader.contents) || shader.surface_flags & SURF_SKY != 0 {
+            continue;
+        }
+        let verts = bsp.vertices.get(surface.vertices.clone()).ok_or("invalid surface vertices")?;
+        // Orient each triangle by its authored vertex normals, as bathymetry does.
+        let mut push = |v: [super::Vertex; 3]| {
+            let p = v.map(|v| v.position);
+            let e1: [f32; 3] = std::array::from_fn(|a| p[1][a] - p[0][a]);
+            let e2: [f32; 3] = std::array::from_fn(|a| p[2][a] - p[0][a]);
+            let mut n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            let authored: [f32; 3] = std::array::from_fn(|a| v.iter().map(|v| v.normal[a]).sum());
+            if n[0] * authored[0] + n[1] * authored[1] + n[2] * authored[2] < 0.0 {
+                n = n.map(|c| -c);
+            }
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len < 1e-6 {
+                return;
+            }
+            let n = n.map(|c| c / len);
+            if n[2] > UP && in_air(&p, n) {
+                out.push(CollisionSurface { triangle: p, solid_bottom_z: None });
+            }
+        };
+        match surface.kind {
+            SurfaceKind::Patch => {
+                let [w, h] = surface.patch_size;
+                if w < 3 || h < 3 || verts.len() < w * h {
+                    continue;
+                }
+                for y in (0..h - 2).step_by(2) {
+                    for x in (0..w - 2).step_by(2) {
+                        for j in 0..8 {
+                            for i in 0..8 {
+                                let q = |u: usize, v: usize| patch_vertex(verts, w, x, y, u as f32 / 8.0, v as f32 / 8.0);
+                                let (a, b, c, d) = (q(i, j), q(i + 1, j), q(i, j + 1), q(i + 1, j + 1));
+                                push([a, c, b]);
+                                push([b, c, d]);
+                            }
+                        }
+                    }
+                }
+            }
+            // Planar faces are brush sides, already handled above.
+            SurfaceKind::Triangles => {
+                let indices = bsp.indices.get(surface.indices.clone()).ok_or("invalid surface indices")?;
+                for t in indices.chunks_exact(3) {
+                    if let (Some(a), Some(b), Some(c)) =
+                        (verts.get(t[0] as usize), verts.get(t[1] as usize), verts.get(t[2] as usize))
+                    {
+                        push([*a, *b, *c]);
+                    }
+                }
+            }
+            SurfaceKind::Planar | SurfaceKind::Flare => {}
+        }
+    }
+    Ok(out)
+}
+
 /// Read map-local entities only. No server state, simulation, bake loading, or
 /// fallback-surface hiding happens here. Call again after applying a .ent edit.
 pub fn parse(entities: &[Entity], models: &[Model]) -> Rivers {
@@ -298,6 +442,7 @@ impl Bsp {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn entity(pairs: &[(&str, &str)]) -> Entity {

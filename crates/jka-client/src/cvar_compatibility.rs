@@ -104,7 +104,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", swim_bank_probe: 0.0", "")
         .replace(", swim_turn_bank: 0.7", "")
         .replace(", swim_turn_bank: 1.0", "")
-        .replace(", move_lean: 0.75", "");
+        .replace(", move_lean: 0.75", "")
+        .replace(", footstep_trace: false", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -607,8 +608,9 @@ seta r_saberFlares 0
 #[test]
 fn shared_auto_lod_default_and_archive_round_trip() {
     let defaults = crate::ui::VideoSettings::default();
-    assert!(defaults.md3_auto_lod);
+    assert!(!defaults.md3_auto_lod);
     assert!(defaults.bsp_model_lod);
+    assert_eq!(crate::app::cvar_registry().find("r_md3AutoLod").unwrap().entry.default, "0");
 
     let fixture = Fixture::new();
     let path = fixture.0.join("model-lods.cfg");

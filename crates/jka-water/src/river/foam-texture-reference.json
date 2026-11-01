@@ -1,0 +1,116 @@
+{
+  "asset_sha256": "57887d02768aaf92a61072f8e3c518fb7a43b8a89314ef47240ce7ddfffa582f",
+  "decoder_sha1": "b5120a64e2756eb99978a9ddc4fb36939a3d4cfe",
+  "source_blake3": "a5deed76ba717121adc0ff0491f47509d8475ac253f93e7261e7c0e3851275d4",
+  "source_sha256": "2c9473b178bf63e438acca9ec01b6065008ee33fd6f508f6c78cc58a5ddc7170",
+  "source_min": [
+    1.3083219528198242e-05,
+    1.9818544387817383e-05,
+    0.502109169960022,
+    0.0
+  ],
+  "source_max": [
+    0.9999864101409912,
+    0.9999884366989136,
+    1.0,
+    0.9770793914794922
+  ],
+  "format": "RGBA16F linear, raw RGB and alpha",
+  "mip_filter": "World TMGS_SimpleAverage, f32 parents, RTNE stores",
+  "mips": [
+    {
+      "name": "mip00.rgba16f",
+      "size": 2048,
+      "bytes": 33554432,
+      "sha256": "31ea151b7481c3a0122e372986d24e410a309a5ed7a7f2bf6e8b60acd5033774"
+    },
+    {
+      "name": "mip01.rgba16f",
+      "size": 1024,
+      "bytes": 8388608,
+      "sha256": "3b140429b9db671c7c9ba66493d4ff7cff40a23a1e3a9dbb24d21ebc7493db94"
+    },
+    {
+      "name": "mip02.rgba16f",
+      "size": 512,
+      "bytes": 2097152,
+      "sha256": "84eccbeafd90cc311f3fb8b9359b15d19f99bfaedefeb215449f780895552d1e"
+    },
+    {
+      "name": "mip03.rgba16f",
+      "size": 256,
+      "bytes": 524288,
+      "sha256": "50adb7ef215549c9f538a57c8ed0c07f5d092b12e49cb8cfccfe3ff4fa311364"
+    },
+    {
+      "name": "mip04.rgba16f",
+      "size": 128,
+      "bytes": 131072,
+      "sha256": "95a4a37c86b9985af0ea74c7eb1a25f0b507527d02b6cc612513628c4e17c972"
+    },
+    {
+      "name": "mip05.rgba16f",
+      "size": 64,
+      "bytes": 32768,
+      "sha256": "9f1d6c88303a35e8026b00ea759b94cddde1b6b1dcd3c1e2e5e4cd639f5d214a"
+    },
+    {
+      "name": "mip06.rgba16f",
+      "size": 32,
+      "bytes": 8192,
+      "sha256": "9a17393fe3fcd06329aac1d59c470635403b90668563b867ab89f09ddaac6706"
+    },
+    {
+      "name": "mip07.rgba16f",
+      "size": 16,
+      "bytes": 2048,
+      "sha256": "2296ed4c615dcde07f42866271b09221c3253deeefba8b2d8da09d2af9f4e365"
+    },
+    {
+      "name": "mip08.rgba16f",
+      "size": 8,
+      "bytes": 512,
+      "sha256": "8d7ebb68101ab46950f7b926b81a68214728635cd8abee2116f4b1e1779e01b0"
+    },
+    {
+      "name": "mip09.rgba16f",
+      "size": 4,
+      "bytes": 128,
+      "sha256": "54bb1ca6d4b510381ffbef147d70791687fae2af9c5bf154c109a3ef46dc35f6"
+    },
+    {
+      "name": "mip10.rgba16f",
+      "size": 2,
+      "bytes": 32,
+      "sha256": "e6d52486e43f3c331c77b50b33680466050fa4beaa71ab664fd5d1f5655c0a5f"
+    },
+    {
+      "name": "mip11.rgba16f",
+      "size": 1,
+      "bytes": 8,
+      "sha256": "5e9ae9a843db9a932269d72aba832d68e944a19791f9f0c95004f528b8951fd4"
+    }
+  ],
+  "sampler_mips": {
+    "Dx12": "linear",
+    "Vulkan": "nearest"
+  },
+  "native_downsample": "void GenerateMip2x2Simple(\n\tconst FImageView2D& SourceImageData, \n\tFImageView2D& DestImageData)\n{\n\tint32 NumRowsEachJob;\n\tint32 NumJobs = ImageParallelForComputeNumJobsForRows(NumRowsEachJob,DestImageData.SizeX,DestImageData.SizeY);\n\n\tParallelFor( TEXT(\"Texture.GenerateMip2x2Simple.PF\"),NumJobs,1, [&](int32 Index)\n\t{\n\t\tint32 StartIndex = Index * NumRowsEachJob;\n\t\tint32 EndIndex = FMath::Min(StartIndex + NumRowsEachJob, DestImageData.SizeY);\n\t\tfor (int32 DestY = StartIndex; DestY < EndIndex; ++DestY)\n\t\t{\n\t\t\tfloat* DestRow = &DestImageData.Access(0, DestY).Component(0);\n\t\t\tconst float* SourceRow0 = &SourceImageData.Access(0, 2*DestY).Component(0);\n\t\t\tconst float* SourceRow1 = &SourceImageData.Access(0, 2*DestY+1).Component(0);\n\n\t\t\tconst VectorRegister4Float Mul = VectorSetFloat1(0.25f);\n\t\t\tfor (int32 DestX = 0; DestX < DestImageData.SizeX; DestX++)\n\t\t\t{\n\t\t\t\tVectorRegister4Float A = VectorLoad(&SourceRow0[0]);\n\t\t\t\tVectorRegister4Float B = VectorLoad(&SourceRow0[4]);\n\t\t\t\tVectorRegister4Float C = VectorLoad(&SourceRow1[0]);\n\t\t\t\tVectorRegister4Float D = VectorLoad(&SourceRow1[4]);\n\t\t\t\tVectorRegister4Float Sum = VectorAdd(VectorAdd(VectorAdd(A, B), C), D);\n\t\t\t\tVectorRegister4Float Avg = VectorMultiply(Sum, Mul);\n\t\t\t\tVectorStore(Avg, &DestRow[0]);\n\t\t\t\tSourceRow0 += 8;\n\t\t\t\tSourceRow1 += 8;\n\t\t\t\tDestRow += 4;\n\t\t\t}\n\t\t}\n\t}, EParallelForFlags::Unbalanced);\n}",
+  "sources": {
+    "Engine/Source/Developer/TextureCompressor/Private/TextureCompressorModule.cpp": "3be8f0c21261ebeff9a5d89946d42e3b234691af728d1f01847499497bb2e36a",
+    "Engine/Source/Runtime/Engine/Private/TextureLODSettings.cpp": "4552edd3e69c0182d1b6bbc3d931aad7314c591797ef3ed0ab8f2ba8fcb5c87e",
+    "Engine/Source/Runtime/Engine/Private/TextureDerivedData.cpp": "d65604f64e6b3308fc18d26f114d2825c47344162c0416d44f884f724cbca523",
+    "Engine/Source/Runtime/Engine/Private/Texture.cpp": "42bdacf2e4be96cd23508be307f86ef171e924b38878f0642c6c27f8284c796b",
+    "Engine/Source/Runtime/ImageCore/Private/ImageCore.cpp": "cc6cf30d03620ec0a3d700787a3b88b614b799d425a399bc340e8c7031b2ff10",
+    "Engine/Source/Runtime/Core/Public/Math/Float16.h": "460e5f3142d4142f6efc18fbb5d822b1411cb804d480fce02f4aa2e1e90d8b14",
+    "Engine/Config/BaseDeviceProfiles.ini": "282781854a1b6e636e89ca0a74e1d998c302ddfd8320eaf9ceb0970250a596e4",
+    "Engine/Source/Runtime/D3D12RHI/Private/D3D12State.cpp": "4173d10e503864d6e81efc0be6f978586c060557a6117428321e25e64d535c27",
+    "Engine/Source/Runtime/VulkanRHI/Private/VulkanState.cpp": "c53eee2dda87e769303ffef953f7780e9f9ee02756ca9e2e04ae8968c0969f77",
+    "Engine/Source/Runtime/Engine/Private/TextureRenderTarget2D.cpp": "211e007db31de48039e65e3cf59fac23dbc4a943d3f63601d05469464a15e227",
+    "Engine/Plugins/FX/Niagara/Source/Niagara/Classes/NiagaraDataInterfaceRenderTarget2D.h": "25bbaf6ab02ce567192d68a462aa26978d0e2bec0c9273797e0f7dcc23926e6c",
+    "Engine/Source/ThirdParty/BLAKE3/1.3.1/c/blake3.c": "5fbff226653ff3f78fcec50194e3d6909460df48ad1b7efb0fb9e625aa420f5d",
+    "Engine/Source/ThirdParty/BLAKE3/1.3.1/c/blake3_dispatch.c": "65740a0354d0da3b695bd22a84f0269b218295504e55276e728a3903a7eee4bc",
+    "Engine/Source/ThirdParty/BLAKE3/1.3.1/c/blake3_portable.c": "abddd44072ff36b41766ebc42bfac9c19d5c304fa6420e0e418d419dd67a4971"
+  },
+  "caveat": "Rebuilt from verified native source/default PC build rules. No executing Unreal texture build/cooked-resource comparison; no low-quality or platform-specific LOD overrides applied."
+}

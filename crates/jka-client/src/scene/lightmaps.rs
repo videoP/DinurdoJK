@@ -58,10 +58,10 @@ pub(in crate::scene) fn load_external_lightmap(
     map_name: &str,
     page: usize,
     prefer_hdr: bool,
-) -> Result<TextureData, String> {
+) -> Result<Option<TextureData>, String> {
     if prefer_hdr {
         if let Some(image) = try_load_hdr_lightmap(assets, map_name, page)? {
-            return Ok(image);
+            return Ok(Some(image));
         }
     }
     let stem = format!("maps/{map_name}/lm_{page:04}");
@@ -81,14 +81,14 @@ pub(in crate::scene) fn load_external_lightmap(
             if prefer_hdr {
                 materials::promote_lightmap_to_float(&mut image);
             }
-            return Ok(image);
+            return Ok(Some(image));
         }
     }
 
-    Err(format!(
-        "External lightmap page {page} is referenced by {map_name}.bsp but {} was not found on the game/base asset search path",
-        candidates[0]
-    ))
+    // TaystJK's R_LoadLightmaps leaves a missing external page unloaded;
+    // R_FindLightmaps then chooses LIGHTMAP_BY_VERTEX for its surfaces.
+    // Missing is not a corrupt image: preserve decoding/I/O errors above.
+    Ok(None)
 }
 
 pub(in crate::scene) fn neutral_deluxemap(label: impl Into<String>) -> TextureData {

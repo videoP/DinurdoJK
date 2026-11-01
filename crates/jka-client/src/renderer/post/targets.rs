@@ -5,18 +5,18 @@ pub(in crate::renderer) fn create_temporal_ssao_history(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    full_resolution: bool,
 ) -> TemporalSsaoHistory {
-    // Bevy's SSAO follow-up design calls out half-resolution rendering with a
-    // bilateral upsample. Keep the temporal history at half resolution as well:
-    // it cuts both AO sampling cost and history bandwidth to one quarter.
-    let half_width = width.div_ceil(2).max(1);
-    let half_height = height.div_ceil(2).max(1);
+    // Half uses one-quarter the pixels; full offers finer contact shadows.
+    // Allocate only the selected resolution (not both).
+    let ao_width = if full_resolution { width.max(1) } else { width.div_ceil(2).max(1) };
+    let ao_height = if full_resolution { height.max(1) } else { height.div_ceil(2).max(1) };
     let textures: [wgpu::Texture; 2] = std::array::from_fn(|_| {
         device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("JKA half-resolution temporal SSAO history"),
+            label: Some("JKA temporal SSAO history"),
             size: wgpu::Extent3d {
-                width: half_width,
-                height: half_height,
+                width: ao_width,
+                height: ao_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,

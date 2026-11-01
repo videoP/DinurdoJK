@@ -276,7 +276,7 @@ static int GetFlipkick(playerState_t *ps) {
 #endif
 }
 
-static int GetFixRoll(playerState_t *ps) {
+static int GetFixRollValue(playerState_t *ps) {
 	//If we are dueling saber only and duels are SP damages and FFA is mp damages..
 		//return 0
 	//If we are dueling force and duels are MP damages and FFA is sp damages
@@ -322,6 +322,17 @@ static int GetFixRoll(playerState_t *ps) {
 #endif
 }
 
+
+/* Observe the actual return value without changing any TaystJK movement rule. */
+static int GetFixRoll(playerState_t *ps) {
+    int mode = GetFixRollValue(ps);
+#ifdef JKA_JAPRO
+    extern void jka_pmove_record_roll(playerState_t *ps, int mode);
+    extern int jka_roll_debug_enabled;
+    if (jka_roll_debug_enabled) jka_pmove_record_roll(ps, mode);
+#endif
+    return mode;
+}
 
 //rww - Get a pointer to the bgEntity by the index
 bgEntity_t *PM_BGEntForNum( int num )

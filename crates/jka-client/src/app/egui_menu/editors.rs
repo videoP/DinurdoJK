@@ -54,8 +54,8 @@ impl App {
         if self.hud_layout.snap_to_grid {
             let spacing_px = self.hud_layout.grid_size.clamp(1.0, 64.0);
             let spacing = to_points(spacing_px);
-            let line = egui::Color32::from_rgba_premultiplied(128, 180, 220, 24);
-            let major = egui::Color32::from_rgba_premultiplied(128, 180, 220, 42);
+            let line = crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(128, 180, 220, 24), egui::Color32::from_rgba_premultiplied(105, 128, 102, 24));
+            let major = crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(128, 180, 220, 42), egui::Color32::from_rgba_premultiplied(105, 128, 102, 42));
             let mut x = full.left();
             let mut column = 0usize;
             while x <= full.right() {
@@ -217,7 +217,7 @@ impl App {
                                 position + egui::vec2(inward_x * inset, inward_y * grip_outer),
                                 position + egui::vec2(inward_x * grip_outer, inward_y * inset),
                             ],
-                            egui::Stroke::new(1.5_f32, theme::ACCENT),
+                            egui::Stroke::new(1.5_f32, theme::ACCENT()),
                         );
                     }
 
@@ -343,13 +343,13 @@ impl App {
                             painter.line_segment([
                                 egui::pos2(full.left() + to_points(left), full.top() + to_points(bottom)),
                                 egui::pos2(full.left() + to_points(right), full.top() + to_points(bottom)),
-                            ], egui::Stroke::new(2.0, theme::ACCENT));
+                            ], egui::Stroke::new(2.0, theme::ACCENT()));
                         }
                         if matched_size[1] && (bottom - top) > 0.0 {
                             painter.line_segment([
                                 egui::pos2(full.left() + to_points(right), full.top() + to_points(top)),
                                 egui::pos2(full.left() + to_points(right), full.top() + to_points(bottom)),
-                            ], egui::Stroke::new(2.0, theme::ACCENT));
+                            ], egui::Stroke::new(2.0, theme::ACCENT()));
                         }
                         let next_extent = [
                             ((right - left) / base.width.max(1.0)).clamp(0.25, 4.0),
@@ -420,11 +420,11 @@ impl App {
 
             let selected = self.hud_edit_selected == Some(id);
             let outline = if selected {
-                theme::ACCENT
+                theme::ACCENT()
             } else if response.hovered() {
-                theme::TEXT
+                theme::TEXT()
             } else {
-                egui::Color32::from_rgba_premultiplied(170, 205, 230, 150)
+                crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(170, 205, 230, 150), egui::Color32::from_rgba_premultiplied(175, 213, 170, 150))
             };
             painter.rect_stroke(
                 // Draw the handle on the true snapped edge. The previous
@@ -437,6 +437,7 @@ impl App {
             let disabled = match id {
                 HudElementId::MovementKeys => self.movement_keys_hud.mode == 0,
                 HudElementId::Fps => self.video.draw_fps == 0,
+                HudElementId::KillFeed => !self.killfeed_settings.enabled,
                 _ => false,
             };
             let label = if disabled {
@@ -546,12 +547,12 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(10, 15, 22, 236), theme::PANEL_FILL()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG()))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            theme::glow_label(ui, "HUD EDIT", 13.0, theme::TEXT);
+                            theme::glow_label(ui, "HUD EDIT", 13.0, theme::TEXT());
                             ui.separator();
                             if ui.checkbox(&mut snap, "Snap").changed() {
                                 layout_changed = true;
@@ -592,7 +593,7 @@ impl App {
                                 theme::plain(
                                     "Drag snaps actual panel edges to grid and nearby panels (align/touch). Wheel/Scale snaps dimensions to the grid; chat corners snap bounds and nearby sizes. ALT bypasses; arrows nudge 1 px, SHIFT+arrows use grid step.",
                                     10.5,
-                                    theme::TEXT_FAINT,
+                                    theme::TEXT_FAINT(),
                                 ),
                             );
                         });
@@ -860,7 +861,7 @@ impl App {
                                     if selected_face_line {
                                         egui::Color32::from_rgba_unmultiplied(255, 214, 92, 210)
                                     } else {
-                                        egui::Color32::from_rgba_unmultiplied(80, 220, 255, 150)
+                                        crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(80, 220, 255, 150), egui::Color32::from_rgba_unmultiplied(175, 213, 170, 150))
                                     },
                                 ),
                             );
@@ -879,21 +880,21 @@ impl App {
             .order(egui::Order::Foreground)
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgba_premultiplied(8, 13, 20, 242))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(8, 13, 20, 242), theme::PANEL_FILL()))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG()))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
                         let Some(editor) = self.map_editor.as_mut() else {
                             ui.horizontal(|ui| {
-                                theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT);
-                                ui.label(egui::RichText::new("This source map is not a writable loose .map file.").color(theme::WARNING));
+                                theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT());
+                                ui.label(egui::RichText::new("This source map is not a writable loose .map file.").color(theme::WARNING()));
                                 if ui.button("DONE").clicked() { close_requested = true; }
                             });
                             return;
                         };
 
                         ui.horizontal(|ui| {
-                            theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT);
+                            theme::glow_label(ui, "MAP EDIT", 13.0, theme::TEXT());
                             ui.separator();
                             if ui.selectable_label(editor.tool == MapEditTool::MoveBrush, "BRUSH MOVE").clicked() {
                                 editor.cancel_drag();
@@ -913,7 +914,7 @@ impl App {
                             ui.separator();
                             let pending = editor.pending_changes;
                             ui.label(egui::RichText::new(format!("{pending} pending change{}", if pending == 1 { "" } else { "s" }))
-                                .color(if pending == 0 { theme::TEXT_DIM } else { theme::WARNING }));
+                                .color(if pending == 0 { theme::TEXT_DIM() } else { theme::WARNING() }));
                             if ui.add_enabled(pending != 0, egui::Button::new("SAVE")).clicked() {
                                 save_requested = true;
                             }
@@ -934,9 +935,9 @@ impl App {
                                 ),
                             );
                             theme::label(ui, theme::plain(
-                                &format!("{}  —  {}  —  LMB selects/drags. ESC exits edit mode without discarding pending edits.", selection, editor.status),
+                                &format!("{}  ·  {}  ·  LMB selects/drags. ESC exits edit mode without discarding pending edits.", selection, editor.status),
                                 10.5,
-                                theme::TEXT_FAINT,
+                                theme::TEXT_FAINT(),
                             ));
                         });
                     });
@@ -1031,9 +1032,9 @@ impl App {
                 save_layout=true;
             }
             let selected = self.hud_edit_extension_selected.as_deref() == Some(widget.key.as_str());
-            let outline = if selected { theme::ACCENT }
-                else if response.hovered() { theme::TEXT }
-                else { egui::Color32::from_rgba_premultiplied(170,205,230,150) };
+            let outline = if selected { theme::ACCENT() }
+                else if response.hovered() { theme::TEXT() }
+                else { crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(170,205,230,150), egui::Color32::from_rgba_premultiplied(175,213,170,150)) };
             painter.rect_stroke(rect,egui::CornerRadius::ZERO,
                 egui::Stroke::new(if selected {2.0}else{1.0},outline),egui::StrokeKind::Inside);
             painter.text(rect.left_top()+egui::vec2(0.0,-8.0),egui::Align2::LEFT_BOTTOM,
@@ -1072,7 +1073,9 @@ impl App {
         }
         if save_layout { self.extensions.save_widget_layouts(); }
         if visual_changed {
-            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, self.extensions.hud_images.clone()));
+            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
+                crate::ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
+                images }));
             self.egui_repaint_requested=true;
         }
     }

@@ -1,7 +1,7 @@
 use super::{
     camera_depth_compare, draw_world_batch, DrawIndexedIndirectArgs, DynamicModelAlphaMode,
     DynamicModelRenderer, DynamicModelVertex, Ghoul2GpuVertex, GpuVertex, Renderer, WorldBatch,
-    WorldGpu, DEPTH_FORMAT, DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
+    WorldGpu, depth_format, DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
     VERTEX_ATTRIBUTES,
 };
 use crate::materials::CullMode;
@@ -98,7 +98,7 @@ impl Renderer {
                                 ..Default::default()
                             },
                             depth_stencil: Some(wgpu::DepthStencilState {
-                                format: DEPTH_FORMAT,
+                                format: depth_format(),
                                 depth_write_enabled: Some(false),
                                 depth_compare: Some(camera_depth_compare()),
                                 stencil: Default::default(),
@@ -209,7 +209,7 @@ fn mask_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: Default::default(),

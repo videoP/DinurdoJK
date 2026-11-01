@@ -19,8 +19,8 @@ codegen-units = 1
 
 # Iteration profile (build.ps1 -Fast). The custom profile builds into its
 # own target/<name> folder, so switching modes never discards another mode's cache.
-# Measured 2026-10-11 on AMJH3TE (one-line change rebuild / FPS vs release):
-#   fast   ~60 s rebuild, about -2% FPS: fine for day-to-day FPS checks.
+# Keep ThinLTO for near-release optimization and enable a persistent incremental
+# cache for local/path crates. It is retained across builds; never auto-purged.
 [profile.fast]
 inherits = "release"
 lto = "thin"
@@ -33,4 +33,5 @@ incremental = true
 [patch.crates-io]
 wgpu-core = { path = "vendor/wgpu-core-30.0.1" }
 wgpu-hal = { path = "vendor/wgpu-hal-30.0.1" }
+wgpu-types = { path = "vendor/wgpu-types-30.0.1" }
 winit = { path = "vendor/winit-0.30.13" }

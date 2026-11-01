@@ -2,7 +2,7 @@
 //! The server owns targeting and zoom state; this module draws only the artwork.
 //! The render thread projects lock targets with its latest view-projection matrix.
 
-use super::{geometry::{rect, textured_rect_with_source, glyph_quad_sized}, hud::movement::{ICON_COMBAT_BASE, ICON_TEXTURE_SOURCE}, UiSnapshot, UiVertex};
+use super::{geometry::{rect, textured_rect_with_source, glyph_quad_sized}, hud::movement::{ICON_COMBAT_BASE, ICON_FORCE_BASE, ICON_RAGE_RECOVERY, ICON_TEXTURE_SOURCE}, UiSnapshot, UiVertex};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UiZoomScope {
@@ -44,7 +44,7 @@ fn rotated_icon(out: &mut Vec<UiVertex>, ui: &UiSnapshot, index: usize,
         let y = cy + dx*w*sin + dy*h*cos;
         UiVertex {
             position: [2.0*x/viewport_w.max(1) as f32-1.0, 1.0-2.0*y/viewport_h.max(1) as f32],
-            uv: uvs[i], color, textured: ICON_TEXTURE_SOURCE,
+            uv: uvs[i], color, textured: ui.icon_texture_source(index),
         }
     };
     out.extend_from_slice(&[vertex(0),vertex(1),vertex(2),vertex(0),vertex(2),vertex(3)]);
@@ -57,7 +57,40 @@ fn icon(out: &mut Vec<UiVertex>, ui: &UiSnapshot, index: usize,
     let (uv0, uv1) = ui.icon_uv(index);
     if uv1[0] - uv0[0] < 0.00001 || uv1[1] - uv0[1] < 0.00001 { return; }
     textured_rect_with_source(out, x, y, w, h, uv0, uv1, color,
-        ICON_TEXTURE_SOURCE, viewport_w, viewport_h);
+        ui.icon_texture_source(index), viewport_w, viewport_h);
+}
+
+/// TaystJK CG_DrawActivePowers: actual snapshot active bits, sorted in
+/// OpenJK forcePowerSorted order, not the currently selected Force power.
+/// Match the 640x480 legacy origin, size (40) and step (42), scaling to screen.
+fn draw_active_force_icons(out: &mut Vec<UiVertex>, ui: &UiSnapshot, width: u32, height: u32) {
+    const FORCE_POWER_SORTED: [usize; 18] = [5, 0, 10, 9, 11, 1, 2, 3, 4, 14, 7, 13, 8, 6, 12, 15, 16, 17];
+    const DURATION_POWER_MASK: i32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 8)
+        | (1 << 9) | (1 << 10) | (1 << 14);
+    let Some(hud) = ui.hud else { return; };
+    if hud.force_icons_hidden || ui.zoom_scope.is_some() { return; }
+    let active = hud.force_powers_active & DURATION_POWER_MASK;
+    let recovering = hud.rage_recovery_until_ms > hud.time_ms;
+    if active == 0 && !recovering { return; }
+    let sx = width as f32 / 640.0;
+    let sy = height as f32 / 480.0;
+    let mut x = 96.0_f32;
+    let mut y = 400.0_f32;
+    for power in FORCE_POWER_SORTED {
+        if active & (1 << power) == 0 { continue; }
+        icon(out, ui, ICON_FORCE_BASE + power, x * sx, y * sy,
+            40.0 * sx, 40.0 * sy, [1.0; 4], width, height);
+        x += 42.0;
+        if x + 40.0 >= 560.0 { x = 96.0; y += 42.0; }
+    }
+    if recovering {
+        // TaystJK additionally draws gfx/mp/f_icon_ragerec after the active icons.
+        // Subtle alpha blink makes the remaining recovery state noticeable even
+        // when a mod supplies a static replacement for that shader.
+        let alpha = if (hud.time_ms.div_euclid(400) & 1) == 0 { 1.0 } else { 0.45 };
+        icon(out, ui, ICON_RAGE_RECOVERY, x * sx, y * sy,
+            40.0 * sx, 40.0 * sy, [1.0, 1.0, 1.0, alpha], width, height);
+    }
 }
 
 /// This is a *late* UI tail: the lock icon must use the same view-projection
@@ -69,6 +102,7 @@ pub(crate) fn build_combat_hud_vertices(
     if ui.video.skip_ui || !ui.video.draw_2d || ui.mode != super::OverlayMode::None { return; }
     let w = width.max(1) as f32;
     let h = height.max(1) as f32;
+    draw_active_force_icons(out, ui, width, height);
     if let Some(zoom) = ui.zoom_scope {
         if zoom.mode == 1 {
             // TaystJK's normal scope is a 640x480 mask centered in the 4:3
@@ -114,7 +148,7 @@ pub(crate) fn build_combat_hud_vertices(
                     if uv1[0]-uv0[0] > 0.00001 {
                         textured_rect_with_source(out, x, y, 134.0*fraction*scale_x, 34.0*scale_y,
                             uv0, [uv0[0]+fraction*(uv1[0]-uv0[0]),uv1[1]], [1.0;4],
-                            ICON_TEXTURE_SOURCE, width, height);
+                            ui.icon_texture_source(ICON_COMBAT_BASE+3), width, height);
                     }
                 }
             }
@@ -231,6 +265,49 @@ mod tests {
         assert!(out.len() >= 90);
         assert!(out.iter().any(|v| v.textured == ICON_TEXTURE_SOURCE));
         assert!(out.iter().any(|v| v.textured == 1.0));
+    }
+
+    #[test]
+    fn active_force_icons_follow_snapshot_bits_and_rage_recovery_timer() {
+        let mut ui = UiSnapshot::default();
+        ui.video.draw_2d = true;
+        ui.video.skip_ui = false;
+        ui.icon_atlas_uvs = vec![([0.0, 0.0], [0.8, 0.8]); ICON_RAGE_RECOVERY + 1];
+        ui.hud = Some(crate::ui::HudState {
+            force_powers_active: (1 << 14) | (1 << 8),
+            rage_recovery_until_ms: 3000,
+            time_ms: 2000,
+            ..Default::default()
+        });
+        let mut vertices = Vec::new();
+        build_combat_hud_vertices(&mut vertices, &ui, None, 1920, 1080);
+        // Force Seeing, Force Rage and rage-recovery are each one 6-vertex quad.
+        assert_eq!(vertices.len(), 18);
+        ui.hud.as_mut().unwrap().time_ms = 3001;
+        vertices.clear();
+        build_combat_hud_vertices(&mut vertices, &ui, None, 1920, 1080);
+        assert_eq!(vertices.len(), 12);
+        ui.hud.as_mut().unwrap().force_icons_hidden = true;
+        vertices.clear();
+        build_combat_hud_vertices(&mut vertices, &ui, None, 1920, 1080);
+        assert!(vertices.is_empty());
+    }
+
+    #[test]
+    fn binocular_authored_shaders_keep_painter_order_with_native_yaw_tape() {
+        let mut ui = zoom_test_ui(2);
+        ui.icon_shader_flags = vec![false; super::super::ICON_NAMES.len()];
+        ui.icon_shader_flags[ICON_COMBAT_BASE + 5] = true; // window
+        ui.icon_shader_flags[ICON_COMBAT_BASE + 11] = true; // number-overlay
+        let mut vertices = Vec::new();
+        build_combat_hud_vertices(&mut vertices, &ui, None, 1920, 1080);
+        let window = ui.icon_texture_source(ICON_COMBAT_BASE + 5);
+        let numbers = ui.icon_texture_source(ICON_COMBAT_BASE + 11);
+        let window_pos = vertices.iter().position(|v| v.textured == window).unwrap();
+        let numbers_pos = vertices.iter().position(|v| v.textured == numbers).unwrap();
+        assert!(window_pos < numbers_pos);
+        assert!(vertices[window_pos+6..numbers_pos].iter().any(|v| v.textured == 1.0));
+        assert_eq!(vertices[window_pos].uv, [0.0, 0.0]);
     }
 
     #[test]

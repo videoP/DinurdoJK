@@ -33,6 +33,7 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::Weather => "Weather",
         VideoSection::Surface => "Surface interaction",
         VideoSection::Water => "Ocean",
+        VideoSection::River => "River",
         VideoSection::Glass => "Glass",
         VideoSection::Optimizations => "Optimizations",
     }
@@ -100,6 +101,7 @@ impl App {
                 "SURFACE INTERACTION",
                 "Footprints and procedural ground detail.",
             ),
+            VideoSection::River => ("RIVER", "Select a river to edit its appearance and rebuild its water source."),
             VideoSection::Water => ("OCEAN", "Stock JKA, Godot, Blue Water or Hybrid promoted water."),
             VideoSection::Glass => ("GLASS", "Glass promotion, transmission, frosting and refractive edges."),
             VideoSection::Optimizations => (
@@ -110,8 +112,8 @@ impl App {
         // The preset toolbar is global to Video, not part of any individual
         // page title or scrollable setting group.
         egui::Frame::new()
-            .fill(theme::RAIL_FILL)
-            .stroke(egui::Stroke::new(1.0, theme::LINE))
+            .fill(theme::RAIL_FILL())
+            .stroke(egui::Stroke::new(1.0, theme::LINE()))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 crate::app::egui_menu::settings_search::search_bar(ui);
@@ -135,7 +137,7 @@ impl App {
                     // Studio profiles never rewrite the monitor, backend,
                     // window or swapchain configuration.
                     if self.render_studio.graphics_gameplay.is_some() {
-                        theme::hint(ui, "Render Studio profile: window, backend and frame pacing stay your gameplay settings.", theme::TEXT_FAINT);
+                        theme::hint(ui, "Render Studio profile: window, backend and frame pacing stay your gameplay settings.", theme::TEXT_FAINT());
                     } else {
                         self.egui_display_settings(ui);
                     }
@@ -163,6 +165,7 @@ impl App {
                 VideoSection::Weather => self.egui_weather(ui),
                 VideoSection::Surface => self.egui_surface(ui),
                 VideoSection::Water => self.egui_water(ui),
+                VideoSection::River => self.egui_river(ui),
                 VideoSection::Glass => self.egui_glass(ui),
                 VideoSection::Optimizations => self.egui_optimizations(ui),
             });
@@ -195,8 +198,8 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG()))
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(390.0);
@@ -204,7 +207,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new(format!(
                             "Current page: {}", video_section_label(pending.section)
-                        )).color(theme::TEXT_DIM));
+                        )).color(theme::TEXT_DIM()));
                         ui.add_space(12.0);
                         ui.add_enabled_ui(has_page_settings, |ui| {
                             if theme::primary_button(ui, "APPLY TO THIS PAGE").clicked() {
@@ -214,7 +217,7 @@ impl App {
                         if !has_page_settings {
                             ui.label(egui::RichText::new(
                                 "This preset has no settings on this page."
-                            ).small().color(theme::TEXT_FAINT));
+                            ).small().color(theme::TEXT_FAINT()));
                         }
                         ui.add_space(8.0);
                         if theme::primary_button(ui, "APPLY TO ALL PAGES").clicked() {
@@ -240,9 +243,10 @@ impl App {
     }
 
     fn egui_preset_header(&mut self, ui: &mut egui::Ui) {
+        // Quality meter positions increase from lowest to highest.
         const PRESETS: [(QualityPreset, &str); 6] = [
-            (QualityPreset::Minimal, "Minimal (Legacy)"),
-            (QualityPreset::MinimalUnified, "Minimal (Unified)"),
+            (QualityPreset::Shitter, "Shitter"),
+            (QualityPreset::Minimal, "Minimal"),
             (QualityPreset::Low, "Low"),
             (QualityPreset::Medium, "Medium"),
             (QualityPreset::High, "High"),
@@ -296,7 +300,7 @@ impl App {
             self.change_video_setting(next as i32 - current as i32);
         }
         if self.video.renderer_backend != self.applied_renderer_backend {
-            theme::hint(ui, "Render backend changed: needs Apply", theme::WARNING);
+            theme::hint(ui, "Render backend changed: needs Apply", theme::WARNING());
         }
         theme::row(
             ui,
@@ -320,7 +324,7 @@ impl App {
         );
         ui.label(format!("Currently rendering on: {} ({})", self.active_gpu_name, self.active_gpu_type));
         if self.video.gpu_adapter != self.applied_gpu_adapter {
-            theme::hint(ui, "Graphics processor changed: needs Apply", theme::WARNING);
+            theme::hint(ui, "Graphics processor changed: needs Apply", theme::WARNING());
         }
 
         const DISPLAY_MODES: [(FullscreenMode, &str); 3] = [
@@ -345,7 +349,7 @@ impl App {
             self.change_video_setting(next as i32 - current as i32);
         }
         if self.video.fullscreen != self.applied_fullscreen {
-            theme::hint(ui, "Display mode changed: needs Apply", theme::WARNING);
+            theme::hint(ui, "Display mode changed: needs Apply", theme::WARNING());
         }
 
         let resolutions =
@@ -382,7 +386,7 @@ impl App {
                         }
                     });
                 if self.video.resolution != self.applied_resolution {
-                    theme::hint(ui, "needs apply", theme::WARNING);
+                    theme::hint(ui, "needs apply", theme::WARNING());
                 }
             },
         );
@@ -465,7 +469,7 @@ impl App {
                     _ if cap >= config::FPS_CAP_MAX => "Maximum",
                     _ => "Capped",
                 };
-                theme::glow_label(ui, state, 12.5, theme::TEXT_FAINT);
+                theme::glow_label(ui, state, 12.5, theme::TEXT_FAINT());
                 if changed {
                     self.set_fps_cap(cap);
                 }

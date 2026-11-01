@@ -57,7 +57,7 @@ impl App {
         if self.ui_catalog.pending.source_maps {
             theme::label(
                 ui,
-                theme::plain("Scanning maps...", 12.0, theme::TEXT_FAINT),
+                theme::plain("Scanning maps...", 12.0, theme::TEXT_FAINT()),
             );
             return;
         }
@@ -65,12 +65,12 @@ impl App {
             theme::banner(
                 ui,
                 &format!("Source map scan failed: {error}"),
-                theme::WARNING,
+                theme::WARNING(),
             );
             return;
         }
         if self.source_maps.is_empty() {
-            theme::banner(ui, "No maps/*.map assets were found.", theme::WARNING);
+            theme::banner(ui, "No maps/*.map assets were found.", theme::WARNING());
             return;
         }
         self.source_map_selected = self.source_map_selected.min(self.source_maps.len() - 1);
@@ -109,7 +109,7 @@ impl App {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     theme::section(ui, "SELECTED SOURCE MAP", "");
-                    theme::glow_label(ui, &format!("maps/{selected_name}.map"), 18.0, theme::TEXT);
+                    theme::glow_label(ui, &format!("maps/{selected_name}.map"), 18.0, theme::TEXT());
                     ui.add_space(10.0);
                     let preview_w = ui.available_width().max(1.0);
                     let preview_box = egui::vec2(preview_w, 360.0);
@@ -122,11 +122,11 @@ impl App {
                         let placeholder = egui::vec2(preview_w, (preview_w * 0.5).min(360.0));
                         let (rect, _) = ui.allocate_exact_size(placeholder, egui::Sense::hover());
                         ui.painter()
-                            .rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL);
+                            .rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL());
                         ui.painter().rect_stroke(
                             rect,
                             egui::CornerRadius::ZERO,
-                            egui::Stroke::new(1.0_f32, theme::LINE),
+                            egui::Stroke::new(1.0_f32, theme::LINE()),
                             egui::StrokeKind::Inside,
                         );
                         ui.painter().text(
@@ -134,7 +134,7 @@ impl App {
                             egui::Align2::CENTER_CENTER,
                             "NO LEVELSHOT",
                             egui::FontId::proportional(13.0),
-                            theme::TEXT_DISABLED,
+                            theme::TEXT_DISABLED(),
                         );
                     }
                     ui.add_space(14.0);

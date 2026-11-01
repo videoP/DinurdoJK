@@ -149,13 +149,13 @@ impl App {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("DURATION")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(Self::format_demo_time(metadata.duration_ms));
                 ui.label(
                     egui::RichText::new("SIZE")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(format!("{size_mb:.1} MB"));
@@ -163,13 +163,13 @@ impl App {
 
                 ui.label(
                     egui::RichText::new("MOD")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(&metadata.fs_game);
                 ui.label(
                     egui::RichText::new("PROTOCOL")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(metadata.protocol.to_string());
@@ -177,13 +177,13 @@ impl App {
 
                 ui.label(
                     egui::RichText::new("GAME TYPE")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(Self::demo_gametype_name(metadata.gametype));
                 ui.label(
                     egui::RichText::new("SERVER")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(metadata.server_name.as_deref().unwrap_or("unknown"));
@@ -191,7 +191,7 @@ impl App {
 
                 ui.label(
                     egui::RichText::new("SNAPSHOTS")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(format!(
@@ -200,7 +200,7 @@ impl App {
                 ));
                 ui.label(
                     egui::RichText::new("KILLS")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(metadata.kill_count.to_string());
@@ -208,13 +208,13 @@ impl App {
 
                 ui.label(
                     egui::RichText::new("RECORDED POV")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(pov);
                 ui.label(
                     egui::RichText::new("SOURCE")
-                        .color(theme::TEXT_DISABLED)
+                        .color(theme::TEXT_DISABLED())
                         .size(11.0),
                 );
                 ui.label(source);
@@ -225,7 +225,7 @@ impl App {
         theme::section(ui, "MAPS", &format!("{} used", metadata.maps.len()));
         for map in &metadata.maps {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&map.map_name).color(theme::TEXT));
+                ui.label(egui::RichText::new(&map.map_name).color(theme::TEXT()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.monospace(Self::format_demo_time(map.duration_ms));
                 });
@@ -246,7 +246,7 @@ impl App {
                 for player in &metadata.players {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&player.name).color(theme::TEXT));
+                            ui.label(egui::RichText::new(&player.name).color(theme::TEXT()));
                             let teams = Self::demo_team_summary(&player.teams);
                             let detail = if player.model.is_empty() {
                                 teams
@@ -257,7 +257,7 @@ impl App {
                             };
                             ui.label(
                                 egui::RichText::new(detail)
-                                    .color(theme::TEXT_DISABLED)
+                                    .color(theme::TEXT_DISABLED())
                                     .size(10.0),
                             );
                         });
@@ -269,7 +269,7 @@ impl App {
                                     Self::format_demo_time(player.first_seen_ms),
                                     Self::format_demo_time(player.last_seen_ms)
                                 ))
-                                .color(theme::TEXT_DISABLED)
+                                .color(theme::TEXT_DISABLED())
                                 .size(10.0),
                             );
                         });
@@ -283,7 +283,7 @@ impl App {
         for round in &metadata.rounds {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("ROUND {}", round.index)).color(theme::ACCENT),
+                    egui::RichText::new(format!("ROUND {}", round.index)).color(theme::ACCENT()),
                 );
                 ui.monospace(format!(
                     "{} +{}",
@@ -300,7 +300,7 @@ impl App {
                     ui.label(format!("leader {name} {score}"));
                 }
                 if metadata.maps.len() > 1 {
-                    ui.label(egui::RichText::new(&round.map_name).color(theme::TEXT_DISABLED));
+                    ui.label(egui::RichText::new(&round.map_name).color(theme::TEXT_DISABLED()));
                 }
             });
         }
@@ -310,7 +310,7 @@ impl App {
         if metadata.duels.is_empty() {
             ui.label(
                 egui::RichText::new("No duel rounds visible in this recording.")
-                    .color(theme::TEXT_DISABLED),
+                    .color(theme::TEXT_DISABLED()),
             );
         } else {
             let mut records = BTreeMap::<String, [usize; 3]>::new(); // W / L / unknown-draw
@@ -328,7 +328,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("OVERVIEW")
-                            .color(theme::TEXT_DISABLED)
+                            .color(theme::TEXT_DISABLED())
                             .size(10.0),
                     );
                     for (player, [wins, losses, unknown]) in records {
@@ -344,11 +344,11 @@ impl App {
             for duel in &metadata.duels {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("DUEL {}", duel.index)).color(theme::ACCENT),
+                        egui::RichText::new(format!("DUEL {}", duel.index)).color(theme::ACCENT()),
                     );
                     ui.label(
                         egui::RichText::new(duel.kind.label())
-                            .color(theme::TEXT_DISABLED)
+                            .color(theme::TEXT_DISABLED())
                             .size(10.0),
                     );
                     ui.monospace(format!(
@@ -371,7 +371,7 @@ impl App {
                             .join(" · ");
                         ui.label(
                             egui::RichText::new(scores)
-                                .color(theme::TEXT_DISABLED)
+                                .color(theme::TEXT_DISABLED())
                                 .size(10.0),
                         );
                     }
@@ -383,7 +383,7 @@ impl App {
                 .any(|duel| matches!(duel.kind, frontend::DemoDuelKind::PrivatePov))
             {
                 ui.label(egui::RichText::new("PRIVATE (POV) duels are limited to duels exposed by the recorded player's playerState.")
-                    .color(theme::TEXT_DISABLED).size(10.0));
+                    .color(theme::TEXT_DISABLED()).size(10.0));
             }
         }
 
@@ -422,12 +422,12 @@ impl App {
                     let row = ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(Self::format_demo_time(entry.elapsed_ms))
-                                .color(theme::TEXT_DISABLED)
+                                .color(theme::TEXT_DISABLED())
                                 .monospace(),
                         );
                         ui.label(
                             egui::RichText::new(entry.kind.label())
-                                .color(theme::ACCENT)
+                                .color(theme::ACCENT())
                                 .size(10.0),
                         );
                         // The theme's default is `Extend`; one long chat line
@@ -453,14 +453,14 @@ impl App {
         self.ensure_demo_catalog();
 
         if let Some(error) = &self.demo_catalog_error {
-            theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING);
+            theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING());
             return;
         }
 
         let mut game_changed = false;
         let games = self.demo_game_choices.clone();
         ui.horizontal(|ui| {
-            theme::label(ui, theme::plain("MOD", 10.0, theme::TEXT_DISABLED));
+            theme::label(ui, theme::plain("MOD", 10.0, theme::TEXT_DISABLED()));
             let selected_text = if games.is_empty() {
                 "No demo folders".to_owned()
             } else if self.demo_game_filter.is_empty() {
@@ -496,15 +496,15 @@ impl App {
         }
 
         if let Some(error) = &self.demo_catalog_error {
-            theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING);
+            theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING());
             return;
         }
         if self.demo_catalog_pending {
-            theme::label(ui, theme::plain("Scanning demos...", 12.0, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain("Scanning demos...", 12.0, theme::TEXT_FAINT()));
             return;
         }
         if self.demo_entries.is_empty() {
-            theme::banner(ui, "No demos/*.dm_26 assets were found.", theme::WARNING);
+            theme::banner(ui, "No demos/*.dm_26 assets were found.", theme::WARNING());
             return;
         }
 
@@ -551,14 +551,14 @@ impl App {
                     // drags the whole page frame wider than its 1120pt column.
                     ui.set_max_width(pane_w);
                     theme::section(ui, "SELECTED DEMO", "");
-                    theme::glow_label(ui, &selected_name, 18.0, theme::TEXT);
+                    theme::glow_label(ui, &selected_name, 18.0, theme::TEXT());
                     ui.add_space(10.0);
 
                     let inspector_height = (ui.available_height() - 56.0).max(180.0);
                     let inspector_w = ui.available_width();
                     egui::Frame::new()
-                        .fill(theme::CONTROL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                        .fill(theme::CONTROL())
+                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE()))
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
                             ui.set_width((inspector_w - 26.0).max(1.0));
@@ -584,7 +584,7 @@ impl App {
                                 theme::banner(
                                     ui,
                                     &format!("Metadata scan failed: {error}"),
-                                    theme::WARNING,
+                                    theme::WARNING(),
                                 );
                             } else {
                                 ui.vertical_centered(|ui| {
@@ -592,7 +592,7 @@ impl App {
                                     ui.spinner();
                                     ui.label(
                                         egui::RichText::new("INDEXING SELECTED DEMO…")
-                                            .color(theme::TEXT_DISABLED),
+                                            .color(theme::TEXT_DISABLED()),
                                     );
                                 });
                             }

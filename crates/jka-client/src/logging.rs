@@ -368,7 +368,7 @@ fn write_line_inner(
 
 
 #[cfg(windows)]
-fn local_hms() -> [u16; 3] {
+pub(crate) fn local_hms() -> [u16; 3] {
     #[repr(C)]
     struct SystemTime {
         year: u16,
@@ -401,7 +401,7 @@ fn local_hms() -> [u16; 3] {
 }
 
 #[cfg(not(windows))]
-fn local_hms() -> [u16; 3] {
+pub(crate) fn local_hms() -> [u16; 3] {
     // std has no cross-platform local-time conversion. Keep timestamps useful
     // on non-Windows builds with UTC rather than adding a runtime dependency.
     let seconds = std::time::SystemTime::now()

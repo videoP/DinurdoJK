@@ -570,8 +570,8 @@ impl App {
             .fixed_pos(egui::pos2(18.0, 28.0))
             .show(root.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(theme::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG))
+                    .fill(theme::PANEL_FILL())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::LINE_STRONG()))
                     .inner_margin(egui::Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_width(250.0);
@@ -618,47 +618,39 @@ impl App {
         } else {
             self.menu_selected
         };
-        egui::Panel::top("jka_menu_top")
-            .exact_size(theme::TOP_BAR_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CHROME)
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(root, |ui| {
-                let width = ui.available_width();
-                let item_w = width / TOP_ITEMS.len() as f32;
-                let mut clicked = None;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
+        let shell = self.menu_shell(root.ctx());
+        let mut clicked = None;
+        super::shell_layout::region(root, "jka_menu_top", shell.header, |ui| {
+            let rect = ui.max_rect();
+            super::holo::header_backdrop(ui.painter(), rect);
+            // The brand in neon tube lettering, as on the Main page's signs.
+            let cap = 17.0;
+            let brand_left = rect.left() + GUTTER;
+            super::holo::neon_text(
+                ui.painter(),
+                egui::pos2(brand_left, rect.center().y + cap * 0.5),
+                "DINURDOJK",
+                cap,
+                theme::TEXT(),
+                0.8,
+            );
+            let tabs_left = brand_left + super::holo::neon_width("DINURDOJK", cap) + 40.0;
+            let tabs = egui::Rect::from_min_max(egui::pos2(tabs_left, rect.top()), rect.max);
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(tabs).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     for (index, item) in TOP_ITEMS.iter().enumerate() {
-                        if theme::nav_item(
-                            ui,
-                            item,
-                            13.5,
-                            item_w,
-                            theme::TOP_BAR_H,
-                            index == selected,
-                        )
-                        .clicked()
-                        {
+                        if super::holo::tab(ui, item, 15.0, rect.height(), index == selected).clicked() {
                             clicked = Some(index);
                         }
                     }
-                });
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(rect.left(), rect.bottom() - 1.0),
-                        egui::vec2(rect.width(), 1.0),
-                    ),
-                    egui::CornerRadius::ZERO,
-                    theme::LINE,
-                );
-                if let Some(index) = clicked {
-                    self.select_top_menu(index);
-                }
-            });
+                },
+            );
+        });
+        if let Some(index) = clicked {
+            self.select_top_menu(index);
+        }
     }
 
     pub(in crate::app::egui_menu) fn select_top_menu(&mut self, index: usize) {
@@ -843,32 +835,16 @@ impl App {
             tabs.push(active.label().to_uppercase());
         }
 
-        egui::Panel::top("jka_setup_tabs")
-            .exact_size(theme::TAB_BAR_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::SURFACE_ALT)
-                    .inner_margin(egui::Margin::symmetric(0, 0)),
-            )
-            .show(root, |ui| {
+        let Some(strip) = self.menu_shell(root.ctx()).tabs else { return };
+        super::shell_layout::region(root, "jka_setup_tabs", strip, |ui| {
                 let mut clicked = None;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    // `nav_item` centres its label, so back off half a label's
-                    // worth of padding to land the first tab's text on GUTTER.
-                    ui.add_space(GUTTER - 10.0);
+                    // Tabs pad their labels by 15 points; land the first
+                    // label on GUTTER.
+                    ui.add_space(GUTTER - 15.0);
                     for (index, tab) in tabs.iter().enumerate() {
-                        let width = 20.0 + tab.len() as f32 * 9.0;
-                        if theme::nav_item(
-                            ui,
-                            tab,
-                            12.5,
-                            width,
-                            theme::TAB_BAR_H,
-                            index == self.setup_selected,
-                        )
-                        .clicked()
-                        {
+                        if super::holo::tab(ui, tab, 13.5, strip.height(), index == self.setup_selected).clicked() {
                             clicked = Some(index);
                         }
                     }
@@ -876,11 +852,11 @@ impl App {
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(
-                        egui::pos2(rect.left(), rect.bottom() - 1.0),
-                        egui::vec2(rect.width(), 1.0),
+                        egui::pos2(rect.left() + GUTTER, rect.bottom() - 1.0),
+                        egui::vec2(rect.width() - GUTTER * 2.0, 1.0),
                     ),
                     egui::CornerRadius::ZERO,
-                    theme::LINE,
+                    theme::HAIRLINE(),
                 );
                 if let Some(index) = clicked {
                     if self.setup_selected != index {
@@ -905,19 +881,16 @@ impl App {
         // Only prepared map data is staged: Apply reloads the map in place and
         // leaves the renderer and window alone.
         let map_only = restart && !self.display_restart_required() && self.map_reprep_wanted();
-        egui::Panel::bottom("jka_menu_footer")
-            .exact_size(if self.front_end { crate::neon_menu::footer::HEIGHT } else { theme::FOOTER_H })
-            .frame(
-                egui::Frame::new()
-                    .fill(if self.front_end { egui::Color32::TRANSPARENT } else { theme::CHROME })
-                    .inner_margin(egui::Margin::symmetric(0, 0)),
-            )
-            .show(root, |ui| {
+        let footer = self.menu_shell(root.ctx()).footer;
+        super::shell_layout::region(root, "jka_menu_footer", footer, |ui| {
                 let rect = ui.max_rect();
+                if !self.front_end {
+                    ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::RAIL_FILL());
+                }
                 if !self.front_end {
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
-                        egui::CornerRadius::ZERO, theme::LINE);
+                        egui::CornerRadius::ZERO, theme::LINE());
                 }
                 ui.horizontal_centered(|ui| {
                     ui.add_space(GUTTER);
@@ -934,7 +907,7 @@ impl App {
                     };
                     if !self.front_end {
                         theme::label(ui, theme::plain(hint,11.5,
-                            if restart { theme::WARNING } else { theme::TEXT_FAINT }));
+                            if restart { theme::WARNING() } else { theme::TEXT_FAINT() }));
                     }
                     if restart && !self.front_end {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -957,7 +930,7 @@ impl App {
                                         }
                                     ),
                                     12.5,
-                                    theme::WARNING,
+                                    theme::WARNING(),
                                 );
                                 ui.add_space(4.0);
                                 for change in &pending_video_changes {
@@ -965,7 +938,7 @@ impl App {
                                         ui,
                                         &format!("{} - {}", change.label, change.detail),
                                         11.5,
-                                        theme::TEXT_DIM,
+                                        theme::TEXT_DIM(),
                                     );
                                 }
                             });
@@ -983,13 +956,8 @@ impl App {
         if on_video {
             self.egui_video_rail(root);
         }
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(root, |ui| {
+        let body = self.menu_shell(root.ctx()).body;
+        super::shell_layout::region(root, "jka_menu_body_region", body, |ui| {
                 // Keep the Servers page at the same 1120-point canvas used by
                 // the front-end browser so the two versions have identical
                 // column geometry and interaction positions. Profile remains a
@@ -1022,16 +990,20 @@ impl App {
                 let profile_preview_page =
                     self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let frame = if on_video {
-                    egui::Frame::new().fill(theme::VIDEO_SCRIM)
+                    egui::Frame::new().fill(theme::VIDEO_SCRIM())
                 } else if profile_preview_page {
                     // The right half is a renderer-owned 3D viewport; do not cover
                     // it with the normal opaque menu body. The Profile controls
                     // draw their own surface on the left.
                     egui::Frame::new().fill(egui::Color32::TRANSPARENT)
                 } else {
-                    egui::Frame::new()
-                        .fill(theme::PANEL_FILL)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
+                    super::holo::glass()
+                };
+                // Glass panels float a little off the shell's edges.
+                let rect = if on_video || profile_preview_page {
+                    rect
+                } else {
+                    rect.shrink2(egui::vec2(0.0, 10.0)).translate(egui::vec2(if server_page { 0.0 } else { GUTTER }, 0.0))
                 };
                 ui.scope_builder(
                     egui::UiBuilder::new()
@@ -1100,23 +1072,18 @@ impl App {
 
     pub(in crate::app::egui_menu) fn egui_video_rail(&mut self, root: &mut egui::Ui) {
         let mut target = None;
-        egui::Panel::left("jka_video_rail")
-            .exact_size(theme::NAV_W)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::RAIL_FILL)
-                    .inner_margin(egui::Margin::symmetric(0, 12)),
-            )
-            .show(root, |ui| {
+        let Some(rail) = self.menu_shell(root.ctx()).rail else { return };
+        super::shell_layout::region(root, "jka_video_rail", rail, |ui| {
                 let rect = ui.max_rect();
+                ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::RAIL_FILL());
+                ui.add_space(12.0);
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(
                         egui::pos2(rect.right() - 1.0, rect.top()),
                         egui::vec2(1.0, rect.height()),
                     ),
                     egui::CornerRadius::ZERO,
-                    theme::LINE,
+                    theme::LINE(),
                 );
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (title, entries) in [

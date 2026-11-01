@@ -23,8 +23,8 @@ impl App {
     pub(in crate::app::egui_settings) fn egui_physics(&mut self, ui: &mut egui::Ui) {
         theme::banner(
             ui,
-            "RAPIER IS CLIENT-ONLY VISUAL PHYSICS — OPENJK/JKA MOVEMENT AND SERVER SNAPSHOTS STAY AUTHORITATIVE.",
-            theme::TEXT_FAINT,
+            "RAPIER IS CLIENT-ONLY VISUAL PHYSICS: OPENJK/JKA MOVEMENT AND SERVER SNAPSHOTS STAY AUTHORITATIVE.",
+            theme::TEXT_FAINT(),
         );
 
         theme::section(

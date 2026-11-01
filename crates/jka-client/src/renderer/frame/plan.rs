@@ -1,7 +1,7 @@
 //! Frame plan.
 use crate::renderer::{
     weather, CullDebugMode, DofMode, DynamicLightsMode,
-    PlanarReflectionDebugMode, Renderer, WorldRenderPath,
+    PlanarReflectionDebugMode, Renderer,
 };
 
 /// Defer truly translucent material stage chains after opaque/cloud drawing.
@@ -138,7 +138,6 @@ impl Renderer {
 
     pub(in crate::renderer) fn rebuild_frame_plan(&mut self) {
         let fog_enabled = self.weather.fog.volumetric_effective();
-        let legacy_fog_enabled = self.weather.fog.legacy_effective();
         let legacy1_global_post = self.weather.fog.legacy1_global_post_active();
         // Legacy GL kept r_drawfog 2 smooth with framebuffer dithering. Our
         // equivalent uses a float scene plus one dithered presentation pass so
@@ -201,66 +200,9 @@ impl Renderer {
         // shaders/frame recorder and reuse one compact post pass for both.
         let use_hiz = self.gpu_driven_enabled && self.hiz_occlusion_enabled;
 
-        // Render settings are resolved here, on the cold path. The maximum-FPS
-        // frame loop should not rediscover that every advanced feature is OFF
-        // hundreds of times per frame/per draw. This path intentionally matches
-        // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
-        // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
-        let fast_baseline = self.sky_backend == 0 && self.blue_water_environment.world_lighting <= 0.0 && self.blue_water_environment.weather_backend != 1 && !self.force_unified_world
-            // bsp_fast has no baked-light adjustment or authored-sun cache pass.
-            && !self.baked_lighting_shader_needed()
-            // Curved-grid LOD belongs to the Unified packed BSP path.
-            && self.world.as_ref().is_none_or(|world| !world.patch_lod.has_patches())
-            && !self.dynamic_light_debug
-            && !self.hdr_enabled
-            && !self.tone_mapping_enabled
-            && !self.glow_mode.enabled()
-            && !self.halation_enabled
-            && !self.ssao_enabled
-            && !self.fxaa_enabled
-            && !self.smaa_enabled
-            && !self.temporal_resolve_active()
-            && !self.contact_shadows_enabled
-            && !fog_enabled
-            && !legacy_fog_enabled
-            && !self.clouds_enabled
-            && !self.weather.rain.enabled
-            && !self.weather.snow.enabled
-            && !self.weather.atmosphere.active()
-            && !self.ocean_enabled
-            && self.weather.rain.surface_wetness <= weather::RAIN_WETNESS_EPSILON
-            && self.weather.rain.puddle_amount <= weather::RAIN_PUDDLE_EPSILON
-            && !self.ssr_enabled
-            && !self.reflection_debug_enabled
-            && self.chromatic_aberration_strength <= 0.001
-            && !self.vignette_enabled
-            && self.film_grain_strength <= 0.001
-            && self.motion_blur_strength <= 0.001
-            && self.depth_of_field_strength <= 0.001
-            && !self.gpu_driven_enabled
-            && !self.hiz_occlusion_enabled
-            && !self.detail_textures_enabled
-            && !self.point_lighting_enabled()
-            && !matches!(
-                self.dynamic_lights_mode,
-                DynamicLightsMode::Legacy
-                    | DynamicLightsMode::Vertex
-                    | DynamicLightsMode::ClusteredLite
-            )
-            && !self.any_area_lights_enabled()
-            && !self.irradiance_volume_enabled
-            && !self.voxel_probe_gi_enabled
-            && !self.local_light_shadows_enabled
-            && !self.pbr_enabled
-            && !self.cascaded_shadows_enabled
-            && !(self.hardware_rt_requested() && self.ray_traced_shadows.is_some())
-            && self.cull_debug_mode == CullDebugMode::Off
-            && !self.planar_reflection.active
-            && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
-            && !self.jump_shade.engaged();
-        // Hi-Z reads the camera depth buffer, so it no longer forces the full
-        // linear-depth prepass: with no other consumer it runs a cheaper
-        // depth-only early pass instead (see `FramePlan::hiz_early`).
+        // Hi-Z uses a separate depth-only early pass when no full linear-depth
+        // consumer is active. Retain the consumers independently of the
+        // removed legacy world-renderer selection.
         let other_linear_depth = self.thermal_vision != 0
             || self.ssao_enabled
             || self.rt_local_cache_wanted()
@@ -296,11 +238,6 @@ impl Renderer {
         ].iter().enumerate().fold(0u32, |bits, (bit, &on)| bits | (u32::from(on) << bit));
         let rain_only_linear_depth = rain_spatial_post && !other_linear_depth;
         self.frame_plan = FramePlan {
-            world_path: if fast_baseline {
-                WorldRenderPath::FastBaseline
-            } else {
-                WorldRenderPath::Advanced
-            },
             use_post,
             lut_post: lut_enabled,
             // The tiny post path handles display gamma and/or one trilinear 3-D
@@ -342,7 +279,6 @@ impl Renderer {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::renderer) struct FramePlan {
-    pub(in crate::renderer) world_path: WorldRenderPath,
     pub(in crate::renderer) use_post: bool,
     /// Select the already-compiled compact grading shader on the fast path.
     /// Color-only effects never require the advanced world renderer.

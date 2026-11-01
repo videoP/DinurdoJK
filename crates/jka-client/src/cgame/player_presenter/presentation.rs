@@ -96,6 +96,12 @@ impl PlayerPresenter {
         };
         self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
+        // CG_BuildSolidList equivalent for the optional footstep-only CG_Trace.
+        // Reuse the existing entity-clip representation and snapshot trajectory
+        // evaluation. No per-frame list construction on the original A path.
+        if self.footstep_trace {
+            crate::net::solid_entities_into(entities, current_time, &mut self.footstep_solids);
+        }
         // TaystJK CG_Player reads the viewing player's authoritative snapshot.
         // Never use the target's forcePowersActive to decide whether we see it.
         self.force_sight_level = 0;
@@ -125,7 +131,7 @@ impl PlayerPresenter {
                 != 0;
             self.viewer_force_see = snapshot.player_state
                 .field_i32("fd.forcePowersActive")
-                .unwrap_or(0) & (1 << 13) != 0; // TaystJK FP_SEE
+                .unwrap_or(0) & (1 << FP_SEE) != 0; // TaystJK FP_SEE=14
             self.viewer_style = viewer_style_from(
                 &snapshot.player_state,
                 game.is_japro(),
@@ -515,6 +521,8 @@ impl PlayerPresenter {
         self.cloak_states
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.force_refractions
+            .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.speed_trail_history
             .retain(|entity_num, _| live_entities.contains(entity_num));
         if !self.logged_first_draw && !draws.is_empty() {
             devprintln!(
@@ -1436,14 +1444,23 @@ impl PlayerPresenter {
                             if let (false, Some(world)) =
                                 (footsteps.is_empty(), self.collision_world.as_mut())
                             {
-                                footsteps::push_footsteps(
-                                    world,
-                                    &mut self.footsteps,
-                                    entity.number,
-                                    runtime.player_angles.legs_yaw_angle,
-                                    &footsteps,
-                                    |_| footsteps::unposed_foot(entity.origin),
-                                );
+                                // Keep world-only A path entirely unchanged.
+                                let bolt = |_| footsteps::unposed_foot(entity.origin);
+                                if self.footstep_trace {
+                                    let mut trace = footsteps::FootstepEntityTrace::new(
+                                        world, &self.footstep_solids, self.viewer_client,
+                                        i32::from(entity.number),
+                                    );
+                                    footsteps::push_footsteps(
+                                        &mut trace, &mut self.footsteps, entity.number,
+                                        runtime.player_angles.legs_yaw_angle, &footsteps, bolt,
+                                    );
+                                } else {
+                                    footsteps::push_footsteps(
+                                        world, &mut self.footsteps, entity.number,
+                                        runtime.player_angles.legs_yaw_angle, &footsteps, bolt,
+                                    );
+                                }
                             }
                             return Ok(Vec::new());
                         }
@@ -1680,24 +1697,28 @@ impl PlayerPresenter {
         if let (false, Some(world)) = (footsteps.is_empty(), self.collision_world.as_mut()) {
             // CG_PlayerFootsteps: the foot bolt in the legs' own frame.
             let perf = &mut self.perf;
-            footsteps::push_footsteps(
-                world,
-                &mut self.footsteps,
-                entity.number,
-                runtime.player_angles.legs_yaw_angle,
-                &footsteps,
-                |foot| {
-                    let bolt = if foot.right_foot() {
-                        "*r_leg_foot"
-                    } else {
-                        "*l_leg_foot"
-                    };
-                    model_bolt_origin_timed(perf, &model, &pose, render_axis, render_origin, bolt)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| footsteps::unposed_foot(entity.origin))
-                },
-            );
+            let bolt = |foot: jka_assets::animevents::FootstepType| {
+                let name = if foot.right_foot() { "*r_leg_foot" } else { "*l_leg_foot" };
+                model_bolt_origin_timed(perf, &model, &pose, render_axis, render_origin, name)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| footsteps::unposed_foot(entity.origin))
+            };
+            if self.footstep_trace {
+                let mut trace = footsteps::FootstepEntityTrace::new(
+                    world, &self.footstep_solids, self.viewer_client,
+                    i32::from(entity.number),
+                );
+                footsteps::push_footsteps(
+                    &mut trace, &mut self.footsteps, entity.number,
+                    runtime.player_angles.legs_yaw_angle, &footsteps, bolt,
+                );
+            } else {
+                footsteps::push_footsteps(
+                    world, &mut self.footsteps, entity.number,
+                    runtime.player_angles.legs_yaw_angle, &footsteps, bolt,
+                );
+            }
         }
         // TaystJK CG_BreathPuffs: one mouth-attached EFX emission at the
         // per-entity breath interval, not a continuously drawn smoke quad.
@@ -1828,6 +1849,78 @@ impl PlayerPresenter {
             true,
             dismember_selection.as_ref(),
         )?;
+
+        // TaystJK CG_Player force-speed trail: translucent duplicates of the
+        // CURRENT animated Ghoul2 body, displaced to the previous two origins.
+        // Only body surfaces are duplicated, not held sabers/jetpacks or Force
+        // shells. CPU positions use scene::jka_position, GPU skinned instances
+        // retain their shared mesh/bones and only change instance origin.
+        const PW_SPEED: i32 = 10; // bg_public.h powerup_t
+        let speed_enabled = self.speed_trail && entity.entity_type == ET_PLAYER
+            && entity_alpha >= 0.999 && e_flags & EF_DEAD == 0
+            && entity.state.field_i32("powerups").unwrap_or(0) & (1 << PW_SPEED) != 0;
+        if speed_enabled && submit_geometry && !draws.is_empty() {
+            let velocity = presented_entity_velocity(entity);
+            let speed = velocity.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let separation = (6.0 * speed * 0.004).max(0.0);
+            let previous = self.speed_trail_history.get(&entity.number).copied();
+            if let Some((first, second, _)) = previous {
+                // Position each echo from the *current* player's pose, not
+                // from a previous pose. TaystJK reuses the same legs refEntity
+                // and changes only origin and forced alpha.
+                let step = |from: [f32; 3], toward: [f32; 3]| -> Option<[f32; 3]> {
+                    let diff = [0, 1, 2].map(|axis| toward[axis] - from[axis]);
+                    let length = diff.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if length <= 0.001 || separation <= 0.001 { return None; }
+                    let bounded = length.min(separation);
+                    Some(diff.map(|value| value * (bounded / length)))
+                };
+                let mut ghosts = Vec::new();
+                let mut emit = |offset: [f32; 3], alpha: f32| {
+                    let position_offset = crate::scene::render_position(offset);
+                    for surface in &draws {
+                        if !surface.raster_visible { continue; }
+                        let mut ghost = surface.clone();
+                        ghost.alpha_mode = DynamicModelAlphaMode::Blend;
+                        ghost.rt_rigid = None;
+                        ghost.rt_skinned_key = None;
+                        ghost.lighting_origin = None;
+                        ghost.authored_glow = false;
+                        if let Some(ref mut gpu) = ghost.ghoul2_gpu {
+                            for axis in 0..3 { gpu.origin[axis] += offset[axis]; }
+                            gpu.color[3] *= alpha;
+                        } else {
+                            ghost.vertices = Arc::new(ghost.vertices.iter().map(|v| {
+                                let mut v = *v;
+                                for axis in 0..3 { v.position[axis] += position_offset[axis]; }
+                                v.color[3] *= alpha;
+                                v
+                            }).collect());
+                        }
+                        ghosts.push(ghost);
+                    }
+                };
+                if let Some(first_step) = step(render_origin, first) {
+                    emit(first_step, 100.0 / 255.0);
+                    if let Some(second) = second {
+                        if let Some(second_step) = step(first, second) {
+                            let total = [0, 1, 2].map(|axis| first_step[axis] + second_step[axis]);
+                            emit(total, 50.0 / 255.0);
+                        }
+                    }
+                }
+                draws.extend(ghosts);
+            }
+            let history = self.speed_trail_history.entry(entity.number)
+                .or_insert((render_origin, None, current_time));
+            if history.2 != current_time {
+                history.1 = Some(history.0);
+                history.0 = render_origin;
+                history.2 = current_time;
+            }
+        } else {
+            self.speed_trail_history.remove(&entity.number);
+        }
 
         // TaystJK CG_Player model index 3: when EF_JETPACK is present, bolt
         // models/weapons2/jetpack/model.glm to the player's *chestg bolt. The

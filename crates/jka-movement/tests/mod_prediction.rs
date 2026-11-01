@@ -229,3 +229,39 @@ fn authoritative_snapshot_resets_previous_style_state() {
         .unwrap();
     assert_eq!(fresh.network(), expected);
 }
+
+#[test]
+fn actual_roll_branch_uses_nf_ff_overrides_and_diagnostics_do_not_change_movement() {
+    let movement = animations();
+    let mut world = Map::floor().world();
+    let roll_anim = (0..3000).find(|&i| jka_movement::animation_name(i) == Some("BOTH_ROLL_F")).unwrap();
+    for (duel_type, active, expected_mode) in [(1, 1, 0), (2, 1, 3), (0, 1, 3), (1, 0, 3)] {
+        let mut p = player(24.125);
+        let mut state = p.network();
+        let mut ps = jka_protocol::server::PlayerState::default();
+        ps.fields.clone_from(&state.fields);
+        for (name, value) in [("clientNum", 3), ("duelInProgress", active), ("duelIndex", 4),
+            ("legsAnim", roll_anim), ("torsoAnim", roll_anim), ("legsTimer", 800),
+            ("torsoTimer", 800), ("pm_flags", jka_movement::PMF_ROLLING)]
+        {
+            assert!(ps.set_field_bits(name, value as u32), "{name}");
+        }
+        state.fields = ps.fields;
+        state.stats[11] = 0; // non-race
+        state.stats[13] = 1; // MV_JKA
+        p.set_network(&state).unwrap();
+        let settings = PredictSettings { duel_client: 3, duel_type, roll_debug: 1,
+            jcinfo: 1 << 3, ..japro() }; // advertised FIXROLL3 must yield to NF
+        p.configure(&settings).unwrap();
+        let mut quiet = p.clone();
+        let cmd = UserCmd { server_time: 8, forward_move: 127, ..Default::default() };
+        movement.predict(&mut p, cmd, &settings, &mut world).unwrap();
+        let observed = p.roll_prediction_debug();
+        assert!(observed.roll_queries > 0, "must exercise GetFixRoll inside a roll");
+        assert_eq!((observed.client_num, observed.duel_type, observed.duel_in_progress, observed.mode),
+            (3, duel_type, active, expected_mode));
+        movement.predict(&mut quiet, cmd, &PredictSettings { roll_debug: 0, ..settings }, &mut world).unwrap();
+        assert_eq!(p.network(), quiet.network(), "diagnostics must not change Pmove");
+        assert_eq!(quiet.roll_prediction_debug().queries, 0);
+    }
+}

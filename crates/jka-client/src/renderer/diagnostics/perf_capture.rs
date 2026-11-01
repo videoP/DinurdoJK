@@ -3,7 +3,7 @@
 //! draw phases each read one relaxed boolean while unarmed. File writing runs after capture on a
 //! separate OS thread, never in the render/present critical section.
 use crate::renderer::diagnostics::profiling::{GpuPass, GPU_PASS_COUNT};
-use crate::renderer::{active_batch_selection, FrameInfo, Renderer};
+use crate::renderer::{active_batch_selection, Camera, FrameInfo, Renderer};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 227] = [
+const FIELDS: [&str; 240] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -256,6 +256,19 @@ const FIELDS: [&str; 227] = [
     "loop_render_call_ms",
     "loop_post_render_prev_ms",
     "frame_interval_ms",
+    "effective_post",
+    "forced_post",
+    "forced_post_glass",
+    "forced_post_legacy",
+    "world_clear",
+    "world_skip_clear",
+    "world_stage_probe",
+    "color_clear_mode",
+    "camera_x",
+    "camera_y",
+    "camera_z",
+    "camera_yaw",
+    "camera_pitch",
 ];
 
 /// Render-thread loop sections around `Renderer::render()`, measured only
@@ -302,10 +315,11 @@ struct PerfRow {
     /// Every `GpuPass` from the newest resolved readback, written after FIELDS
     /// as `gpu_pass_<label>_ms` (NaN when that pass did not run or no timing).
     gpu_passes: [f64; GPU_PASS_COUNT],
+    audit_case: Option<u8>,
 }
 
 impl PerfRow {
-    fn from_frame(info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> Self {
+    fn from_frame(info: &FrameInfo, renderer: &Renderer, camera: &Camera, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> Self {
         let models = &renderer.dynamic_model_renderer;
         let model_calls = models.perf_phase_calls.get();
         let prepare = &models.perf_prepare;
@@ -558,12 +572,67 @@ impl PerfRow {
                 sections.render_call_ms,
                 sections.post_render_prev_ms,
                 f64::NAN,
+                u8::from(info.perf_effective_post) as f64,
+                u8::from(info.perf_forced_post) as f64,
+                u8::from(info.perf_forced_post_glass) as f64,
+                u8::from(info.perf_forced_post_legacy) as f64,
+                u8::from(info.perf_world_clear) as f64,
+                u8::from(info.perf_world_skip_clear) as f64,
+                renderer.world_stage_probe as f64,
+                renderer.color_clear_mode as f64,
+                camera.position.x as f64,
+                camera.position.y as f64,
+                camera.position.z as f64,
+                camera.yaw as f64,
+                camera.pitch as f64,
             ],
             gpu_passes: std::array::from_fn(|pass| {
                 gpu_timing.and_then(|timing| timing.milliseconds[pass]).unwrap_or(f64::NAN)
             }),
+            audit_case: None,
         }
     }
+}
+
+
+/// Cases are diagnostics, NOT alternative renderer settings to ship. Changing
+/// one variable at a time with a repeated baseline exposes both the source
+/// of GPU work and gross thermal/clock drift. Probe 2 deliberately changes
+/// depth/occlusion; its delta must not be interpreted as isolated fragment cost.
+#[derive(Clone, Copy)]
+struct AuditCase {
+    name: &'static str,
+    probe: u8,
+    clear_override: Option<u8>,
+    gpu_timestamps: bool,
+}
+const AUDIT_CASES: [AuditCase; 13] = [
+    AuditCase { name: "baseline", probe: 0, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_transparent", probe: 1, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_opaque_changes_depth", probe: 2, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_multiply", probe: 3, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_additive", probe: 4, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_alpha_composite", probe: 5, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_other_blends", probe: 6, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_water_additive", probe: 7, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "omit_nonwater_additive", probe: 8, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "force_color_clear", probe: 0, clear_override: Some(0), gpu_timestamps: true },
+    AuditCase { name: "skip_color_clear_when_safe", probe: 0, clear_override: Some(1), gpu_timestamps: true },
+    AuditCase { name: "baseline_repeat", probe: 0, clear_override: None, gpu_timestamps: true },
+    AuditCase { name: "baseline_no_gpu_timestamps", probe: 0, clear_override: None, gpu_timestamps: false },
+];
+const AUDIT_PHASE_DURATION: Duration = Duration::from_millis(1400);
+const AUDIT_PHASE_WARMUP_FRAMES: usize = 90;
+
+struct AuditState {
+    case_index: usize,
+    phase_started: Option<Instant>,
+    warmup_remaining: usize,
+    saved_world_probe: u8,
+    saved_color_clear: u8,
+    // Per-phase GPU readbacks are asynchronous; duplicates should not be
+    // interpreted as hundreds of independent GPU frame samples.
+    last_gpu_generation: u64,
 }
 
 pub(in crate::renderer) struct PerfCapture {
@@ -581,6 +650,7 @@ pub(in crate::renderer) struct PerfCapture {
     warmup_frames: usize,
     warmup_remaining: usize,
     hooks_owned: bool,
+    audit: Option<AuditState>,
     adapter: String,
     driver: String,
     backend: String,
@@ -616,6 +686,7 @@ impl PerfCapture {
             warmup_frames,
             warmup_remaining: warmup_frames,
             hooks_owned: true,
+            audit: None,
             adapter: adapter.name,
             driver: format!("{} {}", adapter.driver, adapter.driver_info),
             backend: format!("{:?}", adapter.backend),
@@ -626,7 +697,7 @@ impl PerfCapture {
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             main_view_stages: vec![crate::renderer::api::WorldStagePerf::default(); renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};inline_transform={};bsp_model_surfaces={};early_submit={};shader_mode={};world_sort={};active_world={};hdr_output={};present_copy={}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};igpu_ab={};effective_bundles={};effective_finish_mode={};world_stage_probe={};fastsky={};inline_models={};inline_transform={};bsp_model_surfaces={};early_submit={};shader_mode={};world_sort={};active_world={};hdr_output={};present_copy={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -634,7 +705,7 @@ impl PerfCapture {
                 renderer.msaa_samples,
                 renderer.gpu_profiler.enabled(),
                 renderer.pvs_mode,
-                renderer.frame_plan.world_path,
+                "unified",
                 renderer.dynamic_model_renderer.ghoul2_batch_draws.config_value(),
                 renderer.dynamic_model_renderer.model_state_cache,
                 renderer.dynamic_model_renderer.dynamic_batch_draws,
@@ -652,6 +723,9 @@ impl PerfCapture {
                 renderer.ocean_enabled && renderer.world.as_ref().is_some_and(|w| w.active_pipeline_variant.ocean),
                 renderer.dynamic_model_renderer.model_render_bundles,
                 renderer.encoder_finish_threads,
+                renderer.igpu_ab_mode,
+                renderer.dynamic_model_renderer.model_render_bundles || renderer.igpu_ab_mode & 4 != 0,
+                if renderer.igpu_ab_mode & 1 != 0 { 0 } else { renderer.encoder_finish_threads },
                 renderer.world_stage_probe,
                 renderer.fast_sky,
                 renderer.draw_inline_models,
@@ -667,11 +741,46 @@ impl PerfCapture {
         }
     }
 
+    /// Full one-command study. The caller owns changing the profiler back to
+    /// its saved preference when the run finishes or is cancelled.
+    pub(in crate::renderer) fn arm_audit(stem: PathBuf, renderer: &mut Renderer) -> Self {
+        let saved_world_probe = renderer.world_stage_probe;
+        let saved_color_clear = renderer.color_clear_mode;
+        renderer.set_world_stage_debug(renderer.draw_bsp_model_surfaces, 0);
+        let mut capture = Self::arm(stem, 0, None, renderer);
+        capture.target_frames = 200_000;
+        capture.audit = Some(AuditState {
+            case_index: 0, phase_started: None, warmup_remaining: 0,
+            saved_world_probe, saved_color_clear, last_gpu_generation: 0,
+        });
+        capture
+    }
+
+    pub(in crate::renderer) fn is_audit(&self) -> bool { self.audit.is_some() }
+
+    pub(in crate::renderer) fn audit_tile_stem(&self) -> Option<PathBuf> {
+        self.audit.as_ref()?;
+        let name = self.stem.file_name()?.to_string_lossy();
+        Some(self.stem.with_file_name(format!("{name}-pixel-tiles")))
+    }
+
+    /// No renderer settings are left modified, even when another diagnostic
+    /// cancels this run before a CSV is complete. Idempotent for normal captures.
+    pub(in crate::renderer) fn restore(self, renderer: &mut Renderer, gpu_timing_preference: bool) -> Self {
+        if let Some(audit) = &self.audit {
+            renderer.set_world_stage_debug(renderer.draw_bsp_model_surfaces, audit.saved_world_probe);
+            renderer.color_clear_mode = audit.saved_color_clear;
+            renderer.set_gpu_timings(gpu_timing_preference);
+            eprintln!("[IGPU AUDIT] Original world-stage probe, color-clear and GPU-timing preference restored");
+        }
+        self
+    }
+
     /// Called only after successfully presented frames. Wait two seconds so
     /// users can close the console; then skip 120 additional successful frames
     /// to avoid measuring the first dynamic resource/path warmup. This does not
     /// pretend pipelines are fully prewarmed: repeat the scene before capture.
-    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> bool {
+    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &mut Renderer, camera: &Camera, client: &crate::renderer::ClientFramePerf, sections: LoopSections) -> bool {
         if self.armed_at.elapsed() < Duration::from_secs(2)
             || info.perf_primary_command_buffers == 0
         {
@@ -680,6 +789,12 @@ impl PerfCapture {
         if self.warmup_remaining != 0 {
             self.warmup_remaining -= 1;
             return false;
+        }
+        if let Some(audit) = &mut self.audit {
+            if audit.warmup_remaining > 0 {
+                audit.warmup_remaining -= 1;
+                return false;
+            }
         }
         // PVS candidates, deliberately not "draws": GPU culling, areaportals,
         // frustum, reflection passes, occlusion, water and fog can reject or
@@ -718,11 +833,45 @@ impl PerfCapture {
         }
         let now = Instant::now();
         let started = *self.recording_started.get_or_insert(now);
-        let mut row = PerfRow::from_frame(info, renderer, client, sections);
+        let mut row = PerfRow::from_frame(info, renderer, camera, client, sections);
         if let Some(previous) = self.last_record.replace(now) {
-            row.numbers[FIELDS.len() - 1] = now.duration_since(previous).as_secs_f64() * 1000.0;
+            row.numbers[226] = now.duration_since(previous).as_secs_f64() * 1000.0;
+        }
+        if let Some(audit) = &mut self.audit {
+            row.audit_case = Some(audit.case_index as u8);
+            let generation = renderer.gpu_profiler.latest_generation();
+            if !renderer.gpu_profiler.enabled() || generation == audit.last_gpu_generation {
+                row.gpu_passes.fill(f64::NAN);
+            } else {
+                audit.last_gpu_generation = generation;
+            }
         }
         self.frames.push(row);
+        // Switch experiments only AFTER the previous frame has completed.
+        // All new-case frames are warmed up before entering the measurements.
+        if let Some(audit) = &mut self.audit {
+            let started = *audit.phase_started.get_or_insert(now);
+            if started.elapsed() >= AUDIT_PHASE_DURATION {
+                audit.case_index += 1;
+                if audit.case_index == AUDIT_CASES.len() {
+                    self.recording_wall = self.recording_started.map(|start| start.elapsed());
+                    eprintln!("[IGPU AUDIT] All {} cases completed", AUDIT_CASES.len());
+                    return true;
+                }
+                let case = AUDIT_CASES[audit.case_index];
+                renderer.set_world_stage_debug(renderer.draw_bsp_model_surfaces, case.probe);
+                renderer.color_clear_mode = case.clear_override.unwrap_or(audit.saved_color_clear);
+                renderer.set_gpu_timings(case.gpu_timestamps);
+                audit.warmup_remaining = AUDIT_PHASE_WARMUP_FRAMES;
+                audit.phase_started = None;
+                audit.last_gpu_generation = renderer.gpu_profiler.latest_generation();
+                self.last_record = None;
+                eprintln!("[IGPU AUDIT] case {}/{}: {} (world probe {}, clear {:?}, GPU timestamps {})",
+                    audit.case_index + 1, AUDIT_CASES.len(), case.name, case.probe,
+                    case.clear_override, case.gpu_timestamps);
+            }
+            return false;
+        }
         let done = self.frames.len() >= self.target_frames
             || self.target_duration.is_some_and(|limit| started.elapsed() >= limit);
         if done {
@@ -760,7 +909,7 @@ impl PerfCapture {
     }
 
     fn csv(&self) -> String {
-        let mut out = String::from("frame_index,renderer_path,");
+        let mut out = String::from("frame_index,renderer_path,audit_case,");
         out.push_str(&FIELDS.join(","));
         for pass in GpuPass::ALL {
             out.push_str(",gpu_pass_");
@@ -770,7 +919,8 @@ impl PerfCapture {
         out.push('\n');
         for (index, row) in self.frames.iter().enumerate() {
             use std::fmt::Write;
-            let _ = write!(&mut out, "{index},{},", row.path);
+            let case_name = row.audit_case.map(|index| AUDIT_CASES[index as usize].name).unwrap_or("");
+            let _ = write!(&mut out, "{index},{},{case_name},", row.path);
             for (field, value) in row.numbers.iter().enumerate() {
                 if field != 0 { out.push(','); }
                 if value.is_finite() { let _ = write!(&mut out, "{value:.6}"); }
@@ -848,6 +998,100 @@ impl PerfCapture {
         })
     }
 
+    fn audit_summary(&self) -> serde_json::Value {
+        if self.audit.is_none() { return serde_json::Value::Null; }
+        let mut rows = Vec::new();
+        for (case_index, case) in AUDIT_CASES.iter().enumerate() {
+            let subset: Vec<_> = self.frames.iter()
+                .filter(|row| row.audit_case == Some(case_index as u8)).collect();
+            let summarize = |mut values: Vec<f64>| -> serde_json::Value {
+                values.retain(|v| v.is_finite());
+                if values.is_empty() { return serde_json::Value::Null; }
+                values.sort_unstable_by(f64::total_cmp);
+                serde_json::json!({
+                    "mean": values.iter().sum::<f64>() / values.len() as f64,
+                    "p50": percentile(&values, 0.50),
+                    "p95": percentile(&values, 0.95),
+                    "p99": percentile(&values, 0.99),
+                    "samples": values.len()
+                })
+            };
+            let mut cpu = serde_json::Map::new();
+            for (index, field) in FIELDS.iter().enumerate() {
+                cpu.insert((*field).to_owned(), summarize(subset.iter().map(|row| row.numbers[index]).collect()));
+            }
+            let mut gpu = serde_json::Map::new();
+            for pass in GpuPass::ALL {
+                gpu.insert(pass.label().to_owned(), summarize(subset.iter().map(|row| row.gpu_passes[pass.index()]).collect()));
+            }
+            let frame_interval: Vec<f64> = subset.iter().map(|row| row.numbers[226])
+                .filter(|v| v.is_finite() && *v > 0.0).collect();
+            let observed_fps = if frame_interval.is_empty() { None } else {
+                Some(1000.0 * frame_interval.len() as f64 / frame_interval.iter().sum::<f64>())
+            };
+            let camera_drift = if let Some(first) = subset.first() {
+                let start = &first.numbers;
+                let max_translation = subset.iter().map(|row| {
+                    (0..3).map(|axis| (row.numbers[235 + axis] - start[235 + axis]).powi(2))
+                        .sum::<f64>().sqrt()
+                }).fold(0.0f64, f64::max);
+                let max_rotation = subset.iter().map(|row| {
+                    (row.numbers[238] - start[238]).abs()
+                        .max((row.numbers[239] - start[239]).abs())
+                }).fold(0.0f64, f64::max);
+                serde_json::json!({"max_translation_units": max_translation,
+                    "max_rotation_radians": max_rotation,
+                    "camera_stable": max_translation < 0.01 && max_rotation < 0.0002})
+            } else { serde_json::Value::Null };
+            rows.push(serde_json::json!({
+                "camera_drift": camera_drift,
+                "name": case.name, "case_index": case_index, "probe": case.probe,
+                "color_clear_override": case.clear_override,
+                "gpu_timestamps_enabled": case.gpu_timestamps,
+                "frames": subset.len(), "observed_fps": observed_fps,
+                "cpu": cpu, "gpu_passes_ms": gpu
+            }));
+        }
+        let baseline = rows.first().cloned().unwrap_or(serde_json::Value::Null);
+        let metric = |row: &serde_json::Value, section: &str, field: &str| -> Option<f64> {
+            row[section][field]["mean"].as_f64()
+        };
+        let mut comparisons = Vec::new();
+        for row in rows.iter().skip(1) {
+            let delta = |section: &str, field: &str| -> Option<f64> {
+                Some(metric(&baseline, section, field)? - metric(row, section, field)?)
+            };
+            comparisons.push(serde_json::json!({
+                "name": row["name"],
+                "saved_gpu_frame_ms": delta("gpu_passes_ms", "frame"),
+                "saved_gpu_world_ms": delta("gpu_passes_ms", "world"),
+                "saved_gpu_main_bsp_ms": delta("gpu_passes_ms", "world_main_pass"),
+                "saved_gpu_post_ms": delta("gpu_passes_ms", "post"),
+                "saved_cpu_acquire_ms": delta("cpu", "cpu_acquire_ms"),
+                "saved_cpu_frame_ms": delta("cpu", "frame_ms"),
+                "observed_fps_change": row["observed_fps"].as_f64()
+                    .zip(baseline["observed_fps"].as_f64()).map(|(a, b)| a - b),
+            }));
+        }
+        serde_json::json!({
+            "cases": rows,
+            "comparisons_vs_first_baseline": comparisons,
+            "notes": [
+                "All cases use the same camera/map settings unless the player moved or a server changed state; hold the camera and scene still",
+                "The test omits draw classes to isolate cost; probes deliberately change the picture and are NOT production optimizations",
+                "Probe 2 omits depth-writing geometry, changing overdraw and depth results: it cannot isolate fragment-shader ALU cost alone",
+                "Nested GPU passes (e.g. world_main_pass within world, dynamic models, post_final within post) are NOT additive",
+                "GPU timestamp samples use only distinct asynchronous profiler generations; CPU row and GPU data are not guaranteed to be the exact same frame",
+                "A clear-only acquire probe is a separate test; this audit records real rendering, resource uploads, presentation and per-stage GPU intervals",
+                "Case baseline_no_gpu_timestamps is an observer-overhead control: its GPU columns are deliberately missing",
+                "If baseline and baseline_repeat differ substantially, the A/B results may be confounded by thermal/clock drift or scene changes",
+                "The effective-post flag reports the real forced post path, not the GUI plan",
+                "A 4x4 pixel-cost study starts automatically after this sweep and writes -pixel-tiles.csv and -pixel-tiles.json; that test changes the image while it collects GPU tile timings",
+                "The file captures full per-frame measurements, not an Intel GPA hardware counter trace: sampler occupancy and per-draw pixel events require Intel GPA"
+            ]
+        })
+    }
+
     fn summary(&self) -> String {
         let mut stats = serde_json::Map::new();
         for (index, field) in FIELDS.iter().enumerate() {
@@ -871,7 +1115,8 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v10",
+            "schema": "dinurdojk-cpu-renderperf-v11-audit",
+            "audit": self.audit_summary(),
             "sample_count": self.frames.len(),
             "requested_seconds": self.target_duration.map(|d| d.as_secs_f64()),
             "recording_wall_seconds": self.recording_wall.map(|d| d.as_secs_f64()),

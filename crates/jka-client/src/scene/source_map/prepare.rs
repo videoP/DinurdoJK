@@ -732,6 +732,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         source: path.to_path_buf(),
         material_debug,
         map_hash: 0,
+        vote_prepared_vfs: None,
         stage_keys: PrepStageKeys::default(),
         texture_hashes: Vec::new(),
         bsp_stats: None,

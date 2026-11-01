@@ -185,10 +185,17 @@ impl ModelSource for WorkerModelSource<'_> {
         let shader_time_offset = shared.shader_remaps.time_offset_for(effective.as_ref());
         let shader_clamp_time = jka_assets::shader::find_shader(&shared.shaders, effective.as_ref()).and_then(|shader| shader.clamp_time);
         let (mut texture, mut alpha_mode) = self.load_stage(&layers.base);
+        let animation = resolve_stage_animation(layers.base.animation, |image| {
+            self.load_stage(&StageMaterial { image, animation: None, ..layers.base }).0
+        });
         let overlay = layers.overlay.as_ref().map(|stage| {
             let (texture, alpha_mode) = self.load_stage(stage);
+            let animation = resolve_stage_animation(stage.animation, |image| {
+                self.load_stage(&StageMaterial { image, animation: None, ..*stage }).0
+            });
             SurfaceOverlay {
                 texture,
+                animation,
                 alpha_mode,
                 authored_glow: stage.authored_glow,
             }
@@ -199,11 +206,17 @@ impl ModelSource for WorkerModelSource<'_> {
             .map(|&(stage, mode)| {
                 let (texture, _) = self.load_stage(&StageMaterial {
                     image: stage.image.as_str(),
+                    animation: stage.animation.as_ref(),
                     clamp: stage.clamp,
                     alpha_mode: mode,
                     authored_glow: stage.glow,
                 });
-                resolved_stage(stage, mode, texture)
+                let mut resolved = resolved_stage(stage, mode, texture);
+                resolved.animation = resolve_stage_animation(stage.animation.as_ref(), |image| {
+                    self.load_stage(&StageMaterial { image, animation: None,
+                        clamp: stage.clamp, alpha_mode: mode, authored_glow: stage.glow }).0
+                });
+                resolved
             })
             .collect::<Vec<_>>();
         if let Some(first) = stages.first() {
@@ -212,6 +225,7 @@ impl ModelSource for WorkerModelSource<'_> {
         }
         ResolvedMaterial {
             texture,
+            animation,
             alpha_mode,
             entity_tint: layers.entity_tint,
             overlay,
@@ -261,6 +275,20 @@ impl WorkerModelSource<'_> {
     }
 }
 
+/// Load every frame on the model-load path, never from the render thread.
+/// Missing frames use the normal missing-image fallback without blocking FX.
+fn resolve_stage_animation(
+    animation: Option<&jka_assets::shader::ImageAnimation>,
+    mut load: impl FnMut(&str) -> Option<Arc<TextureData>>,
+) -> Option<super::types::ResolvedAnimation> {
+    let animation = animation?;
+    Some(super::types::ResolvedAnimation {
+        fps: animation.fps,
+        textures: animation.frames.iter().map(|image| load(image)).collect(),
+        one_shot: animation.one_shot,
+    })
+}
+
 /// id Tech 3's periodic `base + func(phase + time*frequency) * amplitude`
 /// (`RB_CalcWaveColorSingle`/`RB_CalcWaveAlphaSingle`), used here as a
 /// per-draw approximation of a shell's `deformVertexes wave` bulge (no
@@ -293,8 +321,10 @@ pub(in crate::cgame::player_presenter) fn wave_value(wave: Wave, time: f32) -> f
 }
 
 /// One shader stage as a player/Ghoul2 surface draws it.
+#[derive(Clone, Copy)]
 pub(in crate::cgame::player_presenter) struct StageMaterial<'a> {
     pub(in crate::cgame::player_presenter) image: &'a str,
+    pub(in crate::cgame::player_presenter) animation: Option<&'a jka_assets::shader::ImageAnimation>,
     pub(in crate::cgame::player_presenter) clamp: bool,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::cgame::player_presenter) authored_glow: bool,
@@ -428,6 +458,7 @@ pub(in crate::cgame::player_presenter) fn resolved_stage(
     let const_rgb = stage.rgb_gen == RgbGen::Const;
     ResolvedStage {
         texture,
+        animation: None,
         alpha_mode,
         rgb: if const_rgb {
             stage.color.unwrap_or([1.0; 3])
@@ -598,6 +629,7 @@ pub(in crate::cgame::player_presenter) fn stage_material(
     };
     StageMaterial {
         image: stage.image.as_str(),
+        animation: stage.animation.as_ref(),
         clamp: stage.clamp,
         alpha_mode,
         authored_glow: stage.glow,
@@ -615,6 +647,7 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
     let unresolved = || MaterialLayers {
         base: StageMaterial {
             image: shader_name,
+            animation: None,
             clamp: false,
             alpha_mode: DynamicModelAlphaMode::Opaque,
             authored_glow: false,
@@ -634,6 +667,7 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
         return MaterialLayers {
             base: StageMaterial {
                 image: primary.image.as_str(),
+                animation: primary.animation.as_ref(),
                 clamp: primary.clamp,
                 alpha_mode: DynamicModelAlphaMode::Glass,
                 authored_glow: false,
@@ -665,6 +699,7 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
                 })
                 .map(|stage| StageMaterial {
                     image: stage.image.as_str(),
+                    animation: stage.animation.as_ref(),
                     clamp: stage.clamp,
                     // rgbGen lightingDiffuse: a lit, alpha-blended layer.
                     alpha_mode: DynamicModelAlphaMode::Blend,
@@ -958,6 +993,7 @@ fn build_character_model(
             default_visible,
             surface_name: hierarchy.name.clone(),
             texture: material.texture,
+            animation: material.animation,
             alpha_mode: material.alpha_mode,
             authored_glow: material.authored_glow,
             shader_time_offset: material.shader_time_offset,
@@ -1212,6 +1248,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
             default_visible: true,
             surface_name: hierarchy.name.clone(),
             texture: material.texture,
+            animation: material.animation,
             alpha_mode: material.alpha_mode,
             authored_glow: material.authored_glow,
             shader_time_offset: material.shader_time_offset,
@@ -1225,7 +1262,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
                 &model_qpath,
                 &glm,
                 surface.surface_index,
-                false,
+                material.two_sided,
                 None,
                 JiggleRemeshTuning::default(),
                 &HashMap::new(),
@@ -1861,10 +1898,17 @@ impl PlayerPresenter {
         let shader_clamp_time = jka_assets::shader::find_shader(&shaders, &effective).and_then(|shader| shader.clamp_time);
         let layers = material_layers(&shaders, &effective);
         let (mut texture, mut alpha_mode) = self.load_stage_texture(&layers.base);
+        let animation = resolve_stage_animation(layers.base.animation, |image| {
+            self.load_stage_texture(&StageMaterial { image, animation: None, ..layers.base }).0
+        });
         let overlay = layers.overlay.as_ref().map(|stage| {
             let (texture, alpha_mode) = self.load_stage_texture(stage);
+            let animation = resolve_stage_animation(stage.animation, |image| {
+                self.load_stage_texture(&StageMaterial { image, animation: None, ..*stage }).0
+            });
             SurfaceOverlay {
                 texture,
+                animation,
                 alpha_mode,
                 authored_glow: stage.authored_glow,
             }
@@ -1875,11 +1919,17 @@ impl PlayerPresenter {
             .map(|&(stage, mode)| {
                 let (texture, _) = self.load_stage_texture(&StageMaterial {
                     image: stage.image.as_str(),
+                    animation: stage.animation.as_ref(),
                     clamp: stage.clamp,
                     alpha_mode: mode,
                     authored_glow: stage.glow,
                 });
-                resolved_stage(stage, mode, texture)
+                let mut resolved = resolved_stage(stage, mode, texture);
+                resolved.animation = resolve_stage_animation(stage.animation.as_ref(), |image| {
+                    self.load_stage_texture(&StageMaterial { image, animation: None,
+                        clamp: stage.clamp, alpha_mode: mode, authored_glow: stage.glow }).0
+                });
+                resolved
             })
             .collect::<Vec<_>>();
         if let Some(first) = stages.first() {
@@ -1888,6 +1938,7 @@ impl PlayerPresenter {
         }
         ResolvedMaterial {
             texture,
+            animation,
             alpha_mode,
             entity_tint: layers.entity_tint,
             overlay,

@@ -56,6 +56,13 @@ void japro_configure(const jka_predict_settings *settings) {
     cgs.restricts = settings->restricts;
     cgs.baseGame = settings->base_game ? qtrue : qfalse;
     cgs.legacyProtocol = qfalse;
+    /* TaystJK GetFixRoll/GetFlipkick use this array, not jcinfo, for
+     * jaPRO NF/FF duel overrides. Feed the real EV_PRIVATE_DUEL parameter.
+     * Do not infer it from g_saberDuelSPDamage (not networked). */
+    if (settings->duel_client >= 0 && settings->duel_client < MAX_CLIENTS) {
+        cg_dueltypes[settings->duel_client] =
+            settings->server_mod == 1 ? settings->duel_type : 0;
+    }
     cp_pluginDisable.integer = settings->plugin_disable;
     pmove_fixed.integer = settings->pmove_fixed;
     cg.snap = &prediction_snapshot;
@@ -80,7 +87,7 @@ int jka_contract(int index) {
         BUTTON_ATTACK, BUTTON_WALKING, BUTTON_ALT_ATTACK, ENTITYNUM_WORLD, ENTITYNUM_NONE, PMF_DUCKED, PMF_ROLLING, PMF_STUCK_TO_WALL,
         FP_SPEED, FP_RAGE, sizeof(jka_entity_view), sizeof(jka_player_angle_entity),
         sizeof(jka_player_angle_state), sizeof(jka_bone_angle_command), sizeof(jka_player_angle_result),
-        sizeof(jka_saber_movement_info), sizeof(jka_predict_settings), sizeof(jka_prediction_entity) };
+        sizeof(jka_saber_movement_info), sizeof(jka_predict_settings), sizeof(jka_prediction_entity), sizeof(jka_roll_debug) };
     return index >= 0 && index < sizeof(values)/sizeof(values[0]) ? values[index] : -1;
 }
 
@@ -181,11 +188,36 @@ typedef struct jka_player_s {
     qboolean foot_valid;
     float foot_bolt[2][3];
 #ifdef JKA_JAPRO
+    jka_roll_debug roll_debug;
     jka_prediction_entity entities[MAX_GENTITIES];
     int entity_count;
     uint64_t entities_revision;
 #endif
 } jka_player;
+
+#ifdef JKA_JAPRO
+static jka_roll_debug *roll_tracking;
+int jka_roll_debug_enabled;
+/* Called with the value returned by the actual GetFixRoll branch. Never recompute it. */
+void jka_pmove_record_roll(playerState_t *ps, int mode) {
+    int rolling;
+    if (!roll_tracking) return;
+    if (ps->clientNum < 0 || ps->clientNum >= MAX_CLIENTS) return;
+    ++roll_tracking->queries;
+    rolling = BG_InRoll(ps, ps->legsAnim) || (ps->pm_flags & PMF_ROLLING);
+    if (!rolling && roll_tracking->roll_queries) return;
+    if (rolling) ++roll_tracking->roll_queries;
+    roll_tracking->mode = mode;
+    roll_tracking->client_num = ps->clientNum;
+    roll_tracking->duel_type = cg_dueltypes[ps->clientNum];
+    roll_tracking->duel_in_progress = ps->duelInProgress;
+    roll_tracking->command_time = ps->commandTime;
+    roll_tracking->legs_anim = ps->legsAnim;
+}
+void japro_player_roll_debug(const void *player, jka_roll_debug *out) {
+    *out = ((const jka_player *)player)->roll_debug;
+}
+#endif
 
 /* PM_SetPMViewAngle is OpenJK's authoritative "pmove owns the view" path.
  * Pmove may split one command into several PmoveSingle calls, so reset at the
@@ -265,7 +297,8 @@ static void install_prediction_entities(const jka_player *p) {
     for (i = 0; i < installed_count; ++i)
         memset(&cg_entities[installed_numbers[i]], 0, sizeof(cg_entities[0]));
     installed_count = 0;
-    memset(cg_dueltypes, 0, sizeof(cg_dueltypes));
+    /* Duel type is connection state, not an entity state. Clearing it
+     * when the visible entity list changes destroys the NF/FF override. */
     for (i = 0; i < p->entity_count; ++i) {
         const jka_prediction_entity *ent = &p->entities[i];
         playerState_t *ps = &remote_players[ent->number];
@@ -1236,7 +1269,17 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
                        jka_trace_fn trace, jka_contents_fn contents, void *context) {
     jka_player *p = player;
     int client;
-    if (setjmp(error_target)) return 0;
+#ifdef JKA_JAPRO
+    roll_tracking = NULL;
+    jka_roll_debug_enabled = 0;
+#endif
+    if (setjmp(error_target)) {
+#ifdef JKA_JAPRO
+        roll_tracking = NULL;
+        jka_roll_debug_enabled = 0;
+#endif
+        return 0;
+    }
     trace_callback = trace; contents_callback = contents; callback_context = context;
     client = p->ps.clientNum;
 #ifdef JKA_JAPRO
@@ -1296,7 +1339,16 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     }
     begin_foot_bolts(p);
     begin_pmove_view_tracking(p->move.ps);
+#ifdef JKA_JAPRO
+    if (settings->roll_debug) memset(&p->roll_debug, 0, sizeof(p->roll_debug));
+    roll_tracking = settings->roll_debug ? &p->roll_debug : NULL;
+    jka_roll_debug_enabled = settings->roll_debug;
+#endif
     Pmove(&p->move);
+#ifdef JKA_JAPRO
+    roll_tracking = NULL;
+    jka_roll_debug_enabled = 0;
+#endif
     p->view_forced = end_pmove_view_tracking();
     end_foot_bolts();
     clear_player_saber_info(saber_client_num);

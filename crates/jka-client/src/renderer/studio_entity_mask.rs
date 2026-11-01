@@ -4,7 +4,7 @@
 //! the source's final frame. Allocated only for an identity-aware overlap.
 use crate::renderer::{
     DynamicModelRenderer, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuVertex,
-    DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES, DEPTH_FORMAT,
+    DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES, depth_format,
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -161,7 +161,7 @@ fn pipeline(device:&wgpu::Device,layout:&wgpu::PipelineLayout,shader:&wgpu::Shad
                 format:FORMAT,blend:None,write_mask:writes
             })]}),
         depth_stencil:Some(wgpu::DepthStencilState {
-            format:DEPTH_FORMAT,depth_write_enabled:Some(false),
+            format:depth_format(),depth_write_enabled:Some(false),
             depth_compare:Some(wgpu::CompareFunction::GreaterEqual),
             stencil:Default::default(),bias:Default::default(),
         }),

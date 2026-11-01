@@ -1,7 +1,7 @@
 //! Post pipelines.
 use crate::materials::CullMode;
 use crate::renderer::{
-    depth_texture_entry, GpuVertex, RenderTargets, DEPTH_FORMAT, VERTEX_ATTRIBUTES,
+    depth_texture_entry, GpuVertex, RenderTargets, depth_format, VERTEX_ATTRIBUTES,
 };
 
 #[cfg(test)]
@@ -149,7 +149,7 @@ pub(in crate::renderer) fn create_ssao_temporal_pipeline(
     shader: &wgpu::ShaderModule,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("JKA half-resolution temporal SSAO pipeline"),
+        label: Some("JKA temporal SSAO pipeline"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
@@ -531,7 +531,7 @@ pub(in crate::renderer) fn create_cull_debug_pipeline(
         // This is intentionally an x-ray diagnostic: rejected surfaces should
         // remain visible through the geometry that caused their rejection.
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -609,7 +609,7 @@ pub(in crate::renderer) fn create_wireframe_pipeline(
         // every line pass while disabling writes leaves the existing depth
         // buffer untouched.
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -660,7 +660,7 @@ pub(in crate::renderer) fn create_cloud_shadow_opaque_pipeline(
         // NEVER write/test scene depth here: cloud attenuation is computed
         // from the independent opaque prepass, and this is a color-only blend.
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),

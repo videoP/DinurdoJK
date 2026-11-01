@@ -3,7 +3,7 @@ use crate::renderer::{
     bevy_cascade_bounds, create_shadow_receiver_bind_group, weather, GpuVertex, Mat4,
     ShadowCasterUniform, ShadowReceiverUniform, Vec3, WeatherSurfaceUniform,
     BEVY_CSM_OVERLAP_PROPORTION, BEVY_CSM_SHADOW_DEPTH_BIAS, BEVY_CSM_SHADOW_NORMAL_BIAS,
-    DEPTH_FORMAT, FALLBACK_SUN_DIRECTION, SHADOW_CASCADES, SHADOW_MAP_SIZE, VERTEX_ATTRIBUTES,
+    depth_format, FALLBACK_SUN_DIRECTION, SHADOW_CASCADES, SHADOW_MAP_SIZE, VERTEX_ATTRIBUTES,
     SunVisibilityMode, DynamicShadowsMode, Camera,
 };
 use wgpu::util::DeviceExt;
@@ -74,14 +74,14 @@ impl StaticSkySnapshot {
         size: wgpu::Extent3d { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE,
             depth_or_array_layers: SHADOW_CASCADES as u32 },
         mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let static_sky_layer_views = (0..SHADOW_CASCADES).map(|index| {
         static_sky_depth.create_view(&wgpu::TextureViewDescriptor {
             label: Some("JKA static CSM cached sky layer"),
-            format: Some(DEPTH_FORMAT), dimension: Some(wgpu::TextureViewDimension::D2),
+            format: Some(depth_format()), dimension: Some(wgpu::TextureViewDimension::D2),
             base_mip_level: 0, mip_level_count: Some(1),
             base_array_layer: index as u32, array_layer_count: Some(1),
             aspect: wgpu::TextureAspect::DepthOnly,
@@ -237,7 +237,7 @@ pub(in crate::renderer) fn create_shadow_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(if bevy_reverse_z {
                 wgpu::CompareFunction::GreaterEqual
@@ -290,7 +290,7 @@ pub(in crate::renderer) fn create_shadow_translucent_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(if bevy_reverse_z {
                 wgpu::CompareFunction::GreaterEqual
@@ -346,7 +346,7 @@ pub(in crate::renderer) fn create_sky_admission_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(if bevy_reverse_z {
                 wgpu::CompareFunction::GreaterEqual
@@ -394,7 +394,7 @@ pub(in crate::renderer) fn create_shadow_mask_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(true),
             depth_compare: Some(if bevy_reverse_z {
                 wgpu::CompareFunction::GreaterEqual
@@ -442,14 +442,14 @@ fn create_shadow_arrays(device: &wgpu::Device, size: u32) -> (
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("JKA cascaded sun shadow array view"),
-        format: Some(DEPTH_FORMAT),
+        format: Some(depth_format()),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         base_mip_level: 0,
         mip_level_count: Some(1),
@@ -462,7 +462,7 @@ fn create_shadow_arrays(device: &wgpu::Device, size: u32) -> (
         .map(|cascade| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA cascaded sun shadow layer"),
-                format: Some(DEPTH_FORMAT),
+                format: Some(depth_format()),
                 dimension: Some(wgpu::TextureViewDimension::D2),
                 base_mip_level: 0,
                 mip_level_count: Some(1),
@@ -483,14 +483,14 @@ fn create_shadow_arrays(device: &wgpu::Device, size: u32) -> (
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let sky_array_view = sky_texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("JKA cascaded shader-sun sky admission array view"),
-        format: Some(DEPTH_FORMAT),
+        format: Some(depth_format()),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         base_mip_level: 0,
         mip_level_count: Some(1),
@@ -503,7 +503,7 @@ fn create_shadow_arrays(device: &wgpu::Device, size: u32) -> (
         .map(|cascade| {
             sky_texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA cascaded shader-sun sky admission layer"),
-                format: Some(DEPTH_FORMAT),
+                format: Some(depth_format()),
                 dimension: Some(wgpu::TextureViewDimension::D2),
                 base_mip_level: 0,
                 mip_level_count: Some(1),

@@ -1274,6 +1274,9 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         // jaPRO-only field. The TaystJK backend is responsible for deciding
         // which fixes actually affect the current server/mod.
         legacy_fixes,
+        duel_client: -1,
+        duel_type: 0,
+        roll_debug: 0,
     }
 }
 
@@ -1485,10 +1488,24 @@ fn solid_entity_from_state(
 /// Solid geometry from the presented scene (for HUD/debug geometry queries).
 /// Network movement prediction must use `prediction_solid_entities` instead.
 pub fn solid_entities(entities: &[crate::cgame::PresentedEntity], physics_time: i32) -> Vec<SolidEntity> {
-    entities.iter()
-        .filter(|e| !prediction_trigger(e.entity_type) && e.state.field_i32("solid").unwrap_or(0) != 0)
-        .map(|e| solid_entity_from_state(&e.state, e.origin, e.angles, physics_time))
-        .collect()
+    let mut solids = Vec::new();
+    solid_entities_into(entities, physics_time, &mut solids);
+    solids
+}
+
+/// Same CG_BuildSolidList shape with reusable storage for high-FPS presentation
+/// probes (e.g. cg_footstepTrace 1). No allocation once capacity is sufficient.
+pub fn solid_entities_into(
+    entities: &[crate::cgame::PresentedEntity],
+    physics_time: i32,
+    solids: &mut Vec<SolidEntity>,
+) {
+    solids.clear();
+    solids.extend(
+        entities.iter()
+            .filter(|e| !prediction_trigger(e.entity_type) && e.state.field_i32("solid").unwrap_or(0) != 0)
+            .map(|e| solid_entity_from_state(&e.state, e.origin, e.angles, physics_time)),
+    );
 }
 
 /// TaystJK CG_BuildSolidList selects cg.nextSnap (unless a teleport boundary)
@@ -1756,6 +1773,17 @@ pub struct Predictor {
     last_view_error: [f32; 3],
     /// What the last replay ran with, for the `predsettings` console command.
     last_regime: Option<(PredictSettings, i32, i32)>,
+    last_duel_log: Option<(crate::cgame::PrivateDuelState, i32, i32)>,
+    roll_records: std::collections::VecDeque<RollRecord>,
+    roll_logged_cmd: i32,
+    roll_compared_snapshot: Option<i32>,
+    roll_last_native_log: Option<i32>,
+    roll_last_compare_log: Option<i32>,
+    roll_compared: u32,
+    roll_matched: u32,
+    roll_max_origin_error: f32,
+    roll_max_velocity_error: f32,
+    roll_summary_dirty: bool,
     /// `cg_groundTraceDebug`: what each new command's ground trace predicted, kept until the
     /// server's snapshot for that command time arrives and can be compared against it.
     ground_log: std::collections::VecDeque<GroundRecord>,
@@ -1766,6 +1794,15 @@ pub struct Predictor {
     diag_previous: Option<(i32, PlayerState)>,
     diag_compared: u32,
     diag_matched: u32,
+}
+
+/// First prediction of a recorded command; compared with a later server snapshot.
+#[derive(Clone, Copy)]
+struct RollRecord {
+    client: i32,
+    duel_type: i32,
+    fix_roll: i32,
+    view: jka_movement::PlayerView,
 }
 
 /// One predicted command's ground state, for `cg_groundTraceDebug`.
@@ -1839,6 +1876,8 @@ pub struct PredictionInput<'a> {
     pub provisional: Option<UserCmd>,
     /// BSP entity graph, used to identify jaPRO race movers by their actual classname.
     pub entity_graph: Option<&'a crate::entity_graph::EntityGraph>,
+    /// Connection-owned authoritative state for snap and nextSnap, respectively.
+    pub duel_states: [crate::cgame::PrivateDuelState; 2],
 }
 
 impl Predictor {
@@ -1909,7 +1948,7 @@ impl Predictor {
         };
         vec![
             format!(
-                "predsettings: backend={} server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
+                "predsettings: duel-event-v3 backend={} server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
                 settings.backend, settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
             ),
             format!("  velocity snap: {snap}"),
@@ -1923,6 +1962,8 @@ impl Predictor {
                 settings.step_slide_fix,
                 if settings.pmove_fixed == 0 { "on" } else { "off (pmove_fixed)" },
             ),
+            format!("  jaPRO private duel: client={} type={} (0=unknown/none, 1=NF, 2=FF, >2=gun)",
+                settings.duel_client, settings.duel_type),
             "  not predicted here: push triggers / jump pads, teleporter touch, item pickups (CG_TouchTriggerPrediction)".to_owned(),
         ]
     }
@@ -1983,7 +2024,7 @@ impl Predictor {
 
     /// CG_PredictPlayerState (vanilla, no vehicles).
     pub fn predict(&mut self, input: PredictionInput<'_>) -> Result<(), String> {
-        let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional, entity_graph } = input;
+        let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional, entity_graph, duel_states } = input;
         let client_num = snap.player_state.field_i32("clientNum").unwrap_or(0);
         // cg.thisFrameTeleport is raised by CG_TransitionSnapshot when the
         // playerstate teleport bit or client number changes.
@@ -2043,6 +2084,90 @@ impl Predictor {
         let base_ps = &base.player_state;
         let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
         prediction_settings.plugin_disable = settings.plugin_disable;
+        let duel = duel_states[usize::from(using_next.is_some())];
+        prediction_settings.duel_client = base_ps.field_i32("clientNum").unwrap_or(-1);
+        prediction_settings.duel_type = if prediction_settings.server_mod == 1
+            && duel.client_num == prediction_settings.duel_client { duel.duel_type } else { 0 };
+        prediction_settings.roll_debug = i32::from(settings.prediction_debug);
+        if settings.prediction_debug {
+            let key = (duel, base_ps.field_i32("duelInProgress").unwrap_or(0),
+                base_ps.field_i32("duelIndex").unwrap_or(-1));
+            if self.last_duel_log != Some(key) {
+                self.misses.push(format!(
+                    "PRED-DUEL v3 snap={} base={} client={} active={} opponent={} type={} source={} eventSnap={} sourceEntity={} raw={} id={} external={}/{} eventSequence={}",
+                    snap.message_num, base.message_num, prediction_settings.duel_client, key.1, key.2,
+                    prediction_settings.duel_type, duel.source, duel.message_num, duel.source_entity,
+                    duel.raw_event, duel.raw_event & !0x300,
+                    base_ps.field_i32("externalEvent").unwrap_or(0),
+                    base_ps.field_i32("externalEventParm").unwrap_or(0),
+                    base_ps.field_i32("eventSequence").unwrap_or(0),
+                ));
+                self.last_duel_log = Some(key);
+            }
+            if self.roll_compared_snapshot != Some(base.message_num) {
+                self.roll_compared_snapshot = Some(base.message_num);
+                let cmd_time = base_ps.field_i32("commandTime").unwrap_or(0);
+                if let Some(record) = self.roll_records.iter().find(|r| r.client == prediction_settings.duel_client
+                    && r.view.command_time == cmd_time).copied()
+                {
+                    let delta = |name: &str, predicted: f32| predicted - base_ps.field_f32(name).unwrap_or(0.0);
+                    let origin_delta = std::array::from_fn::<_, 3, _>(|axis|
+                        delta(&format!("origin[{axis}]"), record.view.origin[axis]));
+                    let velocity_delta = std::array::from_fn::<_, 3, _>(|axis|
+                        delta(&format!("velocity[{axis}]"), record.view.velocity[axis]));
+                    let magnitude = |v: [f32; 3]| v.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let distance = magnitude(origin_delta);
+                    let velocity_error = magnitude(velocity_delta);
+                    let matched = distance < 0.01 && velocity_error < 0.01
+                        && record.view.ground_entity == base_ps.field_i32("groundEntityNum").unwrap_or(-1)
+                        && record.view.pm_flags == base_ps.field_i32("pm_flags").unwrap_or(0)
+                        && record.view.pm_time == base_ps.field_i32("pm_time").unwrap_or(0)
+                        && record.view.legs_anim == base_ps.field_i32("legsAnim").unwrap_or(0);
+                    self.roll_compared += 1;
+                    self.roll_matched += u32::from(matched);
+                    self.roll_max_origin_error = self.roll_max_origin_error.max(distance);
+                    self.roll_max_velocity_error = self.roll_max_velocity_error.max(velocity_error);
+                    self.roll_summary_dirty = true;
+                    if self.roll_last_compare_log.is_none_or(|last| time - last >= 250 || time < last) {
+                        self.roll_last_compare_log = Some(time);
+                        self.roll_summary_dirty = false;
+                        self.misses.push(format!(
+                            "PRED-ROLL-SERVER cmd={} snap={} type={} nativeMode={} match={} originDelta={:?} velocityDelta={:?} legs={}/{} ground={}/{} flags={:#x}/{:#x} timer={}/{} total={}/{} maxOrigin={:.3} maxVelocity={:.3}",
+                            cmd_time, base.message_num, record.duel_type, record.fix_roll, matched,
+                            origin_delta, velocity_delta, record.view.legs_anim, base_ps.field_i32("legsAnim").unwrap_or(0),
+                            record.view.ground_entity, base_ps.field_i32("groundEntityNum").unwrap_or(-1),
+                            record.view.pm_flags, base_ps.field_i32("pm_flags").unwrap_or(0),
+                            record.view.pm_time, base_ps.field_i32("pm_time").unwrap_or(0),
+                            self.roll_matched, self.roll_compared, self.roll_max_origin_error, self.roll_max_velocity_error,
+                        ));
+                    }
+                }
+                while self.roll_records.front().is_some_and(|r| r.view.command_time <= cmd_time) {
+                    self.roll_records.pop_front();
+                }
+            }
+            // Report late samples even if the roll ends before the next rate-limit window.
+            if self.roll_summary_dirty && self.roll_last_compare_log.is_none_or(|last| time - last >= 250 || time < last) {
+                self.roll_last_compare_log = Some(time);
+                self.roll_summary_dirty = false;
+                self.misses.push(format!(
+                    "PRED-ROLL-SUMMARY matched={}/{} maxOrigin={:.3} maxVelocity={:.3}",
+                    self.roll_matched, self.roll_compared, self.roll_max_origin_error, self.roll_max_velocity_error,
+                ));
+            }
+        } else {
+            self.last_duel_log = None;
+            self.roll_records.clear();
+            self.roll_logged_cmd = 0;
+            self.roll_compared_snapshot = None;
+            self.roll_last_native_log = None;
+            self.roll_last_compare_log = None;
+            self.roll_compared = 0;
+            self.roll_matched = 0;
+            self.roll_max_origin_error = 0.0;
+            self.roll_max_velocity_error = 0.0;
+            self.roll_summary_dirty = false;
+        }
         // Pmove is always TaystJK-derived; server-specific rules remain in
         // prediction_settings (server_mod, cinfo, jcinfo, legacy_fixes, etc.).
         let regime = (prediction_settings, base_ps.stats[STAT_RACEMODE], base_ps.stats[STAT_MOVEMENTSTYLE]);
@@ -2050,7 +2175,7 @@ impl Predictor {
             // This is diagnostic context, not normal gameplay output. Keep it visible when the
             // dedicated prediction diagnostics are enabled, or under the global verbose gate.
             let line = format!(
-                "PRED-SETTINGS backend={} pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} base_snapshot={} cmdtime={}",
+                "PRED-SETTINGS backend={} pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} duel_type={} base_snapshot={} cmdtime={}",
                 if prediction_settings.backend == 1 { "TaystJK" } else { "stock" },
                 prediction_settings.pmove_fixed,
                 prediction_settings.pmove_float,
@@ -2061,6 +2186,7 @@ impl Predictor {
                 regime.1,
                 regime.2,
                 prediction_settings.jcinfo,
+                prediction_settings.duel_type,
                 base.message_num,
                 base_ps.field_i32("commandTime").unwrap_or(0),
             );
@@ -2200,6 +2326,25 @@ impl Predictor {
             }
             movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
             let native_view = native.view();
+            // Only the first prediction of a sent command is evidence. Replays and
+            // the unsent render command must never replace this baseline.
+            if settings.prediction_debug && number > self.roll_logged_cmd {
+                self.roll_logged_cmd = number;
+                let roll = native.roll_prediction_debug();
+                if roll.roll_queries > 0 {
+                    self.roll_records.push_back(RollRecord { client: roll.client_num,
+                        duel_type: roll.duel_type, fix_roll: roll.mode, view: native_view });
+                    while self.roll_records.len() > 512 { self.roll_records.pop_front(); }
+                    if self.roll_last_native_log.is_none_or(|last| cmd.server_time - last >= 250 || cmd.server_time < last) {
+                        self.roll_last_native_log = Some(cmd.server_time);
+                        self.misses.push(format!(
+                            "PRED-ROLL-NATIVE cmd={} branchTime={} mode={} client={} type={} active={} legs={} queries={} rollQueries={}",
+                            native_view.command_time, roll.command_time, roll.mode, roll.client_num,
+                            roll.duel_type, roll.duel_in_progress, roll.legs_anim, roll.queries, roll.roll_queries,
+                        ));
+                    }
+                }
+            }
             if record_ground {
                 self.ground_logged_cmd = number;
                 let record = GroundRecord {
@@ -2927,6 +3072,7 @@ mod tests {
                         settings: &settings,
                         provisional,
                         entity_graph: None,
+                        duel_states: [crate::cgame::PrivateDuelState::default(); 2],
                     })
                     .unwrap();
                 predictions += 1;

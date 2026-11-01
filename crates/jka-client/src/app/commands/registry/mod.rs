@@ -193,6 +193,7 @@ pub(crate) mod hud;
 mod hud_commands;
 pub(crate) mod hud_layout_cvars;
 pub(crate) mod japro_cvars;
+pub(crate) mod killfeed_cvars;
 pub(crate) mod jiggle_cvars;
 pub(crate) mod jiggle_bounds_cvars;
 pub(crate) mod anny_cvars;
@@ -202,6 +203,7 @@ pub(crate) mod movement_cvars;
 pub(crate) mod network_cvars;
 pub(crate) mod filesystem_cvars;
 pub(crate) mod ocean_cvars;
+pub(crate) mod river_cvars;
 pub(crate) mod physics_cvars;
 pub(crate) mod postprocess_cvars;
 pub(crate) mod presentation_cvars;
@@ -209,6 +211,7 @@ pub(crate) mod race_ghost_cvars;
 pub(crate) mod renderer_cvars;
 pub(crate) mod patch_cvars;
 pub(crate) mod weather_cvars;
+pub(crate) mod vote_prewarm_cvars;
 
 pub(crate) struct CommandRegistry {
     definitions: Vec<&'static CommandDef>,
@@ -277,6 +280,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(movement_cvars::DEFINITIONS.iter());
         definitions.extend(race_ghost_cvars::DEFINITIONS.iter());
         definitions.extend(network_cvars::DEFINITIONS.iter());
+        definitions.extend(vote_prewarm_cvars::DEFINITIONS.iter());
         definitions.extend(filesystem_cvars::DEFINITIONS.iter());
         definitions.extend(japro_cvars::DEFINITIONS.iter());
         definitions.extend(postprocess_cvars::DEFINITIONS.iter());
@@ -287,6 +291,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(cloud_cvars::DEFINITIONS.iter());
         definitions.extend(weather_cvars::DEFINITIONS.iter());
         definitions.extend(ocean_cvars::DEFINITIONS.iter());
+        definitions.extend(river_cvars::DEFINITIONS.iter());
         definitions.extend(renderer_cvars::DEFINITIONS.iter());
         definitions.extend(patch_cvars::DEFINITIONS.iter());
         definitions.extend(physics_cvars::DEFINITIONS.iter());
@@ -294,6 +299,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(jiggle_cvars::DEFINITIONS.iter());
         definitions.extend(jiggle_bounds_cvars::DEFINITIONS.iter());
         definitions.extend(anny_cvars::DEFINITIONS.iter());
+        definitions.extend(killfeed_cvars::DEFINITIONS.iter());
         definitions
     })
 }

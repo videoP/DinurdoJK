@@ -45,7 +45,7 @@ pub(crate) use shader_remap::{
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
 use collision::bsp_physics_collision_mesh;
-pub use collision::prepare_physics_collision;
+pub use collision::{prepare_physics_collision, river_collision_triangles};
 pub use coordinates::{jka_position, render_position};
 pub use entities::SkyPortal;
 pub(crate) use entities::{append_authored_ocean_planes, bsp_brush_entities};
@@ -282,6 +282,9 @@ pub const REFLECTION_CACHE_PLANAR: u8 = 1 << 2;
 #[derive(Debug, Clone)]
 pub struct DrawBatch {
     pub vertices: Range<u32>,
+    /// First prepared stage of an authored surface. Competitive mode keeps this
+    /// stage and omits siblings without altering the saved prepared material.
+    pub competitive_primary_stage: bool,
     /// Exact BSP shader-table index that produced this draw. Kept only as
     /// developer/debug metadata so the surface inspector never has to infer a
     /// material from the stage texture name.
@@ -291,6 +294,8 @@ pub struct DrawBatch {
     /// Two packed u32s keep this developer metadata to 8 bytes per draw batch.
     pub material_debug_index: u32,
     pub surface_material: u8,
+    /// Only render with Force Seeing; also isolates AUTO/PVS merged batches.
+    pub force_sight_only: bool,
     pub thermal_lava: bool,
     pub thermal_emission: u8,
     /// This *stage*, not the whole surface, has additive/screen emission.
@@ -683,6 +688,30 @@ impl MapSource {
             Self::MapFile(path) | Self::MapEditPreview { path, .. } => path.display().to_string(),
         }
     }
+}
+
+/// Fast path for a completed vote prewarm. Called ONLY on the map-loader
+/// thread, after the server has sent its authoritative map request. This
+/// validates both the complete asset namespace and the actual BSP bytes.
+/// A mismatch uses normal seeded preparation (including stage fingerprints).
+pub(crate) fn vote_prepared_map_still_current(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    options: MapPrepareOptions,
+    prepared: &PreparedMap,
+) -> Result<bool, String> {
+    let MapSource::Bsp(name) = source else { return Ok(false) };
+    let Some(index_at_vote) = prepared.vote_prepared_vfs.as_ref() else { return Ok(false) };
+    if !prepared.sub_bsp_names.is_empty() || prepared.map_hash == 0 { return Ok(false) }
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|e| e.to_string())?;
+    assets.set_allow_asset_overrides(options.allow_asset_overrides);
+    if &assets.index_token() != index_at_vote { return Ok(false) }
+    let asset_name = map_asset_name(name, "bsp")?;
+    let Some(asset) = assets.read(&asset_name, MAX_FILE_BYTES).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    Ok(map_content_hash(&asset.bytes) == prepared.map_hash)
 }
 
 pub fn verify_map_source_exists(
@@ -1710,6 +1739,10 @@ pub struct PreparedMap {
     pub material_debug: MaterialDebugInfo,
     /// Content hash of the BSP this was prepared from (0 for source `.map` worlds).
     pub map_hash: u64,
+    /// Snapshot of the asset namespace used by a speculative vote preparation.
+    /// Never set for normal map loads; a changed PK3/loose-file index rejects
+    /// whole-map adoption even when the BSP bytes themselves are identical.
+    pub vote_prepared_vfs: Option<jka_assets::pk3::VfsIndexToken>,
     /// Inputs of the reusable stages, for the next preparation of this map.
     pub stage_keys: PrepStageKeys,
     /// Per-texture decode hashes aligned with `textures` (0 = not a plain decode).

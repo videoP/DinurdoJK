@@ -46,7 +46,7 @@ impl App {
     fn trace_window_body(&mut self, ui: &mut egui::Ui, actions: &mut Vec<TraceAction>) {
         let entries_len = self.trace_menu_entries.len();
         ui.horizontal(|ui| {
-            theme::label(ui, theme::plain(&format!("{entries_len} traced"), 11.5, theme::TEXT_FAINT));
+            theme::label(ui, theme::plain(&format!("{entries_len} traced"), 11.5, theme::TEXT_FAINT()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::ghost_button(ui, "CLEAR").clicked() {
                     actions.push(TraceAction::Clear);
@@ -55,7 +55,7 @@ impl App {
         });
         if entries_len == 0 {
             ui.add_space(4.0);
-            wrapped(ui, "Aim at something and press the trace key to add it here.", theme::TEXT_FAINT);
+            wrapped(ui, "Aim at something and press the trace key to add it here.", theme::TEXT_FAINT());
             return;
         }
         ui.add_space(4.0);
@@ -80,7 +80,7 @@ impl App {
         ui.add_space(6.0);
 
         let entry = &self.trace_menu_entries[selected];
-        theme::label(ui, theme::plain(&entry.title, 15.0, theme::TEXT));
+        theme::label(ui, theme::plain(&entry.title, 15.0, theme::TEXT()));
         ui.add_space(6.0);
 
         let can_act = self.local_server.is_some();
@@ -109,9 +109,9 @@ impl App {
             }
         });
         if !can_act {
-            wrapped(ui, "TELEPORT TO / USE need a local game (solo map).", theme::TEXT_FAINT);
+            wrapped(ui, "TELEPORT TO / USE need a local game (solo map).", theme::TEXT_FAINT());
         } else if entity_num.is_none() {
-            wrapped(ui, "This trace didn't hit a live entity (bare world geometry).", theme::TEXT_FAINT);
+            wrapped(ui, "This trace didn't hit a live entity (bare world geometry).", theme::TEXT_FAINT());
         }
         ui.add_space(6.0);
         ui.separator();
@@ -127,7 +127,7 @@ impl App {
                     ui.add_space(8.0);
                 }
                 for section in &entry.sections {
-                    theme::label(ui, theme::plain(&section.title, 10.5, theme::TEXT_FAINT));
+                    theme::label(ui, theme::plain(&section.title, 10.5, theme::TEXT_FAINT()));
                     if section.title == "SHADER SCRIPT" {
                         let script = section.lines.join("\n");
                         ui.add(
@@ -135,14 +135,14 @@ impl App {
                                 egui::RichText::new(script)
                                     .monospace()
                                     .size(11.5)
-                                    .color(theme::TEXT),
+                                    .color(theme::TEXT()),
                             )
                             .wrap()
                             .selectable(true),
                         );
                     } else {
                         for line in &section.lines {
-                            wrapped(ui, line, theme::TEXT);
+                            wrapped(ui, line, theme::TEXT());
                         }
                     }
                     ui.add_space(8.0);

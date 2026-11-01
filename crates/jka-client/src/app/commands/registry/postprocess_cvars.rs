@@ -998,6 +998,44 @@ app_cvars! {
         ]
     }
 
+    APP_R_SSAORESOLUTION {
+        runtime: CvarDef::new(
+                "r_ssaoResolution", "", "0..1",
+                "Realtime SSAO render resolution: 0 half width/height (default), 1 full resolution. Used only while r_ssao is enabled.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_ssaoresolution(app)),
+                |app, value| App::cvar_set_r_ssaoresolution(app, APP_R_SSAORESOLUTION.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_r_ssaoresolution, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(resolution) = value.trim().parse::<u8>() {
+                    if resolution <= 1 { settings.ssao_resolution = resolution; }
+                }
+            }),
+            archive: Some((44, |state| state.video.ssao_resolution.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ssaoresolution(&self) -> String {
+                    self.video.ssao_resolution.to_string()
+                }
+                fn cvar_set_r_ssaoresolution(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let resolution = value.trim().parse::<u8>()
+                        .map_err(|_| format!("{name}: expected 0 (half) or 1 (full)"))?;
+                    if resolution > 1 {
+                        return Err(format!("{name}: expected 0 (half) or 1 (full)"));
+                    }
+                    self.video.ssao_resolution = resolution;
+                    if self.video.ssao { self.sync_post_effects(); }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_STATICBSPAO {
         runtime: CvarDef::new(
                 "r_staticBspAo",

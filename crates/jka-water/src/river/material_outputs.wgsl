@@ -11,7 +11,13 @@ struct Settings { dimensions:vec2<u32>, inverse_size:vec2<f32> }
 fn write_fields(@builtin(global_invocation_id) id:vec3<u32>) {
     if any(id.xy>=settings.dimensions) { return; }
     let index=id.x+id.y*settings.dimensions.x;
-    textureStore(surface_out,id.xy,raw_surface[index]);
+    // F32 solver heights can be far outside the representable RGBA16Float
+    // range for dry cells over deep map voids. Saturate the *render-only*
+    // height before conversion; do not change hydraulic buffers or wet depth.
+    // Prevents +/-Infinity from entering vertex displacement on the dry mesh.
+    var render_surface = raw_surface[index];
+    render_surface.x = clamp(render_surface.x, -65500.0, 65500.0);
+    textureStore(surface_out,id.xy,render_surface);
     textureStore(normals_grid_out,id.xy,raw_normals[index]);
 }
 @group(0) @binding(5) var normals_grid:texture_2d<f32>;

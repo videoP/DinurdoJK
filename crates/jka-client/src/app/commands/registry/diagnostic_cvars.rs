@@ -6,6 +6,16 @@ use crate::{
     },
 };
 pub(super) const CVARS: &[CvarDef<App>] = &[
+CvarDef::new("r_riverDebug", "0", "0|1|2", "Live riversource diagnostics: 0 off, 1 one-second solver/draw status, 2 detailed spawn geometry and CPU encoding timings. Session-only; no GPU readbacks or stalls.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::river_runtime::debug_mode() as i32), |app, value| {
+    let CvarValue::Int(mode) = value else { unreachable!() };
+    crate::river_runtime::set_debug_mode(mode as u8);
+    app.push_console_line(format!("^3r_riverDebug:^7 {}", match mode {
+        0 => "OFF",
+        1 => "ON (river progress and draw eligibility every second)",
+        _ => "VERBOSE (plus source bed geometry and CPU encode timings; no GPU stalls)",
+    }));
+    Ok(())
+}),
 CvarDef::new("cm_collisionMerge", "0", "0|1", "Experimental collision union: 0 exact OpenJK BSP collision, 1 merge perfectly flush solid box brushes at map load. Live A/B switch; affects local movement prediction and may differ from vanilla servers.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_movement::collision_merge_enabled()), |app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     jka_movement::set_collision_merge_enabled(enabled);

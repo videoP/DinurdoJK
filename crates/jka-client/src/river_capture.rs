@@ -129,6 +129,97 @@ impl BspCapture {
         Ok(Self { positions, groups })
     }
 
+    /// Generic riverbed: the map's collision geometry
+    /// (`jka_assets::bsp::river::collision_triangles`) as two-sided Landscape,
+    /// limited to triangles overlapping the capture rectangle (`half_extent`,
+    /// map units, around `origin_map_units`). Sky is excluded upstream; any
+    /// roof or overhang over the water is captured as ground (the native
+    /// bridge rule applies only to Actors).
+    pub fn from_collision(
+        triangles: &[[[f32; 3]; 3]],
+        origin_map_units: [f32; 3],
+        half_extent: [f32; 2],
+    ) -> Result<Self, String> {
+        Self::capture_collision(triangles.iter().map(|t| (t, None)), origin_map_units, half_extent, None)
+    }
+
+    /// Keep grounded solid obstacles that intersect the water, while dropping
+    /// overhead brushes and clipping terrain without brush thickness.
+    pub fn from_collision_for_source(
+        surfaces: &[jka_assets::bsp::river::CollisionSurface],
+        origin_map_units: [f32; 3],
+        half_extent: [f32; 2],
+        water_level: f32,
+    ) -> Result<Self, String> {
+        if !water_level.is_finite() { return Err("invalid river capture water level".into()); }
+        Self::capture_collision(surfaces.iter().map(|s| (&s.triangle, s.solid_bottom_z)), origin_map_units, half_extent, Some(water_level))
+    }
+
+    fn capture_collision<'a>(
+        triangles: impl IntoIterator<Item = (&'a [[f32; 3]; 3], Option<f32>)>,
+        origin_map_units: [f32; 3],
+        half_extent: [f32; 2],
+        water_level: Option<f32>,
+    ) -> Result<Self, String> {
+        if origin_map_units.iter().chain(&half_extent).any(|v| !v.is_finite())
+            || half_extent.iter().any(|v| *v <= 0.0)
+        {
+            return Err("invalid river collision capture origin or extent".into());
+        }
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for (t, solid_bottom_z) in triangles {
+            let outside = (0..2).any(|a| {
+                let lo = t.iter().map(|p| p[a]).fold(f32::INFINITY, f32::min);
+                let hi = t.iter().map(|p| p[a]).fold(f32::NEG_INFINITY, f32::max);
+                hi < origin_map_units[a] - half_extent[a] || lo > origin_map_units[a] + half_extent[a]
+            });
+            if outside {
+                continue;
+            }
+            let mut polygon = [[0.0f32; 3]; 4];
+            let count = if let Some(level) = water_level {
+                if solid_bottom_z.is_some_and(|bottom| bottom > level) { continue; }
+                if solid_bottom_z.is_some() { polygon[..3].copy_from_slice(t); 3 }
+                else {
+                    let mut count = 0;
+                    let mut previous = t[2];
+                    for &current in t {
+                        let prev_inside = previous[2] <= level;
+                        let curr_inside = current[2] <= level;
+                        if prev_inside != curr_inside {
+                            let frac = (level - previous[2]) / (current[2] - previous[2]);
+                            let mut p = std::array::from_fn(|a| previous[a] + frac * (current[a] - previous[a]));
+                            p[2] = level; polygon[count] = p; count += 1;
+                        }
+                        if curr_inside { polygon[count] = current; count += 1; }
+                        previous = current;
+                    }
+                    count
+                }
+            } else { polygon[..3].copy_from_slice(t); 3 };
+            for k in 2..count {
+                for p in [polygon[0], polygon[k - 1], polygon[k]] {
+                let converted = std::array::from_fn::<_, 3, _>(|axis| {
+                    (p[axis] - origin_map_units[axis]) * CENTIMETRES_PER_MAP_UNIT
+                });
+                if converted.iter().any(|v| !v.is_finite()) {
+                    return Err("nonfinite river collision vertex".into());
+                }
+                indices.push(u32::try_from(positions.len()).map_err(|_| "too many river capture vertices")?);
+                positions.push(converted);
+                }
+            }
+        }
+        if positions.is_empty() {
+            return Err(if water_level.is_some() { "no collision geometry in the river capture area near or below the water" } else { "no collision geometry inside the river capture area" }.into());
+        }
+        Ok(Self {
+            positions,
+            groups: vec![(MeshClass::Landscape, Sides::TwoSided, indices)],
+        })
+    }
+
     pub fn meshes(&self) -> Vec<Mesh<'_>> {
         self.groups
             .iter()

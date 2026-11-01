@@ -945,6 +945,15 @@ fn ssao_factor(pixel: vec2<i32>, centre_depth: f32) -> f32 {
     let full_viewport = max(settings.aa.yz, vec2<f32>(1.0));
     let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / full_viewport;
     let history_dims_u = textureDimensions(ssao_history_texture);
+    // Full-resolution realtime AO requires no spatial upsampling. One texel
+    // per scene pixel: use a single fetch rather than four bilateral taps.
+    if (all(history_dims_u == vec2<u32>(u32(full_viewport.x), u32(full_viewport.y)))) {
+        let sample_value = textureLoad(ssao_history_texture, pixel, 0);
+        if (!valid_depth(sample_value.g)) {
+            return 1.0;
+        }
+        return clamp(sample_value.r, 0.0, 1.0);
+    }
     let history_dims = vec2<f32>(f32(history_dims_u.x), f32(history_dims_u.y));
     let history_coord = uv * history_dims - vec2<f32>(0.5);
     let base = vec2<i32>(floor(history_coord));

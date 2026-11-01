@@ -76,13 +76,22 @@ mod media_mp4;
 mod model_frame_log;
 mod net;
 mod neon_menu;
+mod palette;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;
 mod river_capture;
+mod river_foam;
 mod river_gpu;
 mod river_grid_mesh;
 mod river_material;
+mod river_runtime;
+mod river_authoring;
+mod river_discharge;
+mod river_settings;
+mod river_composite;
+mod river_surface;
+mod river_slw;
 mod river_ocean;
 mod river_map;
 mod river_water_info;
@@ -91,6 +100,7 @@ mod river_water_info_capture;
 mod river_port_tests;
 mod blue_water_environment;
 mod player;
+mod protocol_link;
 mod pipeline_cache;
 mod pipeline_jobs;
 mod pure;
@@ -247,6 +257,12 @@ impl Options {
                 }
                 "--game" => options.game = Some(args.next().ok_or("--game needs a directory name")?),
                 "--validate-map" => options.validate = true,
+                // Browsers deliver the entire URL as one positional argument.
+                // Parse it before the generic OpenJK +command argument collector.
+                url if url.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("jka:")) => {
+                    let target = protocol_link::parse_jka_url(url)?;
+                    options.startup_commands.push(format!("connect {target}"));
+                }
                 "--console" => {}, // Kept as a harmless compatibility flag; native console stays enabled.
                 command if command.starts_with('+') && command.len() > 1 => {
                     options.startup_commands.push(command[1..].to_owned());
@@ -284,7 +300,7 @@ impl Options {
                 }
                 _ => {
                     return Err(
-                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [--console] [screenshot.jpg] [demo.dm_26] [+command args ...]"
+                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [--console] [jka://host[:port]] [screenshot.jpg] [demo.dm_26] [+command args ...] (Windows: --register-jka-protocol / --unregister-jka-protocol)"
                             .into(),
                     )
                 }
@@ -331,6 +347,9 @@ fn is_demo_path(path: &std::path::Path) -> bool {
 
 fn main() -> std::process::ExitCode {
     crate::startup_timeline::start();
+    if let Some(code) = protocol_link::registration_cli_entry() {
+        return std::process::ExitCode::from(code as u8);
+    }
     if let Some(code) = updater::helper_entry() {
         return std::process::ExitCode::from(code as u8);
     }

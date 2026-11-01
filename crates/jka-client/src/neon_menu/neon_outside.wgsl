@@ -6,7 +6,8 @@ struct Outside {
     // x = scene is gamma-encoded (UNORM swapchain), y = seconds,
     // z = halo strength, w = grade strength
     control: vec4<f32>,
-    // x = scene exposure, y = halo levels, z = cached still strength
+    // x = scene exposure, y = halo levels, z = still strength,
+    // w = 1 when a cached photo is resident (otherwise still is black)
     tone: vec4<f32>,
     // xy = centre-crop UV scale (matching egui Cover) for the cached image
     cache_uv: vec4<f32>,
@@ -71,9 +72,12 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
         base = srgb_to_linear(base);
     }
     if (outside.tone.z > 0.0) {
-        let cache_uv = (in.uv - vec2<f32>(0.5)) * outside.cache_uv.xy + vec2<f32>(0.5);
-        // Rgba8UnormSrgb is decoded to linear automatically by the sampler.
-        let still = textureSampleLevel(cached_scene, linear_sampler, cache_uv, 0.0).rgb;
+        var still = vec3<f32>(0.0);
+        if (outside.tone.w > 0.5) {
+            let cache_uv = (in.uv - vec2<f32>(0.5)) * outside.cache_uv.xy + vec2<f32>(0.5);
+            // Rgba8UnormSrgb is decoded to linear automatically by the sampler.
+            still = textureSampleLevel(cached_scene, linear_sampler, cache_uv, 0.0).rgb;
+        }
         base = mix(base, still, outside.tone.z);
     }
     var graded = mix(base, night_grade(base), outside.control.w);

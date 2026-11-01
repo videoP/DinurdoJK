@@ -24,6 +24,8 @@ impl App {
         browser_hint: Option<(&str, &str)>,
     ) {
         self.leave_render_studio_for_launch();
+        self.cancel_vote_map_prewarm();
+        self.vote_map_candidate = None;
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
         }
@@ -185,6 +187,7 @@ impl App {
             net.pump()
         };
         self.poll_live_cgame_prep();
+        self.observe_live_map_vote();
         let mut sub_bsps_changed = false;
         for event in events {
             if let jka_protocol::session::SessionEvent::ServerCommand(command) = &event {
@@ -384,6 +387,15 @@ impl App {
             }
             SessionEvent::ServerInfo(info) => self.handle_live_server_info(info),
             SessionEvent::Print(text) => {
+                if self.vote_map_preload_mode == 3
+                    && String::from_utf8_lossy(&text).to_ascii_lowercase().contains("vote")
+                {
+                    self.push_console_line(format!(
+                        "[VOTE PREWARM DBG] SessionEvent::Print (not reliable ServerCommand) raw={:?}",
+                        String::from_utf8_lossy(&text),
+                    ));
+                    self.trace_vote_map_network_state("SessionEvent::Print");
+                }
                 let text = self.translate_server_text(&text);
                 for line in text.lines().filter(|line| !line.is_empty()) {
                     self.push_console_line(line.to_owned());
@@ -406,6 +418,42 @@ impl App {
                 self.start_live_gamestate();
             }
             SessionEvent::ServerCommand(command) => {
+                self.observe_live_map_vote_command(&command.text);
+                if self.vote_map_preload_mode == 3 {
+                    let raw = String::from_utf8_lossy(&command.text);
+                    let tokens: Vec<&str> = raw.split_ascii_whitespace().take(3).collect();
+                    let vote_cs = tokens.first().is_some_and(|v| v.eq_ignore_ascii_case("cs"))
+                        && tokens.get(1).is_some_and(|v| matches!(*v, "8" | "9" | "10" | "11"));
+                    let vote_bcs = tokens.first().is_some_and(|v| v.starts_with("bcs"))
+                        && tokens.get(1).is_some_and(|v| matches!(*v, "8" | "9"));
+                    let vote_print = raw.to_ascii_lowercase().contains("vote passed")
+                        || raw.to_ascii_lowercase().contains("vote succeeded");
+                    // Localized `print` payloads won't necessarily contain
+                    // English "Vote passed" on the wire. Trace them while a
+                    // direct vote is active so the first failing boundary is
+                    // visible without dumping unrelated gameplay traffic.
+                    let print_during_map_vote = self.vote_map_candidate.is_some()
+                        && tokens.first().is_some_and(|v| v.eq_ignore_ascii_case("print"));
+                    if vote_cs || vote_bcs || vote_print || print_during_map_vote {
+                        self.push_console_line(format!(
+                            "[VOTE PREWARM DBG] reliable seq={} raw={raw:?} pass_recognized={} print_map={:?}",
+                            command.sequence, crate::vote::is_passed_vote_print(&command.text),
+                            crate::vote::passed_vote_map(&command.text),
+                        ));
+                        self.trace_vote_map_network_state("reliable vote command");
+                    }
+                }
+                self.observe_live_map_vote();
+                if crate::vote::is_passed_vote_print(&command.text) {
+                    self.on_live_map_vote_passed(&command.text);
+                } else if self.vote_map_preload_mode != 0
+                    && String::from_utf8_lossy(&command.text).to_ascii_lowercase().contains("vote passed")
+                {
+                    self.push_console_line(format!(
+                        "[VOTE PREWARM DBG] vote-pass-looking text was NOT accepted as authoritative print: {:?}",
+                        String::from_utf8_lossy(&command.text),
+                    ));
+                }
                 if command.text.split(|byte| byte.is_ascii_whitespace()).next() == Some(b"map_restart".as_slice()) {
                     self.reset_remote_emotes();
                 }
@@ -728,6 +776,7 @@ impl App {
                 .player_presenter
                 .set_saber_staff_multi_color(self.saber_staff_multi_color);
             session.weapon_fx.set_saber_trail(self.saber_trail);
+            session.player_presenter.set_speed_trail(self.speed_trail);
             session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             session.weapon_fx.set_fx_physics(self.video.fx_physics);

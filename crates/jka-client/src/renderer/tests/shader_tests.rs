@@ -304,7 +304,7 @@ fn rt_isolation_world_gpu_pipelines() {
                             },
                             primitive: Default::default(),
                             depth_stencil: Some(wgpu::DepthStencilState {
-                                format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                                format: depth_format(), depth_write_enabled: Some(true),
                                 depth_compare: Some(camera_depth_compare()),
                                 stencil: Default::default(), bias: Default::default(),
                             }),
@@ -1596,7 +1596,7 @@ fn entity_shadow_pass_writes_caster_depth() {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: DEPTH_FORMAT,
+                format: depth_format(),
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });

@@ -242,6 +242,8 @@ pub struct JaproCgame {
     pub drain_fx: u8,
     /// TaystJK screen-copy effects: refractive cloak and Force push/pull.
     pub render_to_texture_fx: u8,
+    /// 0 = TaystJK UV-capture mesh, 1 = cinematic screen-space Push/Pull shockwave.
+    pub force_push_distortion: u8,
     /// jaPRO cg_thirdPersonFlagAlpha: opacity of the viewer's carried flag.
     pub third_person_flag_alpha: f32,
 }
@@ -266,6 +268,7 @@ impl Default for JaproCgame {
             lagometer: crate::lagometer::Settings::default(),
             drain_fx: 2,
             render_to_texture_fx: 1,
+            force_push_distortion: 1,
             third_person_flag_alpha: 1.0,
         }
     }
@@ -1012,6 +1015,21 @@ mod tests {
         assert!(text.contains("seta cg_stylePlayer \"260\""));
         assert!(text.contains("seta cg_lagometer \"4\"") && text.contains("seta cg_lagometerX \"60\""));
         assert!(text.contains("seta cg_drainFX \"2\""));
+    }
+
+    #[test]
+    fn cinematic_force_push_is_independent_of_cloak_modes_and_archived() {
+        let mut settings = JaproCgame::default();
+        assert_eq!(settings.force_push_distortion, 1);
+        settings.set_cvar("cg_forcePushDistortion", "0").unwrap().unwrap();
+        settings.set_cvar("cg_renderToTextureFX", "5").unwrap().unwrap();
+        assert_eq!(settings.force_push_distortion, 0);
+        assert_eq!(settings.render_to_texture_fx, 5);
+        assert!(settings.set_cvar("cg_forcePushDistortion", "2").unwrap().is_err());
+        assert_eq!(settings.force_push_distortion, 0);
+        let mut cfg = String::new();
+        settings.write_cfg(&mut cfg);
+        assert!(cfg.contains("seta cg_forcePushDistortion \"0\""));
     }
 
     #[test]

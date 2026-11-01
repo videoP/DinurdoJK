@@ -2943,7 +2943,7 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
 // A change of d in alpha moves the result by d * |fog - scene|. The scene pixel
 // is unknown here, so assume a typical dark-ish scene luminance and size d so
 // the result moves by about one 8-bit sRGB code step (the same linear LSB
-// model post_fast.wgsl uses). One scalar offset keeps neutral fog hues.
+// model presentation shader uses). One scalar offset keeps neutral fog hues.
 fn legacy_fog_dither_alpha(fog: vec4<f32>, pixel_position: vec2<f32>) -> vec4<f32> {
     if (fog.a <= 0.0 || fog.a >= 1.0) {
         return fog;
@@ -4521,6 +4521,12 @@ fn classic_three_stage_rgb(input: VertexOut, shaded_base: vec4<f32>) -> vec4<f32
 }
 
 @fragment fn fs_legacy_srgb_three_stage(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (3u << 24u)) != 0u) {
+        return competitive_one_stage(input.uv);
+    }
+    if ((camera.render_flags.y & (1u << 23u)) != 0u) {
+        return competitive_one_stage_lit(input.uv, input.lightmap_uv, input.color);
+    }
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(),
         input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) {
@@ -4695,12 +4701,18 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
 
 
 @fragment fn fs_additive_fused2(input: AdditiveVertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (3u << 24u)) != 0u) {
+        return competitive_one_stage(input.uv);
+    }
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(),
         input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) { discard; }
     return additive_fused_contributions(input, 2u);
 }
 @fragment fn fs_additive_fused3(input: AdditiveVertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (3u << 24u)) != 0u) {
+        return competitive_one_stage(input.uv);
+    }
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy, (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) { discard; }
     return additive_fused_contributions(input, 3u);
 }
@@ -4725,7 +4737,68 @@ fn hybrid_rendered_mesh_debug(input: VertexOut) -> vec4<f32> {
     return vec4<f32>(0.98, 0.08, 0.08, 1.0);
 }
 
+// Competitive A/B: a deliberate short-circuit before authored material
+// shading. Modes 11/12 use the prepared first BSP stage, retaining textured
+// alpha-test silhouettes where required. No lightmap, PBR, fog or stage fusion.
+fn competitive_one_stage(uv: vec2<f32>) -> vec4<f32> {
+    let flat = (camera.render_flags.y & (1u << 25u)) != 0u;
+    var sample_color = vec4<f32>(1.0);
+    if (!flat || ENABLE_ALPHA_TEST) {
+        sample_color = textureSample(base_texture, base_sampler, uv);
+    }
+    if (ENABLE_ALPHA_TEST && material_alpha_rejects(sample_color.a * material.color.a)) {
+        discard;
+    }
+    if (flat) {
+        return vec4<f32>(0.72, 0.78, 0.81, 1.0);
+    }
+    return vec4<f32>(sample_color.rgb, sample_color.a * material.color.a);
+}
+
+// Experimental cheap world path: strip secondary material stages while still
+// sampling the BSP baked lightmap. This is distinct from the existing unlit
+// `competitive_one_stage` path. The normal classic lighting controls remain
+// authoritative: r_fullbright, r_vertexLight and r_lightmap.
+fn competitive_one_stage_lit(uv: vec2<f32>, lm_uv: vec2<f32>, vertex_color: vec4<f32>) -> vec4<f32> {
+    let texel = textureSample(base_texture, base_sampler, uv);
+    let alpha = texel.a * material.color.a;
+    if (ENABLE_ALPHA_TEST && material_alpha_rejects(alpha)) {
+        discard;
+    }
+    let classic = select(0u, camera.render_flags.z, ENABLE_CLASSIC_RENDER_FLAGS);
+    let fullbright = (classic & CLASSIC_FULLBRIGHT) != 0u;
+    let vertex_lit = (classic & CLASSIC_VERTEX_LIGHT) != 0u;
+    let debug_lightmap = (classic & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    let flags = material_flags();
+    let has_lightmap = (flags & (2u | MATERIAL_HAS_LIGHTMAP)) != 0u;
+    var light = vec3<f32>(1.0);
+    if (!fullbright) {
+        if (vertex_lit) {
+            light = select(vertex_color.rgb, vec3<f32>(1.0), debug_lightmap);
+        } else if (has_lightmap && lm_uv.x >= 0.0) {
+            light = textureSample(lightmap_texture, lightmap_sampler, lm_uv).rgb;
+        } else if ((flags & 131072u) != 0u) {
+            // Maps with LIGHTMAP_BY_VERTEX have no lightmap texture.
+            light = vertex_color.rgb;
+        }
+    }
+    // An authored first stage can itself be $lightmap; avoid multiplying its
+    // lightmap texel twice. The stripped shader intentionally omits later
+    // special-material stages, but must not fabricate a double-darkened face.
+    let source_is_lightmap = (flags & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
+    if (debug_lightmap) {
+        return vec4<f32>(light, alpha);
+    }
+    return vec4<f32>(texel.rgb * select(light, vec3<f32>(1.0), source_is_lightmap), alpha);
+}
+
 @fragment fn fs_main(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (3u << 24u)) != 0u) {
+        return competitive_one_stage(input.uv);
+    }
+    if ((camera.render_flags.y & (1u << 23u)) != 0u) {
+        return competitive_one_stage_lit(input.uv, input.lightmap_uv, input.color);
+    }
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
         input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
@@ -4746,6 +4819,12 @@ fn hybrid_rendered_mesh_debug(input: VertexOut) -> vec4<f32> {
 }
 
 @fragment fn fs_main_legacy_fog(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if ((camera.render_flags.y & (3u << 24u)) != 0u) {
+        return competitive_one_stage(input.uv);
+    }
+    if ((camera.render_flags.y & (1u << 23u)) != 0u) {
+        return competitive_one_stage_lit(input.uv, input.lightmap_uv, input.color);
+    }
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
         input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)

@@ -83,6 +83,7 @@ impl PlayerPresenter {
         self.mind_trick_fades.clear();
         self.cloak_states.clear();
         self.force_refractions.clear();
+        self.speed_trail_history.clear();
         self.gore.clear();
         self.pending_gore.clear();
         self.last_gpu.clear();
@@ -218,6 +219,8 @@ impl PlayerPresenter {
             breath_view_contents: 0,
             anim_events,
             footstep_stages: FootstepStages::from_level(footsteps::FOOTSTEPS_MARKS),
+            footstep_trace: false,
+            footstep_solids: Vec::new(),
             footsteps: Vec::new(),
             footstep_rng: 0x2545_f491,
             stage_time_ms: 0,
@@ -246,6 +249,8 @@ impl PlayerPresenter {
             move_lean: 0.75,
             saber_team_colors: true,
             saber_staff_multi_color: false,
+            speed_trail: true,
+            speed_trail_history: HashMap::new(),
             duel_shell_gray: None,
             cosmetic_draws: Vec::new(),
             emote_fx: Default::default(),
@@ -322,6 +327,12 @@ impl PlayerPresenter {
         };
         presenter.prime_default_player_models();
         Ok(presenter)
+    }
+
+    /// TaystJK cg_speedTrail: immediately disable/enable Force Speed afterimages.
+    pub fn set_speed_trail(&mut self, enabled: bool) {
+        self.speed_trail = enabled;
+        if !enabled { self.speed_trail_history.clear(); }
     }
 
     /// Applies to player models in live games, demo playback and solo sessions.
@@ -443,6 +454,14 @@ impl PlayerPresenter {
             marks: prints,
             ..FootstepStages::from_level(level)
         };
+    }
+
+    /// Switches the ground-only entity collision A/B immediately; non-archived.
+    pub fn set_footstep_trace(&mut self, enabled: bool) {
+        self.footstep_trace = enabled;
+        if !enabled {
+            self.footstep_solids.clear();
+        }
     }
 
     pub fn footstep_stages(&self) -> FootstepStages {

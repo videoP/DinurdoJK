@@ -17,6 +17,7 @@ impl super::AdapterShared {
             Tf::R16Snorm => (glow::R16_SNORM, glow::RED, glow::SHORT),
             Tf::R16Float => (glow::R16F, glow::RED, glow::HALF_FLOAT),
             Tf::Rg8Unorm => (glow::RG8, glow::RG, glow::UNSIGNED_BYTE),
+            Tf::Rgb565Unorm => (glow::RGB565, glow::RGB, glow::UNSIGNED_SHORT_5_6_5),
             Tf::Rg8Snorm => (glow::RG8_SNORM, glow::RG, glow::BYTE),
             Tf::Rg8Uint => (glow::RG8UI, glow::RG_INTEGER, glow::UNSIGNED_BYTE),
             Tf::Rg8Sint => (glow::RG8I, glow::RG_INTEGER, glow::BYTE),

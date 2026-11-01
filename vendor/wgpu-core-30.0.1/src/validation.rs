@@ -955,7 +955,7 @@ impl NumericType {
             Tf::Rgba8Sint | Tf::Rgba16Sint | Tf::Rgba32Sint => {
                 (NumericDimension::Vector(Vs::Quad), Scalar::I32)
             }
-            Tf::Rg11b10Ufloat => (NumericDimension::Vector(Vs::Tri), Scalar::F32),
+            Tf::Rgb565Unorm | Tf::Rg11b10Ufloat => (NumericDimension::Vector(Vs::Tri), Scalar::F32),
             Tf::Stencil8
             | Tf::Depth16Unorm
             | Tf::Depth32Float

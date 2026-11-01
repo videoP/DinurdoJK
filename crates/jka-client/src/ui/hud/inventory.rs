@@ -1,7 +1,7 @@
 //! TaystJK `CG_DrawInvenSelect` (cg_draw.c): scrollable holdable-item strip.
 //! Reuses the shared, native-resolution UI icon atlas (no per-frame texture IO).
 use crate::ui::{
-    fixed_charset_text, proportional_text, proportional_text_width,
+    fixed_charset_text, proportional_text_uniform, proportional_text_width,
     textured_rect_with_source, ProportionalFont, UiInventorySelect, UiSnapshot,
     UiVertex, ICON_TEXTURE_SOURCE,
 };
@@ -58,7 +58,7 @@ pub(in crate::ui) fn build_inventory_select(
     let draw_icon = |out: &mut Vec<UiVertex>, tag: usize, x: f32, y: f32, size: f32| {
         let (uv0, uv1) = ui.icon_uv(ICON_INVENTORY_BASE + tag);
         textured_rect_with_source(out, x, y, size * scale, size * scale,
-            uv0, uv1, [1.0; 4], ICON_TEXTURE_SOURCE, w, h);
+            uv0, uv1, [1.0; 4], ui.icon_texture_source(ICON_INVENTORY_BASE + tag), w, h);
     };
 
     let mut x = cx - (BIG / 2.0 + PAD + SMALL) * scale;
@@ -79,8 +79,8 @@ pub(in crate::ui) fn build_inventory_select(
     let y = 455.0 * scale;
     if let Some(font) = small_font {
         let font_scale = 0.55;
-        let width = proportional_text_width(label, font, font_scale) * w as f32 / 640.0;
-        proportional_text(out, label, font, cx - width / 2.0, y,
+        let width = proportional_text_width(label, font, font_scale) * h as f32 / 480.0;
+        proportional_text_uniform(out, label, font, cx - width / 2.0, y,
             font_scale, tint, true, w, h);
     } else {
         let glyph_width = 8.0 * scale;

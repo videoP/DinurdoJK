@@ -1,7 +1,7 @@
 //! Context.
 use crate::renderer::{
     create_targets, create_texture_sampler, rebuild_world_bind_groups, Mat4, PhysicalSize,
-    Renderer, TextureFilter, VsyncMode, DEPTH_FORMAT,
+    Renderer, TextureFilter, VsyncMode, depth_format,
 };
 
 pub(in crate::renderer) struct RenderFrame {
@@ -53,6 +53,10 @@ pub(in crate::renderer) fn presentation_config(
     linear_present_supported: bool,
 ) -> wgpu::SurfaceConfiguration {
     let mut config = config.clone();
+    if config.format == wgpu::TextureFormat::Rgb565Unorm {
+        config.view_formats.clear();
+        return config;
+    }
     let linear = config.format.remove_srgb_suffix();
     let srgb_direct = std::env::var_os("JKA_SURFACE_SRGB_DIRECT").is_some_and(|v| v == "1");
     if linear != config.format && linear_present_supported && !srgb_direct {
@@ -96,6 +100,18 @@ impl Renderer {
     /// be an sRGB view of a UNORM swapchain (see `presentation_config`). Native
     /// HDR output instead uses the selected native HDR surface format,
     /// never the internal Rgba16Float compositor format.
+    /// Reinterpret the *same* SDR swapchain image as UNORM for legacy model
+    /// blending. `presentation_config` configures a UNORM swapchain with an
+    /// sRGB view, so both formats are valid views of identical storage. Native
+    /// UNORM blending operates on encoded framebuffer values (OpenJK/TaystJK).
+    /// Caller must check the SDR/direct-surface eligibility before using this.
+    pub(in crate::renderer) fn surface_texture_unorm_view(&self, frame: &RenderFrame) -> wgpu::TextureView {
+        frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.config.format.remove_srgb_suffix()),
+            ..Default::default()
+        })
+    }
+
     pub(in crate::renderer) fn surface_texture_view(&self, frame: &RenderFrame) -> wgpu::TextureView {
         let format = surface_view_format(
             self.config.format,
@@ -140,6 +156,7 @@ impl Renderer {
             self.glow_mode.authored(),
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
+            self.ssao_resolution,
             self.ssr_enabled,
             self.needs_resolved_depth_target(),
             self.taa_enabled || self.rt_taa_mode > 0,
@@ -199,6 +216,7 @@ impl Renderer {
             self.glow_mode.authored(),
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
+            self.ssao_resolution,
             self.ssr_enabled,
             self.needs_resolved_depth_target(),
             self.taa_enabled || self.rt_taa_mode > 0,
@@ -377,7 +395,7 @@ pub(in crate::renderer) fn supported_msaa(
     surface_format: wgpu::TextureFormat,
 ) -> Vec<u32> {
     let color = adapter.get_texture_format_features(surface_format).flags;
-    let depth = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    let depth = adapter.get_texture_format_features(depth_format()).flags;
     let can_resolve = color.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
     let mut result = vec![1];
     if can_resolve {

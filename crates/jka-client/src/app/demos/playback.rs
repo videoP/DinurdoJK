@@ -199,6 +199,15 @@ impl GameSession {
                             // Recorded demos do not have a live local ping stream to
                             // validate the spectator-follow heuristic against.
                             spectating_you: false,
+                            muted: false,
+                            crowned: false,
+                            model: String::new(),
+                            model_fallback: String::new(),
+                            h2h: None,
+                            accuracy: entry.accuracy,
+                            excellent: entry.excellent,
+                            gauntlet: entry.gauntlet,
+                            perfect: entry.perfect,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -237,6 +246,7 @@ impl GameSession {
             show_deaths,
             icon_paths: scoreboard_icon_paths,
             entries,
+            chrome: Default::default(),
         })
     }
 
@@ -863,6 +873,7 @@ impl App {
                 self.demo_scrub_last_applied_fraction = None;
                 self.demo_view_mode = DemoViewMode::Authoritative;
                 self.demo_free_follow_anchor = None;
+                self.demo_player_list_scroll = 0;
                 self.demo_view_outside_authoritative = false;
                 self.demo_free_speed_index = DEMO_FREE_SPEED_DEFAULT_INDEX;
                 if let Some(elapsed_ms) = launch_seek_ms {
@@ -1346,6 +1357,48 @@ impl App {
         self.publish_transient_ui();
     }
 
+    /// Jump to a directly selected, currently visible player. The same demo
+    /// snapshot/PVS restriction as [ / ] follow applies: arbitrary connected
+    /// clients are not necessarily reconstructable from a recorded demo.
+    pub(in crate::app) fn follow_demo_client(&mut self, client: i32) {
+        let Some(session) = self.game_session.as_ref().filter(|session| !session.live) else {
+            return;
+        };
+        let Some((_, name)) = session.demo_visible_players().into_iter()
+            .find(|(candidate, _)| *candidate == client) else { return; };
+        let Some(authoritative) = session.demo_followed_client() else { return; };
+        self.demo_free_follow_anchor = Some(client);
+        self.demo_view_outside_authoritative = false;
+        self.spectator_camera_state.reset();
+        self.third_person_camera.reset();
+        if client == authoritative {
+            self.demo_view_mode = DemoViewMode::Authoritative;
+            self.console_status = format!("DEMO CAMERA: RECORDED POV ({name})");
+        } else {
+            self.demo_view_mode = DemoViewMode::Follow(client);
+            self.console_status = format!("DEMO CAMERA: FAKE POV {name} (CLIENT {client})");
+        }
+        // POV cycling and direct player clicks keep the selected row in view.
+        if let Some(window) = self.window.as_ref() {
+            let size = window.inner_size();
+            let players = self.game_session.as_ref().map_or_else(Vec::new,
+                |s| s.demo_visible_players());
+            let selected = players.iter().position(|(id, _)| *id == client).unwrap_or(0);
+            if let Some(layout) = crate::ui::demo_timeline_layout(
+                size.width, size.height, players.len(), self.demo_player_list_scroll, self.demo_player_list_open,
+            ) {
+                let visible = layout.player_rows.len();
+                if selected < layout.player_start {
+                    self.demo_player_list_scroll = selected;
+                } else if visible > 0 && selected >= layout.player_start + visible {
+                    self.demo_player_list_scroll = selected + 1 - visible;
+                }
+            }
+        }
+        self.sync_demo_camera_capture();
+        self.publish_transient_ui();
+    }
+
     pub(in crate::app) fn cycle_demo_follow(&mut self, direction: i32) {
         let Some(session) = self.game_session.as_ref().filter(|session| !session.live) else {
             return;
@@ -1367,19 +1420,8 @@ impl App {
             .position(|(client, _)| *client == current)
             .unwrap_or(0) as i32;
         let next_index = (index + direction).rem_euclid(players.len() as i32) as usize;
-        let (next, name) = players[next_index].clone();
-        self.demo_free_follow_anchor = Some(next);
-        self.spectator_camera_state.reset();
-        self.third_person_camera.reset();
-        if next == authoritative {
-            self.demo_view_mode = DemoViewMode::Authoritative;
-            self.console_status = format!("DEMO CAMERA: RECORDED POV ({name})");
-        } else {
-            self.demo_view_mode = DemoViewMode::Follow(next);
-            self.console_status = format!("DEMO CAMERA: FAKE POV {name} (CLIENT {next})");
-        }
-        self.sync_demo_camera_capture();
-        self.publish_transient_ui();
+        let next = players[next_index].0;
+        self.follow_demo_client(next);
     }
 
     /// The current camera as a Ghoul2 LOD/cull view, for presenters that need
@@ -1631,6 +1673,10 @@ impl App {
             playback.weapon_fx.set_gpu_staging(
                 self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu
             );
+            // Offline exports require exact frame-time EFX and are captured
+            // sequentially; interactive playback can reuse completed worker
+            // snapshots at cg_fxFPS without waiting on every render frame.
+            playback.weapon_fx.set_async_fx_enabled(self.demo_video_export.is_none());
             let (advance, sample) = if playback.local {
                 let Some((server_time, angles)) = local_frame else {
                     return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
@@ -1677,7 +1723,8 @@ impl App {
                 let entity_graph = self.entity_graph.as_deref();
                 let mut predict = |snap: &ProtocolSnapshot,
                                    next: Option<&ProtocolSnapshot>,
-                                   entities: &[PresentedEntity]| {
+                                   entities: &[PresentedEntity],
+                                   duel_states: [crate::cgame::PrivateDuelState; 2]| {
                     // OpenJK vehicle pmove is a separate path. Until that is ported,
                     // never feed a piloting playerstate through the on-foot predictor;
                     // use snapshot interpolation instead and discard stale prediction.
@@ -1699,6 +1746,7 @@ impl App {
                         settings,
                         provisional,
                         entity_graph,
+                        duel_states,
                     };
                     let previous_committed = predictor
                         .committed()
@@ -1818,7 +1866,7 @@ impl App {
                     viewport_height as f32 / (2.0 * (fov_y * 0.5).tan()).max(1e-3),
                 );
             }
-            let flare = if self.video.saber_flares {
+            let flare = if self.video.saber_flares && crate::fx::render_enabled() {
                 let (viewport_width, viewport_height) = self
                     .window
                     .as_ref()
@@ -1894,8 +1942,13 @@ impl App {
                 tan_half_fov_y: trail_tan_half_y,
                 focal_length_pixels: trail_viewport_height as f32 / (2.0 * trail_tan_half_y),
             };
-            self.strafe_trails
-                .append_draws(trail_view, trail_time, &mut playback.fx_draws);
+            let trail_first = playback.fx_draws.len();
+            if crate::fx::render_enabled() {
+                self.strafe_trails
+                    .append_draws(trail_view, trail_time, &mut playback.fx_draws);
+            }
+            playback.client_perf.fx_trail_draws =
+                (playback.fx_draws.len() - trail_first).min(u32::MAX as usize) as u32;
 
             // Two same-hue additive ribbons produce a soft coloured glow with a
             // brighter coloured centre. Deliberately do not submit RGBcore1 (or
@@ -1903,7 +1956,7 @@ impl App {
             // RGBglow1 is jaPRO's tintable glow asset and EntityPresenter already
             // synthesizes it from stock JKA saber art when the jaPRO texture is
             // unavailable.
-            for ray in &cinematic_strafe_rays {
+            for ray in cinematic_strafe_rays.iter().filter(|_| crate::fx::render_enabled()) {
                 let alpha = ray.color[3].clamp(0.0, 1.0);
                 let rgba = |gain: f32| {
                     let channel = |value: f32| {
@@ -1933,7 +1986,8 @@ impl App {
                     shader: "gfx/effects/sabers/RGBglow1".to_owned(),
                 });
             }
-            if self.race_ghost_trail {
+            let ghost_trail_first = playback.fx_draws.len();
+            if self.race_ghost_trail && crate::fx::render_enabled() {
                 for ghost in &mut playback.race_ghosts {
                     self.strafe_trails.append_prebuilt_draws(
                         &mut ghost.track.strafe_trail,
@@ -1942,11 +1996,13 @@ impl App {
                     );
                 }
             }
+            playback.client_perf.fx_ghost_trail_draws =
+                (playback.fx_draws.len() - ghost_trail_first).min(u32::MAX as usize) as u32;
 
             // Vanilla/TaystJK water wake: collision sampling is rate-limited
             // per player, while the rendered quad follows interpolation at full FPS.
             // Godot-promoted surfaces are excluded so mode 2 never double-draws.
-            if self.video.water_wake != 0 {
+            if self.video.water_wake != 0 && crate::fx::render_enabled() {
                 playback.water_wake.append_draws(
                     self.video.water_wake,
                     sample.presentation_time_ms as i32,
@@ -1979,7 +2035,8 @@ impl App {
                     crate::fx::system::FxDraw::OrientedQuad { .. } => {
                         playback.client_perf.fx_oriented_quads += 1
                     }
-                    crate::fx::system::FxDraw::Line { .. } => playback.client_perf.fx_lines += 1,
+                    crate::fx::system::FxDraw::Line { .. }
+                    | crate::fx::system::FxDraw::Lightning { .. } => playback.client_perf.fx_lines += 1,
                     crate::fx::system::FxDraw::Quad { .. } => playback.client_perf.fx_quads += 1,
                     crate::fx::system::FxDraw::Mesh { .. }
                     | crate::fx::system::FxDraw::LitMesh { .. } => {
@@ -2160,12 +2217,18 @@ impl App {
             // GPU residency is a second independent switch: r_fxGeometry gpu
             // continues to work unchanged when this experimental path is off.
             let mut resident_fx_surfaces = Vec::new();
-            if self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu {
-                if let Some(commands) = playback.gpu_commands.take() {
-                    let writes = playback.gpu_pool.update(&commands, 1800);
-                    let resident_frame = Arc::new(crate::renderer::FxGpuResidentFrame {
+            if crate::fx::render_enabled() && self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu {
+                // Worker packets carry birth/reset deltas at cg_fxFPS; live
+                // resident particles must still draw on EVERY render frame.
+                // Otherwise smoke vanishes between FX worker ticks.
+                let writes = playback.gpu_commands.take()
+                    .map(|commands| playback.gpu_pool.update(&commands, 1800))
+                    .unwrap_or_default();
+                // Expire and animate against the presentation/demo clock.
+                playback.gpu_pool.expire_at(sample.presentation_time_ms as i32);
+                let resident_frame = Arc::new(crate::renderer::FxGpuResidentFrame {
                         reset: writes.clear,
-                        time_ms: commands.time_ms,
+                        time_ms: sample.presentation_time_ms as i32,
                         show_saber_impact: self.video.saber_impact_fx,
                         writes: Arc::new(crate::fx::gpu_sparks::encode_gpu_writes(&writes)),
                         ready_modes: Arc::clone(&playback.gpu_ready_modes),
@@ -2211,7 +2274,7 @@ impl App {
                                     origin: [0.0; 3], radius: 0.0, rotation: 0.0,
                                     rgba: [0; 4], shader: spawn.shader.clone(),
                                 }
-                            } else { spawn.reference_draw_at(commands.time_ms) };
+                            } else { spawn.reference_draw_at(sample.presentation_time_ms as i32) };
                             (spawn.id, slot, draw)
                         })
                         .collect();
@@ -2262,7 +2325,6 @@ impl App {
                             keep
                         });
                     }
-                }
             } else {
                 playback.gpu_commands = None;
                 playback.gpu_pool = crate::fx::gpu_sparks::GpuSparkPool::default();
@@ -2270,7 +2332,10 @@ impl App {
                 playback.weapon_fx.set_gpu_owned(std::collections::HashSet::new());
                 playback.gpu_ready_modes.store(0, std::sync::atomic::Ordering::Release);
             }
-            let mut fx_surfaces = if self.video.fx_occlusion == 1 {
+            let fx_geometry_started = Instant::now();
+            let mut fx_surfaces = if !crate::fx::render_enabled() {
+                Vec::new()
+            } else if self.video.fx_occlusion == 1 {
                 let mask = playback.fx_runner_cull.mask(
                     &playback.fx_draws, &playback.fx_runner_draws, &view, self.video.occlusion_stats,
                 );
@@ -2319,6 +2384,8 @@ impl App {
                 }
             };
             fx_surfaces.extend(resident_fx_surfaces);
+            playback.client_perf.fx_geometry_ms =
+                fx_geometry_started.elapsed().as_secs_f64() * 1000.0;
             playback.client_perf.fx_render_surfaces =
                 u32::try_from(fx_surfaces.len()).unwrap_or(u32::MAX);
             playback.client_perf.fx_cpu_geom_surfaces = 0;

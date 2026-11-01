@@ -318,7 +318,11 @@ impl PlayerPresenter {
                 }
                 let (texture, base_alpha_mode, authored_glow) = custom_material
                     .clone()
-                    .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode, asset.authored_glow));
+                    .unwrap_or_else(|| (asset.animation.as_ref()
+                        .map(|animation| animation.texture_at(jka_assets::shader::shader_time(
+                            stage_seconds, asset.shader_time_offset, asset.shader_clamp_time)))
+                        .unwrap_or_else(|| asset.texture.clone()),
+                        asset.alpha_mode, asset.authored_glow));
                 let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
                     [0.58, 0.58, 0.58, rgba[3]]
                 } else if tinted && asset.entity_tint {
@@ -363,7 +367,8 @@ impl PlayerPresenter {
                             alpha_mode,
                         });
                         if tinted && asset.entity_tint {
-                            Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3]);
+                            Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3],
+                                jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time));
                         }
                         if custom_material.is_none() {
                             Self::push_stage_draws(
@@ -424,7 +429,8 @@ impl PlayerPresenter {
                     alpha_mode,
                 });
                 if tinted && asset.entity_tint {
-                    Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3]);
+                    Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3],
+                                jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time));
                 }
                 if custom_material.is_none() {
                     Self::push_stage_draws(
@@ -544,7 +550,11 @@ impl PlayerPresenter {
             }
             let (texture, base_alpha_mode, authored_glow) = custom_material
                 .clone()
-                .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode, asset.authored_glow));
+                .unwrap_or_else(|| (asset.animation.as_ref()
+                    .map(|animation| animation.texture_at(jka_assets::shader::shader_time(
+                        stage_seconds, asset.shader_time_offset, asset.shader_clamp_time)))
+                    .unwrap_or_else(|| asset.texture.clone()),
+                    asset.alpha_mode, asset.authored_glow));
             let alpha_mode = if apply_alpha_blend {
                 blend_for_alpha(base_alpha_mode, surface_rgba[3])
             } else {
@@ -574,7 +584,8 @@ impl PlayerPresenter {
             self.push_profile_selection(&mut draws, overlay_at - 1, gpu_mesh,
                 preview_remesh && gpu_mesh.key != gpu_mesh.base_key);
             if tinted && asset.entity_tint {
-                Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3]);
+                Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3],
+                                jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time));
             }
             if custom_material.is_none() {
                 Self::push_stage_draws(
@@ -615,7 +626,8 @@ impl PlayerPresenter {
             .map(|stage| {
                 let mut surface = Self::clone_surface_with_material(
                     base,
-                    stage.texture.clone(),
+                    stage.animation.as_ref().map(|anim| anim.texture_at(seconds))
+                        .unwrap_or_else(|| stage.texture.clone()),
                     stage.alpha_mode,
                     [1.0, 1.0, 1.0, alpha],
                 );
@@ -662,7 +674,8 @@ impl PlayerPresenter {
             // No viewer (asset preview): a constant mid glint instead of none.
             color[3] *= 0.5;
         }
-        surface.texture = stage.texture.clone();
+        surface.texture = stage.animation.as_ref().map(|anim| anim.texture_at(seconds))
+            .unwrap_or_else(|| stage.texture.clone());
         surface.alpha_mode = stage.alpha_mode;
         surface.authored_glow = stage.authored_glow;
         // Without a viewer (asset previews) reflect a camera straight ahead.
@@ -715,6 +728,7 @@ impl PlayerPresenter {
         overlay_at: usize,
         asset: &PlayerSurfaceAsset,
         alpha: f32,
+        seconds: f32,
     ) {
         let Some(overlay) = &asset.overlay else {
             return;
@@ -724,7 +738,8 @@ impl PlayerPresenter {
         };
         let mut surface = Self::clone_surface_with_material(
             base,
-            overlay.texture.clone(),
+            overlay.animation.as_ref().map(|anim| anim.texture_at(seconds))
+                .unwrap_or_else(|| overlay.texture.clone()),
             overlay.alpha_mode,
             [1.0, 1.0, 1.0, alpha],
         );

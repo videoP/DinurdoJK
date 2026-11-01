@@ -65,10 +65,12 @@ impl BspModelLod {
         full: &[DrawBatch], full_ranges: &[Range<u32>],
         compiled_surfaces: &[bool],
         patches: &[crate::scene::PreparedPatchDraw],
+        enabled: bool,
     ) -> Self {
-        // Keep the prepared source LOD streams so toggling the shared runtime
-        // setting does not require a map reload or index-buffer reallocations.
-        if compiled_surfaces.is_empty() { return Self::default(); }
+        // Do not simplify or reserve duplicate indices when the feature is off.
+        // Enabling it afterward requires the next map load, which avoids
+        // a surprise synchronous simplification on the render/gameplay thread.
+        if !enabled || compiled_surfaces.is_empty() { return Self::default(); }
         let mut result = Self::default();
         let mut cache = BTreeMap::<(u32, u32), usize>::new();
         let candidate_surfaces = compiled_surfaces.iter().filter(|&&is_model| is_model).count();

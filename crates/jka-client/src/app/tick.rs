@@ -82,7 +82,9 @@ impl App {
         self.studio_cfg_check_exit();
         self.restore_frontend_world_after_studio();
         if self.extensions.poll() {
-            self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, self.extensions.hud_images.clone()));
+            self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
+                ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
+                images }));
             if self.overlay == OverlayMode::HudEdit {
                 self.egui_repaint_requested = true;
             }
@@ -148,6 +150,14 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.previous_tick);
         self.previous_tick = now;
+        // An extremely cheap rolling CPU-frame interval for vote-prewarm
+        // admission control. Capture the baseline *before* the vote passes.
+        let sample_us = dt.as_micros().min(u32::MAX as u128) as u32;
+        let previous_us = self.vote_map_frame_us.load(std::sync::atomic::Ordering::Relaxed);
+        let filtered_us = if previous_us == 0 { sample_us } else {
+            (u64::from(previous_us) * 7 + u64::from(sample_us)).div_ceil(8) as u32
+        };
+        self.vote_map_frame_us.store(filtered_us, std::sync::atomic::Ordering::Relaxed);
 
         if self.sun_ray_sent {
             self.sync_sun_ray();
@@ -294,6 +304,18 @@ impl App {
                     self.publish_ui();
                 }
             }
+            // Non-Siege jaPRO votes with >=5s execution delay send the same
+            // EV_SIEGESPEC deadline as the Siege respawn timer. That event is
+            // authoritative even when the pass `print` is localized. The
+            // target still must have come from the direct CS9 vote command.
+            let passed_vote_deadline = self.vote_map_candidate.is_some()
+                && self.game_session.as_ref().is_some_and(|session| {
+                    session.live && session.client_game.gametype() != 7
+                        && session.siege_respawn_time > session.cgame_time.saturating_add(1000)
+                });
+            if passed_vote_deadline {
+                self.on_live_map_vote_deadline();
+            }
             // TaystJK reads player state from each CG_Draw2D frame. Our
             // renderer owns a separate thread, so publish only the compact
             // state. No command at all when idle, except the one transition
@@ -439,6 +461,7 @@ impl App {
             .as_ref()
             .and_then(|session| session.race_timer_ui.clone());
         let vote_line = self.vote_hud_line();
+        let siege_hud = self.siege_hud_ui();
         let team_overlay = self.team_overlay_ui();
         self.update_speedometer(now);
         self.update_variometer();
@@ -450,6 +473,7 @@ impl App {
             || enemy_info != self.enemy_info_shown
             || race_timer != self.race_timer_shown
             || vote_line != self.vote_line_shown
+            || siege_hud != self.siege_hud_shown
             || team_overlay != self.team_overlay_shown
             || self.speedometer_ui != self.speedometer_shown
             || self.lagometer_ui != self.lagometer_shown
@@ -461,6 +485,7 @@ impl App {
             self.enemy_info_shown = enemy_info;
             self.race_timer_shown = race_timer;
             self.vote_line_shown = vote_line;
+            self.siege_hud_shown = siege_hud;
             self.team_overlay_shown = team_overlay;
             self.speedometer_shown = self.speedometer_ui.clone();
             self.lagometer_shown = self.lagometer_ui.clone();
@@ -472,10 +497,13 @@ impl App {
             && now.duration_since(self.last_chat_refresh) >= Duration::from_millis(250);
         if refresh_chat {
             let demo_now = self.current_demo_elapsed_ms(now);
+            // Keep lines for the typing view (cg_chatHistoryTime), not just
+            // while they are on screen (cg_chatFadeTime).
+            let keep_s = self.chat_settings.history_time.max(self.chat_settings.fade_time).max(1.0);
             self.chat_lines
                 .retain(|line| match (demo_now, line.demo_elapsed_ms) {
-                    (Some(now_ms), Some(created_ms)) => now_ms - created_ms < 10_000.0,
-                    _ => now.saturating_duration_since(line.created) < Duration::from_secs(10),
+                    (Some(now_ms), Some(created_ms)) => now_ms - created_ms < f64::from(keep_s) * 1000.0,
+                    _ => now.saturating_duration_since(line.created) < Duration::from_secs_f32(keep_s),
                 });
             self.last_chat_refresh = now;
         }
@@ -520,7 +548,13 @@ impl App {
         if refresh_demo_timeline {
             self.last_demo_timeline_refresh = now;
         }
-        if refresh_chat || refresh_center || refresh_console_notify || refresh_demo_timeline {
+        self.tick_match_stats(now);
+        let refresh_chat_anim = self.tick_chat_anim(now);
+        let refresh_killfeed = self.tick_killfeed(now);
+        let refresh_scoreboard = self.tick_scoreboard_ui();
+        if refresh_chat || refresh_center || refresh_console_notify || refresh_demo_timeline
+            || refresh_killfeed || refresh_scoreboard || refresh_chat_anim
+        {
             // Fade/timeline updates are intentionally isolated from retained UI.
             // This avoids cloning console/menu state and rebuilding unrelated HUD
             // geometry at render frequency.

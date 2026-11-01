@@ -486,7 +486,7 @@ mod grading_tests {
             1.0,
             Default::default(),
             SplitToningSettings {
-                enabled: true,
+                strength: 0.5,
                 ..Default::default()
             },
             1.0,
@@ -502,7 +502,7 @@ mod grading_tests {
     #[test]
     fn zero_lut_strength_keeps_independent_split_toning() {
         let settings = SplitToningSettings {
-            enabled: true,
+            strength: 0.5,
             ..Default::default()
         };
         let (_, film) = build_graded_rgba8(
@@ -556,7 +556,7 @@ mod grading_tests {
     #[test]
     fn baked_lut_keeps_black_white_and_tone_ranges_across_gamma() {
         let settings = SplitToningSettings {
-            enabled: true,
+            strength: 0.5,
             ..Default::default()
         };
         let mut max_error: f64 = 0.0;
@@ -621,7 +621,7 @@ mod grading_tests {
     #[test]
     fn external_lut_values_are_toned_after_lut_intensity() {
         let settings = SplitToningSettings {
-            enabled: true,
+            strength: 0.5,
             ..Default::default()
         };
         // A flat synthetic external LUT isolates the composition order.

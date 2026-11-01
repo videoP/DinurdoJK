@@ -7,11 +7,13 @@ pub const SHADER: &str = include_str!("wave_advection.wgsl");
 /// Material functions connected as the selected live-grid vertex path. The
 /// caller supplies the actual native FFT detail texture, frame-phase inputs,
 /// native material outputs and samplers; there is no fallback texture/shader.
+/// `river_live_grid_wpo` alone; requires material.wgsl and this SHADER.
+pub const VERTEX_SHADER: &str = include_str!("wave_vertex.wgsl");
 pub fn vertex_shader() -> String {
     [
         super::material::SHADER,
         SHADER,
-        include_str!("wave_vertex.wgsl"),
+        VERTEX_SHADER,
     ]
     .join("\n")
 }

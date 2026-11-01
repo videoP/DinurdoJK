@@ -197,6 +197,10 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.frontend_stage.cache_pending = false;
                     if let Some(image) = image {
+                        // The GPU compositor rebuilds its cached-scene bind
+                        // group asynchronously. Keep the egui photo visible
+                        // until it reports readiness for this specific image.
+                        self.neon_menu.renderer_ready = false;
                         // One decoded bitmap feeds the normal egui fallback AND
                         // the WGPU compositor. The copy/upload is on the render
                         // thread, never the UI frame loop.
@@ -576,6 +580,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.publish_telemetry_ui();
                 }
             }
+            UserEvent::RiverUpdated {id,result} => {
+                if let Err(error)=&result { self.push_console_line(format!("^1River {id}: {error}")); }
+                self.river_editor.finish(id,result);
+                self.egui_repaint_requested=true;
+            }
             UserEvent::RendererError(error) => {
                 // A failed renderer must reveal diagnostics even without a frame.
                 crate::startup_console::reveal();
@@ -817,6 +826,31 @@ impl ApplicationHandler<UserEvent> for App {
                         self.shader_remap_upload = false;
                         self.push_console_line(format!("^1shader remap: {error}"));
                         self.publish_ui();
+                    }
+                }
+            }
+            UserEvent::VoteMapPrewarmed { token, result, elapsed_ms } => {
+                if self.vote_map_prewarm.as_ref().is_none_or(|pending| pending.token != token) {
+                    if self.vote_map_preload_mode == 3 {
+                        self.push_console_line(format!(
+                            "[VOTE PREWARM DBG] ignored late CPU result token={token} after {elapsed_ms:.1} ms; active token={:?}",
+                            self.vote_map_prewarm.as_ref().map(|pending| pending.token),
+                        ));
+                    }
+                    return;
+                }
+                match result {
+                    Ok(map) => {
+                        if let Some(pending) = self.vote_map_prewarm.as_mut() {
+                            pending.prepared = Some(Arc::from(map));
+                        }
+                        if let Some(name) = self.vote_map_prewarm.as_ref().map(|pending| pending.name.clone()) {
+                            self.push_console_line(format!("[VOTE PREWARM] CPU seed ready for {name} in {elapsed_ms:.1} ms (no GPU upload)"));
+                        }
+                    }
+                    Err(error) => {
+                        self.push_console_line(format!("[VOTE PREWARM] preparation failed: {error}"));
+                        self.cancel_vote_map_prewarm();
                     }
                 }
             }
@@ -1399,6 +1433,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // including archived settings loaded before session creation.
                 self.normalize_ocean_settings();
                 self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
+                self.river_editor.clear();
                 self.render_command(RenderCommand::SetOceanEnabled(self.video.ocean));
                 // Apply the configured effects before upload so the world is
                 // compiled for their scene format on its first upload.
@@ -1799,7 +1834,7 @@ impl ApplicationHandler<UserEvent> for App {
                         upload_timings.ocean_coarsest_spacing,
                     ));
                 }
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(2) || self.vote_map_preload_mode == 3 {
                     self.push_console_line(format!(
                         "^6[MAP CPU/GPU SPLIT]^7 vertex CPU {:.1} / wgpu calls {:.1} ms | material classify {:.1} | BC colour worker {:.1} (wait {:.1}) | BC lightmap worker {:.1} (wait {:.1}) | texture wgpu calls {:.1} | lightmap wgpu calls {:.1} ms; calls include driver CPU time, NOT GPU execution",
                         upload_timings.vertex_cpu_ms,
@@ -1846,7 +1881,7 @@ impl ApplicationHandler<UserEvent> for App {
                     + upload_timings.frame_plan_ms
                     + upload_timings.variant_ms;
                 let upload_other_ms = (upload_ms - upload_accounted_ms).max(0.0);
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(2) || self.vote_map_preload_mode == 3 {
                     self.push_console_line(format!(
                         "^6[MAP RENDER-UPLOAD 2]^7 load_map pre-build {:.1} | snow shell {:.1} | CPU copies (inspector/AO) {:.1} | cull+froxel bind groups {:.1} | videos/lights/AO request/weather/fog {:.1} | planar+frame plan {:.1} | pipeline variant {:.1}",
                         upload_timings.pre_build_ms,
@@ -1858,7 +1893,7 @@ impl ApplicationHandler<UserEvent> for App {
                         upload_timings.variant_ms,
                     ));
                 }
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(2) || self.vote_map_preload_mode == 3 {
                     self.push_console_line(format!(
                         "^6[MAP RENDER-UPLOAD]^7 vertex {:.1} | textures {:.1} | lightmaps {:.1} | probes {:.1} | batches {:.1} | cull {:.1} | lighting {:.1} | pipelines {:.1} | visibility {:.1} | grass {:.1} | finalize {:.1} | other {:.1}",
                         upload_timings.vertex_buffer_ms,
@@ -2015,6 +2050,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         if self.studio_navigation_window_event(&event) { return; }
+        if self.scoreboard_cursor_window_event(&event) { return; }
 
         // A focused Remap Editor text field owns *every* typed key before
         // global shortcuts and Dev-bind dismissal. Otherwise a shader path
@@ -2432,6 +2468,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. }
+                if self.demo_player_list_hovered() =>
+            {
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => (position.y as f32 / 48.0).clamp(-8.0, 8.0),
+                };
+                if amount.abs() > f32::EPSILON {
+                    let steps = (amount.abs().ceil() as i32).max(1);
+                    self.scroll_demo_player_list(if amount > 0.0 { -steps } else { steps });
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. }
                 if self.overlay == OverlayMode::None && self.captured =>
             {
                 let key = match delta {
@@ -2660,16 +2708,15 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.demo_timeline_hit(self.cursor_position.0, self.cursor_position.1) {
                     Some(DemoTimelineHit::PlayPause) => self.toggle_demo_pause_ui(),
                     Some(DemoTimelineHit::Track(fraction)) => self.begin_demo_scrub(fraction),
-                    Some(DemoTimelineHit::MarkIn) => self.mark_demo_export_in(),
-                    Some(DemoTimelineHit::MarkOut) => self.mark_demo_export_out(),
-                    Some(DemoTimelineHit::Export) => {
-                        if self.demo_export_available() {
-                            self.start_demo_video_export();
-                        }
-                    }
-                    Some(DemoTimelineHit::ExportPreset) => self.cycle_demo_export_preset(),
-                    Some(DemoTimelineHit::ExportFps) => self.cycle_demo_export_fps(),
-                    Some(DemoTimelineHit::ExportDepth) => self.toggle_demo_export_depth(),
+                    Some(DemoTimelineHit::Back) => self.seek_demo_relative(-5000),
+                    Some(DemoTimelineHit::Forward) => self.seek_demo_relative(5000),
+                    Some(DemoTimelineHit::Recorded) => self.reset_demo_view_authoritative(),
+                    Some(DemoTimelineHit::Free) => self.enter_demo_free_view(),
+                    Some(DemoTimelineHit::Player(client)) => self.follow_demo_client(client),
+                    Some(DemoTimelineHit::TogglePlayerList) => {
+                        self.demo_player_list_open = !self.demo_player_list_open;
+                        self.publish_transient_ui();
+                    },
                     Some(DemoTimelineHit::Speed) => self.cycle_demo_speed_ui(),
                     None => {}
                 }

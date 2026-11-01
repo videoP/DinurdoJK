@@ -31,6 +31,18 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+// Live, non-archived console cvar. Never require a shell environment variable
+// or a renderer restart to time client-side FX assembly.
+static FX_CPU_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn fx_cpu_trace_enabled() -> bool {
+    FX_CPU_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_fx_cpu_trace(enabled: bool) {
+    FX_CPU_TRACE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 const WP_SABER: i32 = 3;
 const WP_BRYAR_PISTOL: i32 = 4;
 const WP_BLASTER: i32 = 5;
@@ -115,6 +127,45 @@ struct MissileFxState {
     next_sample_time: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForceFxCadence {
+    name: &'static str,
+    last_seen_time: i32,
+    next_sample_time: f64,
+}
+
+/// Preserve 0 = stock render-frame spawning. A fixed rate samples each Force
+/// user separately, avoiding cross-player starvation and repeated-frame piles.
+fn force_fx_sample_due(
+    active: &mut HashMap<u16, ForceFxCadence>, entity_num: u16,
+    name: &'static str, time: i32, fps: u32,
+) -> bool {
+    if fps == crate::fx::FX_FPS_LEGACY_JKA { return true; }
+    let period = 1000.0 / f64::from(fps.max(1));
+    use std::collections::hash_map::Entry;
+    let state = match active.entry(entity_num) {
+        Entry::Vacant(slot) => {
+            slot.insert(ForceFxCadence {
+                name, last_seen_time: time, next_sample_time: f64::from(time) + period,
+            });
+            return true;
+        }
+        Entry::Occupied(slot) => slot.into_mut(),
+    };
+    if state.name != name || time < state.last_seen_time
+        || time > state.last_seen_time.saturating_add(200) {
+        *state = ForceFxCadence {
+            name, last_seen_time: time, next_sample_time: f64::from(time) + period,
+        };
+        return true;
+    }
+    state.last_seen_time = time;
+    if f64::from(time) + 1.0e-6 < state.next_sample_time { return false; }
+    let missed = ((f64::from(time) - state.next_sample_time) / period).floor().max(0.0);
+    state.next_sample_time += (missed + 1.0) * period;
+    true
+}
+
 enum FxWorkerCommand {
     AdjustTime(i32),
     ResetTime(i32),
@@ -133,12 +184,15 @@ enum FxWorkerCommand {
     PlayDir { name: String, origin: [f32; 3], dir: [f32; 3] },
     PlayDirClass { name: String, origin: [f32; 3], dir: [f32; 3], class: FxClass },
     PlayAxis { name: String, origin: [f32; 3], axis: [[f32; 3]; 3] },
-    Frame { saber_impact_fx: bool, runner_culling: bool, reply: mpsc::SyncSender<(FxFrame, FxStats)> },
+    Frame { saber_impact_fx: bool, runner_culling: bool, rate_limited: bool, reply: mpsc::SyncSender<(FxFrame, FxStats, f64)> },
     RefreshAssets { reply: mpsc::SyncSender<Result<usize, String>> },
     Shutdown,
 }
 
-struct FxWorker { fx: FxSystem, assets: AssetSearchPath, ids: HashMap<String, EffectId>, missing: HashSet<String> }
+struct FxWorker {
+    fx: FxSystem, assets: AssetSearchPath, ids: HashMap<String, EffectId>,
+    missing: HashSet<String>, last_sample_time: Option<i32>,
+}
 
 impl FxWorker {
     fn effect(&mut self, name: &str) -> EffectId {
@@ -151,12 +205,89 @@ impl FxWorker {
     }
 }
 
+/// Visual-only interpolation of authored particle samples. It never moves
+/// simulated state, repeats one-shot events, or modifies sabers/beam geometry.
+/// Missing IDs represent births/deaths, not reordered draw indices.
+fn fx_particle_fade(draw: &mut FxDraw, opacity: f32) {
+    match draw {
+        FxDraw::Sprite { rgba, .. } | FxDraw::OrientedQuad { rgba, .. } => {
+            rgba[3] = (f32::from(rgba[3]) * opacity.clamp(0.0, 1.0)).round() as u8;
+        }
+        _ => {}
+    }
+}
+
+fn fx_particle_interpolate(dst: &mut FxDraw, old: &FxDraw, t: f32) -> bool {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    let color = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+        std::array::from_fn(|i| lerp(f32::from(a[i]), f32::from(b[i])).round().clamp(0.0, 255.0) as u8)
+    };
+    match (old, dst) {
+        (FxDraw::Sprite { origin: a_pos, radius: a_radius, rotation: a_rotation, rgba: a_rgba, shader: a_shader, .. },
+         FxDraw::Sprite { origin: b_pos, radius: b_radius, rotation: b_rotation, rgba: b_rgba, shader: b_shader, .. }) if a_shader == b_shader => {
+            for i in 0..3 { b_pos[i] = lerp(a_pos[i], b_pos[i]); }
+            *b_radius = lerp(*a_radius, *b_radius);
+            *b_rotation = lerp(*a_rotation, *b_rotation);
+            *b_rgba = color(*a_rgba, *b_rgba);
+            true
+        }
+        (FxDraw::OrientedQuad { origin: a_pos, radius: a_radius, rotation: a_rotation, rgba: a_rgba, shader: a_shader, .. },
+         FxDraw::OrientedQuad { origin: b_pos, radius: b_radius, rotation: b_rotation, rgba: b_rgba, shader: b_shader, .. }) if a_shader == b_shader => {
+            for i in 0..3 { b_pos[i] = lerp(a_pos[i], b_pos[i]); }
+            *b_radius = lerp(*a_radius, *b_radius);
+            *b_rotation = lerp(*a_rotation, *b_rotation);
+            *b_rgba = color(*a_rgba, *b_rgba);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Smooth a fully published particle snapshot over the next simulation tick.
+/// A one-tick visual lag keeps interpolation bounded (no physics extrapolation).
+fn interpolate_fx_particles(
+    frame: &mut FxFrame, previous: &HashMap<u64, FxDraw>, t: f32,
+) {
+    if previous.is_empty() { return; }
+    let t = t.clamp(0.0, 1.0);
+    let mut present = HashSet::with_capacity(frame.particle_draw_ids.len());
+    for &(index, id) in &frame.particle_draw_ids {
+        present.insert(id);
+        let Some(draw) = frame.draws.get_mut(index) else { continue; };
+        if let Some(old) = previous.get(&id) {
+            if !fx_particle_interpolate(draw, old, t) {
+                fx_particle_fade(draw, t);
+            }
+        } else {
+            fx_particle_fade(draw, t);
+        }
+    }
+    // A particle that expired in the latest tick fades instead of disappearing
+    // all at once. These are authored CPU sprites only, never sounds/decals.
+    if t < 1.0 {
+        for (&id, old) in previous {
+            if !present.contains(&id) {
+                let mut draw = old.clone();
+                fx_particle_fade(&mut draw, 1.0 - t);
+                frame.draws.push(draw);
+            }
+        }
+    }
+}
+
 fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) {
-    let mut worker = FxWorker { fx: FxSystem::new(), assets, ids: HashMap::new(), missing: HashSet::new() };
+    let mut worker = FxWorker {
+        fx: FxSystem::new(), assets, ids: HashMap::new(),
+        missing: HashSet::new(), last_sample_time: None,
+    };
     while let Ok(command) = rx.recv() {
         match command {
             FxWorkerCommand::AdjustTime(time) => worker.fx.adjust_time(time),
-            FxWorkerCommand::ResetTime(time) => worker.fx.reset_time(time),
+            FxWorkerCommand::ResetTime(time) => {
+                worker.fx.reset_time(time);
+                worker.last_sample_time = None;
+            },
             FxWorkerCommand::SetPhysics(mode) => worker.fx.set_physics_mode(mode),
             FxWorkerCommand::SetGpuStaging(enabled) => worker.fx.set_gpu_staging(enabled),
             FxWorkerCommand::SetGpuOwned(ids) => worker.fx.set_gpu_owned(ids),
@@ -169,6 +300,16 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
                 worker.fx.set_light_promotion_catalog(catalog);
             }
             FxWorkerCommand::PlayDir { name, origin, dir } => {
+                if !crate::fx::simulation_enabled() { continue; }
+                // Async FX frames are sampled at cg_fxFPS, but AdjustTime is
+                // still sent at render FPS. A repeated integer-millisecond
+                // AdjustTime can set frame_time to zero just before PlayEffect;
+                // CFxScheduler::CreateEffect then discards the entire emitter.
+                // Restore elapsed simulation time since the last FX tick for
+                // FX event creation, without advancing the actual FX clock.
+                if let Some(previous_tick) = worker.last_sample_time {
+                    worker.fx.set_tick_span(Some(previous_tick));
+                }
                 let started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
                 let id = worker.effect(&name);
                 if id != 0 { worker.fx.play_effect_dir(id, origin, dir); }
@@ -178,19 +319,45 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
                     diag::add(diag::FX_PLAY_CALLS, 1);
                 }
             }
-            FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
-            FxWorkerCommand::PlayAxis { name, origin, axis } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect(id, origin, axis); } }
-            FxWorkerCommand::Frame { saber_impact_fx, runner_culling, reply } => {
-                let started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
+            FxWorkerCommand::PlayDirClass { name, origin, dir, class } => {
+                if !crate::fx::simulation_enabled() { continue; }
+                if let Some(previous_tick) = worker.last_sample_time {
+                    worker.fx.set_tick_span(Some(previous_tick));
+                }
+                let id = worker.effect(&name);
+                if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); }
+            }
+            FxWorkerCommand::PlayAxis { name, origin, axis } => {
+                if !crate::fx::simulation_enabled() { continue; }
+                if let Some(previous_tick) = worker.last_sample_time {
+                    worker.fx.set_tick_span(Some(previous_tick));
+                }
+                let id = worker.effect(&name);
+                if id != 0 { worker.fx.play_effect(id, origin, axis); }
+            }
+            FxWorkerCommand::Frame { saber_impact_fx, runner_culling, rate_limited, reply } => {
+                let started = std::time::Instant::now();
+                if rate_limited {
+                    // AdjustTime still accompanies individual PlayEffect events
+                    // at their original game times. Just before the actual FX
+                    // simulation, restore a delta measured from the last worker
+                    // tick, not from the most recent high-FPS display frame.
+                    worker.fx.set_tick_span(worker.last_sample_time);
+                    worker.last_sample_time = Some(worker.fx.time_ms());
+                } else {
+                    worker.last_sample_time = None;
+                }
                 let frame = if runner_culling {
                 worker.fx.frame_with_runner_tracking(saber_impact_fx)
             } else { worker.fx.frame_with_visibility(saber_impact_fx) };
-                if let Some(started) = started {
+                let elapsed = started.elapsed();
+                if crate::fx::diagnostics::enabled() {
                     use crate::fx::diagnostics as diag;
-                    diag::add(diag::WORKER_US, diag::micros(started.elapsed()));
+                    diag::add(diag::WORKER_US, diag::micros(elapsed));
                     diag::add(diag::WORKER_CALLS, 1);
                 }
-                let _ = reply.send((frame, worker.fx.stats()));
+                let worker_ms = elapsed.as_secs_f64() * 1000.0;
+                let _ = reply.send((frame, worker.fx.stats(), worker_ms));
             }
             FxWorkerCommand::RefreshAssets { reply } => {
                 let retried = worker.missing.len();
@@ -1000,9 +1167,31 @@ pub struct WeaponFx {
     worker_tx: mpsc::Sender<FxWorkerCommand>,
     worker: Option<JoinHandle<()>>,
     cached_stats: FxStats,
+    last_worker_wait_ms: f64,
+    last_worker_update_ms: f64,
+    last_snapshot_clone_ms: f64,
+    /// Last traced end_frame subphases: worker tick, persistent marks, immediate extras.
+    last_end_frame_cpu_ms: [f64; 3],
+    /// One in-flight FX worker tick at most. Frames are published complete;
+    /// normal rendering never waits for a worker that's still preparing one.
+    pending_fx_tick: Option<mpsc::Receiver<(FxFrame, FxStats, f64)>>,
+    /// Worker output is reusable visual state. Transient sound/decal/GPU
+    /// commands are drained once on first presentation, never replayed.
+    cached_fx_tick: FxFrame,
+    /// Previous sample's authored particle draws only; avoids cloning tens
+    /// of thousands of lines each tick merely to interpolate smoke sprites.
+    previous_fx_particles: HashMap<u64, FxDraw>,
+    next_fx_tick_time: Option<f64>,
+    published_fx_tick_time: i32,
+    fx_tick_submitted_at: i32,
+    fx_ticks_published: u64,
+    fx_ticks_deferred: u64,
+    async_fx_enabled: bool,
+    fx_was_disabled: bool,
     entity_fx: HashMap<u16, EntityFxState>,
     missile_fx: HashMap<u16, MissileFxState>,
     tripmine_fx: HashMap<u16, TripmineLaserCadence>,
+    force_fx_cadence: HashMap<u16, ForceFxCadence>,
     /// `0` is stock JKA: invoke continuous projectile FX every presentation
     /// frame. Non-zero values sample them at a fixed rate independent of FPS.
     continuous_fx_fps: u32,
@@ -1109,9 +1298,26 @@ impl WeaponFx {
             worker_tx,
             worker: Some(worker),
             cached_stats: FxStats::default(),
+            last_worker_wait_ms: 0.0,
+            last_worker_update_ms: 0.0,
+            last_snapshot_clone_ms: 0.0,
+            last_end_frame_cpu_ms: [0.0; 3],
+            pending_fx_tick: None,
+            cached_fx_tick: FxFrame::default(),
+            previous_fx_particles: HashMap::new(),
+            next_fx_tick_time: None,
+            published_fx_tick_time: 0,
+            fx_tick_submitted_at: 0,
+            fx_ticks_published: 0,
+            fx_ticks_deferred: 0,
+            // Standalone presenters and tests retain exact synchronous FX.
+            // App enables async sampling explicitly for interactive sessions.
+            async_fx_enabled: false,
+            fx_was_disabled: false,
             entity_fx: HashMap::new(),
             missile_fx: HashMap::new(),
             tripmine_fx: HashMap::new(),
+            force_fx_cadence: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
@@ -1195,11 +1401,20 @@ impl WeaponFx {
     }
 
     pub fn set_runner_culling(&mut self, enabled: bool) {
-        self.runner_culling = enabled;
+        if self.runner_culling != enabled {
+            self.runner_culling = enabled;
+            self.pending_fx_tick = None;
+            // Refresh visibility even if the demo is paused.
+            self.next_fx_tick_time = Some(f64::from(self.time));
+        }
     }
 
     pub fn set_saber_impact_fx(&mut self, enabled: bool) {
-        self.saber_impact_fx = enabled;
+        if self.saber_impact_fx != enabled {
+            self.saber_impact_fx = enabled;
+            self.pending_fx_tick = None;
+            self.next_fx_tick_time = Some(f64::from(self.time));
+        }
     }
 
     pub fn set_saber_marks(&mut self, mode: SaberMarkMode) {
@@ -1314,14 +1529,42 @@ impl WeaponFx {
         } else {
             value.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX)
         };
+        crate::fx::system::set_force_fx_sample_fps(value);
         if self.continuous_fx_fps != value {
             self.continuous_fx_fps = value;
+            // A mode/rate switch starts a fresh cadence. Any previously
+            // queued frame remains ordered on the worker channel, but is no
+            // longer a valid published visual snapshot.
+            self.pending_fx_tick = None;
+            self.cached_fx_tick = FxFrame::default();
+            self.previous_fx_particles.clear();
+            self.next_fx_tick_time = None;
             // Start the new cadence from the next presented sample instead of
             // inheriting phase from the previous rate/mode.
             self.missile_fx.clear();
             self.tripmine_fx.clear();
+            self.force_fx_cadence.clear();
             self.saber_contact_history.clear();
         }
+    }
+
+    /// Offline video export must use the exact frame at the capture timestamp;
+    /// regular live/demo presentation may sample the EFX worker at cg_fxFPS.
+    pub fn set_async_fx_enabled(&mut self, enabled: bool) {
+        if self.async_fx_enabled != enabled {
+            self.async_fx_enabled = enabled;
+            self.pending_fx_tick = None;
+            self.cached_fx_tick = FxFrame::default();
+            self.previous_fx_particles.clear();
+            self.next_fx_tick_time = None;
+        }
+    }
+
+    /// Diagnostics: completed worker ticks, deferred ticks, last snapshot age.
+    pub fn worker_cadence_stats(&self) -> (u64, u64, i32, bool, f64) {
+        (self.fx_ticks_published, self.fx_ticks_deferred,
+         (self.time - self.published_fx_tick_time).max(0),
+         self.pending_fx_tick.is_some(), self.last_snapshot_clone_ms)
     }
 
     pub fn set_fx_fps_scope(&mut self, value: u32) {
@@ -1337,10 +1580,20 @@ impl WeaponFx {
     /// Clear time-dependent presentation while retaining registered effect assets.
     /// Used by demo seeking so replayed events do not leak across the seek boundary.
     pub fn reset_for_seek(&mut self, time: i32) {
+        // Discard completed and in-flight frames. Old replies have their own
+        // receivers and cannot be mistaken for post-seek output.
+        self.pending_fx_tick = None;
+        self.cached_fx_tick = FxFrame::default();
+        self.previous_fx_particles.clear();
+        self.next_fx_tick_time = None;
+        self.published_fx_tick_time = time;
+        self.last_worker_update_ms = 0.0;
+        self.last_snapshot_clone_ms = 0.0;
         let _ = self.worker_tx.send(FxWorkerCommand::ResetTime(time));
         self.entity_fx.clear();
         self.missile_fx.clear();
         self.tripmine_fx.clear();
+        self.force_fx_cadence.clear();
         self.vehicle_weapon_names.clear();
         self.reported_vehicle_weapon_missing.clear();
         self.puffs.clear();
@@ -1371,6 +1624,20 @@ impl WeaponFx {
 
     /// FX_AdjustTime for this presentation frame (`cg.time`).
     pub fn begin_frame(&mut self, time: i32) {
+        let disabled = !crate::fx::simulation_enabled();
+        if disabled != self.fx_was_disabled {
+            // Clear worker and local transient state once at each transition.
+            // The worker processes ResetTime in-order with prior Play commands.
+            self.reset_for_seek(time);
+            self.fx_was_disabled = disabled;
+        }
+        if disabled {
+            // Keep the presentation clock current, but do not schedule/update
+            // any FX or submit per-frame worker jobs in the full-off mode.
+            self.time = time;
+            self.repeated_time = false;
+            return;
+        }
         self.projectile_light_requests.clear();
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
@@ -1378,6 +1645,13 @@ impl WeaponFx {
         self.immediate_blades.clear();
         self.saber_multi_lights.clear();
         if time < self.time {
+            // The worker also clears its scheduled population on time rewind.
+            // Never show the pre-rewind FX snapshot while the new one builds.
+            self.pending_fx_tick = None;
+            self.cached_fx_tick = FxFrame::default();
+            self.previous_fx_particles.clear();
+            self.next_fx_tick_time = None;
+            self.published_fx_tick_time = time;
             self.puffs.clear();
             self.beams.clear();
             self.chunks.clear();
@@ -1764,17 +2038,141 @@ impl WeaponFx {
         self.fx_light_promotion_level = level;
     }
 
-    /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
-    pub fn end_frame(&mut self) -> FxFrame {
+    /// The wait includes queued worker commands and FX update/serialization;
+    /// update measures only FX simulation/output generation on the worker.
+    pub fn worker_frame_timings_ms(&self) -> (f64, f64) {
+        (self.last_worker_wait_ms, self.last_worker_update_ms)
+    }
+
+    /// Per-phase costs are populated only while r_fxCpuTrace is enabled.
+    pub(crate) fn end_frame_cpu_ms(&self) -> [f64; 3] {
+        self.last_end_frame_cpu_ms
+    }
+
+    /// Original serial path: exact FX state for offline capture and cg_fxFPS 0.
+    fn end_sync_fx_tick(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
-        let fx_diag_started = crate::fx::diagnostics::enabled().then(std::time::Instant::now);
-        let mut frame = if self.worker_tx.send(FxWorkerCommand::Frame { saber_impact_fx: self.saber_impact_fx, runner_culling: self.runner_culling, reply }).is_ok() {
-            match recv.recv() { Ok((frame, stats)) => { self.cached_stats = stats; frame }, Err(_) => FxFrame::default() }
+        let started = std::time::Instant::now();
+        self.last_snapshot_clone_ms = 0.0;
+        self.last_worker_update_ms = 0.0;
+        let frame = if self.worker_tx.send(FxWorkerCommand::Frame {
+            saber_impact_fx: self.saber_impact_fx, runner_culling: self.runner_culling,
+            rate_limited: false, reply
+        }).is_ok() {
+            match recv.recv() {
+                Ok((frame, stats, worker_ms)) => {
+                    self.cached_stats = stats;
+                    self.last_worker_update_ms = worker_ms;
+                    frame
+                }
+                Err(_) => FxFrame::default(),
+            }
         } else { FxFrame::default() };
-        if let Some(started) = fx_diag_started {
+        self.last_worker_wait_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if crate::fx::diagnostics::enabled() {
             use crate::fx::diagnostics as diag;
             diag::add(diag::FX_END_FRAMES, 1);
             diag::add(diag::WORKER_WAIT_US, diag::micros(started.elapsed()));
+        }
+        frame
+    }
+
+    /// Consume any completed snapshot without blocking and submit one new tick
+    /// when its simulation-time cadence permits. One in-flight frame bounds
+    /// memory/backlog even when the FX worker needs longer than its period.
+    fn end_async_fx_tick(&mut self) -> FxFrame {
+        self.last_worker_wait_ms = 0.0;
+        // Preserve the last *completed* worker update time for r_perfTrace;
+        // most render frames intentionally do not complete a new FX tick.
+        if let Some(receiver) = self.pending_fx_tick.as_ref() {
+            match receiver.try_recv() {
+                Ok((frame, stats, elapsed)) => {
+                    self.cached_stats = stats;
+                    self.last_worker_update_ms = elapsed;
+                    self.published_fx_tick_time = self.fx_tick_submitted_at;
+                    self.fx_ticks_published = self.fx_ticks_published.wrapping_add(1);
+                    self.previous_fx_particles.clear();
+                    for &(idx, id) in &self.cached_fx_tick.particle_draw_ids {
+                        if let Some(draw) = self.cached_fx_tick.draws.get(idx) {
+                            self.previous_fx_particles.insert(id, draw.clone());
+                        }
+                    }
+                    self.cached_fx_tick = frame;
+                    self.pending_fx_tick = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_fx_tick = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let period = 1000.0 / f64::from(self.continuous_fx_fps.max(1));
+        let now = f64::from(self.time);
+        let due = self.next_fx_tick_time.unwrap_or(now);
+        if now + 1.0e-6 >= due {
+            if self.pending_fx_tick.is_none() {
+                let (reply, recv) = mpsc::sync_channel(1);
+                if self.worker_tx.send(FxWorkerCommand::Frame {
+                    saber_impact_fx: self.saber_impact_fx,
+                    runner_culling: self.runner_culling,
+                    rate_limited: true,
+                    reply,
+                }).is_ok() {
+                    self.pending_fx_tick = Some(recv);
+                    self.fx_tick_submitted_at = self.time;
+                }
+            } else {
+                self.fx_ticks_deferred = self.fx_ticks_deferred.wrapping_add(1);
+            }
+            // Skip missed *presentation* deadlines, never create a backlog of
+            // FX frames. The worker's FX_AdjustTime uses authoritative game time
+            // and advances scheduled effects through the elapsed interval.
+            let skipped = ((now - due) / period).floor().max(0.0);
+            self.next_fx_tick_time = Some(due + (skipped + 1.0) * period);
+        }
+        // Cache continuous visuals, but consume event-like outputs exactly
+        // once. Cloning happens on the presentation thread only for the
+        // current, immutable draw snapshot; the worker never holds this lock.
+        let cloned_at = std::time::Instant::now();
+        let mut frame = self.cached_fx_tick.clone();
+        if !self.previous_fx_particles.is_empty() {
+            let tick_period = 1000.0 / self.continuous_fx_fps.max(1) as f32;
+            let t = (self.time.saturating_sub(self.published_fx_tick_time) as f32 / tick_period)
+                .clamp(0.0, 1.0);
+            interpolate_fx_particles(&mut frame, &self.previous_fx_particles, t);
+        }
+        self.last_snapshot_clone_ms = cloned_at.elapsed().as_secs_f64() * 1000.0;
+        self.cached_fx_tick.sounds.clear();
+        self.cached_fx_tick.shakes.clear();
+        self.cached_fx_tick.decals.clear();
+        self.cached_fx_tick.ghoul2_decals.clear();
+        self.cached_fx_tick.gpu_sparks = None;
+        frame
+    }
+
+    /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
+    pub fn end_frame(&mut self) -> FxFrame {
+        let trace = fx_cpu_trace_enabled();
+        self.last_end_frame_cpu_ms = [0.0; 3];
+        let mut phase_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if !crate::fx::simulation_enabled() {
+            self.last_worker_wait_ms = 0.0;
+            self.last_worker_update_ms = 0.0;
+            return FxFrame::default();
+        }
+        let async_mode = self.async_fx_enabled
+            && self.continuous_fx_fps != crate::fx::FX_FPS_LEGACY_JKA;
+        // In the asynchronous mode the worker advances only at cg_fxFPS,
+        // publishes whole snapshots, and never holds up the render frame.
+        // The legacy (0 FPS) and offline-export paths stay synchronous.
+        let mut frame = if async_mode {
+            self.end_async_fx_tick()
+        } else {
+            self.end_sync_fx_tick()
+        };
+        if let Some(start) = phase_start.as_mut() {
+            self.last_end_frame_cpu_ms[0] = start.elapsed().as_secs_f64() * 1000.0;
+            *start = std::time::Instant::now();
         }
         let time = self.time;
         self.saber_trail_segments.retain(|segment| {
@@ -1817,6 +2215,10 @@ impl WeaponFx {
         self.append_score_plums(&mut frame);
         if matches!(self.saber_marks, SaberMarkMode::Enhanced) {
             self.append_enhanced_melt(&mut frame);
+        }
+        if let Some(start) = phase_start.as_mut() {
+            self.last_end_frame_cpu_ms[1] = start.elapsed().as_secs_f64() * 1000.0;
+            *start = std::time::Instant::now();
         }
         self.flush_saber_multi_lights();
         frame.draws.append(&mut self.immediate_draws);
@@ -1889,6 +2291,9 @@ impl WeaponFx {
             });
             true
         });
+        if let Some(start) = phase_start {
+            self.last_end_frame_cpu_ms[2] = start.elapsed().as_secs_f64() * 1000.0;
+        }
         frame
     }
 
@@ -2232,8 +2637,21 @@ impl WeaponFx {
             PlayerFxRequest::Effect { name, origin, axis } => {
                 let _ = self.worker_tx.send(FxWorkerCommand::PlayAxis { name: (*name).to_owned(), origin: *origin, axis: *axis });
             }
+            PlayerFxRequest::ForceEffect { entity_num, name, origin, axis } => {
+                if force_fx_sample_due(&mut self.force_fx_cadence, *entity_num,
+                    name, self.time, self.continuous_fx_fps) {
+                    let _ = self.worker_tx.send(FxWorkerCommand::PlayAxis {
+                        name: (*name).to_owned(), origin: *origin, axis: *axis,
+                    });
+                }
+            }
             PlayerFxRequest::EffectDir { name, origin, dir } => {
                 let _ = self.worker_tx.send(FxWorkerCommand::PlayDir { name: name.clone(), origin: *origin, dir: *dir });
+            }
+            PlayerFxRequest::AuthoredBladeEffect { name, origin, axis } => {
+                let _ = self.worker_tx.send(FxWorkerCommand::PlayAxis {
+                    name: name.clone(), origin: *origin, axis: *axis,
+                });
             }
             PlayerFxRequest::SaberBlade {
                 origin,
@@ -4156,6 +4574,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fx_sprite_interpolation_tracks_ids_and_smooths_birth_death() {
+        let sprite = |x: f32| FxDraw::Sprite {
+            shader_time: 0.0, origin: [x, 0.0, 0.0], radius: 5.0,
+            rotation: 0.0, rgba: [255, 255, 255, 200], shader: "steam".to_owned(),
+        };
+        let previous: HashMap<u64, FxDraw> = [(10, sprite(0.0)), (11, sprite(2.0))].into();
+        let mut frame = FxFrame::default();
+        frame.particle_draw_ids = vec![(0, 10), (1, 12)];
+        frame.draws = vec![sprite(10.0), sprite(7.0)];
+        interpolate_fx_particles(&mut frame, &previous, 0.5);
+        assert_eq!(frame.draws.len(), 3);
+        let FxDraw::Sprite { origin, rgba, .. } = &frame.draws[0] else { panic!() };
+        assert_eq!(origin[0], 5.0);
+        assert_eq!(rgba[3], 200);
+        let FxDraw::Sprite { rgba, .. } = &frame.draws[1] else { panic!() };
+        assert_eq!(rgba[3], 100, "newborn fades in over one FX tick");
+        let FxDraw::Sprite { rgba, .. } = &frame.draws[2] else { panic!() };
+        assert_eq!(rgba[3], 100, "expired particle fades out over one FX tick");
+    }
+
+    #[test]
+    fn async_fx_snapshot_keeps_draws_but_consumes_one_shot_events() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.time = 1000;
+        fx.next_fx_tick_time = Some(2000.0); // no worker submission in this test
+        fx.cached_fx_tick.draws.push(FxDraw::Line {
+            start: [0.0; 3], end: [1.0, 2.0, 3.0], width: 1.0,
+            rgba: [255; 4], shader: "gfx/test".to_owned(),
+        });
+        fx.cached_fx_tick.sounds.push(FxSound {
+            origin: [0.0; 3], qpath: "sound/test.wav".to_owned(),
+        });
+        let first = fx.end_async_fx_tick();
+        assert_eq!(first.draws.len(), 1);
+        assert_eq!(first.sounds.len(), 1);
+        let second = fx.end_async_fx_tick();
+        assert_eq!(second.draws.len(), 1, "continuous visual persists until next FX tick");
+        assert!(second.sounds.is_empty(), "one-shot sound must never replay");
+    }
+
+    #[test]
     fn profile_saber_respects_no_blade_and_no_dlight_independently() {
         let blade = PlayerFxRequest::SaberBlade {
             origin: [1.0, 2.0, 3.0], direction: [1.0, 0.0, 0.0],
@@ -4368,6 +4828,19 @@ mod tests {
             custom_effect: 0,
             alt_fire: false,
         }
+    }
+
+    #[test]
+    fn force_lightning_cadence_is_per_entity_and_has_legacy_override() {
+        let mut states = HashMap::new();
+        assert!(force_fx_sample_due(&mut states, 1, "force/lightning", 100, 30));
+        assert!(force_fx_sample_due(&mut states, 2, "force/lightning", 100, 30));
+        assert!(!force_fx_sample_due(&mut states, 1, "force/lightning", 105, 30));
+        assert!(!force_fx_sample_due(&mut states, 2, "force/lightning", 105, 30));
+        assert!(force_fx_sample_due(&mut states, 1, "force/lightning", 134, 30));
+        assert!(!force_fx_sample_due(&mut states, 2, "force/lightning", 130, 30));
+        assert!(force_fx_sample_due(&mut states, 2, "mp/drain", 130, 30));
+        assert!(force_fx_sample_due(&mut states, 1, "force/lightning", 135, 0));
     }
 
     #[test]

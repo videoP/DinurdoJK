@@ -9,7 +9,7 @@
 use crate::renderer::{
     DynamicModelRenderer, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuVertex,
     SpectatorHighlight, SpectatorHighlightTeam, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
-    GHOUL2_GPU_VERTEX_ATTRIBUTES, DEPTH_FORMAT,
+    GHOUL2_GPU_VERTEX_ATTRIBUTES, depth_format,
 };
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -570,7 +570,7 @@ fn create_mask_pipeline(
             conservative: false,
         },
         depth_stencil: depth_compare.map(|depth_compare| wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),

@@ -604,6 +604,7 @@ fn print_report(label: &str, report: &Report) {
 /// Every field is spelled out so adding a key field forces this test to be updated.
 fn minimal_key() -> WorldShaderVariantKey {
     WorldShaderVariantKey {
+        shader_input_mode: 0,
         pbr: false,
         pom: false,
         pbr_shared_material_eval: false,

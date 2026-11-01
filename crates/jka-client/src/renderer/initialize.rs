@@ -5,7 +5,7 @@ use crate::renderer::{
     create_cloud_pass_pipeline, create_cloud_resolve_bind_group, create_color_lut_texture,
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline, create_dof_bind_group,
     create_rain_depth_prepass_pipeline,
-    create_dof_pipeline, create_fast_post_bind_group, create_gamma_post_bind_group,
+    create_dof_pipeline, create_gamma_post_bind_group,
     create_gamma_post_pipeline, create_hiz_build_bind_group, create_hiz_prepass_pipeline,
     create_hiz_reduce_bind_groups, create_planar_debug_pipeline,
     create_planar_reflection_resources, create_post_bind_group,
@@ -16,7 +16,7 @@ use crate::renderer::{
     create_targets, create_texture_sampler, create_ui_pipeline, cube_texture_entry,
     depth_array_texture_entry, depth_cube_array_texture_entry, depth_texture_entry,
     empty_ui_font_texture, encode_screenshot_job, env_flag, load_texture_asset_or_missing,
-    load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font,
+    load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font, load_ui_clean_font,
     load_ui_unknown_map_texture, mpsc, no_vsync_mode, nonfiltering_sampler_entry,
     sampler_entry, sampler_entry_stages, storage_buffer_entry, supported_msaa,
     texture_2d_array_entry, texture_3d_entry, texture_3d_entry_stages, texture_entry,
@@ -108,6 +108,7 @@ impl Renderer {
             "[RENDER INIT] adapter request {:.1} ms",
             adapter_started.elapsed().as_secs_f64() * 1000.0
         );
+        crate::renderer::configure_igpu_depth_ab(&adapter);
         let info = adapter.get_info();
         eprintln!("[GPU] Requested {} ({}) -> selected {} ({:?}, {:?})",
             crate::renderer::gpu_adapter::label(gpu_adapter_mode), gpu_adapter_mode,
@@ -202,6 +203,9 @@ impl Renderer {
         }
         // Vulkan only (DX12/GL adapters never report it): persisted pipeline cache.
         required_features |= adapter_features & wgpu::Features::PIPELINE_CACHE;
+        // Native passthrough is deliberately not enabled: passing generated
+        // SPIR-V directly to the driver caused an NVIDIA access violation.
+        // The validated SPIR-V input path does not need this unsafe feature.
         // Query support is optional and only used while the FPS diagnostic graph
         // is enabled. Requesting the capability does not execute queries.
         required_features |= adapter_features & wgpu::Features::PIPELINE_STATISTICS_QUERY;
@@ -301,6 +305,7 @@ impl Renderer {
             device_started.elapsed().as_secs_f64() * 1000.0
         );
         if !offscreen { crate::pipeline_cache::install(&device, &info, base); }
+        super::world::shader_input::install_cache_root(base);
         init_mark!("adapter+device");
 
         // A lost device (TDR, driver reset, removed adapter) otherwise shows up
@@ -335,6 +340,44 @@ impl Renderer {
         let display_info = surface.display_hdr_info(&adapter);
         let output_selection = super::hdr_output::select(&caps, hdr_output_mode, Some(&display_info))
             .ok_or("Display has no compatible HDR or SDR output format")?;
+        // Genuine packed 16-bit Vulkan swapchain only. Unsupported surface
+        // formats are reported and keep the original 32-bit presentation path.
+        // No hidden offscreen RGB565 -> 32-bit conversion or additional pass.
+        let requested_rgb565 = super::rgb565_requested() != 0;
+        let rgb565_format = wgpu::TextureFormat::Rgb565Unorm;
+        let rgb565_surface_advertised = caps.formats.contains(&rgb565_format)
+            && caps.color_spaces(rgb565_format).contains(
+                wgpu::SurfaceColorSpace::Srgb.to_color_spaces().unwrap()
+            );
+        let rgb565_attachment_blend = if requested_rgb565 && info.backend == wgpu::Backend::Vulkan {
+            let features = adapter.get_texture_format_features(rgb565_format);
+            features.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                && features.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE)
+        } else {
+            false
+        };
+        let rgb565_usable = requested_rgb565 && !offscreen && hdr_output_mode == 0
+            && info.backend == wgpu::Backend::Vulkan
+            && rgb565_surface_advertised && rgb565_attachment_blend;
+        super::RGB565_EFFECTIVE.store(rgb565_usable, std::sync::atomic::Ordering::Relaxed);
+        if requested_rgb565 {
+            eprintln!(
+                "[RGB565] requested=1 effective={} backend={:?} surface_advertised={} blendable={} hdr={} offscreen={} swapchain={:?} bits_per_color_pixel={}",
+                u8::from(rgb565_usable), info.backend, rgb565_surface_advertised,
+                rgb565_attachment_blend, hdr_output_mode, offscreen,
+                if rgb565_usable { rgb565_format } else { output_selection.format },
+                if rgb565_usable { 16 } else { 32 }
+            );
+        }
+        let output_selection = if rgb565_usable {
+            super::hdr_output::Selection {
+                format: rgb565_format,
+                color_space: wgpu::SurfaceColorSpace::Srgb,
+                encoding: 3,
+            }
+        } else {
+            output_selection
+        };
         let surface_format = output_selection.format;
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -462,7 +505,7 @@ impl Renderer {
         });
         let mut pipeline_jobs = PipelineJobManager::new();
         // Full post is requested on demand by FramePlan, not during startup.
-        // No heavyweight post compilation for Minimal (Unified) + compact
+        // No heavyweight post compilation for Minimal + compact
         // grading, even when those paths render for the entire session.
         let msaa_samples = 1;
         let targets = create_targets(
@@ -475,6 +518,7 @@ impl Renderer {
             false,
             false,
             false,
+            0, // SSAO resolution (half by default)
             false,
             false,
             false,
@@ -575,10 +619,8 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             ],
         });
-        // FastBaseline retains its lightweight draw loop and surface interface.
-        // Its camera shares the grass wind image with the other world/model
-        // paths, so enabling foliage never needs an extra pass or texture.
-        // FramePlan::world_path selects these layouts when settings change.
+        // Secondary companion-view camera retains a lightweight world shader,
+        // independent of the now Unified-only main renderer.
         let fast_camera_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("JKA fast camera layout"),
@@ -1002,7 +1044,7 @@ impl Renderer {
         let fast_world_shader = create_shader_module_timed(
             &device,
             wgpu::ShaderModuleDescriptor {
-                label: Some("JKA BSP shader (known-fast baseline)"),
+                label: Some("JKA BSP shader (companion camera)"),
                 source: wgpu::ShaderSource::Wgsl(
                     format!(
                         "{}\n{}\n{}",
@@ -1097,7 +1139,7 @@ impl Renderer {
             });
         let fast_world_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("JKA BSP pipeline layout (known-fast baseline)"),
+                label: Some("JKA BSP pipeline layout (companion camera)"),
                 bind_group_layouts: &[Some(&fast_camera_layout), Some(&fast_surface_layout)],
                 immediate_size: 0,
             });
@@ -1153,6 +1195,8 @@ impl Renderer {
                 texture_entry(5),
                 texture_entry(6),
                 texture_entry(7),
+                texture_entry(8),
+                texture_entry(9),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1193,9 +1237,35 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        let screen_fx_repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA CGame screen FX repeat sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         let screen_fx_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA CGame screen FX vertices"),
             size: SCREEN_FX_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Standalone native-resolution cg_drawEnemyInfo quad(s). Prepared only
+        // when the panel exists; no texture atlas and no per-frame allocations.
+        // Lazy rendering: no per-frame work until authored HUD shaders are
+        // actually visible; the shared 2D FX PSOs are still compiled on demand.
+        let ui_icon_shader_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA standalone HUD shader stages"),
+            size: (16_384 * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let enemy_icon_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA enemy-info authored shader vertices"),
+            size: (64 * 6 * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1205,6 +1275,10 @@ impl Renderer {
         let (ui_small_font_data, ui_small_font_metrics) =
             load_ui_proportional_font(base, game, "ocr_a");
         let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
+        let (ui_clean_font_data, ui_clean_font_metrics) = load_ui_clean_font(base, game);
+        let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
+        // Filled in the background the first time a scoreboard is shown.
+        let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
         let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
@@ -1281,6 +1355,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&ui_ext_images.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&ui_clean_font.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&ui_avatars.view),
                 },
             ],
         });
@@ -1456,7 +1538,7 @@ impl Renderer {
         let ssao_temporal_shader = create_shader_module_timed(
             &device,
             wgpu::ShaderModuleDescriptor {
-                label: Some("JKA half-resolution temporal SSAO shader"),
+                label: Some("JKA temporal SSAO shader"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("../ssao_temporal.wgsl").into()),
             },
         );
@@ -1537,27 +1619,6 @@ impl Renderer {
                 bind_group_layouts: &[Some(&gamma_post_layout)],
                 immediate_size: 0,
             });
-        let fast_post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("JKA known-fast gamma post layout"),
-            entries: &[
-                texture_entry(0),
-                sampler_entry(1),
-                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
-            ],
-        });
-        let fast_post_shader = create_shader_module_timed(
-            &device,
-            wgpu::ShaderModuleDescriptor {
-                label: Some("JKA known-fast gamma post shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../post_fast.wgsl").into()),
-            },
-        );
-        let fast_post_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("JKA known-fast gamma post pipeline layout"),
-                bind_group_layouts: &[Some(&fast_post_layout)],
-                immediate_size: 0,
-            });
         // Every always-on post/screen-space pipeline is independent once its
         // shader and layout exist. Their driver compiles dominate startup, so
         // overlap them instead of stalling this thread on one after another
@@ -1570,7 +1631,6 @@ impl Renderer {
             ssr_temporal_pipeline,
             ssr_visibility_resources,
             gamma_post_pipeline,
-            fast_post_pipeline,
         ) = thread::scope(|scope| {
             let cloud_march = std::thread::Builder::new().name("pipeline-init-cloud-march".into()).spawn_scoped(scope, || {
                 timed_init_step("cloud march pipeline", || {
@@ -1627,15 +1687,6 @@ impl Renderer {
                     )
                 })
             }).expect("spawn named worker");
-            // The last one runs on this thread rather than idling at the join.
-            let fast_post = timed_init_step("fast post pipeline", || {
-                create_gamma_post_pipeline(
-                    &device,
-                    &fast_post_pipeline_layout,
-                    &fast_post_shader,
-                    config.format,
-                )
-            });
             let joined = |name: &str| format!("{name} pipeline compile thread panicked");
             (
                 cloud_march.join().expect(&joined("cloud march")),
@@ -1644,12 +1695,11 @@ impl Renderer {
                 ssr_temporal.join().expect(&joined("SSR")),
                 ssr_visibility.join().expect(&joined("SSR visibility")),
                 gamma_post.join().expect(&joined("gamma post")),
-                fast_post,
             )
         });
         rverbose!(
             1,
-            "[RENDER INIT] post/screen-space pipelines (7) compiled in parallel: {:.1} ms wall",
+            "[RENDER INIT] post/screen-space pipelines (6) compiled in parallel: {:.1} ms wall",
             post_compile_started.elapsed().as_secs_f64() * 1000.0
         );
         let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
@@ -2075,14 +2125,6 @@ impl Renderer {
             &color_lut_view,
             &color_lut_sampler,
         );
-        let fast_post_bind_group = create_fast_post_bind_group(
-            &device,
-            &fast_post_layout,
-            &targets.scene_view,
-            &post_sampler,
-            &gamma_post_buffer,
-        );
-
         let gpu_profiler = GpuProfiler::new(
             &device,
             &queue,
@@ -2455,6 +2497,8 @@ impl Renderer {
             ocean: None,
             authored_oceans: Vec::new(),
             ocean_spray_pipeline: None,
+            live_rivers: Vec::new(),
+            river_surface: None,
             authored_ocean_definitions: Vec::new(),
             water_boxes: Vec::new(),
             camera_water_surface: NO_WATER_SURFACE,
@@ -2486,7 +2530,7 @@ impl Renderer {
             bsp_model_lod_scale: 5.0,
             bsp_model_lod_bias: 0,
             bsp_model_lod_debug: false,
-            bsp_model_lod_enabled: true,
+            bsp_model_lod_enabled: false,
             patch_no_curves: false,
             patch_speeds: 0,
             shader_complexity_enabled: false,
@@ -2497,7 +2541,6 @@ impl Renderer {
             wireframe_shader,
             wireframe_pipeline,
             world_wireframe_pipelines: BTreeMap::new(),
-            fast_world_wireframe_pipeline: None,
             surface_inspector_shader,
             surface_inspector_pipeline,
             debug_volumes: DebugVolumeRenderer::default(),
@@ -2510,16 +2553,34 @@ impl Renderer {
             screen_fx_texture_layout,
             screen_fx_pipeline_layout,
             screen_fx_sampler,
+            screen_fx_repeat_sampler,
             screen_fx_white_bind_group,
             screen_fx_pipelines: HashMap::new(),
             screen_fx_textures: HashMap::new(),
             screen_fx_vertex_buffer,
             screen_fx_vertex_count: 0,
             screen_fx_batches: Vec::new(),
+            enemy_icon_resolver: None,
+            enemy_icon_key: None,
+            enemy_icon_materials: Vec::new(),
+            enemy_icon_vertex_buffer,
+            enemy_icon_batches: Vec::new(),
+            enemy_icon_vertices: Vec::new(),
+            enemy_icon_vertex_count: 0,
+            ui_icon_shader_resolver: None,
+            ui_icon_shader_materials: HashMap::new(),
+            ui_icon_shader_buffer,
+            ui_icon_shader_vertices: Vec::new(),
+            ui_icon_shader_batches: Vec::new(),
             ui_texture_layout,
             ui_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
+            _ui_clean_font: ui_clean_font,
+            ui_clean_font_metrics: ui_clean_font_metrics.map(std::sync::Arc::new),
+            _ui_avatars: ui_avatars,
+            ui_avatar_atlas: None,
+            ui_avatar_job: None,
             studio_race_font: None,
             _ui_splash: ui_splash,
             _ui_keys: ui_keys,
@@ -2542,6 +2603,7 @@ impl Renderer {
             tile_cost_overlay: None,
             ui_vertex_buffer,
             ui_vertex_count: 0,
+            ui_retained_vertices: Vec::new(),
             ui_dynamic_vertex_buffer,
             ui_dynamic_vertex_count: 0,
             ui_dynamic_stable_vertex_count: 0,
@@ -2586,6 +2648,7 @@ impl Renderer {
             world_videos: Vec::new(),
             dynamic_model_renderer,
             encoder_finish_threads: 0,
+            igpu_ab_mode: 0,
             encoder_finisher: None,
             spectator_highlight,
             white,
@@ -2621,6 +2684,7 @@ impl Renderer {
             glow_mode: GlowMode::Off,
             halation_enabled: false,
             ssao_enabled: false,
+            ssao_resolution: 0,
             static_bsp_ao_enabled: false,
             static_bsp_ao_lightmap: true,
             static_bsp_ao_samples: 32,
@@ -2737,7 +2801,6 @@ impl Renderer {
             cloud_noise_resources,
             cloud_noise_fallback,
             frame_plan: FramePlan::default(),
-            force_unified_world: false,
             foliage_wind_enabled: true,
             indirect_supported,
             gpu_compaction_supported,
@@ -2763,12 +2826,17 @@ impl Renderer {
             inline_vertex_scratch: Vec::new(),
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
+            competitive_ab: 0,
+            configured_gpu_driven: false,
+            configured_hiz_occlusion: false,
+            configured_fast_sky: 0,
             fast_sky: 0,
             sky_perf_probe: 0,
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
             dynamic_light_debug: false,
             fragment_shader_mode: 1,
+            shader_input_mode: 0,
             world_sort_mode: 0,
             ui_transient_tail_uploaded: None,
             sky_box_pipelines: None,
@@ -2777,6 +2845,11 @@ impl Renderer {
             color_clear_mode: 1,
             early_submit_enabled: false,
             present_copy_enabled: false,
+            acquire_probe_started: None,
+            acquire_probe_seconds: 0,
+            acquire_probe_frames: 0,
+            acquire_probe_acquire_ms: 0.0,
+            acquire_probe_submit_ms: 0.0,
             surface_linear_present,
             early_present_target: None,
             tinted_glass_enabled: false,
@@ -2918,9 +2991,6 @@ impl Renderer {
             gamma_post_pipeline,
             gamma_post_buffer,
             gamma_post_bind_group,
-            fast_post_layout,
-            fast_post_pipeline,
-            fast_post_bind_group,
             smaa_target: None,
             gpu_profiler,
             cull_diagnostics_readback,

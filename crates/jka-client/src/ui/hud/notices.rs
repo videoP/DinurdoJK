@@ -1,6 +1,6 @@
 //! Hud notices.
 use crate::ui::{
-    center_print_lines, fixed_charset_text, proportional_text, proportional_text_width,
+    center_print_lines, fixed_charset_text, proportional_centerprint_text, proportional_text_uniform, proportional_text_width,
     visible_jka_chars, ProportionalFont, UiSnapshot, UiVertex,
 };
 
@@ -35,8 +35,8 @@ pub(in crate::ui) fn build_center_print(
         let mut baseline = center_y - (lines.len().saturating_sub(1) as f32 * line_step * 0.5);
         for line in lines {
             let virtual_width = proportional_text_width(&line, font, scale);
-            let x = ((640.0 - virtual_width) * 0.5) * w as f32 / 640.0;
-            proportional_text(
+            let x = (w as f32 - virtual_width * y_scale) * 0.5;
+            proportional_centerprint_text(
                 out,
                 &line,
                 font,
@@ -44,7 +44,6 @@ pub(in crate::ui) fn build_center_print(
                 baseline,
                 scale,
                 [1.0, 1.0, 1.0, alpha],
-                true,
                 w,
                 h,
             );
@@ -53,9 +52,9 @@ pub(in crate::ui) fn build_center_print(
         return;
     }
 
-    let glyph_w = w as f32 * (10.0 / 640.0);
+    let glyph_w = 10.0 * y_scale;
     let glyph_h = h as f32 * (16.0 / 480.0);
-    let advance = w as f32 * (10.0 / 640.0);
+    let advance = glyph_w;
     let line_step = h as f32 * (22.0 / 480.0);
     let mut y = center_y - lines.len().saturating_sub(1) as f32 * line_step * 0.5;
     for line in lines {
@@ -106,7 +105,7 @@ pub(in crate::ui) fn build_follow_indicator(
     for (text, y, scale) in lines {
         let y = y * h as f32 / 480.0;
         if let Some(font) = small_font {
-            proportional_text(
+            proportional_text_uniform(
                 out,
                 text,
                 font,
@@ -126,9 +125,9 @@ pub(in crate::ui) fn build_follow_indicator(
             text,
             x,
             y,
-            w as f32 * (8.0 / 640.0) * glyph_scale,
+            h as f32 * (8.0 / 480.0) * glyph_scale,
             h as f32 * (12.0 / 480.0) * glyph_scale,
-            w as f32 * (8.0 / 640.0) * glyph_scale,
+            h as f32 * (8.0 / 480.0) * glyph_scale,
             [1.0, 1.0, 1.0, 1.0],
             false,
             w,
@@ -143,10 +142,10 @@ pub(in crate::ui) fn build_vote(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
         return;
     };
     let x = 4.0 * w as f32 / 640.0;
-    let glyph_w = w as f32 * (8.0 / 640.0);
+    let glyph_w = h as f32 * (8.0 / 480.0);
     let glyph_h = h as f32 * (12.0 / 480.0);
     let mut y = 62.0 * h as f32 / 480.0;
-    for text in [line, "or press ESC then click Vote"] {
+    for text in [line, "hold SCORES + Mouse 2 to vote, or ESC > Vote"] {
         fixed_charset_text(
             out,
             text,
@@ -161,5 +160,26 @@ pub(in crate::ui) fn build_vote(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
             h,
         );
         y += h as f32 * (18.0 / 480.0);
+    }
+}
+
+#[cfg(test)]
+mod widescreen_vote_tests {
+    use super::*;
+
+    #[test]
+    fn vote_fixed_charset_is_uniform_in_ultrawide() {
+        for (w, h) in [(640, 480), (1920, 1080), (2560, 1080), (1920, 700)] {
+            let mut ui = UiSnapshot::default();
+            ui.vote_line = Some("Vote".into());
+            let mut out = Vec::new();
+            build_vote(&mut out, &ui, w, h);
+            assert!(out.len() >= 6);
+            let first = &out[0..6];
+            let x = |v: &UiVertex| (v.position[0] + 1.0) * w as f32 * 0.5;
+            let width = first.iter().map(x).fold(f32::NEG_INFINITY, f32::max)
+                - first.iter().map(x).fold(f32::INFINITY, f32::min);
+            assert!((width - 8.0 * h as f32 / 480.0).abs() < 0.002);
+        }
     }
 }

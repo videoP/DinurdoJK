@@ -8,7 +8,7 @@ use crate::renderer::{
     aabb_intersects_clip_frustum, camera_depth_compare, gpu_blend_factor, pipeline_hash,
     sampler_entry, scene, storage_buffer_entry, texture_entry, uniform_entry, BTreeMap,
     BlendFactor, BlendFunc, Camera, Instant, Mat4, PipelineJobKey, PipelineJobManager, Pod, Vec3,
-    Zeroable, DEPTH_FORMAT,
+    Zeroable, depth_format,
 };
 
 #[repr(C)]
@@ -586,7 +586,7 @@ impl SurfaceSpritePipelineRecipe {
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
+                format: depth_format(),
                 depth_write_enabled: Some(depth_write && !wireframe),
                 depth_compare: Some(if wireframe { wgpu::CompareFunction::Always } else { camera_depth_compare() }),
                 stencil: wgpu::StencilState::default(),

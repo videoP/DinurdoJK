@@ -17,6 +17,7 @@ pub(crate) type TraceFn = unsafe extern "C" fn(
 );
 pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) -> i32;
 unsafe extern "C" {
+    pub fn jka_player_roll_debug(player: *const c_void, out: *mut RollPredictionDebug);
     pub fn jka_full_body_taunt(torso_anim: i32, legs_anim: i32) -> i32;
     pub fn jka_taunt_should_cancel(torso_anim: i32, legs_anim: i32, buttons: i32, upmove: i32) -> i32;
     pub fn jka_taunt_action_should_cancel(buttons: i32) -> i32;
@@ -195,6 +196,7 @@ fn rust_bridge_layout_and_constants_match_original_headers() {
         size_of::<SaberMovementInfo>() as i32,
         size_of::<PredictSettings>() as i32,
         size_of::<PredictionEntity>() as i32,
+        size_of::<RollPredictionDebug>() as i32,
     ];
     for (i, expected) in values.into_iter().enumerate() {
         assert_eq!(

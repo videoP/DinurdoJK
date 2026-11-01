@@ -106,7 +106,7 @@ pub(in crate::renderer) fn make_cull_record(
             index_range.end.saturating_sub(index_range.start),
             index_range.start,
             u32::from(source.pipeline.class == DrawClass::Sky),
-            0,
+            u32::from(source.force_sight_only) << 9,
         ],
         compact: [u32::MAX, 0, 0, 0],
         face_plane: [0.0; 4],

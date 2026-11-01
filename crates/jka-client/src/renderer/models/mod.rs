@@ -10,5 +10,6 @@ pub(in crate::renderer) mod state;
 pub(in crate::renderer) mod submission;
 pub(in crate::renderer) mod types;
 pub(in crate::renderer) mod resident_fx;
+pub(in crate::renderer) mod lightning_gpu;
 
 pub(in crate::renderer) mod legacy_blend;

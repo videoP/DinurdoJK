@@ -1,5 +1,143 @@
 //! renderer module facade. Implementations are grouped by responsibility.
 
+// Live A/B of model color transfers; default 4 uses native SDR blending
+// with exact reference fallback when direct presentation is incompatible.
+// The renderer snapshots this once per frame so target selection and drawing agree.
+// Experimental CPU-throughput A/B: mode 0 leaves configured settings unchanged.
+// Bits: 1 single encoder, 2 force bind-group caching, 4 force model bundles,
+// 8 use write_buffer_with for Ghoul2 staging uploads,
+// 16 reuse six precomputed homogeneous frustum planes for main-view AABB tests.
+static IGPU_AB_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn igpu_ab_mode() -> u8 {
+    IGPU_AB_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_igpu_ab_mode(mode: u8) {
+    IGPU_AB_MODE.store(mode.min(31), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Alternate staging for the same Ghoul2 upload bytes and ordering.
+#[inline]
+fn igpu_ab_model_upload(queue: &wgpu::Queue, buffer: &wgpu::Buffer, bytes: &[u8], mode: u8) {
+    if bytes.is_empty() { return; }
+    if mode & 8 != 0 {
+        if let Some(size) = std::num::NonZeroU64::new(bytes.len() as u64) {
+            if let Some(mut staging) = queue.write_buffer_with(buffer, 0, size) {
+                staging.copy_from_slice(bytes);
+                return;
+            }
+        }
+    }
+    queue.write_buffer(buffer, 0, bytes);
+}
+
+// Native Vulkan RGB565 swapchain A/B. No offscreen conversion or resolution change.
+static RGB565_REQUESTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static RGB565_EFFECTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn rgb565_requested() -> u8 {
+    RGB565_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_rgb565_requested(mode: u8) {
+    RGB565_REQUESTED.store(mode.min(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn rgb565_effective() -> bool {
+    RGB565_EFFECTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LEGACY_BLEND_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(4);
+
+static COMPETITIVE_AB_MODE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn competitive_ab_mode() -> u32 {
+    COMPETITIVE_AB_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_competitive_ab_mode(mode: u32) {
+    COMPETITIVE_AB_MODE.store(mode.min(competitive_probe::MAX_MODE), std::sync::atomic::Ordering::Relaxed);
+}
+
+// Bitmask experiments start at mode 16. Values 0..15 keep their exact
+// historic meanings; 16 is another unmodified baseline. For independent
+// probes set `r_competitiveAB` to 16 + one bit, or combine bits by addition.
+// These are diagnostic skip switches, NOT recommended multiplayer defaults.
+pub(crate) mod competitive_probe {
+    pub const BASE: u32 = 16;
+    pub const PVS: u32 = 1 << 0;
+    pub const AUTO4: u32 = 1 << 1;
+    pub const INLINE_PVS: u32 = 1 << 2;
+    pub const PATCH_LOD: u32 = 1 << 3;
+    pub const BSP_MODEL_LOD: u32 = 1 << 4;
+    pub const LEGACY_DLIGHT_LISTS: u32 = 1 << 5;
+    pub const ACTIVE_CULL_UPLOAD: u32 = 1 << 6;
+    pub const GRASS: u32 = 1 << 7;
+    pub const SURFACE_SPRITES: u32 = 1 << 8;
+    pub const CPU_COMPACTION: u32 = 1 << 9;
+    pub const WORLD_SORT: u32 = 1 << 10;
+    pub const FACE_CULL: u32 = 1 << 11;
+    pub const WORLD_DRAW: u32 = 1 << 12;
+    pub const WORLD_PREP_AND_DRAW: u32 = 1 << 13;
+    pub const DYNAMIC_MODELS: u32 = 1 << 14;
+    pub const CLIENT_FX: u32 = 1 << 15;
+    pub const HUD: u32 = 1 << 16;
+    pub const SUN_BAKE_SYNC: u32 = 1 << 17;
+    pub const SKY_PORTAL: u32 = 1 << 18;
+    pub const WORLD_FLARES: u32 = 1 << 19;
+    pub const NATIVE_OCEAN: u32 = 1 << 20;
+    pub const ACQUIRE_ONLY: u32 = 1 << 21;
+    pub const FORCE_FAST_SKY: u32 = 1 << 22;
+    pub const CPU_VISIBILITY_ONLY: u32 = 1 << 23;
+    pub const BSP_ONE_STAGE: u32 = 1 << 24;
+    pub const BSP_ONE_TEXTURE: u32 = 1 << 25;
+    pub const BSP_FLAT: u32 = 1 << 26;
+    pub const HIDE_BSP_PROPS: u32 = 1 << 27;
+    pub const HIDE_TRANSPARENT: u32 = 1 << 28;
+    pub const SHADOW_PASSES: u32 = 1 << 29;
+    pub const PLANAR_REFLECTIONS: u32 = 1 << 30;
+    pub const MAX_MODE: u32 = BASE + (1 << 31) - 1;
+}
+
+#[inline]
+pub(crate) fn competitive_probe_mask(mode: u32) -> u32 {
+    mode.checked_sub(competitive_probe::BASE).unwrap_or(0)
+}
+
+
+
+#[cfg(test)]
+mod competitive_probe_tests {
+    use super::{competitive_probe as p, competitive_probe_mask};
+
+    #[test]
+    fn legacy_modes_are_not_mask_probes() {
+        for mode in 0..=15 { assert_eq!(competitive_probe_mask(mode), 0); }
+        assert_eq!(competitive_probe_mask(16), 0);
+    }
+
+    #[test]
+    fn independent_and_combined_probe_bits() {
+        assert_eq!(competitive_probe_mask(16 + p::PVS), p::PVS);
+        assert_eq!(competitive_probe_mask(16 + p::PATCH_LOD), p::PATCH_LOD);
+        let combined = p::PVS | p::PATCH_LOD | p::ACTIVE_CULL_UPLOAD;
+        assert_eq!(competitive_probe_mask(16 + combined), combined);
+        assert_eq!(p::MAX_MODE, 16 + (1 << 31) - 1);
+    }
+}
+
+pub(crate) fn legacy_blend_mode() -> u8 {
+    LEGACY_BLEND_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_legacy_blend_mode(mode: u8) {
+    LEGACY_BLEND_MODE.store(mode.min(4), std::sync::atomic::Ordering::Relaxed);
+}
+
 // Narrow trace flag bridge for ocean startup instrumentation.
 pub(crate) fn first_world_frame_trace() -> bool {
     diagnostics::perf_capture::first_world_frame_trace()
@@ -36,6 +174,7 @@ pub(crate) fn input_diag_win32_message(message: *const std::ffi::c_void) {
 }
 
 mod lighting;
+mod live_river;
 mod models;
 mod neon_menu;
 mod overlay;
@@ -105,7 +244,7 @@ pub(crate) use diagnostics::tile_cost::{
 use environment::clouds::{create_cloud_fallback_resources, CloudNoiseResources};
 use environment::fog::create_world_froxel_bind_group;
 use environment::snow::{
-    create_snow_shell_gpu, draw_snow_shell, draw_snow_shell_fast, gpu_vertex_key,
+    create_snow_shell_gpu, draw_snow_shell, gpu_vertex_key,
     snow_shell_draw_near_center, SnowShellGpu,
 };
 use environment::surface_sprites::{
@@ -158,7 +297,7 @@ use lighting::shadow_resources::{
 };
 use lighting::upload::{upload_reflection_probes, upload_static_light_grid, upload_voxel_probe_gi};
 use models::pipelines::{
-    create_dynamic_model_pipeline_inner, create_fast_world_wireframe_pipeline,
+    create_dynamic_model_pipeline_inner,
     create_world_pipeline, create_world_pipeline_specialized, create_world_wireframe_pipeline,
     world_base_fragment_entry,
     project_blob_shadow_mark,
@@ -175,12 +314,12 @@ use models::types::{
 };
 use overlay::{
     empty_ui_font_texture, load_ui_font_texture, load_ui_loading_texture,
-    load_studio_overlay_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
+    load_studio_overlay_font, load_ui_clean_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
     ScreenFxTexture,
 };
 use post::bindings::{
     create_auto_exposure_bind_group, create_bloom_bind_groups, create_dof_bind_group,
-    create_fast_post_bind_group, create_gamma_post_bind_group, create_post_bind_group,
+    create_gamma_post_bind_group, create_post_bind_group,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups,
 };
 use post::color_lut::create_color_lut_texture;
@@ -314,7 +453,7 @@ use world::types::{
 };
 use world::upload::build_world;
 use world::variants::{
-    MaterialFragmentKey, WorldRenderPath, WorldShaderFamily, WorldShaderVariantKey,
+    MaterialFragmentKey, WorldShaderFamily, WorldShaderVariantKey,
 };
 
 #[path = "renderer/lighting/rt_models.rs"]
@@ -381,7 +520,53 @@ use std::{
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, event_loop::EventLoopProxy, window::Window};
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// Real GPU depth attachment bit-depth A/B; NOT a shader quantization test.
+// Changing requested mode does not affect the active device or its pipelines.
+// The effective format is selected only during renderer initialization.
+static IGPU_DEPTH_REQUESTED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+static IGPU_DEPTH_EFFECTIVE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn igpu_depth_requested() -> u8 {
+    IGPU_DEPTH_REQUESTED.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_igpu_depth_requested(mode: u8) {
+    IGPU_DEPTH_REQUESTED.store(mode.min(1), Ordering::Release);
+}
+
+fn depth_format() -> wgpu::TextureFormat {
+    match IGPU_DEPTH_EFFECTIVE.load(Ordering::Acquire) {
+        1 => wgpu::TextureFormat::Depth16Unorm,
+        _ => wgpu::TextureFormat::Depth32Float,
+    }
+}
+
+fn configure_igpu_depth_ab(adapter: &wgpu::Adapter) {
+    let requested = igpu_depth_requested();
+    let requested_format = match requested {
+        1 => wgpu::TextureFormat::Depth16Unorm,
+        _ => wgpu::TextureFormat::Depth32Float,
+    };
+    // Every scene depth texture is both renderable and sampleable.
+    let usages = adapter.get_texture_format_features(requested_format).allowed_usages;
+    // Cached sky-depth layers are also copied between depth textures.
+    let required = wgpu::TextureUsages::RENDER_ATTACHMENT
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST;
+    let effective = if usages.contains(required) { requested } else { 0 };
+    IGPU_DEPTH_EFFECTIVE.store(effective, Ordering::Release);
+    eprintln!(
+        "[IGPU DEPTH A/B] requested={} effective={} depth={:?} bits_nominal={} fallback={} (direct SDR color unchanged)",
+        requested, effective, depth_format(),
+        if effective == 1 { 16 } else { 32 },
+        requested != effective,
+    );
+}
+
+
 const UI_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 // Hot gameplay HUD and short-lived chat/center-print geometry are isolated from
 // the retained UI. These buffers are intentionally small; a normal frame uses
@@ -698,6 +883,9 @@ struct Renderer {
     )>,
     /// Shared by every ocean; lazy, see ensure_lazy_scene_pipelines.
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
+    /// Developer "riversource" patches: native Unreal river solver, debug view.
+    live_rivers: Vec<crate::river_runtime::LiveRiver>,
+    river_surface: Option<crate::river_surface::RiverSurface>,
     authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
     /// Render-space water volumes this frame (at most eight): the bounding box
     /// of each plus the outline slot that cuts holes out of it.
@@ -735,8 +923,7 @@ struct Renderer {
     world_pipeline_layout_lean: wgpu::PipelineLayout,
     fast_world_pipeline_layout: wgpu::PipelineLayout,
     world_shader: wgpu::ShaderModule,
-    // Advanced path without the newer area/GI bindings. The genuinely minimal
-    // known-fast renderer below is a separate shader/layout/render loop.
+    // Lean Unified shader without the larger area/GI binding layout.
     world_shader_lean: wgpu::ShaderModule,
     fast_world_shader: wgpu::ShaderModule,
     wireframe_supported: bool,
@@ -757,7 +944,6 @@ struct Renderer {
     /// World x-ray overlay, one per shader cull mode (`wireframe_cull_slot`).
     wireframe_pipeline: [Option<wgpu::RenderPipeline>; 3],
     world_wireframe_pipelines: BTreeMap<WorldShaderVariantKey, wgpu::RenderPipeline>,
-    fast_world_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     surface_inspector_shader: wgpu::ShaderModule,
     surface_inspector_pipeline: Option<wgpu::RenderPipeline>,
     debug_volumes: DebugVolumeRenderer,
@@ -771,16 +957,40 @@ struct Renderer {
     screen_fx_texture_layout: wgpu::BindGroupLayout,
     screen_fx_pipeline_layout: wgpu::PipelineLayout,
     screen_fx_sampler: wgpu::Sampler,
+    screen_fx_repeat_sampler: wgpu::Sampler,
     screen_fx_white_bind_group: wgpu::BindGroup,
     screen_fx_pipelines: HashMap<FxBlend, wgpu::RenderPipeline>,
     screen_fx_textures: HashMap<String, ScreenFxTexture>,
     screen_fx_vertex_buffer: wgpu::Buffer,
     screen_fx_vertex_count: u32,
     screen_fx_batches: Vec<ScreenFxBatch>,
+    /// One standalone, full-resolution, multi-stage cg_drawEnemyInfo shader.
+    enemy_icon_resolver: Option<crate::cgame::entity_presenter::EntityPresenter>,
+    enemy_icon_key: Option<String>,
+    enemy_icon_materials: Vec<crate::fx::draw::FxMaterial>,
+    enemy_icon_vertex_buffer: wgpu::Buffer,
+    enemy_icon_batches: Vec<ScreenFxBatch>,
+    enemy_icon_vertices: Vec<UiVertex>,
+    enemy_icon_vertex_count: u32,
+    /// Shader-backed native UI icons share the existing screen FX PSOs and
+    /// textures. Only currently visible icons are resolved and submitted.
+    ui_icon_shader_resolver: Option<crate::cgame::entity_presenter::EntityPresenter>,
+    ui_icon_shader_materials: HashMap<usize, Vec<crate::fx::draw::FxMaterial>>,
+    ui_icon_shader_buffer: wgpu::Buffer,
+    ui_icon_shader_vertices: Vec<UiVertex>,
+    ui_icon_shader_batches: Vec<overlay::UiIconShaderBatch>,
     ui_texture_layout: wgpu::BindGroupLayout,
     ui_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
+    /// Clean TrueType UI font (binding 8) and its metrics.
+    _ui_clean_font: GpuImage,
+    ui_clean_font_metrics: Option<std::sync::Arc<ui::ProportionalFont>>,
+    /// Scoreboard avatar atlas (binding 9), its lookup, and the background
+    /// build that produces both; no job and no atlas means not started.
+    _ui_avatars: GpuImage,
+    ui_avatar_atlas: Option<std::sync::Arc<ui::AvatarAtlas>>,
+    ui_avatar_job: Option<std::sync::mpsc::Receiver<(TextureData, ui::AvatarAtlas)>>,
     /// Studio overlay font, keyed by its choice (None inner = failed to load).
     studio_race_font: Option<(String, Option<(GpuImage, crate::ui::ProportionalFont, wgpu::BindGroup)>)>,
     _ui_splash: GpuImage,
@@ -816,6 +1026,7 @@ struct Renderer {
     tile_cost_overlay: Option<diagnostics::tile_cost::TileCostOverlay>,
     ui_vertex_buffer: wgpu::Buffer,
     ui_vertex_count: u32,
+    ui_retained_vertices: Vec<UiVertex>,
     ui_dynamic_vertex_buffer: wgpu::Buffer,
     ui_dynamic_vertex_count: u32,
     ui_dynamic_stable_vertex_count: usize,
@@ -880,6 +1091,7 @@ struct Renderer {
     world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
     encoder_finish_threads: u32,
+    igpu_ab_mode: u8,
     encoder_finisher: Option<frame::finish::EncoderFinisher>,
     spectator_highlight: SpectatorHighlightResources,
     white: GpuImage,
@@ -925,6 +1137,8 @@ struct Renderer {
     glow_mode: GlowMode,
     halation_enabled: bool,
     ssao_enabled: bool,
+    /// 0 = half-res AO, 1 = full-res AO.
+    ssao_resolution: u8,
     static_bsp_ao_enabled: bool,
     static_bsp_ao_lightmap: bool,
     static_bsp_ao_samples: u32,
@@ -1045,8 +1259,6 @@ struct Renderer {
     cloud_noise_resources: Option<CloudNoiseResources>,
     cloud_noise_fallback: CloudNoiseResources,
     frame_plan: FramePlan,
-    /// Benchmark control: never select `WorldRenderPath::FastBaseline`.
-    force_unified_world: bool,
     foliage_wind_enabled: bool,
     indirect_supported: bool,
     gpu_compaction_supported: bool,
@@ -1092,6 +1304,14 @@ struct Renderer {
     draw_bsp_model_surfaces: bool,
     /// 0 all, 1 opaque/masked only, 2 transparent only (diagnostic).
     world_stage_probe: u8,
+    /// 0 stock, 1..4 diagnostics, 5..9 stripped, 10..15 throughput/fragment experiments.
+    competitive_ab: u32,
+    /// Requested GPU culling state; competitive CPU-only stage selection
+    /// temporarily bypasses indirect submission without losing the user's choice.
+    configured_gpu_driven: bool,
+    configured_hiz_occlusion: bool,
+    /// User-selected fast sky, restored after leaving a competitive mode.
+    configured_fast_sky: u8,
     /// TaystJK fast-sky palette mode; never selects an alternate renderer.
     fast_sky: u8,
     /// Session-only sky fragment diagnostic; zero has no effect on authored rendering.
@@ -1101,6 +1321,8 @@ struct Renderer {
     dynamic_light_debug: bool,
     /// r_fragmentShaderMode (see `MaterialFragmentKey`).
     fragment_shader_mode: u8,
+    /// BSP shader source input A/B; independent of r_fragmentShaderMode.
+    shader_input_mode: u8,
     /// r_worldSortMode, 0 authored-sort baseline, 1 pipeline-first within safe opaque runs.
     world_sort_mode: u8,
     /// TaystJK-style sky box face PSOs, keyed by (scene format, MSAA, Enhanced).
@@ -1109,13 +1331,19 @@ struct Renderer {
     sky_cloud_pipelines: HashMap<BlendMode, wgpu::RenderPipeline>,
     /// Index buffer of the map `sky_cloud_pipelines` was filled for.
     sky_cloud_world: Option<wgpu::Buffer>,
-    /// r_colorClearMode: 0 always clear the world colour target, 1 skip it when
-    /// the map's sky box covers the background.
+    /// r_colorClearMode: 0 always clear, 1 skip beneath authored sky,
+    /// 2 always load the main world color attachment (even with fast sky).
     color_clear_mode: u8,
     /// r_earlySubmit: see `EarlyPresentTarget`.
     early_submit_enabled: bool,
     /// r_presentCopy: see `Renderer::present_copy_frame`.
     present_copy_enabled: bool,
+    /// Timed, session-only acquire/present test: clear and present, no world work.
+    acquire_probe_started: Option<Instant>,
+    acquire_probe_seconds: u32,
+    acquire_probe_frames: u64,
+    acquire_probe_acquire_ms: f64,
+    acquire_probe_submit_ms: f64,
     /// The surface supports the UNORM twin of the sRGB render format.
     surface_linear_present: bool,
     early_present_target: Option<EarlyPresentTarget>,
@@ -1274,9 +1502,6 @@ struct Renderer {
     gamma_post_pipeline: wgpu::RenderPipeline,
     gamma_post_buffer: wgpu::Buffer,
     gamma_post_bind_group: wgpu::BindGroup,
-    fast_post_layout: wgpu::BindGroupLayout,
-    fast_post_pipeline: wgpu::RenderPipeline,
-    fast_post_bind_group: wgpu::BindGroup,
     // Created lazily on first use so SMAA adds no resources or pipeline work
     // to the maximum-FPS path unless the user selects it.
     smaa_target: Option<smaa::SmaaTarget>,

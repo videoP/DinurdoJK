@@ -1,6 +1,91 @@
 //! Game.
 use crate::app::egui_settings::{segmented_row, theme, App};
 
+#[cfg(windows)]
+#[derive(Clone)]
+struct JkaLinkSettings {
+    status: Result<crate::protocol_link::RegistrationStatus, String>,
+    confirm_replace: bool,
+    message: Option<Result<String, String>>,
+}
+
+#[cfg(windows)]
+fn jka_link_settings(ui: &mut egui::Ui) {
+    use crate::protocol_link::{self, RegistrationStatus};
+
+    // Cache the registry read across egui frames. Refresh handles external changes.
+    let id = ui.make_persistent_id("jka_protocol_registration_state");
+    let mut state = ui.ctx().data(|data| data.get_temp::<JkaLinkSettings>(id))
+        .unwrap_or_else(|| JkaLinkSettings {
+            status: protocol_link::registration_status(),
+            confirm_replace: false,
+            message: None,
+        });
+
+    theme::section(ui, "SERVER LINKS", "Windows jka:// server links. No registry changes occur on game startup.");
+    theme::row(ui, "Open jka:// links", "Explicitly register this executable to handle jka://host[:port] links for your Windows user. Other clients' associations are not replaced without confirmation.", theme::Reset::None, |ui| {
+        match state.status.clone() {
+            Ok(RegistrationStatus::OwnedByUs) => {
+                ui.label("Registered to DinurdoJK");
+                if ui.button("Unregister").clicked() {
+                    state.message = Some(match protocol_link::unregister_explicit() {
+                        Ok(true) => Ok("DinurdoJK's jka:// handler removed.".to_owned()),
+                        Ok(false) => Err("Association is no longer owned by this executable; nothing was removed.".to_owned()),
+                        Err(error) => Err(error),
+                    });
+                    state.status = protocol_link::registration_status();
+                    state.confirm_replace = false;
+                }
+            }
+            Ok(RegistrationStatus::Unregistered) => {
+                ui.label("Not registered");
+                if ui.button("Register").clicked() {
+                    state.message = Some(protocol_link::register_if_unclaimed_explicit()
+                        .map(|()| "DinurdoJK registered for jka:// links.".to_owned()));
+                    state.status = protocol_link::registration_status();
+                }
+            }
+            Ok(RegistrationStatus::OtherHandler) => {
+                ui.label("Another application is registered");
+                if ui.button("Change handler...").clicked() {
+                    state.confirm_replace = true;
+                    state.message = None;
+                }
+            }
+            Err(ref error) => { ui.colored_label(theme::WARNING(), error); }
+        }
+        if ui.button("Refresh").clicked() {
+            state.status = protocol_link::registration_status();
+            state.confirm_replace = false;
+            state.message = None;
+        }
+    });
+
+    if state.confirm_replace {
+        ui.label("Replace the current jka:// registry handler with DinurdoJK for this Windows user?");
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                state.confirm_replace = false;
+            }
+            if ui.button("Confirm replacement").clicked() {
+                // Another process might have changed this association after
+                // the UI was opened; this is the user's explicit opt-in.
+                state.message = Some(protocol_link::register_explicit()
+                    .map(|()| "DinurdoJK registered for jka:// links.".to_owned()));
+                state.status = protocol_link::registration_status();
+                state.confirm_replace = false;
+            }
+        });
+    }
+    if let Some(message) = &state.message {
+        match message {
+            Ok(text) => { ui.label(text); }
+            Err(error) => { ui.colored_label(theme::WARNING(), error); }
+        }
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(id, state));
+}
+
 impl App {
     pub(in crate::app) fn egui_game_settings(&mut self, ui: &mut egui::Ui) {
         theme::page_title(
@@ -34,6 +119,9 @@ impl App {
                     },
                 );
 
+                #[cfg(windows)]
+                jka_link_settings(ui);
+
                 theme::section(ui, "UPDATES", "Check GitHub Releases on launch. Downloads are always manual.");
                 theme::row(ui, "Check for updates at launch",
                     "Checks videop/DinurdoJK once at launch. Only announces a newer stable release; never downloads automatically.",
@@ -47,7 +135,7 @@ impl App {
                 if ui.button("Check for Updates").clicked() { self.check_for_updates(true); }
                 if self.updater.checking { ui.label("Checking GitHub..."); }
                 if let Some(result) = &self.updater.manual_result { ui.label(result); }
-                if let Some(error) = &self.updater.error { ui.colored_label(theme::WARNING, error); }
+                if let Some(error) = &self.updater.error { ui.colored_label(theme::WARNING(), error); }
                 if let Some(release) = self.updater.release.clone() {
                     ui.label(format!("Available: {} (installed: {})", release.tag, env!("CARGO_PKG_VERSION")));
                     if self.updater.downloading {

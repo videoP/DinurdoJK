@@ -150,6 +150,80 @@ pub struct EntityDispatchSummary {
     pub rendered_surfaces: usize,
 }
 
+/// Four camera-facing vertices are enough: all optics run in screen space in
+/// the shared Glass pass. Unlike testboom.md3, this needs no PK3 asset and
+/// introduces no particle simulation, extra scene copy, or postprocess pass.
+fn force_shockwave_surface(
+    cosmetic: &super::player_presenter::CosmeticDraw,
+    eye: [f32; 3],
+) -> DynamicModelSurface {
+    let source = cosmetic.origin;
+    let distance_vec = std::array::from_fn::<_, 3, _>(|i| source[i] - eye[i]);
+    let distance = distance_vec.iter().map(|v| v * v).sum::<f32>().sqrt().max(0.001);
+    let forward = distance_vec.map(|v| v / distance); // Eye -> real hand.
+    let cross = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+        [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+    };
+    let unit = |v: [f32; 3]| -> [f32; 3] {
+        let len = v.iter().map(|c| c*c).sum::<f32>().sqrt().max(0.001);
+        v.map(|c| c / len)
+    };
+    // JKA axis[1] is model-left. Build a stable orthogonal basis from the
+    // camera ray, *not* the player's viewing or hand orientation: the first
+    // version used the latter and could vanish or go edge-on in normal play.
+    let world_up = if forward[2].abs() > 0.95 { [0.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let left = unit(cross(world_up, forward));
+    let up = cross(forward, left);
+    // Render a perspective-equivalent proxy in front of opaque actors. The
+    // Glass pipeline still depth-tests this proxy, but the fragment shader
+    // rejects scene samples that lie in front of the *real* hand position.
+    // This avoids an otherwise fully occluded quad at a player's palm while
+    // preserving scene/world depth coherence without a second render pass.
+    let proxy_distance = (distance * 0.25).clamp(8.0, 32.0).min(distance * 0.75);
+    let proxy_origin = std::array::from_fn::<_, 3, _>(|i| eye[i] + forward[i] * proxy_distance);
+    let proxy_radius = cosmetic.rgba[2] * (proxy_distance / distance);
+    let real_centre = scene::render_position(source);
+    let mut vertices = Vec::with_capacity(4);
+    for (sx, sy, u, v) in [(-1.0_f32,-1.0_f32,0.0_f32,1.0_f32),
+                          ( 1.0,-1.0,1.0,1.0),
+                          ( 1.0, 1.0,1.0,0.0),
+                          (-1.0, 1.0,0.0,0.0)] {
+        let point = std::array::from_fn(|i| proxy_origin[i]
+            + proxy_radius * (-sx * left[i] + sy * up[i]));
+        vertices.push(DynamicModelVertex {
+            position: scene::render_position(point),
+            normal: scene::render_position(forward.map(|c| -c)),
+            uv: [u, v],
+            // Glass uses negative alpha as a specialized FX marker. Keep the
+            // actual hand position separate from the proxy vertex positions.
+            color: [real_centre[0], real_centre[1], real_centre[2], -6.0 - cosmetic.rgba[0]],
+            depth_hack: cosmetic.rgba[3],
+            water_wetness: cosmetic.rgba[1],
+            foliage_wind: 0.0,
+        });
+    }
+    DynamicModelSurface {
+        geometry_source: crate::renderer::ModelGeometrySource::Fx,
+        authored_lighting: false,
+        material_trace: Some(Arc::from("INTERNAL: depth-aware Force Push/Pull screen-space shockwave")),
+        entity_num: cosmetic.entity_num,
+        wireframe_class: DynamicWireframeClass::Effect,
+        raster_visible: true,
+        vertices: Arc::new(vertices),
+        // The basis is (forward, left, up). With the positions above, the
+        // triangle normal points back to the eye and survives backface culling.
+        indices: Arc::new(vec![0,1,2,0,2,3]),
+        lighting_origin: None,
+        rt_rigid: None,
+        rt_skinned_key: None,
+        ghoul2_gpu: None,
+        fx_gpu_sprites: None,
+        authored_glow: false,
+        texture: None,
+        alpha_mode: DynamicModelAlphaMode::Glass,
+    }
+}
+
 pub struct EntityPresenter {
     assets: AssetSearchPath,
     pbr: bool,
@@ -1674,6 +1748,10 @@ impl EntityPresenter {
     ) -> Vec<DynamicModelSurface> {
         let mut draws = Vec::new();
         for cosmetic in cosmetics {
+            if cosmetic.custom_shader == Some("internal/force_shockwave") {
+                draws.push(force_shockwave_surface(&cosmetic, self.material_eye));
+                continue;
+            }
             if cosmetic.model.ends_with(".djk_prop") {
                 match self.present_imported_prop(cosmetic.entity_num,&cosmetic.model,cosmetic.origin,cosmetic.axis,cosmetic.rgba,cosmetic.skin_pose.as_deref().map(|v|v.as_slice())) {
                     Ok(mut surfaces)=>draws.append(&mut surfaces),
@@ -2833,7 +2911,7 @@ impl EntityPresenter {
             tc_mods: Vec::new(),
             shader_time_offset: self.shader_remaps.time_offset_for(&effective),
             shader_clamp_time: None,
-            authored_glow: false,
+            authored_glow: false, alpha_test: 0.0,
         }];
         self.fx_materials.insert(key, materials.clone());
         Some(materials)
@@ -2953,7 +3031,7 @@ impl EntityPresenter {
                 tc_mods: Vec::new(),
                 shader_time_offset: 0.0,
                 shader_clamp_time: None,
-                authored_glow: false,
+                authored_glow: false, alpha_test: 0.0,
             }];
         }
         if let Some(materials) = self.fx_materials.get(&key) {
@@ -3011,6 +3089,13 @@ impl EntityPresenter {
                 shader_time_offset,
                 shader_clamp_time,
                 authored_glow: stage.glow,
+                alpha_test: match stage.alpha_test.as_str() {
+                    "ge128" => 0.5,
+                    "ge192" => 0.75,
+                    "gt0" => 1.0 / 255.0,
+                    "lt128" => -0.5,
+                    _ => 0.0,
+                },
             });
         }
         if materials.is_empty() {
@@ -3038,7 +3123,7 @@ impl EntityPresenter {
                     tc_mods: Vec::new(),
                     shader_time_offset,
                     shader_clamp_time,
-                    authored_glow: false,
+                    authored_glow: false, alpha_test: 0.0,
                 });
             } else {
                 // Faithful RE_RegisterShader behavior: an explicit .shader
@@ -3063,7 +3148,7 @@ impl EntityPresenter {
                         tc_mods: Vec::new(),
                         shader_time_offset,
                         shader_clamp_time,
-                        authored_glow: false,
+                        authored_glow: false, alpha_test: 0.0,
                     }),
                     None => {
                         if let Some(texture) = self.rgb_saber_fallback_texture(&effective) {
@@ -3082,7 +3167,7 @@ impl EntityPresenter {
                                 tc_mods: Vec::new(),
                                 shader_time_offset,
                                 shader_clamp_time,
-                                authored_glow: false,
+                                authored_glow: false, alpha_test: 0.0,
                             });
                         } else {
                             if let Some(warning) = self.textures.warnings.last() {
@@ -3107,7 +3192,7 @@ impl EntityPresenter {
                                 tc_mods: Vec::new(),
                                 shader_time_offset,
                                 shader_clamp_time,
-                                authored_glow: false,
+                                authored_glow: false, alpha_test: 0.0,
                             });
                         }
                     }
@@ -3679,6 +3764,43 @@ fn facing_axis(axis: [[f32; 3]; 3], origin: [f32; 3], eye: [f32; 3], locked: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_shockwave_proxy_faces_camera_and_retains_real_hand_depth() {
+        let eye = [0.0, 0.0, 0.0];
+        let cosmetic = super::super::player_presenter::CosmeticDraw {
+            entity_num: 2,
+            model: "internal/force_shockwave".into(),
+            origin: [180.0, 0.0, 0.0],
+            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            rgba: [0.25, 0.0, 120.0, 1.0],
+            custom_shader: Some("internal/force_shockwave"),
+            skin_pose: None,
+            face_camera: None,
+        };
+        let surface = force_shockwave_surface(&cosmetic, eye);
+        assert_eq!(surface.indices.as_slice(), &[0, 1, 2, 0, 2, 3]);
+        assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::Glass);
+        let p = |i: usize| surface.vertices[i].position;
+        let delta = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+            std::array::from_fn(|i| a[i] - b[i])
+        };
+        let a = delta(p(1), p(0));
+        let b = delta(p(2), p(0));
+        let n = [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]];
+        let centre: [f32; 3] = std::array::from_fn(|axis| {
+            surface.vertices.iter().map(|v| v.position[axis]).sum::<f32>() * 0.25
+        });
+        let eye_direction = delta(scene::render_position(eye), centre);
+        assert!(n.iter().zip(eye_direction).map(|(x, y)| x * y).sum::<f32>() > 0.0,
+            "backface culled camera-facing shockwave");
+        // A hand 180 units away projects to a proxy 32 units away; its 120u
+        // radius must scale by 32/180 to preserve the *screen-space* size.
+        assert!((centre[0] - 32.0).abs() < 0.001);
+        assert!(((p(0)[1] - centre[1]).abs() - 120.0 * 32.0 / 180.0).abs() < 0.001);
+        assert_eq!(&surface.vertices[0].color[..3], &scene::render_position(cosmetic.origin));
+        assert!((surface.vertices[0].color[3] + 6.25).abs() < 0.0001);
+    }
 
     #[test]
     #[ignore = "requires DJK_FN_ASSET_BASE with a converted native prop PK3"]

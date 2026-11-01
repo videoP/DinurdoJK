@@ -5,7 +5,7 @@ use crate::renderer::{
     DrawClass, DynamicModelAlphaMode, DynamicModelRenderer, DynamicModelVertex,
     FxGpuSpriteInstance, Ghoul2GpuVertex, GpuVertex, PipelineJobKey, PipelineJobManager,
     MaterialFragmentKey, PipelineKey, Vec3, WorldShaderVariantKey, BLOB_MARK_PROJECTION, BLOB_MARK_SURFACE_LIFT,
-    DEPTH_FORMAT, DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
+    depth_format, DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
     FX_GPU_SPRITE_INSTANCE_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
     LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_ATTRIBUTES, VERTEX_ATTRIBUTES,
 };
@@ -694,7 +694,7 @@ pub(in crate::renderer) fn create_dynamic_wireframe_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -749,7 +749,7 @@ pub(in crate::renderer) fn create_ghoul2_wireframe_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -991,7 +991,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
             depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
                 wgpu::CompareFunction::Always
@@ -1075,7 +1075,7 @@ pub(in crate::renderer) fn create_fx_sprite_wireframe_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -1306,7 +1306,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
             depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
                 wgpu::CompareFunction::Always
@@ -1497,7 +1497,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(dynamic_model_writes_depth(alpha_mode)),
             depth_compare: Some(if alpha_mode == DynamicModelAlphaMode::SightShellNoDepth {
                 wgpu::CompareFunction::Always
@@ -1586,7 +1586,7 @@ pub(in crate::renderer) fn create_world_wireframe_pipeline(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(false),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
@@ -1603,61 +1603,6 @@ pub(in crate::renderer) fn create_world_wireframe_pipeline(
                 constants: &shader_constants,
                 ..Default::default()
             },
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: crate::pipeline_cache::get().as_ref(),
-    })
-}
-
-pub(in crate::renderer) fn create_fast_world_wireframe_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    shader: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-    msaa_samples: u32,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("JKA fast deformed-world wireframe pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRIBUTES,
-            })],
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Line,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Always),
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: msaa_samples,
-            ..Default::default()
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_wireframe"),
-            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: None,
@@ -1922,6 +1867,24 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         println!("[{kind} pipeline BEGIN] id={id} hash={fingerprint:016x} source_hash={source_hash:?} thread={:?} key={key:?} variant={shader_variant:?} vs={vertex_entry_point} fs={fragment_entry_point} format={surface_format:?} msaa={msaa_samples} legacy_fog={legacy_fog} fog_pass={fog_pass} legacy_dlight_pass={legacy_dlight_pass}", current_thread.name());
         Some(id)
     } else { None };
+    // World-stage SPIR-V A/B: bake the *same* vertex/fragment overrides before
+    // importing SPIR-V. All of this executes on the existing pipeline compiler,
+    // never on the draw hot path. Other passes deliberately remain unchanged.
+    let input_modules = if !shader_complexity {
+        shader_variant.and_then(|variant| {
+            crate::renderer::world::shader_input::prepare(
+                device, variant, material_key,
+                vertex_entry_point, fragment_entry_point,
+                vertex_shader_constants.as_deref().unwrap_or(&[]),
+                shader_constants.as_deref().unwrap_or(&[]),
+            )
+        })
+    } else { None };
+    // wgpu can reject a structurally valid SPIR-V program at final pipeline
+    // layout / stage-interface validation. Catch that too, so an experimental
+    // input format can never take the whole client down with an uncaptured
+    // wgpu validation error. Only scope the experimental path.
+    let input_error_scope = input_modules.as_ref().map(|_| device.push_error_scope(wgpu::ErrorFilter::Validation));
     let native_compile_started = std::time::Instant::now();
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if legacy_dlight_pass {
@@ -1933,9 +1896,9 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
-            module: shader,
+            module: input_modules.as_ref().map_or(shader, |modules| &modules.vertex),
             entry_point: Some(vertex_entry_point),
-            compilation_options: vertex_compilation_options,
+            compilation_options: if input_modules.is_some() { Default::default() } else { vertex_compilation_options },
             buffers: &vertex_buffers,
         },
         primitive: wgpu::PrimitiveState {
@@ -1952,7 +1915,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             conservative: false,
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
+            format: depth_format(),
             depth_write_enabled: Some(if shader_complexity || legacy_dlight_pass {
                 false
             } else {
@@ -1979,9 +1942,9 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {
-            module: complexity_fragment.unwrap_or(shader),
+            module: input_modules.as_ref().map_or(complexity_fragment.unwrap_or(shader), |modules| &modules.fragment),
             entry_point: Some(fragment_entry_point),
-            compilation_options: fragment_compilation_options,
+            compilation_options: if input_modules.is_some() { Default::default() } else { fragment_compilation_options },
             targets: &[Some(wgpu::ColorTargetState {
                 format: if shader_complexity { wgpu::TextureFormat::Rgba16Float } else { surface_format },
                 blend,
@@ -1991,6 +1954,30 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         multiview_mask: None,
         cache: crate::pipeline_cache::get().as_ref(),
     });
+    if let Some(scope) = input_error_scope {
+        if let Some(error) = futures_lite::future::block_on(scope.pop()) {
+            let reason = format!("SPIR-V pipeline validation rejected vs={vertex_entry_point} fs={fragment_entry_point}: {error}; retrying WGSL");
+            crate::renderer::world::shader_input::quarantine_pipeline(
+                shader_variant.expect("SPIR-V pipeline requires a variant"), material_key,
+                vertex_entry_point, fragment_entry_point,
+                vertex_shader_constants.as_deref().unwrap_or(&[]),
+                shader_constants.as_deref().unwrap_or(&[]), &reason,
+            );
+            if let Some(id) = compile_id {
+                println!("[BSP pipeline END] id={id} hash={fingerprint:016x} result=WGSL-fallback");
+            }
+            // Re-run the same pipeline recipe, but with the original WGSL
+            // program and its original override constants. The recursive
+            // invocation cannot reselect SPIR-V because its variant mode is 0.
+            let mut wgsl_variant = shader_variant.expect("SPIR-V pipeline requires a variant");
+            wgsl_variant.shader_input_mode = 0;
+            return create_world_pipeline_specialized(
+                device, layout, shader, surface_format, key, msaa_samples,
+                legacy_fog, fog_pass, Some(wgsl_variant), legacy_dlight_pass,
+                complexity_fragment, material_key, minimal_entry,
+            );
+        }
+    }
     if let Some(id) = compile_id {
         let kind = if is_rt { "RT" } else { "BSP" };
         println!("[{kind} pipeline END] id={id} hash={fingerprint:016x} elapsed_ms={:.2}",

@@ -15,7 +15,7 @@ impl App {
                     theme::plain(
                         "Loose .map brush editing is available for this world.",
                         10.5,
-                        theme::TEXT_FAINT,
+                        theme::TEXT_FAINT(),
                     ),
                 );
             });
@@ -57,15 +57,15 @@ impl App {
             theme::page_title(ui, "JOIN", &format!("Currently {}.", mode.to_lowercase()));
             if let Some(hostname) = self.current_server_hostname() {
                 ui.horizontal(|ui| {
-                    theme::glow_label(ui, "On", 12.0, theme::TEXT_FAINT);
+                    theme::glow_label(ui, "On", 12.0, theme::TEXT_FAINT());
                     ui.add(egui::Label::new(jka_colored_text(
                         &hostname,
                         13.0,
-                        theme::TEXT,
+                        theme::TEXT(),
                     )));
                     if let Some(active_mod) = self.ui_mod() {
-                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT));
-                        theme::glow_label(ui, active_mod.label(), 11.5, theme::TEXT_DIM);
+                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT()));
+                        theme::glow_label(ui, active_mod.label(), 11.5, theme::TEXT_DIM());
                     }
                     // The live gamestate supplies the authoritative map name;
                     // use the active session so this follows map changes too.
@@ -76,8 +76,8 @@ impl App {
                         .and_then(|session| session.map_name.as_deref())
                         .filter(|name| !name.is_empty())
                     {
-                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT));
-                        theme::glow_label(ui, map_name, 11.5, theme::TEXT_DIM);
+                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT()));
+                        theme::glow_label(ui, map_name, 11.5, theme::TEXT_DIM());
                     }
                 });
                 ui.add_space(8.0);

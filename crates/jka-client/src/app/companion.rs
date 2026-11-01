@@ -430,7 +430,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(format!("SECONDARY POV · {name}"))
                                         .strong()
-                                        .color(theme::TEXT),
+                                        .color(theme::TEXT()),
                                 );
                             });
                     });
@@ -438,7 +438,7 @@ impl App {
             }
 
             egui::Frame::new()
-                .fill(theme::PANEL_FILL)
+                .fill(theme::PANEL_FILL())
                 .inner_margin(egui::Margin::same(12))
                 .show(root, |ui| {
                     ui.centered_and_justified(|ui| {
@@ -448,7 +448,7 @@ impl App {
                                 egui::RichText::new(
                                     "That player is not present in the current spectator snapshot/PVS.",
                                 )
-                                .color(theme::TEXT_DIM),
+                                .color(theme::TEXT_DIM()),
                             );
                         });
                     });
@@ -457,14 +457,14 @@ impl App {
         }
 
         let frame = egui::Frame::new()
-            .fill(theme::PANEL_FILL)
+            .fill(theme::PANEL_FILL())
             .inner_margin(egui::Margin::same(12));
         frame.show(root, |ui| {
             ui.label(
                 egui::RichText::new("DINURDOJK COMPANION")
                     .strong()
                     .size(15.0)
-                    .color(theme::TEXT),
+                    .color(theme::TEXT()),
             );
             ui.add_space(4.0);
 
@@ -473,7 +473,7 @@ impl App {
             // strip at the top, scoreboard above, and give the console the remaining
             // space so all three surfaces stay visible while the game owns focus.
             egui::Frame::new()
-                .fill(theme::PANEL_FILL)
+                .fill(theme::PANEL_FILL())
                 .inner_margin(egui::Margin::symmetric(4, 4))
                 .show(ui, |ui| self.draw_companion_server_info(ui));
 
@@ -483,7 +483,7 @@ impl App {
                     egui::RichText::new("SCOREBOARD")
                         .strong()
                         .size(13.0)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::TEXT_DIM()),
                 );
                 // Optional explicit refresh, not an automatic background poll:
                 // shared server flood protection can otherwise drop chat.
@@ -505,7 +505,7 @@ impl App {
                 egui::RichText::new("CONSOLE")
                     .strong()
                     .size(13.0)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::TEXT_DIM()),
             );
             self.draw_companion_console(ui);
         });
@@ -526,7 +526,7 @@ impl App {
                         egui::RichText::new(crate::logging::strip_jka_colors(line))
                             .monospace()
                             .size(12.0)
-                            .color(theme::TEXT),
+                            .color(theme::TEXT()),
                     );
                 }
             });
@@ -535,7 +535,7 @@ impl App {
     fn draw_companion_scoreboard(&mut self, ui: &mut egui::Ui) {
         let Some(board) = self.scoreboard.as_ref() else {
             ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new("Waiting for scoreboard data…").color(theme::TEXT_DIM));
+                ui.label(egui::RichText::new("Waiting for scoreboard data…").color(theme::TEXT_DIM()));
             });
             return;
         };
@@ -565,7 +565,7 @@ impl App {
                         for entry in &board.entries {
                             ui.label(
                                 egui::RichText::new(crate::logging::strip_jka_colors(&entry.name))
-                                    .color(theme::TEXT),
+                                    .color(theme::TEXT()),
                             );
                             ui.label(entry.score.to_string());
                             let ping = if entry.ping < 0 {
@@ -610,8 +610,8 @@ impl App {
         // that should consume a large fraction of the companion display.
         ui.horizontal_wrapped(|ui| {
             let field = |ui: &mut egui::Ui, label: &str, value: String| {
-                ui.label(egui::RichText::new(label).color(theme::TEXT_DIM));
-                ui.label(egui::RichText::new(value).color(theme::TEXT));
+                ui.label(egui::RichText::new(label).color(theme::TEXT_DIM()));
+                ui.label(egui::RichText::new(value).color(theme::TEXT()));
                 ui.add_space(12.0);
             };
             field(ui, "SERVER", server.to_owned());
@@ -627,7 +627,7 @@ impl App {
         ui.label(
             egui::RichText::new(&self.console_status)
                 .small()
-                .color(theme::TEXT_DIM),
+                .color(theme::TEXT_DIM()),
         );
     }
 

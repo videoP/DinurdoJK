@@ -1,6 +1,6 @@
 //! Hud team.
 use crate::ui::{
-    fixed_charset_text, proportional_text, proportional_text_width, rect, text,
+    fixed_charset_text, proportional_text_uniform, proportional_text_width, rect, text,
     shared_player_icon_count, textured_rect_with_source, truncate_jka_text, visible_jka_chars,
     ProportionalFont, UiSnapshot, UiVertex, TEAM_ICON_CELL, TEAM_ICON_COLUMNS,
     TEAM_ICON_TEXTURE_SOURCE,
@@ -329,8 +329,8 @@ pub(in crate::ui) fn build_team_overlay(
                     y_v + card_h_v / 3.0 - text_h_v / 2.0 - 2.5
                 };
                 if let Some(font) = small_font {
-                    let name_w_v = proportional_text_width(&name, font, 0.55);
-                    proportional_text(
+                    let name_w_v = proportional_text_width(&name, font, 0.55) * ratio;
+                    proportional_text_uniform(
                         out,
                         &name,
                         font,
@@ -343,8 +343,8 @@ pub(in crate::ui) fn build_team_overlay(
                         h,
                     );
                     if has_locations {
-                        let loc_w_v = proportional_text_width(&loc, font, 0.55);
-                        proportional_text(
+                        let loc_w_v = proportional_text_width(&loc, font, 0.55) * ratio;
+                        proportional_text_uniform(
                             out,
                             &loc,
                             font,
@@ -358,30 +358,30 @@ pub(in crate::ui) fn build_team_overlay(
                         );
                     }
                 } else {
-                    let name_w_v = visible_jka_chars(&name) as f32 * 5.0;
+                    let name_w_v = visible_jka_chars(&name) as f32 * 5.0 * ratio;
                     fixed_charset_text(
                         out,
                         &name,
                         (x_v + card_w_v / 2.0 - name_w_v / 2.0) * sx,
                         name_y_v * sy,
-                        5.0 * sx,
+                        5.0 * sy,
                         8.0 * sy,
-                        5.0 * sx,
+                        5.0 * sy,
                         [1.0; 4],
                         false,
                         w,
                         h,
                     );
                     if has_locations {
-                        let loc_w_v = visible_jka_chars(&loc) as f32 * 5.0;
+                        let loc_w_v = visible_jka_chars(&loc) as f32 * 5.0 * ratio;
                         fixed_charset_text(
                             out,
                             &loc,
                             (x_v + card_w_v / 2.0 - loc_w_v / 2.0) * sx,
                             (y_v + card_h_v / 2.0 - text_h_v / 1.4) * sy,
-                            5.0 * sx,
+                            5.0 * sy,
                             8.0 * sy,
-                            5.0 * sx,
+                            5.0 * sy,
                             [1.0; 4],
                             false,
                             w,
@@ -409,14 +409,14 @@ pub(in crate::ui) fn build_team_overlay(
                         break;
                     }
                     let value_w_v = if let Some(font) = small_font {
-                        proportional_text_width(&value, font, 0.55)
+                        proportional_text_width(&value, font, 0.55) * ratio
                     } else {
-                        visible_jka_chars(&value) as f32 * 5.0
+                        visible_jka_chars(&value) as f32 * 5.0 * ratio
                     };
                     let tx_v =
                         x_v + (slot as f32 + 1.0) * card_w_v / (elements + 1.0) - value_w_v / 2.0;
                     if let Some(font) = small_font {
-                        proportional_text(
+                        proportional_text_uniform(
                             out,
                             &value,
                             font,
@@ -434,9 +434,9 @@ pub(in crate::ui) fn build_team_overlay(
                             &value,
                             tx_v * sx,
                             stats_y_v * sy,
-                            5.0 * sx,
+                            5.0 * sy,
                             8.0 * sy,
-                            5.0 * sx,
+                            5.0 * sy,
                             color,
                             false,
                             w,
@@ -548,9 +548,9 @@ pub(in crate::ui) fn build_team_overlay(
                 let total = entry.health.max(0).saturating_add(entry.armor.max(0));
                 let total_text = total.to_string();
                 let total_w_v = if let Some(font) = small_font {
-                    proportional_text_width(&total_text, font, text_scale)
+                    proportional_text_width(&total_text, font, text_scale) * ratio
                 } else {
-                    visible_jka_chars(&total_text) as f32 * 5.0 * scale
+                    visible_jka_chars(&total_text) as f32 * 5.0 * scale * ratio
                 };
                 let total_x_v = panel_x_v + panel_w_v - pad_x_v - total_w_v;
                 let mut text_color = [1.0; 4];
@@ -558,7 +558,7 @@ pub(in crate::ui) fn build_team_overlay(
                     text_color[3] = 0.4;
                 }
                 if let Some(font) = small_font {
-                    proportional_text(
+                    proportional_text_uniform(
                         out,
                         &total_text,
                         font,
@@ -576,9 +576,9 @@ pub(in crate::ui) fn build_team_overlay(
                         &total_text,
                         total_x_v * sx,
                         (y_v + pad_v) * sy,
-                        5.0 * scale * sx,
+                        5.0 * scale * sy,
                         8.0 * scale * sy,
-                        5.0 * scale * sx,
+                        5.0 * scale * sy,
                         text_color,
                         false,
                         w,
@@ -626,9 +626,9 @@ pub(in crate::ui) fn build_team_overlay(
                 let mut name = truncate_jka_text(&entry.name, name_len);
                 loop {
                     let width_v = if let Some(font) = small_font {
-                        proportional_text_width(&name, font, text_scale)
+                        proportional_text_width(&name, font, text_scale) * ratio
                     } else {
-                        visible_jka_chars(&name) as f32 * 5.0 * scale
+                        visible_jka_chars(&name) as f32 * 5.0 * scale * ratio
                     };
                     if name_len <= 1 || width_v <= name_w_v {
                         break;
@@ -637,7 +637,7 @@ pub(in crate::ui) fn build_team_overlay(
                     name = truncate_jka_text(&entry.name, name_len);
                 }
                 if let Some(font) = small_font {
-                    proportional_text(
+                    proportional_text_uniform(
                         out,
                         &name,
                         font,
@@ -655,9 +655,9 @@ pub(in crate::ui) fn build_team_overlay(
                         &name,
                         text_x_v * sx,
                         (y_v + pad_v) * sy,
-                        5.0 * scale * sx,
+                        5.0 * scale * sy,
                         8.0 * scale * sy,
-                        5.0 * scale * sx,
+                        5.0 * scale * sy,
                         text_color,
                         true,
                         w,
@@ -669,7 +669,7 @@ pub(in crate::ui) fn build_team_overlay(
                 if has_locations {
                     let loc = truncate_jka_text(&entry.location, 16);
                     if let Some(font) = small_font {
-                        proportional_text(
+                        proportional_text_uniform(
                             out,
                             &loc,
                             font,
@@ -687,9 +687,9 @@ pub(in crate::ui) fn build_team_overlay(
                             &loc,
                             text_x_v * sx,
                             bars_y_v * sy,
-                            5.0 * scale * sx,
+                            5.0 * scale * sy,
                             8.0 * scale * sy,
-                            5.0 * scale * sx,
+                            5.0 * scale * sy,
                             text_color,
                             false,
                             w,

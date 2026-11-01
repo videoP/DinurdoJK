@@ -12,6 +12,27 @@ use crate::cgame::player_presenter::{
 };
 use jka_movement::TraceWorld;
 
+// Keep the cinematic visual's decay independent of the short network marker.
+const FORCE_SHOCKWAVE_LIFETIME_MS: i32 = 720;
+
+// This distinguishes the acting caster's hand from a player's hit reaction.
+fn force_shockwave_eligible(modern: bool, casting: bool, trailing: bool, body_pushed: bool) -> bool {
+    (casting || (modern && trailing)) && (!modern || !body_pushed)
+}
+
+// Audio-shaped cinematic envelope; all geometry/time control lives on the
+// caster so a 3D wave remains coherent as its hand follows the animation.
+fn force_shockwave_motion(elapsed: i32, pull: bool) -> [f32; 4] {
+    let t = (elapsed as f32 / FORCE_SHOCKWAVE_LIFETIME_MS as f32).clamp(0.0, 1.0);
+    let burst = 1.0 - (1.0 - t).powf(3.4);
+    let wave = if pull { 1.0 - burst } else { burst };
+    let radius = 10.0 + 65.0 * wave;
+    let attack = (elapsed as f32 / 35.0).clamp(0.0, 1.0);
+    let fade = (-2.0 * ((t - 0.41).max(0.0) / 0.59)).exp();
+    let end = (1.0 - ((t - 0.83) / 0.17).clamp(0.0, 1.0)).powf(0.75);
+    [t, f32::from(pull), radius, attack * fade * end]
+}
+
 impl PlayerPresenter {
     /// jaPRO CG_PlayerSprites, called from CG_Player once the client is valid and
     /// not EF_NODRAW: at most one icon floats 48 units over the head - connection
@@ -106,7 +127,8 @@ impl PlayerPresenter {
                 if let Some(origin) =
                     model_bolt_origin_timed(&mut self.perf, model, pose, axis, render_origin, hand)?
                 {
-                    self.fx_requests.push(PlayerFxRequest::Effect {
+                    self.fx_requests.push(PlayerFxRequest::ForceEffect {
+                        entity_num: entity.number,
                         name,
                         origin,
                         axis: fx_axis,
@@ -124,7 +146,17 @@ impl PlayerPresenter {
                 }
             }
         }
-        if state.field_i32("powerups").unwrap_or(0) & (1 << PW_DISINT_4) != 0 {
+        let casting = state.field_i32("powerups").unwrap_or(0) & (1 << PW_DISINT_4) != 0;
+        let modern = self.japro.render_to_texture_fx != 0 && self.japro.force_push_distortion == 1;
+        // EF_BODYPUSH marks the *recipient* reacting to a Force impulse, not
+        // the hand that emitted it. Preserve their original full-body puffs
+        // above, but never spawn the cinematic shockwave on that recipient.
+        let body_pushed = state.field_i32("eFlags").unwrap_or(0) & EF_BODYPUSH != 0;
+        let trailing = modern && self.force_refractions.get(&entity.number).is_some_and(|fx| {
+            current_time >= fx.sampled_at
+                && current_time.saturating_sub(fx.start) < FORCE_SHOCKWAVE_LIFETIME_MS
+        });
+        if force_shockwave_eligible(modern, casting, trailing, body_pushed) {
             if let Some(origin) = model_bolt_origin_timed(
                 &mut self.perf,
                 model,
@@ -135,13 +167,13 @@ impl PlayerPresenter {
             )? {
                 let gripping =
                     state.field_i32("forcePowersActive").unwrap_or(0) & (1 << FP_GRIP) != 0;
-                if gripping && third_person {
+                if gripping && third_person && casting {
                     self.fx_requests.push(PlayerFxRequest::GripPuffs { origin });
                     self.fx_requests.push(PlayerFxRequest::GripPuffs { origin });
                 } else if !gripping {
                     if self.japro.render_to_texture_fx != 0 {
-                        self.queue_force_refraction(entity, origin, current_time);
-                    } else {
+                        self.queue_force_refraction(entity, origin, current_time, casting);
+                    } else if casting {
                         self.fx_requests.push(PlayerFxRequest::PushPuffs { origin });
                     }
                 }
@@ -152,12 +184,20 @@ impl PlayerPresenter {
         Ok(())
     }
 
-    fn queue_force_refraction(&mut self, entity: &PresentedEntity, origin: [f32; 3], now: i32) {
-        // TaystJK CG_ForcePushBlur: 500 ms, follows the hand for 200 ms.
+    fn queue_force_refraction(&mut self, entity: &PresentedEntity, origin: [f32; 3], now: i32, casting: bool) {
+        // TaystJK legacy: 500 ms, follows the hand for 200 ms.
         const PW_PULL: i32 = 3;
-        let pull = entity.state.field_i32("powerups").unwrap_or(0) & (1 << PW_PULL) != 0;
+        let modern = self.japro.force_push_distortion == 1;
+        // When the network flag expires, retain the original Pull direction
+        // for the remaining cinematic decay instead of changing it to Push.
+        let pull = if modern && !casting {
+            self.force_refractions.get(&entity.number).is_some_and(|fx| fx.pull)
+        } else {
+            entity.state.field_i32("powerups").unwrap_or(0) & (1 << PW_PULL) != 0
+        };
+        let follow_ms = if modern { FORCE_SHOCKWAVE_LIFETIME_MS } else { 200 };
         let (state, scale, alpha) = super::cloak::ForceRefractionState::advance(
-            self.force_refractions.get(&entity.number).copied(), now, origin, pull,
+            self.force_refractions.get(&entity.number).copied(), now, origin, pull, follow_ms,
         );
         self.force_refractions.insert(entity.number, state);
         let Some(eye) = self.stage_view_position else { return; };
@@ -165,14 +205,27 @@ impl PlayerPresenter {
         if direction.iter().map(|v| v * v).sum::<f32>() <= 0.01 { return; }
         let mut angles = super::openjk_vectoangles(direction);
         angles[2] += 180.0;
-        let axis = angles_to_axis(angles).map(|v| v.map(|c| c * scale));
+        let elapsed = now.saturating_sub(state.start);
+        if modern && elapsed >= FORCE_SHOCKWAVE_LIFETIME_MS { return; }
+        // The supplied Push audio has a sharp onset, a dense first ~0.5 s,
+        // then a long decaying air rush (~1.5 s total). Compress the audible
+        // gesture into a 720 ms visual: explosive early travel and a slower
+        // dissipating wake, never a linear interpolation of the radius.
+        let shockwave = force_shockwave_motion(elapsed, pull);
+        let axis = angles_to_axis(angles).map(|v| v.map(|c| c * if modern { 1.0 } else { scale }));
         self.cosmetic_draws.push(super::CosmeticDraw {
             entity_num: entity.number,
-            model: "models/weaphits/testboom.md3".into(),
+            model: if modern { "internal/force_shockwave" } else { "models/weaphits/testboom.md3" }.into(),
             origin: state.origin,
             axis,
-            rgba: [(now - state.start) as f32 * 0.001, 1.0, 1.0, alpha],
-            custom_shader: Some("internal/force_refraction"),
+            // The modern quad carries t, pull flag, radius in JKA units,
+            // and a smooth envelope; the legacy UV-capture uses its own data.
+            rgba: if modern {
+                shockwave
+            } else {
+                [elapsed as f32 * 0.001, 1.0, 1.0, alpha]
+            },
+            custom_shader: Some(if modern { "internal/force_shockwave" } else { "internal/force_refraction" }),
             skin_pose: None,
             face_camera: None,
         });
@@ -1105,6 +1158,36 @@ fn force_sight_shell_color(gametype: i32, viewer_team: i32, target_team: i32) ->
         }
     } else {
         YELLOW
+    }
+}
+
+#[cfg(test)]
+mod force_shockwave_tests {
+    use super::{force_shockwave_eligible, force_shockwave_motion};
+
+    #[test]
+    fn only_the_caster_emits_the_modern_shockwave() {
+        assert!(force_shockwave_eligible(true, true, false, false));
+        assert!(!force_shockwave_eligible(true, true, false, true));
+        assert!(!force_shockwave_eligible(true, false, true, true));
+        assert!(force_shockwave_eligible(true, false, true, false));
+        assert!(!force_shockwave_eligible(true, false, false, false));
+        // Unchanged TaystJK legacy rendering still responds to its marker.
+        assert!(force_shockwave_eligible(false, true, false, true));
+    }
+
+    #[test]
+    fn audio_shaped_motion_bursts_then_decay() {
+        let start = force_shockwave_motion(0, false);
+        let early = force_shockwave_motion(100, false);
+        let middle = force_shockwave_motion(250, false);
+        let late = force_shockwave_motion(540, false);
+        let end = force_shockwave_motion(720, false);
+        assert!(early[2] - start[2] > 20.0);
+        assert!(middle[2] - early[2] > late[2] - middle[2]);
+        assert!(early[3] > 0.95 && middle[3] > 0.95);
+        assert!(late[3] < 0.55 && end[3] <= 0.001);
+        assert!(force_shockwave_motion(0, true)[2] > force_shockwave_motion(300, true)[2]);
     }
 }
 

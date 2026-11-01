@@ -2,7 +2,7 @@
 use crate::renderer::{
     create_bloom_pyramid, create_dof_target, create_temporal_ssao_history,
     create_temporal_ssr_history, sampler_entry, texture_entry, weather, Arc, AtomicU64,
-    CloudRenderResolution, Duration, Instant, DEPTH_FORMAT,
+    CloudRenderResolution, Duration, Instant, depth_format,
 };
 
 pub(in crate::renderer) struct AuthoredGlowTarget {
@@ -280,6 +280,7 @@ pub(in crate::renderer) fn create_targets(
     enable_authored_glow: bool,
     enable_dof: bool,
     enable_ssao: bool,
+    ssao_resolution: u8,
     enable_ssr: bool,
     enable_resolved_depth: bool,
     enable_temporal: bool,
@@ -296,7 +297,7 @@ pub(in crate::renderer) fn create_targets(
         mip_level_count: 1,
         sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -379,7 +380,7 @@ pub(in crate::renderer) fn create_targets(
     });
     let bloom = enable_bloom.then(|| create_bloom_pyramid(device, width, height));
     let dof = enable_dof.then(|| create_dof_target(device, width, height));
-    let ssao_history = enable_ssao.then(|| create_temporal_ssao_history(device, width, height));
+    let ssao_history = enable_ssao.then(|| create_temporal_ssao_history(device, width, height, ssao_resolution == 1));
     let ssr_history = enable_ssr.then(|| create_temporal_ssr_history(device, width, height));
     // Inactive effects still need valid sampled bindings, but no viewport-sized
     // storage. Rebuild at full size before enabling their render passes.
@@ -460,7 +461,7 @@ pub(in crate::renderer) fn create_targets(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: depth_format(),
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });

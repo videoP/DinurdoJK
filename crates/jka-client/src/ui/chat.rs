@@ -1,6 +1,6 @@
 //! Chat.
 use crate::ui::{
-    color_code, fixed_charset_text, proportional_text, rect, visible_jka_chars,
+    color_code, fixed_charset_text, proportional_text_uniform, rect, visible_jka_chars,
     wrap_proportional_text, ChatMode, ProportionalFont, UiSnapshot, UiVertex, CHATBOX_CUTOFF,
     CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
@@ -77,6 +77,10 @@ pub(in crate::ui) fn build_chat_history(
     w: u32,
     h: u32,
 ) {
+    if ui.chat_settings.docked() {
+        super::chat_dock::build(out, ui, small_font, w, h);
+        return;
+    }
     if ui.chat_lines.is_empty() {
         return;
     }
@@ -132,9 +136,9 @@ pub(in crate::ui) fn build_chat_history(
                 &text,
                 w as f32 * (30.0 / 640.0),
                 y,
-                w as f32 * (4.0 / 640.0),
+                h as f32 * (4.0 / 480.0),
                 h as f32 * (8.0 / 480.0),
-                w as f32 * (4.5 / 640.0),
+                h as f32 * (4.5 / 480.0),
                 color,
                 true,
                 w,
@@ -188,7 +192,7 @@ pub(in crate::ui) fn build_chat_history(
     let mut baseline_y = (CHATBOX_Y - line_step_virtual * total_lines as f32) * h as f32 / 480.0;
 
     for (value, lines, alpha) in wrapped {
-        proportional_text(
+        proportional_text_uniform(
             out,
             &value,
             font,
@@ -256,6 +260,10 @@ pub(in crate::ui) fn build_chat_input(
     // boundary so resizing the HUD chat history cannot clip or displace input.
     // Unlike the legacy single-line Field_BigDraw, wrap the *whole* composer
     // (prompt included) so long messages remain visible while being typed.
+    // The docked style draws its field with the feed (see chat_dock).
+    if ui.chat_settings.docked() {
+        return;
+    }
     const BIG_CHAR_VIRTUAL: f32 = 16.0;
     const CHAT_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     let scale = (h as f32 / 480.0).max(0.5);
