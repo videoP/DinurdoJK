@@ -22,6 +22,7 @@ use jka_protocol::{
 };
 
 pub mod mod_support;
+pub(crate) mod jk2_prediction;
 
 // ---------------------------------------------------------------- cvars --
 
@@ -1771,6 +1772,7 @@ impl TraceWorld for PredictionTraceWorld<'_, '_> {
 /// cg.predictedPlayerState and its error-decay bookkeeping.
 #[derive(Default)]
 pub struct Predictor {
+    pub(crate) jk2: Option<Box<jk2_prediction::Predictor>>,
     native: Option<NativePlayerState>,
     failure_logged_at: Option<Instant>,
     /// cg.predictedPlayerState from committed usercmds only; the base for

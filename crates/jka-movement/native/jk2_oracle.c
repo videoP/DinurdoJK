@@ -16,17 +16,20 @@ int jk2_oracle_replay_impl(const void *opaque, const jka_cmd *commands, int coun
     move.ps = &ps; move.animations = (animation_t *)seed->animations;
     move.trace = jk2_host_trace; move.pointcontents = jk2_host_contents;
     move.tracemask = settings->tracemask; move.noFootsteps = settings->no_footsteps;
-    move.gametype = settings->gametype; move.pmove_fixed = settings->pmove_fixed; move.pmove_msec = settings->pmove_msec;
+    if (settings->spectator_server_timing && ps.pm_type != PM_SPECTATOR) return 0;
+    move.gametype = settings->gametype;
+    move.pmove_fixed = settings->spectator_server_timing ? 0 : settings->pmove_fixed;
+    move.pmove_msec = settings->pmove_msec;
     for (i = 0; i < MAX_CLIENTS; i++) move.bgClients[i] = &clients[i];
     jk2_bind_services(trace, contents, context);
     for (n = 0; n < count; n++) {
         jk2_copy_command(&move.cmd, &commands[n]);
-        if (move.pmove_fixed) PM_UpdateViewAngles(&ps, &move.cmd);
+        if (settings->pmove_fixed) PM_UpdateViewAngles(&ps, &move.cmd);
         if (move.cmd.serverTime <= ps.commandTime) {
             memcpy(states + (size_t)n * state_size, &ps, state_size);
             continue;
         }
-        if (move.pmove_fixed) move.cmd.serverTime = ((move.cmd.serverTime + move.pmove_msec-1)/move.pmove_msec)*move.pmove_msec;
+        if (settings->pmove_fixed) move.cmd.serverTime = ((move.cmd.serverTime + move.pmove_msec-1)/move.pmove_msec)*move.pmove_msec;
         jk2_require_context(&ps, move.cmd.serverTime);
         Pmove(&move);
         memcpy(states + (size_t)n * state_size, &ps, state_size);

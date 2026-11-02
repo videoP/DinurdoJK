@@ -134,6 +134,23 @@ fn snapshot(version: Version, time: i32, distance: i32, arrays: bool, remove: bo
 }
 
 #[test]
+fn prediction_history_is_raw_sequence_checked_and_cleared_by_gamestate() {
+    for version in [Version::V102, Version::V104] {
+        let mut decoder = Decoder::new();
+        decoder.parse_packet(1, &gamestate(version)).unwrap();
+        decoder.parse_packet(2, &snapshot(version, 1000, 0, true, false)).unwrap();
+        let raw = decoder.snapshot(2).unwrap();
+        assert_eq!(raw.player_state.fields.field_i32("weapon"), Some(2));
+        assert_eq!(raw.player_state.fields.field_bits("origin[0]"), Some((-0.0_f32).to_bits()));
+        assert!(decoder.snapshot(2 + PACKET_BACKUP as i32).is_none());
+        decoder.parse_packet(2 + PACKET_BACKUP as i32, &snapshot(version, 2000, 0, false, false)).unwrap();
+        assert!(decoder.snapshot(2).is_none());
+        decoder.parse_packet(3 + PACKET_BACKUP as i32, &gamestate(version)).unwrap();
+        assert!(decoder.snapshot(2 + PACKET_BACKUP as i32).is_none());
+    }
+}
+
+#[test]
 fn live_bootstrap_consumes_snapshots_without_publishing_or_identifying_gamestate() {
     for version in [Version::V102, Version::V104] {
         let early = snapshot(version, 1000, 0, true, false);

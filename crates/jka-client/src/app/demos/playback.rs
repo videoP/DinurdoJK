@@ -1756,16 +1756,45 @@ impl App {
                 let world = &mut self.map_collision;
                 let settings = &self.network;
                 let session = net.session();
-                let jk2_spectating = session.jk2_version().is_some();
+                let jk2 = session.jk2_version().is_some();
+                let base_path = &self.base;
+                let game = self.game.as_deref();
                 let provisional = self.live_provisional;
                 let entity_graph = self.entity_graph.as_deref();
                 let mut predict = |snap: &ProtocolSnapshot,
                                    next: Option<&ProtocolSnapshot>,
                                    entities: &[PresentedEntity],
                                    duel_states: [crate::cgame::PrivateDuelState; 2]| {
-                    if jk2_spectating {
-                        predictor.reset();
-                        return Ok(None);
+                    if jk2 {
+                        let Some(world) = world.as_mut() else { return Ok(None) };
+                        let native = predictor.jk2.get_or_insert_with(Default::default);
+                        let result = native.predict(session, snap, next, server_time, world,
+                            entities, settings, provisional, || {
+                                let mut assets = jka_assets::pk3::AssetSearchPath::open_game(base_path, game)
+                                    .map_err(|e| e.to_string())?;
+                                assets.read("models/players/_humanoid/animation.cfg", 39998)
+                                    .map_err(|e| e.to_string())?
+                                    .map(|asset| asset.bytes)
+                                    .ok_or_else(|| "JK2 animation.cfg missing".to_owned())
+                            });
+                        predictor.misses.extend(native.messages.drain(..));
+                        return match result {
+                            Ok(frame) => {
+                                predictor.clear_failure();
+                                Ok(frame.map(|frame| LivePredictionFrame {
+                                    display: frame.display,
+                                    committed: frame.committed,
+                                    previous_committed: frame.previous,
+                                    error: [0.0; 3],
+                                    command_angles: frame.angles,
+                                    view_forced: false,
+                                }))
+                            }
+                            Err(error) => {
+                                predictor.report_failure(&error);
+                                Ok(None)
+                            }
+                        };
                     }
                     // OpenJK vehicle pmove is a separate path. Until that is ported,
                     // never feed a piloting playerstate through the on-foot predictor;
@@ -1824,11 +1853,11 @@ impl App {
                     ghoul2_view,
                     rt_rigid_casters_enabled,
                     blob_shadow_settings,
-                    settings.no_predict || jk2_spectating,
+                    settings.no_predict,
                     Some(&mut predict),
                     Some(crate::app::PlayerPresentationInput::Remote {
                         angles: self.live_input.view_angles,
-                        no_predict: settings.no_predict || jk2_spectating,
+                        no_predict: settings.no_predict || jk2,
                     }),
                 )?
             } else {

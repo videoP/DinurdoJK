@@ -176,6 +176,10 @@ int jk2_player_predict(void *opaque, const jka_cmd *cmd, const jk2_settings *set
     jka_trace_fn trace, jka_contents_fn contents, void *context) {
     jk2_player *p = opaque; int i;
     last_error[0] = 0;
+    if (settings->spectator_server_timing && p->ps.pm_type != PM_SPECTATOR) {
+        snprintf(last_error, sizeof(last_error), "JK2 server spectator timing requires PM_SPECTATOR");
+        return 0;
+    }
     if (!jk2_select_versions(p->version, settings->gameplay_version) || settings->pmove_msec < 8 || settings->pmove_msec > 33
         || !trace || !contents || cmd->weapon >= WP_NUM_WEAPONS || (cmd->force_selection != 255 && cmd->force_selection >= NUM_FORCE_POWERS)
         || (cmd->inventory_selection != 255 && cmd->inventory_selection >= HI_NUM_HOLDABLE)) return 0;
@@ -185,7 +189,11 @@ int jk2_player_predict(void *opaque, const jka_cmd *cmd, const jk2_settings *set
     memset(&p->move, 0, sizeof(p->move)); p->move.ps = &p->ps;
     p->move.animations = p->animations; p->move.trace = jk2_host_trace; p->move.pointcontents = jk2_host_contents;
     p->move.gametype = settings->gametype; p->move.tracemask = settings->tracemask;
-    p->move.pmove_fixed = settings->pmove_fixed; p->move.pmove_msec = settings->pmove_msec; p->move.noFootsteps = settings->no_footsteps;
+    /* ClientThink_real rounds ucmd time before SpectatorThink. The latter
+     * zeroes pmove_t and never installs fixed subdivision (g_active.c).
+     * Keep the CGame/default mode separately available for replay diagnostics. */
+    p->move.pmove_fixed = settings->spectator_server_timing ? 0 : settings->pmove_fixed;
+    p->move.pmove_msec = settings->pmove_msec; p->move.noFootsteps = settings->no_footsteps;
     for (i = 0; i < MAX_CLIENTS; i++) p->move.bgClients[i] = &p->clients[i];
     jk2_copy_command(&p->move.cmd, cmd);
     if (settings->pmove_fixed) {

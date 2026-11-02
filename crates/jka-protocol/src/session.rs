@@ -269,6 +269,9 @@ impl ClientSession {
     pub fn has_gamestate(&self) -> bool { self.gamestate_received }
     pub fn decoder(&self) -> &Decoder { &self.decoder }
     pub fn jk2_version(&self) -> Option<crate::jk2::Version> { self.jk2.as_ref().map(|state| state.version) }
+    pub fn jk2_decoder(&self) -> Option<&crate::jk2::Decoder> {
+        self.jk2.as_ref().map(|state| &state.wire)
+    }
     pub fn server_time(&self) -> i32 { self.server_time }
     /// Server time minus the commandTime the newest snapshot acknowledged: how far behind the
     /// server's clock our commands are being processed (about the round trip plus a server frame).
@@ -759,7 +762,7 @@ impl ClientSession {
             let args = tokenize(text);
             if args.first().is_some_and(|s| s.eq_ignore_ascii_case(b"team"))
                 && args.get(1).is_some_and(|s| !s.eq_ignore_ascii_case(b"spectator") && !s.eq_ignore_ascii_case(b"s")) {
-                return Err("JK2 live milestone supports spectating; native MVSDK prediction is not integrated yet".into());
+                return Err("JK2 supports native free-spectator prediction; playing teams await remote combat context validation".into());
             }
         }
         let unacknowledged = self.reliable_sequence - self.reliable_acknowledge;

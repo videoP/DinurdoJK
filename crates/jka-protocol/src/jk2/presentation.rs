@@ -221,15 +221,34 @@ impl Adapter {
         sequence: i32,
         command: i32,
     ) -> Result<server::Snapshot, String> {
+        let ps = self.player_state(version, &raw.player_state)?;
+        Ok(server::Snapshot {
+            server_time: raw.server_time,
+            message_num: sequence,
+            delta_num: -1,
+            snap_flags: raw.snap_flags,
+            ping: 0,
+            server_command_num: command,
+            area_mask: raw.area_mask,
+            player_state: ps,
+            vehicle_player_state: None,
+            entities: raw.entities.iter()
+                .map(|entity| self.entity(version, entity)).collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn player_state(&mut self, version: Version, raw: &super::PlayerState)
+        -> Result<server::PlayerState, String>
+    {
         let mut ps = server::PlayerState::default();
         for (target, source) in [("legsFlip", "legsAnim"), ("torsoFlip", "torsoAnim")] {
             ps.set_field_bits(
                 target,
-                u32::from(raw.player_state.fields.field_i32(source).unwrap_or(0) & 2048 != 0),
+                u32::from(raw.fields.field_i32(source).unwrap_or(0) & 2048 != 0),
             );
         }
         for &(name, bits) in crate::PLAYER_FIELDS {
-            let Some(value) = raw.player_state.fields.field_bits(name) else {
+            let Some(value) = raw.fields.field_bits(name) else {
                 continue;
             };
             let value = value as i32;
@@ -248,15 +267,15 @@ impl Adapter {
                 "forceHandExtend" => mapped(ids::HAND_ANIMS, value).unwrap_or(0),
                 "events[0]" | "events[1]" | "externalEvent" => self.event(value),
                 "eventParms[0]" => self.event_parm(
-                    raw.player_state.fields.field_i32("events[0]").unwrap_or(0),
+                    raw.fields.field_i32("events[0]").unwrap_or(0),
                     value,
                 ),
                 "eventParms[1]" => self.event_parm(
-                    raw.player_state.fields.field_i32("events[1]").unwrap_or(0),
+                    raw.fields.field_i32("events[1]").unwrap_or(0),
                     value,
                 ),
                 "externalEventParm" => self.event_parm(
-                    raw.player_state
+                    raw
                         .fields
                         .field_i32("externalEvent")
                         .unwrap_or(0),
@@ -270,7 +289,6 @@ impl Adapter {
         ps.set_field_bits(
             "saberHolstered",
             if raw
-                .player_state
                 .fields
                 .field_i32("saberActive")
                 .unwrap_or(0)
@@ -283,42 +301,33 @@ impl Adapter {
         );
         ps.set_field_bits("standheight", 32);
         ps.set_field_bits("crouchheight", 16);
-        for (i, &value) in raw.player_state.stats.iter().enumerate() {
+        for (i, &value) in raw.stats.iter().enumerate() {
             if let Some(dest) = mapped(ids::STATS, i as i32).filter(|&n| n < 16) {
                 ps.stats[dest as usize] = value;
             }
         }
-        ps.stats[1] = mapped(ids::ITEMS, raw.player_state.stats[1]).unwrap_or(0);
-        ps.stats[2] = bitmask(ids::HOLDABLES, raw.player_state.stats[2]);
-        ps.stats[4] = bitmask(ids::WEAPONS, raw.player_state.stats[4]);
-        for (i, &value) in raw.player_state.persistant.iter().enumerate() {
+        ps.stats[1] = mapped(ids::ITEMS, raw.stats[1]).unwrap_or(0);
+        ps.stats[2] = bitmask(ids::HOLDABLES, raw.stats[2]);
+        ps.stats[4] = bitmask(ids::WEAPONS, raw.stats[4]);
+        for (i, &value) in raw.persistant.iter().enumerate() {
             if let Some(dest) = mapped(ids::PERSISTANT, i as i32).filter(|&n| n < 16) {
                 ps.persistant[dest as usize] = value;
             }
         }
-        ps.ammo = raw.player_state.ammo;
-        for (i, &value) in raw.player_state.powerups.iter().enumerate() {
+        ps.ammo = raw.ammo;
+        for (i, &value) in raw.powerups.iter().enumerate() {
             if let Some(dest) = mapped(ids::POWERUPS, i as i32).filter(|&n| n < 16) {
                 ps.powerups[dest as usize] = value;
             }
         }
-        Ok(server::Snapshot {
-            server_time: raw.server_time,
-            message_num: sequence,
-            delta_num: -1,
-            snap_flags: raw.snap_flags,
-            ping: 0,
-            server_command_num: command,
-            area_mask: raw.area_mask,
-            player_state: ps,
-            vehicle_player_state: None,
-            entities: raw
-                .entities
-                .iter()
-                .map(|entity| self.entity(version, entity))
-                .collect::<Result<_, _>>()?,
-        })
+        Ok(ps)
     }
+}
+
+/// Map native JK2 output once. Native normalized state must pass V104 here,
+/// including when the server wire version is V102.
+pub fn player_state(version: Version, raw: &super::PlayerState) -> Result<server::PlayerState, String> {
+    Adapter::default().player_state(version, raw)
 }
 
 fn queue_command(commands: &mut Vec<(i32, Vec<u8>)>, counter: &mut i32, text: Vec<u8>) {

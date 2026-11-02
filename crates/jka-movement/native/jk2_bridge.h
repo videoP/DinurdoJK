@@ -4,6 +4,7 @@
 /* Host ABI only. Never an alias of either game's playerState_t / pmove_t. */
 typedef struct jk2_settings_s {
     int32_t gameplay_version, pmove_fixed, pmove_msec, gametype, tracemask, no_footsteps;
+    int32_t spectator_server_timing;
 } jk2_settings;
 
 void *jk2_player_new(int version, const unsigned char *animations, int length);

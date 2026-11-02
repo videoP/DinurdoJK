@@ -26,6 +26,9 @@ pub struct Settings {
     pub gametype: i32,
     pub tracemask: i32,
     pub no_footsteps: i32,
+    /// Match G_ClientThink's rounded timestamps and SpectatorThink's zeroed
+    /// pmove_t timing flags. Default zero retains the CGame replay contract.
+    pub spectator_server_timing: i32,
 }
 impl Settings {
     pub fn new(gameplay_version: Version) -> Self {
@@ -36,6 +39,7 @@ impl Settings {
             gametype: 0,
             tracemask: unsafe { jk2_contract(11) },
             no_footsteps: 0,
+            spectator_server_timing: 0,
         }
     }
 }
@@ -248,6 +252,7 @@ impl Drop for Player {
 }
 fn validate_command(cmd: &UserCmd, settings: &Settings) -> Result<(), String> {
     if !(8..=33).contains(&settings.pmove_msec)
+        || !(0..=1).contains(&settings.spectator_server_timing)
         || !(0..=8).contains(&settings.gametype)
         || cmd.angles.iter().any(|&v| !(-32768..=65535).contains(&v))
         || !(0..=i32::MAX - 1000).contains(&cmd.server_time)

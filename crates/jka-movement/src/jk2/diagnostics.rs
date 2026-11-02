@@ -178,5 +178,5 @@ pub fn run(animations: &[u8]) -> Result<String, String> {
             }
         }
     }
-    Ok(format!("Pinned MVSDK {SOURCE_REVISION}\nJK2 native bridge verified: {cases} cases, {total} commands, complete native state compared after every command.\n1.02/1.04 wire and gameplay selection; saber/blaster; floor, wall, water; jump, crouch, attacks; variable/fixed 8/16/33 ms; stale command backlog.\nThis compares the host with direct calls to the same native SDK. Live JK2 prediction is still disabled."))
+    Ok(format!("Pinned MVSDK {SOURCE_REVISION}\nJK2 native bridge verified: {cases} cases, {total} commands, complete native state compared after every command.\n1.02/1.04 wire and gameplay selection; saber/blaster; floor, wall, water; jump, crouch, attacks; variable/fixed 8/16/33 ms; stale command backlog.\nThis compares the host with direct calls to the same native SDK. This diagnostic does not validate live prediction."))
 }

@@ -1,5 +1,124 @@
 # JK2 1.02 / 1.04 support
 
+**Next deliverable: a playable-team build.** Joining/spectating is already
+demonstrated. Continue with native remote context, JK2 command selection,
+playing-state prediction and team admission, then spawn/movement/combat tests.
+Use [the next-step handoff](<Development Docs/JK2_NEXT_HANDOFF.md>) as the
+implementation entry point. Client gameplay remains native MVSDK C/FFI; the
+private test endpoint is the existing JK2MV executable, with no server fork.
+
+## Live prediction continuation (November 2, 2026)
+
+The working tree now routes live **free spectators** through the existing
+MVSDK C/FFI bridge. `net/jk2_prediction.rs` owns this path separately from the
+JKA predictor. Playing-team commands remain blocked pending native remote
+combat context and playable command selection/validation.
+
+- `ClientSession::jk2_decoder()` exposes read-only raw wire history; snapshot
+  lookup verifies the exact message sequence and gamestate resets clear it.
+  The ordinary session decoder remains the mapped presentation view.
+- Replay starts from an accepted raw snapshot and uses actual stored usercmds.
+  Native Pmove retains responsibility for physics, fixed timestamp rounding,
+  view-angle ordering and subdivision. Preview commands use a native clone and
+  the same JK2 selection suppression as transmitted commands.
+- Live spectators select the bridge's explicit `spectator_server_timing`
+  option. Pinned `ClientThink_real` rounds command times, while `SpectatorThink`
+  zeroes `pmove_t` and leaves fixed subdivision disabled. The host applies that
+  combination without changing vendored Pmove. Default bridge settings retain
+  the existing CGame/oracle timing contract. A native regression compares the
+  spectator mode with a rounded command passed directly to variable-step Pmove
+  and also checks rejection outside `PM_SPECTATOR`.
+- Wire version and `mvgp` gameplay selection stay independent. Timing comes
+  from systeminfo, while gametype and footstep flags come from serverinfo.
+  Version 1.03 gameplay is explicitly rejected.
+- World/inline collision uses the existing collision host. Spectators exclude
+  body contents. Follow mode, non-spectator states, prediction disable, missing
+  raw history and native failures fall back to snapshot presentation. Restart,
+  teleport, followed-client and movement-mode boundaries invalidate predictions;
+  an exhausted command ring freezes the last valid result.
+- Native normalized output is mapped once as JK2 1.04 identifiers through the
+  existing presentation adapter, including on a 1.02 wire connection. The new
+  real-demo fixture test checks this against ordinary snapshot presentation.
+- First predictions are retained by command time and compared with later raw
+  server acknowledgements. `cg_predictionDebug`, `cg_showmiss` or
+  `cg_physicsDiag` enables `JK2-PRED-SERVER` output with the first differing
+  field/raw values, command number/time and origin delta. This milestone applies
+  no prediction-error smoothing. Comparisons cover the spectator movement
+  contract, not server-owned scores or multiplayer combat state.
+- Live validation retains bit-exact counts and every first differing field.
+  It separately requires exact discrete fields and maximum absolute component
+  errors of at most `1/1024` for origin, velocity and view angles. This bound is
+  an acceptance check only: it never alters predicted state or rendering. The
+  private JK2MV server reports `vm_game=2`, with `jk2mpgame` compiled on load;
+  native-versus-QVM runs showed small float differences. Their precise numeric
+  cause has not been independently isolated. Full component-error reporting
+  keeps these visible rather than describing bounded results as bit-exact.
+
+Pinned source audit: MVSDK `cg_predict.c` chooses nextSnap only across safe
+snapshot boundaries, updates fixed view angles before skipping acknowledged
+commands, projects remote entities before Pmove, and writes remote animation/
+lock results back afterward. `cg_snapshot.c` gates interpolation on teleport,
+client changes and server-count changes. `cg_players.c` selects the local
+gameplay through `mvgp`. The next playable increment must supply the real
+`CG_EntityStateToPlayerState` projection (including Force targets, lock frame,
+animations, saber state, health projection and its deliberate generic-enemy
+override), lock-facing angles and writeback; the bridge's empty remote states
+remain insufficient for multiplayer saber prediction.
+
+The opt-in `net::jk2_prediction::tests::loopback_102` / `loopback_104` tests use
+the private helper's default loopback port, retail animation/BSP data, existing
+pure admission, real packet/usercmd flow and the production predictor. Run
+them serially against the matching server version. Reuse the existing fast
+test executable (with `target/release` and `target/fast` on PATH for DLLs), or
+build it with the same fast profile and compiler flags as `build.ps1 -Fast`.
+
+Live validation on November 2, 2026 (private JK2MV, pure 1, `ffa_bespin`):
+
+| Wire version | Timing | Acknowledgements | Bit-exact | Max origin component error | Max velocity component error |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1.02 | Variable | 119 | 84 | 0.000122071 | 0.000061036 |
+| 1.02 | Fixed 8 ms | 119 | 119 | 0 | 0 |
+| 1.04 | Variable | 119 | 88 | 0.000030518 | 0.000030518 |
+| 1.04 | Fixed 8 ms | 119 | 119 | 0 | 0 |
+
+All 476 acknowledgements met the stated acceptance bound, with zero discrete
+field mismatches and zero view-angle error. Each case ran six seconds of real
+movement commands and travelled approximately 395–399 units from its starting
+position. Of these comparisons, 410 were bit-exact. This is a bounded private
+spectator result, not a claim of bit-exact variable-step QVM parity, multiplayer
+combat accuracy, public-mod compatibility or FPS parity.
+
+Nine focused native tests and seven focused client tests pass. The native
+suite includes the existing 96-case / 18,432-command full-state oracle check,
+the new spectator timing regression, callback rollback and version isolation.
+All 73 previously run protocol checks remain applicable; their sources did not
+change during the final timing fix. The broader movement integration target
+currently fails to compile because unrelated pending `tests/movement.rs` edits
+use `CollisionWorld` without importing it. Those edits were preserved; native
+verification used the focused library target.
+
+Reports: `artifacts/jk2-live-validation-summary.json`, the four
+`jk2-live-loopback-{102,104}-{variable,fixed}.log` files, and
+`jk2-live-native-final-tests.log` / `jk2-live-client-final-tests.log`.
+
+The final fast build succeeded and staged `target/release/DinurdoJK.exe`.
+Offscreen pure-server follow/spectator switching and reconnect checks passed
+on both versions. The 1.04 fixed-timing run also survived a live `map_restart`.
+These stationary presentation/reset checks complement the real movement-command
+tests above; headless mode suppresses window input and saved-config writes.
+
+The installed 1.02 basemv VM has a restart compatibility limit: after
+`map_restart` it reported game version 1.04 and sent out-of-table 1.02 animation
+1100, which the client rejected. A clean server restart restored correct
+follow/reconnect behavior. Pinned MVSDK's shutdown routine contains a
+gameversion-reset workaround for older JK2MV builds, suggesting an installed-VM
+issue; this diagnosis has not been independently confirmed with another
+client/VM. No animation fallback or physics compatibility mode was added.
+See `artifacts/jk2-live-final-smoke-102.log`,
+`jk2-live-map-restart-102-response.log`, `jk2-live-final-smoke-102-clean.log`
+and `jk2-live-final-smoke-104.log`. The helper is restored to 1.04 / pure 1 /
+variable timing, ready for a focused-window spectator-movement playtest.
+
 ## Agreed scope
 
 Recorded November 2, 2026, following review of the initial handoff and user

@@ -110,6 +110,14 @@ impl Fields {
             .map(|i| self.values[i])
     }
 
+    pub fn set_field_bits(&mut self, name: &str, value: u32) -> bool {
+        let Some(index) = self.schema.iter().position(|&(key, _)| key == name) else {
+            return false;
+        };
+        self.values[index] = value;
+        true
+    }
+
     pub fn field_i32(&self, name: &str) -> Option<i32> {
         self.field_bits(name).map(|value| value as i32)
     }
@@ -142,7 +150,7 @@ pub struct PlayerState {
 }
 
 impl PlayerState {
-    fn zero(version: Version) -> Self {
+    pub fn zero(version: Version) -> Self {
         Self {
             fields: Fields::zero(version.player_fields()),
             stats: [0; 16],
@@ -219,6 +227,13 @@ impl Decoder {
 
     pub fn version(&self) -> Option<Version> {
         self.version
+    }
+
+    /// Exact accepted wire snapshot, never the mapped presentation state.
+    /// Check the sequence as ring slots can already belong to newer packets.
+    pub fn snapshot(&self, message_num: i32) -> Option<&Snapshot> {
+        self.snapshots[(message_num as usize) & (PACKET_BACKUP - 1)]
+            .as_ref().filter(|snapshot| snapshot.message_num == message_num)
     }
 
     pub fn map_name(&self) -> Option<String> {

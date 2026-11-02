@@ -125,6 +125,63 @@ fn native_command_replays_match_direct_mvsdk() {
 }
 
 #[test]
+fn native_server_spectator_rounds_time_without_fixed_subdivision() {
+    for version in [Version::V102, Version::V104] {
+        let mut state = diagnostics::seed(version, 2);
+        state.set_field_bits("pm_type", 3).unwrap();
+        state.set_field_bits("origin[2]", 64_f32.to_bits()).unwrap();
+        let seed = Player::new(version, &animations(), &state).unwrap();
+        let mut server = seed.try_clone().unwrap();
+        let mut expected = seed.try_clone().unwrap();
+        let mut cgame = seed.try_clone().unwrap();
+        let mut settings = Settings::new(version);
+        settings.pmove_fixed = 1;
+        settings.spectator_server_timing = 1;
+        let cmd = UserCmd {
+            server_time: 1017,
+            weapon: 2,
+            forward_move: 127,
+            up_move: 64,
+            ..Default::default()
+        };
+        server
+            .predict(cmd, &settings, &mut diagnostics::FixtureWorld::default())
+            .unwrap();
+        // g_active.c rounds to 1024 before entering SpectatorThink, which
+        // zeroes pmove_t and calls native Pmove with variable subdivision.
+        expected
+            .predict(
+                UserCmd {
+                    server_time: 1024,
+                    ..cmd
+                },
+                &Settings::new(version),
+                &mut diagnostics::FixtureWorld::default(),
+            )
+            .unwrap();
+        assert_eq!(server.native_bytes(), expected.native_bytes());
+        settings.spectator_server_timing = 0;
+        cgame
+            .predict(cmd, &settings, &mut diagnostics::FixtureWorld::default())
+            .unwrap();
+        assert_ne!(
+            server.network().field_bits("origin[0]"),
+            cgame.network().field_bits("origin[0]")
+        );
+        settings.spectator_server_timing = 1;
+        verify_replay(&seed, &[cmd], &settings, diagnostics::FixtureWorld::default).unwrap();
+        let normal = diagnostics::seed(version, 2);
+        server.set_network(&normal).unwrap();
+        let before = server.native_bytes();
+        assert!(server
+            .predict(cmd, &settings, &mut diagnostics::FixtureWorld::default())
+            .unwrap_err()
+            .contains("PM_SPECTATOR"));
+        assert_eq!(server.native_bytes(), before);
+    }
+}
+
+#[test]
 fn native_collision_failure_rolls_back_complete_state() {
     struct BadWorld;
     impl TraceWorld for BadWorld {
