@@ -1756,12 +1756,17 @@ impl App {
                 let world = &mut self.map_collision;
                 let settings = &self.network;
                 let session = net.session();
+                let jk2_spectating = session.jk2_version().is_some();
                 let provisional = self.live_provisional;
                 let entity_graph = self.entity_graph.as_deref();
                 let mut predict = |snap: &ProtocolSnapshot,
                                    next: Option<&ProtocolSnapshot>,
                                    entities: &[PresentedEntity],
                                    duel_states: [crate::cgame::PrivateDuelState; 2]| {
+                    if jk2_spectating {
+                        predictor.reset();
+                        return Ok(None);
+                    }
                     // OpenJK vehicle pmove is a separate path. Until that is ported,
                     // never feed a piloting playerstate through the on-foot predictor;
                     // use snapshot interpolation instead and discard stale prediction.
@@ -1819,11 +1824,11 @@ impl App {
                     ghoul2_view,
                     rt_rigid_casters_enabled,
                     blob_shadow_settings,
-                    settings.no_predict,
+                    settings.no_predict || jk2_spectating,
                     Some(&mut predict),
                     Some(crate::app::PlayerPresentationInput::Remote {
                         angles: self.live_input.view_angles,
-                        no_predict: settings.no_predict,
+                        no_predict: settings.no_predict || jk2_spectating,
                     }),
                 )?
             } else {

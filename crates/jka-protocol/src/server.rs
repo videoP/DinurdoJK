@@ -186,6 +186,12 @@ impl Decoder {
 
     pub fn latest_snapshot(&self) -> Option<&Snapshot> { self.latest_snapshot.as_ref() }
 
+    /// A JK2 presentation view owns no protocol-26 delta history. Its actual
+    /// snapshot history remains in the separate JK2 decoder.
+    pub(crate) fn set_presentation_snapshot(&mut self, snapshot: Snapshot) {
+        self.latest_snapshot = Some(snapshot);
+    }
+
     pub fn map_name(&self) -> Option<String> {
         let serverinfo = self.configstrings.get(&0)?;
         info_value(serverinfo, b"mapname").and_then(|value| String::from_utf8(value.to_vec()).ok())

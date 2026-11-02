@@ -1,6 +1,15 @@
 use super::{CommandDef, CommandResult, CommandScope};
 use crate::app::App;
 commands! {
+    cmd_net_jk2_connect ["jk2_connect"] ("jk2_connect <1.02|1.04> <host[:port]>", "Connect to a JK2 server for spectating (default port 28070).", CommandScope::Always) |self, line| {
+        let words: Vec<_> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [_, version, target] => self.connect_to_jk2_server(version, target),
+            _ => self.push_console_line("^3usage:^7 jk2_connect <1.02|1.04> <host[:port]>"),
+        }
+        CommandResult::Handled
+    }
+
     cmd_net_connect ["connect"] ("connect <host[:port]>", "Connect to a server: connect <host[:port]> (default port 29070).", CommandScope::Always) |self, line| {
         let words: Vec<_> = line.split_whitespace().collect();
         match words.get(1) {

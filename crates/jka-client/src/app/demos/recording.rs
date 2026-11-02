@@ -46,6 +46,10 @@ pub(in crate::app) struct DemoRecording {
 
 impl App {
     pub(in crate::app) fn start_demo_recording(&mut self, requested_name: Option<&str>) {
+        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            self.push_console_line("^3Live JK2 demo recording is not implemented yet.");
+            return;
+        }
         use jka_protocol::session::ConnectionState;
 
         if self.demo_recording.is_some() {

@@ -136,6 +136,8 @@ pub struct ClientSession {
     last_packet_sent_time: i32,
 
     decoder: Decoder,
+    /// Only JK2 connections allocate a separate wire decoder / presentation map.
+    jk2: Option<Box<crate::jk2::live::LiveDecoder>>,
     server_message_sequence: i32,
     server_command_sequence: i32,
     server_commands: Vec<Vec<u8>>,
@@ -185,16 +187,23 @@ impl ClientSession {
     /// CL_Connect_f for a remote server. `client_challenge` is the random
     /// value OpenJK derives from rand()/Com_Milliseconds; `qport` is net_qport.
     pub fn connect(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32) -> Self {
-        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, false)
+        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, false, None)
     }
 
     /// Same handshake, but pause before sending the gameplay `connect` packet
     /// so the owner can inspect the speculative infoResponse first.
     pub fn connect_preflight(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32) -> Self {
-        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, true)
+        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, true, None)
     }
 
-    fn connect_inner(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32, pause_preflight: bool) -> Self {
+    pub fn connect_jk2_preflight(server: SocketAddr, mut userinfo: Vec<u8>, qport: u16,
+        client_challenge: i32, realtime: i32, version: crate::jk2::Version) -> Self
+    {
+        set_info_value(&mut userinfo, b"team", b"spectator");
+        Self::connect_inner(server, userinfo, qport, client_challenge, realtime, true, Some(version))
+    }
+
+    fn connect_inner(server: SocketAddr, userinfo: Vec<u8>, qport: u16, client_challenge: i32, realtime: i32, pause_preflight: bool, jk2: Option<crate::jk2::Version>) -> Self {
         let info_challenge = format!("{:08x}", client_challenge as u32);
         let mut session = Self {
             server,
@@ -215,6 +224,7 @@ impl ClientSession {
             last_packet_time: realtime,
             last_packet_sent_time: -9999,
             decoder: Decoder::new(),
+            jk2: jk2.map(|version| Box::new(crate::jk2::live::LiveDecoder::new(version))),
             server_message_sequence: 0,
             server_command_sequence: 0,
             server_commands: vec![Vec::new(); MAX_RELIABLE_COMMANDS],
@@ -258,6 +268,7 @@ impl ClientSession {
     pub fn state(&self) -> ConnectionState { self.state }
     pub fn has_gamestate(&self) -> bool { self.gamestate_received }
     pub fn decoder(&self) -> &Decoder { &self.decoder }
+    pub fn jk2_version(&self) -> Option<crate::jk2::Version> { self.jk2.as_ref().map(|state| state.version) }
     pub fn server_time(&self) -> i32 { self.server_time }
     /// Server time minus the commandTime the newest snapshot acknowledged: how far behind the
     /// server's clock our commands are being processed (about the round trip plus a server frame).
@@ -403,7 +414,7 @@ impl ClientSession {
                 }
                 let mut info = self.userinfo.clone();
                 for (key, value) in [
-                    ("protocol", crate::PROTOCOL_VERSION.to_string()),
+                    ("protocol", self.jk2_version().map_or(crate::PROTOCOL_VERSION, |v| v.protocol()).to_string()),
                     ("qport", self.qport.to_string()),
                     ("challenge", self.challenge.to_string()),
                 ] {
@@ -474,9 +485,10 @@ impl ClientSession {
         // CL_Netchan_Decode keys on our own reliable command that this message
         // acknowledges.
         let reliable = &self.reliable_commands;
-        let decoded = netchan::decode_server_message(&mut message.payload, message.sequence, self.challenge, |ack| {
-            reliable[ack as usize & (MAX_RELIABLE_COMMANDS - 1)].as_slice()
-        });
+        let key_text = |ack: i32| reliable[ack as usize & (MAX_RELIABLE_COMMANDS - 1)].as_slice();
+        let decoded = if self.jk2.is_some() {
+            netchan::decode_jk2_server_message(&mut message.payload, message.sequence, self.challenge, key_text)
+        } else { netchan::decode_server_message(&mut message.payload, message.sequence, self.challenge, key_text) };
         if let Err(error) = decoded {
             self.drop_connection(format!("CL_Netchan_Decode: {error}"));
             return;
@@ -507,6 +519,12 @@ impl ClientSession {
                     return;
                 }
                 if let Ok(info) = crate::parse_info_response(data, &self.info_challenge) {
+                    if let Some(version) = self.jk2_version() {
+                        if info.protocol != version.protocol() || info.get(b"version").is_some_and(|v| v.windows(5).any(|s| s == b"v1.03")) {
+                            self.drop_connection(format!("Server does not match selected JK2 {}", version.name()));
+                            return;
+                        }
+                    }
                     self.server_info_seen = true;
                     self.events.push_back(SessionEvent::ServerInfo(info));
                 }
@@ -534,7 +552,7 @@ impl ClientSession {
                 if self.state != ConnectionState::Challenging || from != self.server {
                     return;
                 }
-                self.netchan = Some(Netchan::new(self.qport));
+                self.netchan = Some(if self.jk2.is_some() { Netchan::new_jk2(self.qport) } else { Netchan::new(self.qport) });
                 self.last_packet_sent_time = -9999;
                 self.last_packet_time = realtime;
                 self.awaiting_gamestate_since = Some(realtime);
@@ -580,7 +598,9 @@ impl ClientSession {
 
     /// CL_ParseServerMessage over the shared decoder.
     fn parse_server_message(&mut self, sequence: i32, payload: &[u8], realtime: i32) {
-        let result = match self.decoder.parse_packet(sequence, payload) {
+        let parsed = if let Some(jk2) = &mut self.jk2 { jk2.parse(sequence, payload, &mut self.decoder) }
+            else { self.decoder.parse_packet(sequence, payload).map_err(|e| e.to_string()) };
+        let result = match parsed {
             Ok(result) => result,
             Err(error) => {
                 self.drop_connection(format!("CL_ParseServerMessage: {error}"));
@@ -591,6 +611,15 @@ impl ClientSession {
         if self.reliable_acknowledge < self.reliable_sequence - MAX_RELIABLE_COMMANDS as i32 {
             self.reliable_acknowledge = self.reliable_sequence;
         }
+        // Reject before emitting Gamestate: the owner must never enter JKA's
+        // pure-checksum negotiation for a JK2 server, even for one event tick.
+        if self.jk2.is_some() && result.events.iter().any(|e| matches!(e, Event::Gamestate { .. }))
+            && self.decoder.configstrings.get(&CS_SYSTEMINFO)
+                .and_then(|info| info_value(info, b"sv_pure")).is_some_and(|value| atoi(value) != 0)
+        {
+            self.drop_connection("JK2 pure-server admission is not implemented in this spectating preview (sv_pure 0 required)".into());
+            return;
+        }
         for event in result.events {
             match event {
                 Event::Nop => {}
@@ -598,6 +627,12 @@ impl ClientSession {
                 Event::Gamestate { server_command_sequence, .. } => {
                     self.server_command_sequence = server_command_sequence;
                     self.gamestate_parsed();
+                    if self.jk2.is_some() {
+                        if let Err(error) = self.add_reliable_command(b"team spectator", false) {
+                            self.drop_connection(error);
+                            return;
+                        }
+                    }
                 }
                 Event::Snapshot { .. } => {
                     if let Some(snapshot) = self.decoder.latest_snapshot().cloned() {
@@ -646,7 +681,13 @@ impl ClientSession {
                 self.system_info_changed(&args[2..].join(&b' '));
             }
         }
-        self.events.push_back(SessionEvent::ServerCommand(command));
+        if let Some(jk2) = &mut self.jk2 {
+            match jk2.command(command, &mut self.decoder) {
+                Ok(Some(command)) => self.events.push_back(SessionEvent::ServerCommand(command)),
+                Ok(None) => {}
+                Err(error) => self.drop_connection(error),
+            }
+        } else { self.events.push_back(SessionEvent::ServerCommand(command)); }
     }
 
     fn system_info_changed(&mut self, info: &[u8]) {
@@ -723,6 +764,13 @@ impl ClientSession {
 
     /// CL_AddReliableCommand. Fails on overflow (ERR_DROP "Client command overflow").
     pub fn add_reliable_command(&mut self, text: &[u8], is_disconnect: bool) -> Result<(), String> {
+        if self.jk2.is_some() {
+            let args = tokenize(text);
+            if args.first().is_some_and(|s| s.eq_ignore_ascii_case(b"team"))
+                && args.get(1).is_some_and(|s| !s.eq_ignore_ascii_case(b"spectator") && !s.eq_ignore_ascii_case(b"s")) {
+                return Err("JK2 live milestone supports spectating; native MVSDK prediction is not integrated yet".into());
+            }
+        }
         let unacknowledged = self.reliable_sequence - self.reliable_acknowledge;
         let limit = MAX_RELIABLE_COMMANDS as i32;
         if (is_disconnect && unacknowledged > limit) || (!is_disconnect && unacknowledged >= limit) {
@@ -751,6 +799,14 @@ impl ClientSession {
             return None;
         }
         cmd.server_time = server_time;
+        if self.jk2.is_some() {
+            // Spectator navigation / follow only. JKA selection/generic IDs
+            // must never be sent as JK2 gameplay IDs.
+            cmd.weapon = 0;
+            cmd.force_selection = 0;
+            cmd.inventory_selection = 0;
+            cmd.generic_command = 0;
+        }
         self.cmd_number += 1;
         self.cmds[self.cmd_number as usize & (CMD_BACKUP - 1)] = cmd;
         Some(self.cmd_number)
@@ -829,7 +885,9 @@ impl ClientSession {
                 commands: &commands,
             }),
         };
-        let mut data = match netchan::write_client_message(&packet) {
+        let encoded = if self.jk2.is_some() { netchan::write_jk2_client_message(&packet) }
+            else { netchan::write_client_message(&packet) };
+        let mut data = match encoded {
             Ok(data) => data,
             Err(error) => {
                 self.drop_connection(format!("CL_WritePacket: {error}"));
@@ -837,9 +895,10 @@ impl ClientSession {
             }
         };
         let server_commands = &self.server_commands;
-        if let Err(error) = netchan::encode_client_message(&mut data, self.challenge, |ack| {
-            server_commands[ack as usize & (MAX_RELIABLE_COMMANDS - 1)].as_slice()
-        }) {
+        let key_text = |ack: i32| server_commands[ack as usize & (MAX_RELIABLE_COMMANDS - 1)].as_slice();
+        let scrambled = if self.jk2.is_some() { netchan::encode_jk2_client_message(&mut data, self.challenge, key_text) }
+            else { netchan::encode_client_message(&mut data, self.challenge, key_text) };
+        if let Err(error) = scrambled {
             self.drop_connection(format!("CL_Netchan_Encode: {error}"));
             return;
         }
@@ -1125,6 +1184,70 @@ mod tests {
         assert!(session.take_outgoing().is_empty());
         session.send_commands(4200, 30);
         assert_eq!(session.take_outgoing().len(), 1);
+    }
+
+    #[test]
+    fn jk2_handshake_selects_protocol_and_keeps_wire_keys_before_presentation() {
+        for version in [crate::jk2::Version::V102, crate::jk2::Version::V104] {
+            let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 4321, 777, 0, version);
+            session.take_outgoing();
+            session.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345", 10);
+            assert!(session.take_outgoing().is_empty());
+            session.resume_connect(20);
+            let outgoing = session.take_outgoing();
+            let plain = adaptive_huffman::decompress(&outgoing[0], 12, 16384);
+            assert!(plain.windows(12).any(|s| s == format!("\\protocol\\{}", version.protocol()).as_bytes()));
+            session.packet_event(addr(), b"\xff\xff\xff\xffconnectResponse", 30);
+            session.take_outgoing();
+            let command = ServerCommand { sequence: 8, text: b"cs 544 \"n\\Changed\\model\\kyle/blue\"".to_vec() };
+            session.take_events();
+            session.server_command(command.clone());
+            assert_eq!(session.server_commands[8], command.text);
+            assert!(session.take_events().iter().any(|e| matches!(e,
+                SessionEvent::ServerCommand(c) if c.sequence == 8 && c.text.starts_with(b"cs 1131 "))));
+            assert!(session.add_reliable_command(b"team red", false).is_err());
+            assert!(session.add_reliable_command(b"team spectator", false).is_ok());
+            session.set_primed(40);
+            let number = session.create_command(UserCmd { weapon: 4, generic_command: 7, forward_move: 127, ..Default::default() }).unwrap();
+            let cmd = session.command(number).unwrap();
+            assert_eq!(cmd.weapon, 0);
+            assert_eq!(cmd.generic_command, 0);
+            assert_eq!(cmd.forward_move, 127);
+        }
+    }
+
+    #[test]
+    fn jk2_preflight_rejects_protocol_mismatch_before_connect() {
+        let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 1, 777, 0, crate::jk2::Version::V104);
+        session.take_outgoing();
+        session.packet_event(addr(), b"\xff\xff\xff\xffinfoResponse\n\\challenge\\00000309\\protocol\\15", 10);
+        assert_eq!(session.state(), ConnectionState::Disconnected);
+        assert!(session.take_outgoing().is_empty());
+    }
+
+    #[test]
+    fn jk2_pure_rejection_never_emits_a_jka_gamestate_event() {
+        let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 1, 777, 0, crate::jk2::Version::V104);
+        session.state = ConnectionState::Connected;
+        session.take_events();
+        let mut w = crate::message::MessageWriter::new(16384).unwrap();
+        w.write_bits(0, 32).unwrap();
+        w.write_bits(2, 8).unwrap(); // JK2 svc_gamestate
+        w.write_bits(0, 32).unwrap();
+        for (index, text) in [(0, b"\\protocol\\16\\version\\JK2MP: v1.04\\mapname\\ffa_bespin".as_slice()), (1, b"\\sv_pure\\1\\sv_serverid\\99")] {
+            w.write_bits(3, 8).unwrap();
+            w.write_bits(index, 16).unwrap();
+            netchan::write_string(&mut w, text).unwrap();
+        }
+        w.write_bits(9, 8).unwrap(); // JK2 svc_EOF inside gamestate
+        w.write_bits(0, 32).unwrap();
+        w.write_bits(42, 32).unwrap();
+        w.write_bits(9, 8).unwrap();
+        session.parse_server_message(1, w.as_bytes(), 100);
+        assert_eq!(session.state(), ConnectionState::Disconnected);
+        let events = session.take_events();
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Gamestate)));
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Disconnected(reason) if reason.contains("sv_pure 0 required"))));
     }
 
     #[test]

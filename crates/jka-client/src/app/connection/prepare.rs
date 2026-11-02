@@ -294,7 +294,7 @@ impl App {
             map_name,
             elapsed_ms.unwrap_or(0.0)
         );
-        if !info.is_protocol_26() {
+        if !info.is_protocol_26() && !self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
             if let Some(net) = self.net.as_mut() {
                 net.resume_connect();
             }
@@ -381,6 +381,12 @@ impl App {
     }
 
     pub(in crate::app) fn choose_missing_map_autodownload(&mut self) {
+        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            self.console_status = "JK2 AUTODOWNLOAD IS NOT IMPLEMENTED YET".into();
+            self.push_console_line("^3Install the JK2 map PK3 under <client>/jk2/base, then retry. JK2 downloads require their own package rules.");
+            self.egui_repaint_requested = true;
+            return;
+        }
         if !self.network.allow_http_downloads && !self.network.allow_legacy_downloads {
             self.console_status = "AUTODOWNLOAD IS DISABLED IN SETUP > NETWORK".into();
             self.push_console_line(

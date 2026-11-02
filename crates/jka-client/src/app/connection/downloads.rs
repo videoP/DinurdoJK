@@ -14,6 +14,10 @@ impl App {
         map_name: &str,
         configstrings: &BTreeMap<u16, Vec<u8>>,
     ) {
+        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            self.fail_live_autodownload(map_name, "JK2 autodownload is not implemented; install the map in the separate JK2 asset namespace.".into());
+            return;
+        }
         if self.live_download.is_some() {
             return;
         }

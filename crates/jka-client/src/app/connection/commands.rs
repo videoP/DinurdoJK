@@ -97,7 +97,9 @@ impl App {
                     .to_vec()
             })
             .unwrap_or_default();
-        let info = self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info);
+        let info = if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            self.network.jk2_userinfo(&self.solo_client_info.model_cvar())
+        } else { self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info) };
         let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
         let Some(net) = self.net.as_mut() else {
             return Err("network session disappeared while queuing userinfo".to_owned());

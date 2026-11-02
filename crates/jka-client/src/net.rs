@@ -198,6 +198,21 @@ impl Default for NetworkSettings {
 }
 
 impl NetworkSettings {
+    /// Stock JK2 fields only; packed JKA body/cosmetic extensions are not part
+    /// of JK2's color1/team protocol. Do not mutate the user's JKA settings.
+    pub fn jk2_userinfo(&self, model: &str) -> Vec<u8> {
+        let mut info = Vec::new();
+        for (key, value) in [
+            ("name", self.name.clone()), ("model", model.to_owned()),
+            ("rate", self.rate.to_string()), ("snaps", self.snaps.to_string()),
+            ("color1", self.color1.to_string()), ("forcepowers", self.forcepowers.clone()),
+            ("sex", self.sex.clone()), ("handicap", self.handicap.to_string()),
+            ("password", self.password.clone()), ("team", "spectator".into()),
+            ("cg_predictItems", "0".into()), ("teamoverlay", u8::from(self.team_overlay).to_string()),
+        ] { set_info_value(&mut info, key.as_bytes(), value.as_bytes()); }
+        info
+    }
+
     /// Console, config archive and userinfo must all see the exact same cvar.
     pub fn color1_value(&self) -> String {
         self.color1_packed.clone().unwrap_or_else(||
@@ -538,6 +553,23 @@ impl NetClient {
     }
 
     fn connect_inner(server_name: &str, userinfo: Vec<u8>, net_port: u16, preflight: bool) -> Result<Self, String> {
+        Self::connect_game(server_name, userinfo, net_port, preflight, None)
+    }
+
+    pub fn connect_jk2_preflight(server_name: &str, userinfo: Vec<u8>, net_port: u16,
+        version: jka_protocol::jk2::Version) -> Result<Self, String>
+    {
+        Self::connect_game(server_name, userinfo, net_port, true, Some(version))
+    }
+
+    fn connect_game(server_name: &str, userinfo: Vec<u8>, net_port: u16, preflight: bool,
+        jk2: Option<jka_protocol::jk2::Version>) -> Result<Self, String>
+    {
+        let address;
+        let server_name = if jk2.is_some() && !server_name.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
+            address = format!("{server_name}:{}", jka_protocol::jk2::DEFAULT_PORT);
+            &address
+        } else { server_name };
         let server = resolve_server(server_name)?;
         let socket = bind_live_socket(net_port)?;
         socket
@@ -545,7 +577,10 @@ impl NetClient {
             .map_err(|error| format!("UDP socket setup failed: {error}"))?;
         let epoch = Instant::now();
         let seed = random_u32();
-        let session = if preflight {
+        let session = if let Some(version) = jk2 {
+            ClientSession::connect_jk2_preflight(server, userinfo, (seed & 0xffff) as u16,
+                (seed >> 1) as i32, 0, version)
+        } else if preflight {
             ClientSession::connect_preflight(
                 server,
                 userinfo,

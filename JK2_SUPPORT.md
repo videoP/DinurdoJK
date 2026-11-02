@@ -256,7 +256,95 @@ Pausing immediately after a seek can freeze the initial animation blend in a
 neutral pose; briefly resuming playback allows the pose to settle. This remains
 a presentation limitation to address before treating paused seeks as exact poses.
 
-Live JK2 connection, server admission/pure negotiation, native MVSDK prediction,
-and playable gameplay remain to be implemented. The next step is live 1.04
-connection/spectating with explicit version selection and isolated JK2 networking,
-followed by 1.02 compatibility and native movement validation.
+User validation accepted both demos. Deferred visual issue: in
+`imp495xAMoMAx.dm_16`, xAMo's Kyle head appears to have missing or incorrect
+hair/ear surfaces. The supplied close-up shows the head texture/surface seam;
+check JK2 skin surface selection and caps against the native client in a later
+presentation pass. This is not a reason to change the configured HUD or menus.
+
+## Live spectating preview
+
+The next increment adds explicit live connections for both versions:
+
+```
+jk2_connect 1.04 host:28070
+jk2_connect 1.02 host:28070
+```
+
+Omitting the port uses 28070; ordinary `connect` retains JKA's 29070 default.
+Reconnect remembers the selected game/version. Connection preflight checks the
+advertised protocol and the gamestate independently verifies the version.
+Protocol 15 gamestates identifying 1.03 are rejected.
+
+The JK2 wire decoder owns JK2 delta history. A separate presentation adapter
+supplies existing CGame consumers with mapped snapshots/configstrings without
+re-encoding or retaining a demo stream. The network reliable-command ring keeps
+the original server text and sequence numbers for acknowledgements, XOR, and
+command hashes. Split configstrings are assembled before mapping their indices.
+JK2MV's 16 KiB limit, high-ASCII/percent key normalization, usercmd hash rules,
+and full-time encoding for backwards usercmd times are selected only for JK2.
+JKA keeps its existing protocol defaults and byte behavior.
+
+This preview is for spectating: the native JKA predictor is explicitly bypassed
+for JK2 live sessions, JKA selection/generic-command IDs are not transmitted,
+and `team spectator` is requested on admission. Commands to join playing teams
+are rejected until native MVSDK prediction is integrated. Stock JK2 userinfo
+uses plain color/team fields without modifying the user's JKA cosmetic settings.
+No physics accuracy or playable movement claim is made by this milestone.
+
+Pure servers are rejected with an explicit `sv_pure 0 required` error before a
+gamestate reaches JKA pure handling. Autodownload and live JK2 demo recording
+are disabled with explanatory messages; their existing JKA implementations are
+not used. Installed custom maps can be placed under `<client>/jk2/base`.
+
+For a private local test, run from this checkout:
+
+```powershell
+.\scripts\jk2-test-server.ps1
+# In DinurdoJK: jk2_connect 1.04 127.0.0.1:28079
+# Follow the bot with: follow 0
+.\scripts\jk2-test-server.ps1 -Stop
+# Optional alternate version, after stopping:
+.\scripts\jk2-test-server.ps1 -Version 1.02
+```
+
+The helper reads `fs_jk2path` or accepts `-GameData`, starts the installed
+`jk2mvded.exe` bound to loopback with one Kyle bot and `sv_pure 0`, and reuses
+`target/release/jk2` as its runtime home. It copies no binaries/build trees and
+does not write to the retail installation. Python 3 is required to launch this
+old server without an inherited console: PowerShell's hidden-window launch
+triggered a JK2MV 1.4.1 console-resizing crash before networking. The helper
+checks the actual protocol response and records PID/creation-time ownership
+before managing shutdown. Its temporary RCON credential and logs stay under
+ignored `artifacts`.
+
+Validation on November 2, 2026:
+
+- All 61 protocol tests passed, including existing JKA tests, both real-demo
+  mappings, JK2 handshakes, wire/presentation command separation, key rules,
+  backwards command times, version mismatch rejection, and pure rejection before
+  the owner receives any gamestate event.
+- The standard fast build succeeded and staged the game executable. Builds
+  reused the existing profile/cache/flags; no alternate target tree was created.
+- The supplied installed server reports JK2MV 1.4.1 (February 2018) / basemv;
+  it is an independent runtime check, not a build of the pinned reference tree.
+  Both 1.02 and 1.04 admitted the client on non-pure loopback servers, rendered
+  Bespin and followed the bot. Diagnostics measured 20 received snapshots/second
+  with 50 ms gaps. Saved game config hashes were unchanged in both checks.
+- The 1.04 test also accepted chat containing a percent sign, changed to Yavin,
+  re-entered CGame, disconnected, reconnected with the right game/version, then
+  restored JKA packages on return to the menu. The final executable repeated the
+  same sequence. Screenshot captures show authored moving character poses.
+- A pure-mode native-server check returned the explicit unsupported error,
+  never entered the game and did not attempt a JKA stock-PK3 reply.
+- Reports: `artifacts/jk2-live-final.log`, `artifacts/jk2-102-live-smoke.log`,
+  and `artifacts/jk2-pure-rejection.log`; associated screenshots/server dumps
+  are under the normal runtime `base` output directories. Free spectator movement
+  still needs a focused-window user check: the offscreen renderer intentionally
+  suppresses capture, so its scripted `+forward` did not create movement input.
+  No numerical JKA performance regression claim is made.
+
+Next: implement JK2 pure-package selection/checksum admission and native MVSDK
+prediction with explicit state conversion and differential command replay.
+Public discovery, downloads, arbitrary mod client modules, and full gameplay
+presentation remain separate work items.

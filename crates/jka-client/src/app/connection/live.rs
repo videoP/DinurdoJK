@@ -12,7 +12,30 @@ impl App {
     }
 
     pub(in crate::app) fn connect_to_server(&mut self, target: &str) {
+        if let Some(rest) = target.strip_prefix("jk2://") {
+            if let Some((version, address)) = rest.split_once('/') {
+                self.connect_to_jk2_server(version, address);
+                return;
+            }
+        }
         self.connect_to_server_with_hint(target, None);
+    }
+
+    pub(in crate::app) fn connect_to_jk2_server(&mut self, version: &str, target: &str) {
+        let version = match version {
+            "1.02" => jka_protocol::jk2::Version::V102,
+            "1.04" => jka_protocol::jk2::Version::V104,
+            _ => { self.push_console_line("^1JK2 version must be 1.02 or 1.04; 1.03 is unsupported"); return; }
+        };
+        let Some(root) = self.fs_roots.jk2path.as_ref() else {
+            self.push_console_line("^1Set fs_jk2path to the JK2 GameData directory first"); return;
+        };
+        let required = if version == jka_protocol::jk2::Version::V102 { &["assets0.pk3", "assets1.pk3"][..] }
+            else { &["assets0.pk3", "assets1.pk3", "assets2.pk3", "assets5.pk3"][..] };
+        if let Some(missing) = required.iter().find(|name| !root.join("base").join(name).is_file()) {
+            self.push_console_line(format!("^1JK2 {} requires base/{missing} under fs_jk2path", version.name())); return;
+        }
+        self.connect_to_server_game(target, None, Some(version));
     }
 
     /// A browser refresh is an early map/mod *hint*, not a verified gamestate.
@@ -23,12 +46,17 @@ impl App {
         target: &str,
         browser_hint: Option<(&str, &str)>,
     ) {
+        self.connect_to_server_game(target, browser_hint, None);
+    }
+
+    fn connect_to_server_game(&mut self, target: &str, browser_hint: Option<(&str, &str)>, jk2: Option<jka_protocol::jk2::Version>) {
         self.leave_render_studio_for_launch();
         self.cancel_vote_map_prewarm();
         self.vote_map_candidate = None;
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
         }
+        self.select_demo_asset_game(jk2.map(|v| if v == jka_protocol::jk2::Version::V102 { 2 } else { 4 }));
         self.disconnect_notice = None;
         self.server_password_prompt = None;
         // Start before DNS/socket setup so the join metric really measures from
@@ -49,8 +77,11 @@ impl App {
         if self.network.color2_packed.is_none() {
             if let Err(error) = self.sync_packed_body_cvar() { self.push_console_error(error); }
         }
-        let userinfo = self.network.userinfo(&self.solo_client_info.model_cvar());
-        match crate::net::NetClient::connect_preflight(target, userinfo, self.network.net_port) {
+        let userinfo = if jk2.is_some() { self.network.jk2_userinfo(&self.solo_client_info.model_cvar()) }
+            else { self.network.userinfo(&self.solo_client_info.model_cvar()) };
+        let connection = if let Some(version) = jk2 { crate::net::NetClient::connect_jk2_preflight(target, userinfo, self.network.net_port, version) }
+            else { crate::net::NetClient::connect_preflight(target, userinfo, self.network.net_port) };
+        match connection {
             Ok(net) => {
                 // NET_OpenIP parity: if the requested port was occupied and we
                 // scanned upward, expose the actual bound port through net_port.
@@ -58,7 +89,10 @@ impl App {
                 let resolved_server = net.session().server();
                 self.push_console_line(format!("^7{target} resolved to {}", resolved_server));
                 self.console_status = format!("CONNECTING TO {}...", target.to_ascii_uppercase());
-                self.reconnect_target = Some(target.to_owned());
+                self.reconnect_target = Some(jk2.map_or_else(|| target.to_owned(), |v| format!("jk2://{}/{target}", v.name())));
+                if jk2.is_some() {
+                    self.push_console_line("^3JK2 live preview: spectating only; native MVSDK prediction and pure-server admission are pending.");
+                }
                 self.live_input = crate::net::LiveInput::default();
                 self.reset_remote_emotes();
                 self.predictor.reset();
@@ -79,10 +113,11 @@ impl App {
                             None
                         }
                     },
-                    None => {
+                    None if jk2.is_none() => {
                         self.apply_fs_game_hint(resolved_server);
                         None
                     }
+                    None => None,
                 };
                 self.net = Some(net);
                 self.start_live_cgame_prep();
@@ -111,6 +146,7 @@ impl App {
                 self.publish_ui();
             }
             Err(error) => {
+                self.select_demo_asset_game(None);
                 self.live_join_timing = None;
                 self.console_status = error.clone();
                 self.push_console_line(format!("^1{error}"));

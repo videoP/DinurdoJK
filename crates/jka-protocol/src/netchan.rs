@@ -39,6 +39,7 @@ const OOB_PREFIX: &[u8] = b"\xff\xff\xff\xff";
 /// packets carry the qport, incoming ones do not.
 #[derive(Debug, Clone)]
 pub struct Netchan {
+    max_message_size: usize,
     pub qport: u16,
     pub incoming_sequence: i32,
     pub outgoing_sequence: i32,
@@ -60,6 +61,7 @@ impl Netchan {
     /// Netchan_Setup.
     pub fn new(qport: u16) -> Self {
         Self {
+            max_message_size: MAX_MSGLEN,
             qport,
             incoming_sequence: 0,
             outgoing_sequence: 1,
@@ -69,10 +71,14 @@ impl Netchan {
         }
     }
 
+    pub fn new_jk2(qport: u16) -> Self {
+        Self { max_message_size: crate::jk2::MAX_MESSAGE_BYTES, ..Self::new(qport) }
+    }
+
     /// Netchan_Transmit followed by CL_WritePacket's "fire all fragments at
     /// once" loop. Returns the datagrams in send order.
     pub fn transmit(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
-        assert!(data.len() <= MAX_MSGLEN, "Netchan_Transmit: length = {}", data.len());
+        assert!(data.len() <= self.max_message_size, "Netchan_Transmit: length = {}", data.len());
         if data.len() < FRAGMENT_SIZE {
             let mut packet = Vec::with_capacity(6 + data.len());
             packet.extend_from_slice(&self.outgoing_sequence.to_le_bytes());
@@ -134,7 +140,7 @@ impl Netchan {
                 return None;
             }
             if cursor + fragment_length > packet.len()
-                || self.fragment_buffer.len() + fragment_length > MAX_MSGLEN
+                || self.fragment_buffer.len() + fragment_length > self.max_message_size
             {
                 return None;
             }
@@ -143,7 +149,7 @@ impl Netchan {
             if fragment_length == FRAGMENT_SIZE {
                 return None;
             }
-            if self.fragment_buffer.len() + 4 > MAX_MSGLEN {
+            if self.fragment_buffer.len() + 4 > self.max_message_size {
                 return None;
             }
             // As in the reference, a completed fragmented message does not
@@ -153,6 +159,7 @@ impl Netchan {
         }
 
         self.incoming_sequence = sequence;
+        if packet.len() - cursor > self.max_message_size { return None; }
         Some(IncomingMessage {
             sequence,
             payload: packet[cursor..].to_vec(),
@@ -254,8 +261,12 @@ fn write_delta_key(w: &mut MessageWriter, key: i32, old: i32, new: i32, bits: i8
 
 /// MSG_WriteDeltaUsercmdKey.
 pub fn write_delta_usercmd_key(w: &mut MessageWriter, key: i32, from: &UserCmd, to: &UserCmd) -> Result<(), Error> {
+    write_delta_usercmd_key_mode(w, key, from, to, false)
+}
+
+fn write_delta_usercmd_key_mode(w: &mut MessageWriter, key: i32, from: &UserCmd, to: &UserCmd, jk2: bool) -> Result<(), Error> {
     let delta_time = to.server_time.wrapping_sub(from.server_time);
-    if delta_time < 256 {
+    if delta_time < 256 && (!jk2 || to.server_time >= from.server_time) {
         w.write_bits(1, 1)?;
         w.write_bits(delta_time, 8)?;
     } else {
@@ -362,32 +373,75 @@ pub struct ClientPacket<'a> {
 
 /// CL_WritePacket + CL_Netchan_Transmit's clc_EOF, before XOR encoding.
 pub fn write_client_message(packet: &ClientPacket<'_>) -> Result<Vec<u8>, Error> {
-    let mut w = MessageWriter::new(MAX_MSGLEN)?;
+    write_client_message_mode(packet, false)
+}
+
+/// JK2MV msg.cpp: 16 KiB messages, high ASCII string normalization and
+/// Com_HashKey's additional percent normalization. Usercmd fields otherwise
+/// match JKA's ordering and widths; backwards times use a full time value.
+pub fn write_jk2_client_message(packet: &ClientPacket<'_>) -> Result<Vec<u8>, Error> {
+    write_client_message_mode(packet, true)
+}
+
+fn write_client_message_mode(packet: &ClientPacket<'_>, jk2: bool) -> Result<Vec<u8>, Error> {
+    let mut w = MessageWriter::new(if jk2 { crate::jk2::MAX_MESSAGE_BYTES } else { MAX_MSGLEN })?;
     w.write_bits(packet.server_id, 32)?;
     w.write_bits(packet.message_acknowledge, 32)?;
     w.write_bits(packet.command_acknowledge, 32)?;
     for &(sequence, text) in packet.reliable_commands {
         w.write_bits(i32::from(CLC_CLIENT_COMMAND), 8)?;
         w.write_bits(sequence, 32)?;
-        write_string(&mut w, text)?;
+        if jk2 { write_string(&mut w, &text.iter().map(|&c| if c > 127 { b'.' } else { c }).collect::<Vec<_>>())?; }
+        else { write_string(&mut w, text)?; }
     }
     if let Some(moves) = &packet.moves {
         let count = moves.commands.len().min(MAX_PACKET_USERCMDS);
         if count > 0 {
             w.write_bits(i32::from(if moves.delta { CLC_MOVE } else { CLC_MOVE_NO_DELTA }), 8)?;
             w.write_bits(count as i32, 8)?;
+            let normalized;
+            let key_text = if jk2 {
+                normalized = jk2_key_text(moves.acknowledged_server_command);
+                &normalized
+            } else { moves.acknowledged_server_command };
             let key = moves.checksum_feed
                 ^ packet.message_acknowledge
-                ^ hash_key(moves.acknowledged_server_command, 32);
+                ^ hash_key(key_text, 32);
             let mut old = UserCmd::default();
             for cmd in &moves.commands[moves.commands.len() - count..] {
-                write_delta_usercmd_key(&mut w, key, &old, cmd)?;
+                write_delta_usercmd_key_mode(&mut w, key, &old, cmd, jk2)?;
                 old = *cmd;
             }
         }
     }
     w.write_bits(i32::from(CLC_EOF), 8)?;
     Ok(w.as_bytes().to_vec())
+}
+
+fn jk2_key_text(text: &[u8]) -> Vec<u8> {
+    text.iter().map(|&c| if c > 127 || c == b'%' { b'.' } else { c }).collect()
+}
+
+pub fn decode_jk2_server_message<'a>(payload: &mut [u8], sequence: i32, challenge: i32,
+    reliable_command: impl FnOnce(i32) -> &'a [u8]) -> Result<(), Error>
+{
+    let ack = MessageReader::new(payload)?.read_long()?;
+    let text = jk2_key_text(reliable_command(ack));
+    scramble(payload, CL_DECODE_START, 4, (challenge ^ sequence) as u8, &text);
+    Ok(())
+}
+
+pub fn encode_jk2_client_message<'a>(data: &mut [u8], challenge: i32,
+    server_command: impl FnOnce(i32) -> &'a [u8]) -> Result<(), Error>
+{
+    if data.len() <= CL_ENCODE_START { return Ok(()); }
+    let mut reader = MessageReader::new(data)?;
+    let server_id = reader.read_long()?;
+    let message_acknowledge = reader.read_long()?;
+    let ack = reader.read_long()?;
+    let text = jk2_key_text(server_command(ack));
+    scramble(data, CL_ENCODE_START, 0, (challenge ^ server_id ^ message_acknowledge) as u8, &text);
+    Ok(())
 }
 
 /// `getchallenge <clientChallenge>` (NET_OutOfBandPrint, no terminator).
@@ -449,6 +503,42 @@ pub fn parse_connectionless(packet: &[u8]) -> Option<Connectionless> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jk2_command_hash_xor_and_backwards_time_follow_native_rules() {
+        let text = b"print \"caf\xe9 50%\"";
+        let normalized = b"print \"caf. 50.\"";
+        let cmds = [UserCmd { server_time: 1000, forward_move: 127, ..Default::default() },
+            UserCmd { server_time: 900, right_move: -127, ..Default::default() }];
+        let packet = ClientPacket { server_id: 77, message_acknowledge: 9, command_acknowledge: 3,
+            reliable_commands: &[(1, b"say caf\xe9")], moves: Some(ClientMoves {
+                delta: true, checksum_feed: 1234, acknowledged_server_command: text, commands: &cmds }) };
+        let plain = write_jk2_client_message(&packet).unwrap();
+        let mut reader = MessageReader::new(&plain).unwrap();
+        assert_eq!(reader.read_long().unwrap(), 77);
+        assert_eq!(reader.read_long().unwrap(), 9);
+        assert_eq!(reader.read_long().unwrap(), 3);
+        assert_eq!(reader.read_byte().unwrap(), CLC_CLIENT_COMMAND);
+        assert_eq!(reader.read_long().unwrap(), 1);
+        assert_eq!(reader.read_string(1024).unwrap(), b"say caf.");
+        assert_eq!(reader.read_byte().unwrap(), CLC_MOVE);
+        assert_eq!(reader.read_byte().unwrap(), 2);
+        let key = 1234 ^ 9 ^ hash_key(normalized, 32);
+        let first = read_delta_usercmd_key(&mut reader, key, &UserCmd::default()).unwrap();
+        assert_eq!(first, cmds[0]);
+        assert_eq!(read_delta_usercmd_key(&mut reader, key, &first).unwrap(), cmds[1]);
+        let mut actual = plain.clone();
+        encode_jk2_client_message(&mut actual, 42, |_| text).unwrap();
+        let mut reference = plain;
+        encode_client_message(&mut reference, 42, |_| normalized).unwrap();
+        assert_eq!(actual, reference);
+        let mut server = vec![0; 70];
+        server[0] = 12;
+        let mut reference = server.clone();
+        decode_jk2_server_message(&mut server, 12, 99, |_| text).unwrap();
+        decode_server_message(&mut reference, 12, 99, |_| normalized).unwrap();
+        assert_eq!(server, reference);
+    }
 
     #[test]
     fn small_messages_carry_sequence_and_qport() {

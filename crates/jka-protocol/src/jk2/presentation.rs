@@ -96,7 +96,7 @@ fn serverinfo(value: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
-fn configstring(index: u16, value: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn configstring(index: u16, value: &[u8]) -> Result<Vec<u8>, String> {
     if index == 0 {
         return serverinfo(value);
     }
@@ -121,8 +121,9 @@ fn configstring(index: u16, value: &[u8]) -> Result<Vec<u8>, String> {
     Ok(value.to_vec())
 }
 
-struct Adapter {
-    omitted_events: usize,
+#[derive(Default)]
+pub(crate) struct Adapter {
+    pub(crate) omitted_events: usize,
 }
 
 impl Adapter {
@@ -149,7 +150,7 @@ impl Adapter {
         }
     }
 
-    fn entity(
+    pub(crate) fn entity(
         &mut self,
         version: Version,
         raw: &EntityState,
@@ -213,7 +214,7 @@ impl Adapter {
         Ok(result)
     }
 
-    fn snapshot(
+    pub(crate) fn snapshot(
         &mut self,
         version: Version,
         raw: &Snapshot,
