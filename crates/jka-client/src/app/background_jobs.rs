@@ -90,6 +90,7 @@ fn run_lane(
 pub(super) enum JobResult {
     ConfigSaved { generation: u64, result: Result<(), String> },
     ServerDump { path: std::path::PathBuf, result: Result<(), String> },
+    Jk2DemoInfo { result: Result<String, String> },
 }
 
 #[cfg(test)]

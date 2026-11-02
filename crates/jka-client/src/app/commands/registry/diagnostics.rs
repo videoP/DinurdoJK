@@ -3,6 +3,26 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_jk2_demo_info ["jk2_demoInfo"] ("jk2_demoInfo <demoname or absolute path>", "Decode an entire JK2 demo and report its version, map, duration, and snapshot integrity. Names resolve under fs_jk2path/base/demos.", CommandScope::Always) |self, command| {
+        let args = jka_protocol::commands::tokenize(command.as_bytes());
+        let result = (|| {
+            if args.len() != 2 { return Err("usage: jk2_demoInfo <demoname or absolute path>".to_owned()); }
+            let name = std::str::from_utf8(&args[1]).map_err(|_| "Invalid demo path".to_owned())?;
+            let path = crate::jk2_diagnostics::resolve_demo(self.fs_roots.jk2path.as_deref(), name)?;
+            let tx = self.background_result_tx.clone();
+            self.background_jobs.io(move || {
+                let result = crate::jk2_diagnostics::inspect(&path);
+                let _ = tx.send(crate::app::background_jobs::JobResult::Jk2DemoInfo { result });
+            })?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.push_console_line("JK2 demo inspection queued"),
+            Err(error) => self.push_console_line(error),
+        }
+        CommandResult::Handled
+    }
+
     cmd_force_jump_slope_fix ["force_jump_slope_fix"] ("force_jump_slope_fix [0|1]", "Solo authority: time-consistent Force Jump boost on overhead slopes (default 1). Remote correction applies only to jaPRO race mode and requires matching server physics.", CommandScope::Connected) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let Some(server) = self.local_server.as_mut() else {

@@ -62,6 +62,7 @@ fn imported_map(name: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Er
 }
 
 fn help() {
+    println!("  jk2-demo <path.dm_15|dm_16>  Decode all JK2 1.02/1.04 messages and report snapshot integrity");
     println!("JKA Rust diagnostic console\n  help                         Show commands\n  <IPv4:port>                  Query a server\n  demo <path.dm_26>            Inspect demo framing\n  gamestate <path.dm_26>       Decode initial game state\n  gamestate-dump <path.dm_26>  Dump state for reference comparison\n  map <path.bsp>               Load RBSP geometry\n  mapinfo mp/ffa3              Load a development-imported map\n  quit                         Close console\n\nCLI: jka-probe <command> [argument]\nNo arguments opens this console. Paths with spaces may be quoted.\nThis build has no renderer, walking, or live game session yet.");
 }
 
@@ -287,6 +288,11 @@ fn inspect_demo(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn dispatch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() == 2 && args[0] == "jk2-demo" {
+        let summary = jka_protocol::jk2::demo::inspect(BufReader::new(File::open(&args[1])?))?;
+        println!("{}", summary.report());
+        return Ok(());
+    }
     if args == ["--help"] || args == ["-h"] || args == ["help"] {
         help();
         return Ok(());

@@ -1,0 +1,16 @@
+{
+  "jk2-102-prefix.dm_15": {
+    "source": "CoS-WickedR1.dm_15",
+    "source_sha256": "57b7d90b6fe3a5a8088505f0f12cd07d9fa6fd6f3c6633c7f1bbe8b027d28047",
+    "prefix_records": 16,
+    "prefix_sha256": "c969fe3628d6df43b756cf0addbb036767a3849c6ddb6135023a51c9f5876ec1",
+    "notes": "First consecutive framed records, followed by a synthetic end marker. No payload edits."
+  },
+  "jk2-104-prefix.dm_16": {
+    "source": "imp495xAMoMAx.dm_16",
+    "source_sha256": "1118286a92625bccddf8f732265da122a6cf144a15a7c00f509c17b5fcb91a89",
+    "prefix_records": 16,
+    "prefix_sha256": "3d2a9d18924fbbc5deec4125af25869e581cdf63d23e987cb643cb41bc7e573d",
+    "notes": "First consecutive framed records, followed by a synthetic end marker. No payload edits."
+  }
+}

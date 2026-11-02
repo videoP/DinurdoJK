@@ -26,8 +26,8 @@ clarifications. These decisions supersede conflicting instructions in that hando
 - Protect the JKA rendering fast path and Minimal (Unified) performance by design.
   The user will evaluate performance as implementation progresses; no numerical
   acceptance threshold or benchmark has been agreed.
-- Do not compile locally until explicitly requested. When builds are requested,
-  follow `AGENTS.md` and the existing fast-profile/cache configuration.
+- The user has now authorized normal fast builds and focused tests for the JK2
+  milestone. Follow `AGENTS.md` and the existing fast-profile/cache configuration.
 - Use live in-game cvars for diagnostics. Preserve upstream licensing and notices
   when source is incorporated.
 
@@ -60,8 +60,17 @@ versions, assets2 with 1.03/1.04, and assets5 with 1.04. Mount and pure-referenc
 selection must respect the active version even when one installation contains
 all packages. Keep JK2 and JKA search paths and caches correctly separated.
 
-No replay fixtures or agreed test servers have been supplied. The user will
-provide validation material when needed. Do not claim connection, movement,
+The user supplied `base/demos/jk2ffa.dm_15`, which identifies itself as JK2
+1.03. The user explicitly kept support limited to 1.02/1.04; reject that recording
+with a version-specific error rather than decoding it as 1.02. Full 1.03 support
+remains deferred.
+
+The user subsequently supplied `base/jk2demos`. At validation time it contained
+24 unpacked demos: 20 identified as 1.02 and four as 1.04, plus one RAR archive
+not inspected or extracted. Another recording arrived during implementation;
+the final corpus run covered all 24 unpacked demos then present.
+The diagnostics search both `base/demos` and `base/jk2demos` for named recordings.
+No live test servers have been agreed. Do not claim connection, movement,
 pure-server, rendering, or performance validation until actually performed.
 
 ## Initial source audit
@@ -135,6 +144,56 @@ This installation's ignored `target/release/DinurdoJK-paths.ini` now records
 `fs_jk2path=C:\Games\JK21.02\GameData`, preserving its existing JKA path. No personal
 path is hardcoded as a source default.
 
-JK2 networking, version-specific mounting, prediction, and gameplay are not yet
-implemented. No builds, test execution, or gameplay/performance validation have
-been run.
+The next increment adds an isolated `jka_protocol::jk2` message decoder with
+pinned generated 1.02/1.04 netfields, JK2 opcodes/limits, gamestates, baselines,
+playerstate arrays, packet-entity deltas, snapshot history, and configstring
+updates. No JKA field layouts, native structs, or vehicle selectors are reused.
+
+The game exposes a headless diagnostic entry point:
+
+```powershell
+.\target\release\DinurdoJK.exe --jk2-demo-info "CoS-WickedR1"
+.\target\release\DinurdoJK.exe --jk2-demo-info "imp495xAMoMAx"
+```
+
+The in-game console command `jk2_demoInfo <name or absolute path>` performs the
+same inspection on the existing background I/O worker. Neither entry point
+mounts JK2 assets or exercises JKA native prediction. `jka-probe jk2-demo <path>`
+also exposes the streaming inspector if that optional diagnostic binary is built.
+
+Two small regression fixtures retain the first 16 consecutive records of actual
+1.02/1.04 recordings, with synthetic end markers. Payloads are unmodified; source
+and fixture hashes are recorded in `crates/jka-protocol/tests/fixtures/jk2-demo-prefixes.json`.
+
+All 54 protocol unit tests passed, including five JK2 tests covering real-demo
+full/delta snapshots, signed arrays, baseline inheritance/removal, raw float bits,
+lost-delta recovery, truncation rejection, and explicit 1.03 rejection. Existing
+JKA unit tests passed in the same run. Both existing filesystem-layer tests also
+passed, including the case configuring JK2 and JKA retail roots together.
+
+Validation on November 2, 2026:
+
+- `build.ps1 -Fast` succeeded and staged `target/release/DinurdoJK.exe`.
+  It reused the standard cache (430 fresh packages, seven compiled), with about
+  276 MiB additional drive usage reported by the build script. No separate target
+  directory, alternate profile, or compiler-flag configuration was introduced.
+- The built game's headless inspector completed all 24 recordings successfully:
+  1,157,366 records, 1,157,342 accepted snapshots (703 full and 1,156,639 delta),
+  zero missing-base snapshot drops, zero nonfinite player origin/velocity poses.
+  Every recording reached its end marker.
+- Bare-name lookup succeeded for `CoS-WickedR1` and `imp495xAMoMAx` using the
+  configured JK2 root. Absolute paths, including filenames containing spaces,
+  were exercised across the corpus. The original `jk2ffa` recording failed with
+  the expected explicit 1.03 error.
+- Per-recording reports are in the local ignored
+  `artifacts/jk2-demo-validation.json`; totals are in
+  `artifacts/jk2-demo-validation-summary.json`.
+- This validates decoding against real recordings and synthetic edge cases. It
+  is not a differential comparison against a running JK2MV decoder, nor a test of
+  native prediction, visual presentation, server admission, or JKA FPS. The
+  in-game command uses the same tested inspector on a background worker; its GUI
+  dispatch has not been manually exercised in a game window.
+
+Live JK2 connectivity, version-specific asset mounting, rendering/playback,
+native prediction, and gameplay remain to be implemented. Diagnostic decoding
+is a first testable milestone, not a claim of playable JK2 support.

@@ -10,6 +10,7 @@ pub mod demo_bake;
 mod entity_fields;
 pub mod entity_event;
 pub mod gamestate;
+pub mod jk2;
 mod huffman_codes;
 mod player_fields;
 // Public, read-only protocol field descriptors used by the extension bridge.

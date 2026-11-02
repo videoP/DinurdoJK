@@ -109,6 +109,7 @@ mod runtime;
 mod scene;
 mod screenshot;
 mod filesystem_paths;
+mod jk2_diagnostics;
 mod streamer;
 mod server_browser;
 mod speedometer;
@@ -347,6 +348,9 @@ fn is_demo_path(path: &std::path::Path) -> bool {
 
 fn main() -> std::process::ExitCode {
     crate::startup_timeline::start();
+    if let Some(code) = jk2_diagnostics::cli_entry() {
+        return code;
+    }
     if let Some(code) = protocol_link::registration_cli_entry() {
         return std::process::ExitCode::from(code as u8);
     }

@@ -87,7 +87,17 @@ set fs_jk2path "C:\Games\JK21.02\GameData"
 
 The setting persists in `DinurdoJK-paths.ini` and takes effect after restarting.
 It records the JK2 root for upcoming JK2 support; it does not add those packages
-to the JKA search path. JK2 gameplay is not implemented yet. See
+to the JKA search path. Inspect a JK2 1.02/1.04 demo without starting the renderer:
+
+```powershell
+.\target\release\DinurdoJK.exe --jk2-demo-info "CoS-WickedR1"
+.\target\release\DinurdoJK.exe --jk2-demo-info "imp495xAMoMAx"
+```
+
+The in-game command `jk2_demoInfo <name or absolute path>` provides the same
+version, map, duration, and snapshot-integrity report. Names resolve under the
+JK2 installation's `base/demos` and `base/jk2demos` folders. JK2 visual playback,
+live connections, and gameplay are not implemented yet. See
 [JK2 implementation notes](JK2_SUPPORT.md) for source revisions and scope.
 
 ## Technical notes and credits

@@ -199,6 +199,12 @@ impl App {
                     ),
                     Err(error) => self.push_console_line(format!("^1serverdump: couldn't write files: {error}")),
                 },
+                super::background_jobs::JobResult::Jk2DemoInfo { result } => match result {
+                    Ok(report) => {
+                        for line in report.lines() { self.push_console_line(line.to_owned()); }
+                    }
+                    Err(error) => self.push_console_line(format!("^1JK2 demo inspection failed:^7 {error}")),
+                },
             }
         }
     }
