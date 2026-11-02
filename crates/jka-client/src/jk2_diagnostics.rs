@@ -66,11 +66,51 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
     let flag = args.next();
     if !matches!(
         flag.as_deref(),
-        Some("--jk2-demo-info" | "--jk2-presentation-info")
+        Some("--jk2-demo-info" | "--jk2-presentation-info" | "--jk2-pmove-test")
     ) {
         return None;
     }
     let result = (|| {
+        if flag.as_deref() == Some("--jk2-pmove-test") {
+            let demo = args.next();
+            if args.next().is_some() {
+                return Err(
+                    "Usage: DinurdoJK --jk2-pmove-test [demo name or absolute path]".into(),
+                );
+            }
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let base = exe
+                .parent()
+                .ok_or("Cannot locate executable directory")?
+                .join("base");
+            let mut roots = crate::filesystem_paths::load(&base);
+            if roots.jk2path.is_none() {
+                return Err("Set fs_jk2path to your JK2 GameData directory first".into());
+            }
+            let demo = demo
+                .map(|name| resolve_demo(roots.jk2path.as_deref(), &name))
+                .transpose()?;
+            roots.active_jk2 = Some(2);
+            jka_assets::pk3::configure_filesystem_roots(&base, roots);
+            let mut assets =
+                jka_assets::pk3::AssetSearchPath::open_game(&base, None).map_err(|e| e.to_string())?;
+            let asset = assets
+                .read("models/players/_humanoid/animation.cfg", 39998)
+                .map_err(|e| e.to_string())?
+                .ok_or("JK2 animation.cfg missing under fs_jk2path")?;
+            let mut report = jka_movement::jk2::diagnostics::run(&asset.bytes)?;
+            if let Some(demo) = demo {
+                report.push_str(&format!(
+                    "\n{}",
+                    verify_native_snapshots(&demo, &asset.bytes)?
+                ));
+            }
+            return Ok(format!(
+                "Animation data: {} ({} bytes)\n{report}",
+                asset.source.display(),
+                asset.bytes.len()
+            ));
+        }
         let name = args
             .next()
             .ok_or("Usage: DinurdoJK --jk2-demo-info <demo name or absolute path>")?;
@@ -108,8 +148,77 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
             std::process::ExitCode::SUCCESS
         }
         Err(error) => {
-            std::eprintln!("JK2 demo inspection failed: {error}");
+            std::eprintln!("JK2 diagnostic failed: {error}");
             std::process::ExitCode::FAILURE
         }
     })
+}
+
+fn verify_native_snapshots(path: &Path, animations: &[u8]) -> Result<String, String> {
+    use jka_movement::jk2::{Player, State, Version};
+    let mut player: Option<Player> = None;
+    let mut previous_version = None;
+    let mut checked = 0u64;
+    let mut remapped = 0u64;
+    jka_protocol::jk2::demo::inspect_with(
+        BufReader::new(File::open(path).map_err(|e| e.to_string())?),
+        |decoder, snapshot| {
+            let result = (|| -> Result<(), String> {
+                let version = match decoder.version().ok_or("Missing JK2 version")? {
+                    jka_protocol::jk2::Version::V102 => Version::V102,
+                    jka_protocol::jk2::Version::V104 => Version::V104,
+                };
+                let raw = &snapshot.player_state;
+                let state = State {
+                    version,
+                    fields: raw.fields.iter().map(|(_, bits)| bits).collect(),
+                    stats: raw.stats,
+                    persistant: raw.persistant,
+                    ammo: raw.ammo,
+                    powerups: raw.powerups,
+                };
+                if previous_version != Some(version) {
+                    player = Some(Player::new(version, animations, &state)?);
+                    previous_version = Some(version);
+                }
+                let player = player.as_mut().unwrap();
+                player.set_network(&state)?;
+                let returned = player.network();
+                for (i, (name, expected)) in raw.fields.iter().enumerate() {
+                    if returned.fields[i] == expected {
+                        continue;
+                    }
+                    // The pinned 1.02 animation maps deliberately collapse some
+                    // unavailable clips. All other wire fields must roundtrip.
+                    if version == Version::V102
+                        && matches!(name, "legsAnim" | "torsoAnim" | "forceDodgeAnim")
+                    {
+                        remapped += 1;
+                        continue;
+                    }
+                    return Err(format!(
+                        "snapshot {} time {}: native field {name} changed {expected:#x} -> {:#x}",
+                        snapshot.message_num, snapshot.server_time, returned.fields[i]
+                    ));
+                }
+                if (
+                    returned.stats,
+                    returned.persistant,
+                    returned.ammo,
+                    returned.powerups,
+                ) != (state.stats, state.persistant, state.ammo, state.powerups)
+                {
+                    return Err(format!(
+                        "snapshot {}: native array roundtrip differs",
+                        snapshot.message_num
+                    ));
+                }
+                checked += 1;
+                Ok(())
+            })();
+            result.map_err(std::io::Error::other)
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(format!("{}: {checked} real demo snapshots imported/exported through native JK2 state; {remapped} lossy 1.02 animation mappings. Demo usercmds are unavailable; these are state-conversion checks.", path.file_name().unwrap_or_default().to_string_lossy()))
 }

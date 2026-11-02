@@ -4,6 +4,7 @@
 mod collision;
 mod ffi;
 mod jump_trace;
+pub mod jk2;
 pub use jump_trace::JumpTraceEvent;
 pub use collision::{collision_merge_enabled, set_collision_merge_enabled, CollisionWorld, EntityClip, PlacedInlineCollision, SourceCollisionBrush, SourceCollisionPlane};
 use std::{

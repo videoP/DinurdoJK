@@ -404,6 +404,94 @@ Validation on November 2, 2026:
   `artifacts/jk2-pure-server-systeminfo.txt`. No public-server/mod matrix or JKA
   FPS benchmark has been performed.
 
-Next: native MVSDK prediction with explicit state conversion and differential
-command replay. Public discovery, downloads, arbitrary mod client modules, and
+## Native MVSDK movement bridge
+
+The isolated native movement host now builds the pinned MVSDK shared gameplay
+directly. This is the foundation for live prediction; live sessions still use
+the accepted spectator preview and do not call this host yet.
+
+- `jka-movement/vendor/mvsdk` contains 27 verbatim files from
+  `4c7c463638192aead1ff3de8a88cc5de266bf3a2`, including the upstream license.
+  `PROVENANCE.json` lists the ten compiled source files and every SHA256.
+  `reference/vendor_mvsdk.py` reproduces the include closure and generated host
+  tables from that Git revision. Git preserves vendor bytes on Windows.
+- Compiler-only symbol prefixes isolate MVSDK from OpenJK and TaystJK. The Rust
+  `jk2::Player` owns native state and animation data, and serializes shared SDK
+  globals/callbacks with the existing native collision/movement lock. The JKA
+  backend dispatcher and prediction paths are unchanged.
+- Input uses the JK2 wire schema, copying individual field bits into the SDK's
+  own `playerState_t` by C-computed offsets. No JKA player-state struct is cast
+  into a JK2 layout. The neutral command and trace ABI is checked before use;
+  native traces are populated member by member. Animation IDs, toggle bits,
+  conditional dodge/taunt animations, and saber-block IDs receive the same 1.02
+  conversions as pinned `CG_GetSnapshot`. Native CGame state uses 1.04 animation
+  IDs even on 1.02; export can return either wire or normalized identifiers.
+- Wire/start version and gameplay version are separate. Each call selects
+  native weapon and Force tables through `MV_SetGamePlay`. Fixed timing follows
+  CGame's view-angle update, acknowledged-command skip, and timestamp rounding
+  order, then native Pmove's subdivision/backlog behavior. Rust supplies no
+  acceleration, friction, jump, weapon, saber, or Force calculations.
+- Invalid fields/commands fail before native execution. Panicking or nonfinite
+  collision callbacks return an error and restore the complete native player
+  state. Recursive movement entry from a callback is rejected. Saber locks need
+  remote player context and currently fail explicitly. The flat-world test
+  fixtures contain no remote players; this is not full multiplayer prediction.
+- A separate C replay loop calls native Pmove without per-command host-step
+  calls or wire export/import between commands. The diagnostic compares every
+  native player-state byte after every command, reporting the first command,
+  server time, native field/array element, offset and differing bytes. This
+  compares two call paths through the same compiled SDK; it is not an independent
+  JK2MV server, 32-bit/QVM comparison, or proof of server prediction agreement.
+
+Reproduce the diagnostic from this checkout:
+
+```powershell
+.\target\release\DinurdoJK.exe --jk2-pmove-test
+.\target\release\DinurdoJK.exe --jk2-pmove-test imp495xAMoMAx.dm_16
+.\target\release\DinurdoJK.exe --jk2-pmove-test CoS-WickedR1.dm_15
+```
+
+It loads the installed JK2 animation.cfg through `fs_jk2path`, then checks 96
+cases / 18,432 replayed commands: both wire versions and both gameplay versions,
+saber/blaster, floor/wall/water, jump/crouch/attack inputs, variable timing and
+fixed 8/16/33 ms steps, duplicate/backwards commands and a stale backlog. An
+optional demo additionally streams its actual snapshots through native import
+and export. The 1.02 animation map deliberately collapses some unavailable
+clips; these are counted separately. Other fields and all arrays must roundtrip.
+Demo recordings do not contain usercmd history, so this checks state conversion,
+not movement reproduction of a recorded player. Unit tests use synthetic clip
+timings; the executable diagnostic uses installed animation data.
+
+Validation on November 2, 2026:
+
+- The standard fast build succeeded and staged the executable. The final build
+  reused 435 fresh Cargo targets and compiled two; no additional profile, flags,
+  target tree, or cache cleanup was used. Runtime asset staging needed normal
+  file access outside the restricted tool process; the authorized build completed
+  with that access. Final drive-space change was about 5 MiB (volume-wide).
+- All 34 focused tests passed: 18 movement-library tests (eight new JK2 tests),
+  eight existing native-backend tests, three JKA network-state tests and five
+  JKA saber-prediction tests. Coverage includes every 1.02 animation ID/toggle,
+  native field naming, an intentionally divergent replay, collision failure
+  rollback, callback panic/reentry, and interleaved 1.02/1.04 instances.
+- The broader JKA movement suite passed 25/26 tests. The existing
+  `equipped_saber_drives_stock_idle_stance_style_and_crouch_torso` expectation
+  failed (slow stance versus fast at line 390). The same failure reproduced in
+  the already-built October 21 `movement-203b241bc50d32ca.exe`, predating this
+  bridge. Its source and JKA movement behavior were not changed for this work.
+- The final executable loaded the 36,167-byte JK2 retail animation.cfg from
+  assets0.pk3 and passed all 96 cases / 18,432 command comparisons. All 24 supplied
+  1.02/1.04 demos then passed native import/export: 1,157,342 snapshots, no field
+  or array differences, and no lossy animation mappings in this corpus. The RAR
+  was not unpacked. These checks do not reconstruct recorded usercmds.
+- All 27 vendor hashes match the provenance manifest. An audit of the twelve
+  native COFF objects found 323 isolated SDK/host external definitions, with only
+  compiler literals and standard MSVC CRT COMDATs outside their prefixes.
+- Reports: `artifacts/jk2-native-build.log`, `artifacts/jk2-native-tests.log`,
+  and `artifacts/jk2-native-corpus.log`. No new live prediction, server-correction
+  comparison, full saber-lock test, or JKA FPS benchmark is claimed.
+
+Next: wire this host into live command replay using raw JK2 snapshots, supply
+remote entity/player context, and validate server corrections before allowing
+playing teams. Public discovery, downloads, arbitrary mod client modules, and
 full gameplay presentation remain separate work items.

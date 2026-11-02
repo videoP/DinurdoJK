@@ -76,6 +76,28 @@ fn main() {
         japro.flag("-include").flag("native/japro_namespace.h");
     }
     japro.file("native/japro_movement.c").compile("jka_japro_pmove");
+    // Separate JK2 native layouts and symbols. Never add this to JKA's backend
+    // switch or feed normalized presentation state to its snapshot importer.
+    let mut jk2 = cc::Build::new();
+    jk2.include("vendor/mvsdk/code").include("vendor/mvsdk/code/game")
+        .include("vendor/mvsdk/code/cgame").include("vendor/mvsdk/code/renderer").include("native")
+        .define("JK2_CGAME", None).define("_JK2", None).define("FINAL_BUILD", None)
+        .define("_CRT_SECURE_NO_WARNINGS", None).warnings(false)
+        .flag_if_supported("/fp:precise").flag_if_supported("/we4013")
+        .flag_if_supported("-fno-strict-aliasing").flag_if_supported("-ffp-contract=off");
+    match env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() {
+        Some("x86_64") => { jk2.define("ARCH_X86_64", None); }
+        Some("x86") => { jk2.define("ARCH_X86", None); }
+        Some("aarch64") => { jk2.define("ARCH_ARM64", None); }
+        _ => {}
+    }
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") { jk2.define("WIN32", None); }
+    if jk2.get_compiler().is_like_msvc() { jk2.flag("/FIjk2_namespace.h"); }
+    else { jk2.flag("-include").flag("native/jk2_namespace.h"); }
+    for file in ["bg_pmove", "bg_slidemove", "bg_panimate", "bg_saber", "bg_weapons", "bg_misc", "bg_multiversion", "animMappingTable", "q_math", "q_shared"] {
+        jk2.file(format!("vendor/mvsdk/code/game/{file}.c"));
+    }
+    jk2.file("native/jk2_movement.c").file("native/jk2_oracle.c").compile("jk2_mvsdk_pmove");
     let mut collision = cc::Build::new();
     collision
         .cpp(true)
