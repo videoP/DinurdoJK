@@ -86,7 +86,7 @@ mod tests {
 
 impl LiveDecoder {
     pub fn new(version: Version) -> Self {
-        Self { version, wire: Decoder::new(), adapter: Adapter::default(), big: BigConfigString::default() }
+        Self { version, wire: Decoder::for_live(version), adapter: Adapter::default(), big: BigConfigString::default() }
     }
 
     pub fn parse(&mut self, sequence: i32, payload: &[u8], view: &mut server::Decoder)
@@ -135,7 +135,7 @@ impl LiveDecoder {
                 }
                 Event::Download(block) => events.push(server::Event::Download(block)),
                 Event::MapChange => events.push(server::Event::MapChange),
-                Event::Nop | Event::DroppedSnapshot { .. } => {}
+                Event::Nop | Event::DroppedSnapshot { .. } | Event::UnprimedSnapshot { .. } => {}
             }
         }
         view.reliable_acknowledge = packet.reliable_acknowledge;

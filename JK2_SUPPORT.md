@@ -379,6 +379,36 @@ Validation on November 2, 2026:
   suppresses capture, so its scripted `+forward` did not create movement input.
   No numerical JKA performance regression claim is made.
 
+## Live connection bootstrap snapshots
+
+The public 1.04 server `78.47.50.174:28070` reproduced an immediate
+`JK2 snapshot before gamestate` disconnect. JK2MV's `SV_SendClientMessages`
+sends snapshots to connected clients before they necessarily receive their
+gamestate, marking non-active clients with `SNAPFLAG_NOT_ACTIVE`. The native
+client consumes these packets; activation waits for a real gamestate/CGame.
+
+Live JK2 decoders now use the explicitly selected protocol to consume and
+validate such snapshots, while withholding them from presentation, timing and
+delta history. The netchan sequence is still acknowledged, allowing the server
+to deliver/resend the gamestate. Serverinfo remains the authority for version
+identification and mismatch rejection. Offline/demo decoding still requires a
+gamestate first, and malformed live bootstrap snapshots remain errors.
+
+All 72 protocol checks passed (64 unit and eight integration tests). New tests
+cover both versions, encrypted session packet/ack flow, no premature activation
+or history publication, malformed areamasks, and recovery after the gamestate.
+The reproduced failure and test reports are `artifacts/jk2-remote-admission.log`
+and `artifacts/jk2-bootstrap-tests.log`.
+
+The final fast build succeeded (`artifacts/jk2-bootstrap-build.log`). The updated
+executable joined that exact public server, received its gamestate in about
+1.53 seconds, entered active spectating at about 1.69 seconds, and rendered
+`ctf_bespin`. Its basemv / JK2MV 1.4.1 server reported protocol 16 and `sv_pure 0`;
+the client received 29.9 snapshots/second (205 measured gaps, usually 33 ms).
+The scripted check disconnected and restored JKA afterward. Runtime report:
+`artifacts/jk2-remote-fixed.log`. Full playing-team/native prediction support is
+still pending; this fixes connection startup only.
+
 ## JK2 pure-server admission
 
 JK2 1.02 and 1.04 now mount a session-specific pure namespace and send the

@@ -134,6 +134,39 @@ fn snapshot(version: Version, time: i32, distance: i32, arrays: bool, remove: bo
 }
 
 #[test]
+fn live_bootstrap_consumes_snapshots_without_publishing_or_identifying_gamestate() {
+    for version in [Version::V102, Version::V104] {
+        let early = snapshot(version, 1000, 0, true, false);
+        // Offline/demo streams still require their identifying gamestate.
+        assert!(Decoder::new().parse_packet(10, &early).is_err());
+        let mut live = Decoder::for_live(version);
+        let result = live.parse_packet(10, &early).unwrap();
+        assert_eq!(result.events, [Event::UnprimedSnapshot { message_num:10, server_time:1000 }]);
+        assert_eq!(result.reliable_acknowledge, 17);
+        assert_eq!(live.version(), None);
+        assert!(!live.have_gamestate);
+        assert!(live.snapshots.iter().all(Option::is_none));
+        live.parse_packet(11, &gamestate(version)).unwrap();
+        let result = live.parse_packet(12, &snapshot(version, 1100, 2, false, false)).unwrap();
+        assert!(matches!(result.events[0], Event::DroppedSnapshot { delta_num:10, .. }));
+        let result = live.parse_packet(13, &snapshot(version, 1150, 0, true, false)).unwrap();
+        assert!(matches!(result.events[0], Event::Snapshot(_)));
+    }
+}
+
+#[test]
+fn live_bootstrap_still_validates_the_complete_snapshot() {
+    let invalid = packet(|w| {
+        w.write_bits(i32::from(SVC_SNAPSHOT), 8).unwrap();
+        w.write_bits(1000, 32).unwrap();
+        w.write_bits(0, 8).unwrap();
+        w.write_bits(2, 8).unwrap(); // inactive
+        w.write_bits(33, 8).unwrap(); // invalid areamask length
+    });
+    assert!(Decoder::for_live(Version::V104).parse_packet(10, &invalid).is_err());
+}
+
+#[test]
 fn jk2_layouts_preserve_raw_bits_baselines_and_signed_array_values() {
     for version in [Version::V102, Version::V104] {
         let mut decoder = Decoder::new();

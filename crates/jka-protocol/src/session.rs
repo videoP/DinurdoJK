@@ -1208,6 +1208,58 @@ mod tests {
     }
 
     #[test]
+    fn jk2_bootstrap_snapshot_is_acknowledged_before_the_first_gamestate() {
+        use crate::message::{MessageReader, MessageWriter};
+        for version in [crate::jk2::Version::V102, crate::jk2::Version::V104] {
+            let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 4321, 777, 0, version);
+            session.take_outgoing();
+            session.packet_event(addr(), b"\xff\xff\xff\xffchallengeResponse -12345", 10);
+            session.resume_connect(20);
+            session.take_outgoing();
+            session.packet_event(addr(), b"\xff\xff\xff\xffconnectResponse", 30);
+            session.take_outgoing(); session.take_events();
+            let send = |session: &mut ClientSession, sequence: i32, mut payload: Vec<u8>| {
+                // Server XOR is symmetric; there are no prior client commands.
+                netchan::decode_jk2_server_message(&mut payload, sequence, -12345, |_| b"").unwrap();
+                let mut datagram = sequence.to_le_bytes().to_vec(); datagram.extend(payload);
+                session.packet_event(addr(), &datagram, 30 + sequence);
+            };
+            let mut w = MessageWriter::new(16384).unwrap();
+            for (value, bits) in [(0,32), (7,8), (1000,32), (0,8), (2,8), (0,8), (0,8), (0,1), (1023,10), (9,8)] {
+                w.write_bits(value, bits).unwrap();
+            }
+            send(&mut session, 1, w.as_bytes().to_vec());
+            assert_eq!(session.state(), ConnectionState::Connected);
+            assert!(!session.gamestate_received);
+            assert!(!session.snap_valid);
+            assert!(session.decoder().latest_snapshot().is_none());
+            assert_eq!(session.server_message_sequence(), 1);
+            assert!(session.take_events().is_empty());
+            session.write_packet_now(40);
+            let outgoing = session.take_outgoing();
+            let mut payload = outgoing.last().unwrap()[6..].to_vec();
+            netchan::encode_jk2_client_message(&mut payload, -12345, |_| b"").unwrap();
+            let mut reader = MessageReader::new(&payload).unwrap();
+            assert_eq!(reader.read_long().unwrap(), 0); // no server ID yet
+            assert_eq!(reader.read_long().unwrap(), 1); // early packet acknowledged
+
+            let mut w = MessageWriter::new(16384).unwrap();
+            w.write_bits(0,32).unwrap(); w.write_bits(2,8).unwrap(); w.write_bits(0,32).unwrap();
+            for (index, text) in [(0, format!("\\protocol\\{}\\version\\JK2MP: v{}\\mapname\\ffa_bespin", version.protocol(), version.name())),
+                (1, "\\sv_pure\\0\\sv_serverid\\99".into())] {
+                w.write_bits(3,8).unwrap(); w.write_bits(index,16).unwrap();
+                netchan::write_string(&mut w, text.as_bytes()).unwrap();
+            }
+            w.write_bits(9,8).unwrap(); w.write_bits(0,32).unwrap(); w.write_bits(42,32).unwrap(); w.write_bits(9,8).unwrap();
+            send(&mut session, 2, w.as_bytes().to_vec());
+            assert_eq!(session.state(), ConnectionState::Connected);
+            assert!(session.gamestate_received);
+            assert_eq!(session.server_id, 99);
+            assert!(session.take_events().iter().any(|event| matches!(event, SessionEvent::Gamestate)));
+        }
+    }
+
+    #[test]
     fn jk2_preflight_rejects_protocol_mismatch_before_connect() {
         let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 1, 777, 0, crate::jk2::Version::V104);
         session.take_outgoing();

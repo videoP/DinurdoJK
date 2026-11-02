@@ -171,6 +171,9 @@ pub enum Event {
     Gamestate,
     ServerCommand(ServerCommand),
     Snapshot(Box<Snapshot>),
+    /// A live server may send inactive snapshots before the first gamestate.
+    /// Consume them for packet acknowledgement without exposing CGame state.
+    UnprimedSnapshot { message_num: i32, server_time: i32 },
     /// The packet was consumed, but its required delta base was unavailable.
     DroppedSnapshot {
         message_num: i32,
@@ -199,6 +202,7 @@ pub struct Decoder {
     snapshots: [Option<Snapshot>; PACKET_BACKUP],
     big_config: BigConfigString,
     have_gamestate: bool,
+    live_version: Option<Version>,
 }
 
 impl Decoder {
@@ -207,6 +211,10 @@ impl Decoder {
             client_number: -1,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn for_live(version: Version) -> Self {
+        Self { live_version: Some(version), ..Self::new() }
     }
 
     pub fn version(&self) -> Option<Version> {
@@ -410,10 +418,12 @@ impl Decoder {
         reader: &mut MessageReader<'_>,
         sequence: i32,
     ) -> Result<Event, Error> {
-        if !self.have_gamestate {
+        if !self.have_gamestate && self.live_version.is_none() {
             return Err(reader.error(ErrorKind::InvalidValue("JK2 snapshot before gamestate")));
         }
-        let version = self.version.unwrap();
+        // CL_ParseSnapshot consumes these connected-but-inactive packets too.
+        // Only live connections have a selected protocol before serverinfo.
+        let version = self.version.or(self.live_version).unwrap();
         let server_time = reader.read_long()?;
         let distance = i32::from(reader.read_byte()?);
         let delta_num = (distance != 0).then_some(sequence - distance);
@@ -435,6 +445,13 @@ impl Decoder {
         }
         let player_state = read_player(reader, version, old.as_ref().map(|s| &s.player_state))?;
         let entities = self.read_entities(reader, version, old.as_ref())?;
+        if !self.have_gamestate {
+            // Never seed delta history, identify the server version, or start
+            // CGame from a snapshot received before its gamestate. The outer
+            // session still acknowledges this netchan sequence, allowing the
+            // server's gamestate resend/bootstrap logic to proceed.
+            return Ok(Event::UnprimedSnapshot { message_num: sequence, server_time });
+        }
         if delta_num.is_some() && old.is_none() {
             return Ok(Event::DroppedSnapshot {
                 message_num: sequence,
