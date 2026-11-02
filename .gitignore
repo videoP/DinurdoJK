@@ -15,6 +15,7 @@
 *.md
 !README.md
 !readme.md
+!/JK2_SUPPORT.md
 *.log
 
 # Keep the Anny v1 authoring tool reproducible; generated data stays local.

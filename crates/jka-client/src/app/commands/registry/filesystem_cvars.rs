@@ -30,6 +30,17 @@ app_cvars! {
         config: CvarBinding::NONE,
         implementations: []
     }
+    APP_FS_JK2PATH {
+        runtime: CvarDef::new(
+            "fs_jk2path", "", "path to JK2 GameData",
+            "Separate read-only JK2 asset root containing base/. Saved for JK2 support; never mounted in JKA. Restart required.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.fs_roots.jk2path.as_ref().map_or(String::new(), |p| p.display().to_string())),
+            |app, value| App::set_fs_jk2path(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_jk2path(app, value), None),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_FS_HOMEPATH {
         runtime: CvarDef::new(
             "fs_homepath", "", "writable/readable GameData root",
@@ -75,6 +86,12 @@ impl App {
     fn set_fs_cdpath(&mut self, value: &str) -> Result<(), String> {
         let mut proposed = self.fs_roots.clone();
         proposed.cdpath = crate::filesystem_paths::parse_root(&self.base, value)?;
+        self.store_fs_roots(proposed)
+    }
+
+    fn set_fs_jk2path(&mut self, value: &str) -> Result<(), String> {
+        let mut proposed = self.fs_roots.clone();
+        proposed.jk2path = crate::filesystem_paths::parse_root(&self.base, value)?;
         self.store_fs_roots(proposed)
     }
 

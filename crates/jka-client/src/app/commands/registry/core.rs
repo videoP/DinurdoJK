@@ -291,6 +291,7 @@ commands! {
         self.push_console_line(format!("^2FS:^7 basepath = {}", self.base.parent().unwrap_or(&self.base).display()));
         self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(portable)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 cdpath = {}", effective.cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 jk2path = {} (separate JK2 root; not mounted in JKA)", effective.jk2path.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
         self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));
         for (i, dir) in jka_assets::pk3::filesystem_search_dirs(&self.base, self.game.as_deref(), &effective).iter().enumerate() {

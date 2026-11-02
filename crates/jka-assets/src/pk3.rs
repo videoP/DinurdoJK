@@ -163,6 +163,8 @@ pub struct FilesystemRoots {
     pub homepath: Option<PathBuf>,
     /// Extra, lowest-priority read-only root (usually a shared retail install).
     pub cdpath: Option<PathBuf>,
+    /// Separate JK2 GameData root. Never mounted by the JKA search path.
+    pub jk2path: Option<PathBuf>,
     /// Always-on, highest-priority game directory name (not a path).
     pub forcegame: Option<String>,
 }
@@ -354,7 +356,8 @@ pub fn filesystem_game_layer_dirs(base: &Path, game: Option<&Path>, roots: &File
 
 /// Priority: always-on forcegame, current mod, base; within each layer, home
 /// precedes local. The cdpath is a retail-asset fallback *only* (cdpath/base),
-/// never used as a mod override or write destination.
+/// never used as a mod override or write destination. The JK2 root is kept
+/// separate and must not contribute packages to this JKA search path.
 pub fn filesystem_search_dirs(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> Vec<PathBuf> {
     let local = base.parent().unwrap_or(base);
     let home = roots.homepath.as_deref();
@@ -1680,6 +1683,7 @@ mod filesystem_roots_tests {
         let roots = FilesystemRoots {
             homepath: Some(PathBuf::from("/user")),
             cdpath: Some(PathBuf::from("/retail")),
+            jk2path: Some(PathBuf::from("/jk2")),
             forcegame: Some("dinurdojk".into()),
         };
         assert_eq!(filesystem_write_directory(base, Some(game), &roots), PathBuf::from("/user/dinurdojk"));

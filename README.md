@@ -78,6 +78,18 @@ In the main menu, choose **Play → Join a Game**, **Solo Game**, or **Play Demo
 
 **Optional:** Put a compatible `ffmpeg.exe` next to `DinurdoJK.exe` to enable Render Studio video export.
 
+On the `jk2-support` branch, the JK2 installation is configured separately from
+JKA's `fs_cdpath`:
+
+```text
+set fs_jk2path "C:\Games\JK21.02\GameData"
+```
+
+The setting persists in `DinurdoJK-paths.ini` and takes effect after restarting.
+It records the JK2 root for upcoming JK2 support; it does not add those packages
+to the JKA search path. JK2 gameplay is not implemented yet. See
+[JK2 implementation notes](JK2_SUPPORT.md) for source revisions and scope.
+
 ## Technical notes and credits
 
 DinurdoJK uses **Rust**, **WGPU/WGSL**, **winit**, and **egui** for most client systems, graphics, and UI. Selected native **OpenJK**, **TaystJK/jaPRO**, and collision/movement code is retained for compatibility. It is an independent client, not an official Jedi Academy release or a single-player campaign port.

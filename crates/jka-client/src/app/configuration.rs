@@ -154,6 +154,7 @@ impl App {
                 for (name, value) in [
                     ("fs_homepath", value(&fs_roots.homepath)),
                     ("fs_cdpath", value(&fs_roots.cdpath)),
+                    ("fs_jk2path", value(&fs_roots.jk2path)),
                     ("fs_forcegame", fs_roots.forcegame.unwrap_or_default()),
                 ] {
                     writeln!(file, "seta {name} \"{value}\"").map_err(|e| e.to_string())?;

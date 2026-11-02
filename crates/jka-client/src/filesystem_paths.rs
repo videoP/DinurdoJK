@@ -36,6 +36,7 @@ pub(crate) fn load(base: &Path) -> FilesystemRoots {
         let result: Result<(), String> = match key.trim().to_ascii_lowercase().as_str() {
             "fs_homepath" => parse_root(base, value).map(|v| { roots.homepath = v; }),
             "fs_cdpath" => parse_root(base, value).map(|v| { roots.cdpath = v; }),
+            "fs_jk2path" => parse_root(base, value).map(|v| { roots.jk2path = v; }),
             "fs_forcegame" => validate_game_name(value).map(|v| { roots.forcegame = v; }),
             _ => continue,
         };
@@ -48,9 +49,10 @@ pub(crate) fn save(base: &Path, roots: &FilesystemRoots) -> Result<(), String> {
     let install = base.parent().ok_or("base has no installation root")?;
     let file = install.join(FILE);
     let contents = format!(
-        "# Filesystem roots; relative paths are relative to the directory containing base/.\nfs_homepath={}\nfs_cdpath={}\nfs_forcegame={}\n",
+        "# Filesystem roots; relative paths are relative to the directory containing base/.\nfs_homepath={}\nfs_cdpath={}\nfs_jk2path={}\nfs_forcegame={}\n",
         roots.homepath.as_ref().map_or(String::new(), |v| v.display().to_string()),
         roots.cdpath.as_ref().map_or(String::new(), |v| v.display().to_string()),
+        roots.jk2path.as_ref().map_or(String::new(), |v| v.display().to_string()),
         roots.forcegame.as_deref().unwrap_or(""),
     );
     std::fs::write(&file, contents).map_err(|error| format!("{}: {error}", file.display()))
@@ -72,6 +74,7 @@ pub(crate) fn apply_startup_commands(
         match name.to_ascii_lowercase().as_str() {
             "fs_homepath" => roots.homepath = parse_root(base, value)?,
             "fs_cdpath" => roots.cdpath = parse_root(base, value)?,
+            "fs_jk2path" => roots.jk2path = parse_root(base, value)?,
             "fs_forcegame" => roots.forcegame = validate_game_name(value)?,
             _ => {}
         }
