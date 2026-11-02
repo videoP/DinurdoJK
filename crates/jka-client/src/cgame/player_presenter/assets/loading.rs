@@ -8,7 +8,7 @@ use crate::cgame::player_presenter::source_player::{
     self, build_source_player_model, source_descriptor_qpath,
 };
 use crate::cgame::player_presenter::{
-    asset_jobs, build_joined_breast_bakes, build_lod_gpu_meshes, load_skin, materials, openjk_default_gla, parse_gla,
+    asset_jobs, build_joined_breast_bakes, build_lod_gpu_meshes, materials, openjk_default_gla, parse_gla,
     player_model_key, static_model_key, AlphaGen, Arc, AssetPriority, AssetSearchPath,
     AssetSource, AssetState, BTreeMap, DynamicModelAlphaMode, GlaAnimation, HashMap, JiggleProfile, JiggleRemeshTuning,
     Mutex, OnceLock, PlayerModelAsset, PlayerPresenter, PlayerSurfaceAsset, Requested,
@@ -16,6 +16,70 @@ use crate::cgame::player_presenter::{
     SurfaceOverlay, TcGen, TcMod, TextureData, Textures, Vec3, Wave, WaveFunc, ASSET_PENDING,
     MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_SKIN_BYTES, OPENJK_DEFAULT_GLA_NAME,
 };
+
+/// OpenJK Ghoul2 `RenderSurfaces` checks skin entries in file order and uses
+/// the first matching shader. `collect::<HashMap<_, _>>()` instead kept the
+/// last entry, changing the meaning of duplicate JKA-normalized names.
+fn skin_first_match_map(skin: Vec<jka_assets::skin::SkinSurface>) -> HashMap<String, String> {
+    let mut shaders = HashMap::with_capacity(skin.len());
+    for surface in skin {
+        shaders.entry(surface.name.to_ascii_lowercase()).or_insert(surface.shader);
+    }
+    shaders
+}
+
+#[cfg(test)]
+#[test]
+fn jk2_skin_first_match_matches_ghoul2_renderer_order() {
+    let bytes = b"head,head01\nhead_off,head02\nhead_face_off,face02\nhead_face,face01\n";
+    let jk2 = skin_first_match_map(jka_assets::skin::parse_skin_jk2(bytes).unwrap());
+    assert_eq!(jk2.get("head").unwrap(), "head01");
+    assert_eq!(jk2.get("head_off").unwrap(), "head02");
+    assert_eq!(jk2.get("head_face").unwrap(), "face01");
+    assert_eq!(jk2.get("head_face_off").unwrap(), "face02");
+    let jka = skin_first_match_map(jka_assets::skin::parse_skin(bytes).unwrap());
+    assert_eq!(jka.get("head").unwrap(), "head01");
+    assert_eq!(jka.get("head_face").unwrap(), "face02");
+    let duplicate = skin_first_match_map(jka_assets::skin::parse_skin_jk2(b"HEAD,*off\nhead,head02\n").unwrap());
+    assert_eq!(duplicate.get("head").unwrap(), "*off");
+}
+
+#[cfg(test)]
+#[test]
+fn jk2_skin_worker_keeps_nonpure_game_context_across_session_changes() {
+    use jka_assets::pk3::{configure_filesystem_roots, FilesystemRoots};
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("djk-jk2-skin-{}-{unique}", std::process::id()));
+    let base = root.join("base");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("jedi.skin"), b"head,head01\nhead_off,head02\nhead_face_off,face02\nhead_face,face01\n").unwrap();
+    for version in [None, Some(2), Some(4)] {
+        configure_filesystem_roots(&base, FilesystemRoots {
+            active_jk2: version, jk2path: Some(root.clone()), ..Default::default()
+        });
+        let mut assets = AssetSearchPath::open_game(&base, None).unwrap();
+        assert!(assets.jk2_pure_policy().is_none());
+        assets.set_allow_asset_overrides(false);
+        let source = AssetSource::from_search_path(&assets);
+        // The worker may start after a disconnect changed the global policy.
+        configure_filesystem_roots(&base, FilesystemRoots::default());
+        let map = std::thread::spawn(move || {
+            asset_jobs::with_worker_vfs(&source, |vfs| {
+                assert_eq!(vfs.jk2_version(), version);
+                assert!(!vfs.asset_overrides_allowed());
+                let shared = ModelLoadShared::new(Arc::new(BTreeMap::new()), Default::default());
+                let mut worker = WorkerModelSource { vfs, shared: &shared };
+                skin_first_match_map(worker.load_skin("jedi.skin").unwrap())
+            }).unwrap()
+        }).join().unwrap();
+        assert_eq!(map["head"], "head01");
+        assert_eq!(map["head_face"], if version.is_some() { "face01" } else { "face02" });
+        assert_eq!(map.get("head_off").map(String::as_str), version.map(|_| "head02"));
+    }
+    std::fs::remove_file(base.join("jedi.skin")).unwrap();
+    std::fs::remove_dir(&base).unwrap();
+    std::fs::remove_dir(&root).unwrap();
+}
 
 /// NPC topology is authored by the server-selected GLM, never by local
 /// Profile sliders. Shared by both the synchronous and worker load paths.
@@ -171,11 +235,12 @@ impl ModelSource for WorkerModelSource<'_> {
 
     fn load_skin(&mut self, qpath: &str) -> Result<Vec<jka_assets::skin::SkinSurface>, String> {
         let vfs = &mut *self.vfs;
-        load_skin(qpath, |name| {
+        let jk2 = vfs.jk2_version().is_some();
+        jka_assets::skin::load_skin_with_mode(qpath, |name| {
             vfs.read(name, MAX_SKIN_BYTES)
                 .map_err(|error| error.to_string())
                 .map(|asset| asset.map(|asset| asset.bytes))
-        })
+        }, jk2)
     }
 
     fn resolve_material(&mut self, shader_name: &str) -> ResolvedMaterial {
@@ -952,11 +1017,7 @@ fn build_character_model(
                 }
             }
         };
-        skin.map_or_else(HashMap::new, |skin| {
-            skin.into_iter()
-                .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-                .collect::<HashMap<_, _>>()
-        })
+        skin.map_or_else(HashMap::new, skin_first_match_map)
     } else {
         HashMap::new()
     };
@@ -1174,10 +1235,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
 
     let skin_map = if let Some(skin_qpath) = custom_skin {
         match source.load_skin(skin_qpath) {
-            Ok(skin) => skin
-                .into_iter()
-                .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-                .collect::<HashMap<_, _>>(),
+            Ok(skin) => skin_first_match_map(skin),
             Err(error) => {
                 // TaystJK R_RegisterSkin can return skinID=0 without failing
                 // G2API_InitGhoul2Model. An optional skin registration failure
@@ -1880,12 +1938,13 @@ impl PlayerPresenter {
         &mut self,
         qpath: &str,
     ) -> Result<Vec<jka_assets::skin::SkinSurface>, String> {
-        load_skin(qpath, |name| {
+        let jk2 = self.assets.jk2_version().is_some();
+        jka_assets::skin::load_skin_with_mode(qpath, |name| {
             self.assets
                 .read(name, MAX_SKIN_BYTES)
                 .map_err(|error| error.to_string())
                 .map(|asset| asset.map(|asset| asset.bytes))
-        })
+        }, jk2)
     }
 
     pub(in crate::cgame::player_presenter) fn resolve_surface_material(

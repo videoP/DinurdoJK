@@ -149,7 +149,6 @@ use jka_assets::{
     },
     shader::{AlphaGen, Bulge, RgbGen, Shader, Stage, TcGen, TcMod, Wave, WaveFunc},
     siege::find_siege_class_visual,
-    skin::load_skin,
     vehicle::{load_vehicle_definitions, VehicleDefinition, VehicleDefinitions},
 };
 use jka_movement::{

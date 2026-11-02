@@ -256,11 +256,45 @@ Pausing immediately after a seek can freeze the initial animation blend in a
 neutral pose; briefly resuming playback allows the pose to settle. This remains
 a presentation limitation to address before treating paused seeks as exact poses.
 
-User validation accepted both demos. Deferred visual issue: in
-`imp495xAMoMAx.dm_16`, xAMo's Kyle head appears to have missing or incorrect
-hair/ear surfaces. The supplied close-up shows the head texture/surface seam;
-check JK2 skin surface selection and caps against the native client in a later
-presentation pass. This is not a reason to change the configured HUD or menus.
+User validation accepted both demos. The later report of incorrect head/hair
+textures in `imp495xAMoMAx.dm_16` led to the Patch20 skin-selection fix below.
+Confirmation against the user's original close-up remains a visual test.
+
+## Skin surface lookup fix (Patch20)
+
+Applied `Development Docs/Patch20/jk2_skin_surface_fix.patch` with its paths rooted
+under `crates/`, plus the worker-context correction found during review.
+
+- Local JK2MV `tr_image.cpp` preserves `_off` names unless JKA skin conversion
+  mode 2 is requested; its default mode 1 preserves them. `tr_ghoul2.cpp` chooses
+  the first matching skin entry. Both behaviors agree with the patch's approach.
+- Retail Jedi skins contain separate `head`/`head_off` and
+  `head_face`/`head_face_off` entries. The native GLM marks the first pair members
+  visible (`0x0`) and the `_off` counterparts hidden (`0x2`). Default skins use
+  Jedi textures; red/blue skins use Prisoner textures. Normalizing these names
+  and keeping the last duplicate assigned the alternate head texture.
+- JK2 skin loading now preserves original names. JKA retains its existing
+  `_off` normalization, with first-match precedence for duplicate names. Both
+  character and static-model registration use the same ordered lookup.
+- Background workers previously reconstructed their VFS from directory names,
+  losing non-pure JK2 identity. The patch alone would therefore miss demo and
+  non-pure worker loads. Workers now fork a captured VFS context, preserving
+  game identity, package policy and override preference. No filesystem mount
+  order, mesh, UV, or visibility-flag changes are needed.
+- Five skin-parser tests and two client regressions pass. The worker regression
+  covers JKA, 1.02 and 1.04 after a session change, using the actual worker skin
+  loader. A pre-existing malformed tag fixture also failed in the October 23
+  cached test executable; it now uses the native `tag_weapon,` syntax, without
+  changing the parser's tag behavior.
+- Retail surface/texture review: `artifacts/jk2-skin-retail-review.txt`.
+  Test reports: `artifacts/jk2-skin-assets-tests.log` and
+  `artifacts/jk2-skin-client-test.log`.
+- The fast build succeeded (`artifacts/jk2-skin-build.log`). The xAMo replay
+  loaded `models/players/jedi/model_blue.skin`, rendered with the preserved
+  surface names, captured a screenshot, and returned to JKA. The top-of-head
+  view shows the young brown hair texture; the user's exact face close-up still
+  needs confirmation. Saved config hashes were unchanged. Runtime report:
+  `artifacts/jk2-skin-replay.log`.
 
 ## Live spectating preview
 

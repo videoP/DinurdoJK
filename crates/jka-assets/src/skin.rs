@@ -1,4 +1,4 @@
-//! Jedi Academy `.skin` parsing ported from OpenJK `codemp/rd-vanilla/tr_skin.cpp`.
+//! JKA/JK2 `.skin` parsing from OpenJK `tr_skin.cpp` and JK2MV `tr_image.cpp`.
 //!
 //! The renderer's skin grammar is deliberately *not* the normal COM parser grammar. OpenJK
 //! uses its local `CommaParse` routine, including comment skipping and comma-delimited words.
@@ -34,6 +34,17 @@ pub fn split_skin_macro(name: &str) -> Option<[String; 3]> {
 
 /// Parse one physical `.skin` file as `RE_RegisterIndividualSkin` does.
 pub fn parse_skin(bytes: &[u8]) -> Result<Vec<SkinSurface>, String> {
+    parse_skin_with_mode(bytes, false)
+}
+
+/// JK2's original Ghoul2 skins use `head` and `head_off` as two *different*
+/// surfaces. The JKA `_off` name rewrite would alias them (and likewise
+/// `head_face`/`head_face_off`), assigning the wrong head texture.
+pub fn parse_skin_jk2(bytes: &[u8]) -> Result<Vec<SkinSurface>, String> {
+    parse_skin_with_mode(bytes, true)
+}
+
+fn parse_skin_with_mode(bytes: &[u8], jk2: bool) -> Result<Vec<SkinSurface>, String> {
     // FS_ReadFile provides a NUL-terminated C buffer. Treat an embedded NUL as end-of-file and
     // preserve every other byte 1:1 for CommaParse; skin qpaths are byte-oriented in the engine.
     let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(bytes.len());
@@ -60,7 +71,7 @@ pub fn parse_skin(bytes: &[u8]) -> Result<Vec<SkinSurface>, String> {
 
         let shader = comma_parse(data, &mut cursor);
 
-        if surface_name.ends_with("_off") {
+        if !jk2 && surface_name.ends_with("_off") {
             if shader == b"*off" {
                 // OpenJK intentionally does not add duplicate explicit *_off/*off entries.
                 continue;
@@ -82,7 +93,16 @@ pub fn parse_skin(bytes: &[u8]) -> Result<Vec<SkinSurface>, String> {
 /// This mirrors the order in `RE_RegisterSkin`: head first, torso if distinct, then lower if it
 /// differs from both. The caller supplies the asset lookup so this module stays independent of
 /// filesystem/PK3 ownership.
-pub fn load_skin<F>(name: &str, mut read: F) -> Result<Vec<SkinSurface>, String>
+pub fn load_skin<F>(name: &str, read: F) -> Result<Vec<SkinSurface>, String>
+where
+    F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+{
+    load_skin_with_mode(name, read, false)
+}
+
+/// Load stock JK2 skins without applying JKA's `_off`-surface normalization.
+/// Select this for JK2 sessions, keeping the normal `load_skin` JKA behavior.
+pub fn load_skin_with_mode<F>(name: &str, mut read: F, jk2: bool) -> Result<Vec<SkinSurface>, String>
 where
     F: FnMut(&str) -> Result<Option<Vec<u8>>, String>,
 {
@@ -102,7 +122,7 @@ where
     let mut surfaces = Vec::new();
     for qpath in names {
         let bytes = read(&qpath)?.ok_or_else(|| format!("RE_RegisterSkin: {qpath} failed to load"))?;
-        surfaces.extend(parse_skin(&bytes)?);
+        surfaces.extend(if jk2 { parse_skin_jk2(&bytes)? } else { parse_skin(&bytes)? });
     }
 
     // RE_RegisterIndividualSkin returns 0 when the accumulated skin has no surfaces.
@@ -195,6 +215,42 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn jk2_original_head_surfaces_keep_off_names_distinct() {
+        let bytes = b"head,models/players/jedi/head_01.tga\n\
+head_off,models/players/jedi/head_02.tga\n\
+head_face_off,models/players/jedi/face_02.tga\n\
+head_face,models/players/jedi/face_01.tga\n";
+        let parsed = parse_skin_jk2(bytes).unwrap();
+        assert_eq!(parsed[0].name, "head");
+        assert_eq!(parsed[1].name, "head_off");
+        assert_eq!(parsed[2].name, "head_face_off");
+        assert_eq!(parsed[3].name, "head_face");
+        // JKA's original parser deliberately retains its existing behavior.
+        let jka = parse_skin(bytes).unwrap();
+        assert_eq!(jka[1].name, "head");
+        assert_eq!(jka[2].name, "head_face");
+    }
+
+    #[test]
+    fn jk2_skin_loader_keeps_explicit_off_surfaces_and_entry_order() {
+        let bytes = b"head,young_head\nhead_off,*off\nhead_face_off,older_face\nhead_face,young_face\n";
+        let mut reads = Vec::new();
+        let jk2 = load_skin_with_mode("models/players/jedi/model_default.skin", |name| {
+            reads.push(name.to_owned());
+            Ok(Some(bytes.to_vec()))
+        }, true).unwrap();
+        assert_eq!(reads, ["models/players/jedi/model_default.skin"]);
+        assert_eq!(jk2.iter().map(|s| (s.name.as_str(), s.shader.as_str())).collect::<Vec<_>>(), [
+            ("head", "young_head"), ("head_off", "*off"),
+            ("head_face_off", "older_face"), ("head_face", "young_face"),
+        ]);
+        let jka = load_skin("models/players/jedi/model_default.skin", |_| Ok(Some(bytes.to_vec()))).unwrap();
+        assert_eq!(jka.iter().map(|s| (s.name.as_str(), s.shader.as_str())).collect::<Vec<_>>(), [
+            ("head", "young_head"), ("head_face", "older_face"), ("head_face", "young_face"),
+        ]);
+    }
+
+    #[test]
     fn split_skin_macro_matches_openjk_example() {
         assert_eq!(
             split_skin_macro("models/players/jedi_tf/|head01_skin1|torso01|lower01"),
@@ -213,7 +269,7 @@ mod tests {
             br#"
                 // line comment
                 Torso,models/players/kyle/torso
-                tag_weapon,ignored/tag_shader
+                tag_weapon,
                 head_off,*off
                 /* block comment */
                 arm_off,models/players/kyle/arm

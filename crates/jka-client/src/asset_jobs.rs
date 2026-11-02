@@ -25,7 +25,6 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     panic::{self, AssertUnwindSafe},
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         mpsc, Arc, Condvar, Mutex, OnceLock, Weak,
@@ -201,22 +200,24 @@ fn worker_loop(shared: &PoolShared, slot: Option<ThreadSlot>) {
 
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Description of a VFS a worker can open independently. `AssetSearchPath`
-/// needs `&mut` for reads, so each worker thread lazily opens its own view of
-/// the same search directories instead of contending with the owner thread.
-#[derive(Debug)]
+/// Captured VFS context for independent worker readers. Forking retains the
+/// owner's game identity and immutable package policy across session changes.
 pub struct AssetSource {
     id: u64,
-    dirs: Vec<PathBuf>,
-    allow_overrides: bool,
+    template: Mutex<AssetSearchPath>,
+}
+
+impl std::fmt::Debug for AssetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetSource").field("id", &self.id).finish_non_exhaustive()
+    }
 }
 
 impl AssetSource {
     pub fn from_search_path(assets: &AssetSearchPath) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_SOURCE_ID.fetch_add(1, AtomicOrdering::Relaxed),
-            dirs: assets.search_dirs().to_vec(),
-            allow_overrides: assets.asset_overrides_allowed(),
+            template: Mutex::new(assets.fork()),
         })
     }
 
@@ -235,9 +236,8 @@ pub fn with_worker_vfs<R>(
     WORKER_VFS.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.as_ref().map(|(id, _)| *id) != Some(source.id) {
-            let mut assets = AssetSearchPath::open_search_dirs(&source.dirs)
-                .map_err(|error| format!("could not open asset search path: {error}"))?;
-            assets.set_allow_asset_overrides(source.allow_overrides);
+            let assets = source.template.lock()
+                .map_err(|_| "asset source context poisoned".to_owned())?.fork();
             *slot = Some((source.id, assets));
         }
         let (_, assets) = slot.as_mut().expect("worker vfs just installed");
