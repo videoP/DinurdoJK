@@ -339,6 +339,7 @@ impl App {
         });
         self.demo_scrub_fraction = None;
         self.demo_scrub_dragging = false;
+        self.demo_speed_dragging = false;
         self.console_status = format!(
             "EXPORTING {total_frames} FRAMES @ {fps} FPS · {}{} · ESC TO CANCEL",
             preset.label(),

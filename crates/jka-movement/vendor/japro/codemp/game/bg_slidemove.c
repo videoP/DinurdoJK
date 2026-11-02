@@ -27,6 +27,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "qcommon/q_shared.h"
 #include "bg_public.h"
 #include "bg_local.h"
+#include "jump_slope.h"
 
 #ifdef _GAME
 	#include "g_local.h"
@@ -669,6 +670,7 @@ Returns qtrue if the velocity was clipped in some way
 #define	MAX_CLIP_PLANES	5
 qboolean	PM_SlideMove( qboolean gravity ) {
 	int			bumpcount, numbumps;
+	qboolean jka_jump_applied = qfalse;
 	vec3_t		dir;
 	float		d;
 	int			numplanes;
@@ -728,6 +730,7 @@ qboolean	PM_SlideMove( qboolean gravity ) {
 
 		// see if we can make it there
 		pm->trace ( &trace, pm->ps->origin, pm->mins, pm->maxs, end, pm->ps->clientNum, pm->tracemask); //Normal player tracemask is SOLID,PLAYERCLIP,BODY,TERRAIN
+		if (trace.fraction < 1) JKA_JUMP_TRACE(3, pm->ps->velocity, pm->ps->velocity, trace.plane.normal, trace.fraction, trace.entityNum, bumpcount, OVERCLIP);
 
 		if (trace.allsolid) {
 			// entity is completely trapped in another solid
@@ -767,6 +770,13 @@ qboolean	PM_SlideMove( qboolean gravity ) {
 			}
 		}
 #endif
+
+		if (jka_force_jump_slope_enabled && !jka_jump_applied && pml.forceJumpSlopeTarget > 0 &&
+			!(pm->ps->pm_flags & PMF_STUCK_TO_WALL) && PM_GroundSlideOkay(trace.plane.normal[2]) &&
+			trace.plane.normal[2] < -0.01f && trace.plane.normal[2] > -0.999f) {
+			JKA_ForceJumpSlopeCollision(&trace, endVelocity);
+			jka_jump_applied = qtrue;
+		}
 
 		time_left -= time_left * trace.fraction;
 

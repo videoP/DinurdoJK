@@ -788,6 +788,7 @@ impl OceanGpu {
         seconds: f32,
         lake_planar: Option<(&wgpu::TextureView, &wgpu::Sampler, &[Option<[f32; 4]>; 4])>,
         lake_submerged: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+        player_interaction: Option<&super::interaction::RenderResources>,
     ) {
         if self.settings.backend == 3 {
             self.prepare_lakes(device, queue, encoder, camera, key, jitter, dt, frame, pvs, sky_pvs_mask,
@@ -1079,6 +1080,8 @@ impl OceanGpu {
                     }
                 }),
             );
+            slot.bindings.set_player_interaction(device, &renderer.pipeline,
+                player_interaction.map(|field| (&field.view, &field.uniform)));
             slot.bindings.set_godot_water(device, &renderer.pipeline, gerstner_views.as_ref());
             if slot.wake_generation != slot.bindings.wake_generation() {
                 slot.wake_generation = slot.bindings.wake_generation();

@@ -17,6 +17,10 @@ impl App {
             .unwrap_or(self.video.river_settings);
         let d = crate::river_settings::Settings::default();
         let mut changed = false;
+        theme::section(ui, "UNDERWATER", "Hybrid-style submerged presentation for this river. r_showtris 128 shows the displaced grid, including dry cells.");
+        color_row(ui, "Underwater color", "Fog tint below the solved water surface (sRGB).", theme::Reset::None, &mut s.underwater_color, &mut changed);
+        ocean_slider_d(ui, "Underwater visibility", "Distance in map units at which blue transmission falls to five percent. Red and green fade sooner, as in Hybrid ocean.", &mut s.underwater_visibility, d.underwater_visibility, 1.0..=65536.0, &mut changed);
+        ocean_slider_d(ui, "Underwater darkening depth", "Downwelling-light depth distance in map units; larger values darken more slowly.", &mut s.underwater_darkening, d.underwater_darkening, 1.0..=65536.0, &mut changed);
         theme::section(
             ui,
             "WATER MATERIAL",
@@ -203,6 +207,9 @@ impl App {
             0.0..=30.0,
             &mut changed,
         );
+        theme::section(ui, "FOAM GENERATION", "Depth gate for new foam. Existing foam keeps advecting and fading; turbulence and speed gates still apply.");
+        ocean_slider_d(ui, "Foam minimum depth", "Water-column thickness in map units below which no new foam forms. Default 60 units = 1.5 m. Full strength is calculated at 3.333 times this depth; zero removes the depth gate.", &mut s.foam_minimum_depth, d.foam_minimum_depth, 0.0..=200.0, &mut changed);
+        theme::hint(ui, &format!("Full depth weight at {:.2} map units", s.foam_minimum_depth * (500.0 / 150.0)), theme::TEXT_FAINT());
         theme::section(
             ui,
             "FOAM MATERIAL",
@@ -269,6 +276,19 @@ impl App {
         }
     }
     fn commit_river_defaults(&mut self, s: crate::river_settings::Settings) {
+        if s.foam_minimum_depth != self.video.river_settings.foam_minimum_depth {
+            let _ = self.set_console_cvar("r_riverFoamMinimumDepth", &s.foam_minimum_depth.to_string());
+        }
+        if s.underwater_color != self.video.river_settings.underwater_color {
+            let c = s.underwater_color;
+            let _ = self.set_console_cvar("r_riverUnderwaterColor", &format!("{} {} {}", c[0], c[1], c[2]));
+        }
+        if s.underwater_visibility != self.video.river_settings.underwater_visibility {
+            let _ = self.set_console_cvar("r_riverUnderwaterVisibility", &s.underwater_visibility.to_string());
+        }
+        if s.underwater_darkening != self.video.river_settings.underwater_darkening {
+            let _ = self.set_console_cvar("r_riverUnderwaterDarkening", &s.underwater_darkening.to_string());
+        }
         if s.water.scattering[..3] != self.video.river_settings.water.scattering[..3] {
             let c = s.water.scattering;
             let _ = self.set_console_cvar(

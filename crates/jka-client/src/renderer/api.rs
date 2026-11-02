@@ -1195,6 +1195,7 @@ pub enum RenderCommand {
     OceanWake(crate::ocean::WakeCommand),
     /// Developer river patch: source spec plus the map's collision triangles.
     RiverMaterial(crate::river_authoring::Id, crate::river_settings::Settings),
+    RiverSource(crate::river_authoring::Id, crate::river_authoring::LiveControls),
     RiverRemove(crate::river_authoring::Id),
     RiverSpawn(crate::river_authoring::Definition, std::sync::Arc<Vec<jka_assets::bsp::river::CollisionSurface>>),
     RiverClear,

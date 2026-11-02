@@ -28,6 +28,20 @@ fn main() {
         return;
     }
 
+    // Windows defaults to Common Controls v5 unless the executable manifest
+    // requests v6. TaskDialogIndirect is ordinal 345 and exists only in v6;
+    // unoptimized builds can retain code that imports this function.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let app_manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("DinurdoJK.manifest");
+        println!("cargo:rerun-if-changed={}", app_manifest.display());
+        println!("cargo:rustc-link-arg-bin=DinurdoJK=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-bin=DinurdoJK=/MANIFESTINPUT:{}",
+            app_manifest.display()
+        );
+    }
+
     println!("cargo:rerun-if-changed=native");
     println!("cargo:rerun-if-changed=../../vendor/ealman");
     cc::Build::new()

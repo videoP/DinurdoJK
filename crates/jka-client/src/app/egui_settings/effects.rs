@@ -152,6 +152,27 @@ impl App {
             self.video.modern_sabers,
         );
 
+        ui.add_enabled_ui(!self.video.modern_sabers, |ui| {
+            const CORE_MODES: [(u32, &str); 4] = [
+                (0, "Original"),
+                (1, "SBAK"),
+                (2, "Both"),
+                (3, "Glow only"),
+            ];
+            if let Some(mode) = segmented_row(
+                ui,
+                "Legacy saber core",
+                "r_saberCoreMode: Original = normal OpenJK core only; SBAK = thin pulsing \
+                 0.8..0.9-unit core only; Both = normal plus thin pulsing core; Glow only = \
+                 neither core. The legacy glow remains in every mode. Does not affect Modern sabers.",
+                theme::Reset::Video(ui::VIDEO_ROW_SABER_CORE_MODE),
+                self.video.saber_core_mode,
+                &CORE_MODES,
+            ) {
+                let _ = self.set_console_cvar("r_saberCoreMode", &mode.to_string());
+            }
+        });
+
         self.egui_toggle_row(
             ui,
             "World flares (r_flares)",

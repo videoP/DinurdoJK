@@ -491,7 +491,7 @@ fn material_analysis(
         FxBlend::AddAlpha => 5,
         FxBlend::Alpha => 0,
         FxBlend::Opaque => -4,
-        FxBlend::DstColorAdd | FxBlend::Modulate | FxBlend::Modulate2x | FxBlend::Darken => -8,
+        FxBlend::DstColorAdd | FxBlend::Modulate | FxBlend::Modulate2x | FxBlend::Darken | FxBlend::Screen => -8,
     };
     if authored_glow {
         score += 6;

@@ -204,7 +204,8 @@ fn hud_frame_with_accent_alpha(
     );
 }
 
-/// Label top-left and value top-right, in the shared HUD type sizes.
+/// Label top-left and value in a fixed left-aligned numeric column.  Do not
+/// move HP/ammo/force text horizontally when the number of digits changes.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn hud_texts(
     out: &mut Vec<UiVertex>,
@@ -228,11 +229,14 @@ pub(in crate::ui) fn hud_texts(
         h,
     );
     let value_scale = 1.6 * s;
-    let value_width = value.len() as f32 * 6.0 * value_scale;
+    // Reserve four normal-width glyph cells (up to 9999).  A varying label
+    // must never change the screen x of the first digit.
+    const VALUE_COLUMN_CHARS: f32 = 4.0;
+    let value_column_width = VALUE_COLUMN_CHARS * 6.0 * value_scale;
     text(
         out,
         value,
-        rect_.x + rect_.width - value_width - 8.0 * s,
+        rect_.x + rect_.width - value_column_width - 8.0 * s,
         rect_.y + 4.0 * s,
         value_scale,
         value_color,

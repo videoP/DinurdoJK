@@ -542,7 +542,7 @@ impl App {
             self.last_console_notify_refresh = now;
         }
         let refresh_demo_timeline = self.demo_playback_active()
-            && (self.demo_scrub_dragging
+            && (self.demo_scrub_dragging || self.demo_speed_dragging
                 || now.saturating_duration_since(self.last_demo_timeline_refresh)
                     >= Duration::from_millis(16));
         if refresh_demo_timeline {

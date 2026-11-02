@@ -124,10 +124,29 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
     let recorded_active = state.players.iter().any(|p| p.recorded && p.active);
     button(out, &font, layout.recorded, "REC POV", recorded_active,
         hover(layout.recorded), false, type_scale, w, h);
-    button(out, &font, layout.free, "FREECAM", state.free_view,
-        hover(layout.free), false, type_scale, w, h);
-    button(out, &font, layout.speed,
-        &format!("{}x", state.playback_rate), false, hover(layout.speed), false, type_scale, w, h);
+    // Slider replaces the old cycling button: 0.25x ── 1x ── 4x.
+    // The precise track rect is shared with the input hit-test.
+    let [sx, sy, sw, sh] = layout.speed;
+    let speed_hover = hover(layout.speed);
+    rect(out, sx, sy, sw, sh,
+        if speed_hover { [0.15, 0.22, 0.30, 0.97] } else { [0.075, 0.11, 0.17, 0.95] }, w, h);
+    rect_outline(out, sx, sy, sw, sh, 1.0,
+        if speed_hover { [0.35, 0.73, 0.86, 0.85] } else { [0.25, 0.34, 0.44, 0.63] }, w, h);
+    label(out, &font, [sx + 8.0, sy, 55.0 * (sh / 30.0), sh],
+        "SPEED", 18.0 * type_scale, MUTED, false);
+    let [rx, ry, rw, rh] = crate::ui::demo_speed_rail(layout.speed);
+    let fraction = crate::ui::demo_speed_fraction(state.playback_rate);
+    let rail_y = ry + rh * 0.5 - 2.0;
+    rect(out, rx, rail_y, rw, 4.0, [0.02, 0.04, 0.07, 1.0], w, h);
+    rect(out, rx, rail_y, rw * fraction, 4.0, [0.22, 0.65, 0.86, 1.0], w, h);
+    // 1x center marker and a thumb tall enough to locate with a glance.
+    rect(out, rx + rw * 0.5 - 0.5, rail_y - 5.0, 1.0, 14.0,
+        [0.62, 0.70, 0.78, 0.78], w, h);
+    let thumb_x = rx + rw * fraction;
+    rect(out, thumb_x - 3.0, ry + 1.0, 6.0, rh - 2.0,
+        if speed_hover { CYAN } else { WHITE }, w, h);
+    label(out, &font, [rx + rw + 9.0, sy, (sx + sw - rx - rw - 9.0).max(0.0), sh],
+        &format!("{:.2}x", state.playback_rate), 22.0 * type_scale, WHITE, false);
 
     // Flat browser like Render Studio: one pane header, quiet rows, compact
     // selected highlight, not a tall stack of glossy cards.
@@ -213,10 +232,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timescale_slider_is_logarithmic_and_unity_is_centered() {
+        let eps = 0.00001;
+        assert!((crate::ui::demo_speed_from_fraction(0.0) - 0.25).abs() < eps);
+        assert!((crate::ui::demo_speed_from_fraction(0.5) - 1.0).abs() < eps);
+        assert!((crate::ui::demo_speed_from_fraction(1.0) - 4.0).abs() < eps);
+        for rate in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0] {
+            let f = crate::ui::demo_speed_fraction(rate);
+            assert!((crate::ui::demo_speed_from_fraction(f) - rate).abs() < eps);
+        }
+        assert_eq!(crate::ui::demo_speed_from_fraction(f32::NAN), 1.0);
+        assert_eq!(crate::ui::demo_speed_fraction(f64::NAN), 0.5);
+    }
+
+    #[test]
     fn taffy_demo_buttons_have_no_overlap_and_fit_on_screen() {
         for (w, h) in [(740, 480), (1280, 720), (1649, 928), (2560, 1440)] {
             let layout = demo_timeline_layout(w, h, 8, 3, true).unwrap();
-            let buttons = [layout.back, layout.play, layout.forward, layout.recorded, layout.free, layout.speed];
+            let buttons = [layout.back, layout.play, layout.forward, layout.recorded, layout.speed];
             for (i, a) in buttons.iter().enumerate() {
                 assert!(a[2] > 0.0 && a[3] > 0.0);
                 assert!(a[0] >= 0.0 && a[0] + a[2] <= w as f32 + 1.0);

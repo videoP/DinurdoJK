@@ -99,6 +99,8 @@ impl App {
             race_ghost_demo_base_url: self.race_ghost_demo_base_url.clone(),
             console_timestamps: self.console_timestamps,
             console_scale: self.console_scale,
+            console_hl2: self.console_hl2,
+            console_hl2_rect: self.console_hl2_rect,
             console_notify_lines: self.console_notify_lines,
             console_notify_words: self.console_notify_words.clone(),
             console_notify_connect: self.console_notify_connect,

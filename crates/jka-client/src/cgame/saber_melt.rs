@@ -954,7 +954,7 @@ impl SaberMelt {
                 end: d.pos,
                 width: 0.32,
                 rgba: [255, 150, 40, 255],
-                shader: "gfx/effects/whiteGlow".to_owned(),
+                shader: "gfx/effects/whiteGlow".into(),
             });
             draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin: d.pos,

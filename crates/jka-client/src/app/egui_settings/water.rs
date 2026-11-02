@@ -66,55 +66,30 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
-        let current = self.ocean_type();
-        theme::section(ui, "WATER PROMOTION", "Choose how map water is promoted. Off keeps stock JKA water.");
-        theme::row(ui, "Water renderer", "Lakes / ponds uses subtle noise relief, wind ripples and editable water colors, without ocean FFT or an infinite horizon. Gerstner is Hybrid with godot-water-shader's waves, colour and persistent foam, lit by Blue Water. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
-            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (5, "Gerstner"), (4, "Lakes / ponds")] {
-                if theme::chip(ui, label, mode == current).clicked() && mode != current {
-                    self.set_ocean_type(mode);
+        // This is a global player-wake selection, not an ocean backend option.
+        // Keep it visible for stock JKA water, all promoted water renderers,
+        // and Lakes / ponds (which has its own early return below).
+        theme::section(ui, "PLAYER WATER WAKE", "Independent of the water renderer. Console: cg_waterwake.");
+        theme::row(ui, "Water wake",
+            "Off disables player wakes; Regular uses the original JKA wake on unpromoted water; Enhanced adds the animated JKA wake and enables supported promoted-water player interaction (where configured). This does not change ship wakes or ambient wave foam.",
+            theme::Reset::None, |ui| {
+                for (mode, label) in [(0u8, "Off"), (1, "Regular"), (2, "Enhanced")] {
+                    if theme::chip(ui, label, self.video.water_wake == mode).clicked()
+                        && self.video.water_wake != mode
+                    {
+                        let _ = self.set_console_cvar("cg_waterwake", &mode.to_string());
+                    }
+                    ui.add_space(3.0);
                 }
-                ui.add_space(3.0);
-            }
-        });
-        if !self.video.ocean {
-            theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM());
-            return;
-        }
-        if self.video.ocean && !self.applied_ocean {
-            theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING());
-        }
+            });
 
-        if self.video.ocean_settings.backend == 3 {
-            self.egui_lakes(ui);
-            return;
-        }
-        let mut wake_mode = self.video.water_wake;
-        ui.horizontal(|ui| {
-            ui.label("Water Wake");
-            egui::ComboBox::from_id_salt("cg_waterwake_mode")
-                .selected_text(match wake_mode {
-                    0 => "Off", 1 => "JKA", _ => "Enhanced",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut wake_mode, 0, "Off");
-                    ui.selectable_value(&mut wake_mode, 1, "JKA");
-                    ui.selectable_value(&mut wake_mode, 2, "Enhanced");
-                });
-        }).response.on_hover_text("cg_waterwake: original wake shader on vanilla water, or enhanced movement-driven wake plus the existing Godot ocean wake in mode 2.");
-        if wake_mode != self.video.water_wake {
-            self.video.water_wake = wake_mode;
-            if let Some(session) = self.game_session.as_mut() {
-                session.water_wake_mode = wake_mode;
-            }
-            self.commit_ocean_settings();
-        }
         let mut interaction = self.video.ocean_settings.interaction;
         let mut strength = self.video.ocean_settings.interaction_strength;
         let mut splash_mode = self.video.ocean_settings.interaction_splash_mode;
         let toggled = ui.checkbox(&mut interaction, "Player water deformation").on_hover_text(
-            "Nearby ripples from moving players. Uses the ocean update rate and fades after contact stops.").changed();
-        let adjusted = interaction && ui.horizontal(|ui| {
-            ui.label("Deformation strength");
+            "Global player displacement for Godot, Blue Water, Hybrid, Gerstner and supported lake surfaces. Requires Enhanced wake.").changed();
+        let adjusted = ui.horizontal(|ui| {
+            ui.label("Deformation strength (all water renderers)");
             ui.add(egui::DragValue::new(&mut strength).speed(0.5).range(0.0..=f32::MAX)).changed()
         }).inner;
         let mut splash_changed = false;
@@ -144,6 +119,29 @@ impl App {
             self.video.ocean_settings.interaction_strength = strength;
             self.video.ocean_settings.interaction_splash_mode = splash_mode;
             self.commit_ocean_settings();
+        }
+
+        let current = self.ocean_type();
+        theme::section(ui, "WATER PROMOTION", "Choose how map water is promoted. Off keeps stock JKA water.");
+        theme::row(ui, "Water renderer", "Lakes / ponds uses subtle noise relief, wind ripples and editable water colors, without ocean FFT or an infinite horizon. Gerstner is Hybrid with godot-water-shader's waves, colour and persistent foam, lit by Blue Water. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
+            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (5, "Gerstner"), (4, "Lakes / ponds")] {
+                if theme::chip(ui, label, mode == current).clicked() && mode != current {
+                    self.set_ocean_type(mode);
+                }
+                ui.add_space(3.0);
+            }
+        });
+        if !self.video.ocean {
+            theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM());
+            return;
+        }
+        if self.video.ocean && !self.applied_ocean {
+            theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING());
+        }
+
+        if self.video.ocean_settings.backend == 3 {
+            self.egui_lakes(ui);
+            return;
         }
         if self.video.ocean_settings.backend != 0 {
             self.egui_blue_water(ui);

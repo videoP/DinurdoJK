@@ -148,6 +148,9 @@ impl Discharge {
             1,
         );
     }
+    pub fn set_cfs(&mut self, cfs: f32) {
+        self.cfs = cfs;
+    }
     pub fn encode(
         &self,
         device: &wgpu::Device,

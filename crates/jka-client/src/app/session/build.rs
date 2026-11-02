@@ -121,12 +121,13 @@ impl App {
         &self, session: &mut GameSession, game: Option<&Path>, inherit_map: bool,
     ) {
         session.water_wake_mode = self.video.water_wake;
-        session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
+        session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
         session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
         session
             .weapon_fx
             .set_modern_sabers(self.video.modern_sabers);
+        session.weapon_fx.set_saber_core_mode(self.video.saber_core_mode);
         session
             .weapon_fx
             .set_saber_impact_fx(self.video.saber_impact_fx);

@@ -289,14 +289,14 @@ impl App {
                                         );
                                         let painter = ui.painter().with_clip_rect(rect);
                                         if selected {
-                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL_SELECTED());
+                                            painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL_SELECTED());
                                             painter.rect_filled(
                                                 egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
                                                 egui::CornerRadius::ZERO,
                                                 theme::ACCENT(),
                                             );
                                         } else if response.hovered() {
-                                            painter.rect_filled(rect, egui::CornerRadius::same(3), theme::CONTROL());
+                                            painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::CONTROL());
                                         }
 
                                         let inset = rect.shrink2(egui::vec2(8.0, 5.0));

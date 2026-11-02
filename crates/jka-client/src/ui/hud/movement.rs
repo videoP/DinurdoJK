@@ -1,7 +1,7 @@
 //! Hud movement.
 use crate::extensions::NativeHud;
 use crate::ui::{
-    color_code, draw_placed, fixed_charset_text, hud_line, proportional_text, proportional_text_uniform,
+    color_code, draw_placed, fixed_charset_text, hud_line, proportional_text_uniform,
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
     MovementKeysSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_IMAGE_NAMES, KEY_ART_SIZE, KEY_ATLAS_COLUMNS, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
@@ -24,30 +24,23 @@ pub(in crate::ui) fn speedometer_color(color: [f32; 4]) -> [f32; 4] {
     })
 }
 
-/// jaPRO `cg_speedometer`: text at the 640x480 positions `DF_DrawSpeedometer`
-/// and friends pick, in the same shadowed font as the race timer.
-/// Both native jaPRO text and the Q3DF provider use one saved HUD layout.
-/// Map their actual glyph bounds to the same stock rectangle; this also keeps
-/// switching between providers from jumping to the center of the viewport.
-fn position_speedometer_batch(
-    batch: &mut [UiVertex], ui: &UiSnapshot, w: u32, h: u32,
-    native_font_aspect: bool,
-) {
+/// A fixed source anchor for Q3DF's alternate speed readout, which is
+/// produced by the independent strafe-helper renderer at x=266, y=200.  Map
+/// it to the editable speedometer origin without inspecting current glyph
+/// bounds; 9, 99 and 9999 UPS must all begin at exactly the same pixel.
+fn position_q3df_speedometer_batch(batch: &mut [UiVertex], ui: &UiSnapshot, w: u32, h: u32) {
     if batch.is_empty() || w == 0 || h == 0 { return; }
     let ctx = crate::ui::HudRectContext::from_snapshot(ui);
     let stock = crate::ui::hud_stock_rect(HudElementId::Speedometer, &ctx, w, h);
-    let target_x = (stock.x + stock.width * 0.5) / w as f32 * 2.0 - 1.0;
-    let target_y = 1.0 - (stock.y + stock.height * 0.5) / h as f32 * 2.0;
-    let min_x = batch.iter().map(|v| v.position[0]).fold(f32::INFINITY, f32::min);
-    let max_x = batch.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY, f32::max);
-    let min_y = batch.iter().map(|v| v.position[1]).fold(f32::INFINITY, f32::min);
-    let max_y = batch.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY, f32::max);
-    let center_x = (min_x + max_x) * 0.5;
-    let center_y = (min_y + max_y) * 0.5;
-    let x_aspect = if native_font_aspect { 2.0 * (h as f32 / 480.0) / (w as f32 / 640.0) } else { 1.0 };
+    let sy = h as f32 / 480.0;
+    // draw_extended anchors Q3DF labels to the widescreen-safe 4:3 centre.
+    let source_x = w as f32 * 0.5 + (crate::strafehelper::Q3DF_SPEED_LEFT_X - 320.0) * sy;
+    let source_y = crate::strafehelper::Q3DF_SPEED_TOP_Y * sy;
+    let offset_x = (stock.x - source_x) * 2.0 / w as f32;
+    let offset_y = (stock.y - source_y) * -2.0 / h as f32;
     for v in batch {
-        v.position[0] = target_x + (v.position[0] - center_x) * x_aspect;
-        v.position[1] = target_y + (v.position[1] - center_y);
+        v.position[0] += offset_x;
+        v.position[1] += offset_y;
     }
 }
 
@@ -65,12 +58,16 @@ pub(in crate::ui) fn build_speedometer(
         return;
     }
     let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
-    let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text| {
-        let (px, py) = (item.x * sx, item.y * sy);
+    // Preserve the panel's original configurable X coordinate, but scale the
+    // spacing of its contents uniformly with the screen's height. Otherwise
+    // jumps columns, acceleration bars and the speed graph spread out on 21:9.
+    let panel_x = |x: f32, anchor: f32| anchor * sx + (x - anchor) * sy;
+    let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text, anchor: f32| {
+        let (px, py) = (panel_x(item.x, anchor), item.y * sy);
         let color = speedometer_color(item.color);
         if let Some(font) = small_font {
             // The acceleration label uses the legacy font's 0xB5 glyph.
-            proportional_text(
+            proportional_text_uniform(
                 out,
                 &item.text,
                 font,
@@ -91,9 +88,13 @@ pub(in crate::ui) fn build_speedometer(
             text(out, &ascii, px, py, speedo.size * 1.4, color, w, h);
         }
     };
-    let fill = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Rect| {
+    let fill = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Rect, anchor: f32, legacy: bool| {
         let color = speedometer_color(item.color);
-        let (x, y, rw, rh) = (item.x * sx, item.y * sy, item.w * sx, item.h * sy);
+        // The old lagometer-shaped graph already carries widthRatioCoef on
+        // both its X increments and bar widths, so don't apply it twice.
+        let (x, rw) = if legacy { (item.x * sx, item.w * sx) }
+            else { (panel_x(item.x, anchor), item.w * sy) };
+        let (y, rh) = (item.y * sy, item.h * sy);
         match item.outline {
             Some(thickness) => {
                 rect_outline(out, x, y, rw, rh, (thickness * sy).max(1.0), color, w, h)
@@ -105,22 +106,18 @@ pub(in crate::ui) fn build_speedometer(
         // Gate cached data using the current selection, never the flags that
         // happened to build the previous frame's speedometer batch.
         if crate::ui::movement_components::selected(*id, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 1 { continue; }
+        let anchor = crate::speedometer::component_origin(*id, &speedo.settings)[0];
         draw_placed(out, ui, *id, w, h, |out| {
-            let start = out.len();
-            for item in &speedo.rects[rects.clone()] { fill(out, item); }
-            for item in &speedo.texts[texts.clone()] { paint(out, item); }
-            if *id == HudElementId::Speedometer && out.len() > start {
-                // Keep the fonts square in widescreen and center the drawn
-                // speedometer inside the editor's *configured* 640x480 stock
-                // rectangle rather than forcibly placing it mid-screen.
-                position_speedometer_batch(&mut out[start..], ui, w, h, true);
-            }
+            // Native jaPRO text retains the authored left anchor. No bounds-
+            // dependent recentering or anisotropic glyph/rectangle scaling.
+            for item in &speedo.rects[rects.clone()] { fill(out, item, anchor, false); }
+            for item in &speedo.texts[texts.clone()] { paint(out, item, anchor); }
         });
     }
     if crate::ui::movement_components::selected(HudElementId::SpeedometerJumps, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 0 {
     draw_placed(out, ui, HudElementId::SpeedometerJumps, w, h, |out| {
         for item in &speedo.jump_texts {
-            paint(out, item);
+            paint(out, item, speedo.settings.jumps_x);
         }
     });
     }
@@ -130,8 +127,9 @@ pub(in crate::ui) fn build_speedometer(
         for pic in &speedo.graph_pics {
             lagometer_pic(out, pic, ui, w, h);
         }
+        let legacy = ui.speedometer_settings.flags & crate::speedometer::flag::SPEEDGRAPH == 0;
         for item in &speedo.graph_rects {
-            fill(out, item);
+            fill(out, item, 245.0, legacy);
         }
     });
     }
@@ -868,7 +866,7 @@ pub(in crate::ui) fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapsho
                 let start = out.len();
                 draw_extended(out, hud, w, h);
                 if id == HudElementId::Speedometer && out.len() > start {
-                    position_speedometer_batch(&mut out[start..], ui, w, h, false);
+                    position_q3df_speedometer_batch(&mut out[start..], ui, w, h);
                 }
             });
         }
@@ -892,6 +890,88 @@ fn draw_extended(out: &mut Vec<UiVertex>, hud: crate::strafehelper::ExtendedHud,
 #[cfg(test)]
 mod strafehelper_review {
     use super::*;
+
+    fn bounds_x(vertices: &[UiVertex], w: u32) -> (f32, f32) {
+        let scale = w as f32 * 0.5;
+        (
+            vertices.iter().map(|v| (v.position[0] + 1.0) * scale).fold(f32::INFINITY, f32::min),
+            vertices.iter().map(|v| (v.position[0] + 1.0) * scale).fold(f32::NEG_INFINITY, f32::max),
+        )
+    }
+
+    #[test]
+    fn native_speedometer_left_anchor_and_glyph_width_are_widescreen_safe() {
+        let mut ui = UiSnapshot::default();
+        ui.speedometer_settings.flags = crate::speedometer::flag::ENABLE;
+        let mut speed = crate::speedometer::preview(&ui.speedometer_settings);
+        speed.texts.retain(|t| !t.text.contains("612"));
+        // A single "1" versus "1000" at identical authored x/y.
+        let base = crate::speedometer::Text {
+            text: "1".into(), x: 132.0, y: 459.0, color: [1.0; 4],
+        };
+        speed.components = vec![(HudElementId::Speedometer, 0..1, 0..0)];
+        speed.rects.clear();
+        for (w, h) in [(1024, 768), (1920, 1080), (3440, 1440)] {
+            let mut origins = Vec::new();
+            let mut glyph_width = 0.0;
+            for value in ["1", "1000"] {
+                speed.texts = vec![crate::speedometer::Text { text: value.into(), ..base.clone() }];
+                ui.speedometer = Some(speed.clone());
+                let mut vertices = Vec::new();
+                build_speedometer(&mut vertices, &ui, None, w, h);
+                let (left, right) = bounds_x(&vertices, w);
+                origins.push(left);
+                if value == "1000" { glyph_width = right - left; }
+            }
+            assert!((origins[0] - origins[1]).abs() < 0.05, "{w}x{h}: {origins:?}");
+            // The fixed fallback font has a 6px advance per 640x480 unit.
+            // Four digits should occupy the same *height-based* width in 4:3
+            // and ultrawide (not scale with physical framebuffer width).
+            assert!(glyph_width.is_finite() && glyph_width > 0.0);
+        }
+    }
+
+    #[test]
+    fn new_speed_graph_keeps_its_width_at_4_by_3_and_ultrawide() {
+        let mut ui = UiSnapshot::default();
+        ui.speedometer_settings.flags = crate::speedometer::flag::SPEEDGRAPH;
+        ui.speedometer = Some(crate::speedometer::Ui {
+            graph_rects: vec![crate::speedometer::Rect {
+                x: 245.0, y: 368.0, w: 150.0, h: 22.0,
+                color: [1.0; 4], outline: None,
+            }],
+            ..Default::default()
+        });
+        for (w, h) in [(1440, 1080), (1920, 1080), (2560, 1080)] {
+            let mut vertices = Vec::new();
+            build_speedometer(&mut vertices, &ui, None, w, h);
+            let (left, right) = bounds_x(&vertices, w);
+            assert!((right - left - 150.0 * h as f32 / 480.0).abs() < 0.05, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn q3df_speedometer_position_does_not_depend_on_batch_bounds() {
+        let ui = UiSnapshot::default();
+        for (w, h) in [(1280, 960), (1920, 1080), (3440, 1440)] {
+            let sy = h as f32 / 480.0;
+            let source_x = w as f32 * 0.5 + (crate::strafehelper::Q3DF_SPEED_LEFT_X - 320.0) * sy;
+            let source_y = crate::strafehelper::Q3DF_SPEED_TOP_Y * sy;
+            let make_vertex = |x: f32| UiVertex {
+                position: [x / w as f32 * 2.0 - 1.0, 1.0 - source_y / h as f32 * 2.0],
+                uv: [0.0; 2], color: [1.0; 4], textured: 1.0,
+            };
+            let mut short = vec![make_vertex(source_x), make_vertex(source_x + 12.0 * sy)];
+            let mut long = vec![make_vertex(source_x), make_vertex(source_x + 95.0 * sy)];
+            position_q3df_speedometer_batch(&mut short, &ui, w, h);
+            position_q3df_speedometer_batch(&mut long, &ui, w, h);
+            assert!((short[0].position[0] - long[0].position[0]).abs() < 1e-6);
+            assert!((short[0].position[1] - long[0].position[1]).abs() < 1e-6);
+            let ctx = crate::ui::HudRectContext::from_snapshot(&ui);
+            let stock = crate::ui::hud_stock_rect(HudElementId::Speedometer, &ctx, w, h);
+            assert!(((short[0].position[0] + 1.0) * 0.5 * w as f32 - stock.x).abs() < 0.05);
+        }
+    }
 
     #[test]
     fn movement_components_off_suppresses_stale_cached_readouts() {

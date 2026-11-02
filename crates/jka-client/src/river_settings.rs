@@ -7,6 +7,13 @@ pub struct Settings {
     pub foam: foam::Settings,
     pub wave_amount: f32,
     pub wave_height: f32,
+    /// Hybrid/Godot-style submerged optics; distances in JKA map units.
+    pub underwater_color: [f32; 3],
+    pub underwater_visibility: f32,
+    pub underwater_darkening: f32,
+    /// Start of foam generation's depth gate, in map units. Full strength is
+    /// derived using the native 150:500 ratio (60:200 map units).
+    pub foam_minimum_depth: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -15,12 +22,16 @@ impl Default for Settings {
             foam: foam::Settings::default(),
             wave_amount: 1.0,
             wave_height: 5.0,
+            underwater_color: crate::ocean::optics::Settings::default().fog_color,
+            underwater_visibility: 2304.0,
+            underwater_darkening: 2304.0,
+            foam_minimum_depth: 60.0,
         }
     }
 }
 impl Settings {
-    /// RiverAuthored: eight SLW vectors, seven foam vectors and surface detail.
-    pub fn uniform(self) -> [[f32; 4]; 16] {
+    /// RiverAuthored: SLW, foam, surface detail and submerged optics.
+    pub fn uniform(self) -> [[f32; 4]; 18] {
         let p = self.water;
         let f = self.foam;
         [
@@ -80,6 +91,11 @@ impl Settings {
                 0.0,
             ],
             [self.wave_amount, self.wave_height, 0.0, 0.0],
+            {
+                let c = crate::ocean::optics::linear_color(self.underwater_color);
+                [c[0], c[1], c[2], self.underwater_visibility * 2.5]
+            },
+            [self.underwater_darkening * 2.5, 0.0, 0.0, 0.0],
         ]
     }
 }

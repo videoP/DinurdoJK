@@ -202,6 +202,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetOceanSkyExtend(..) => "SetOceanSkyExtend",
         RenderCommand::SetOceanSettings(..) => "SetOceanSettings",
         RenderCommand::RiverMaterial(..) => "RiverMaterial",
+        RenderCommand::RiverSource(..) => "RiverSource",
         RenderCommand::RiverRemove(..) => "RiverRemove",
         RenderCommand::OceanWake(..) => "OceanWake",
         RenderCommand::SetPromotedOceanSettings(..) => "SetPromotedOceanSettings",
@@ -1570,6 +1571,12 @@ pub(in crate::renderer) fn render_thread_main(
                         if let Some(river)=renderer.live_rivers.iter().find(|r|r.id==id) {river.set_settings(&renderer.queue,settings);}
                     }
                     Ok(RenderCommand::RiverRemove(id)) => {renderer.live_rivers.retain(|r|r.id!=id);}
+                    Ok(RenderCommand::RiverSource(id, controls)) => {
+                        if let Some(river) = renderer.live_rivers.iter_mut().find(|r| r.id == id) {
+                            let error = river.set_live_controls(&renderer.device, &renderer.queue, controls).err();
+                            let _ = proxy.send_event(UserEvent::RiverSourceUpdated { id, controls, source: river.source, error });
+                        }
+                    }
                     Ok(RenderCommand::RiverSpawn(definition, collision)) => {
                         let result=renderer.spawn_live_river(definition,&collision).map(|()|definition.source);
                         let _=proxy.send_event(UserEvent::RiverUpdated {id:definition.id,result});

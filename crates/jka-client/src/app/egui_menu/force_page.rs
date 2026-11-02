@@ -116,9 +116,9 @@ impl App {
             } else {
                 Color32::from_rgba_unmultiplied(0x10, 0x0E, 0x0C, 120)
             };
-            painter.rect_filled(rect, 10.0, fill);
+            painter.rect_filled(rect,egui::CornerRadius::ZERO, fill);
             let edge = if selected { color } else { theme::LINE() };
-            painter.rect_stroke(rect, 10.0, egui::Stroke::new(if selected { 1.5 } else { 1.0 }, edge), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect,egui::CornerRadius::ZERO, egui::Stroke::new(if selected { 1.5 } else { 1.0 }, edge), egui::StrokeKind::Inside);
             // The saber: lit when chosen, a bare hilt otherwise.
             let y = rect.top() + 30.0;
             let lit = if selected { 1.0 } else if hovered { 0.45 } else { 0.0 };
@@ -206,7 +206,7 @@ impl App {
         let (area, row_response) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
         let painter = ui.painter().clone();
         if row_response.hovered() && lock.is_none() {
-            painter.rect_filled(area, 8.0, Color32::from_rgba_unmultiplied(0xF0, 0xF2, 0xEF, 9));
+            painter.rect_filled(area,egui::CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0xF0, 0xF2, 0xEF, 9));
         }
         let level = force.powers[power];
         let name_rect = to_rect(area.min, flex.bounds(name));

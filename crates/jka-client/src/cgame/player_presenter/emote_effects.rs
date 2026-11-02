@@ -143,7 +143,7 @@ fn particle_frame(particles: &[Particle], renderers: &[jka_emotes::effects::Rend
         }
         let shader = renderers[a.0 as usize].shader.clone();
         let rgba = std::array::from_fn(|i| ((a.5[i] as u16 + b.5[i] as u16) / 2) as u8);
-        out.draws.push(FxDraw::Line { start: a.3, end: b.3, width: (a.4 + b.4) * 0.5, rgba, shader });
+        out.draws.push(FxDraw::Line { start: a.3, end: b.3, width: (a.4 + b.4) * 0.5, rgba, shader: shader.into() });
     }
     if out.lights.len() > 4 {
         out.lights.sort_by(|a, b| b.radius.total_cmp(&a.radius));

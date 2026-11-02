@@ -5,6 +5,15 @@ use crate::cgame::{ClientInfo, player_presenter::ProfileAttachmentFrame};
 use serde::{Deserialize,Serialize};
 use std::collections::BTreeMap;
 
+/// Ghoul2 supplies renderer-space poses. Studio owns native JKA authoring data.
+pub(in crate::app) fn frame_point(frame: ProfileAttachmentFrame, offset: [f32;3], local: bool) -> [f32;3] {
+    crate::scene::jka_position(frame.point(if local { offset } else { crate::scene::render_position(offset) }, local))
+}
+pub(in crate::app) fn frame_offset(frame: ProfileAttachmentFrame, point: [f32;3], local: bool) -> [f32;3] {
+    let offset=frame.offset(crate::scene::render_position(point),local);
+    if local { offset } else { crate::scene::jka_position(offset) }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::app) enum StudioAttachmentPart { #[default] Player, Saber1, Saber2 }
 impl StudioAttachmentPart {
@@ -49,21 +58,19 @@ impl StudioCameraOrbit {
         && self.pitch.is_finite() && (-90.0..=90.0).contains(&self.pitch)}
     fn basis(frame:ProfileAttachmentFrame,local:bool)->Option<glam::Mat3> {
         let basis=if local {
-            // Bone XYZ uses local Z as up; the orbit editor uses renderer Y-up.
-            glam::Mat3::from_cols_array_2d(&frame.axis)
-                *glam::Mat3::from_cols(glam::Vec3::X,glam::Vec3::Z,-glam::Vec3::Y)
+            glam::Mat3::from_cols_array_2d(&frame.axis.map(crate::scene::jka_position))
         } else {glam::Mat3::IDENTITY};
         (basis.is_finite() && basis.determinant().abs()>1e-6).then_some(basis)
     }
     pub fn from_binding(binding:&StudioCameraAttachment,frame:ProfileAttachmentFrame,key_delta:[f32;3])->Option<Self> {
-        let vector=glam::Vec3::from_array(frame.point(binding.offset,binding.local_offset))
-            +glam::Vec3::from_array(key_delta)-glam::Vec3::from_array(frame.position);
+        let vector=glam::Vec3::from_array(frame_point(frame,binding.offset,binding.local_offset))
+            +glam::Vec3::from_array(key_delta)-glam::Vec3::from_array(crate::scene::jka_position(frame.position));
         if !vector.is_finite() {return None;}
         let direction=Self::basis(frame,binding.local_offset)?.inverse()*vector;
         let distance=vector.length();
         if !distance.is_finite() {return None;}
         let (yaw,pitch)=if distance>1e-5 {
-            ((-direction.z).atan2(direction.x).to_degrees(),direction.y.atan2(direction.x.hypot(direction.z)).to_degrees())
+            (direction.y.atan2(direction.x).to_degrees(),-direction.z.atan2(direction.x.hypot(direction.y)).to_degrees())
         } else {(180.,0.)};
         Some(Self {distance,yaw,pitch})
     }
@@ -71,9 +78,9 @@ impl StudioCameraOrbit {
         if !self.distance.is_finite() || self.distance<0. || !self.yaw.is_finite() || !self.pitch.is_finite() {return false;}
         let Some(basis)=Self::basis(frame,binding.local_offset) else{return false;};
         let (sy,cy)=self.yaw.to_radians().sin_cos();let (sp,cp)=self.pitch.to_radians().sin_cos();
-        let vector=(basis*glam::Vec3::new(cy*cp,sp,-sy*cp)).normalize_or_zero()*self.distance;
-        let eye=glam::Vec3::from_array(frame.position)+vector-glam::Vec3::from_array(key_delta);
-        let offset=frame.offset(eye.to_array(),binding.local_offset);
+        let vector=(basis*glam::Vec3::new(cy*cp,sy*cp,-sp)).normalize_or_zero()*self.distance;
+        let eye=glam::Vec3::from_array(crate::scene::jka_position(frame.position))+vector-glam::Vec3::from_array(key_delta);
+        let offset=frame_offset(frame,eye.to_array(),binding.local_offset);
         if offset.iter().any(|v|!v.is_finite()) {return false;}
         binding.offset=offset;true
     }
@@ -102,8 +109,8 @@ impl StudioCameraRig {
             if let Some(p)=target {
                 let delta=glam::Vec3::from_array(p)-glam::Vec3::from_array(base.position);
                 if delta.length_squared()>1e-8 {
-                    base.yaw=(-delta.z).atan2(delta.x).to_degrees();
-                    base.pitch=delta.y.atan2(delta.x.hypot(delta.z)).to_degrees().clamp(-89.9,89.9);
+                    base.yaw=delta.y.atan2(delta.x).to_degrees();
+                    base.pitch=-delta.z.atan2(delta.x.hypot(delta.y)).to_degrees().clamp(-89.9,89.9);
                 }
             }
         }
@@ -115,7 +122,7 @@ impl StudioCameraRig {
     pub fn position_point(&self,base:StudioCameraKey,frame:ProfileAttachmentFrame)->[f32;3] {
         let mut binding=self.position.clone();
         if let Some(orbit)=base.rig_orbit {orbit.apply(&mut binding,frame,[0.;3]);}
-        frame.point(binding.offset,binding.local_offset)
+        frame_point(frame,binding.offset,binding.local_offset)
     }
 }
 
@@ -214,8 +221,8 @@ impl App {
             let Some(orbit)=key.rig_orbit else{continue;};
             let Some(frame)=self.studio_orbit_edit_frame(key.time) else{continue;};
             let mut binding=old.clone();if !orbit.apply(&mut binding,frame,[0.;3]) {continue;}
-            let point=frame.point(binding.offset,old.local_offset);
-            binding.local_offset=local;binding.offset=frame.offset(point,local);
+            let point=frame_point(frame,binding.offset,old.local_offset);
+            binding.local_offset=local;binding.offset=frame_offset(frame,point,local);
             if let Some(value)=StudioCameraOrbit::from_binding(&binding,frame,[0.;3]) {
                 self.render_studio.timeline.camera[i].rig_orbit=Some(value);
             }
@@ -262,7 +269,7 @@ impl App {
         let yaw=(self.profile_preview_yaw+motion.yaw).to_radians();let (s,c)=yaw.sin_cos();
         let axis=[[c,s,0.],[-s,c,0.],[0.,0.,1.]];
         let origin=[88.*self.profile_preview_zoom.clamp(0.45,2.5)+motion.position[0],
-            motion.position[1],-22.+binding.lane as f32*26.+motion.position[2]];
+            binding.lane as f32*26.+motion.position[1],-22.+motion.position[2]];
         let info=self.studio_attachment_info(binding.lane);
         self.ensure_asset_preview_player_presenter()?;
         self.asset_preview_player_presenter.as_mut().ok_or("Player presenter unavailable")?
@@ -335,7 +342,7 @@ impl App {
                 Ok(ProfileAttachmentFrame {position,axis})
             })();
             match filtered {
-                Ok(frame)=>{points[i]=Some(frame.point(binding.offset,binding.local_offset));runtime.frames[i]=Some(frame);}
+                Ok(frame)=>{points[i]=Some(frame_point(frame,binding.offset,binding.local_offset));runtime.frames[i]=Some(frame);}
                 Err(error)=>runtime.messages[i]=Some(error),
             }
             // Bound memory, including after long exports and arbitrary seeks.
@@ -349,13 +356,13 @@ impl App {
             if let Some(frame)=runtime.frames[0] {
                 if !rig.position.local_offset || glam::Mat3::from_cols_array_2d(&frame.axis).determinant().abs()>1e-8 {
                     if base.rig_orbit.is_some() {
-                        let mut binding=rig.position.clone();binding.offset=frame.offset(eye,binding.local_offset);
+                        let mut binding=rig.position.clone();binding.offset=frame_offset(frame,eye,binding.local_offset);
                         base.rig_orbit=StudioCameraOrbit::from_binding(&binding,frame,[0.;3]);
                         base.position=rig.reference_position;base.time=time;
                         self.render_studio.timeline.insert_camera_key(base);
                     } else {
                         rig.reference_position=base.position;
-                        rig.position.offset=frame.offset(eye,rig.position.local_offset);
+                        rig.position.offset=frame_offset(frame,eye,rig.position.local_offset);
                     }
                     self.render_studio.timeline.camera_rig=rig.clone();
                     self.render_studio.camera_pending_match=None;
@@ -389,12 +396,13 @@ mod tests {
                 let key=timeline.camera_at(time);
                 let head=[time as f32*20.,40.,-15.];
                 let frame=ProfileAttachmentFrame {position:head,axis:[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]};
-                let camera=rig.resolve(key,Some(rig.position_point(key,frame)),Some(head));
-                let vector=glam::Vec3::from_array(camera.position)-glam::Vec3::from_array(head);
+                let native_head=crate::scene::jka_position(head);
+                let camera=rig.resolve(key,Some(rig.position_point(key,frame)),Some(native_head));
+                let vector=glam::Vec3::from_array(camera.position)-glam::Vec3::from_array(native_head);
                 assert!((vector.length()-120.).abs()<0.001,"camera must orbit instead of cutting a chord");
-                if time==2. {assert!((vector-glam::Vec3::new(84.85281,0.,-84.85281)).length()<0.001);assert_eq!(key.fov,70.);}
+                if time==2. {assert!((vector-glam::Vec3::new(84.85281,84.85281,0.)).length()<0.001);assert_eq!(key.fov,70.);}
                 assert!(super::super::render_studio_spatial::camera_from_key(camera).forward()
-                    .dot(-vector.normalize())>0.9999,"camera must keep aiming at the moving head");
+                    .dot(-glam::Vec3::from_array(crate::scene::render_position(vector.to_array())).normalize())>0.9999,"camera must keep aiming at the moving head");
             }
             let quarter=timeline.camera_at(1.).rig_orbit.unwrap().yaw;
             assert!((quarter-if mode==StudioInterpolation::Smooth {14.0625}else{22.5}).abs()<0.001);
@@ -423,17 +431,17 @@ mod tests {
     fn studio_orbit_distance_and_angles_control_the_resolved_eye_with_keyed_movement() {
         let frame=ProfileAttachmentFrame {position:[30.,40.,50.],axis:[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]};
         let mut binding=StudioCameraAttachment {enabled:true,offset:[100.,20.,-15.],..Default::default()};
-        let delta=[10.,-5.,25.];let before=frame.point(binding.offset,false);
+        let delta=[10.,-5.,25.];let before=frame_point(frame,binding.offset,false);
         let original=StudioCameraOrbit::from_binding(&binding,frame,delta).unwrap();
         assert!(original.apply(&mut binding,frame,delta));
-        assert!((glam::Vec3::from_array(frame.point(binding.offset,false))-glam::Vec3::from_array(before)).length()<0.001);
+        assert!((glam::Vec3::from_array(frame_point(frame,binding.offset,false))-glam::Vec3::from_array(before)).length()<0.001);
         let orbit=StudioCameraOrbit {distance:120.,yaw:90.,pitch:30.};
         assert!(orbit.apply(&mut binding,frame,delta));
         let rig=StudioCameraRig {position:binding,target:Default::default(),reference_position:[0.;3]};
         let key=StudioCameraKey {position:delta,fov:77.,..Default::default()};
-        let eye=rig.resolve(key,Some(frame.point(rig.position.offset,false)),None);
-        let vector=glam::Vec3::from_array(eye.position)-glam::Vec3::from_array(frame.position);
-        assert!((vector-glam::Vec3::new(0.,60.,-103.92305)).length()<0.001);assert_eq!(eye.fov,77.);
+        let eye=rig.resolve(key,Some(frame_point(frame,rig.position.offset,false)),None);
+        let vector=glam::Vec3::from_array(eye.position)-glam::Vec3::from_array(crate::scene::jka_position(frame.position));
+        assert!((vector-glam::Vec3::new(0.,103.92305,-60.)).length()<0.001);assert_eq!(eye.fov,77.);
         let saved:StudioCameraRig=serde_json::from_str(&serde_json::to_string(&rig).unwrap()).unwrap();
         assert_eq!(saved,rig,"orbit controls must persist through the existing offset format");
     }
@@ -464,7 +472,7 @@ mod tests {
         let base=StudioCameraKey {position:[11.,2.,3.],fov:73.,..Default::default()};
         let camera=rig.resolve(base,Some([40.,5.,6.]),Some([50.,15.,6.]));
         assert_eq!(camera.position,[50.,5.,6.]);assert_eq!(camera.fov,73.);
-        assert_eq!(camera.pitch,89.9);
+        assert_eq!(camera.yaw,90.);assert_eq!(camera.pitch,0.);
         let camera=rig.resolve(base,Some([40.,5.,6.]),Some([50.,5.,6.]));
         assert_eq!(camera.yaw,base.yaw);assert_eq!(camera.pitch,base.pitch);
         assert_eq!(rig.resolve(base,None,None).position,base.position);
@@ -485,9 +493,9 @@ mod tests {
         let rig:StudioCameraRig=serde_json::from_str(&serde_json::to_string(&rig).unwrap()).unwrap();
         assert!(rig.valid(1));
         let frame=ProfileAttachmentFrame {position:[4.,5.,6.],axis:[[0.,1.,0.],[-1.,0.,0.],[0.,0.,1.]]};
-        let offset=[10.,2.,3.];let p=frame.point(offset,true);
-        assert_eq!(p,[2.,15.,9.]);assert_eq!(frame.offset(p,true),offset);
-        assert_eq!(frame.offset(frame.point(offset,false),false),offset);
+        let offset=[10.,2.,3.];let p=frame_point(frame,offset,true);
+        assert_eq!(p,[2.,-9.,15.]);assert_eq!(frame_offset(frame,p,true),offset);
+        assert_eq!(frame_offset(frame,frame_point(frame,offset,false),false),offset);
         let project:super::super::render_studio_timeline::StudioProject=serde_json::from_value(serde_json::json!({
             "version":3,"model":"kyle/default","with_sabers":true,"background":"black",
             "background_map":"","clips":[],"camera":[]

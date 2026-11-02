@@ -38,10 +38,13 @@ pub const EXT_IMAGE_TEXTURE_SOURCE: f32 = 7.0;
 /// Square cell, in pixels, each extension image is resampled into.
 pub const EXT_IMAGE_CELL: u32 = 256;
 pub const EXT_IMAGE_COLUMNS: u32 = 8;
+/// Texture-source marker for an authored HUD image. Kept separate from both
+/// the native UI image atlas and the native icon shader source tags.
+pub(crate) const EXT_IMAGE_SHADER_SOURCE_BASE: f32 = 8192.0;
 
 /// UV rectangle of atlas cell `index`, inset half a texel. The atlas always has
 /// room for `MAX_HUD_IMAGES` cells so adding an image never moves another one.
-pub(in crate::ui) fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
+pub(crate) fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
     let columns = EXT_IMAGE_COLUMNS;
     let rows = (MAX_HUD_IMAGES as u32 + 1).div_ceil(columns);
     let cell = EXT_IMAGE_CELL as f32;
@@ -54,7 +57,8 @@ pub(in crate::ui) fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
 }
 
 pub(in crate::ui) fn build_extension_hud(
-    out: &mut Vec<UiVertex>, widgets: &[PlacedHudWidget], images: &[String], width: u32, height: u32,
+    out: &mut Vec<UiVertex>, widgets: &[PlacedHudWidget], images: &[String],
+    shader_flags: &[bool], width: u32, height: u32,
 ) {
     if width == 0 || height == 0 { return; }
     // Reserve space in the preallocated UI dynamic buffer for the stock HUD.
@@ -129,7 +133,10 @@ pub(in crate::ui) fn build_extension_hud(
                     let (v0, v1) = axis(y0, y1, ry, rh, flip_y, cell0[1], cell1[1]);
                     textured_rect_with_source(
                         out, x0, y0, x1 - x0, y1 - y0, [u0, v0], [u1, v1], *color,
-                        EXT_IMAGE_TEXTURE_SOURCE, width, height,
+                        if shader_flags.get(index).copied().unwrap_or(false) {
+                            EXT_IMAGE_SHADER_SOURCE_BASE + index as f32
+                        } else { EXT_IMAGE_TEXTURE_SOURCE },
+                        width, height,
                     );
                 }
                 HudCommand::Circle { x, y, radius, color } => {
@@ -169,7 +176,7 @@ mod tests {
             placement: HudPlacement { x: 30.0, y: 25.0, scale: 2.0, visible: true },
         };
         let mut out=Vec::new();
-        build_extension_hud(&mut out, &[widget], &[], 640, 480);
+        build_extension_hud(&mut out, &[widget], &[], &[], 640, 480);
         assert_eq!(out.len(), 6);
         assert!((out[0].position[0] - ((34.0 / 640.0) * 2.0 - 1.0)).abs() < 0.0001);
     }
@@ -193,7 +200,7 @@ mod tests {
             crate::extensions::HudAnchor::TopLeft);
         let mut out = Vec::new();
         let slots = ["gfx/a".to_owned(), "gfx/b".to_owned()];
-        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &slots, 640, 480);
+        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &slots, &[], 640, 480);
         assert_eq!(out.len(), 12);
         assert!(out.iter().all(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
         // Cells follow the slot list: "gfx/b" is cell 1, "gfx/a" cell 0 (8 columns).
@@ -204,8 +211,25 @@ mod tests {
         more.push("gfx/c".to_owned());
         let mut again = Vec::new();
         let w2 = image_widget(vec![image("gfx/b", 0.0, 0.0, 10.0, 10.0)], crate::extensions::HudAnchor::TopLeft);
-        build_extension_hud(&mut again, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..w2.placement }, ..w2 }], &more, 640, 480);
+        build_extension_hud(&mut again, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..w2.placement }, ..w2 }], &more, &[], 640, 480);
         assert_eq!(again[0].uv, out[0].uv);
+    }
+
+    #[test]
+    fn authored_shader_marks_only_its_own_image() {
+        let widget = image_widget(
+            vec![image("gfx/a", 0.0, 0.0, 10.0, 10.0),
+                 image("gfx/b", 15.0, 0.0, 10.0, 10.0)],
+            crate::extensions::HudAnchor::TopLeft,
+        );
+        let mut out = Vec::new();
+        build_extension_hud(&mut out, &[widget],
+            &["gfx/a".into(), "gfx/b".into()], &[true, false], 640, 480);
+        assert!(out[0..6].iter().all(|v| v.textured == EXT_IMAGE_SHADER_SOURCE_BASE));
+        assert!(out[6..12].iter().all(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
+        let (uv0, uv1) = image_cell_uv(0);
+        assert_eq!(out[0].uv, uv0);
+        assert_eq!(out[2].uv, uv1);
     }
 
     #[test]
@@ -213,7 +237,7 @@ mod tests {
         let mut out = Vec::new();
         // Negative width mirrors; the 100-unit widget clips the right 20 units.
         let widget = image_widget(vec![image("gfx/a", 80.0, 0.0, -40.0, 10.0)], crate::extensions::HudAnchor::TopLeft);
-        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &["gfx/a".to_owned()], 640, 480);
+        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &["gfx/a".to_owned()], &[], 640, 480);
         assert_eq!(out.len(), 6);
         let (u_left, u_right) = (out[0].uv[0], out[2].uv[0]);
         assert!(u_left > u_right, "mirrored image must run right-to-left: {u_left} {u_right}");
@@ -225,7 +249,7 @@ mod tests {
     fn bottom_right_widgets_sit_in_the_corner() {
         let mut out = Vec::new();
         let widget = image_widget(vec![image("gfx/a", 0.0, 0.0, 100.0, 50.0)], crate::extensions::HudAnchor::BottomRight);
-        build_extension_hud(&mut out, &[widget], &["gfx/a".to_owned()], 640, 480);
+        build_extension_hud(&mut out, &[widget], &["gfx/a".to_owned()], &[], 640, 480);
         let right_px = (out[2].position[0] + 1.0) * 0.5 * 640.0;
         let bottom_px = (1.0 - out[2].position[1]) * 0.5 * 480.0;
         assert!((right_px - 640.0).abs() < 0.01 && (bottom_px - 480.0).abs() < 0.01, "{right_px} {bottom_px}");

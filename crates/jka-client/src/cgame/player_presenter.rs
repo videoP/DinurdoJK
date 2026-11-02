@@ -1,6 +1,8 @@
 //! cgame::player_presenter module facade. Implementations are grouped by responsibility.
 mod source_player;
 mod swim_tilt;
+mod swing_transition;
+pub(crate) use swing_transition::{animation_blend_enabled, set_animation_blend, saber_swing_fix, set_saber_swing_fix};
 mod move_lean;
 mod source_vtf;
 mod assets;

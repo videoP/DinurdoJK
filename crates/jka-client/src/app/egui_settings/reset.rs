@@ -350,6 +350,9 @@ impl App {
                 self.video.modern_sabers = defaults.modern_sabers;
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_SABER_CORE_MODE => {
+                let _ = self.set_console_cvar("r_saberCoreMode", &defaults.saber_core_mode.to_string());
+            }
             ui::VIDEO_ROW_FLARES => {
                 self.video.flares = defaults.flares;
                 self.sync_world_flares();

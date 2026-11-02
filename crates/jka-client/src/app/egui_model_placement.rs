@@ -344,7 +344,7 @@ pub(super) fn bmodel_pivot(map: &scene::PreparedMap, model: u32) -> Option<([f32
 fn paint_bmodel_thumbnail(ui: &mut egui::Ui, map: &scene::PreparedMap,
     model: &scene::InlineModelGeometry, bounds: ([f32; 3], [f32; 3])) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 42.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, theme::CONTROL());
+    ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, theme::CONTROL());
     let midpoint: [f32; 3] = std::array::from_fn(|i| (bounds.0[i] + bounds.1[i]) * 0.5);
     let span = (0..3).map(|i| (bounds.1[i] - bounds.0[i]).abs())
         .fold(1.0_f32, f32::max);
@@ -1533,7 +1533,7 @@ impl App {
                                 if kind == AssetKind::Efx {
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(60.0, 60.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL());
+                                    ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, theme::CONTROL());
                                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                                         "▶ FX", egui::FontId::monospace(12.0), theme::TEXT_DIM());
                                 } else if let Some(texture) = state.thumbnails.get(qpath) {
@@ -1542,7 +1542,7 @@ impl App {
                                 } else {
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(60.0, 60.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, theme::CONTROL());
+                                    ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, theme::CONTROL());
                                     if !state.thumbnails_missing.contains(qpath)
                                         && state.thumbnails_pending.insert(qpath.clone()) {
                                         image_requests.push(qpath.clone());
@@ -1724,8 +1724,7 @@ impl App {
         }
         let bounds = root.max_rect();
         let top = bounds.min + egui::vec2(20.0, 20.0);
-        painter.rect_filled(egui::Rect::from_min_size(top, egui::vec2(690.0, 78.0)),
-            5.0, egui::Color32::from_black_alpha(188));
+        painter.rect_filled(egui::Rect::from_min_size(top, egui::vec2(690.0, 78.0)),egui::CornerRadius::ZERO, egui::Color32::from_black_alpha(188));
         painter.text(top + egui::vec2(12.0, 11.0), egui::Align2::LEFT_TOP,
             match state.kind {
                 _ if state.editor_placing => match state.kind {

@@ -1283,6 +1283,9 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     trace_callback = trace; contents_callback = contents; callback_context = context;
     client = p->ps.clientNum;
 #ifdef JKA_JAPRO
+    /* User-selected scope: only jaPRO race prediction adopts the correction.
+     * The authoritative jaPRO server must carry the matching movement patch. */
+    jka_force_jump_slope_enabled = IsRacemode(&p->ps);
     if (p->ps.m_iVehicleNum) host_error(ERR_DROP, "Vehicle prediction requires a vehicle entity host");
     install_prediction_entities(p);
     cg.clientNum = client;

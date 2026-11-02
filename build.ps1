@@ -3,9 +3,16 @@ param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [switch]$Check,
     [switch]$Fetch,
-    [switch]$Fast
+    [switch]$Fast,
+    [switch]$Faster,
+    [switch]$CacheAudit
 )
 $ErrorActionPreference = 'Stop'
+# Measure the whole command, not just the Cargo subprocess.
+$buildWallClock = [System.Diagnostics.Stopwatch]::StartNew()
+$beforeCargoSeconds = $null
+$cargoEndSeconds = $null
+$cargoBuildElapsed = $null
 $stableCargoPath = Join-Path $env:USERPROFILE '.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe'
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $stableCargoPath) {
@@ -49,6 +56,10 @@ if ($existingEncoded) {
 } elseif ($existingRustFlags) {
     $inherited = $existingRustFlags.Split(' ') | Where-Object { $_ }
 }
+# Existing flags can already include this script's remapping flags (for example,
+# after a previous failed invocation). Do not append a second copy: Cargo
+# fingerprints the entire flag list and would rebuild unchanged dependencies.
+$inherited = @($inherited | Where-Object { $remapFlags -cnotcontains $_ })
 $env:CARGO_ENCODED_RUSTFLAGS = ($inherited + $remapFlags) -join $separator
 
 # Call the toolchain binaries directly so build scripts that shell out to `rustc`
@@ -62,19 +73,20 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 # Build modes ---------------------------------------------------------------
 # (no flag)  Cargo 'release' profile: fat LTO, codegen-units=1. Use it for final FPS
 #            numbers and shipping. A one-line change costs ~6.5 min (the LTO step).
-# -Fast      Cargo 'fast' profile: ThinLTO with persistent incremental compilation.
-#            Keeps cached local/path crate outputs for faster small edits.
-# The fast profile keeps its own target\fast cache (see Cargo.toml), so switching
-# modes never recompiles every dependency. -Fast copies the exe, .pdb and
-# runtime DLLs into target\release, where the base folder lives, so the game is
-# always run from target\release\DinurdoJK.exe. DinurdoJK.exe.mode records which
-# mode produced the exe currently there.
-if ($Fast -and $Configuration -eq 'Debug') {
-    throw '-Fast is an optimized profile; omit -Configuration Debug.'
+# -Fast      Optimized iteration: ThinLTO, codegen-units=16, incremental ON.
+# -Faster    Visual-only iteration: opt-level=0, LTO off, incremental OFF.
+# Each profile has its own cache (target\fast, target\faster).
+# Both stage their executable into target\release; neither builds jka-probe.
+if ($Fast -and $Faster) { throw 'Choose -Fast or -Faster, not both.' }
+if (($Fast -or $Faster) -and $Configuration -eq 'Debug') {
+    throw 'For -Fast or -Faster, omit -Configuration Debug.'
 }
 if ($Fast) {
     $buildMode = 'fast'
     $profileArguments = @('--profile', 'fast')
+} elseif ($Faster) {
+    $buildMode = 'faster'
+    $profileArguments = @('--profile', 'faster')
 } elseif ($Configuration -eq 'Release') {
     $buildMode = 'release'
     $profileArguments = @('--release')
@@ -87,8 +99,40 @@ $runtimeDirectory = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInva
 $executable = Join-Path $runtimeDirectory 'DinurdoJK.exe'
 $previousExecutable = "$executable.prev"
 
-# Cache reporter is read-only; it never deletes or truncates build artifacts.
-. (Join-Path $PSScriptRoot 'scripts\build-cache-ntfs.ps1')
+# Near-zero-overhead disk snapshot: list only immediate files in the active
+# profile root (not deps/build/incremental); query volume free space via Windows.
+# These are net size changes, NEVER write-byte counters.
+function Get-ProfileRootFileBytes([string]$Folder) {
+    [long]$sum = 0
+    if ([System.IO.Directory]::Exists($Folder)) {
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($Folder, '*', [System.IO.SearchOption]::TopDirectoryOnly)) {
+            try { $sum += ([System.IO.FileInfo]::new($file)).Length } catch { }
+        }
+    }
+    return $sum
+}
+function Format-SignedBuildBytes([long]$Bytes) {
+    if ($Bytes -eq 0) { return '0 B' }
+    $prefix = if ($Bytes -gt 0) { '+' } else { '-' }
+    $absolute = [math]::Abs([double]$Bytes)
+    if ($absolute -ge 1GB) { return ('{0}{1:N2} GiB' -f $prefix, ($absolute / 1GB)) }
+    if ($absolute -ge 1MB) { return ('{0}{1:N1} MiB' -f $prefix, ($absolute / 1MB)) }
+    if ($absolute -ge 1KB) { return ('{0}{1:N1} KiB' -f $prefix, ($absolute / 1KB)) }
+    return ('{0}{1} B' -f $prefix, [long]$absolute)
+}
+$profileRootBytesBefore = Get-ProfileRootFileBytes $buildDirectory
+$volumeDisk = $null
+$volumeFreeBefore = $null
+try {
+    $volumeDisk = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($PSScriptRoot))
+    if ($volumeDisk.IsReady) { $volumeFreeBefore = [long]$volumeDisk.AvailableFreeSpace }
+} catch { $volumeDisk = $null }
+
+# Cargo's per-target reuse is lightweight. A full directory/NTFS scan is not.
+# Load NTFS probes only for explicit -CacheAudit requests.
+if ($CacheAudit) {
+    . (Join-Path $PSScriptRoot 'scripts\build-cache-ntfs.ps1')
+}
 . (Join-Path $PSScriptRoot 'scripts\build-cache-report.ps1')
 
 # Restore upstream SMAA 0.21 with WGPU default backends disabled.
@@ -154,15 +198,18 @@ function Sync-IfDifferent([string]$Source, [string]$Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
-# The fast profile must be incremental even when an inherited Cargo setting
-# disables it. Restore the caller's environment after the build.
+# Keep the two profiles' incremental settings deterministic and independent of
+# the caller's environment. Original values are restored in finally.
 $previousCargoIncremental = $env:CARGO_INCREMENTAL
 if ($Fast) { $env:CARGO_INCREMENTAL = '1' }
+if ($Faster) { $env:CARGO_INCREMENTAL = '0' }
 $cacheReport = New-CargoArtifactReport
 $cacheSnapshot = $null
 Push-Location $PSScriptRoot
 try {
-    $cacheSnapshot = Get-BuildOutputSnapshot -BuildDirectory $buildDirectory -RuntimeDirectory $runtimeDirectory
+    if ($CacheAudit) {
+        $cacheSnapshot = Get-BuildOutputSnapshot -BuildDirectory $buildDirectory -RuntimeDirectory $runtimeDirectory
+    }
     Ensure-PatchedSmaaVendor -WorkspaceRoot $PSScriptRoot
     $openalRuntime = Ensure-OpenALRuntime -WorkspaceRoot $PSScriptRoot
     New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
@@ -202,6 +249,8 @@ try {
     # own stderr. The previous plain-JSON rendering lost the normal error/warning
     # colors when PowerShell reprinted it. stderr is not part of this pipeline.
     $cargoArguments = @('build', '--package', 'DinurdoJK', '--offline', '--locked') + $profileArguments + @('--message-format=json,json-render-diagnostics')
+    $beforeCargoSeconds = $buildWallClock.Elapsed.TotalSeconds
+    $cargoBuildTimer = [System.Diagnostics.Stopwatch]::StartNew()
     & $cargoPath @cargoArguments | ForEach-Object {
         $line = [string]$_
         if (-not $line.StartsWith('{')) { Write-Host $line; return }
@@ -227,6 +276,9 @@ try {
         }
     }
     $cargoExitCode = $LASTEXITCODE
+    $cargoBuildTimer.Stop()
+    $cargoBuildElapsed = $cargoBuildTimer.Elapsed
+    $cargoEndSeconds = $buildWallClock.Elapsed.TotalSeconds
     if ($cargoExitCode -ne 0) {
         if ($buildsInPlace -and -not (Test-Path -LiteralPath $executable) -and (Test-Path -LiteralPath $previousExecutable)) {
             Move-Item -LiteralPath $previousExecutable -Destination $executable
@@ -244,7 +296,7 @@ try {
             Preserve-RunningExecutable
             Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force
         }
-        Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb')
+        if (-not $Faster) { Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb') }
         Get-ChildItem -LiteralPath $buildDirectory -Filter '*.dll' | ForEach-Object { Sync-RuntimeFile $_.FullName }
     }
     Set-Content -LiteralPath "$executable.mode" -Value "$buildMode $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
@@ -265,17 +317,42 @@ try {
         Copy-Item -LiteralPath $shaderModes -Destination $runtimeShaderModes -Force
     }
     Write-Host "`nBuilt ($buildMode): $executable"
-    if ($Fast) { Write-Host '(-Fast: ThinLTO; persistent incremental compilation enabled)' }
+    if ($Fast) { Write-Host '(-Fast: ThinLTO, codegen-units 16, incremental ON)' }
+    if ($Faster) { Write-Host '(-Faster: visual-only, opt-level 0, LTO off, incremental OFF)' }
 } finally {
-    if ($null -ne $cacheSnapshot) {
+    # Normal builds never recursively scan target output or query NTFS file IDs.
+    # Full file sizes and hard-link accounting are opt-in via -CacheAudit.
+    $stagingSeconds = if ($null -ne $cargoEndSeconds) {
+        $buildWallClock.Elapsed.TotalSeconds - $cargoEndSeconds
+    } else { [double]0 }
+    $auditClock = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($CacheAudit -and $null -ne $cacheSnapshot) {
         try {
             Show-BuildCacheReport -BuildDirectory $buildDirectory -RuntimeDirectory $runtimeDirectory -Before $cacheSnapshot -Artifacts $cacheReport
         } catch {
             Write-Warning "Build-cache reporting failed (build artifacts are unaffected): $($_.Exception.Message)"
         }
+    } else {
+        Write-Host ("[JKA CACHE] Cargo: {0} fresh, {1} compiled" -f $cacheReport.FreshTargets, $cacheReport.BuiltTargets) -ForegroundColor Green
+        Write-Host '  Size and NTFS hard-link scan skipped. Run with -CacheAudit for details.' -ForegroundColor DarkGray
     }
+    $auditClock.Stop()
     Pop-Location
     $env:CARGO_ENCODED_RUSTFLAGS = $existingEncoded
     $env:Path = $existingPath
     $env:CARGO_INCREMENTAL = $previousCargoIncremental
+    $buildWallClock.Stop()
+    $cargoSeconds = if ($null -ne $cargoBuildElapsed) { $cargoBuildElapsed.TotalSeconds } else { [double]0 }
+    $preSeconds = if ($null -ne $beforeCargoSeconds) { $beforeCargoSeconds } else { $buildWallClock.Elapsed.TotalSeconds - $auditClock.Elapsed.TotalSeconds }
+    Write-Host ("[JKA TIME] Setup {0:N2}s | Cargo {1:N2}s | Staging {2:N2}s | Cache report {3:N2}s | TOTAL {4:N2}s" -f $preSeconds, $cargoSeconds, $stagingSeconds, $auditClock.Elapsed.TotalSeconds, $buildWallClock.Elapsed.TotalSeconds) -ForegroundColor Cyan
+    # Cheap disk summary: no recursive scans and no per-file NTFS queries.
+    $profileRootDelta = (Get-ProfileRootFileBytes $buildDirectory) - $profileRootBytesBefore
+    Write-Host ("[JKA DISK] target\{0} top-level files: {1} (nonrecursive)" -f $buildMode, (Format-SignedBuildBytes $profileRootDelta)) -ForegroundColor Cyan
+    if ($null -ne $volumeFreeBefore -and $null -ne $volumeDisk) {
+        try {
+            $volumeUsedDelta = $volumeFreeBefore - [long]$volumeDisk.AvailableFreeSpace
+            Write-Host ("           Drive {0} net used: {1} (volume-wide, includes other activity)" -f $volumeDisk.Name, (Format-SignedBuildBytes $volumeUsedDelta)) -ForegroundColor DarkGray
+        } catch { }
+    }
+    Write-Host '           Net size changes only; not SSD write bytes. -CacheAudit for full breakdown.' -ForegroundColor DarkGray
 }

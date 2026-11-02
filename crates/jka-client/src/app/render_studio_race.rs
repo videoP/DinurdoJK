@@ -1084,13 +1084,13 @@ fn chase_reach(
 
 fn chase_view(position: glam::Vec3, target: glam::Vec3, fov: f32) -> crate::camera::Camera {
     let mut key = super::render_studio_timeline::StudioCameraKey {
-        position: super::scene::render_position(position.to_array()),
+        position: position.to_array(),
         fov,
         ..Default::default()
     };
     super::render_studio_director::look_at(
         &mut key,
-        glam::Vec3::from_array(super::scene::render_position(target.to_array())),
+        target,
     );
     let mut camera = super::render_studio_spatial::camera_from_key(key);
     camera.set_presentation_fov(fov);

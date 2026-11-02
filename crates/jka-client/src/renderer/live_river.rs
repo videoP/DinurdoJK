@@ -151,7 +151,7 @@ impl super::Renderer {
         ];
         let blue_water_ambient = self.sky_backend == 1 && self.blue_water_sky.is_some();
         let foam = water.has_foam_detail();
-        if copyable {
+        {
             let sun = self.river_scene_sun();
             let view = ViewUniform::new(
                 camera,
@@ -164,7 +164,9 @@ impl super::Renderer {
             );
             let water = self.river_surface.as_mut().expect("checked above");
             water.prepare(&self.device, &self.queue, size, self.msaa_samples, &view);
-        } else if !water.warned_unsampleable {
+        }
+        let water = self.river_surface.as_mut().expect("checked above");
+        if !copyable && !water.warned_unsampleable {
             water.warned_unsampleable = true;
             eprintln!("[RIVER] the water look needs post-processing or MSAA (the scene must be copyable); not drawn");
         }

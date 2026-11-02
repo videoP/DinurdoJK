@@ -466,7 +466,7 @@ impl App {
                 egui::Frame::new()
                     .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_unmultiplied(16, 23, 33, 238), egui::Color32::from_rgba_unmultiplied(26, 24, 20, 238)))
                     .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG()))
-                    .corner_radius(egui::CornerRadius::same(9))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(10.0)
                     .show(ui, |ui| {
                         ui.set_width(width - 20.0);

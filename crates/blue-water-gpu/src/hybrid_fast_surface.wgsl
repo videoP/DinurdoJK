@@ -85,7 +85,7 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
     let view = to_camera / distance;
     let pixel_size = distance * 2.0 * camera.tan_half_fov_y * camera.viewport.w / sqrt(max(abs(view.y), 0.05));
     let rain = rain_surface(xz, waves.wind.z, surface.weather.x, pixel_size);
-    let wake_slope = -wake.normal.xz / max(wake.normal.y, 0.05);
+    let wake_slope = -wake.normal.xz / max(wake.normal.y, 0.05) + jka_player_interaction(xz).yz;
     var up = normalize(sample.normal - vec3<f32>(wake_slope.x + rain.slope.x, 0.0,
         wake_slope.y + rain.slope.y) * abs(sample.normal.y));
     if dot(up, view) < 0.0 { up = -up; }

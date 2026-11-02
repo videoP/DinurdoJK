@@ -49,7 +49,8 @@ pub(in crate::ui) fn build_fps_simple(out: &mut Vec<UiVertex>, ui: &UiSnapshot, 
     let label = format!("{:.0} FPS", ui.perf.fps);
     let scale = 1.55;
     let glyph_w = 6.0 * scale;
-    let x = (w as f32 - 12.0 - label.chars().count() as f32 * glyph_w).max(12.0);
+    // Fixed x origin: 99 -> 100 -> 1000 FPS must not shake the label.
+    let x = (w as f32 - 12.0 - 8.0 * glyph_w).max(12.0);
     // Keep the simple FPS counter readable like the chat text, but with a
     // tight screen-space shadow instead of a resolution-scaled offset.
     text(

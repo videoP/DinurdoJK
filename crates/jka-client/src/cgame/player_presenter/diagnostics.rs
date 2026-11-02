@@ -1,6 +1,34 @@
 //! Diagnostics.
 use crate::cgame::player_presenter::Instant;
 
+#[cfg(test)]
+impl super::PlayerPresenter {
+    pub(crate) fn swing_probe_animation(&self, entity: u16, time: i32) -> serde_json::Value {
+        let Some(runtime) = self.entities.get(&entity) else { return serde_json::Value::Null };
+        let gla = &runtime.model.animation_gla;
+        let mut animator = runtime.animation.animator.clone();
+        let bones: Vec<_> = ["model_root", "lower_lumbar", "Motion"].into_iter().map(|name| {
+            let index = jka_assets::ghoul2::Ghoul2Animator::bone_index(gla, name).unwrap();
+            let state = animator.bone_anim(index).copied().unwrap();
+            serde_json::json!({"name": name, "frame": animator.bone_frame(gla, index, time).unwrap(),
+                "start_frame": state.start_frame, "end_frame": state.end_frame,
+                "start_time": state.start_time, "speed": state.anim_speed, "flags": state.flags,
+                "blend_start": state.blend_start, "blend_time": state.blend_time,
+                "blend_frame": state.blend_frame, "blend_lerp_frame": state.blend_lerp_frame})
+        }).collect();
+        // Evaluate a clone without procedural bone angles. This isolates the
+        // authored GLA + transition blend from BG_G2PlayerAngles and smoothing.
+        animator.clear_bone_angle_overrides();
+        let raw_pose = animator.evaluate_pose_openjk_root(gla, time).unwrap();
+        let raw_joints: serde_json::Map<String, serde_json::Value> =
+            ["rhand", "lhand", "lower_lumbar", "thoracic", "Motion"].into_iter().filter_map(|name| {
+                let index = jka_assets::ghoul2::Ghoul2Animator::bone_index(gla, name)?;
+                Some((name.into(), serde_json::json!(raw_pose[index])))
+            }).collect();
+        serde_json::json!({"model": runtime.model_key, "bones": bones, "raw_joints": raw_joints})
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ghoul2PerfStats {
     pub pose_ms: f64,

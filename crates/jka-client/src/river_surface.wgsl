@@ -21,6 +21,7 @@ struct ShadowSettings {
 };
 struct RiverBody {
     origin: vec4<f32>, // native actor origin (XY centre, minimum Z), cm
+    grid: vec4<f32>,   // world extent XY in cm, mesh cell count XY
 };
 // Per frame, in river axes (JKA/Unreal Z-up) and Unreal centimetres.
 struct RiverView {
@@ -62,7 +63,7 @@ struct RiverView {
 @group(4) @binding(1) var env_sampler: sampler;
 @group(4) @binding(2) var<uniform> env: SkyEnvironment;
 
-struct RiverAuthored {water:RiverSlwParameters,foam:RiverFoamSettings,detail:vec4<f32>}
+struct RiverAuthored {water:RiverSlwParameters,foam:RiverFoamSettings,detail:vec4<f32>,underwater:vec4<f32>,underwater_depth:vec4<f32>}
 @group(1) @binding(9) var<uniform> authored: RiverAuthored;
 @group(3) @binding(11) var reflection_hzb: texture_2d<f32>;
 
@@ -235,6 +236,7 @@ struct RiverOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) world: vec3<f32>, // river axes, cm
+    @location(2) @interpolate(flat) eye_water: vec4<f32>, // surface, bed, wet flag
 };
 
 // Live-grid WPO: SimGridRT height plus the advected FFT wave height on the
@@ -250,6 +252,7 @@ struct RiverOut {
     out.clip = camera.view_proj * vec4<f32>(map.x, map.z, -map.y, 1.0);
     out.uv = uv;
     out.world = world;
+    out.eye_water = river_eye_water();
     return out;
 }
 
@@ -300,6 +303,12 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
         foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask);
     if masks.material_mask < 0.3333 {
         discard;
+    }
+
+    // Hybrid-style underside replaces the above-water-only SLW volume path.
+    // The completed scene receives absorption once, in the submerged pass.
+    if input.eye_water.z > 0.5 {
+        return river_hybrid_underside(input, graph_normal, foam);
     }
 
     // Two-sided: WorldNormal flips on the back face.

@@ -358,7 +358,7 @@ impl App {
                                                 if keyboard_selected || hovered {
                                                     ui.painter().rect_filled(
                                                         rect,
-                                                        egui::CornerRadius::same(2),
+                                                        egui::CornerRadius::ZERO,
                                                         if keyboard_selected {
                                                             theme::CONTROL_SELECTED()
                                                         } else {
@@ -533,7 +533,7 @@ impl App {
                                         if selected {
                                             painter.rect_filled(
                                                 rect,
-                                                egui::CornerRadius::same(2),
+                                                egui::CornerRadius::ZERO,
                                                 theme::CONTROL_SELECTED(),
                                             );
                                             painter.rect_filled(
@@ -547,7 +547,7 @@ impl App {
                                         } else if response.hovered() {
                                             painter.rect_filled(
                                                 rect,
-                                                egui::CornerRadius::same(2),
+                                                egui::CornerRadius::ZERO,
                                                 theme::CONTROL(),
                                             );
                                         }

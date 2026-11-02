@@ -51,7 +51,7 @@ fn show_remap_thumbnail(
     }
 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL());
+    ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, theme::PANEL_FILL());
     if state.thumbnails_missing.contains(shader_name) {
         ui.painter().text(
             rect.center(), egui::Align2::CENTER_CENTER, "NO IMAGE",
@@ -347,7 +347,7 @@ impl App {
                                     } else {
                                         let (rect, _) = ui.allocate_exact_size(
                                             egui::vec2(112.0, 112.0), egui::Sense::hover());
-                                        ui.painter().rect_filled(rect, 3.0, theme::PANEL_FILL());
+                                        ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, theme::PANEL_FILL());
                                         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                                             "SELECT SHADER", egui::FontId::proportional(10.0),
                                             theme::TEXT_FAINT());

@@ -113,8 +113,7 @@ impl StudioDemoSource {
         ))
     }
 
-    /// Offsets use renderer coordinates (X forward, Y up, Z right for a player
-    /// facing yaw=0). Optional actor-local mode rotates X/Z with the player;
+    /// Offsets use native JKA coordinates (Z up). Optional actor-local mode rotates X/Y with the player;
     /// it is not claimed to be bone-local, since Ghoul2 bolt local axes are
     /// not required for the two independent anchor points.
     fn anchor_point(&self,sample:super::DemoCameraSample,client:i32,
@@ -132,9 +131,9 @@ impl StudioDemoSource {
         let delta=glam::Vec3::from_array(offset);
         let delta=if local {
             let (sn,cs)=actor.angles[1].to_radians().sin_cos();
-            glam::Vec3::new(cs*delta.x+sn*delta.z,delta.y,-sn*delta.x+cs*delta.z)
+            glam::Vec3::new(cs*delta.x-sn*delta.y,sn*delta.x+cs*delta.y,delta.z)
         }else{delta};
-        Some(base+delta)
+        Some(base+glam::Vec3::from_array(scene::render_position(delta.to_array())))
     }
 
     fn aim_camera(camera:&mut crate::camera::Camera,target:glam::Vec3) {
@@ -168,8 +167,8 @@ impl StudioDemoSource {
         camera.pitch=-sample.view_angles[0].to_radians();
         match key.source {
             StudioCameraSource::Demo{pov:StudioDemoPov::Free,client}=>{
-                camera.position=glam::Vec3::from_array(key.position);
-                camera.yaw=key.yaw.to_radians();camera.pitch=key.pitch.to_radians();
+                camera.position=glam::Vec3::from_array(scene::render_position(key.position));
+                camera.yaw=key.yaw.to_radians();camera.pitch=-key.pitch.to_radians();
                 // World-anchored Director shots (pan, fly-by, crane) stay put
                 // and turn to keep the subject in frame.
                 let rig=key.demo_follow;
@@ -281,7 +280,10 @@ impl StudioDemoSource {
             }
             _=>{}
         }
-        self.visible_from_recorded(sample,camera.position.to_array()).then_some(camera)
+        if matches!(key.source, StudioCameraSource::Demo { pov: StudioDemoPov::Free, .. })
+            || self.visible_from_recorded(sample,camera.position.to_array()) {
+            Some(camera)
+        } else { None }
     }
 
     fn visible_from_recorded(&self, sample: super::DemoCameraSample, point: [f32; 3]) -> bool {
@@ -355,7 +357,7 @@ impl StudioDemoSource {
         key: StudioCameraKey,
     ) -> crate::camera::Camera {
         if key.demo_follow.fallback == StudioFollowFallback::KeyedCamera
-            && self.visible_from_recorded(sample, key.position)
+            && self.visible_from_recorded(sample, scene::render_position(key.position))
         {
             return super::render_studio_spatial::camera_from_key(key);
         }
@@ -514,7 +516,8 @@ impl StudioDemoSource {
                 }
             }
         }
-        if self.visible_from_recorded(sample, camera.position.to_array()) {
+        if matches!(key.source, StudioCameraSource::Demo { pov: StudioDemoPov::Free, .. })
+            || self.visible_from_recorded(sample, camera.position.to_array()) {
             camera
         } else {
             self.fallback_camera(sample, if key.demo_follow.fallback==StudioFollowFallback::KeyedCamera {backup}else{key})
@@ -534,12 +537,14 @@ impl StudioDemoSource {
         composite_entity_numbers: &[u16],
         playing: bool,
         capturing: bool,
-        scene_view:bool,
+        observer: Option<StudioCameraKey>,
+        viewport: [u32; 2],
         guard_subject: bool,
         fpls: bool,
         now: Instant,
     ) -> Result<StudioSourceFrame, String> {
         let target = clip.source_time_ms(time);
+        let scene_view = observer.is_some();
         let session = &mut self.playback;
         session.player_presenter.studio_fpls = fpls;
         session.studio_external_player_entities.clear();
@@ -610,7 +615,7 @@ impl StudioDemoSource {
             crate::cgame::PresentationViewer::Client,
         ));
         session.demo_hidden_view_client = follow.filter(|_| {
-            key.demo_follow.perspective == StudioFollowPerspective::FirstPerson
+            !scene_view && key.demo_follow.perspective == StudioFollowPerspective::FirstPerson
                 && from_key.is_none()
         });
         // Only a follow rig placed outside the actor (or a free camera / move)
@@ -679,6 +684,19 @@ impl StudioDemoSource {
         session
             .entity_presenter
             .set_md3_geometry_cache(video.md3_geometry_cache);
+        // Scene navigation is the current presentation view, not a late change
+        // to the projection of geometry already built for the authored shot.
+        let presentation_key = observer.or_else(|| matches!(key.source,
+            StudioCameraSource::Demo { pov: StudioDemoPov::Free, .. })
+            .then_some(key).filter(|key| !key.demo_follow.aim_enabled));
+        session.studio_presentation_view = presentation_key.map(|key| {
+            let camera = super::render_studio_spatial::camera_from_key(key);
+            crate::cgame::player_presenter::Ghoul2PresentationView::new(
+                camera.position.to_array(), camera.forward().to_array(),
+                camera.fov_y_for_viewport(viewport[0], viewport[1]),
+                viewport[0].max(1) as f32 / viewport[1].max(1) as f32, 0.0,
+            )
+        });
         let (_, sample) = session.advance(
             now,
             third_person,
@@ -712,9 +730,28 @@ impl StudioDemoSource {
             }
         }
         self.last_presentation_server_ms = Some(sample.presentation_time_ms.round() as i32);
-        let mut view = crate::fx::draw::FxView::from_camera(&camera);
-        view.seconds = sample.presentation_time_ms as f32 / 1000.0;
         let session = &mut self.playback;
+        let mut frame = StudioSourceFrame {
+            shot_camera:camera,lens,environment:None,
+            id: self.id,
+            revision: self.revision,
+            camera,
+            time: sample.presentation_time_ms as f32 / 1000.0,
+            player_position: session.player_position,
+            area_mask: if matches!(key.source, StudioCameraSource::Demo { pov: StudioDemoPov::Free, .. }) {
+                None
+            } else { session.demo_area_mask() },
+            dynamic_models: session.dynamic_models.clone(),
+            inline_models: session.inline_models.clone(),
+            lights: if crate::fx::render_enabled() { session.fx_lights.clone() } else { Arc::new(Vec::new()) },
+            screen_fx: session.screen_fx.clone(),
+            cloud_foreground: if crate::fx::render_enabled() { session.fx_blades.clone() } else { Arc::new(Vec::new()) },
+            ocean_actors: session.ocean_actors.clone(),
+            hud: None,
+        };
+        apply_scene_observer(&mut frame, observer, false);
+        let mut view = crate::fx::draw::FxView::from_camera(&frame.camera);
+        view.seconds = sample.presentation_time_ms as f32 / 1000.0;
         let presenter = &mut session.entity_presenter;
         let fx = if !crate::fx::render_enabled() {
             Vec::new()
@@ -738,22 +775,8 @@ impl StudioDemoSource {
         let mut models = Vec::with_capacity(session.dynamic_models.len() + fx.len());
         models.extend(session.dynamic_models.iter().cloned());
         models.extend(fx);
-        Ok(StudioSourceFrame {
-            shot_camera:camera,lens,environment:None,
-            id: self.id,
-            revision: self.revision,
-            camera,
-            time: sample.presentation_time_ms as f32 / 1000.0,
-            player_position: session.player_position,
-            area_mask: session.demo_area_mask(),
-            dynamic_models: Arc::new(models),
-            inline_models: session.inline_models.clone(),
-            lights: if crate::fx::render_enabled() { session.fx_lights.clone() } else { Arc::new(Vec::new()) },
-            screen_fx: session.screen_fx.clone(),
-            cloud_foreground: if crate::fx::render_enabled() { session.fx_blades.clone() } else { Arc::new(Vec::new()) },
-            ocean_actors: session.ocean_actors.clone(),
-            hud: None,
-        })
+        frame.dynamic_models = Arc::new(models);
+        Ok(frame)
     }
 }
 
@@ -1663,6 +1686,7 @@ impl App {
             .map(|(key, _, a)| (key, a));
         let exporting=self.render_studio.export.is_some();
         let offline_capture=exporting || self.render_studio.still.is_some() || dm26;
+        let observer = if offline_capture { None } else { self.render_studio.spatial.scene_camera };
         let mut dm26_frame=None;
         let capturing=exporting && self.render_studio.preset!=StudioVideoFormat::Gif;
         let playing = (self.render_studio.timeline.playing && self.render_studio.still.is_none()) || capturing;
@@ -1769,7 +1793,8 @@ impl App {
                 &composite_entity_numbers,
                 playing,
                 capturing,
-                !offline_capture && self.render_studio.spatial.scene_camera.is_some(),
+                observer,
+                viewport,
                 self.render_studio.timeline.director_at(time).is_some_and(|shot| shot.auto) && clip.comparison.is_none(),
                 self.first_person_lightsaber,
                 now,
@@ -1785,15 +1810,12 @@ impl App {
                         source.race_audio_state=Some((focus,race_audible,time));
                     }
                     if let Some((camera,lens))=race_camera {
-                        frame.camera=camera;frame.shot_camera=camera;frame.lens=lens;
+                        frame.shot_camera=camera;
+                        if observer.is_none() { frame.camera=camera;frame.lens=lens; }
                         // Server area masks describe the held native POV, not
                         // the indexed ghost's current replay location.
                         frame.area_mask=None;
                     }
-                    // Preview observer is presentation-only. Resolve the final
-                    // camera BEFORE view-dependent Studio trail culling/tessellation;
-                    // offline captures still retain the authored camera.
-                    apply_scene_observer(&mut frame,self.render_studio.spatial.scene_camera,offline_capture);
                     if dm26 {
                         let recorded=source.playback.demo_followed_client().unwrap_or(-1);
                         dm26_frame=Some(super::render_studio_dm26::Dm26Frame {
@@ -1928,7 +1950,7 @@ impl App {
                                             }
                                         }
                                     }
-                                    trail_draws.extend(crate::cgame::weapon_fx::profile_saber_blade_draws_for_request(&request,self.video.modern_sabers,&mut rng));
+                                    trail_draws.extend(crate::cgame::weapon_fx::profile_saber_blade_draws_for_request(&request,self.video.modern_sabers,self.video.saber_core_mode,actor_time,&mut rng));
                                 }
                                 if overlay.strafe_trail {
                                     if let Some(view) = trail_view {
@@ -2306,6 +2328,8 @@ pub(in crate::app) fn resolve_recorded_subject(mut key: StudioCameraKey, recorde
 fn apply_scene_observer(frame:&mut StudioSourceFrame,observer:Option<StudioCameraKey>,offline_capture:bool) {
     if !offline_capture {if let Some(observer)=observer {
         frame.camera=super::render_studio_spatial::camera_from_key(observer);frame.lens.aperture=None;
+        // The demo's area mask belongs to its recorded POV, not this observer.
+        frame.area_mask=None;
     }}
 }
 #[cfg(test)]
@@ -2329,7 +2353,7 @@ mod scene_observer_tests {
             lights:Arc::new(vec![]),screen_fx:Arc::new(vec![]),cloud_foreground:Arc::new(vec![]),ocean_actors:Arc::new(vec![]),hud:None};
         let observer=StudioCameraKey{position:[200.0,80.0,100.0],..Default::default()};
         let mut preview=original.clone();apply_scene_observer(&mut preview,Some(observer),false);
-        assert_eq!(preview.camera.position.to_array(),observer.position);assert!(preview.lens.aperture.is_none());
+        assert_eq!(preview.camera.position.to_array(),scene::render_position(observer.position));assert!(preview.lens.aperture.is_none());
         assert_eq!(preview.shot_camera.position,shot.position);
         let mut export=original.clone();apply_scene_observer(&mut export,Some(observer),true);
         assert_eq!(export.camera.position,shot.position);assert_eq!(export.lens,original.lens);

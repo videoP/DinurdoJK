@@ -381,6 +381,9 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
         FxBlend::DstColorAdd => Some(DynamicModelAlphaMode::DstColorAdd),
         FxBlend::Modulate2x => Some(DynamicModelAlphaMode::Modulate2x),
         FxBlend::Darken => Some(DynamicModelAlphaMode::Darken),
+        // Model-stage path does not yet have an exact screen pipeline; do not
+        // misrepresent the authored operation as regular alpha blending.
+        FxBlend::Screen => None,
         FxBlend::Alpha => {
             let blend = stage
                 .blend

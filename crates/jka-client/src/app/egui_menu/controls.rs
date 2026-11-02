@@ -31,7 +31,7 @@ impl App {
         theme::page_title(
             ui,
             "CONTROLS",
-            "Base JKA, spectator, active-mod and mouse bindings. Spectator binds override normal keys only while spectating.",
+            "Normal, Spectate, Demo and active-mod bindings. Demo overrides never change gameplay keys.",
         );
 
         if self.controls_waiting_for_key {
@@ -48,6 +48,7 @@ impl App {
         if !keybinds::SPECTATOR_CONTROL_ACTIONS.is_empty() {
             groups.push("Spectate");
         }
+        groups.push("Demo");
         if self.ui_mod() == Some(crate::net::mod_support::ServerMod::Japro)
             && !keybinds::JAPRO_CONTROL_ACTIONS.is_empty()
         {
@@ -57,7 +58,7 @@ impl App {
         self.controls_section = self.controls_section.min(mouse_tab);
         let mut picked_tab = None;
         egui::Frame::new().fill(theme::SURFACE_ALT()).show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (index, label) in groups.iter().copied().chain(["Mouse"]).enumerate() {
                     let label = label.to_uppercase();
@@ -100,12 +101,15 @@ impl App {
                 }
                 let group = groups[section];
                 let spectator_group = group == "Spectate";
+                let demo_group = group == "Demo";
                 let japro_group = group == "JAPRO";
                 theme::section(
                     ui,
                     &group.to_uppercase(),
                     if spectator_group {
-                        "Overrides used only while spectating. Unassigned keys inherit the normal binding."
+                        "Spectating-only overrides. Inherit shows the underlying normal command and live key. Right-click to restore inheritance."
+                    } else if demo_group {
+                        "Demo playback only. Inherit uses the displayed gameplay/spectator bind. Walk tap pauses; Walk hold exposes the demo cursor. Right-click to inherit."
                     } else if japro_group {
                         "Bindings exposed by the active jaPRO integration."
                     } else {
@@ -117,7 +121,7 @@ impl App {
                     for (index, action) in keybinds::SPECTATOR_CONTROL_ACTIONS.iter().enumerate() {
                         let selection = keybinds::spectator_selection(index);
                         let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
-                        let binding = self.bindings.display_for_spectator_command(action.command);
+                        let binding = self.bindings.display_for_spectator_inheritance(action.command);
                         let tip = format!(
                             "Spectator override for the \"{}\" command. Right-click to inherit the normal bind again.",
                             action.command
@@ -125,8 +129,8 @@ impl App {
                         theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
                             let (text, color) = if waiting {
                                 ("PRESS A KEY…".to_owned(), theme::WARNING())
-                            } else if binding == "INHERIT NORMAL" {
-                                ("Inherit normal".to_owned(), theme::TEXT_DISABLED())
+                            } else if binding.starts_with("Inherit ") {
+                                (binding.clone(), theme::TEXT_DISABLED())
                             } else {
                                 (binding.clone(), theme::ACCENT())
                             };
@@ -137,6 +141,29 @@ impl App {
                             if response.secondary_clicked() {
                                 clear = Some(selection);
                             }
+                        });
+                    }
+                } else if demo_group {
+                    for (index, action) in keybinds::DEMO_CONTROL_ACTIONS.iter().enumerate() {
+                        let selection = keybinds::demo_selection(index);
+                        let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
+                        let binding = self.bindings.display_for_demo_command(action.command);
+                        let inherit = keybinds::demo_inherit_command(action.command);
+                        let tip = format!(
+                            "Demo action {}. Inherits {} unless overridden. Right-click to restore inheritance.",
+                            action.command, inherit
+                        );
+                        theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
+                            let (text, color) = if waiting {
+                                ("PRESS A KEY…".to_owned(), theme::WARNING())
+                            } else if binding.starts_with("Inherit ") {
+                                (binding.clone(), theme::TEXT_DISABLED())
+                            } else {
+                                (binding.clone(), theme::ACCENT())
+                            };
+                            let response = binding_slot(ui, &text, color, waiting);
+                            if response.clicked() { rebind = Some(selection); }
+                            if response.secondary_clicked() { clear = Some(selection); }
                         });
                     }
                 } else if japro_group {
@@ -193,7 +220,7 @@ impl App {
                 theme::row(
                     ui,
                     "Default bindings",
-                    "Replaces normal bindings with the stock jaPRO/JKA multiplayer layout and restores DinurdoJK spectator defaults.",
+                    "Restores normal JKA, spectator camera and inherited demo controls. Clears all demo overrides.",
                     theme::Reset::None,
                     |ui| {
                         let armed_id = ui.id().with("restore_default_binds");

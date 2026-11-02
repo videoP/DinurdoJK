@@ -729,10 +729,10 @@ impl App {
             if block.width() <= 0.0 { continue; }
             let selected = selection.contains(&shot.id);
             let color = if shot.enabled { sui::CAMERA() } else { theme::TEXT_DISABLED() };
-            painter.rect_filled(block, 3.0, sui::clip_body(color, selected).gamma_multiply(if shot.enabled { 1.0 } else { 0.6 }));
+            painter.rect_filled(block,egui::CornerRadius::ZERO, sui::clip_body(color, selected).gamma_multiply(if shot.enabled { 1.0 } else { 0.6 }));
             painter.rect_filled(egui::Rect::from_min_max(block.left_top(), egui::pos2(block.right(), block.top() + 3.0)),
-                egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, color);
-            painter.rect_stroke(block, 3.0, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
+                egui::CornerRadius::ZERO, color);
+            painter.rect_stroke(block,egui::CornerRadius::ZERO, egui::Stroke::new(if selected { 1.5 } else { 1.0 },
                 if selected { egui::Color32::WHITE } else { color.gamma_multiply(0.5) }), egui::StrokeKind::Inside);
             if active == Some(shot.id) {
                 painter.circle_filled(egui::pos2(block.right() - 8.0, block.center().y + 1.0), 3.0, theme::ACCENT());
@@ -964,13 +964,13 @@ impl App {
                 Some("World shots stand in the map. Positions are placed from the recorded player's path with a clear line of sight; Re-place picks another spot."),
                 true, |ui| {
                 if let Some(position) = &mut edited.position_override {
-                    sui::prop_vec3(ui, "Position", position, 1.0, ["X", "Y", "Z"], true);
+                    sui::prop_vec3(ui, "Position", position,1.0,["X","Y","Z"],true);
                     let mut moving = edited.position_end.is_some();
                     if sui::prop_toggle(ui, "Move during shot", &mut moving).changed() {
                         edited.position_end = moving.then_some(*position);
                     }
                     if let Some(end) = &mut edited.position_end {
-                        sui::prop_vec3(ui, "End position", end, 1.0, ["X", "Y", "Z"], true);
+                        sui::prop_vec3(ui, "End position", end,1.0,["X","Y","Z"],true);
                         sui::prop_toggle(ui, "Ease in/out", &mut edited.ease);
                     }
                     let rig = &mut edited.rig;
@@ -1024,7 +1024,7 @@ impl App {
                         sui::prop_slider(ui, "Pitch", egui::Slider::new(&mut rig.pitch_offset, -89.0..=89.0).suffix("°"));
                     }
                 }
-                sui::prop_vec3(ui, "Offset", &mut rig.position_offset, 0.5, ["X", "Y", "Z"], true);
+                sui::prop_vec3(ui, "Offset", &mut rig.position_offset,0.5,["X","Y","Z"],true);
                 sui::prop_toggle(ui, "Facing-relative", &mut rig.position_local);
             });
             if perspective != StudioFollowPerspective::FirstPerson {
@@ -1062,7 +1062,7 @@ impl App {
                     Self::studio_client_rows(ui, "studio_director_aim_client", &players, &mut rig.aim_client, FOLLOWED_PLAYER);
                     let anchors: Vec<(StudioDemoAnchor, &str)> = StudioDemoAnchor::ALL.iter().map(|a| (*a, a.label())).collect();
                     sui::prop_combo(ui, "Look at", ("studio_director_aim_anchor", shot.id), &mut rig.aim_anchor, &anchors);
-                    sui::prop_vec3(ui, "Aim offset", &mut rig.aim_offset, 0.5, ["X", "Y", "Z"], true);
+                    sui::prop_vec3(ui, "Aim offset", &mut rig.aim_offset,0.5,["X","Y","Z"],true);
                 }
             });
         }

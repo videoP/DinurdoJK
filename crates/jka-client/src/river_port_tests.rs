@@ -23,6 +23,8 @@ mod sampling;
 mod surface_tests;
 #[path = "river_water_info_tests.rs"]
 mod water_info_tests;
+#[path = "river_underwater_tests.rs"]
+mod underwater_tests;
 #[path = "river_wave_tests.rs"]
 mod wave_tests;
 
@@ -368,7 +370,8 @@ fn check_backend(backend: wgpu::Backends) {
         std::eprintln!("river stage check: {:?}", adapter.get_info());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::FLOAT32_BLENDABLE,
+                required_features: wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::FLOAT32_BLENDABLE
+                    | (adapter.features() & wgpu::Features::POLYGON_MODE_LINE),
                 // Offscreen normal diagnostics retain three full-precision
                 // outputs so typed stores cannot hide sampling differences.
                 required_limits: wgpu::Limits {
@@ -1294,6 +1297,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
         resolution: 64,
         // 240 frames of 1/60 s at 10x: 40 s of water, 10 solver frames each.
         rate: 10.0,
+        mode: crate::river_runtime::SourceMode::WaterLevel,
         discharge_cfs:None,
     };
     let spawn = |source| LiveRiver::spawn(device, queue, &collision, source, |_| None, None);
@@ -1320,6 +1324,35 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     assert!(supplied_state.iter().any(|s|s[1]>0.01),"CFS source must feed the actual native solve");
     assert!(supplied_state.iter().flatten().all(|v|v.is_finite()));
     drop(supplied);
+    // The standalone volumetric CFS adapter must be independent of the
+    // held-height source box, including when it feeds above inlet Z.
+    let mut discharge = spawn(LocalSource {
+        mode: crate::river_runtime::SourceMode::Discharge,
+        discharge_cfs: Some(75.0),
+        ..source
+    }).unwrap();
+    for i in 0..12 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        discharge.encode_frame(device, &mut encoder, 1.0/60.0, f64::from(i)/60.0, None).unwrap();
+        queue.submit(Some(encoder.finish()));
+    }
+    let discharge_state = read_state(device, queue, discharge.state());
+    assert!(discharge_state.iter().any(|s| s[1] > 0.01), "standalone CFS must inject water");
+    assert!(discharge_state.iter().flatten().all(|v| v.is_finite()));
+    let seconds = discharge.simulated_seconds;
+    for (mode, cfs, speed) in [
+        (crate::river_runtime::SourceMode::WaterLevel, Some(32.0), 1.0),
+        (crate::river_runtime::SourceMode::Discharge, Some(15.0), 4.0),
+        (crate::river_runtime::SourceMode::Discharge, Some(120.0), 2.0),
+        (crate::river_runtime::SourceMode::WaterLevel, None, 1.0),
+    ] {
+        discharge.set_live_controls(device, queue, crate::river_authoring::LiveControls { mode, discharge_cfs: cfs, speed }).unwrap();
+        assert_eq!(read_state(device, queue, discharge.state()), discharge_state, "live source edits must preserve water and velocity exactly");
+        assert_eq!(discharge.simulated_seconds, seconds, "editing controls must not reset hydraulic time");
+        assert_eq!(discharge.source.rate, speed);
+        assert_eq!(discharge.source.discharge_cfs, cfs);
+    }
+    drop(discharge);
 
     assert!(river.surface().is_none());
     // The Single Layer Water body against the renderer's real camera layout,
@@ -1545,6 +1578,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     std::eprintln!("live river water body: {water_pixels} water pixels, {dry_pixels} untouched");
     assert!(water_pixels > 0 && dry_pixels > 0, "the patch must draw and the view beyond it stay untouched");
     assert!(pixels.iter().all(|p| p[3] == 1.0), "Single Layer Water output is opaque");
+    underwater_tests::check(device, queue, &mut water, &river, &camera_layout, &shadow_layout);
 }
 
 fn river_state(river: &crate::river_runtime::LiveRiver) -> &wgpu::Texture {

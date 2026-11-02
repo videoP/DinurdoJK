@@ -79,6 +79,11 @@ fn q3_project(delta: f32, fov: f32) -> f32 {
     320.0 + 320.0 * angle.to_radians().tan() / (fov * 0.5).to_radians().tan()
 }
 
+/// Shared with the HUD consumer so provider switching retains a stable,
+/// left-aligned speedometer origin (independent of the current digit count).
+pub(crate) const Q3DF_SPEED_LEFT_X: f32 = 266.0;
+pub(crate) const Q3DF_SPEED_TOP_Y: f32 = 200.0;
+
 fn q3df(settings: &StrafeHelperSettings, hud: &MovementHudState) -> ExtendedHud {
     let mut out = ExtendedHud::default();
     let flags = settings.flags;
@@ -90,12 +95,13 @@ fn q3df(settings: &StrafeHelperSettings, hud: &MovementHudState) -> ExtendedHud 
     // the translucent compass palette and 0.8 alpha accel bar match the C.
     let opacity = 1.0_f32;
 
-    // CGaz_StrafeHud.c integer/fraction styling, centered for the component HUD.
+    // Q3DF's original centered integer+fraction group shifts its origin when
+    // the integer grows. Keep the start fixed, while the decimal part follows
+    // the integer so digits never overlap.
     if flags & SHELPER_Q3DF_SPEED != 0 {
         let integer = format!("{:.0}", speed.floor());
-        let integer_x = 320.0 - (integer.len() as f32*16.0 + 60.0)*0.5;
-        out.label(integer_x, 200.0, 16.0, 24.0, [1.0,1.0,1.0,1.0], integer.clone());
-        out.label(integer_x + integer.len() as f32*16.0, 204.0, 12.0, 18.0, [1.0,1.0,1.0,1.0],
+        out.label(Q3DF_SPEED_LEFT_X, Q3DF_SPEED_TOP_Y, 16.0, 24.0, [1.0,1.0,1.0,1.0], integer.clone());
+        out.label(Q3DF_SPEED_LEFT_X + integer.len() as f32 * 16.0, Q3DF_SPEED_TOP_Y + 4.0, 12.0, 18.0, [1.0,1.0,1.0,1.0],
             format!(".{:01}^3u/s", (speed.fract()*10.0).floor() as u8));
     }
     if flags & SHELPER_Q3DF_ACCEL != 0 {

@@ -236,8 +236,14 @@ pub(crate) fn board_layout(board: &UiScoreboard, w: u32, h: u32) -> BoardLayout 
 
     let ([left, right], spectators, teams) = split(board);
     let players = left.len() + right.len();
-    let spectator_rows = if spectators.is_empty() || stats_open { 0 } else { spectators.len().div_ceil(6) };
-    let spectator_h = if spectator_rows == 0 { 0.0 } else { 14.0 * s + spectator_rows as f32 * 30.0 * s };
+    // Make room for a ping readout and the optional WATCHING YOU hint. The
+    // narrower FFA board uses fewer columns than the wide team board.
+    let spectator_label_w = 110.0 * s;
+    let spectator_available = (width - 2.0 * pad - spectator_label_w).max(1.0);
+    let spectator_cols = ((spectator_available / (170.0 * s)).floor() as usize).clamp(1, 6);
+    let spectator_step = 44.0 * s;
+    let spectator_rows = if spectators.is_empty() || stats_open { 0 } else { spectators.len().div_ceil(spectator_cols) };
+    let spectator_h = if spectator_rows == 0 { 0.0 } else { 14.0 * s + spectator_rows as f32 * spectator_step };
     let available = (sh - y - 18.0 * s - header_h - footer_h - spectator_h).max(half_header_h + row_h);
     let visible = (((available - half_header_h) / row_h).floor() as usize).max(1);
     let longest = left.len().max(right.len());
@@ -337,17 +343,18 @@ pub(crate) fn board_layout(board: &UiScoreboard, w: u32, h: u32) -> BoardLayout 
         (track, [track[0], thumb_y, track[2], thumb_h])
     });
 
-    // Spectators: name chips flowing across the strip, six to a line.
+    // Spectators: two-line chips, responsive column count shared with the
+    // band-height calculation above (also used for pointer hit testing).
     let band = spectator_band.map(|node| flex.bounds(node));
     let spectator_chips = band
         .map(|band| {
-            let chip_w = (band[2] - 2.0 * pad - 110.0 * s) / 6.0;
+            let chip_w = spectator_available / spectator_cols as f32;
             spectators
                 .iter()
                 .enumerate()
                 .map(|(i, &entry)| {
-                    let (col, line) = ((i % 6) as f32, (i / 6) as f32);
-                    ([band[0] + pad + 110.0 * s + col * chip_w, band[1] + 8.0 * s + line * 30.0 * s, chip_w - 6.0 * s, 26.0 * s], entry)
+                    let (col, line) = ((i % spectator_cols) as f32, (i / spectator_cols) as f32);
+                    ([band[0] + pad + spectator_label_w + col * chip_w, band[1] + 8.0 * s + line * spectator_step, chip_w - 6.0 * s, 40.0 * s], entry)
                 })
                 .collect()
         })
@@ -449,6 +456,19 @@ fn team_tone(team: i32) -> [f32; 4] {
     }
 }
 
+/// Keep spectator and player ping colours / disconnected labels identical.
+fn ping_readout(ping: i32) -> (String, [f32; 4]) {
+    if ping < 0 {
+        ("CNCT".to_owned(), pal::TEXT_FAINT())
+    } else if ping <= 60 {
+        (ping.to_string(), pal::ACCENT())
+    } else if ping <= 120 {
+        (ping.to_string(), pal::GOLD())
+    } else {
+        (ping.to_string(), pal::ROSE_LIGHT())
+    }
+}
+
 pub(in crate::ui) fn build_scoreboard(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
@@ -533,11 +553,35 @@ pub(in crate::ui) fn build_scoreboard(
                 let lit = hovered == Some(ScoreboardHit::Row(entry.client)) || menu_client == Some(entry.client);
                 rect(out, chip[0], chip[1], chip[2], chip[3], pal::fade(if lit { pal::ACCENT() } else { pal::TEXT() }, if lit { 0.18 } else { 0.05 }), w, h);
                 let size = px(size::SMALL);
-                let name = truncate_jka_text(&entry.name, 18);
-                txt.draw(out, &name, chip[0] + 8.0 * s, txt.baseline_in(chip, size), size, pal::fade(pal::TEXT(), 0.8));
+                let left = chip[0] + 8.0 * s;
+                let right = chip[0] + chip[2] - 8.0 * s;
+                let name_line = [chip[0], chip[1] + 2.0 * s, chip[2], 19.0 * s];
+                let status_line = [chip[0], chip[1] + 21.0 * s, chip[2], 17.0 * s];
+
+                // The scores reply already supplies each spectator's ping.
+                // Reserve its width before truncating names, so a long colored
+                // name cannot obscure the readout on narrow scoreboards.
+                let (ping, ping_color) = ping_readout(entry.ping);
+                let ping_text = if entry.ping < 0 { ping } else { format!("PING {ping}") };
+                txt.draw_right(out, &ping_text, right, txt.baseline_in(name_line, size), size, ping_color);
+                let room = (right - left - txt.width(&ping_text, size) - 8.0 * s).max(0.0);
+                let mut chars = 24usize;
+                let mut name = truncate_jka_text(&entry.name, chars);
+                while chars > 0 && txt.width(&name, size) > room {
+                    chars -= 1;
+                    name = truncate_jka_text(&entry.name, chars);
+                }
+                txt.draw(out, &name, left, txt.baseline_in(name_line, size), size, pal::fade(pal::TEXT(), 0.8));
+
+                // Preserve the existing three-distinct-ping-samples heuristic:
+                // it is computed on receipt of scores, never inferred here.
+                if entry.spectating_you {
+                    let status_size = px(size::CAPTION);
+                    txt.draw(out, "WATCHING YOU", left, txt.baseline_in(status_line, status_size), status_size, pal::ACCENT());
+                }
                 if entry.muted {
                     let icon = 12.0 * s;
-                    glyphs::muted(out, [chip[0] + chip[2] - icon * 1.3, chip[1] + (chip[3] - icon) * 0.5, icon * 1.15, icon], 1.0, w, h);
+                    glyphs::muted(out, [right - icon * 1.15, status_line[1] + (status_line[3] - icon) * 0.5, icon * 1.15, icon], 1.0, w, h);
                 }
             }
         }
@@ -796,15 +840,7 @@ fn draw_row(
                 }
             }
             Slot::Ping => {
-                let (value, color) = if entry.ping < 0 {
-                    ("CNCT".to_owned(), pal::TEXT_FAINT())
-                } else if entry.ping <= 60 {
-                    (entry.ping.to_string(), pal::ACCENT())
-                } else if entry.ping <= 120 {
-                    (entry.ping.to_string(), pal::GOLD())
-                } else {
-                    (entry.ping.to_string(), pal::ROSE_LIGHT())
-                };
+                let (value, color) = ping_readout(entry.ping);
                 txt.draw_centered(out, &value, center(x, width), size::SMALL * s * 1.1, color);
             }
             Slot::HeadToHead => {
@@ -1112,6 +1148,28 @@ mod tests {
         assert_eq!(hit_test(&board, 1920, 1080, center(layout.halves[1].rows[0].0)), Some(ScoreboardHit::Row(11)));
         assert_eq!(hit_test(&board, 1920, 1080, center(layout.spectators[0].0)), Some(ScoreboardHit::Row(12)));
         assert_eq!(hit_test(&board, 1920, 1080, [2.0, 2.0]), None);
+    }
+
+    #[test]
+    fn spectator_chips_have_space_for_ping_and_watching_you_status() {
+        let mut ffa = board((0..12).map(|i| entry(i, 3, 0)).collect(), false);
+        ffa.entries[0].ping = 75;
+        ffa.entries[0].spectating_you = true;
+        let layout = board_layout(&ffa, 1920, 1080);
+        assert_eq!(layout.spectators.len(), 12);
+        // Compact FFA fits four two-line chips per row, not six tiny names.
+        assert_eq!(layout.spectators[0].0[1], layout.spectators[3].0[1]);
+        assert!(layout.spectators[4].0[1] > layout.spectators[0].0[1]);
+        assert!(layout.spectators[0].0[3] >= 40.0);
+        let box0 = layout.spectators[0].0;
+        assert_eq!(hit_test(&ffa, 1920, 1080, [box0[0] + 10.0, box0[1] + box0[3] - 5.0]), Some(ScoreboardHit::Row(0)));
+        assert_eq!(ping_readout(75).0, "75");
+        assert_eq!(ping_readout(-1).0, "CNCT");
+
+        let team = board((0..12).map(|i| entry(i, 3, 0)).collect(), true);
+        let wide = board_layout(&team, 1920, 1080);
+        assert_eq!(wide.spectators[0].0[1], wide.spectators[5].0[1]);
+        assert!(wide.spectators[6].0[1] > wide.spectators[0].0[1]);
     }
 
     #[test]

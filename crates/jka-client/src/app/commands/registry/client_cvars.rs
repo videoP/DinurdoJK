@@ -2,6 +2,40 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_CG_ANIMBLEND {
+        runtime: CvarDef::new(
+            "cg_animBlend", "1", "0|1",
+            "Blend player animation transitions as in TaystJK. Session-only; rewind the demo after changing. Disabling also bypasses the saber spine transition blend.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(u8::from(crate::cgame::player_presenter::animation_blend_enabled()).to_string()),
+            |_app, value| {
+                let enabled = value.to_string().trim().parse::<u8>()
+                    .map_err(|_| "cg_animBlend expects 0 or 1".to_owned())?;
+                if enabled > 1 { return Err("cg_animBlend expects 0 or 1".to_owned()); }
+                crate::cgame::player_presenter::set_animation_blend(enabled != 0);
+                Ok(())
+            },
+        ),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_CG_SABERSWINGFIX {
+        runtime: CvarDef::new(
+            "cg_saberSwingFix", "2", "0|1|2",
+            "Saber animation A/B test: 0 baseline, 1 skip animation blend at split/full-body boundaries, 2 preserve procedural spine angles through that blend. Session-only; rewind the demo before comparing.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(crate::cgame::player_presenter::saber_swing_fix().to_string()),
+            |_app, value| {
+                let mode = value.to_string().trim().parse::<u8>()
+                    .map_err(|_| "cg_saberSwingFix expects 0, 1, or 2".to_owned())?;
+                if mode > 2 { return Err("cg_saberSwingFix expects 0, 1, or 2".to_owned()); }
+                crate::cgame::player_presenter::set_saber_swing_fix(mode);
+                Ok(())
+            },
+        ),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_CG_BOBUP {
         runtime: CvarDef::new(
             "cg_bobUp", "0", "number", "TaystJK vertical walking/running view bob.",
@@ -1243,6 +1277,12 @@ app_cvars! {
                                     .to_owned(),
                             );
                         }
+                        // Demo Freecam owns its camera; changing spectator camera
+                        // style must be a true no-op (including reset/capture).
+                        if self.demo_playback_active()
+                            && self.demo_view_mode == crate::app::DemoViewMode::Free {
+                            return Ok(());
+                        }
                         // One camera-mode cvar. Mode 2 is still ordinary third person
                         // for an active player; only spectator/demo follow interprets
                         // it as free orbit.
@@ -2022,6 +2062,67 @@ app_cvars! {
         ]
     }
 
+    APP_CON_HL2 {
+        runtime: CvarDef::new(
+            "con_hl2", "0", "0|1",
+            "Use a draggable, resizable Source/HL2-style console window. 0 keeps the original console unchanged.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.console_hl2),
+            |app, value| {
+                app.console_hl2 = matches!(value, CvarValue::Bool(true));
+                app.mark_config_dirty();
+                app.egui_repaint_requested = true;
+                app.publish_ui();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                settings.console_hl2 = matches!(value.trim(), "1" | "true");
+            }),
+            archive: Some((29050, |state| if state.presentation.console_hl2 { "1" } else { "0" }.to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CON_HL2_RECT {
+        runtime: CvarDef::new(
+            "con_hl2Rect", "160 100 840 530", "x y width height",
+            "Saved position and size of the HL2-style console window (egui points).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.console_hl2_rect.iter().map(|n| format!("{n:.1}")).collect::<Vec<_>>().join(" ")),
+            |app, value| App::cvar_set_con_hl2_rect(app, "con_hl2Rect", &value.to_string()),
+        ).with_text_setter(App::cvar_set_con_hl2_rect, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(rect) = App::parse_con_hl2_rect(value) {
+                    settings.console_hl2_rect = rect;
+                }
+            }),
+            archive: Some((29051, |state| state.presentation.console_hl2_rect.iter().map(|n| format!("{n:.1}")).collect::<Vec<_>>().join(" "))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn parse_con_hl2_rect(value: &str) -> Option<[f32; 4]> {
+                    let coords: Vec<f32> = value.split_whitespace().map(str::parse::<f32>)
+                        .collect::<Result<_, _>>().ok()?;
+                    if coords.len() != 4 || coords.iter().any(|n| !n.is_finite())
+                        || coords[2] < 360.0 || coords[3] < 220.0
+                        || coords[2] > 8192.0 || coords[3] > 8192.0 { return None; }
+                    Some([coords[0], coords[1], coords[2], coords[3]])
+                }
+                fn cvar_set_con_hl2_rect(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.console_hl2_rect = Self::parse_con_hl2_rect(value)
+                        .ok_or_else(|| format!("{name}: expected x y width height, finite and at least 360x220"))?;
+                    // Saved geometry is applied when the egui window is next created.
+                    self.mark_config_dirty();
+                    self.egui_repaint_requested = true;
+                    Ok(())
+                }
+            }
+        ]
+    }
     APP_CON_SCALE {
         runtime: CvarDef::new(
             "con_scale", "1.0", "0.2..10.0",
@@ -2507,9 +2608,9 @@ app_cvars! {
     APP_CL_SERVERFILTERS {
         runtime: CvarDef::new(
                 "cl_serverFilters",
-                "",
-                "flags|maxping|mods",
-                "Server browser filters (hide flags, max ping, mod list); saved between launches.",
+                crate::server_browser::DEFAULT_SERVER_FILTERS,
+                "flags|maxping|mods|gametypes",
+                "Server browser filters (hide flags, max ping, include/exclude mods, gametype mask); archived.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

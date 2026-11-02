@@ -1,3 +1,4 @@
+use crate::app::render_studio_camera::{frame_point,frame_offset};
 use super::App;
 
 pub(super) fn studio_lens_editor(ui:&mut egui::Ui,id:impl std::hash::Hash+std::fmt::Debug,
@@ -44,7 +45,7 @@ impl App {
             true,|ui| {
                 let time=self.render_studio.timeline_time();
                 let visible=self.studio_shot_camera();
-                let preview_eye=self.asset_preview_camera().position.to_array();
+                let preview_eye=crate::scene::jka_position(self.asset_preview_camera().position.to_array());
                 let edit_index=self.render_studio.timeline.selected_camera.filter(|&i|i<self.render_studio.timeline.camera.len());
                 let edit_key=edit_index.map(|i|self.render_studio.timeline.camera[i]).unwrap_or_else(|| {
                     let mut key=self.render_studio.timeline.camera_at(time);key.time=time;key
@@ -71,14 +72,14 @@ impl App {
                         rig.target=anchor.clone();rig.target.enabled=true;
                         rig.position=StudioCameraAttachment {enabled:true,lane:anchor.lane,part:anchor.part,bone:anchor.bone,
                             local_offset:rig.position.local_offset,half_life:rig.position.half_life,..Default::default()};
-                        match_view=Some(visible.position.to_array());
+                        match_view=Some(crate::scene::jka_position(visible.position.to_array()));
                     }
                     Some(2)=>{
                         self.set_studio_actor_sabers_enabled(lane,true);
                         rig.position=StudioCameraAttachment {enabled:true,lane,part:StudioAttachmentPart::Saber1,
                             bone:"@hilt".into(),local_offset:true,half_life:0.08,..Default::default()};
                         rig.target=StudioCameraAttachment {enabled:true,lane,half_life:0.12,..Default::default()};
-                        match_view=Some(visible.position.to_array());
+                        match_view=Some(crate::scene::jka_position(visible.position.to_array()));
                     }
                     _=>{}
                 }
@@ -173,13 +174,13 @@ impl App {
                         let mut local=binding.local_offset;
                         sui::prop_row(ui,if i==0 {"Orbit space"}else{"Offset space"},|ui| {
                             ui.add_enabled_ui(bone_space_ok || local,|ui| sui::segmented(ui,&mut local,&[(false,"World"),(true,"Bone")])).response
-                        }).on_hover_text("World: fixed directions, Y up. Bone: rotates with the attachment, local Z up. Switching keeps the current position. If bone axes collapse during smoothing, reduce smoothing or use World.");
+                        }).on_hover_text("World: JKA XYZ, Z up. Bone: local XYZ rotates with the attachment. Switching keeps the current position. If bone axes collapse during smoothing, reduce smoothing or use World.");
                         binding.local_offset=local;
                         // Changing spaces preserves the currently displayed attachment point.
                         if binding.local_offset!=before.local_offset {
                             if i==0 {convert_space=Some(binding.local_offset);}
                             if let Some(frame)=frame {
-                                binding.offset=frame.offset(frame.point(before.offset,before.local_offset),binding.local_offset);
+                                binding.offset=frame_offset(frame,frame_point(frame,before.offset,before.local_offset),binding.local_offset);
                             }
                         }
                         if i==0 {
@@ -188,7 +189,7 @@ impl App {
                             if let Some((frame,mut editor_binding,mut orbit))=frame.and_then(|frame| {
                                 let point=previous.position_point(edit_key,frame);
                                 let eye=std::array::from_fn(|a|point[a]+edit_key.position[a]-previous.reference_position[a]);
-                                let mut editor_binding=binding.clone();editor_binding.offset=frame.offset(eye,binding.local_offset);
+                                let mut editor_binding=binding.clone();editor_binding.offset=frame_offset(frame,eye,binding.local_offset);
                                 StudioCameraOrbit::from_binding(&editor_binding,frame,[0.;3]).map(|orbit|(frame,editor_binding,orbit))
                             }) {
                                 let mut changed=false;
@@ -213,9 +214,11 @@ impl App {
                             if sui::button_row(ui,&[(Some(Icon::Camera),"Use preview position",ButtonKind::Normal,true)]).is_some() {
                                 match_view=Some(preview_eye);
                             }
-                            if !before.enabled || before.lane!=binding.lane || before.part!=binding.part || before.bone!=binding.bone {match_view=Some(visible.position.to_array());}
+                            if !before.enabled || before.lane!=binding.lane || before.part!=binding.part || before.bone!=binding.bone {match_view=Some(crate::scene::jka_position(visible.position.to_array()));}
                         } else {
-                            sui::prop_vec3(ui,"Aim offset",&mut binding.offset,0.25,["X","Y","Z"],true);
+                            if binding.local_offset {
+                                sui::prop_vec3(ui,"Aim offset",&mut binding.offset,0.25,["X","Y","Z"],true);
+                            } else { sui::prop_vec3(ui,"Aim offset",&mut binding.offset,0.25,["X","Y","Z"],true); }
                             if sui::button_row(ui,&[(None,"Center on bone",ButtonKind::Ghost,true)]).is_some() {binding.offset=[0.;3];}
                         }
                         sui::prop_slider(ui,"Smoothing",egui::Slider::new(&mut binding.half_life,0.0..=2.0).suffix(" s"))
@@ -240,8 +243,8 @@ impl App {
                     self.render_studio.timeline.begin_camera_edit();
                     let index=self.render_studio.timeline.selected_camera.unwrap();
                     let key=&mut self.render_studio.timeline.camera[index];
-                    if source_off {key.position=visible.position.to_array();}
-                    if target_off {key.yaw=visible.yaw.to_degrees();key.pitch=visible.pitch.to_degrees();}
+                    if source_off {key.position=crate::scene::jka_position(visible.position.to_array());}
+                    if target_off {key.yaw=visible.yaw.to_degrees();key.pitch=-visible.pitch.to_degrees();}
                 }
                 if previous!=rig || match_view.is_some() || detach {
                     self.render_studio.timeline.camera_rig=rig;

@@ -18,6 +18,15 @@ fn ui_shader_icon_index(source: f32) -> Option<usize> {
     } else { None }
 }
 
+/// Unified shader cache key: native icon indices first, then extension slots.
+fn ui_shader_material_index(source: f32) -> Option<usize> {
+    if let Some(index) = ui_shader_icon_index(source) { return Some(index); }
+    let index = source - ui::EXT_IMAGE_SHADER_SOURCE_BASE;
+    if index >= 0.0 && index < crate::extensions::MAX_HUD_IMAGES as f32
+        && index.fract() == 0.0
+    { Some(ui::ICON_NAMES.len() + index as usize) } else { None }
+}
+
 pub(in crate::renderer) struct PendingUiLevelshot {
     pub(in crate::renderer) key: String,
     pub(in crate::renderer) map_name: String,
@@ -38,6 +47,7 @@ impl Renderer {
         // lookup after a scroll/HUD snapshot arrives on the render thread.
         ui_state.icon_atlas_uvs.clone_from(&self.ui_state.icon_atlas_uvs);
         ui_state.icon_shader_flags.clone_from(&self.ui_state.icon_shader_flags);
+        ui_state.extension_shader_flags.clone_from(&self.ui_state.extension_shader_flags);
         // Likewise the clean font: loaded once by the renderer, never by the app.
         ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
         ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
@@ -444,6 +454,8 @@ impl Renderer {
                 &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
             );
             self.ui_ext_image_key.clear();
+            self.ui_state.extension_shader_flags.clear();
+            self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
             self.rebuild_ui_bind_group();
             return;
         }
@@ -451,14 +463,17 @@ impl Renderer {
             self._ui_ext_images =
                 upload_texture(&self.device, &self.queue, &blank_ui_extension_atlas());
             self.ui_ext_image_key.clear();
+            self.ui_state.extension_shader_flags.clear();
+            self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
             self.rebuild_ui_bind_group();
         }
         let first_new = self.ui_ext_image_key.len();
-        let cells = load_ui_extension_images(
+        let (cells, shader_flags) = load_ui_extension_images_with_shaders(
             &self.base,
             self.detail_texture_game.as_deref(),
             &wanted[first_new..],
         );
+        self.ui_state.extension_shader_flags.extend(shader_flags);
         let cell = ui::EXT_IMAGE_CELL;
         for (offset, pixels) in cells.iter().enumerate() {
             let Some(pixels) = pixels else { continue };
@@ -1056,8 +1071,9 @@ impl Renderer {
     pub(in crate::renderer) fn prepare_ui_icon_shaders(&mut self) {
         self.ui_icon_shader_batches.clear();
         self.ui_icon_shader_vertices.clear();
-        if !self.ui_icons_loaded || self.ui_state.video.skip_ui
-            || !self.ui_state.icon_shader_flags.iter().any(|&flag| flag)
+        if self.ui_state.video.skip_ui ||
+            !(self.ui_icons_loaded && self.ui_state.icon_shader_flags.iter().any(|&flag| flag)
+              || self.ui_state.extension_shader_flags.iter().any(|&flag| flag))
         { return; }
         // Collect only the tagged triangles. In practice this is the small
         // handful of scope/Force icons on screen, not the whole HUD.
@@ -1070,11 +1086,11 @@ impl Renderer {
             let mut i = 0;
             while i + 3 <= source.len() {
                 let mark = source[i].textured;
-                if let Some(index) = ui_shader_icon_index(mark) {
+                if let Some(index) = ui_shader_material_index(mark) {
                     let start = i;
                     i += 3;
                     while i + 3 <= source.len()
-                        && ui_shader_icon_index(source[i].textured) == Some(index)
+                        && ui_shader_material_index(source[i].textured) == Some(index)
                     { i += 3; }
                     segments.push((layer, start as u32, index, source[start..i].to_vec()));
                 } else { i += 3; }
@@ -1104,13 +1120,18 @@ impl Renderer {
                 },
             });
             if !self.ui_icon_shader_materials.contains_key(&index) {
-                let Some(&name) = ui::ICON_NAMES.get(index) else { continue; };
-                let requested = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF)
-                    .contains(&index) { format!("{name}_na") }
-                    else { name.to_owned() };
+                let is_extension = index >= ui::ICON_NAMES.len();
+                let name = if is_extension {
+                    self.ui_state.extension_images.get(index - ui::ICON_NAMES.len())
+                        .map(String::as_str)
+                } else { ui::ICON_NAMES.get(index).copied() };
+                let Some(name) = name else { continue; };
+                let requested = if !is_extension &&
+                    (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF).contains(&index)
+                { format!("{name}_na") } else { name.to_owned() };
                 let Some(resolver) = self.ui_icon_shader_resolver.as_mut() else { continue; };
-                let fallback = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE)
-                    .contains(&index) {
+                let fallback = if !is_extension &&
+                    (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE).contains(&index) {
                     Some(if index >= ui::ICON_WEAPON_STAFF {
                         "gfx/hud/w_icon_lightsaber"
                     } else { name })
@@ -1139,6 +1160,16 @@ impl Renderer {
                 );
                 let start = self.ui_icon_shader_vertices.len() as u32;
                 for mut v in quad.iter().copied() {
+                    // The extension's atlas UVs encode clipping and mirroring.
+                    // Remap them into the original image's 0..1 UV domain
+                    // before applying authored tcMods and sampling stage maps.
+                    if index >= ui::ICON_NAMES.len() {
+                        let (uv0, uv1) = ui::extension_image_cell_uv(index - ui::ICON_NAMES.len());
+                        v.uv = [
+                            (v.uv[0] - uv0[0]) / (uv1[0] - uv0[0]),
+                            (v.uv[1] - uv0[1]) / (uv1[1] - uv0[1]),
+                        ];
+                    }
                     v.uv = stage.tc_mods.iter().fold(v.uv, |uv, &modifier|
                         crate::fx::draw::modified_uv(uv, [0.0; 3], modifier, time));
                     v.color = stage.float_vertex_color_at_time(v.color, seconds);
@@ -2016,17 +2047,39 @@ pub(in crate::renderer) fn load_ui_extension_images(
     game: Option<&Path>,
     names: &[String],
 ) -> Vec<Option<Vec<u8>>> {
+    load_ui_extension_images_with_shaders(base, game, names).0
+}
+
+/// RegisterShader semantics: explicit shader definitions take precedence over
+/// same-named bitmaps. Unauthored images still use the one-draw atlas path.
+/// This work runs only when extension image registrations change, not per present.
+pub(in crate::renderer) fn load_ui_extension_images_with_shaders(
+    base: &Path,
+    game: Option<&Path>,
+    names: &[String],
+) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
     let cell = ui::EXT_IMAGE_CELL;
     let mut assets = match AssetSearchPath::open_game(base, game) {
         Ok(assets) => assets,
         Err(error) => {
             eprintln!("Extension HUD image asset search: {error}");
-            return vec![None; names.len()];
+            return (vec![None; names.len()], vec![false; names.len()]);
         }
     };
-    names
-        .iter()
-        .map(|name| {
+    // Respect mod precedence and .oshader support exactly as native HUD icons.
+    let mut warnings = Vec::new();
+    let library = match crate::materials::shader_library(&mut assets, &mut warnings, false) {
+        Ok((library, _)) => Some(library),
+        Err(err) => { eprintln!("Extension HUD shader library: {err}"); None }
+    };
+    for warning in warnings { rverbose!(2, "Extension HUD shader library: {warning}"); }
+    let flags: Vec<bool> = names.iter().map(|name| library.as_ref().is_some_and(|library|
+        ui_icon_has_authored_shader(library, name))).collect();
+    let pixels = names
+        .iter().zip(flags.iter())
+        .map(|(name, &authored)| {
+            if authored { return None; } // Do not decode/resize authored stages.
+
             let Some(image) = try_load_texture_asset_from_search_path(
                 &mut assets,
                 name,
@@ -2050,7 +2103,8 @@ pub(in crate::renderer) fn load_ui_extension_images(
                     .into_raw()
             })
         })
-        .collect()
+        .collect();
+    (pixels, flags)
 }
 
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.

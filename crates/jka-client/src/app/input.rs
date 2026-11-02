@@ -106,6 +106,9 @@ impl App {
         let was_zoomed = self.live_buttons.contains("+zoom");
         self.keys.clear();
         self.mouse_buttons_down.clear();
+        self.demo_walk_pressed_at = None;
+        self.demo_walk_used = false;
+        self.demo_previous_held.clear();
         self.modifiers = Default::default();
         self.live_buttons.clear();
         self.live_button_sources.clear();
@@ -520,9 +523,12 @@ impl App {
         // Demo mouse attack bindings are POV controls in this client. Keep the
         // behavior, but execute it at Cbuf time so `wait` also orders it.
         if self.demo_playback_active() && is_down {
-            let follow_direction = if plus_verb == "+attack" {
+            let follow_direction = if plus_verb == "+attack"
+                && !self.bindings.demo_has_override("demo_next") {
                 Some(1)
-            } else if plus_verb == "+altattack" {
+            } else if plus_verb == "+altattack"
+                && !self.bindings.demo_has_override("demo_previous")
+                && self.demo_view_mode != DemoViewMode::Free {
                 Some(-1)
             } else {
                 None
@@ -561,11 +567,17 @@ impl App {
                     }
                 }
                 if plus_verb == "+moveup"
+                    && !self.bindings.demo_has_override("demo_freecam")
                     && self.demo_playback_active()
                     && self.demo_view_mode != DemoViewMode::Free
                 {
                     self.enter_demo_free_view();
                 }
+            }
+            if plus_verb == "+speed" && self.demo_playback_active()
+                && !self.bindings.demo_has_override("demo_pause") && !was_active {
+                self.demo_walk_pressed_at = Some(Instant::now());
+                self.demo_walk_used = false;
             }
         } else if let Some(source) = source {
             let mut remove_entry = false;
@@ -583,7 +595,21 @@ impl App {
             self.live_buttons.remove(&plus_verb);
         }
 
+        // Walk's inherited demo Pause action is a *tap*, not a hold. This
+        // shares the physical Walk binding with the existing hold-to-show-UI
+        // behavior without making UI clicks unexpectedly pause the movie.
+        let pause_tap = !is_down && plus_verb == "+speed" && was_active
+            && !self.live_buttons.contains("+speed") && self.demo_playback_active()
+            && !self.bindings.demo_has_override("demo_pause")
+            && !self.demo_walk_used
+            && self.demo_walk_pressed_at.take().is_some_and(|start|
+                start.elapsed().as_millis() <= 230);
+        if !is_down && plus_verb == "+speed" {
+            self.demo_walk_pressed_at = None;
+            self.demo_walk_used = false;
+        }
         self.sync_button_transitions(was_scores_showing, was_demo_ui_modifier, was_zoomed);
+        if pause_tap { self.toggle_demo_pause_ui(); }
         true
     }
 
@@ -830,11 +856,45 @@ impl App {
         self.execute_binding_press_from(key, key);
     }
 
+    /// Demo-only actions replace this physical key's gameplay binding only
+    /// during demo playback; an absent override inherits the regular binding.
+    fn handle_demo_override(&mut self, key: BindKey, down: bool) -> bool {
+        if !self.demo_playback_active() { return false; }
+        let Some(command) = self.bindings.get_demo(key).map(str::to_owned) else { return false; };
+        match command.as_str() {
+            "demo_pause" if down => self.toggle_demo_pause_ui(),
+            "demo_next" if down => {
+                if !self.live_buttons.contains("+speed") { self.cycle_demo_follow(1); }
+            }
+            "demo_previous" => {
+                if down {
+                    if self.demo_previous_held.insert(key)
+                        && self.demo_view_mode != DemoViewMode::Free
+                        && !self.live_buttons.contains("+speed") {
+                        self.cycle_demo_follow(-1);
+                    }
+                } else {
+                    self.demo_previous_held.remove(&key);
+                }
+            }
+            "demo_camera" if down && self.demo_view_mode != DemoViewMode::Free => {
+                let next = (self.spectator_camera.mode.as_i32() + 1) % 3;
+                let _ = self.set_console_cvar("cg_thirdPerson", &next.to_string());
+            }
+            "demo_freecam" if down && self.demo_view_mode != DemoViewMode::Free => {
+                self.enter_demo_free_view();
+            }
+            _ => {}
+        }
+        true
+    }
+
     pub(in crate::app) fn execute_binding_press_from(
         &mut self,
         key: BindKey,
         source_key: BindKey,
     ) {
+        if self.handle_demo_override(key, true) { return; }
         let spectator_context = self.spectator_binding_context();
         let Some(binding) = self
             .bindings
@@ -843,15 +903,20 @@ impl App {
         else {
             return;
         };
-        // Binding lookup intentionally normalizes left/right modifiers, but a
-        // kbutton source must identify the physical key. Use Debug for keyboard
-        // codes so Left/Right Ctrl/Shift/Alt remain independent sources.
+        // Each modifier side has its own binding. Use the physical KeyCode
+        // for kbutton ownership as well, so releasing one side cannot release
+        // a +command still held by the other side.
         let source = match source_key {
             BindKey::Keyboard(code) => format!("@bind:key:{code:?}"),
             _ => format!("@bind:{}", keybinds::key_name(source_key)),
         };
         let mut buffered = Vec::new();
         for command in keybinds::split_binding_commands(&binding) {
+            if self.demo_playback_active()
+                && self.bindings.demo_has_override("demo_camera")
+                && command.eq_ignore_ascii_case("toggle cg_thirdPerson 0 1 2") {
+                continue;
+            }
             let verb = command.split_whitespace().next().unwrap_or("");
             if verb.starts_with('+') {
                 buffered.push(format!("{command} {source}"));
@@ -874,6 +939,7 @@ impl App {
         key: BindKey,
         source_key: BindKey,
     ) {
+        if self.handle_demo_override(key, false) { return; }
         let spectator_context = self.spectator_binding_context();
         let Some(binding) = self
             .bindings
@@ -921,7 +987,10 @@ impl App {
             return;
         };
         let command = action.command;
-        if keybinds::is_spectator_selection(self.controls_selected) {
+        if keybinds::is_demo_selection(self.controls_selected) {
+            self.bindings.unbind_demo_command(command);
+            self.bindings.set_demo(key, command);
+        } else if keybinds::is_spectator_selection(self.controls_selected) {
             self.bindings.unbind_spectator_command(command);
             self.bindings.set_spectator(key, command);
         } else {
@@ -938,7 +1007,9 @@ impl App {
     pub(in crate::app) fn unbind_selected_control(&mut self) {
         if let Some(action) = keybinds::control_action(self.controls_selected) {
             let command = action.command;
-            let changed = if keybinds::is_spectator_selection(self.controls_selected) {
+            let changed = if keybinds::is_demo_selection(self.controls_selected) {
+                self.bindings.unbind_demo_command(command)
+            } else if keybinds::is_spectator_selection(self.controls_selected) {
                 self.bindings.unbind_spectator_command(command)
             } else {
                 self.bindings.unbind_command(command)

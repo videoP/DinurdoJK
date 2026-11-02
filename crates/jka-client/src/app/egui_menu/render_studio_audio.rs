@@ -114,8 +114,7 @@ impl App {
             let r = egui::Rect::from_center_size(egui::pos2(header_right - at, y + h * 0.5), egui::vec2(20.0, 18.0));
             let hovered = !locked && ui.rect_contains_pointer(r);
             ui.painter().rect_filled(
-                r,
-                3.0,
+                r,egui::CornerRadius::ZERO,
                 if value {
                     color.gamma_multiply(0.85)
                 } else if hovered {
@@ -190,10 +189,9 @@ impl App {
                 let selected = self.render_studio.audio.selected == Some((track, i));
                 let tint = sui::clip_body(sui::AUDIO, selected);
                 let painter = ui.painter().with_clip_rect(draw);
-                painter.rect_filled(r, 3.0, tint);
+                painter.rect_filled(r,egui::CornerRadius::ZERO, tint);
                 painter.rect_stroke(
-                    r,
-                    3.0,
+                    r,egui::CornerRadius::ZERO,
                     egui::Stroke::new(
                         if selected { 2.0 } else { 0.6 },
                         if selected {
@@ -391,8 +389,7 @@ impl App {
                         egui::vec2(9.0, 13.0),
                     );
                     painter.rect_filled(
-                        egui::Rect::from_center_size(handle.center(), egui::vec2(3.0, 10.0)),
-                        1.0,
+                        egui::Rect::from_center_size(handle.center(), egui::vec2(3.0, 10.0)),egui::CornerRadius::ZERO,
                         egui::Color32::WHITE,
                     );
                     let grip = ui.interact(

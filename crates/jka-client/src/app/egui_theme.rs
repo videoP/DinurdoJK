@@ -193,9 +193,8 @@ pub(super) const FOOTER_H: f32 = 40.0;
 pub(super) const ROW_H: f32 = 30.0;
 pub(super) const LABEL_W: f32 = 232.0;
 pub(super) const VALUE_W: f32 = 132.0;
-/// Corner rounding for controls, popups and windows: soft enough to read as
-/// modern, small enough that dense rows still line up as a grid.
-pub(super) const CORNER: egui::CornerRadius = egui::CornerRadius::same(3);
+/// Menus are squared-off throughout: inputs, buttons, dialogs and popups.
+pub(super) const CORNER: egui::CornerRadius = egui::CornerRadius::ZERO;
 
 /// egui zoom derived from the drawable height so the menu keeps a usable
 /// physical size from 900p up to 4K without a manual UI-scale setting.
@@ -230,7 +229,7 @@ pub(super) fn apply(ctx: &egui::Context) {
     visuals.panel_fill = SURFACE();
     visuals.window_fill = SURFACE();
     visuals.window_stroke = egui::Stroke::new(1.0_f32, LINE_STRONG());
-    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    visuals.window_corner_radius = CORNER;
     visuals.menu_corner_radius = CORNER;
     // A soft, low drop shadow lifts popups and dialogs off the page without
     // the hard outline the flat theme used to rely on.
@@ -445,9 +444,9 @@ pub(super) fn chip_sized(
         (false, false, _) => CONTROL(),
         (false, true, _) => CONTROL_HOVER(),
     };
-    painter.rect_filled(rect, 11.5, fill);
+    painter.rect_filled(rect,egui::CornerRadius::ZERO, fill);
     if selected {
-        painter.rect_stroke(rect, 11.5, egui::Stroke::new(1.0, if pending { WARNING() } else { ACCENT() }), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect,egui::CornerRadius::ZERO, egui::Stroke::new(1.0, if pending { WARNING() } else { ACCENT() }), egui::StrokeKind::Inside);
     }
     painter.with_clip_rect(rect).text(
         rect.center(),
@@ -468,14 +467,14 @@ pub(super) fn switch(ui: &mut egui::Ui, on: bool) -> Option<bool> {
     let tone = if pending { WARNING() } else { ACCENT() };
     let y = rect.center().y;
     let hovered = response.hovered();
-    painter.rect_filled(rect, 10.0, if hovered { CONTROL_HOVER() } else { CONTROL() });
+    painter.rect_filled(rect,egui::CornerRadius::ZERO, if hovered { CONTROL_HOVER() } else { CONTROL() });
     let hilt = egui::Rect::from_min_size(egui::pos2(rect.left() + 5.0, y - 3.5), egui::vec2(13.0, 7.0));
     if on {
         super::egui_menu::holo::blade(&painter, egui::pos2(hilt.right(), y), egui::pos2(rect.right() - 6.0, y), 2.2, tone, 1.0);
     } else {
         painter.line_segment([egui::pos2(hilt.right() + 2.0, y), egui::pos2(rect.right() - 6.0, y)], egui::Stroke::new(1.0, LINE()));
     }
-    painter.rect_filled(hilt, 2.0, if on { TEXT() } else { TEXT_FAINT() });
+    painter.rect_filled(hilt,egui::CornerRadius::ZERO, if on { TEXT() } else { TEXT_FAINT() });
     painter.rect_filled(egui::Rect::from_min_size(egui::pos2(hilt.left() + 4.0, hilt.top()), egui::vec2(2.0, hilt.height())), 0.0, CONTROL());
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1329,8 +1328,8 @@ pub(super) fn slider_with(
     let lit = if response.hovered() || response.dragged() { 1.0 } else { 0.75 };
     super::egui_menu::holo::blade(painter, egui::pos2(rail.left(), y), egui::pos2(knob_x, y), 2.0, tone, lit);
     let knob = egui::Rect::from_center_size(egui::pos2(knob_x, y), egui::vec2(8.0, 16.0));
-    painter.rect_filled(knob, 3.0, TEXT());
-    painter.rect_stroke(knob, 3.0, egui::Stroke::new(1.0, tone), egui::StrokeKind::Outside);
+    painter.rect_filled(knob,egui::CornerRadius::ZERO, TEXT());
+    painter.rect_stroke(knob,egui::CornerRadius::ZERO, egui::Stroke::new(1.0, tone), egui::StrokeKind::Outside);
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     }

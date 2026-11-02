@@ -819,7 +819,7 @@ fn jka_hybrid_surface_source(source: &str) -> String {
         .replace("let da = displacement(pa, spacing);", "let da = jka_hybrid_parent_displacement(pa, spacing);")
         .replace("let db = displacement(pb, spacing);", "let db = jka_hybrid_parent_displacement(pb, spacing);")
         .replace("let dc = displacement(pc, spacing);", "let dc = jka_hybrid_parent_displacement(pc, spacing);")
-        .replace(NORMAL, "let legacy_slope = sample.slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);\n    let total = select(legacy_slope, sample.slope, jka_hybrid.breaker.x > 0.5) - wake.normal.xz / max(wake.normal.y, 0.05);")
+        .replace(NORMAL, "let legacy_slope = sample.slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);\n    let player_slope = jka_player_interaction(xz).yz;\n    let total = select(legacy_slope, sample.slope, jka_hybrid.breaker.x > 0.5) + player_slope - wake.normal.xz / max(wake.normal.y, 0.05);")
         .replace(WINDROWS_END, "    windrows *= surface.crest_foam.a;\n    let white = billows(patterns.pattern.a,")
         // Keep wake aeration independently; hide only ocean bubbles persisting
         // from earlier high-sea FFT frames.

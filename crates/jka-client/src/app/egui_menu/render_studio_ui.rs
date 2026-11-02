@@ -123,7 +123,7 @@ pub(super) fn editor_style(ui: &mut Ui) {
     style.spacing.button_padding = vec2(8.0, 3.0);
     style.spacing.interact_size = vec2(22.0, 22.0);
     style.spacing.indent = 12.0;
-    let radius = egui::CornerRadius::same(3);
+    let radius = egui::CornerRadius::ZERO;
     for w in [
         &mut style.visuals.widgets.inactive,
         &mut style.visuals.widgets.hovered,
@@ -139,7 +139,7 @@ fn widget(fill: Color32, stroke: Color32, text: Color32) -> egui::style::WidgetV
     egui::style::WidgetVisuals {
         bg_fill: fill, weak_bg_fill: fill,
         bg_stroke: Stroke::new(1.0, stroke),
-        corner_radius: egui::CornerRadius::same(3),
+        corner_radius: egui::CornerRadius::ZERO,
         fg_stroke: Stroke::new(1.0, text),
         expansion: 0.0,
     }
@@ -255,8 +255,8 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
     match icon {
         Icon::Play => fill(&[(-4.0, -6.5), (6.5, 0.0), (-4.0, 6.5)]),
         Icon::Pause => {
-            p.rect_filled(Rect::from_center_size(c + vec2(-3.5, 0.0), vec2(3.0, 12.0)), 0.5, color);
-            p.rect_filled(Rect::from_center_size(c + vec2(3.5, 0.0), vec2(3.0, 12.0)), 0.5, color);
+            p.rect_filled(Rect::from_center_size(c + vec2(-3.5, 0.0), vec2(3.0, 12.0)),egui::CornerRadius::ZERO, color);
+            p.rect_filled(Rect::from_center_size(c + vec2(3.5, 0.0), vec2(3.0, 12.0)),egui::CornerRadius::ZERO, color);
         }
         Icon::ToStart => {
             p.rect_filled(Rect::from_center_size(c + vec2(-6.0, 0.0), vec2(2.0, 12.0)), 0.0, color);
@@ -325,7 +325,7 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
             line((-7.0, -1.0), (7.0, -1.0));
         }
         Icon::Save => {
-            p.rect_stroke(Rect::from_center_size(c, vec2(13.0, 13.0)), 1.5, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_center_size(c, vec2(13.0, 13.0)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             p.rect_filled(Rect::from_center_size(c + vec2(0.0, -3.5), vec2(7.0, 3.5)), 0.0, color);
             p.rect_stroke(Rect::from_center_size(c + vec2(0.0, 3.5), vec2(7.0, 5.0)), 0.0, s, egui::StrokeKind::Inside);
         }
@@ -390,7 +390,7 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
         }
         Icon::Anim => {
             // Film strip: frame with sprocket ticks.
-            p.rect_stroke(Rect::from_center_size(c, vec2(14.0, 11.0)), 1.5, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_center_size(c, vec2(14.0, 11.0)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             for x in [-3.5, 0.0, 3.5] {
                 line((x, -5.5), (x, -3.5));
                 line((x, 3.5), (x, 5.5));
@@ -406,7 +406,7 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
         }
         Icon::Cinematic => {
             // Clapperboard.
-            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -1.5), c + vec2(7.0, 6.5)), 1.0, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -1.5), c + vec2(7.0, 6.5)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             p.add(egui::Shape::convex_polygon(
                 vec![c + vec2(-7.0, -2.5), c + vec2(6.0, -6.5), c + vec2(6.8, -4.0), c + vec2(-6.2, 0.0)],
                 color, Stroke::NONE,
@@ -414,13 +414,13 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
         }
         Icon::Demo => {
             // Monitor with a play triangle: recorded POV footage.
-            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -6.0), c + vec2(7.0, 3.5)), 1.5, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -6.0), c + vec2(7.0, 3.5)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             line((-3.0, 6.5), (3.0, 6.5));
             line((0.0, 3.5), (0.0, 6.5));
             fill(&[(-1.5, -3.5), (2.5, -1.25), (-1.5, 1.0)]);
         }
         Icon::Camera => {
-            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -4.0), c + vec2(3.0, 4.5)), 1.5, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -4.0), c + vec2(3.0, 4.5)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             fill(&[(3.0, 0.25), (7.5, -3.5), (7.5, 4.0)]);
         }
         Icon::Audio => {
@@ -472,7 +472,7 @@ pub(super) fn paint_icon(p: &egui::Painter, c: Pos2, icon: Icon, color: Color32)
             p.circle_filled(c, 1.6, color);
         }
         Icon::Still => {
-            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -4.5), c + vec2(7.0, 6.0)), 1.5, s, egui::StrokeKind::Inside);
+            p.rect_stroke(Rect::from_min_max(c + vec2(-7.0, -4.5), c + vec2(7.0, 6.0)),egui::CornerRadius::ZERO, s, egui::StrokeKind::Inside);
             p.rect_filled(Rect::from_min_max(c + vec2(-3.0, -6.5), c + vec2(2.0, -4.5)), 0.0, color);
             p.circle_stroke(c + vec2(0.0, 0.8), 2.8, s);
         }
@@ -494,7 +494,7 @@ pub(super) fn icon_button(ui: &mut Ui, icon: Icon, enabled: bool, active: bool, 
     } else {
         Color32::TRANSPARENT
     };
-    p.rect_filled(rect, 3.0, fill);
+    p.rect_filled(rect,egui::CornerRadius::ZERO, fill);
     let color = if !enabled {
         theme::TEXT_DISABLED()
     } else if active {
@@ -555,8 +555,8 @@ pub(super) fn button_sized(ui: &mut Ui, icon: Option<Icon>, label: &str, kind: B
         (theme::CONTROL().gamma_multiply(0.6), theme::HAIRLINE(), theme::TEXT_DISABLED())
     };
     let p = ui.painter();
-    p.rect_filled(rect, 3.0, fill);
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    p.rect_filled(rect,egui::CornerRadius::ZERO, fill);
+    p.rect_stroke(rect,egui::CornerRadius::ZERO, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
     let content_w = (galley.size().x + icon_w).min(rect.width() - 12.0);
     let mut x = rect.center().x - content_w * 0.5;
     if let Some(icon) = icon {
@@ -595,7 +595,7 @@ pub(super) fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
     let t = ui.ctx().animate_bool(r.id, *on);
     let track = theme::LINE().lerp_to_gamma(theme::ACCENT_DEEP(), t);
     let p = ui.painter();
-    p.rect_filled(rect, 8.0, if r.hovered() { track.gamma_multiply(1.25) } else { track });
+    p.rect_filled(rect,egui::CornerRadius::ZERO, if r.hovered() { track.gamma_multiply(1.25) } else { track });
     let knob = pos2(egui::lerp(rect.left() + 8.0..=rect.right() - 8.0, t), rect.center().y);
     p.circle_filled(knob, 5.5, if *on { theme::TEXT() } else { theme::TEXT_FAINT() });
     r
@@ -604,19 +604,19 @@ pub(super) fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
 // ----------------------------------------------------------------- panes --
 
 pub(super) fn paint_pane(p: &egui::Painter, rect: Rect) {
-    p.rect_filled(rect, 2.0, PANE());
+    p.rect_filled(rect,egui::CornerRadius::ZERO, PANE());
 }
 
 /// Paints a pane header strip with its caption. Returns the rectangle to the
 /// right of the caption, for tabs / tools laid out by the caller.
 pub(super) fn pane_header(p: &egui::Painter, rect: Rect, title: &str) -> Rect {
-    p.rect_filled(rect, egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, PANE_HEADER());
+    p.rect_filled(rect, egui::CornerRadius::ZERO, PANE_HEADER());
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::HAIRLINE()));
     if title.is_empty() {
         return rect.shrink2(vec2(6.0, 0.0));
     }
     // Magenta tick before the caption, as on the console title bar.
-    p.rect_filled(Rect::from_center_size(pos2(rect.left() + PAD + 1.5, rect.center().y), vec2(3.0, 13.0)), 1.0, theme::MAGENTA());
+    p.rect_filled(Rect::from_center_size(pos2(rect.left() + PAD + 1.5, rect.center().y), vec2(3.0, 13.0)),egui::CornerRadius::ZERO, theme::MAGENTA());
     let galley = p.layout_no_wrap(title.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM());
     let width = galley.size().x;
     p.galley(pos2(rect.left() + PAD + 9.0, rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_DIM());
@@ -650,7 +650,7 @@ pub(super) fn inspector_title(ui: &mut Ui, color: Color32, kind: &str, title: &s
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         let (sw, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-        ui.painter().rect_filled(sw, 2.0, color);
+        ui.painter().rect_filled(sw,egui::CornerRadius::ZERO, color);
         ui.label(egui::RichText::new(kind.to_ascii_uppercase()).size(10.5).color(color).strong());
     });
     ui.add(egui::Label::new(egui::RichText::new(title).size(15.5).color(theme::TEXT())).truncate());
@@ -672,7 +672,7 @@ pub(super) fn section<R>(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug
     }
     let open = state.is_open();
     let p = ui.painter();
-    p.rect_filled(rect, 2.0, if r.hovered() { theme::CONTROL() } else { PANE_HEADER() });
+    p.rect_filled(rect,egui::CornerRadius::ZERO, if r.hovered() { theme::CONTROL() } else { PANE_HEADER() });
     paint_icon(p, pos2(rect.left() + 11.0, rect.center().y),
         if open { Icon::ChevronDown } else { Icon::ChevronRight }, theme::TEXT_FAINT());
     p.with_clip_rect(rect.shrink(2.0)).text(pos2(rect.left() + 22.0, rect.center().y), Align2::LEFT_CENTER,
@@ -797,8 +797,8 @@ pub(super) fn segmented<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
     let h = 24.0;
     let (rect, base) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let p = ui.painter().clone();
-    p.rect_filled(rect, 3.0, WELL());
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
+    p.rect_filled(rect,egui::CornerRadius::ZERO, WELL());
+    p.rect_stroke(rect,egui::CornerRadius::ZERO, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
     let n = options.len().max(1) as f32;
     let cell = rect.width() / n;
     let mut changed = false;
@@ -813,7 +813,7 @@ pub(super) fn segmented<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
         } else {
             Color32::TRANSPARENT
         };
-        p.rect_filled(r, 2.0, fill);
+        p.rect_filled(r,egui::CornerRadius::ZERO, fill);
         let color = if !ui.is_enabled() {
             theme::TEXT_DISABLED()
         } else if selected {
@@ -843,13 +843,13 @@ pub(super) fn hint(ui: &mut Ui, text: &str) {
 
 /// Callout with a colored left bar (warnings, blocked states).
 pub(super) fn callout(ui: &mut Ui, text: &str, color: Color32) {
-    let frame = egui::Frame::new().fill(color.gamma_multiply(0.10)).corner_radius(3)
+    let frame = egui::Frame::new().fill(color.gamma_multiply(0.10)).corner_radius(egui::CornerRadius::ZERO)
         .inner_margin(egui::Margin { left: 10, right: 8, top: 6, bottom: 6 });
     let r = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::TEXT_DIM())).wrap());
     }).response;
-    ui.painter().rect_filled(Rect::from_min_size(r.rect.left_top(), vec2(3.0, r.rect.height())), 1.0, color);
+    ui.painter().rect_filled(Rect::from_min_size(r.rect.left_top(), vec2(3.0, r.rect.height())),egui::CornerRadius::ZERO, color);
 }
 
 // ---------------------------------------------------------------- browser --
@@ -867,13 +867,12 @@ pub(super) fn tab_strip<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
         let resp = ui.interact(r, base.id.with(i), Sense::click());
         let selected = v == value;
         if resp.hovered() && !selected {
-            p.rect_filled(r.shrink2(vec2(1.0, 3.0)), 3.0, theme::CONTROL());
+            p.rect_filled(r.shrink2(vec2(1.0, 3.0)),egui::CornerRadius::ZERO, theme::CONTROL());
         }
         let color = if selected { theme::TEXT() } else if resp.hovered() { theme::TEXT_DIM() } else { theme::TEXT_FAINT() };
         p.with_clip_rect(r).text(r.center(), Align2::CENTER_CENTER, *label, FontId::proportional(12.0), color);
         if selected {
-            p.rect_filled(Rect::from_min_max(pos2(r.left() + 6.0, r.bottom() - 2.0), pos2(r.right() - 6.0, r.bottom())),
-                1.0, theme::ACCENT());
+            p.rect_filled(Rect::from_min_max(pos2(r.left() + 6.0, r.bottom() - 2.0), pos2(r.right() - 6.0, r.bottom())),egui::CornerRadius::ZERO, theme::ACCENT());
         }
         if resp.clicked() && !selected {
             *value = v.clone();
@@ -887,14 +886,14 @@ pub(super) fn tab_strip<T: PartialEq + Clone>(ui: &mut Ui, value: &mut T, option
 pub(super) fn search_field(ui: &mut Ui, text: &mut String, hint_text: &str) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
     // Fill first: the text edit paints over it, the border and icons after.
-    ui.painter().rect_filled(rect, 3.0, WELL());
+    ui.painter().rect_filled(rect,egui::CornerRadius::ZERO, WELL());
     let inner = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top()),
         pos2(rect.right() - if text.is_empty() { 6.0 } else { 24.0 }, rect.bottom()));
     let r = ui.put(inner, egui::TextEdit::singleline(text).frame(egui::Frame::NONE).hint_text(hint_text)
         .vertical_align(egui::Align::Center).desired_width(inner.width()));
     let focused = r.has_focus();
     let p = ui.painter();
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, if focused { theme::ACCENT_DEEP() } else { theme::LINE() }), egui::StrokeKind::Inside);
+    p.rect_stroke(rect,egui::CornerRadius::ZERO, Stroke::new(1.0, if focused { theme::ACCENT_DEEP() } else { theme::LINE() }), egui::StrokeKind::Inside);
     paint_icon(p, pos2(rect.left() + 13.0, rect.center().y), Icon::Search, theme::TEXT_FAINT());
     if !text.is_empty() {
         let clear = Rect::from_center_size(pos2(rect.right() - 12.0, rect.center().y), vec2(18.0, 18.0));
@@ -919,7 +918,7 @@ pub(super) fn list_row(ui: &mut Ui, icon: Icon, tint: Color32, title: &str, meta
     } else {
         Color32::TRANSPARENT
     };
-    p.rect_filled(rect, 3.0, fill);
+    p.rect_filled(rect,egui::CornerRadius::ZERO, fill);
     paint_icon(p, pos2(rect.left() + 14.0, rect.center().y), icon, tint);
     let meta_w = if meta.is_empty() {
         0.0
@@ -954,8 +953,8 @@ pub(super) fn overlay_pill(p: &egui::Painter, anchor: Pos2, align: Align2, text:
 
 /// Paint the shared empty-state chrome into a caller-sized card.
 fn empty_state_card(p: &egui::Painter, card: Rect, icon: Icon, title: &str, detail: &str) {
-    p.rect_filled(card, 6.0, PANE().gamma_multiply(0.94));
-    p.rect_stroke(card, 6.0, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
+    p.rect_filled(card,egui::CornerRadius::ZERO, PANE().gamma_multiply(0.94));
+    p.rect_stroke(card,egui::CornerRadius::ZERO, Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
     paint_icon(p, card.center_top() + vec2(0.0, 20.0), icon, theme::TEXT_DIM());
     p.text(card.center_top() + vec2(0.0, 44.0), Align2::CENTER_CENTER, title, FontId::proportional(14.0), theme::TEXT());
     let galley = p.layout(detail.to_owned(), FontId::proportional(11.5), theme::TEXT_DIM(), card.width() - 28.0);

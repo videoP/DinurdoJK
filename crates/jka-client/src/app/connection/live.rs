@@ -747,6 +747,7 @@ impl App {
             session
                 .weapon_fx
                 .set_modern_sabers(self.video.modern_sabers);
+            session.weapon_fx.set_saber_core_mode(self.video.saber_core_mode);
             session
                 .weapon_fx
                 .set_saber_impact_fx(self.video.saber_impact_fx);

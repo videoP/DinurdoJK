@@ -44,7 +44,7 @@ type Axis = [[f32; 3]; 3];
 /// Presentation ownership for a spawned FX tree. Child/death/emitter effects
 /// inherit the root class so runtime A/B switches suppress the authored tree
 /// without guessing from shader names.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FxClass {
     #[default]
     General,
@@ -106,6 +106,9 @@ struct Primitive {
     time_end: i32,
     kill_time: i32,
     shader: Option<String>,
+    /// Share the material name across every generated line segment.
+    line_shader: std::sync::Arc<str>,
+    source_effect: EffectId,
     origin: [f32; 3],
     origin2: [f32; 3],
     old_origin: [f32; 3],
@@ -182,7 +185,7 @@ pub enum FxDraw {
     /// it fade out towards it instead of being cut by a hard depth edge.
     Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
-    Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: String },
+    Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: std::sync::Arc<str> },
     /// GPU-procedural, view-facing electricity ribbon. Its endpoint and authored
     /// material come from the EFX/trace; only cosmetic intermediate vertices
     /// are generated in the shader (24 steps, branching, core + corona).
@@ -289,7 +292,13 @@ pub struct FxBlade {
 
 #[derive(Clone, Default, Debug)]
 pub struct FxFrame {
+    /// Local, mutable presentation draws. Worker draws are immutable and
+    /// referenced through shared_draws when async cg_fxFPS is enabled.
     pub draws: Vec<FxDraw>,
+    pub shared_draws: Option<Arc<Vec<FxDraw>>>,
+    /// Sparse interpolated CPU particle replacements, indexed into shared_draws.
+    /// Non-particle worker primitives (especially electricity lines) stay shared.
+    pub draw_overrides: Vec<(usize, FxDraw)>,
     /// Only newly spawned author-written decal primitives, not persistent draws.
     pub decals: Vec<FxDecalSpawn>,
     /// Authored decals requesting Ghoul2 mesh projection, after world projection.
@@ -302,8 +311,8 @@ pub struct FxFrame {
     /// `(draw_index, stable_particle_id)` for ordinary CPU sprite fallbacks.
     /// The app promotes these by material and leaves every unaccepted draw intact.
     pub gpu_sprite_draw_indices: Vec<(usize, u64)>,
-    /// Stable IDs for authored CPU particle draws. Indexes refer only to `draws`;
-    /// interpolation must never touch one-shot events or render-frame saber FX.
+    /// Stable IDs for authored CPU particles. Indices refer to the worker's
+    /// `shared_draws` (async) or `draws` (sync). One-shot and saber FX are excluded.
     pub particle_draw_ids: Vec<(usize, u64)>,
     pub blades: Vec<FxBlade>,
     pub lights: Vec<FxLight>,
@@ -313,6 +322,127 @@ pub struct FxFrame {
     pub auto_light_candidates: Vec<FxAutoLightCandidate>,
     pub sounds: Vec<FxSound>,
     pub shakes: Vec<FxShake>,
+}
+
+/// Indexed read-only view over ordinary contiguous FX draws or an immutable
+/// worker snapshot with sparse interpolated sprites and local presentation FX.
+/// All renderer paths can sample it without materializing/copying 100k lines.
+pub trait FxDrawSource: Sync {
+    type Iter<'a>: ExactSizeIterator<Item = &'a FxDraw> where Self: 'a;
+    fn len(&self) -> usize;
+    fn get(&self, index: usize) -> Option<&FxDraw>;
+    fn iter(&self) -> Self::Iter<'_>;
+}
+
+impl FxDrawSource for [FxDraw] {
+    type Iter<'a> = std::slice::Iter<'a, FxDraw>;
+    fn len(&self) -> usize { <[FxDraw]>::len(self) }
+    fn get(&self, index: usize) -> Option<&FxDraw> { <[FxDraw]>::get(self, index) }
+    fn iter(&self) -> Self::Iter<'_> { <[FxDraw]>::iter(self) }
+}
+impl FxDrawSource for Vec<FxDraw> {
+    type Iter<'a> = std::slice::Iter<'a, FxDraw>;
+    fn len(&self) -> usize { Vec::len(self) }
+    fn get(&self, index: usize) -> Option<&FxDraw> { self.as_slice().get(index) }
+    fn iter(&self) -> Self::Iter<'_> { self.as_slice().iter() }
+}
+impl<const N: usize> FxDrawSource for [FxDraw; N] {
+    type Iter<'a> = std::slice::Iter<'a, FxDraw>;
+    fn len(&self) -> usize { N }
+    fn get(&self, index: usize) -> Option<&FxDraw> { self.as_slice().get(index) }
+    fn iter(&self) -> Self::Iter<'_> { self.as_slice().iter() }
+}
+
+/// Append-only local output over the shared worker tick. Expensive render-frame
+/// work reads the immutable geometry by reference rather than cloning it.
+#[derive(Default)]
+pub struct FxDrawStream {
+    shared: Option<Arc<Vec<FxDraw>>>,
+    overrides: Vec<(usize, FxDraw)>,
+    local: Vec<FxDraw>,
+    /// Optional logical-to-raw index remap after GPU resident promotion.
+    /// Filtering never clones worker geometry.
+    kept: Option<Vec<usize>>,
+}
+
+impl FxDrawStream {
+    pub fn from_frame(mut frame: FxFrame) -> Self {
+        Self::from_parts(frame.shared_draws.take(),
+            std::mem::take(&mut frame.draw_overrides), std::mem::take(&mut frame.draws))
+    }
+    pub fn from_parts(shared: Option<Arc<Vec<FxDraw>>>, overrides: Vec<(usize, FxDraw)>, local: Vec<FxDraw>) -> Self {
+        Self { shared, overrides, local, kept: None }
+    }
+    pub fn len(&self) -> usize {
+        self.kept.as_ref().map_or_else(|| self.shared.as_ref().map_or(0, |s| s.len()) + self.local.len(), Vec::len)
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn get(&self, index: usize) -> Option<&FxDraw> {
+        let index = if let Some(kept) = &self.kept { *kept.get(index)? } else { index };
+        if let Some(shared) = &self.shared {
+            if index < shared.len() {
+                if let Ok(i) = self.overrides.binary_search_by_key(&index, |(slot, _)| *slot) {
+                    return Some(&self.overrides[i].1);
+                }
+                return shared.get(index);
+            }
+            self.local.get(index - shared.len())
+        } else { self.local.get(index) }
+    }
+    pub fn iter(&self) -> FxDrawStreamIter<'_> { FxDrawStreamIter { source: self, index: 0 } }
+    pub fn push(&mut self, draw: FxDraw) {
+        if let Some(kept) = &mut self.kept {
+            kept.push(self.shared.as_ref().map_or(0, |s| s.len()) + self.local.len());
+        }
+        self.local.push(draw);
+    }
+    pub fn local_mut(&mut self) -> &mut Vec<FxDraw> {
+        // This is only used to append trails/wakes *before* resident promotion.
+        debug_assert!(self.kept.is_none(), "append to FX stream after index filtering");
+        &mut self.local
+    }
+    pub fn clear(&mut self) {
+        self.shared = None;
+        self.overrides.clear();
+        self.local.clear();
+        self.kept = None;
+    }
+    /// Resident promotion discards selected logical indices but does not copy
+    /// or allocate the underlying (possibly very large) FX geometry vector.
+    pub fn retain(&mut self, mut predicate: impl FnMut(&FxDraw) -> bool) {
+        let mut kept = Vec::with_capacity(self.len());
+        for i in 0..self.len() {
+            let raw = self.kept.as_ref().map_or(i, |old| old[i]);
+            if self.get(i).is_some_and(&mut predicate) { kept.push(raw); }
+        }
+        self.kept = Some(kept);
+    }
+}
+
+pub struct FxDrawStreamIter<'a> { source: &'a FxDrawStream, index: usize }
+impl<'a> Iterator for FxDrawStreamIter<'a> {
+    type Item = &'a FxDraw;
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.source.get(self.index);
+        if result.is_some() { self.index += 1; }
+        result
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.source.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+impl ExactSizeIterator for FxDrawStreamIter<'_> {}
+impl<'a> IntoIterator for &'a FxDrawStream {
+    type Item = &'a FxDraw;
+    type IntoIter = FxDrawStreamIter<'a>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+impl FxDrawSource for FxDrawStream {
+    type Iter<'a> = FxDrawStreamIter<'a>;
+    fn len(&self) -> usize { FxDrawStream::len(self) }
+    fn get(&self, index: usize) -> Option<&FxDraw> { FxDrawStream::get(self, index) }
+    fn iter(&self) -> Self::Iter<'_> { FxDrawStream::iter(self) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -471,6 +601,11 @@ pub struct FxSystem {
     /// Promotion metadata prepared by the map worker. Runtime EFX parsing stays
     /// lazy for normal OpenJK behavior, but it no longer scans materials/images.
     light_promotion: Arc<super::light_promotion::FxLightPromotionCatalog>,
+    population_last_report: Option<std::time::Instant>,
+    population_plays: HashMap<EffectId, u64>,
+    /// Shader-path interning on the FX worker: no owned shader per electricity
+    /// segment, and no duplicate backing strings across effect instances.
+    line_shaders: HashMap<String, Arc<str>>,
 }
 
 impl Default for FxSystem {
@@ -512,6 +647,9 @@ impl FxSystem {
             physics_mode: super::FX_PHYSICS_DEFAULT,
             collision: None,
             light_promotion: Arc::new(super::light_promotion::FxLightPromotionCatalog::default()),
+            population_last_report: None,
+            population_plays: HashMap::new(),
+            line_shaders: HashMap::new(),
         }
     }
 
@@ -713,6 +851,9 @@ impl FxSystem {
     }
 
     fn play_effect_class(&mut self, id: EffectId, origin: [f32; 3], axis: Axis, class: FxClass) {
+        if crate::fx::diagnostics::enabled() {
+            *self.population_plays.entry(id).or_default() += 1;
+        }
         let Some(effect) = (id as usize).checked_sub(1).and_then(|index| self.effects.get(index)) else {
             return;
         };
@@ -844,6 +985,9 @@ impl FxSystem {
         let collision = &mut self.collision;
         let owned = &self.gpu_owned;
         let mut gpu_offloaded = 0;
+        let pop_diag = crate::fx::diagnostics::enabled() && self.population_last_report
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1));
+        let mut population = HashMap::<(EffectId, PrimType, FxClass), (usize, usize)>::new();
         self.active.retain_mut(|prim| {
             if time > prim.kill_time {
                 if prim.flags & FX_DEATH_RUNS_FX != 0 && prim.flags & FX_KILL_ON_IMPACT == 0 && prim.death_fx != 0 {
@@ -889,8 +1033,13 @@ impl FxSystem {
             let visible = crate::fx::render_enabled()
                 && (saber_impact_fx || prim.class != FxClass::SaberImpact);
             let world = collision.as_deref_mut().map(|world| world as &mut dyn TraceWorld);
-            let first_draw = if TRACK_RUNNERS { out.draws.len() } else { 0 };
+            let first_draw = if TRACK_RUNNERS || pop_diag { out.draws.len() } else { 0 };
             let alive = update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible, physics_mode, world);
+            if pop_diag && alive {
+                let entry = population.entry((prim.source_effect, prim.kind, prim.class)).or_default();
+                entry.0 += 1;
+                entry.1 += out.draws.len() - first_draw;
+            }
             if TRACK_RUNNERS {
                 if let FxClass::MapRunner(id) = prim.class {
                     out.runner_draws.extend((first_draw..out.draws.len()).map(|i| (i, id)));
@@ -899,6 +1048,23 @@ impl FxSystem {
             alive
         });
         self.gpu_offloaded_last_frame = gpu_offloaded;
+        if pop_diag {
+            self.population_last_report = Some(std::time::Instant::now());
+            // Report named sources rather than just the raw segment count: one
+            // electricity primitive can expand to hundreds of line draws.
+            let mut rows: Vec<_> = population.into_iter().collect();
+            rows.sort_unstable_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| b.1.0.cmp(&a.1.0)));
+            println!("[FX POP] time={} active={} scheduled={} output_draws={} output_lights={} tracked_sources={} (top 10 by draw expansion)",
+                time, self.active.len(), self.scheduled.len(), out.draws.len(), out.lights.len(), rows.len());
+            for ((id, kind, class), (count, draws)) in rows.into_iter().take(10) {
+                let name = self.effects.get((id as usize).saturating_sub(1))
+                    .map(|effect| effect.template.name.as_str()).unwrap_or("<unknown>");
+                println!("[FX POP] effect={} id={} primitive={:?} class={:?} active={} output_draws={} draws_per_prim={:.1} plays_since_report={}",
+                    name, id, kind, class, count, draws, draws as f64 / count.max(1) as f64,
+                    self.population_plays.get(&id).copied().unwrap_or(0));
+            }
+            self.population_plays.clear();
+        }
         for (id, origin, dir, class) in deaths {
             self.play_effect_dir_class(id, origin, dir, class);
         }
@@ -1183,6 +1349,17 @@ impl FxSystem {
         let length = (fx.length_start.get(rng), fx.length_end.get(rng), parm(fx.length_parm.get(rng), FX_LENGTH_SHIFT));
         let alpha = (fx.alpha_start.get(rng), fx.alpha_end.get(rng), parm(fx.alpha_parm.get(rng), FX_ALPHA_SHIFT));
         let rgb_parm = parm(fx.rgb_parm.get(rng), FX_RGB_SHIFT);
+        let line_shader: Arc<str> = if matches!(fx.kind, PrimType::Line | PrimType::Electricity | PrimType::Tail) {
+            if let Some(path) = shader.as_deref() {
+                if let Some(handle) = self.line_shaders.get(path) {
+                    Arc::clone(handle)
+                } else {
+                    let handle: Arc<str> = Arc::from(path);
+                    self.line_shaders.insert(path.to_owned(), Arc::clone(&handle));
+                    handle
+                }
+            } else { Arc::from("") }
+        } else { Arc::from("") };
         let mut primitive = Primitive {
             visual_id: self.next_visual_id,
             gpu_id: None,
@@ -1195,6 +1372,8 @@ impl FxSystem {
             time_start: time,
             time_end: time + life,
             kill_time: time + life,
+            line_shader,
+            source_effect: id,
             shader,
             origin: org,
             origin2: org2,
@@ -1347,10 +1526,13 @@ fn update_primitive(
             }
         }
         _ => {
-            let shader = if visible { prim.shader.clone().unwrap_or_default() } else { String::new() };
+            // Electricity subdivides each authored primitive into many lines.
+            // Never allocate a separate shader String for every segment.
+            let line_kind = matches!(prim.kind, PrimType::Line | PrimType::Electricity | PrimType::Tail);
+            let shader = if visible && !line_kind { prim.shader.clone().unwrap_or_default() } else { String::new() };
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgba = rgba_at(prim, time, rng);
-            if visible && !shader.is_empty() {
+            if visible && prim.shader.as_ref().is_some_and(|shader| !shader.is_empty()) {
                 if let Some(auto) = prim.auto_light {
                     let segment = if matches!(prim.kind, PrimType::Line | PrimType::Electricity) {
                         Some([prim.origin, prim.origin2])
@@ -1366,7 +1548,7 @@ fn update_primitive(
                         origin: light_origin,
                         radius,
                         rgba,
-                        shader: shader.clone(),
+                        shader: prim.shader.clone().unwrap_or_default(),
                         life_ms: prim.time_end.saturating_sub(prim.time_start),
                         spot,
                         segment,
@@ -1415,19 +1597,19 @@ fn update_primitive(
                             width: radius.max(0.15), chaos: prim.elasticity,
                             seed: (prim.time_start as f32 * 0.127 + prim.origin[0] * 0.037
                                 + prim.origin[1] * 0.053 + prim.origin[2] * 0.019).fract().abs(),
-                            rgba, shader,
+                            rgba, shader: prim.shader.clone().unwrap_or_default(),
                         });
                     }
                 }
                 PrimType::Line => {
                     if visible {
-                        out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader });
+                        out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader: prim.line_shader.clone() });
                     }
                 }
                 PrimType::Electricity => {
                     if visible {
                         for (start, end) in electricity_segments(prim.origin, prim.origin2, prim.elasticity, rng) {
-                            out.draws.push(FxDraw::Line { start, end, width: radius, rgba, shader: shader.clone() });
+                            out.draws.push(FxDraw::Line { start, end, width: radius, rgba, shader: prim.line_shader.clone() });
                         }
                     }
                 }
@@ -1437,7 +1619,7 @@ fn update_primitive(
                     let back = normalize(sub(prim.old_origin, prim.origin));
                     let end = add(prim.origin, scale(back, length));
                     if visible {
-                        out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader });
+                        out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader: prim.line_shader.clone() });
                     }
                 }
                 PrimType::Cylinder => {
@@ -1896,6 +2078,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_fx_draw_stream_preserves_overrides_and_filtered_indices() {
+        let sprite = |x: f32| FxDraw::Sprite {
+            shader_time: 0.0, origin: [x, 0.0, 0.0], radius: 1.0,
+            rotation: 0.0, rgba: [255; 4], shader: "test".to_owned(),
+        };
+        let shared = Arc::new(vec![sprite(1.0), sprite(2.0), sprite(3.0)]);
+        let mut stream = FxDrawStream::from_parts(Some(Arc::clone(&shared)),
+            vec![(1, sprite(20.0))], vec![sprite(4.0)]);
+        assert_eq!(stream.len(), 4);
+        assert_eq!(stream.iter().count(), 4);
+        let FxDraw::Sprite { origin, .. } = stream.get(1).unwrap() else { panic!() };
+        assert_eq!(origin[0], 20.0);
+        stream.retain(|draw| matches!(draw, FxDraw::Sprite { origin, .. } if origin[0] != 1.0));
+        assert_eq!(stream.len(), 3);
+        let FxDraw::Sprite { origin, .. } = stream.get(0).unwrap() else { panic!() };
+        assert_eq!(origin[0], 20.0);
+        stream.push(sprite(5.0));
+        assert_eq!(stream.len(), 4);
+        assert_eq!(stream.iter().count(), 4);
+        assert!(Arc::ptr_eq(stream.shared.as_ref().unwrap(), &shared),
+            "filter and append should not clone shared worker draws");
+    }
+
+    #[test]
+    fn electricity_line_segments_reuse_one_material_handle() {
+        const BOLT: &str = "Electricity\n{\nlife 500\norigin2 140 0 0\nshader\n[\ngfx/effects/blaster_blob\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/bolt", &mut read_fixture(&[("effects/test/bolt.efx", BOLT)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.play_effect_dir(id, [0.0; 3], [0.0, 0.0, 1.0]);
+        let frame = fx.frame();
+        assert!(frame.draws.len() >= 3, "authored bolt should subdivide");
+        let FxDraw::Line { shader: a, .. } = &frame.draws[0] else { panic!("expected first line") };
+        let FxDraw::Line { shader: b, .. } = &frame.draws[1] else { panic!("expected second line") };
+        assert!(std::sync::Arc::ptr_eq(a, b), "subdivided lines must share material storage");
+        assert_eq!(a.as_ref(), "gfx/effects/blaster_blob");
+    }
+
+    #[test]
     fn electricity_shorter_than_one_step_draws_nothing() {
         // rd-vanilla's `for (i = 20; i <= dis; i += 20)` never runs below 20 units.
         let mut rng = Rng::new(1);
@@ -1954,7 +2176,7 @@ mod tests {
         assert!((start[1] - 8.0).abs() < 1e-5 && (end[1] + 80.0).abs() < 1e-5);
         assert_eq!(*width, 1.5);
         assert_eq!(rgba[3], 153, "useAlpha writes 0.6 into the alpha byte");
-        assert_eq!(shader, "gfx/effects/blaster_blob");
+        assert_eq!(shader.as_ref(), "gfx/effects/blaster_blob");
         let FxDraw::Sprite { origin, radius, rgba, .. } = &frame.draws[1] else { panic!() };
         assert!((origin[1] + 5.0).abs() < 1e-5, "no motion on the spawn frame");
         assert_eq!(*radius, 2.0);

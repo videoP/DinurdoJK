@@ -889,6 +889,9 @@ impl App {
             deadline: Instant::now() + Duration::from_secs(VIDEO_CONFIRM_TIMEOUT_SECS),
             shown_seconds: seconds,
         });
+        // A renderer/input restart can leave the game mouse grabbed. The
+        // keep/revert dialog needs an unlocked, visible native cursor.
+        self.set_capture(false);
         let applied = self.applied_video_mode();
         self.console_status = format!(
             "VIDEO CHANGED TO {}X{} {} / {} - CONFIRM WITHIN {seconds} SECONDS",

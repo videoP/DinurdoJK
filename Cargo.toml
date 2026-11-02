@@ -17,15 +17,22 @@ strip = true
 lto = true
 codegen-units = 1
 
-# Iteration profile (build.ps1 -Fast). The custom profile builds into its
-# own target/<name> folder, so switching modes never discards another mode's cache.
-# Keep ThinLTO for near-release optimization and enable a persistent incremental
-# cache for local/path crates. It is retained across builds; never auto-purged.
+# -Fast: optimized iteration (original ThinLTO settings, persistent incremental cache).
+# -Faster: visual-only iteration, fast codegen and minimal cache churn.
+# Each profile has its own target/<profile> folder; no automatic cache cleanup.
 [profile.fast]
 inherits = "release"
 lto = "thin"
 codegen-units = 16
 incremental = true
+
+[profile.faster]
+inherits = "release"
+opt-level = 0
+debug = 0
+lto = "off"
+codegen-units = 16
+incremental = false
 
 # wgpu-core 30.0.1 with one fix: Queue::present re-transitions the surface
 # PRESENT -> PRESENT and pays a second queue submit every frame (~20 us, ~5-8% at

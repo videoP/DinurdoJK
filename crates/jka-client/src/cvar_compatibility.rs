@@ -85,6 +85,7 @@ pub(crate) fn digest(text: &str) -> String {
         // New flare settings did not exist in the frozen pre-registry settings.
         .replace(", world_flares: false", "")
         .replace(", saber_flares: true", "")
+        .replace(", saber_core_mode: 0", "")
         .replace(", rt_taa: 0", "")
         .replace(", baked_sun_removal: 0.0", "")
         .replace(", baked_sun_cache: false", "")

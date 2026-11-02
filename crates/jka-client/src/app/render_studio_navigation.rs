@@ -2,6 +2,26 @@
 use super::render_studio_timeline::StudioCameraKey;
 use super::{App, FrontendPage};
 use glam::Vec3;
+use super::render_studio_camera::{frame_offset};
+
+/// A captured view is an explicit fixed shot; inherited tracking must not
+/// replace its position or angles when the timeline is rendered.
+pub(in crate::app) fn fixed_demo_camera_from_view(
+    mut key: StudioCameraKey, camera: crate::camera::Camera,
+) -> StudioCameraKey {
+    use super::render_studio_timeline::{StudioCameraSource, StudioDemoPov};
+    let client = match key.source { StudioCameraSource::Demo { client, .. } => client, _ => -1 };
+    key.position = crate::scene::jka_position(camera.position.to_array());
+    key.yaw = camera.yaw.to_degrees();
+    key.pitch = -camera.pitch.to_degrees();
+    key.fov = camera.cg_fov();
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Free, client };
+    key.demo_follow.aim_enabled = false;
+    key.demo_follow.blend_seconds = 0.0;
+    key.focus_target = None;
+    key.rig_orbit = None;
+    key
+}
 
 pub(in crate::app) struct StudioPreviewNavigation {
     pub selected: bool,
@@ -44,7 +64,7 @@ impl StudioPreviewNavigation {
         if looking {
             // Same yaw/pitch signs and sensitivity as JKA's free camera.
             camera.yaw = (camera.yaw - mouse[0] * mouse_scale[0]).rem_euclid(360.0);
-            camera.pitch = (camera.pitch - mouse[1] * mouse_scale[1]).clamp(-89.0, 89.0);
+            camera.pitch = (camera.pitch + mouse[1] * mouse_scale[1]).clamp(-89.0, 89.0);
         }
         let moving = movement.length_squared() > 0.0 && dt > 0.0;
         if moving {
@@ -52,11 +72,11 @@ impl StudioPreviewNavigation {
             let pitch = camera.pitch.to_radians();
             let forward = Vec3::new(
                 yaw.cos() * pitch.cos(),
-                pitch.sin(),
-                -yaw.sin() * pitch.cos(),
+                yaw.sin() * pitch.cos(),
+                -pitch.sin(),
             );
-            let right = Vec3::new(yaw.sin(), 0.0, yaw.cos());
-            let direction = (right * movement.x + Vec3::Y * movement.y + forward * movement.z)
+            let right = Vec3::new(yaw.sin(), -yaw.cos(), 0.0);
+            let direction = (right * movement.x + Vec3::Z * movement.y + forward * movement.z)
                 .normalize_or_zero();
             let delta = direction * self.speed * dt.clamp(0.0, 0.05);
             camera.position = (Vec3::from_array(camera.position) + delta)
@@ -132,33 +152,52 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn capture_studio_preview_camera(&mut self, time: f64) {
-        let is_demo=self.render_studio.timeline.demo_at(time).is_some();
-        let preview_camera=if is_demo {
+    pub(in crate::app) fn studio_current_preview_camera(&self) -> crate::camera::Camera {
+        if let Some(key) = self.render_studio.spatial.scene_camera {
+            return super::render_studio_spatial::camera_from_key(key);
+        }
+        if self.render_studio.timeline.demo_at(self.render_studio.timeline_time()).is_some() {
             self.render_studio.scene_frame.as_ref().map(|scene|
                 if scene.progress>=0.5 {scene.incoming.as_ref().unwrap_or(&scene.outgoing).camera}
                 else {scene.outgoing.camera})
                 .unwrap_or_else(||self.asset_preview_camera())
-        } else {self.asset_preview_camera()};
+        } else { self.asset_preview_camera() }
+    }
+
+    pub(in crate::app) fn preview_studio_camera_key(&mut self, index: usize) {
+        let Some(key) = self.render_studio.timeline.camera.get(index) else { return; };
+        let time = key.time;
+        self.set_studio_mouse_look(false);
+        self.render_studio.timeline.seek(time);
+        self.render_studio.spatial.scene_camera = None;
+        self.render_studio.spatial.drag = None;
+        self.render_studio.cinematic_preview = None;
+        self.render_studio.preview_sample_time = None;
+        self.render_studio.navigation.selected = false;
+        self.profile_preview_key = None;
+        self.egui_repaint_requested = true;
+    }
+
+    pub(in crate::app) fn capture_studio_preview_camera(&mut self, time: f64) {
+        let is_demo=self.render_studio.timeline.demo_at(time).is_some();
+        let preview_camera=self.studio_current_preview_camera();
         let mut key = super::render_studio_spatial::key_from_camera(preview_camera);
         let previous=self.render_studio.timeline.camera_at(time);
         let inherited=previous.source;
-        // A new camera key inherits the current per-shot demo rig as well as
-        // its source, otherwise capturing a shot silently resets distance/FOV.
+        // Stage attachments retain their rig; a demo view becomes a fixed shot.
         key.demo_follow=previous.demo_follow;
         key.lens=previous.lens;
-        key.focus_target=previous.focus_target.map(|_|(preview_camera.position+preview_camera.forward()*previous.lens.focus_distance).to_array());
+        key.focus_target=previous.focus_target.map(|_|crate::scene::jka_position((preview_camera.position+preview_camera.forward()*previous.lens.focus_distance).to_array()));
         key.lens.aperture=key.lens.aperture.map(|n|n.min(128.0));
         key.source=inherited;
-        if is_demo && !matches!(inherited,super::render_studio_timeline::StudioCameraSource::Demo{..}) {
-            Self::studio_default_demo_camera(&mut key);
-            key.fov=self.studio_default_fov();
+        if is_demo {
+            key = fixed_demo_camera_from_view(key, preview_camera);
         }
         if !is_demo && self.render_studio.timeline.camera_rig.position.enabled {
             let mut captured_orbit=false;
             if let Some(frame)=self.studio_orbit_edit_frame(self.render_studio.timeline_time()) {
                 let mut binding=self.render_studio.timeline.camera_rig.position.clone();
-                binding.offset=frame.offset(key.position,binding.local_offset);
+                binding.offset=frame_offset(frame,key.position,binding.local_offset);
                 if let Some(orbit)=super::render_studio_camera::StudioCameraOrbit::from_binding(&binding,frame,[0.;3]) {
                     if self.set_studio_orbit_key(time,orbit) {
                         key.position=self.render_studio.timeline.camera_rig.reference_position;
@@ -171,16 +210,21 @@ impl App {
             if !captured_orbit {
                 let shot = self.studio_shot_camera();
                 let base = self.render_studio.timeline.camera_at(self.render_studio.timeline_time());
-                key.position=std::array::from_fn(|a|base.position[a]+key.position[a]-shot.position[a]);
+                let shot_position=crate::scene::jka_position(shot.position.to_array());
+                key.position=std::array::from_fn(|a|base.position[a]+key.position[a]-shot_position[a]);
             }
         }
         key.time = time;
-        self.render_studio.timeline.add_camera_key(key);
-        self.profile_preview_key = None;
-        self.render_studio.status = if self.render_studio.timeline.camera_rig.target.enabled {
+        if self.render_studio.timeline.camera.iter().any(|existing| (existing.time-time).abs()<1e-5) {
+            self.render_studio.timeline.insert_camera_key(key);
+        } else { self.render_studio.timeline.add_camera_key(key); }
+        if let Some(index) = self.render_studio.timeline.selected_camera {
+            self.preview_studio_camera_key(index);
+        }
+        self.render_studio.status = if !is_demo && self.render_studio.timeline.camera_rig.target.enabled {
             "Captured preview camera; the camera rig still controls shot aim".into()
         } else {
-            "Camera key captured from the current preview view".into()
+            "Current view saved to camera key; previewing the output shot".into()
         };
     }
 }
@@ -231,12 +275,40 @@ mod tests {
         assert!((captured.yaw - view.yaw).abs() < 0.0001);
         assert!((captured.pitch - view.pitch).abs() < 0.0001);
         assert!((captured.fov - view.fov).abs() < 0.0001);
+        assert!(app.render_studio.spatial.scene_camera.is_none(), "capture previews the output shot");
+        // A demo capture replaces the selected key without retaining a rig
+        // that would override the view the user just positioned.
+        app.render_studio.timeline.demos.push(serde_json::from_value(serde_json::json!({
+            "name":"camera-test", "game":"japro", "start":0.0,
+            "duration_ms":15000, "in_ms":0, "out_ms":15000
+        })).unwrap());
+        app.render_studio.timeline.camera[0].source = super::super::render_studio_timeline::StudioCameraSource::Demo {
+            pov: super::super::render_studio_timeline::StudioDemoPov::Follow, client: 7,
+        };
+        app.render_studio.timeline.camera[0].demo_follow.aim_enabled = true;
+        app.render_studio.timeline.camera[0].focus_target = Some([0.0; 3]);
+        app.render_studio.spatial.scene_camera = Some(view);
+        let count = app.render_studio.timeline.camera.len();
+        app.capture_studio_preview_camera(0.0);
+        assert_eq!(app.render_studio.timeline.camera.len(), count, "replace the existing key");
+        let captured = app.render_studio.timeline.camera[0];
+        assert!(matches!(captured.source, super::super::render_studio_timeline::StudioCameraSource::Demo {
+            pov: super::super::render_studio_timeline::StudioDemoPov::Free, client: 7,
+        }));
+        assert_eq!(captured.position, view.position);
+        assert!((captured.yaw-view.yaw).abs()<0.0001);
+        assert!((captured.pitch-view.pitch).abs()<0.0001);
+        assert!((captured.fov-view.fov).abs()<0.0001);
+        assert!(!captured.demo_follow.aim_enabled);
+        assert!(captured.focus_target.is_none());
+        assert!(app.render_studio.spatial.scene_camera.is_none());
         // Demo worlds disable the isolated-asset preview flag. The independent
         // Scene observer must still supply its camera and accept navigation.
+        app.render_studio.spatial.scene_camera=Some(view);
         app.profile_preview_active=false;app.window_focused=true;
         app.overlay=super::super::OverlayMode::None;
         assert!(app.studio_navigation_available());
-        assert_eq!(app.asset_preview_camera().position.to_array(),view.position);
+        assert_eq!(app.asset_preview_camera().position.to_array(),crate::scene::render_position(view.position));
     }
     #[test]
     fn studio_free_flight_uses_jka_axes_normalizes_motion_and_requires_selection() {
@@ -257,7 +329,7 @@ mod tests {
         assert!((Vec3::from_array(camera.position).length() - 8.0).abs() < 0.0001);
         let before = camera.position;
         nav.step(&mut camera, Vec3::Y, 0.05, [0.2; 2]);
-        assert_eq!(camera.position[1], before[1] + 8.0);
+        assert_eq!(camera.position[2], before[2] + 8.0);
     }
     #[test]
     fn studio_free_flight_looks_in_place_and_wheel_only_changes_speed() {
@@ -272,7 +344,7 @@ mod tests {
         nav.step(&mut camera, Vec3::ZERO, 0.016, [0.2; 2]);
         assert_eq!(camera.position, position);
         assert_eq!(camera.yaw, 358.0);
-        assert_eq!(camera.pitch, -89.0);
+        assert_eq!(camera.pitch, 89.0);
         nav.change_speed(1.0);
         assert_eq!(nav.speed, 200.0);
         nav.change_speed(-1.0);

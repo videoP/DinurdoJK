@@ -279,6 +279,7 @@ fn expected_frame(
     frame: Frame,
     fields: &CpuFields,
     previous: &wgpu::Texture,
+    depth_range: [f32; 2],
 ) -> (Vec<[f32; 4]>, Vec<f32>) {
     let [w, h] = setup.dimensions;
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -296,7 +297,7 @@ fn expected_frame(
             let unit = foam_field::execution_unit(setup, [x, y]);
             let a = foam_field::advection_unit(setup, frame, [x, y], fields.velocity(unit));
             units.push([a[0], a[1], 0.0, 0.0]);
-            emits.push(foam_field::emit_amount(foam_field::emission_inputs(setup, frame, unit, fields)));
+            emits.push(foam_field::emit_amount_with_depth_range(foam_field::emission_inputs(setup, frame, unit, fields), depth_range));
             // Propagate check_noise's validated curl tolerance at this noise
             // input magnitude through NoiseOffset into the advection index.
             let m = setup.unit_to_world;
@@ -400,7 +401,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
         &setup,
     )
     .unwrap();
-    assert_eq!(field.logical_bytes(), 2 * 13 * 11 * 8 + 144);
+    assert_eq!(field.logical_bytes(), 2 * 13 * 11 * 8 + 160);
     let frames = [
         (0usize, Frame::new(0.016, 1234.5)),
         (1, Frame::new(0.033, 1234.533)),
@@ -427,12 +428,24 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
             water: states[s].clone(),
             normals: normals.clone(),
         };
-        let (expected, spread) = expected_frame(device, queue, &setup, frame, &fields, &traces[k]);
+        let (expected, spread) = expected_frame(device, queue, &setup, frame, &fields, &traces[k], foam_field::WATER_DEPTH.0);
         let gpu = read_texture(device, queue, &traces[k + 1], 0);
         compare_frame(&gpu, &expected, &spread, &format!("foam frame {k}"));
         peak = gpu.iter().fold(peak, |m, v| m.max(v[0]));
     }
     assert!(peak > 0.05, "fixture must exercise emission and advection, peak {peak}");
+    // Changing the generation depth keeps old foam and changes only the next
+    // frame's emission; queued native/default frames above stay independent.
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let previous = trace(device, &mut encoder, &field);
+    field.set_minimum_depth(2.5);
+    let frame = Frame::new(0.016, 86400.266);
+    field.encode_frame(device, &mut encoder, 0, frame).unwrap();
+    let result = trace(device, &mut encoder, &field);
+    queue.submit(Some(encoder.finish()));
+    let fields = CpuFields { dimensions: dims, water: states[0].clone(), normals: normals.clone() };
+    let (expected, spread) = expected_frame(device, queue, &setup, frame, &fields, &previous, foam_field::authored_depth_range(2.5));
+    compare_frame(&read_texture(device, queue, &result, 0), &expected, &spread, "live authored shallow foam depth");
     // Frozen hydraulics keep only the final state's binding.
     field.retain_state(0);
     let mut encoder = device.create_command_encoder(&Default::default());
@@ -455,6 +468,16 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
         &bad,
     )
     .is_err());
+}
+
+#[test]
+fn river_foam_minimum_depth_preserves_native_ratio_and_can_allow_shallow_rapids() {
+    assert_eq!(foam_field::authored_depth_range(150.0), [150.0, 500.0]);
+    let inputs = foam_field::EmissionInputs { curl: 3.0, curvature: 0.05, velocity: [300.0, 0.0], water_depth: 10.0, depth_difference: 0.0 };
+    assert_eq!(foam_field::emit_amount(inputs), 0.0);
+    assert!(foam_field::emit_amount_with_depth_range(inputs, foam_field::authored_depth_range(2.5)) > 0.0);
+    assert!(foam_field::emit_amount_with_depth_range(inputs, foam_field::authored_depth_range(0.0)).is_finite());
+    assert_eq!(foam_field::emit_amount_with_depth_range(foam_field::EmissionInputs { curl: 0.0, curvature: 0.0, ..inputs }, foam_field::authored_depth_range(0.0)), 0.0, "removing the depth gate must still require turbulence");
 }
 
 /// Wiring against the real Simulation arrays and material NormalGrid.
@@ -495,6 +518,6 @@ pub fn check_simulation(
         water: super::read_state(device, queue, simulation.state()),
         normals: read_texture(device, queue, normal_grid, 0),
     };
-    let (expected, spread) = expected_frame(device, queue, &setup, frame, &fields, &previous);
+    let (expected, spread) = expected_frame(device, queue, &setup, frame, &fields, &previous, foam_field::WATER_DEPTH.0);
     compare_frame(&read_texture(device, queue, field.foam(), 0), &expected, &spread, "real river foam");
 }

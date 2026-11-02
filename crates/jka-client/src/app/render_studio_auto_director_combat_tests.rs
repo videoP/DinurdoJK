@@ -283,8 +283,8 @@ fn framing_checks_each_exact_impact_in_a_chain() {
     assert!(shot_sample_times(4000, 6500, 7, &kills).contains(&5371));
     let intent = ShotIntent { subject: 0, kills };
     let mut shot = StudioDirectorShot::new(0, P::Static, -1, 4.0, 2.5);
-    shot.position_override = Some(render(Vec3::new(-300.0, 0.0, 50.0)));
-    shot.focus_target = Some(render(Vec3::new(100.0, 0.0, 30.0)));
+    shot.position_override = Some(authored_point(Vec3::new(-300.0, 0.0, 50.0)));
+    shot.focus_target = Some(authored_point(Vec3::new(100.0, 0.0, 30.0)));
     shot.fov = 70.0;
     assert!(!director().frames_ok(&path, &shot, Beat::Kill, 4000, 6500, &intent));
 }
@@ -533,8 +533,8 @@ fn low_aim_pitch_is_corrected_while_chase_keeps_the_recorded_yaw() {
     shot.rig.pitch_offset = 10.0;
     assert!(director().plan_chase(&mut shot, &path, 0, 3000, 0, Some(1)));
     for key in &shot.path_keys {
-        let camera = Vec3::from_array(super::super::scene::jka_position(key.position));
-        let look = Vec3::from_array(super::super::scene::jka_position(key.look));
+        let camera = Vec3::from_array(key.position);
+        let look = Vec3::from_array(key.look);
         let direction = look - camera;
         assert!((heading_of(direction) - 30.0).abs() < 0.01);
         let pitch = (-direction.z)
@@ -756,7 +756,7 @@ fn baked_combat_camera_follows_actor_time_through_slow_motion() {
         let time = job.clip.timeline_at_source_ms(ms);
         let u = ((time - camera.start) / camera.duration) as f32;
         let (_, look) = camera.path_at(u).unwrap();
-        let look = Vec3::from_array(super::super::scene::jka_position(look));
+        let look = Vec3::from_array(look);
         assert!(
             (look.x - (ms as f32 * 0.1 + 256.0)).abs() < 0.2,
             "camera leads/lags the actor at source {ms}: {look:?}"

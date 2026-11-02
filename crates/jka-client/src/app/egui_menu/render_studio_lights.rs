@@ -190,7 +190,7 @@ impl App {
     pub(super) fn egui_studio_light_header(&mut self,ui:&mut egui::Ui,p:&egui::Painter,head:egui::Rect,kind:StudioTrackRow,locked:bool) {
         let (layer,light)=match kind {StudioTrackRow::LightLayer(l)=>(l,None),StudioTrackRow::Light(l,i)=>(l,Some(i)),_=>return};
         let selected=self.render_studio.light_ui.selection.is_some_and(|s|s.layer==layer&&s.light==light);
-        if selected {p.rect_stroke(head.shrink(1.0),2.0,egui::Stroke::new(1.0,LIGHT),egui::StrokeKind::Inside);}
+        if selected {p.rect_stroke(head.shrink(1.0),egui::CornerRadius::ZERO,egui::Stroke::new(1.0,LIGHT),egui::StrokeKind::Inside);}
         let offset=if light.is_none(){54.0}else{26.0};
         let click=ui.interact(egui::Rect::from_min_max(head.min+egui::vec2(offset,0.0),head.max),
             ui.make_persistent_id(("studio_light_header",layer,light)),egui::Sense::click());

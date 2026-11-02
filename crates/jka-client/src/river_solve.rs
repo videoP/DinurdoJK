@@ -52,6 +52,7 @@ pub(super) struct SolveConvergence {
     bytes: u64,
     readback_state: Readback,
     has_snapshot: bool,
+    discard_pending: bool,
     last_sample: Instant,
     last_poll: Instant,
     last_sim_seconds: f64,
@@ -156,10 +157,21 @@ impl SolveConvergence {
         let now = Instant::now();
         Self {
             pipeline, groups, snapshot, summaries, readback, groups_xy, bytes,
-            readback_state: Readback::Idle, has_snapshot: false,
+            readback_state: Readback::Idle, has_snapshot: false, discard_pending: false,
             last_sample: now, last_poll: now, last_sim_seconds: 0.0,
             consecutive: 0, samples: 0,
         }
+    }
+
+    /// A live source edit invalidates comparisons from the old flow. Reuse the
+    /// probe allocation and drain any outstanding async map without counting it.
+    pub(super) fn restart(&mut self, simulated_seconds: f64) {
+        self.has_snapshot = false;
+        self.consecutive = 0;
+        self.samples = 0;
+        self.last_sample = Instant::now();
+        self.last_sim_seconds = simulated_seconds;
+        self.discard_pending = !matches!(&self.readback_state, Readback::Idle);
     }
 
     /// Poll only occasionally and never Wait. Called each render frame while
@@ -183,6 +195,10 @@ impl SolveConvergence {
         };
         let Some(result) = result else { return false; };
         self.readback_state = Readback::Idle;
+        if std::mem::take(&mut self.discard_pending) {
+            if result.is_ok() { self.readback.unmap(); }
+            return false;
+        }
         if let Err(error) = result {
             self.consecutive = 0;
             if debug > 0 { eprintln!("[RIVER SOLVE] async readback failed: {error}"); }

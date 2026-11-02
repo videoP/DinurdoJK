@@ -165,6 +165,8 @@ pub struct LocalPlayer {
     accumulated: Duration,
     command_rate: u32,
     command_time_remainder: u32,
+    force_jump_slope_fix: bool,
+    jump_trace_remaining: i32,
     input_angles: [f32; 3],
     // Usercmd angle basis that produced the current local Pmove state.
     // Subframe presentation advances from ps.viewangles by only mouse motion
@@ -227,6 +229,8 @@ impl LocalPlayer {
             accumulated: Duration::ZERO,
             command_rate: 125,
             command_time_remainder: 0,
+            force_jump_slope_fix: true,
+            jump_trace_remaining: 0,
             input_angles: [0.0, spawn.yaw.to_degrees(), 0.0],
             subframe_base_cmd_angles: [
                 angle_to_short(0.0),
@@ -354,6 +358,17 @@ impl LocalPlayer {
         Ok(())
     }
 
+    pub fn force_jump_slope_fix(&self) -> bool { self.force_jump_slope_fix }
+
+    pub fn set_force_jump_slope_fix(&mut self, enabled: bool) {
+        self.force_jump_slope_fix = enabled;
+        if let Some(player) = &mut self.player { player.set_local_force_jump_slope_fix(enabled); }
+    }
+
+    pub fn start_jump_trace(&mut self, msec: i32) {
+        self.jump_trace_remaining = msec.clamp(0, 5000);
+    }
+
     fn command_interval(&self) -> Duration {
         Duration::from_secs_f64(1.0 / f64::from(self.command_rate.max(15)))
     }
@@ -393,6 +408,7 @@ impl LocalPlayer {
                     mode,
                 )?;
                 Self::apply_saber_movement_to_state(&mut player, self.saber_movement)?;
+                player.set_local_force_jump_slope_fix(self.force_jump_slope_fix);
                 self.player = Some(player);
             } else if mode == JoinMode::Spectator {
                 let view = self.state().view();
@@ -412,6 +428,7 @@ impl LocalPlayer {
             self.mode,
         )?;
         Self::apply_saber_movement_to_state(&mut state, self.saber_movement)?;
+        state.set_local_force_jump_slope_fix(self.mode == JoinMode::Player && self.force_jump_slope_fix);
         if self.mode == JoinMode::Player && self.noclip {
             state.set_noclip(true);
         }
@@ -607,7 +624,18 @@ impl LocalPlayer {
             )?;
             let view = if clipping {
                 let mut traced = GameWorld { world: &mut self.world, solids: game.solids() };
-                self.movement.step_command_with_msec(state, cmd, command_msec, &mut traced)?
+                if self.jump_trace_remaining > 0 {
+                    self.jump_trace_remaining -= command_msec;
+                    let (view, events) = self.movement.trace_command(state, cmd, command_msec, &mut traced)?;
+                    for e in events {
+                        println!("JUMPTRACE stage={} time={} msec={} ground={} walking={} plane={} level={} active={} origin={:?} before={:?} after={:?} normal={:?} jump_start={} fraction={} entity={} bump={} overbounce={}",
+                            e.stage, e.time, e.msec, e.ground, e.walking, e.ground_plane, e.level, e.active,
+                            e.origin, e.before, e.after, e.normal, e.jump_start, e.fraction, e.entity, e.bump, e.overbounce);
+                    }
+                    view
+                } else {
+                    self.movement.step_command_with_msec(state, cmd, command_msec, &mut traced)?
+                }
             } else {
                 self.movement
                     .step_command_with_msec(state, cmd, command_msec, &mut self.world)?

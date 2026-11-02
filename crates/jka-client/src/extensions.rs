@@ -251,9 +251,11 @@ impl HudAnchor {
 /// Distinct game images one frame of widgets may reference (atlas capacity).
 pub const MAX_HUD_IMAGES: usize = 32;
 
-/// Only plain `gfx/` paths: no extension, no traversal, bounded length.
+/// Plain HUD art names and authored `fx/hud/` materials only: no file
+/// extensions, traversal or arbitrary filesystem path access.
 fn valid_hud_image(name: &str) -> bool {
-    name.len() <= 64 && name.starts_with("gfx/") && !name.contains("//")
+    name.len() <= 64 && (name.starts_with("gfx/") || name.starts_with("fx/hud/"))
+        && !name.contains("//")
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/'))
         && !name.ends_with('/')
 }
@@ -1415,6 +1417,8 @@ hides_native_hud = ['health', 'speedometer']
     #[test]
     fn hud_image_names_are_validated_and_ordered() {
         assert!(valid_hud_image("gfx/hud/health_tic_1"));
+        assert!(valid_hud_image("fx/hud/background"));
+        assert!(!valid_hud_image("fx/arbitrary_effect"));
         assert!(!valid_hud_image("../gfx/x") && !valid_hud_image("models/a") && !valid_hud_image("gfx/a.tga"));
         assert!(!valid_hud_image("gfx//a") && !valid_hud_image(&format!("gfx/{}", "a".repeat(80))));
         let widget = |names: &[&str]| PlacedHudWidget {

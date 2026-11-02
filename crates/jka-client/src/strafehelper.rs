@@ -27,6 +27,7 @@ use crate::ui::{
 /// `SCREEN_WIDTH` / `SCREEN_HEIGHT`: the virtual space every coordinate here uses.
 mod extended;
 pub use extended::{extended_hud, ExtendedHud};
+pub(crate) use extended::{Q3DF_SPEED_LEFT_X, Q3DF_SPEED_TOP_Y};
 
 pub const SCREEN_WIDTH: f32 = 640.0;
 pub const SCREEN_HEIGHT: f32 = 480.0;

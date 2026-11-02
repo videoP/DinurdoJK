@@ -860,6 +860,8 @@ pub(in crate::renderer) enum WorldPipelinePass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::renderer) struct WorldPassPipelineIdentity {
     pub variant: WorldShaderVariantKey,
+    /// Physical group-2 bind layout, not the reduced dry-stage shader variant.
+    pub layout_enhanced: bool,
     pub pass: WorldPipelinePass,
     pub native_key: PipelineKey,
     pub target_format: wgpu::TextureFormat,
@@ -887,7 +889,8 @@ impl WorldPassPipelineIdentity {
         variant.material_specialization = false;
         variant.minimal_entries = false;
         variant.program_mode = super::programs::WorldProgramMode::Specialized;
-        Self { variant, pass, native_key, target_format, samples, material: None, minimal: false }
+        Self { layout_enhanced: variant.family() == super::variants::WorldShaderFamily::Enhanced,
+            variant, pass, native_key, target_format, samples, material: None, minimal: false }
     }
 
     pub(in crate::renderer) fn specialized(
@@ -898,6 +901,11 @@ impl WorldPassPipelineIdentity {
         Self {
             material: Some(material),
             minimal,
+            // A SpecializedLean shader under Hybrid Ocean uses the Enhanced
+            // pipeline layout, even though its code variant has ocean=false.
+            // Reusing that native PSO in the Lean family caused the missing
+            // group-2 bindings 10..14 validation panic on switching to JKA.
+            layout_enhanced: variant.family() == super::variants::WorldShaderFamily::Enhanced,
             ..Self::new(super::programs::program_variant(variant, material), WorldPipelinePass::Base { authored_fog }, native_key,
                 target_format, samples)
         }
@@ -2471,4 +2479,27 @@ pub(in crate::renderer) fn create_entity_shadow_pipeline(
         multiview_mask: None,
         cache: crate::pipeline_cache::get().as_ref(),
     })
+}
+
+#[cfg(test)]
+mod ocean_dry_layout_reuse_tests {
+    use super::*;
+    #[test]
+    fn ocean_dry_specialized_pso_cannot_alias_lean_layout() {
+        let lean = WorldShaderVariantKey::default();
+        let enhanced = WorldShaderVariantKey { ocean: true, ..lean };
+        let material = MaterialFragmentKey {
+            program: crate::renderer::world::programs::StageProgram::SpecializedLean,
+            ..Default::default()
+        };
+        let key = ocean_pipeline_key();
+        let a = WorldPassPipelineIdentity::specialized(lean, false, key, material, false,
+            wgpu::TextureFormat::Rgba8Unorm, 1);
+        let b = WorldPassPipelineIdentity::specialized(enhanced, false, key, material, false,
+            wgpu::TextureFormat::Rgba8Unorm, 1);
+        assert_eq!(a.variant, b.variant, "dry shader programs alias before layout identity");
+        assert!(!a.layout_enhanced);
+        assert!(b.layout_enhanced);
+        assert_ne!(a, b, "physical layout is part of the PSO reuse identity");
+    }
 }

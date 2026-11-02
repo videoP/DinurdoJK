@@ -3,6 +3,49 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_force_jump_slope_fix ["force_jump_slope_fix"] ("force_jump_slope_fix [0|1]", "Solo authority: time-consistent Force Jump boost on overhead slopes (default 1). Remote correction applies only to jaPRO race mode and requires matching server physics.", CommandScope::Connected) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let Some(server) = self.local_server.as_mut() else {
+            self.push_console_line("force_jump_slope_fix requires a local game".to_owned());
+            return CommandResult::Handled;
+        };
+        if let [_verb, value @ ("0" | "1")] = words.as_slice() {
+            server.set_force_jump_slope_fix(*value == "1");
+        } else if words.len() != 1 {
+            self.push_console_line("usage: force_jump_slope_fix [0|1]".to_owned());
+            return CommandResult::Handled;
+        }
+        let enabled = server.force_jump_slope_fix();
+        self.push_console_line(format!("force_jump_slope_fix {} (local authority)", i32::from(enabled)));
+        CommandResult::Handled
+    }
+
+    cmd_jumptrace ["jumptrace"] ("jumptrace [milliseconds]", "Solo: log bounded native Force Jump/collision traces (default off; captures 2000 ms, maximum 5000).", CommandScope::Connected) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let msec = match words.as_slice() {
+            [_verb] => Some(2000),
+            [_verb, value] => value.parse::<i32>().ok().filter(|v| (0..=5000).contains(v)),
+            _ => None,
+        };
+        match (self.local_server.as_mut(), msec) {
+            (Some(server), Some(msec)) => {
+                server.start_jump_trace(msec);
+                self.push_console_line(format!("jumptrace: capturing {msec} ms of local physics to latest.log"));
+            }
+            _ => self.push_console_line("usage: jumptrace [0..5000] (local game)".to_owned()),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_movespeed ["movespeed"] ("movespeed", "Print the local authoritative horizontal speed, velocity and position.", CommandScope::Connected) |self, _command| {
+        if let Some(server) = self.local_server.as_ref() {
+            let v = server.view();
+            self.push_console_line(format!("MOVESPEED time={} horizontal={:.3} velocity={:?} origin={:?}", v.command_time, v.velocity[0].hypot(v.velocity[1]), v.velocity, v.origin));
+        } else {
+            self.push_console_line("movespeed requires a local game".to_owned());
+        }
+        CommandResult::Handled
+    }
     cmd_memory_info ["memory_info"] ("memory_info", "Report retained map CPU pixels and GPU live/reserved allocations.", CommandScope::Always) |self, command| {
         if command.split_whitespace().count() != 1 {
             self.push_console_line("usage: memory_info".to_owned());
@@ -602,7 +645,7 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_riversource ["riversource", ] ("riversource [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'riverclear' removes all patches.", CommandScope::Always) |self, command| {
+    cmd_riversource ["riversource", ] ("riversource [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level|discharge:<CFS>]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'riverclear' removes all patches.", CommandScope::Always) |self, command| {
         use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE};
         let words: Vec<_> = command.split_whitespace().collect();
         let defaults=self.river_editor.defaults;
@@ -612,12 +655,17 @@ commands! {
             };
             let cells=number(4,defaults.cells as f32)?;
             if !cells.is_finite()||cells.fract()!=0.0||!(16.0..=1024.0).contains(&cells) {return Err("cells must be an integer from 16 to 1024".into());}
-            let discharge_cfs=match words.get(6) {
-                Some(w) if w.eq_ignore_ascii_case("level")=>None,
-                Some(w)=>Some(w.parse::<f32>().map_err(|_|"CFS must be a number or 'level'".to_owned())?),
-                None=>defaults.discharge_cfs,
+            let (mode, discharge_cfs)=match words.get(6) {
+                Some(w) if w.eq_ignore_ascii_case("level") =>
+                    (crate::river_runtime::SourceMode::WaterLevel, None),
+                Some(w) if w.to_ascii_lowercase().starts_with("discharge:") =>
+                    (crate::river_runtime::SourceMode::Discharge,
+                        Some(w["discharge:".len()..].parse::<f32>().map_err(|_|"discharge CFS must be numeric".to_owned())?)),
+                Some(w) => (crate::river_runtime::SourceMode::WaterLevel,
+                    Some(w.parse::<f32>().map_err(|_|"CFS must be numeric, 'level', or 'discharge:<CFS>'".to_owned())?)),
+                None => (defaults.mode, defaults.discharge_cfs),
             };
-            Ok(crate::river_authoring::SourceParameters {height:number(1,defaults.height)?,radius:number(2,defaults.radius)?,width:number(3,defaults.width)?,cells:cells as u32,speed:number(5,defaults.speed)?,discharge_cfs})
+            Ok(crate::river_authoring::SourceParameters {height:number(1,defaults.height)?,radius:number(2,defaults.radius)?,width:number(3,defaults.width)?,cells:cells as u32,speed:number(5,defaults.speed)?,mode,discharge_cfs})
         })();
         let params=match parsed {Ok(p)=>p,Err(error)=>{self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}};
         if let Err(error)=params.at([0.0;3]).validate() {self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}
@@ -660,7 +708,12 @@ commands! {
             return CommandResult::Handled;
         }
         let definition=self.river_editor.add(source,self.video.river_settings);
-        let supply=source.discharge_cfs.map(|q|format!("max {q} CFS to target")).unwrap_or_else(||format!("unlimited water level {:.0}",source.water_level));
+        let supply=match (source.mode, source.discharge_cfs) {
+            (crate::river_runtime::SourceMode::WaterLevel, Some(q)) => format!("water level {:.0}, max {q} CFS", source.water_level),
+            (crate::river_runtime::SourceMode::WaterLevel, None) => format!("unlimited water level {:.0}", source.water_level),
+            (crate::river_runtime::SourceMode::Discharge, Some(q)) => format!("discharge {q} CFS (unclamped)",),
+            (crate::river_runtime::SourceMode::Discharge, None) => unreachable!("validated discharge source must have CFS"),
+        };
         self.push_console_line(format!("River {} at ({:.0} {:.0} {:.0}), {supply}, patch +/-{:.0}, {} cells, {}x simulation speed",definition.id,trace.end[0],trace.end[1],trace.end[2],source.radius,source.resolution,source.rate));
         self.render_command(RenderCommand::RiverSpawn(definition, collision));
         CommandResult::Handled

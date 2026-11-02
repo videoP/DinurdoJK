@@ -3438,7 +3438,8 @@ impl Renderer {
                         &mut info.ocean.native_cpu, perf_timing, frame_time,
                         self.planar_reflection.active.then_some((&self.planar_reflection._color_array_view,
                             &self.planar_reflection._sampler, &self.planar_slot_history)),
-                        Some(self.ocean_optics.submerged_scene()));
+                        Some(self.ocean_optics.submerged_scene()),
+                        self.ocean_settings.interaction.then_some(&self.ocean_interaction.render));
                     if let Some(started) = native_prepare_started {
                         info.ocean.native_cpu.prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
                     }
@@ -6212,12 +6213,15 @@ impl Renderer {
             // the scene without the river, after world transparency. The swapchain
             // (no post, no MSAA) cannot be copied; encode_live_rivers reports it.
             if let Some(water) = self.river_surface.as_ref().filter(|water| {
-                (plan.use_post || self.msaa_samples > 1)
+                (plan.use_post || self.msaa_samples > 1 || self.wireframe_mask & ui::wireframe::RIVER != 0)
                     && water.ready_for(flare_scene_format, self.msaa_samples)
                     && self.live_rivers.iter().any(|river| river.body_group().is_some())
             }) {
                 drop(pass);
-                water.capture(&self.device, &mut encoder, color_view, &self.targets.depth_view);
+                let copyable = plan.use_post || self.msaa_samples > 1;
+                if copyable {
+                    water.capture(&self.device, &mut encoder, color_view, &self.targets.depth_view);
+                }
                 pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene after river copy"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
@@ -6226,11 +6230,34 @@ impl Renderer {
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
                 let environment = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
                     .map(|atmosphere| &atmosphere.sky.environment().bind_group);
-                for river in &self.live_rivers {
-                    water.draw(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                if copyable {
+                    for river in &self.live_rivers {
+                        water.draw(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                    }
+                    for river in &self.live_rivers {
+                        water.draw_composite(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                    }
                 }
-                for river in &self.live_rivers {
-                    water.draw_composite(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                if copyable && self.live_rivers.iter().any(|river| river.contains_eye_xy(camera)) {
+                    // Reuse the same copy allocation. The nearest depth now
+                    // includes the exact displaced underside, ending absorption
+                    // at the interface rather than fogging the air beyond it.
+                    drop(pass);
+                    water.capture_submerged(&self.device, &mut encoder, color_view, &self.targets.depth_view);
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("river Hybrid submerged medium"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
+                        depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
+                    });
+                    tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
+                    for river in self.live_rivers.iter().filter(|river| river.contains_eye_xy(camera)) {
+                        water.draw_submerged(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                    }
+                }
+                if self.wireframe_mask & ui::wireframe::RIVER != 0 {
+                    for river in &self.live_rivers {
+                        water.draw_wire(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                    }
                 }
                 // Restore the world pass's shared bindings for what follows.
                 pass.set_bind_group(0,&self.camera_bind_group,&[]);

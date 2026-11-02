@@ -178,6 +178,7 @@ pub struct Simulation {
     dimensions: [u32; 2],
     geometry: wgpu::Buffer,
     discharge: Option<crate::river_discharge::Discharge>,
+    discharge_active: bool,
     state: [wgpu::Texture; 2],
     initial_upload: Option<InitialUpload>,
     groups: [wgpu::BindGroup; 2],
@@ -725,7 +726,7 @@ impl Simulation {
             cache: None,
         });
         Ok(Self {
-            dimensions, geometry:geo, discharge:None,
+            dimensions, geometry:geo, discharge:None, discharge_active:false,
             state,
             initial_upload,
             groups,
@@ -850,7 +851,7 @@ impl Simulation {
         encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 0, 64);
         encoder.copy_buffer_to_buffer(&upload, 64, &self.boundary_uniform, 0, 48);
         self.encode_kernel(encoder, Kernel::SourceAndSink);
-        if let Some(discharge)=&self.discharge {
+        if let Some(discharge)=self.discharge.as_ref().filter(|_| self.discharge_active) {
             discharge.encode(device,encoder,self.current,frame.hydraulic_duration());
             self.current=1-self.current;
         }
@@ -870,6 +871,27 @@ impl Simulation {
         let discharge=crate::river_discharge::Discharge::new(device,grid,&self.state,&self.geometry,width_cm,level_cm,cfs);
         discharge.initialize(encoder);
         self.discharge=Some(discharge);
+        self.discharge_active=true;
+    }
+
+    /// Existing inlet-box storage stays bound in either mode; the native loop
+    /// count and rise cap are copied with the next solver frame's parameters.
+    pub fn set_height_source(&mut self, enabled: bool, rise_limit_cm: f32) {
+        self.boundary_template.flags[0] = u32::from(enabled);
+        self.boundary_template.origin[3] = rise_limit_cm;
+    }
+
+    /// Reuse inlet resources when tuning Q or toggling modes. The hydraulic
+    /// ping-pong state and presentation buffers are never replaced.
+    pub fn update_discharge(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, grid: jka_water::river::control::Grid, width_cm: f32, level_cm: f32, cfs: Option<f32>) {
+        self.discharge_active = cfs.is_some();
+        if let Some(cfs) = cfs {
+            if let Some(discharge) = &mut self.discharge {
+                discharge.set_cfs(cfs);
+            } else {
+                self.enable_discharge(device, encoder, grid, width_cm, level_cm, cfs);
+            }
+        }
     }
 
     /// Hydraulic attributes; initial sample uploads are recorded by the first

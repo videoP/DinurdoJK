@@ -144,7 +144,7 @@ impl Detail {
 
 /// Native FoamGrid producer (cached stages 4/16). Its current output is also
 /// FoamRT for the material. Allocate per river; bind groups and pipelines are
-/// built once. Frames record a 16-byte control copy and one dispatch.
+/// built once. Frames record a 32-byte time/emission control copy and one dispatch.
 pub struct Field {
     dimensions: [u32; 2],
     foam: [wgpu::Texture; 2],
@@ -155,6 +155,7 @@ pub struct Field {
     /// [hydraulic state parity][FoamGrid read parity]
     groups: [[Option<wgpu::BindGroup>; 2]; 2],
     uniform: wgpu::Buffer,
+    depth_range: [f32; 2],
 }
 
 /// Previous-buffer readers of stage 16: Simulation's R32f hydraulic arrays and
@@ -205,9 +206,10 @@ impl Field {
                 view_formats: &[],
             })
         });
-        let mut bytes = Vec::with_capacity(144);
+        let mut bytes = Vec::with_capacity(160);
         bytes.extend_from_slice(bytemuck::cast_slice(&setup.uniform()));
         bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(bytemuck::cast_slice(&[150.0f32, 500.0, 0.0, 0.0]));
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("native river foam stage controls"),
             contents: &bytes,
@@ -278,6 +280,7 @@ impl Field {
             init_groups,
             groups,
             uniform,
+            depth_range: foam_field::WATER_DEPTH.0,
         })
     }
 
@@ -321,14 +324,21 @@ impl Field {
         if !(frame.delta.is_finite() && frame.delta >= 0.0 && frame.time.is_finite()) {
             return Err("invalid river foam frame time");
         }
+        let mut values = frame.uniform().to_vec();
+        values.extend_from_slice(&[self.depth_range[0], self.depth_range[1], 0.0, 0.0]);
         let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("native river foam frame controls"),
-            contents: bytemuck::cast_slice(&frame.uniform()),
+            contents: bytemuck::cast_slice(&values),
             usage: wgpu::BufferUsages::COPY_SRC,
         });
-        encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 128, 16);
+        encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 128, 32);
         self.dispatch(encoder, Some(state_index));
         Ok(())
+    }
+
+    /// Live authoring affects future emission; accumulated foam is retained.
+    pub fn set_minimum_depth(&mut self, minimum_cm: f32) {
+        self.depth_range = foam_field::authored_depth_range(minimum_cm);
     }
 
     /// After hydraulics freeze, keep only the final state's bindings so the
@@ -354,6 +364,6 @@ impl Field {
 
     /// Owned FoamGrid ping-pong pair (8 bytes/cell each) plus controls.
     pub fn logical_bytes(&self) -> u64 {
-        2 * u64::from(self.dimensions[0]) * u64::from(self.dimensions[1]) * 8 + 144
+        2 * u64::from(self.dimensions[0]) * u64::from(self.dimensions[1]) * 8 + 160
     }
 }

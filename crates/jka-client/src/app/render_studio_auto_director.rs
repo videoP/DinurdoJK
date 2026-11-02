@@ -459,7 +459,7 @@ fn forward(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(cy * cp, sy * cp, -sp)
 }
 fn flat(v: Vec3) -> Vec3 { Vec3::new(v.x, v.y, 0.0).normalize_or_zero() }
-fn render(p: Vec3) -> [f32; 3] { super::scene::render_position(p.to_array()) }
+fn authored_point(p: Vec3) -> [f32; 3] { p.to_array() }
 
 fn features(path: &DirectorPath, a: i32, b: i32) -> Features {
     let window = path.window(a, b);
@@ -857,10 +857,10 @@ impl AutoDirector {
         let mut shot = StudioDirectorShot::new(0, P::Static, -1, 0.0, 1.0);
         let mut rng = Rng::new(&[u64::from(self.seed), a as u64, b as u64, 0x726f757465]);
         if !self.place_static(&mut shot, path, a, b, &extra, &mut rng) { return None; }
-        let p = Vec3::from_array(super::scene::jka_position(shot.position_override?));
+        let p = Vec3::from_array(shot.position_override?);
         if self.visible_count(p, &eyes) != eyes.len() { return None; }
         if moving {
-            let center = Vec3::from_array(super::scene::jka_position(shot.focus_target?));
+            let center = Vec3::from_array(shot.focus_target?);
             // A small pull-back keeps the same composition and is repeated for
             // each runner. Check the whole move, not just its endpoint.
             let end = p + (p - center).normalize_or_zero() * p.distance(center).min(800.0) * 0.12;
@@ -868,7 +868,7 @@ impl AutoDirector {
                 && [0.25, 0.5, 0.75, 1.0].into_iter()
                     .all(|u| self.visible_count(p.lerp(end, u), &eyes) == eyes.len()) {
                 shot.preset = P::Glide;
-                shot.position_end = Some(render(end));
+                shot.position_end = Some(authored_point(end));
             }
         }
         shot.auto = true;
@@ -1358,7 +1358,7 @@ impl AutoDirector {
         let rig = shot.rig;
         if shot.preset.perspective() == super::render_studio_timeline::StudioFollowPerspective::FirstPerson
             || rig.range < 48.0 { return true; }
-        let offset = Vec3::from_array(super::scene::jka_position(rig.position_offset));
+        let offset = Vec3::from_array(rig.position_offset);
         let client = if shot.client >= 0 { shot.client } else { subject };
         let n = ((e-s)/100+1).clamp(7,121);
         for k in 0..n {
@@ -1539,8 +1539,8 @@ impl AutoDirector {
                 rig.yaw_offset = wrap(line.y.atan2(line.x).to_degrees() - side * rng.range(25.0, 45.0));
                 rig.pitch_offset = rng.range(8.0, 14.0);
                 rig.range = (distance * 0.8 + 220.0).clamp(240.0, 700.0);
-                // Centre the frame between the fighters (renderer-space offset).
-                rig.position_offset = render(line * 0.5);
+                // Centre the frame between the fighters (native JKA offset).
+                rig.position_offset = authored_point(line * 0.5);
                 shot.fov = rng.range(66.0, 74.0);
             }
         }
@@ -1604,8 +1604,8 @@ impl AutoDirector {
             if found.len() >= 6 { break; }
         }
         let Some((p, drift)) = Self::pick(found, rng) else { return false };
-        shot.position_override = Some(render(p));
-        shot.position_end = Some(render(drift));
+        shot.position_override = Some(authored_point(p));
+        shot.position_end = Some(authored_point(drift));
         shot.fov = rng.range(80.0, 92.0);
         shot.rig.range = p.distance(anchor);
         true
@@ -1639,8 +1639,8 @@ impl AutoDirector {
             }
         }
         let Some((p, fov)) = Self::pick(found, rng) else { return false };
-        shot.position_override = Some(render(p));
-        shot.focus_target = Some(render(center));
+        shot.position_override = Some(authored_point(p));
+        shot.focus_target = Some(authored_point(center));
         shot.fov = fov.x.clamp(40.0, 105.0);
         shot.rig.aim_enabled = false;
         // Framing is fixed; focus follows the subject wherever it moves.
@@ -1675,7 +1675,7 @@ impl AutoDirector {
             if found.len() >= 4 { break; }
         }
         let Some((p, _)) = Self::pick(found, rng) else { return false };
-        shot.position_override = Some(render(p));
+        shot.position_override = Some(authored_point(p));
         shot.fov = rng.range(50.0, 62.0);
         shot.rig.range = p.distance(m);
         true
@@ -1705,7 +1705,7 @@ impl AutoDirector {
             if found.len() >= 3 { break; }
         }
         let Some((p, _)) = Self::pick(found, rng) else { return false };
-        shot.position_override = Some(render(p));
+        shot.position_override = Some(authored_point(p));
         shot.fov = rng.range(80.0, 92.0);
         shot.rig.range = p.distance(m);
         true
@@ -1729,8 +1729,8 @@ impl AutoDirector {
             found.push((rise / 100.0 - yaw.abs() / 90.0, p0, p1));
         }
         let Some((p0, p1)) = Self::pick(found, rng) else { return false };
-        shot.position_override = Some(render(p0));
-        shot.position_end = Some(render(p1));
+        shot.position_override = Some(authored_point(p0));
+        shot.position_end = Some(authored_point(p1));
         shot.rig.range = p0.distance(subject);
         shot.rig.aim_anchor = StudioDemoAnchor::Chest;
         true
@@ -1761,13 +1761,13 @@ impl StageBeat {
     }
 }
 
-/// Horizontal renderer-space direction of a JKA yaw.
+/// Horizontal JKA-space direction of a JKA yaw.
 fn stage_flat(yaw: f32) -> Vec3 {
     let (s, c) = yaw.to_radians().sin_cos();
-    Vec3::new(c, 0.0, -s)
+    Vec3::new(c, s, 0.0)
 }
 fn stage_chest(origin: Vec3) -> Vec3 {
-    origin + Vec3::Y * super::render_studio_director::stage_anchor_height(StudioDemoAnchor::Chest)
+    origin + Vec3::Z * super::render_studio_director::stage_anchor_height(StudioDemoAnchor::Chest)
 }
 
 pub(in crate::app) struct StageDirector<'a> {
@@ -1877,7 +1877,7 @@ impl<'a> StageDirector<'a> {
         let (oe, _) = self.sample(lane, e, end)?;
         let moving = self.travel(lane, s, e, end) > 48.0;
         let travel = oe - o0;
-        let heading = if travel.x.hypot(travel.z) > 16.0 { (-travel.z).atan2(travel.x).to_degrees() } else { yawm };
+        let heading = if travel.x.hypot(travel.y) > 16.0 { travel.y.atan2(travel.x).to_degrees() } else { yawm };
         let mut shot = StudioDirectorShot::new(0, preset, -1, s, e - s);
         preset.seed_shot(&mut shot, self.fov);
         shot.auto = true;
@@ -1932,7 +1932,7 @@ impl<'a> StageDirector<'a> {
             P::Establishing => {
                 let subject = stage_chest(o0);
                 let p = subject + stage_flat(yaw0 + rng.range(-40.0, 40.0)) * rng.range(320.0, 420.0)
-                    + Vec3::Y * rng.range(120.0, 180.0);
+                    + Vec3::Z * rng.range(120.0, 180.0);
                 shot.position_override = Some(p.to_array());
                 shot.position_end = Some((p + (subject - p) * 0.12).to_array());
                 shot.fov = rng.range(70.0, 80.0);
@@ -1944,7 +1944,7 @@ impl<'a> StageDirector<'a> {
                 let center = chests.iter().copied().sum::<Vec3>() / chests.len().max(1) as f32;
                 let extent = chests.iter().map(|p| p.distance(center)).fold(0.0, f32::max);
                 let distance = (extent * 1.2 + 150.0).max(rng.range(180.0, 260.0));
-                let p = center + stage_flat(yawm + side * rng.range(30.0, 70.0)) * distance + Vec3::Y * rng.range(10.0, 40.0);
+                let p = center + stage_flat(yawm + side * rng.range(30.0, 70.0)) * distance + Vec3::Z * rng.range(10.0, 40.0);
                 let look = (center - p).normalize_or_zero();
                 let spread = chests.iter().map(|&c| look.angle_between((c - p).normalize_or_zero()).to_degrees()).fold(0.0, f32::max);
                 shot.position_override = Some(p.to_array());
@@ -1958,7 +1958,7 @@ impl<'a> StageDirector<'a> {
             P::Pan => {
                 let subject = stage_chest(om);
                 let p = subject + stage_flat(yawm + side * rng.range(50.0, 100.0)) * rng.range(160.0, 240.0)
-                    + Vec3::Y * rng.range(10.0, 40.0);
+                    + Vec3::Z * rng.range(10.0, 40.0);
                 shot.position_override = Some(p.to_array());
                 shot.fov = rng.range(50.0, 62.0);
                 shot.rig.range = p.distance(subject);
@@ -1968,7 +1968,7 @@ impl<'a> StageDirector<'a> {
             P::FlyBy => {
                 if !moving { return None; }
                 let subject = stage_chest(om);
-                let p = subject + stage_flat(heading - 90.0) * side * rng.range(70.0, 110.0) + Vec3::Y * rng.range(0.0, 20.0);
+                let p = subject + stage_flat(heading - 90.0) * side * rng.range(70.0, 110.0) + Vec3::Z * rng.range(0.0, 20.0);
                 shot.position_override = Some(p.to_array());
                 shot.fov = rng.range(80.0, 90.0);
                 shot.rig.range = p.distance(subject);
@@ -1976,9 +1976,9 @@ impl<'a> StageDirector<'a> {
             P::Crane => {
                 let (origin, yaw) = if e >= end - 0.05 { (oe, yawm) } else { (o0, yaw0) };
                 let subject = stage_chest(origin);
-                let p0 = subject + stage_flat(yaw + side * rng.range(30.0, 60.0)) * 150.0 - Vec3::Y * 10.0;
-                let away = Vec3::new(p0.x - subject.x, 0.0, p0.z - subject.z).normalize_or_zero();
-                let p1 = p0 + Vec3::Y * rng.range(200.0, 260.0) + away * 120.0;
+                let p0 = subject + stage_flat(yaw + side * rng.range(30.0, 60.0)) * 150.0 - Vec3::Z * 10.0;
+                let away = Vec3::new(p0.x - subject.x, p0.y - subject.y, 0.0).normalize_or_zero();
+                let p1 = p0 + Vec3::Z * rng.range(200.0, 260.0) + away * 120.0;
                 shot.position_override = Some(p0.to_array());
                 shot.position_end = Some(p1.to_array());
                 shot.rig.range = p0.distance(subject);
@@ -2221,14 +2221,14 @@ impl AutoDirector {
             // Orbit-type shots look at their anchor: move it to the midpoint.
             P::Tracking | P::Orbit | P::LowAngle => {
                 rig.aim_enabled = false;
-                rig.position_offset = render(half);
+                rig.position_offset = authored_point(half);
                 rig.range = rig.range.max(gap * 1.0 + 170.0).min(1500.0);
                 shot.fov = shot.fov.max(60.0);
             }
             // World pans aim at the midpoint and widen to fit both.
             P::Pan if shot.position_override.is_some() => {
-                rig.aim_offset = render(half);
-                let camera = super::scene::jka_position(shot.position_override.unwrap());
+                rig.aim_offset = authored_point(half);
+                let camera = shot.position_override.unwrap();
                 let camera = Vec3::from_array(camera);
                 let distance = camera.distance(me + half).max(1.0);
                 let needed = (2.0 * (gap * 0.5 / distance).atan().to_degrees() * 1.6 + 20.0).clamp(50.0, 100.0);
@@ -2367,7 +2367,7 @@ impl AutoDirector {
         -> Option<(Vec3, Vec3)> {
         use super::render_studio_director::stage_anchor_height as height;
         use super::render_studio_timeline::StudioFollowPerspective as Fp;
-        let native = |p: [f32; 3]| Vec3::from_array(super::scene::jka_position(p));
+        let native = |p: [f32; 3]| Vec3::from_array(p);
         let e = if shot.ease { u * u * (3.0 - 2.0 * u) } else { u };
         let rig = shot.rig;
         let aim_client = if rig.aim_client >= 0 { rig.aim_client } else { follow };
@@ -2528,11 +2528,11 @@ impl AutoDirector {
             if !(self.free(p0) && self.free(p1) && self.free(p2)) { continue; }
             if !(self.clear(p0, p1) && self.clear(p1, p2)) { continue; }
             if !(self.clear(p0, c0) && self.clear(p1, (c0 + c1) * 0.5) && self.clear(p2, c1)) { continue; }
-            shot.position_override = Some(render(p0));
-            shot.position_mid = Some(render(p1));
-            shot.position_end = Some(render(p2));
-            shot.focus_target = Some(render(c0));
-            shot.focus_end = Some(render(c1));
+            shot.position_override = Some(authored_point(p0));
+            shot.position_mid = Some(authored_point(p1));
+            shot.position_end = Some(authored_point(p2));
+            shot.focus_target = Some(authored_point(c0));
+            shot.focus_end = Some(authored_point(c1));
             shot.rig.aim_enabled = false;
             shot.rig.autofocus = true;
             shot.rig.range = p0.distance(c0);
@@ -2569,7 +2569,7 @@ impl AutoDirector {
             if player_at(path, subject, ms).is_none() && lingering_player(path, subject, ms).is_some() {
                 if let (Some(c), Some(l)) = (camera, look) {
                     if !self.recorded_visible(path, ms, c) { return false; }
-                    keys.push(StudioPathKey { t: ((ms - s) as f32 / span).clamp(0.0, 1.0), position: render(c), look: render(l) });
+                    keys.push(StudioPathKey { t: ((ms - s) as f32 / span).clamp(0.0, 1.0), position: authored_point(c), look: authored_point(l) });
                     if ms >= e - 1 { break; }
                     t += STEP;
                     continue;
@@ -2628,7 +2628,7 @@ impl AutoDirector {
                 let l = target;
                 camera = Some(c);
                 look = Some(l);
-                keys.push(StudioPathKey { t: ((ms - s) as f32 / span).clamp(0.0, 1.0), position: render(c), look: render(l) });
+                keys.push(StudioPathKey { t: ((ms - s) as f32 / span).clamp(0.0, 1.0), position: authored_point(c), look: authored_point(l) });
             }
             if ms >= e - 1 { break; }
             t += STEP;
@@ -2683,7 +2683,7 @@ impl AutoDirector {
             }
             let Some((camera, offset, _)) = selected else { return false };
             previous = Some(camera); angle = offset;
-            keys.push(StudioPathKey { t: (ms - s) as f32 / (e - s).max(1) as f32, position: render(camera), look: render(look) });
+            keys.push(StudioPathKey { t: (ms - s) as f32 / (e - s).max(1) as f32, position: authored_point(camera), look: authored_point(look) });
         }
         if keys.len() < 2 { return false; }
         keys.last_mut().unwrap().t = 1.0;
@@ -2739,8 +2739,8 @@ impl AutoDirector {
                     job.clip.timeline_at_source_ms(s), job.clip.timeline_at_source_ms(e) - job.clip.timeline_at_source_ms(s));
                 shot.auto = true;
                 shot.fov = fov;
-                shot.position_override = Some(render(camera));
-                shot.focus_target = Some(render(center));
+                shot.position_override = Some(authored_point(camera));
+                shot.focus_target = Some(authored_point(center));
                 shot.rig.aim_enabled = false;
                 shot.rig.range = distance;
                 shot.lens.focus_distance = camera.distance(center);
@@ -2778,7 +2778,7 @@ impl AutoDirector {
             if !self.recorded_visible(path, ms, camera) { return false; }
             previous = Some(origin);
             let look = eye + forward(yaw, pitch) * 256.0;
-            keys.push(StudioPathKey { t: (ms - s) as f32 / (e - s).max(1) as f32, position: render(camera), look: render(look) });
+            keys.push(StudioPathKey { t: (ms - s) as f32 / (e - s).max(1) as f32, position: authored_point(camera), look: authored_point(look) });
         }
         if keys.len() < 2 { return false; }
         keys.last_mut().unwrap().t = 1.0;
@@ -3098,7 +3098,7 @@ impl AutoDirector {
                 shot.rig.orbit_world_angles = true;
                 let side = match self.side_at(kill.ms) { s if s != 0.0 => s, _ => rng.sign() };
                 shot.rig.yaw_offset = wrap(gap.y.atan2(gap.x).to_degrees() - side * rng.range(60.0, 100.0));
-                shot.rig.position_offset = render(gap * 0.5);
+                shot.rig.position_offset = authored_point(gap * 0.5);
                 shot.rig.pitch_offset = rng.range(-4.0, 2.0);
                 shot.rig.range = (gap.truncate().length() * 1.1 + 170.0).clamp(180.0, 900.0);
                 shot.fov = shot.fov.max(66.0);
@@ -3142,10 +3142,10 @@ impl AutoDirector {
                     }
                 }
                 let (p, _) = Self::pick(found, rng)?;
-                shot.position_override = Some(render(p));
+                shot.position_override = Some(authored_point(p));
                 shot.rig.range = p.distance(center);
                 if preset == P::Static {
-                    shot.focus_target = Some(render(center));
+                    shot.focus_target = Some(authored_point(center));
                     shot.rig.aim_enabled = false;
                     // Focus on the victim, wherever they fall.
                     shot.client = victim;

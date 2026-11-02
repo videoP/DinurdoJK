@@ -102,6 +102,14 @@ use jka_water::river::control::{Controls, Frame, Grid};
 use jka_water::river::grid_mesh::GridMesh;
 use jka_water::river::{Presentation, Transport, CENTIMETRES_PER_MAP_UNIT};
 
+/// Authored inlet control, independent of whether the inlet has a flow limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceMode {
+    #[default]
+    WaterLevel,
+    Discharge,
+}
+
 /// One test source, in JKA map units (Z up).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalSource {
@@ -117,7 +125,11 @@ pub struct LocalSource {
     pub resolution: u32,
     /// Simulated seconds per real second: 1 is real time, higher fast-fills.
     pub rate: f32,
-    /// Explicit volume per simulated second; None keeps the native held-level source.
+    /// Which control the author selected. A water-level inlet may also carry
+    /// an optional CFS cap; mode must not be inferred from `discharge_cfs`.
+    pub mode: SourceMode,
+    /// Explicit volume per simulated second. None keeps the native held-level
+    /// source in WaterLevel mode.
     pub discharge_cfs: Option<f32>,
 }
 
@@ -145,9 +157,10 @@ impl LocalSource {
             || self
                 .discharge_cfs
                 .is_some_and(|q| !q.is_finite() || !(0.0..=1_000_000.0).contains(&q) || q == 0.0)
+            || (self.mode == SourceMode::Discharge && self.discharge_cfs.is_none())
         {
             return Err(
-                "invalid river source: radius >= 64, width > 0, resolution 16..1024, rate 0..100"
+                "invalid river source: radius >= 64, width > 0, resolution 16..1024, rate (0,100], discharge CFS (0,1000000] when enabled"
                     .into(),
             );
         }
@@ -190,10 +203,12 @@ fn source_rise_per_step_cm(cfs: f32, step_seconds: f64, cells: u32, cell_area_cm
 pub struct LiveRiver {
     pub id: crate::river_authoring::Id,
     pub authored: wgpu::Buffer,
+    foam_minimum_depth: std::cell::Cell<f32>,
     pub source: LocalSource,
     /// Native actor origin (XY centre, minimum Z), centimetres.
     pub origin_cm: [f64; 3],
     pub grid: Grid,
+    inlet: SourceBox,
     controls: Controls,
     simulation: Simulation,
     material: Option<crate::river_material::Presentation>,
@@ -364,7 +379,7 @@ impl LiveRiver {
         let mut boundary_controls =
             BoundaryControls::cached_river_variant(1.0 / 60.0, domain.grid_min());
         boundary_controls.match_spline = false;
-        if let Some(cfs) = source.discharge_cfs {
+        if let (SourceMode::WaterLevel, Some(cfs)) = (source.mode, source.discharge_cfs) {
             let cells = source_cell_count(grid, domain.grid_min(), source_box);
             let step_seconds = frame.hydraulic_duration();
             let cell_area_cm2 = f64::from(grid.cell_size[0]) * f64::from(grid.cell_size[1]);
@@ -374,7 +389,9 @@ impl LiveRiver {
                     source.water_level, cfs, cells, boundary_controls.source_rise_limit_cm, source.rate);
             }
         }
-        let simulation = Simulation::from_prepared_bed(
+        // Standalone discharge uses the existing volumetric GPU adapter instead
+        // of a held-level box. Only Water Height mode enforces an elevation cap.
+        let mut simulation = Simulation::from_prepared_bed(
             device,
             bed,
             frame.parameters(),
@@ -382,10 +399,25 @@ impl LiveRiver {
             Presentation::default(),
             BoundaryInput {
                 water_info: &info,
+                // Retain the actual box even when inactive, so switching back
+                // to height mode can use it without a rebuild.
                 boxes: std::slice::from_ref(&source_box),
                 controls: boundary_controls,
             },
         )?;
+        simulation.set_height_source(source.mode == SourceMode::WaterLevel, boundary_controls.source_rise_limit_cm);
+        if source.mode == SourceMode::Discharge {
+            let cfs = source.discharge_cfs.expect("validated discharge mode has a CFS rate");
+            simulation.enable_discharge(
+                device, &mut encoder, grid, width as f32,
+                (f64::from(source.water_level) * cm - domain.origin[2]) as f32,
+                cfs,
+            );
+            if debug > 0 {
+                eprintln!("[RIVER DBG FLOW] mode=discharge inlet_z={:.1}u rate={:.3} CFS; no water-height clamp",
+                    source.water_level, cfs);
+            }
+        }
         let convergence = (source.rate != 1.0).then(|| SolveConvergence::new(device, &simulation));
         let mesh = crate::river_grid_mesh::encode(
             device,
@@ -421,9 +453,11 @@ impl LiveRiver {
         Ok(Self {
             id: 0,
             authored,
+            foam_minimum_depth: std::cell::Cell::new(60.0),
             source,
             origin_cm: domain.origin,
             grid,
+            inlet: source_box,
             controls,
             simulation,
             material: None,
@@ -536,6 +570,7 @@ impl LiveRiver {
         }
         let foam = self.foam.as_mut().expect("created above");
         let frame = jka_water::river::foam_field::Frame::new(scaled, world_time);
+        foam.set_minimum_depth(self.foam_minimum_depth.get() * CENTIMETRES_PER_MAP_UNIT);
         foam.encode_frame(device, encoder, self.simulation.state_index(), frame)?;
         if self.body_groups.is_none() {
             if let (Some(water), Some(textures)) = (water, material.textures()) {
@@ -544,6 +579,7 @@ impl LiveRiver {
                     water.body_group(
                         device,
                         self.origin_cm,
+                        self.mesh.geometry,
                         textures,
                         &self.ambient,
                         &pair[i],
@@ -572,6 +608,7 @@ impl LiveRiver {
     }
 
     pub fn set_settings(&self, queue: &wgpu::Queue, settings: crate::river_settings::Settings) {
+        self.foam_minimum_depth.set(settings.foam_minimum_depth);
         queue.write_buffer(&self.authored, 0, bytemuck::cast_slice(&settings.uniform()));
     }
 
@@ -579,6 +616,50 @@ impl LiveRiver {
     pub fn body_group(&self) -> Option<&wgpu::BindGroup> {
         let (_, current) = self.foam.as_ref()?.foam_pair();
         self.body_groups.as_ref().map(|groups| &groups[current])
+    }
+
+    /// Coarse admission only; the shader checks the solved bed, wet mask and
+    /// exact displaced mesh triangle before applying any submerged effect.
+    pub fn contains_eye_xy(&self, camera: &crate::camera::Camera) -> bool {
+        let eye = crate::scene::jka_position(camera.position.to_array());
+        (0..2).all(|axis| {
+            let center = self.origin_cm[axis] / f64::from(CENTIMETRES_PER_MAP_UNIT);
+            let half = f64::from(self.mesh.geometry.size()[axis]) / (2.0 * f64::from(CENTIMETRES_PER_MAP_UNIT));
+            (f64::from(eye[axis]) - center).abs() < half
+        })
+    }
+
+    pub fn set_live_controls(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, controls: crate::river_authoring::LiveControls) -> Result<(), String> {
+        let source = controls.apply(self.source)?;
+        if source == self.source { return Ok(()); }
+        let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
+        let frame = Frame::new(self.grid, self.controls, 1.0 / 60.0)?;
+        let mut rise_limit = 0.0;
+        if let (SourceMode::WaterLevel, Some(q)) = (source.mode, source.discharge_cfs) {
+            let grid_min = [-self.grid.world_size[0] * 0.5, -self.grid.world_size[1] * 0.5, 0.0];
+            let cells = source_cell_count(self.grid, grid_min, self.inlet);
+            let area = f64::from(self.grid.cell_size[0]) * f64::from(self.grid.cell_size[1]);
+            rise_limit = source_rise_per_step_cm(q, frame.hydraulic_duration(), cells, area)?;
+        }
+        self.simulation.set_height_source(source.mode == SourceMode::WaterLevel, rise_limit);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("river live inlet controls") });
+        self.simulation.update_discharge(device, &mut encoder, self.grid,
+            source.source_width * CENTIMETRES_PER_MAP_UNIT,
+            (f64::from(source.water_level) * cm - self.origin_cm[2]) as f32,
+            if source.mode == SourceMode::Discharge { source.discharge_cfs } else { None });
+        queue.submit(Some(encoder.finish()));
+        self.source = source;
+        self.settled = false;
+        if source.rate != 1.0 {
+            if self.convergence.is_none() {
+                self.convergence = Some(SolveConvergence::new(device, &self.simulation));
+            }
+            let probe = self.convergence.as_mut().expect("created above");
+            probe.restart(self.simulated_seconds);
+        } else {
+            self.convergence = None;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

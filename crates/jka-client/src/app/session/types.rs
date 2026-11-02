@@ -172,6 +172,9 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) studio_external_player_entities: Vec<u16>,
     /// Render Studio "Hide other players": only these clients are presented.
     pub(in crate::app) studio_visible_players: Option<Vec<u16>>,
+    /// Current Studio observer, supplied before camera-dependent presentation.
+    /// Unlike gameplay's previous-frame camera hint, this survives teleports.
+    pub(in crate::app) studio_presentation_view: Option<crate::cgame::player_presenter::Ghoul2PresentationView>,
     pub(in crate::app) race_ghost_alpha: f32,
     /// Exact predicted/followed sample used to compare the live racer against
     /// the synchronized ghost labels on this frame.
@@ -192,7 +195,7 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) fx_light_promoter: crate::fx::light_promotion::FxLightPromoter,
     pub(in crate::app) promote_fx_lights: u8,
     /// This frame's FX primitives, tessellated once the final camera is known.
-    pub(in crate::app) fx_draws: Vec<crate::fx::system::FxDraw>,
+    pub(in crate::app) fx_draws: crate::fx::system::FxDrawStream,
     pub(in crate::app) fx_runner_draws: Vec<(usize, u16)>,
     pub(in crate::app) fx_runner_cull: crate::fx::runner_cull::RunnerCullScratch,
     pub(in crate::app) gpu_commands: Option<crate::fx::gpu_sparks::GpuSparkCommands>,

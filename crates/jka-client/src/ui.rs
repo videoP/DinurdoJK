@@ -77,6 +77,7 @@ use hud::layout::draw_placed;
 use hud::extensions::build_extension_hud;
 pub(crate) use hud::extensions::hud_element_replaced;
 pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
+pub(crate) use hud::extensions::{EXT_IMAGE_SHADER_SOURCE_BASE, image_cell_uv as extension_image_cell_uv};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
@@ -153,7 +154,7 @@ pub use settings::rendering::{
     VIDEO_ROW_GPU_DRIVEN, VIDEO_ROW_GPU_TIMINGS, VIDEO_ROW_HALATION, VIDEO_ROW_HDR, VIDEO_ROW_HIZ,
     VIDEO_ROW_LIGHTMAP_ONLY, VIDEO_ROW_LOCAL_LIGHT_SHADOWS, VIDEO_ROW_LUT_STRENGTH,
     VIDEO_ROW_MAP_LIGHT_SIMULATION, VIDEO_ROW_MAX_FRAME_LATENCY, VIDEO_ROW_MODEL_BRIGHTNESS,
-    VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PERF_TRACE,
+    VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_SABER_CORE_MODE, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PERF_TRACE,
     VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
     VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_GPU_ADAPTER, VIDEO_ROW_RESOLUTION,
@@ -186,7 +187,8 @@ pub mod wireframe {
     pub const GRASS: u32 = 1 << 4;
     pub const OCEAN: u32 = 1 << 5;
     pub const DEFORMATION: u32 = 1 << 6;
-    pub const ALL: u32 = MAP | PLAYERS | ENTITIES | EFFECTS | GRASS | OCEAN | DEFORMATION;
+    pub const RIVER: u32 = 1 << 7;
+    pub const ALL: u32 = MAP | PLAYERS | ENTITIES | EFFECTS | GRASS | OCEAN | DEFORMATION | RIVER;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,7 +626,7 @@ pub struct DemoTimelineLayout {
     pub play: [f32; 4],
     pub forward: [f32; 4],
     pub recorded: [f32; 4],
-    pub free: [f32; 4],
+    /// Draggable 0.25x..4x timescale slider with 1x at the center.
     pub speed: [f32; 4],
     pub player_panel: Option<[f32; 4]>,
     pub player_header: Option<[f32; 4]>,
@@ -667,10 +669,9 @@ pub fn demo_timeline_layout(
     let forward = flex.leaf(48.0 * s, 30.0 * s);
     let spring = flex.spring();
     let recorded = flex.leaf(111.0 * s, 30.0 * s);
-    let free = flex.leaf(99.0 * s, 30.0 * s);
-    let speed = flex.leaf(64.0 * s, 30.0 * s);
+    let speed = flex.leaf(215.0 * s, 30.0 * s);
     let controls = flex.node(Container::row().width(inner_w).height(30.0 * s).gap(5.0 * s),
-        &[back, play, forward, spring, recorded, free, speed]);
+        &[back, play, forward, spring, recorded, speed]);
     let timeline = flex.absolute(
         Container::column().width(panel_w).height(panel_h).pad(pad_x, 6.5 * s).gap(3.5 * s),
         margin, panel_y, &[header, track_row, controls],
@@ -728,9 +729,34 @@ pub fn demo_timeline_layout(
         panel: flex.bounds(timeline), title: flex.bounds(title), camera: flex.bounds(camera),
         current: flex.bounds(current), total: flex.bounds(total), track: flex.bounds(track),
         back: flex.bounds(back), play: flex.bounds(play), forward: flex.bounds(forward),
-        recorded: flex.bounds(recorded), free: flex.bounds(free), speed: flex.bounds(speed),
+        recorded: flex.bounds(recorded), speed: flex.bounds(speed),
         player_panel: list, player_header, player_footer, player_rows, player_start,
     })
+}
+
+/// A logarithmic (base-2) timescale makes 1x exactly the slider midpoint,
+/// with equal travel from 1x to 0.25x and from 1x to 4x. Keep these helpers
+/// shared by renderer and input; changing the visual rail must not break hits.
+pub const DEMO_SPEED_MIN: f64 = 0.25;
+pub const DEMO_SPEED_MAX: f64 = 4.0;
+
+pub fn demo_speed_fraction(rate: f64) -> f32 {
+    if !rate.is_finite() { return 0.5; }
+    ((rate.clamp(DEMO_SPEED_MIN, DEMO_SPEED_MAX).log2() + 2.0) / 4.0) as f32
+}
+
+pub fn demo_speed_from_fraction(fraction: f32) -> f64 {
+    let fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.5 };
+    2.0_f64.powf(f64::from(fraction) * 4.0 - 2.0)
+}
+
+/// Rail geometry inside the Taffy speed cell; used by both hit-testing and paint.
+pub fn demo_speed_rail(bounds: [f32; 4]) -> [f32; 4] {
+    let [x, y, w, h] = bounds;
+    let scale = h / 30.0;
+    let left = 66.0 * scale;
+    let right = 67.0 * scale;
+    [x + left, y + 6.0 * scale, (w - left - right).max(1.0), (h - 12.0 * scale).max(1.0)]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1427,6 +1453,7 @@ pub struct UiSnapshot {
     pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
     pub console_scroll: usize,
     pub console_size: ConsoleSize,
+    pub console_hl2: bool,
     /// Character scale for console log and prompt; independent of HUD and popup UI.
     pub console_scale: f32,
     pub console_selection: Option<ConsoleSelection>,
@@ -1497,6 +1524,9 @@ pub struct UiSnapshot {
     pub native_hidden: crate::extensions::NativeHudMask,
     /// Extension image atlas slots, in cell order (see `Manager::hud_images`).
     pub extension_images: Vec<String>,
+    /// Renderer-owned: which extension images have authored .shader/.oshader
+    /// materials. Such images bypass the atlas and execute their shader stages.
+    pub(crate) extension_shader_flags: Vec<bool>,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
@@ -1559,6 +1589,7 @@ impl Default for UiSnapshot {
             console_line_kinds: Vec::new(),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,
+            console_hl2: false,
             console_scale: 1.0,
             console_selection: None,
             console_search_open: false,
@@ -1608,6 +1639,7 @@ impl Default for UiSnapshot {
             extension_hud: Vec::new(),
             native_hidden: crate::extensions::NativeHudMask::default(),
             extension_images: Vec::new(),
+            extension_shader_flags: Vec::new(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,

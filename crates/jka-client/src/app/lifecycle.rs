@@ -585,6 +585,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.river_editor.finish(id,result);
                 self.egui_repaint_requested=true;
             }
+            UserEvent::RiverSourceUpdated {id,controls,source,error} => {
+                self.river_editor.finish_live(id,controls,source,error);
+                self.egui_repaint_requested=true;
+            }
             UserEvent::RendererError(error) => {
                 // A failed renderer must reveal diagnostics even without a frame.
                 crate::startup_console::reveal();
@@ -2046,6 +2050,9 @@ impl ApplicationHandler<UserEvent> for App {
                 | WindowEvent::CursorMoved { .. }
             )
         {
+            // The confirmation dialog owns pointer input. Forward it to
+            // egui rather than dropping it, then stop it reaching game binds.
+            let _ = self.route_egui_window_event(&event);
             return;
         }
 
@@ -2298,6 +2305,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // A click on the demo timeline can be consumed by egui before the
+        // gameplay mouse handler sees it. It still cancels Walk's quick-tap
+        // Pause interpretation when Walk is held to expose the UI cursor.
+        if let WindowEvent::MouseInput { state: ElementState::Pressed, .. } = &event {
+            if self.demo_playback_active() && self.live_buttons.contains("+speed") {
+                self.demo_walk_used = true;
+            }
+        }
         if self.route_egui_window_event(&event) {
             return;
         }
@@ -2510,6 +2525,10 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if !focused && self.overlay == OverlayMode::EmoteRadial {
                     self.close_emote_radial();
                 }
+                if !focused {
+                    self.demo_speed_dragging = false;
+                    self.demo_speed_last_click = None;
+                }
                 self.sync_gamma_focus();
                 self.apply_audio_mix();
 
@@ -2528,7 +2547,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if self.overlay == OverlayMode::None {
                         let demo_active = self.demo_playback_active();
                         let wants_capture = !demo_active
-                            || (!self.live_buttons.contains("+speed") && !self.demo_scrub_dragging);
+                            || (!self.live_buttons.contains("+speed")
+                                && !self.demo_scrub_dragging && !self.demo_speed_dragging);
                         if wants_capture
                             && !self.captured
                             && !self.connection_modal_active()
@@ -2622,6 +2642,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.demo_scrub_dragging {
                     self.update_demo_scrub(position.x);
                 }
+                if self.demo_speed_dragging {
+                    self.update_demo_speed_slider(position.x);
+                }
                 if self.overlay == OverlayMode::Console && self.console_selecting {
                     let size = self
                         .window
@@ -2711,15 +2734,21 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(DemoTimelineHit::Back) => self.seek_demo_relative(-5000),
                     Some(DemoTimelineHit::Forward) => self.seek_demo_relative(5000),
                     Some(DemoTimelineHit::Recorded) => self.reset_demo_view_authoritative(),
-                    Some(DemoTimelineHit::Free) => self.enter_demo_free_view(),
                     Some(DemoTimelineHit::Player(client)) => self.follow_demo_client(client),
                     Some(DemoTimelineHit::TogglePlayerList) => {
                         self.demo_player_list_open = !self.demo_player_list_open;
                         self.publish_transient_ui();
                     },
-                    Some(DemoTimelineHit::Speed) => self.cycle_demo_speed_ui(),
+                    Some(DemoTimelineHit::Speed(fraction)) => self.begin_demo_speed_slider(fraction),
                     None => {}
                 }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if self.overlay == OverlayMode::None && self.demo_speed_dragging => {
+                self.finish_demo_speed_slider();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,

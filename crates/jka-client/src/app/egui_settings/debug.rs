@@ -120,6 +120,11 @@ impl App {
                 "Promoted ocean clipmap triangles after wave displacement.",
             ),
             (
+                ui::wireframe::RIVER,
+                "River",
+                "The actual river grid after solved surface and wave displacement, including dry cells.",
+            ),
+            (
                 ui::wireframe::DEFORMATION,
                 "Surface deformation",
                 "3D Snowflow/footprint shell geometry after deformation.",

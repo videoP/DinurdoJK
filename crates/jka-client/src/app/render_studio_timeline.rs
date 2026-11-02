@@ -627,8 +627,9 @@ impl StudioDemoFollowRig {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(in crate::app) struct StudioCameraKey {
     #[serde(default)] pub lens: crate::renderer::StudioLens,
-    /// Renderer-space aim point. Also drives physical focus after rig resolution.
+    /// Native JKA aim point (Z up). Also drives physical focus after rig resolution.
     #[serde(default,skip_serializing_if="Option::is_none")] pub focus_target: Option<[f32;3]>,
+    /// Native JKA XYZ and angles: Z up, positive yaw toward +Y, positive pitch down.
     pub time: f64, pub position: [f32;3], pub yaw: f32, pub pitch: f32, pub fov: f32,
     #[serde(default)] pub source: StudioCameraSource,
     #[serde(default)] pub demo_follow: StudioDemoFollowRig,
@@ -636,13 +637,13 @@ pub(in crate::app) struct StudioCameraKey {
     pub rig_orbit: Option<StudioCameraOrbit>,
 }
 impl Default for StudioCameraKey {
-    fn default() -> Self { Self { focus_target:None,lens:Default::default(),time: 0.0, position: [0.0,-11.0,0.0], yaw: 0.0, pitch: 5.0, fov: 58.0,source: StudioCameraSource::default(),demo_follow:StudioDemoFollowRig::default(),rig_orbit:None } }
+    fn default() -> Self { Self { focus_target:None,lens:Default::default(),time: 0.0, position: [0.0,0.0,-11.0], yaw: 0.0, pitch: -5.0, fov: 58.0,source: StudioCameraSource::default(),demo_follow:StudioDemoFollowRig::default(),rig_orbit:None } }
 }
 impl StudioCameraKey {
     pub fn focus_point(self)->[f32;3] {
         self.focus_target.unwrap_or_else(|| {
             let camera=super::render_studio_spatial::camera_from_key(self);
-            (camera.position+camera.forward()*self.lens.focus_distance).to_array()
+            crate::scene::jka_position((camera.position+camera.forward()*self.lens.focus_distance).to_array())
         })
     }
     pub fn focus_target_valid(self)->bool {
@@ -651,7 +652,7 @@ impl StudioCameraKey {
     pub fn lens_for_camera(self,camera:&mut crate::camera::Camera)->crate::renderer::StudioLens {
         let mut lens=self.lens;
         if let Some(target)=self.focus_target {
-            let delta=glam::Vec3::from_array(target)-camera.position;
+            let delta=glam::Vec3::from_array(crate::scene::render_position(target))-camera.position;
             if delta.is_finite()&&delta.length_squared()>1e-8 {
                 camera.yaw=(-delta.z).atan2(delta.x);
                 camera.pitch=delta.y.atan2(delta.x.hypot(delta.z)).clamp(-89.9_f32.to_radians(),89.9_f32.to_radians());
@@ -662,10 +663,10 @@ impl StudioCameraKey {
     }
     pub fn resolve_focus_target(&mut self) {
         if self.focus_target.is_none(){return;}
-        let mut camera=crate::camera::Camera::new_with_fov(self.position,self.yaw.to_radians(),self.fov);
-        camera.pitch=self.pitch.to_radians();
+        let mut camera=crate::camera::Camera::new_with_fov(crate::scene::render_position(self.position),self.yaw.to_radians(),self.fov);
+        camera.pitch=-self.pitch.to_radians();
         self.lens=self.lens_for_camera(&mut camera);
-        self.yaw=camera.yaw.to_degrees();self.pitch=camera.pitch.to_degrees();
+        self.yaw=camera.yaw.to_degrees();self.pitch=-camera.pitch.to_degrees();
     }
     /// Rotate the current camera around the actor without resetting its framing.
     pub fn orbit(&mut self, target: [f32;3], delta: [f32;2]) {
@@ -673,13 +674,13 @@ impl StudioCameraKey {
         let target=glam::Vec3::from_array(target);
         let offset=glam::Vec3::from_array(self.position)-target;
         let yaw_delta=delta[0]*0.25;
-        let pitch=(self.pitch-delta[1]*0.25).clamp(-89.0,89.0);
+        let pitch=(self.pitch+delta[1]*0.25).clamp(-89.0,89.0);
         let pitch_delta=pitch-self.pitch;
         self.yaw=(self.yaw+yaw_delta).rem_euclid(360.0);
         let yaw=self.yaw.to_radians();
-        let right=glam::Vec3::new(yaw.sin(),0.0,yaw.cos());
-        let rotation=glam::Quat::from_axis_angle(right,pitch_delta.to_radians())
-            *glam::Quat::from_rotation_y(yaw_delta.to_radians());
+        let right=glam::Vec3::new(yaw.sin(),-yaw.cos(),0.0);
+        let rotation=glam::Quat::from_axis_angle(right,-pitch_delta.to_radians())
+            *glam::Quat::from_rotation_z(yaw_delta.to_radians());
         self.position=(target+rotation*offset).to_array();
         self.pitch=pitch;
     }
@@ -2127,8 +2128,8 @@ mod tests {
         let target=[110.0,24.0,16.0];
         let mut camera=StudioCameraKey::default();
         let offset=glam::Vec3::from_array(target)-glam::Vec3::from_array(camera.position);
-        camera.yaw=(-offset.z).atan2(offset.x).to_degrees();
-        camera.pitch=offset.y.atan2(offset.x.hypot(offset.z)).to_degrees();
+        camera.yaw=offset.y.atan2(offset.x).to_degrees();
+        camera.pitch=(-offset.z).atan2(offset.x.hypot(offset.y)).to_degrees();
         let radius=offset.length();
         let original=camera.position;
         for delta in [[120.0,60.0],[-40.0,-2000.0],[800.0,4000.0]] {
@@ -2136,7 +2137,7 @@ mod tests {
             let offset=glam::Vec3::from_array(target)-glam::Vec3::from_array(camera.position);
             assert!((offset.length()-radius).abs()<0.001);
             let (yaw,pitch)=(camera.yaw.to_radians(),camera.pitch.to_radians());
-            let forward=glam::Vec3::new(yaw.cos()*pitch.cos(),pitch.sin(),-yaw.sin()*pitch.cos());
+            let forward=glam::Vec3::new(yaw.cos()*pitch.cos(),yaw.sin()*pitch.cos(),-pitch.sin());
             assert!(forward.dot(offset.normalize())>0.9999);
             assert!(camera.pitch.abs()<=89.0);
         }
@@ -2146,8 +2147,8 @@ mod tests {
         fn framing(camera:&StudioCameraKey,target:[f32;3])->glam::Vec3 {
             let offset=glam::Vec3::from_array(target)-glam::Vec3::from_array(camera.position);
             let (yaw,pitch)=(camera.yaw.to_radians(),camera.pitch.to_radians());
-            let forward=glam::Vec3::new(yaw.cos()*pitch.cos(),pitch.sin(),-yaw.sin()*pitch.cos());
-            let right=glam::Vec3::new(yaw.sin(),0.0,yaw.cos());
+            let forward=glam::Vec3::new(yaw.cos()*pitch.cos(),yaw.sin()*pitch.cos(),-pitch.sin());
+            let right=glam::Vec3::new(yaw.sin(),-yaw.cos(),0.0);
             glam::Vec3::new(offset.dot(right),offset.dot(right.cross(forward)),offset.dot(forward))
         }
         let target=[88.0,18.0,-22.0];
@@ -2161,7 +2162,7 @@ mod tests {
         camera.orbit(target,[0.1,-0.1]);
         assert!((glam::Vec3::from_array(camera.position)-glam::Vec3::from_array(original.position)).length()<0.5);
         assert!((camera.yaw-17.025).abs()<0.0001);
-        assert!((camera.pitch+11.975).abs()<0.0001);
+        assert!((camera.pitch+12.025).abs()<0.0001);
         assert!((framing(&camera,target)-before).length()<0.001);
         // Pan/dolly farther, release, and resume orbit from that new view.
         camera.position[0]-=250.0;camera.position[1]+=80.0;camera.position[2]+=120.0;

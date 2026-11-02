@@ -1,4 +1,5 @@
 /* Isolate the reference C backend from stock OpenJK symbols. */
+#include "jump_trace.h"
 #define AddPointToBounds japro_AddPointToBounds
 #define AngleDelta japro_AngleDelta
 #define AngleMod japro_AngleMod

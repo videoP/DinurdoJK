@@ -1106,6 +1106,10 @@ impl App {
                     }
                 );
             }
+            ui::VIDEO_ROW_SABER_CORE_MODE => {
+                let mode = (self.video.saber_core_mode as i32 + direction).rem_euclid(4);
+                let _ = self.set_console_cvar("r_saberCoreMode", &mode.to_string());
+            }
             ui::VIDEO_ROW_FLARES => {
                 self.video.flares = !self.video.flares;
                 self.sync_world_flares();
@@ -1674,13 +1678,20 @@ impl App {
         self.publish_ui();
     }
 
-    /// Gate the existing GPU Godot wake/deformation system without erasing
-    /// the user's r_oceanInteraction preference. RenderCommand carries canonical
+    /// Gate the existing promoted-water player interactions without erasing
+    /// the user's Godot/cheapwater preferences. Regular uses the JKA shader on
+    /// unpromoted water; only Enhanced enables promoted mesh interactions.
+    /// RenderCommand carries canonical
     /// (unresolved) settings: Renderer::set_ocean_settings resolves exactly once.
     /// Otherwise Hybrid transparency multipliers would be applied twice.
     pub(in crate::app) fn effective_ocean_settings(&self) -> crate::ocean::OceanSettings {
         let mut settings = self.video.ocean_settings;
         settings.interaction &= self.video.water_wake == 2;
+        // A single strength setting drives all supported backends. Cheapwater
+        // has a [0,10] gain range; keep its legacy stored preference intact.
+        settings.lake.wake_strength = if settings.interaction {
+            settings.interaction_strength.clamp(0.0, 10.0)
+        } else { 0.0 };
         settings
     }
 
@@ -1731,7 +1742,7 @@ impl App {
 
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
-            session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
+            session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
             session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
@@ -1991,7 +2002,7 @@ impl App {
             ui::ENV_ROW_OCEAN => {
                 self.video.ocean = !self.video.ocean;
                 if let Some(session) = self.game_session.as_mut() {
-                    session.lake_wakes_enabled = self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.lake.wake_strength > 0.0;
+                    session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
                     session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                 }

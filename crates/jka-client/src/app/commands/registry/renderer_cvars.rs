@@ -4780,6 +4780,68 @@ app_cvars! {
         ]
     }
 
+    APP_R_SABERCOREMODE {
+        runtime: CvarDef::new(
+            "r_saberCoreMode", "", "0..3",
+            "Legacy saber core: 0 original only (default); 1 SBAK thin pulsing only; 2 both cores; 3 glow only (no core). Modern saber rendering ignores this setting.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.video.saber_core_mode.to_string()),
+            |app, value| App::cvar_set_r_sabercoremode(app, APP_R_SABERCOREMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_sabercoremode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.parse::<u32>() {
+                    if mode <= 3 { settings.saber_core_mode = mode; }
+                }
+            }),
+            archive: Some((466, |state| state.video.saber_core_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_sabercoremode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.parse::<u32>()
+                    .map_err(|_| format!("{name}: expected integer 0..3"))?;
+                if mode > 3 { return Err(format!("{name}: expected integer 0..3")); }
+                self.video.saber_core_mode = mode;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.weapon_fx.set_saber_core_mode(mode);
+                }
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = format!("LEGACY SABER CORE: {}", match mode {
+                    0 => "ORIGINAL", 1 => "SBAK ONLY", 2 => "BOTH", _ => "GLOW ONLY",
+                });
+                Ok(())
+            }
+        }]
+    }
+
+    // Compatibility alias for configs created by the earlier 0/1 SBAK toggle.
+    // Deliberately not archived: new configurations write r_saberCoreMode only.
+    APP_R_SABERCOREPULSE {
+        runtime: CvarDef::new(
+            "r_saberCorePulse", "", "0..1",
+            "Deprecated alias: 0 selects Original; 1 selects Both. Use r_saberCoreMode 0..3 for full control.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(bool_value(matches!(app.video.saber_core_mode, 1 | 2))),
+            |app, value| App::cvar_set_r_sabercorepulse(app, APP_R_SABERCOREPULSE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_sabercorepulse, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.saber_core_mode = if enabled { 2 } else { 0 };
+                }
+            }),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_sabercorepulse(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                self.cvar_set_r_sabercoremode("r_saberCoreMode", if enabled { "2" } else { "0" })
+            }
+        }]
+    }
+
     APP_R_MOTIONBLUR {
         runtime: CvarDef::new(
                 "r_motionBlur",
@@ -5422,7 +5484,7 @@ app_cvars! {
     }
 
     APP_R_SHOWTRIS {
-        runtime: CvarDef::new("r_showtris", "", "0..127", "Wireframe category bitmask: 1 map, 2 players, 4 entities, 8 effects, 16 grass, 32 ocean, 64 deformation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_showtris(app)), |app, value| App::cvar_set_r_showtris(app, APP_R_SHOWTRIS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_showtris, None),
+        runtime: CvarDef::new("r_showtris", "", "0..255", "Wireframe category bitmask: 1 map, 2 players, 4 entities, 8 effects, 16 grass, 32 ocean, 64 deformation, 128 river.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_showtris(app)), |app, value| App::cvar_set_r_showtris(app, APP_R_SHOWTRIS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_showtris, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     if let Ok(mask) = value.trim().parse::<u32>() {

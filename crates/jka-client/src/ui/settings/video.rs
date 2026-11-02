@@ -99,8 +99,8 @@ pub struct VideoSettings {
     pub draw_inline_models: bool,
     /// CPU, CPU workers, or GPU compute transforms for inline BSP movers.
     pub inline_transform_mode: crate::ui::InlineTransformMode,
-    /// r_fragmentShaderMode: 0 general world fragment program, 1 TaystJK-style
-    /// per-material specialized programs (MaterialFragmentKey).
+    /// r_fragmentShaderMode: 0 general, 1 material-specialized, 2 compact entries,
+    /// 3 shared families, 4 generated recipes, 5 hybrid (default).
     pub fragment_shader_mode: u8,
     /// Session-only shader input A/B: 0 WGSL, 1 round-trip validated SPIR-V (WGSL fallback).
     pub shader_input_mode: u8,
@@ -521,6 +521,9 @@ pub struct VideoSettings {
     /// Optional continuous-ribbon saber presentation. False keeps the OpenJK-style
     /// RT_SABER_GLOW sprite chain + RT_LINE core.
     pub modern_sabers: bool,
+    /// Legacy saber core selection (0 original, 1 thin sbak, 2 both, 3 glow only).
+    /// Has no effect on the modern saber presentation.
+    pub saber_core_mode: u32,
     /// Standard OpenJK/TaystJK `r_flares`: authored RBSP MST_FLARE world flares.
     pub flares: bool,
     /// Experiment: permit conservative reverse-lightmap pair fusion when the
@@ -710,7 +713,7 @@ impl Default for VideoSettings {
             draw_map_models: true,
             draw_inline_models: true,
             inline_transform_mode: crate::ui::InlineTransformMode::Gpu,
-            fragment_shader_mode: 1,
+            fragment_shader_mode: 5,
             shader_input_mode: 0,
             world_sort_mode: 0,
             post_specialize: true,
@@ -1001,6 +1004,7 @@ impl Default for VideoSettings {
             vertex_lighting: false,
             lightmap_only: false,
             modern_sabers: false,
+            saber_core_mode: 0,
             flares: true,
             stage_collapse_extra: false,
             additive_stage_fusion: true,

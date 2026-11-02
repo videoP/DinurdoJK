@@ -1,4 +1,5 @@
 /* Only the public host entry points are renamed; stock BG stays untouched. */
+#include "jump_trace.h"
 #define jka_player_jump_level stock_jka_player_jump_level
 #define jka_player_knockback stock_jka_player_knockback
 #define jka_player_set_noclip stock_jka_player_set_noclip

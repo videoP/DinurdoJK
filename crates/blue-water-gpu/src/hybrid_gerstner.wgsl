@@ -22,6 +22,35 @@ struct JkaHybridSwell {
 @group(1) @binding(20) var jka_godot_foam_near: texture_2d<f32>;
 @group(1) @binding(21) var jka_godot_foam_far: texture_2d<f32>;
 
+// Shared persistent JKA actor-interaction field (Rgba16Float, four body layers).
+// Native clipmaps and Godot BSP clipmaps read the *same* published texture;
+// no secondary solver or extra wake geometry is created here.
+struct JkaInteractionDomain {
+    region: vec4<f32>,
+    bounds: vec4<f32>,
+    controls: vec4<f32>,
+    identity: vec4<f32>,
+}
+struct JkaInteractionDomains { domains: array<JkaInteractionDomain, 4>, }
+@group(1) @binding(23) var jka_interaction_field: texture_2d_array<f32>;
+@group(1) @binding(24) var<uniform> jka_interactions: JkaInteractionDomains;
+
+fn jka_player_interaction(grid: vec2<f32>) -> vec3<f32> {
+    if jka_interactions.domains[0].controls.w < 0.5 { return vec3<f32>(0.0); }
+    let pos = grid * jka_boundary.scale.x;
+    for (var i = 0u; i < 4u; i++) {
+        let domain = jka_interactions.domains[i];
+        if domain.controls.x < 0.5
+            || abs(domain.region.w - jka_boundary.sky_plane.x) > 0.5
+            || any(abs(domain.bounds - jka_boundary.bounds) > vec4<f32>(0.1)) { continue; }
+        let uv = (pos - domain.region.xy) * domain.region.z;
+        if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) { return vec3<f32>(0.0); }
+        return textureSampleLevel(jka_interaction_field, wake_sampler, uv, i32(i), 0.0).xyz
+            * domain.controls.z;
+    }
+    return vec3<f32>(0.0);
+}
+
 fn jka_godot_noise(uv: vec2<f32>) -> f32 {
     return textureSampleLevel(jka_godot_patterns, jka_godot_repeat, uv, 0.0).g;
 }
@@ -50,14 +79,18 @@ fn jka_hybrid_crest_scale() -> f32 {
 fn jka_hybrid_displacement(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
     let raw = jka_hybrid_raw_displacement(grid, spacing);
     let scale = jka_hybrid_crest_scale();
-    return raw * vec3<f32>(scale, 1.0, scale);
+    let player = jka_player_interaction(grid);
+    return raw * vec3<f32>(scale, 1.0, scale)
+        + vec3<f32>(0.0, player.x / jka_boundary.scale.x, 0.0);
 }
 
 // Tile LOD transitions must land on the same corrected parent triangle.
 // Keep the original parent's evaluation byte-for-byte in the off path.
 fn jka_hybrid_parent_displacement(grid: vec2<f32>, spacing: f32) -> vec3<f32> {
     if jka_hybrid.breaker.x > 0.5 || jka_hybrid.godot.x > 0.5 { return jka_hybrid_displacement(grid, spacing); }
-    return displacement(grid, spacing);
+    let player = jka_player_interaction(grid);
+    return displacement(grid, spacing)
+        + vec3<f32>(0.0, player.x / jka_boundary.scale.x, 0.0);
 }
 
 fn jka_hybrid_strain(grid: vec2<f32>) -> vec3<f32> {

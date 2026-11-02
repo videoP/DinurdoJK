@@ -282,7 +282,7 @@ impl QualityPreset {
         settings.extend([
             ("r_pvsMode", "auto"),
             ("r_igpuAB", "0"),
-            ("r_fragmentShaderMode", "1"),
+            ("r_fragmentShaderMode", "5"),
             ("r_competitiveAB", "0"),
             ("r_fullbright", "0"),
             ("r_vertexLight", "0"),
@@ -539,6 +539,17 @@ mod tests {
     }
 
     #[test]
+    fn quality_presets_default_to_hybrid_fragment_shaders() {
+        for preset in QualityPreset::ALL {
+            assert!(
+                preset.settings().contains(&("r_fragmentShaderMode", "5")),
+                "{} must default to Hybrid world shaders",
+                preset.label()
+            );
+        }
+    }
+
+    #[test]
     fn quality_presets_restore_shitter_overrides() {
         let baseline = QualityPreset::Minimal.settings();
         let shitter = QualityPreset::Shitter.settings();
@@ -547,7 +558,7 @@ mod tests {
             ("r_igpuAB", "19", "0"),
             ("r_igpuMemoryAB", "1", "0"),
             ("r_rgb565", "1", "0"),
-            ("r_fragmentShaderMode", "5", "1"),
+            ("r_fragmentShaderMode", "5", "5"),
             ("r_competitiveAB", "5", "0"),
             ("r_fullbright", "0", "0"),
             ("r_vertexLight", "0", "0"),

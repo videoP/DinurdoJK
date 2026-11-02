@@ -2,7 +2,7 @@
 use super::App;
 use super::render_studio_ui::palette as theme;
 use crate::app::render_studio_spatial::{StudioSpatialDrag,StudioSpatialMarker,StudioMotionPath,
-    key_from_camera,stored_position,translate_item};
+    key_from_camera,stored_position,translate_item,STUDIO_JKA_AXES};
 use glam::Vec3;
 
 fn project(camera:&crate::camera::Camera,viewport:egui::Rect,point:[f32;3])->Option<egui::Pos2> {
@@ -151,8 +151,10 @@ impl App {
                 let depth=(Vec3::from_array(marker.position)-camera.position).dot(camera.forward()).max(1.);
                 let length=depth*2.*(camera.fov_y_for_viewport(viewport.width() as u32,viewport.height() as u32)*0.5).tan()
                     /viewport.height().max(1.)*66.;
-                for (axis,(direction,tint,name)) in [(Vec3::X,egui::Color32::from_rgb(247,102,104),"X"),
-                    (Vec3::Y,egui::Color32::from_rgb(114,223,118),"Y"),(Vec3::Z,egui::Color32::from_rgb(103,162,255),"Z")].into_iter().enumerate() {
+                for (native,(axis,direction,name)) in STUDIO_JKA_AXES.into_iter().enumerate() {
+                    let direction=Vec3::from_array(direction);
+                    let tint=[egui::Color32::from_rgb(247,102,104),egui::Color32::from_rgb(114,223,118),
+                        egui::Color32::from_rgb(103,162,255)][native];
                     let end=Vec3::from_array(marker.position)+direction*length;
                     let Some(end)=project(&camera,viewport,end.to_array()).filter(|p|viewport.shrink(8.).contains(*p)) else {continue;};
                     if anchor.distance(end)<20. {continue;}
@@ -203,7 +205,7 @@ impl App {
             let time=self.render_studio.timeline_time();self.render_studio.timeline.seek(time);
             if self.render_studio.spatial.scene_camera.is_none() {
                 self.render_studio.spatial.scene_camera=Some(key_from_camera(camera));
-                self.render_studio.spatial.pivot=marker.position;
+                self.render_studio.spatial.pivot=crate::scene::jka_position(marker.position);
             }
             let items=self.render_studio.timeline.selected_items().into_iter().filter_map(|item|
                 stored_position(&self.render_studio.timeline,item).map(|position|(item,position))).collect();
@@ -245,13 +247,17 @@ impl App {
                     let shot=frame.outgoing.shot_camera;
                     let target=shot.position+shot.forward()*128.0;
                     let eye=shot.position-shot.forward()*180.0+glam::Vec3::Y*80.0;
-                    let mut camera=key_from_camera(shot);camera.position=eye.to_array();camera.focus_target=Some(target.to_array());camera.resolve_focus_target();
+                    let mut camera=key_from_camera(shot);camera.position=crate::scene::jka_position(eye.to_array());camera.focus_target=Some(crate::scene::jka_position(target.to_array()));camera.resolve_focus_target();
                     camera.focus_target=None;self.render_studio.spatial.scene_camera=Some(camera);
                     self.render_studio.spatial.show_keys=true;
                 }
                 self.profile_preview_key=None;
             }
             let time=self.render_studio.timeline_time();
+            if sui::button(ui,Some(Icon::AddKey),"Key from view",ButtonKind::Normal,!locked)
+                .on_hover_text("Save the current view as a camera key at the playhead and preview the output shot").clicked() {
+                self.capture_studio_preview_camera(time);
+            }
             if let Some(shot)=self.render_studio.timeline.director_at(time) {
                 ui.label(egui::RichText::new(format!("Director · {}",shot.preset.label())).size(12.0).color(sui::CAMERA()))
                     .on_hover_text("A live Director shot drives the camera here (see the Camera track)");

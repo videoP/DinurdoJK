@@ -1013,6 +1013,8 @@ pub struct OriginalSurfaceBindings {
     reflection_table: wgpu::Buffer,
     pub(crate) boundary: wgpu::Buffer,
     sky_roof: wgpu::TextureView,
+    player_interaction: (wgpu::TextureView, wgpu::Buffer),
+    neutral_player_interaction: (wgpu::TextureView, wgpu::Buffer),
     pub surface_bytes: usize,
 }
 
@@ -1221,6 +1223,11 @@ impl OriginalSurfaceBindings {
         };
         let sky_roof = placeholder(device, "no BSP roof", wgpu::TextureFormat::Rgba32Float,
             wgpu::TextureViewDimension::D2, 1);
+        let neutral_player_interaction = (
+            placeholder(device, "Blue Water inert player-interaction field",
+                wgpu::TextureFormat::Rgba16Float, wgpu::TextureViewDimension::D2Array, 1),
+            buffer(device, "Blue Water inert player-interaction domains", 256, false),
+        );
         let material_group = Self::make_material_group(
             device,
             &pipeline.surface_layout,
@@ -1242,6 +1249,7 @@ impl OriginalSurfaceBindings {
             &hybrid_swell,
             &neutral_godot,
             &sky_roof,
+            &neutral_player_interaction.0, &neutral_player_interaction.1,
             &color,
             &depth,
         );
@@ -1354,6 +1362,8 @@ impl OriginalSurfaceBindings {
             reflection_table,
             boundary,
             sky_roof,
+            player_interaction: neutral_player_interaction.clone(),
+            neutral_player_interaction,
             surface_bytes,
         }
     }
@@ -1375,6 +1385,8 @@ impl OriginalSurfaceBindings {
         hybrid_swell: &wgpu::Buffer,
         godot: &GodotWaterViews,
         sky_roof: &wgpu::TextureView,
+        player_interaction_view: &wgpu::TextureView,
+        player_interaction_domains: &wgpu::Buffer,
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
@@ -1405,6 +1417,8 @@ impl OriginalSurfaceBindings {
                 entry_texture(20, &godot.foam_near),
                 entry_texture(21, &godot.foam_far),
                 entry_texture(22, sky_roof),
+                entry_texture(23, player_interaction_view),
+                entry_buffer(24, player_interaction_domains),
             ],
         })
     }
@@ -1452,10 +1466,26 @@ impl OriginalSurfaceBindings {
             &self.hybrid_swell,
             &self.godot,
             &self.sky_roof,
+            &self.player_interaction.0, &self.player_interaction.1,
             color,
             depth,
         );
         self.current_scene = Some(next);
+    }
+
+    /// Bind the renderer-global published player interaction, shared with
+    /// Godot BSP ocean. Rebuild only when the binding identity actually changes.
+    pub fn set_player_interaction(
+        &mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline,
+        field: Option<(&wgpu::TextureView, &wgpu::Buffer)>,
+    ) {
+        let next = field.map_or_else(|| self.neutral_player_interaction.clone(),
+            |(view, domains)| (view.clone(), domains.clone()));
+        if self.player_interaction == next { return; }
+        self.player_interaction = next;
+        if let Some((color, depth)) = self.current_scene.take() {
+            self.set_scene(device, pipeline, &color, &depth);
+        }
     }
 
     /// Bind `r_oceanType 5`'s textures (or the neutral ones again for `None`). Rebuilds the material group against the
@@ -1770,13 +1800,15 @@ impl OriginalSurfacePipeline {
                 uniform(13, fragment),
                 sampled(14, fragment, t2, false),
                 storage(15, fragment),
-                uniform(16, fragment),
+                uniform(16, both),
                 uniform(17, both),
                 sampled(18, both, t2, false),
                 sampler(19, both, false),
                 sampled(20, fragment, t2, false),
                 sampled(21, fragment, t2, false),
                 roof_sampled(fragment),
+                sampled(23, both, wgpu::TextureViewDimension::D2Array, false),
+                uniform(24, both),
             ],
         });
         let environment_layout =

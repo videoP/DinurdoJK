@@ -4,6 +4,14 @@ use crate::camera::Camera;
 use glam::Vec3;
 use std::collections::BTreeMap;
 
+/// Native JKA axis labels/directions paired with the renderer-axis index used
+/// by translation constraints. JKA +Y is renderer -Z; JKA +Z is renderer +Y.
+pub(in crate::app) const STUDIO_JKA_AXES: [(usize, [f32; 3], &str); 3] = [
+    (0, [1.0, 0.0, 0.0], "X"),
+    (2, [0.0, 0.0, -1.0], "Y"),
+    (1, [0.0, 1.0, 0.0], "Z"),
+];
+
 #[derive(Clone,Debug)]
 pub(in crate::app) struct StudioSpatialMarker {
     pub item: StudioItem,
@@ -106,10 +114,64 @@ fn motion_paths(timeline:&StudioTimeline,zoom:f32)->Vec<StudioMotionPath> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn studio_native_coordinates_persist_and_render_with_jka_angles() {
+        let key=StudioCameraKey {position:[12.,34.,56.],yaw:90.,pitch:30.,..Default::default()};
+        let json=serde_json::to_value(key).unwrap();
+        assert_eq!(json["position"],serde_json::json!([12.,34.,56.]));
+        let restored:StudioCameraKey=serde_json::from_value(json).unwrap();
+        let camera=camera_from_key(restored);
+        assert_eq!(camera.position.to_array(),[12.,56.,-34.]);
+        let expected=Vec3::new(0.,-0.5,-30_f32.to_radians().cos());
+        assert!(camera.forward().distance(expected)<0.00001);
+        let captured=key_from_camera(camera);
+        assert_eq!(captured.position,key.position);
+        assert!((captured.yaw-key.yaw).abs()<0.00001);
+        assert!((captured.pitch-key.pitch).abs()<0.00001);
+        let mut target=StudioCameraKey {position:[0.;3],focus_target:Some([0.,100.,100.]),..Default::default()};
+        target.resolve_focus_target();
+        assert_eq!(target.yaw,90.);assert!((target.pitch+45.).abs()<0.00001);
+        assert!(camera_from_key(target).forward().distance(Vec3::new(0.,1.,-1.).normalize())<0.00001);
+    }
+    #[test]
+    fn studio_gizmos_camera_and_actor_share_native_xyz() {
+        for (native,(_,direction,label)) in STUDIO_JKA_AXES.into_iter().enumerate() {
+            let mut timeline=timeline();
+            let camera=timeline.camera[0];let motion=timeline.clips[0].motion[1];
+            let delta=Vec3::from_array(direction)*10.;
+            translate_item(&mut timeline,StudioItem::Camera(0),camera.position,delta);
+            translate_item(&mut timeline,StudioItem::Motion(0,1),motion.position,delta);
+            for axis in 0..3 {
+                let expected=if axis==native {10.}else{0.};
+                assert_eq!(timeline.camera[0].position[axis]-camera.position[axis],expected,"{label}");
+                assert_eq!(timeline.clips[0].motion[1].position[axis]-motion.position[axis],expected,"{label}");
+            }
+        }
+        let first=Vec3::from_array(motion_world([0.;3],0,1.));
+        let second=Vec3::from_array(motion_world([0.;3],1,1.));
+        assert_eq!(crate::scene::jka_position((second-first).to_array()),[0.,26.,0.]);
+    }
+    #[test]
+    fn studio_stage_director_offsets_rotate_about_native_z() {
+        use super::super::render_studio_director::{StudioDirectorShot,StudioDirectorPreset};
+        use super::super::render_studio_timeline::StudioDemoAnchor;
+        let mut timeline=timeline();
+        let mut shot=StudioDirectorShot::new(1,StudioDirectorPreset::PlayerEyes,-1,2.,1.);
+        shot.actor_lane=1;shot.rig.position_anchor=StudioDemoAnchor::Origin;
+        shot.rig.position_offset=[10.,20.,30.];shot.rig.position_local=false;
+        shot.rig.aim_enabled=false;shot.rig.yaw_offset=0.;shot.rig.pitch_offset=25.;
+        timeline.director_shots.push(shot);
+        let camera=timeline.stage_camera_at(2.,1.,60.).unwrap();
+        assert_eq!(camera.position,[100.,49.,12.]);
+        assert_eq!(camera.yaw,90.);assert_eq!(camera.pitch,25.);
+        timeline.director_shots[0].rig.position_local=true;
+        let camera=timeline.stage_camera_at(2.,1.,60.).unwrap();
+        assert!(Vec3::from_array(camera.position).distance(Vec3::new(70.,39.,12.))<0.00001);
+    }
     fn camera()->Camera {
         let eye=Vec3::new(-100.,70.,130.);let aim=Vec3::new(88.,-10.,0.);let d=aim-eye;
-        camera_from_key(StudioCameraKey {position:eye.to_array(),yaw:(-d.z).atan2(d.x).to_degrees(),
-            pitch:d.y.atan2(d.x.hypot(d.z)).to_degrees(),..Default::default()})
+        camera_from_key(StudioCameraKey {position:crate::scene::jka_position(eye.to_array()),yaw:(-d.z).atan2(d.x).to_degrees(),
+            pitch:-d.y.atan2(d.x.hypot(d.z)).to_degrees(),..Default::default()})
     }
     fn project(camera:&Camera,rect:egui::Rect,p:Vec3)->egui::Pos2 {
         rect.min+camera.project_to_screen(rect.width() as u32,rect.height() as u32,p).unwrap().to_vec2()
@@ -130,15 +192,15 @@ mod tests {
         let clip=&mut timeline.clips[0];clip.start=2.25;clip.end_frame=90;clip.source_end=100;
         clip.motion=vec![StudioMotionKey::default(),StudioMotionKey {time:5.,position:[100.,0.,0.],yaw:0.}];
         let paths=motion_paths(&timeline,1.);let path=&paths[0];
-        assert_eq!(path.points.first(),Some(&[98.,4.,0.]));
-        assert_eq!(path.points.last(),Some(&[178.,4.,0.]));
+        assert_eq!(path.points.first(),Some(&[98.,-22.,-26.]));
+        assert_eq!(path.points.last(),Some(&[178.,-22.,-26.]));
         assert_eq!(path.ticks.iter().map(|t|t.second).collect::<Vec<_>>(),vec![3,4,5,6]);
-        assert_eq!(path.ticks[0].position,[113.,4.,0.]);
-        assert_eq!(path.ticks[3].position,[173.,4.,0.]);
+        assert_eq!(path.ticks[0].position,[113.,-22.,-26.]);
+        assert_eq!(path.ticks[3].position,[173.,-22.,-26.]);
         assert_eq!(path.ticks[0].tangent,[1.,0.,0.]);
         timeline.interpolation=StudioInterpolation::Smooth;
         let smooth=motion_paths(&timeline,1.);
-        assert_eq!(smooth[0].ticks[0].position,[103.625,4.,0.]);
+        assert_eq!(smooth[0].ticks[0].position,[103.625,-22.,-26.]);
         timeline.interpolation=StudioInterpolation::Spline;
         assert_eq!(motion_paths(&timeline,1.)[0].ticks[0].position,smooth[0].ticks[0].position);
     }
@@ -152,15 +214,15 @@ mod tests {
             StudioMotionKey {time:2.,position:[20.,40.,0.],yaw:0.},
             StudioMotionKey {time:6.,position:[60.,40.,0.],yaw:0.}];
         let hold=motion_paths(&timeline,1.);
-        assert_eq!(hold[0].points.first(),Some(&[98.,4.,0.]));
-        assert_eq!(hold[0].points.last(),Some(&[133.,4.,-40.]));
-        assert!(hold[0].points.contains(&[108.,4.,0.]));assert!(hold[0].points.contains(&[108.,4.,-40.]));
+        assert_eq!(hold[0].points.first(),Some(&[98.,-22.,-26.]));
+        assert_eq!(hold[0].points.last(),Some(&[133.,-22.,-66.]));
+        assert!(hold[0].points.contains(&[108.,-22.,-26.]));assert!(hold[0].points.contains(&[108.,-22.,-66.]));
         assert_eq!(hold[0].ticks.iter().map(|t|t.second).collect::<Vec<_>>(),vec![1,2,3,4]);
         timeline.clips[0].playback=StudioClipPlayback::Loop;
         let looping=motion_paths(&timeline,1.);
         assert_eq!(looping[0].ticks.iter().map(|t|t.position).collect::<Vec<_>>(),
             hold[0].ticks.iter().map(|t|t.position).collect::<Vec<_>>());
-        assert_eq!(looping[0].ticks[3].position,[130.5,4.,-40.]);
+        assert_eq!(looping[0].ticks[3].position,[130.5,-22.,-66.]);
     }
     #[test]
     fn actor_paths_keep_clips_and_lanes_separate_and_stationary_ticks_finite() {
@@ -168,7 +230,7 @@ mod tests {
         let mut next=timeline.clips[0].clone();next.start=8.;next.lane=0;timeline.clips.push(next);
         let paths=motion_paths(&timeline,1.5);
         assert_eq!(paths.len(),2);
-        assert!(paths[0].points.iter().all(|&p|p==[132.,4.,0.]));
+        assert!(paths[0].points.iter().all(|&p|p==[132.,-22.,-26.]));
         assert!(paths[1].points.iter().all(|&p|p==[132.,-22.,0.]));
         assert_eq!(paths[0].ticks.iter().map(|t|t.second).collect::<Vec<_>>(),vec![2,3,4]);
         assert_eq!(paths[1].ticks.iter().map(|t|t.second).collect::<Vec<_>>(),vec![8,9,10]);
@@ -180,9 +242,9 @@ mod tests {
         clip.start=0.;clip.first_frame=0;clip.end_frame=80;clip.motion.clear();
         let path=motion_path(clip,false,1.,90.,|t|Ok::<_,()>([t as f32*10.,(t*t) as f32,0.])).unwrap();
         let tick=&path.ticks[2];assert_eq!(tick.second,2);
-        assert!((Vec3::from_array(tick.position)-Vec3::new(88.,8.,-20.)).length()<0.0001);
+        assert!((Vec3::from_array(tick.position)-Vec3::new(88.,-18.,-46.)).length()<0.0001);
         assert!(path.points.len()>100,"trace must follow the curve within the clip");
-        assert!(path.points.iter().any(|p|p[1]>4. && p[1]<20.));
+        assert!(path.points.iter().any(|p|p[1]>-22. && p[1]< -6.));
     }
     #[test]
     fn camera_path_follows_spline_and_actual_rig_positions_with_second_ticks() {
@@ -301,11 +363,11 @@ mod tests {
             app.render_studio.preview_sample_time=Some(time);app.update_studio_camera_rig();
             let camera=app.render_studio.camera_rig_runtime.camera.unwrap();
             let head=app.render_studio.camera_rig_runtime.frames[0].unwrap().position;
-            let vector=Vec3::from_array(camera.position)-Vec3::from_array(head);
+            let vector=Vec3::from_array(camera.position)-Vec3::from_array(crate::scene::jka_position(head));
             assert!((vector.length()-120.).abs()<0.002);
-            assert!(((-vector.z).atan2(vector.x).to_degrees()-angle).abs()<0.002);
-            assert!(camera_from_key(camera).forward().dot(-vector.normalize())>0.9999);
-            shots.push(camera.position);
+            assert!((vector.y.atan2(vector.x).to_degrees()-angle).abs()<0.002);
+            assert!(camera_from_key(camera).forward().dot(-Vec3::from_array(crate::scene::render_position(vector.to_array())).normalize())>0.9999);
+            shots.push(crate::scene::render_position(camera.position));
         }
         let started=std::time::Instant::now();
         loop {
@@ -354,7 +416,7 @@ mod tests {
             assert!(translate_item(&mut timeline,StudioItem::Camera(0),camera.position,delta));
             assert!(translate_item(&mut timeline,StudioItem::Motion(0,1),initial.position,delta));
         }
-        assert_eq!(timeline.camera[0].position,[10.,9.,30.]);assert_eq!(timeline.camera[0].time,camera.time);
+        assert_eq!(timeline.camera[0].position,[10.,-30.,9.]);assert_eq!(timeline.camera[0].time,camera.time);
         assert_eq!(timeline.clips[0].motion[1].position,[12.,-27.,24.]);
         assert_eq!(timeline.clips[0].motion[1].time,initial.time);assert_eq!(timeline.clips[0].motion[1].yaw,initial.yaw);
         let before=Vec3::from_array(motion_world(initial.position,1,1.));
@@ -431,15 +493,19 @@ impl Default for StudioSpatialEditor {
 }
 
 pub(in crate::app) fn camera_from_key(key:StudioCameraKey)->Camera {
-    let mut camera=Camera::new_with_fov(key.position,key.yaw.to_radians(),key.fov);
-    camera.pitch=key.pitch.to_radians();key.lens_for_camera(&mut camera);camera
+    let mut camera=Camera::new_with_fov(crate::scene::render_position(key.position),key.yaw.to_radians(),key.fov);
+    camera.pitch=-key.pitch.to_radians();key.lens_for_camera(&mut camera);camera
 }
 pub(in crate::app) fn key_from_camera(camera:Camera)->StudioCameraKey {
-    StudioCameraKey {position:camera.position.to_array(),yaw:camera.yaw.to_degrees(),
-        pitch:camera.pitch.to_degrees(),fov:camera.cg_fov(),..Default::default()}
+    StudioCameraKey {position:crate::scene::jka_position(camera.position.to_array()),yaw:camera.yaw.to_degrees(),
+        pitch:-camera.pitch.to_degrees(),fov:camera.cg_fov(),..Default::default()}
+}
+/// Stage placement in native JKA coordinates, shared by actors and authoring tools.
+pub(in crate::app) fn motion_origin(position:[f32;3],lane:usize,zoom:f32)->[f32;3] {
+    [88.*zoom.clamp(0.45,2.5)+position[0],lane as f32*26.+position[1],-22.+position[2]]
 }
 pub(in crate::app) fn motion_world(position:[f32;3],lane:usize,zoom:f32)->[f32;3] {
-    crate::scene::render_position([88.*zoom.clamp(0.45,2.5)+position[0],position[1],-22.+lane as f32*26.+position[2]])
+    crate::scene::render_position(motion_origin(position,lane,zoom))
 }
 pub(in crate::app) fn stored_position(timeline:&StudioTimeline,item:StudioItem)->Option<[f32;3]> {
     match item {StudioItem::Camera(i)=>timeline.camera.get(i).map(|k|k.position),
@@ -447,11 +513,12 @@ pub(in crate::app) fn stored_position(timeline:&StudioTimeline,item:StudioItem)-
 }
 pub(in crate::app) fn translate_item(timeline:&mut StudioTimeline,item:StudioItem,initial:[f32;3],delta:Vec3)->bool {
     if !delta.is_finite() {return false;}
+    let delta=Vec3::from_array(crate::scene::jka_position(delta.to_array()));
     let (position,delta)=match item {
         StudioItem::Camera(i)=>match timeline.camera.get_mut(i) {Some(k)=>{let target=k.focus_point();k.position=(Vec3::from_array(initial)+delta).clamp(Vec3::splat(-50000.0),Vec3::splat(50000.0)).to_array();
             k.focus_target=Some(target);k.resolve_focus_target();return true},None=>return false},
         StudioItem::Motion(i,k)=>match timeline.clips.get_mut(i).and_then(|c|c.motion.get_mut(k)) {
-            Some(k)=>(&mut k.position,crate::scene::jka_position(delta.to_array())),None=>return false},
+            Some(k)=>(&mut k.position,delta.to_array()),None=>return false},
         _=>return false,
     };
     *position=std::array::from_fn(|i|(initial[i]+delta[i]).clamp(-50000.,50000.));true
@@ -542,7 +609,7 @@ impl App {
                 offset
             };
             spatial.markers.push(StudioSpatialMarker {item:StudioItem::Camera(i),number:i+1,time:key.time,
-                position:std::array::from_fn(|a|key.position[a]+offset[a]),lane:None});
+                position:crate::scene::render_position(std::array::from_fn(|a|key.position[a]+offset[a])),lane:None});
         }
         spatial.camera_offsets.retain(|t,_|keys.iter().any(|k|k.time.to_bits()==*t));
         let mut camera_pending=false;
@@ -551,7 +618,7 @@ impl App {
             timeline.interpolation=self.render_studio.timeline.interpolation;
             let started=std::time::Instant::now();let mut queries=0;
             let result=camera_path(&timeline,|time| {
-                if !rig.active() {return Ok(timeline.camera_at(time).position);}
+                if !rig.active() {return Ok(crate::scene::render_position(timeline.camera_at(time).position));}
                 if let Some(&position)=spatial.camera_samples.get(&time.to_bits()) {return Ok(position);}
                 if queries>=128 || (queries>0 && started.elapsed().as_secs_f32()>0.004) {return Err(PathSampleError::Pending);}
                 queries+=1;self.render_studio.preview_sample_time=Some(time);self.update_studio_camera_rig();
@@ -559,7 +626,7 @@ impl App {
                     .find(|message|message.to_ascii_lowercase().contains("loading")) {
                     return Err(PathSampleError::Asset(message.clone()));
                 }
-                let position=self.render_studio.camera_rig_runtime.camera.unwrap_or_else(||timeline.camera_at(time)).position;
+                let position=crate::scene::render_position(self.render_studio.camera_rig_runtime.camera.unwrap_or_else(||timeline.camera_at(time)).position);
                 spatial.camera_samples.insert(time.to_bits(),position);Ok(position)
             });
             match result {
@@ -656,9 +723,9 @@ impl App {
         let distance=radius/vertical.min(horizontal).sin().max(0.1)*1.15;
         let eye=pivot+Vec3::new(-1.,0.65,0.9).normalize()*distance;
         let direction=pivot-eye;
-        key.position=eye.to_array();key.yaw=(-direction.z).atan2(direction.x).to_degrees();
-        key.pitch=direction.y.atan2(direction.x.hypot(direction.z)).to_degrees();
-        self.render_studio.spatial.scene_camera=Some(key);self.render_studio.spatial.pivot=pivot.to_array();
+        key.position=crate::scene::jka_position(eye.to_array());key.yaw=(-direction.z).atan2(direction.x).to_degrees();
+        key.pitch=-direction.y.atan2(direction.x.hypot(direction.z)).to_degrees();
+        self.render_studio.spatial.scene_camera=Some(key);self.render_studio.spatial.pivot=crate::scene::jka_position(pivot.to_array());
         self.profile_preview_key=None;
     }
 }

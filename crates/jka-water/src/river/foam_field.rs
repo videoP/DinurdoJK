@@ -49,6 +49,12 @@ pub const CURVATURE: ([f32; 2], f32) = ([0.002, 0.05], 5.0);
 pub const VELOCITY: ([f32; 2], f32) = ([800.0, 1000.0], 0.0);
 pub const DEPTH_DIFFERENCE: ([f32; 2], f32) = ([0.0, 0.0], 0.0);
 pub const WATER_DEPTH: ([f32; 2], f32) = ([150.0, 500.0], 1.0);
+/// Authoring adapter: keep the selected native depth ramp's ratio. At zero,
+/// the existing criterion treats every positive wet depth as full weight.
+pub fn authored_depth_range(minimum_cm: f32) -> [f32; 2] {
+    let minimum = if minimum_cm.is_finite() { minimum_cm.max(0.0) } else { WATER_DEPTH.0[0] };
+    [minimum, minimum * (WATER_DEPTH.0[1] / WATER_DEPTH.0[0])]
+}
 pub const LOW_VELOCITY: ([f32; 2], f32) = ([50.0, 200.0], 1.0);
 pub const LOCAL_PIVOT: [f32; 2] = [0.5, 0.5];
 const LWC_TILE_SIZE: f64 = 2097152.0;
@@ -405,13 +411,17 @@ pub fn emission_inputs(setup: &Setup, frame: Frame, unit: [f32; 2], fields: &imp
 
 /// Grid2D_Secondary_EmissionPoints001 EmitAmount (all selected criteria).
 pub fn emit_amount(e: EmissionInputs) -> f32 {
+    emit_amount_with_depth_range(e, WATER_DEPTH.0)
+}
+
+pub fn emit_amount_with_depth_range(e: EmissionInputs, depth_range: [f32; 2]) -> f32 {
     let speed = (e.velocity[0] * e.velocity[0] + e.velocity[1] * e.velocity[1]).sqrt();
     let c = |v: f32, (range, mult): ([f32; 2], f32)| criterion(v, range, mult);
     let strongest = c(e.curl, VORTICITY)
         .max(c(e.curvature, CURVATURE))
         .max(c(speed, VELOCITY))
         .max(c(e.depth_difference, DEPTH_DIFFERENCE));
-    (1.0 * strongest * c(e.water_depth, WATER_DEPTH) * c(speed, LOW_VELOCITY)).clamp(0.0, 1.0)
+    (1.0 * strongest * c(e.water_depth, (depth_range, WATER_DEPTH.1)) * c(speed, LOW_VELOCITY)).clamp(0.0, 1.0)
 }
 
 /// Add_Float then DissipateFloat (subtraction amount zero, clamp 0..1e9).

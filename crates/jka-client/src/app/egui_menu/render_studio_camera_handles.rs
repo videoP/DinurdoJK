@@ -1,6 +1,6 @@
 //! Camera position and aim/focus endpoints in the independent Scene view.
 use super::{App,render_studio_ui::{self as sui,palette as theme}};
-use crate::app::{render_studio_spatial::{StudioSpatialDrag,camera_from_key},
+use crate::app::{render_studio_spatial::{StudioSpatialDrag,camera_from_key,STUDIO_JKA_AXES},
     render_studio_timeline::{StudioCameraKey,StudioCameraSource,StudioDemoPov}};
 use glam::Vec3;
 
@@ -22,7 +22,7 @@ mod tests {
         key.lens.aperture=Some(2.8);key.resolve_focus_target();
         let target=Vec3::from_array(key.focus_target.unwrap());
         assert!((key.lens.focus_distance-target.length()).abs()<1e-4);
-        assert!(camera_from_key(key).forward().dot(target.normalize())>0.99999);
+        assert!(camera_from_key(key).forward().dot(Vec3::from_array(crate::scene::render_position(target.to_array())).normalize())>0.99999);
         let mut timeline=StudioTimeline::default();timeline.camera=vec![key];
         translate_item(&mut timeline,StudioItem::Camera(0),key.position,Vec3::new(20.0,10.0,0.0));
         let moved=timeline.camera[0];
@@ -32,7 +32,7 @@ mod tests {
         let resolved=rig.resolve(moved,Some([40.0,20.0,0.0]),Some([-100.0,0.0,0.0]));
         let delta=target-Vec3::from_array(resolved.position);
         assert!((resolved.lens.focus_distance-delta.length()).abs()<1e-4);
-        assert!(camera_from_key(resolved).forward().dot(delta.normalize())>0.99999);
+        assert!(camera_from_key(resolved).forward().dot(Vec3::from_array(crate::scene::render_position(delta.to_array())).normalize())>0.99999);
         assert_eq!(resolved.lens.aperture,Some(2.8));
     }
     #[test]
@@ -93,7 +93,7 @@ impl App {
         };
         let lens=key.lens_for_camera(&mut shot);
         let eye=shot.position;
-        let aim=key.focus_target.map(Vec3::from_array).unwrap_or(eye+shot.forward()*lens.focus_distance);
+        let aim=key.focus_target.map(|p|Vec3::from_array(crate::scene::render_position(p))).unwrap_or(eye+shot.forward()*lens.focus_distance);
         let observer=self.asset_preview_camera();
         let project=|point:Vec3|observer.project_to_screen(viewport.width().max(1.0) as u32,viewport.height().max(1.0) as u32,point)
             .map(|p|viewport.min+p.to_vec2());
@@ -108,22 +108,24 @@ impl App {
             painter.line_segment([center-egui::vec2(11.0,0.0),center+egui::vec2(11.0,0.0)],egui::Stroke::new(1.0,tint));
             painter.line_segment([center-egui::vec2(0.0,11.0),center+egui::vec2(0.0,11.0)],egui::Stroke::new(1.0,tint));
             painter.text(center+egui::vec2(12.0,12.0),egui::Align2::LEFT_TOP,label,egui::FontId::proportional(11.0),tint);
-            for (axis,point,color) in std::iter::once((None,origin,tint)).chain(
-                [Vec3::X,Vec3::Y,Vec3::Z].into_iter().enumerate().map(|(axis,direction)| {
+            for (axis,point,color,name) in std::iter::once((None,origin,tint,"")).chain(
+                STUDIO_JKA_AXES.into_iter().enumerate().map(|(native,(axis,direction,name))| {
+                    let direction=Vec3::from_array(direction);
                     let scale=(origin-observer.position).dot(observer.forward()).max(1.0)
                         *2.0*(observer.cg_fov().to_radians()*0.5).tan()*0.75/viewport.height().max(1.0);
-                    (Some(axis),origin+direction*scale*42.0,[egui::Color32::LIGHT_RED,egui::Color32::LIGHT_GREEN,egui::Color32::LIGHT_BLUE][axis])
+                    (Some(axis),origin+direction*scale*42.0,[egui::Color32::LIGHT_RED,egui::Color32::LIGHT_GREEN,egui::Color32::LIGHT_BLUE][native],name)
                 })) {
                 let Some(point)=project(point).filter(|p|viewport.shrink(8.0).contains(*p)) else{continue};
                 if axis.is_some() {if center.distance(point)<14.0 {continue;}
-                    painter.line_segment([center,point],egui::Stroke::new(1.2,color));painter.circle_filled(point,4.0,color);}
+                    painter.line_segment([center,point],egui::Stroke::new(1.2,color));painter.circle_filled(point,4.0,color);
+                    painter.text(point+egui::vec2(0.,-9.),egui::Align2::CENTER_BOTTOM,name,egui::FontId::proportional(10.),color);}
                 let r=ui.interact(egui::Rect::from_center_size(point,egui::Vec2::splat(if axis.is_some(){13.0}else{22.0})),
                     ui.make_persistent_id(("studio_camera_endpoint",target,axis)),egui::Sense::click_and_drag());
                 busy|=r.hovered()||r.is_pointer_button_down_on();
                 if r.drag_started() {
                     self.render_studio.timeline.playing=false;
                     let mut authored=key;
-                    if demo {authored.position=eye.to_array();authored.yaw=shot.yaw.to_degrees();authored.pitch=shot.pitch.to_degrees();authored.fov=shot.cg_fov();}
+                    if demo {authored.position=crate::scene::jka_position(eye.to_array());authored.yaw=shot.yaw.to_degrees();authored.pitch=-shot.pitch.to_degrees();authored.fov=shot.cg_fov();}
                     self.render_studio.spatial.camera_handle_drag=Some(StudioCameraHandleDrag{owner,target,key:authored,eye,aim,
                         spatial:StudioSpatialDrag{camera:observer,viewport,origin,start_pointer:ui.ctx().input(|i|i.pointer.press_origin()).unwrap_or(point),axis,items:vec![]}});
                 }
@@ -138,17 +140,17 @@ impl App {
                 let target=(if drag.target {drag.aim+delta}else{drag.aim}).clamp(Vec3::splat(-1_000_000.0),Vec3::splat(1_000_000.0));
                 match drag.owner {
                     Owner::Key(i)=>if let Some(key)=self.render_studio.timeline.camera.get_mut(i) {
-                        *key=drag.key;key.focus_target=Some(target.to_array());
+                        *key=drag.key;key.focus_target=Some(crate::scene::jka_position(target.to_array()));
                         if !drag.target {
                             if matches!(key.source,StudioCameraSource::Demo{..}) {
-                                key.source=StudioCameraSource::Demo{pov:StudioDemoPov::Free,client:-1};key.position=eye.to_array();
-                            } else {key.position=(Vec3::from_array(drag.key.position)+eye-drag.eye).to_array();}
+                                key.source=StudioCameraSource::Demo{pov:StudioDemoPov::Free,client:-1};key.position=crate::scene::jka_position(eye.to_array());
+                            } else {key.position=(Vec3::from_array(drag.key.position)+Vec3::from_array(crate::scene::jka_position((eye-drag.eye).to_array()))).to_array();}
                         }
                         key.resolve_focus_target();key.lens.focus_distance=eye.distance(target).clamp(1.0,65536.0);
                     },
                     Owner::Director(i)=>if let Some(shot)=self.render_studio.timeline.director_shots.get_mut(i) {
-                        shot.focus_target=Some(target.to_array());shot.rig.autofocus=false;shot.lens.focus_distance=eye.distance(target).clamp(1.0,65536.0);
-                        if !drag.target {shot.position_override=Some(eye.to_array());}
+                        shot.focus_target=Some(crate::scene::jka_position(target.to_array()));shot.rig.autofocus=false;shot.lens.focus_distance=eye.distance(target).clamp(1.0,65536.0);
+                        if !drag.target {shot.position_override=Some(crate::scene::jka_position(eye.to_array()));}
                     },
                 }
                 self.profile_preview_key=None;ui.ctx().request_repaint();

@@ -8,7 +8,8 @@ use crate::app::{
     KeyCode, LivePredictionFrame, MapLoadingState, MissingMapPrompt, OverlayMode, Path,
     PresentationViewer, PresentedEntity, ProtocolSnapshot, RagdollConfig, ServerMessageDecoder,
     SessionPhase, SpectatorCameraMode, ThirdPersonViewInput, UiScoreEntry, UiScoreboard,
-    ViewBobInput, ViewLatchMode, DEMO_FREE_SPEEDS, DEMO_FREE_SPEED_DEFAULT_INDEX, ET_PLAYER, REWARD_BLOB_MS,
+    ViewBobInput, ViewLatchMode, DEMO_FREE_SPEEDS, DEMO_FREE_SPEED_DEFAULT_INDEX,
+    DEMO_FREE_ALTATTACK_MULTIPLIER, ET_PLAYER, REWARD_BLOB_MS,
     REWARD_ICON_SIZE, REWARD_TIME_MS,
 };
 
@@ -867,6 +868,8 @@ impl App {
                 // simulator on top of the recorded playerstate.
                 self.local_server = None;
                 self.demo_scrub_dragging = false;
+                self.demo_speed_dragging = false;
+                self.demo_speed_last_click = None;
                 self.demo_scrub_fraction = None;
                 self.demo_scrub_resume_rate = 1.0;
                 self.demo_scrub_last_seek = None;
@@ -876,6 +879,9 @@ impl App {
                 self.demo_player_list_scroll = 0;
                 self.demo_view_outside_authoritative = false;
                 self.demo_free_speed_index = DEMO_FREE_SPEED_DEFAULT_INDEX;
+                self.demo_walk_pressed_at = None;
+                self.demo_walk_used = false;
+                self.demo_previous_held.clear();
                 if let Some(elapsed_ms) = launch_seek_ms {
                     self.restore_demo_transients(elapsed_ms, now);
                 }
@@ -1226,9 +1232,18 @@ impl App {
             movement -= glam::Vec3::Y;
         }
         if movement.length_squared() > 0.0 {
-            let speed =
+            let base_speed =
                 DEMO_FREE_SPEEDS[self.demo_free_speed_index.min(DEMO_FREE_SPEEDS.len() - 1)];
-            self.camera.position += movement.normalize() * speed * dt.as_secs_f32();
+            // AltAttack (or an explicit Demo Previous override) boosts while
+            // held. Releasing it immediately restores the selected base speed.
+            let multiplier = if !self.demo_previous_held.is_empty()
+                || (!self.bindings.demo_has_override("demo_previous")
+                    && self.live_buttons.contains("+altattack")) {
+                DEMO_FREE_ALTATTACK_MULTIPLIER
+            } else {
+                1.0
+            };
+            self.camera.position += movement.normalize() * base_speed * multiplier * dt.as_secs_f32();
         }
     }
 
@@ -1317,7 +1332,8 @@ impl App {
         // Camera input owns the mouse in every demo view. +speed is the one
         // temporary UI modifier: reveal/release the cursor while held so the
         // timeline can be clicked or scrubbed, then recapture on release.
-        self.set_capture(!self.live_buttons.contains("+speed") && !self.demo_scrub_dragging);
+        self.set_capture(!self.live_buttons.contains("+speed")
+            && !self.demo_scrub_dragging && !self.demo_speed_dragging);
     }
 
     pub(in crate::app) fn reset_demo_view_authoritative(&mut self) {
@@ -1506,6 +1522,7 @@ impl App {
             playback
                 .weapon_fx
                 .set_modern_sabers(self.video.modern_sabers);
+            playback.weapon_fx.set_saber_core_mode(self.video.saber_core_mode);
             playback
                 .weapon_fx
                 .set_saber_impact_fx(self.video.saber_impact_fx);
@@ -1945,7 +1962,7 @@ impl App {
             let trail_first = playback.fx_draws.len();
             if crate::fx::render_enabled() {
                 self.strafe_trails
-                    .append_draws(trail_view, trail_time, &mut playback.fx_draws);
+                    .append_draws(trail_view, trail_time, playback.fx_draws.local_mut());
             }
             playback.client_perf.fx_trail_draws =
                 (playback.fx_draws.len() - trail_first).min(u32::MAX as usize) as u32;
@@ -1976,14 +1993,14 @@ impl App {
                     end: ray.end,
                     width: ray.width * 2.75,
                     rgba: rgba(0.30),
-                    shader: "gfx/effects/sabers/RGBglow1".to_owned(),
+                    shader: "gfx/effects/sabers/RGBglow1".into(),
                 });
                 playback.fx_draws.push(crate::fx::system::FxDraw::Line {
                     start: ray.start,
                     end: ray.end,
                     width: ray.width,
                     rgba: rgba(0.90),
-                    shader: "gfx/effects/sabers/RGBglow1".to_owned(),
+                    shader: "gfx/effects/sabers/RGBglow1".into(),
                 });
             }
             let ghost_trail_first = playback.fx_draws.len();
@@ -1992,7 +2009,7 @@ impl App {
                     self.strafe_trails.append_prebuilt_draws(
                         &mut ghost.track.strafe_trail,
                         trail_view,
-                        &mut playback.fx_draws,
+                        playback.fx_draws.local_mut(),
                     );
                 }
             }
@@ -2014,7 +2031,7 @@ impl App {
                     if self.video.ocean && self.applied_ocean {
                         &self.authored_oceans
                     } else { &[] },
-                    &mut playback.fx_draws,
+                    playback.fx_draws.local_mut(),
                 );
             }
             playback.client_perf.fx_draws =

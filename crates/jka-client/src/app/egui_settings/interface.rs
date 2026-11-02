@@ -420,7 +420,17 @@ impl App {
                     },
                 );
 
-                theme::section(ui, "CONSOLE", "The ` console. Also switchable from the SUGGEST chip in the console header.");
+                theme::section(ui, "CONSOLE", "The ` console. Optional Source-style floating window, without changing the classic console.");
+                theme::row(
+                    ui, "HL2-style console",
+                    "con_hl2. Opens a floating Source Engine-style console. Drag the Developer Console header to move and drag the edges to resize. Off leaves the original console untouched.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.console_hl2) {
+                            let _ = self.set_console_cvar("con_hl2", if value { "1" } else { "0" });
+                        }
+                    },
+                );
                 theme::row(
                     ui,
                     "Live suggestions",

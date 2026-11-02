@@ -972,6 +972,8 @@ pub const VIDEO_ROW_GHOUL2_BATCH_DRAWS: usize = 58;
 pub const VIDEO_ROW_GHOUL2_EARLY_CULL: usize = 59;
 
 pub const VIDEO_ROW_MODERN_SABERS: usize = 60;
+/// Appended ID: never renumber existing settings rows.
+pub const VIDEO_ROW_SABER_CORE_MODE: usize = 112;
 
 pub const VIDEO_ROW_FX_FPS: usize = 61;
 

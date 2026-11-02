@@ -290,12 +290,12 @@ fn paint_tool_icon(painter: &egui::Painter, center: egui::Pos2, tool: DevTool, c
         }
         DevTool::RemapShader => {
             let rect = egui::Rect::from_center_size(center, egui::vec2(24.0, 20.0));
-            painter.rect_stroke(rect, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, egui::CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
             painter.line_segment([center + egui::vec2(-9.0, 5.0), center + egui::vec2(9.0, -5.0)], stroke);
         }
         DevTool::MapMods => {
             painter.rect_stroke(egui::Rect::from_center_size(center, egui::vec2(22.0, 26.0)),
-                egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+                egui::CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
             for y in [-7.0, 0.0, 7.0] {
                 painter.line_segment([center+egui::vec2(-7.0,y), center+egui::vec2(7.0,y)], stroke);
             }

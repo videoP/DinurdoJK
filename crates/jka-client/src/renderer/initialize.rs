@@ -2835,7 +2835,7 @@ impl Renderer {
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
             dynamic_light_debug: false,
-            fragment_shader_mode: 1,
+            fragment_shader_mode: 5,
             shader_input_mode: 0,
             world_sort_mode: 0,
             ui_transient_tail_uploaded: None,

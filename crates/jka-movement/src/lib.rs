@@ -3,6 +3,8 @@
 //! storage stays native, including animation, Force, weapon and event state.
 mod collision;
 mod ffi;
+mod jump_trace;
+pub use jump_trace::JumpTraceEvent;
 pub use collision::{collision_merge_enabled, set_collision_merge_enabled, CollisionWorld, EntityClip, PlacedInlineCollision, SourceCollisionBrush, SourceCollisionPlane};
 use std::{
     ffi::{c_void, CStr},
@@ -713,6 +715,12 @@ pub struct PredictionEntity {
 // Ownership is exclusive; native globals are always protected by NativeGuard.
 unsafe impl Send for PlayerState {}
 impl PlayerState {
+    /// Local authority only. Remote `predict` enables the correction solely
+    /// for jaPRO race mode, independently of this local testing switch.
+    pub fn set_local_force_jump_slope_fix(&mut self, enabled: bool) {
+        let _guard = ffi::NativeGuard::new();
+        unsafe { ffi::jka_player_local_force_jump_slope_fix(self.raw.as_ptr(), i32::from(enabled)); }
+    }
     pub fn roll_prediction_debug(&self) -> RollPredictionDebug {
         let _guard = ffi::NativeGuard::new();
         let mut result = RollPredictionDebug::default();

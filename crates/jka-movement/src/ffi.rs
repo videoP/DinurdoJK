@@ -32,6 +32,7 @@ unsafe extern "C" {
     pub fn jka_player_new(origin: *const f32, yaw: f32, spectator: i32) -> *mut c_void;
     pub fn jka_player_free(player: *mut c_void);
     pub fn jka_player_configure(player: *mut c_void, settings: *const PredictSettings) -> i32;
+    pub fn jka_player_local_force_jump_slope_fix(player: *mut c_void, enabled: i32);
     pub fn jka_player_set_entities(player: *mut c_void, entities: *const PredictionEntity, count: i32) -> i32;
     pub fn jka_player_clip_entity(player: *const c_void, entity: *const PredictionEntity) -> i32;
     pub fn jka_player_clone(player: *const c_void) -> *mut c_void;

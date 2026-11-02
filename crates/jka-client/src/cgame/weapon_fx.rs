@@ -108,6 +108,17 @@ const MAX_SABER_BLADES: usize = 8;
 // would produce detached beads/chunks rather than a coherent molten wall. If
 // cooled slag later breaks free, those detached pieces can become Rapier bodies.
 
+/// The authored ET_FX delay is a game-time cadence, not a render-frame
+/// callback. A zero-delay runner is sampled no faster than cg_fxFPS when
+/// fixed-rate FX is active; nonzero authored delays are preserved.
+fn fx_runner_cadence_ms(authored_delay: i32, fx_fps: u32) -> i32 {
+    if authored_delay == 0 && fx_fps != crate::fx::FX_FPS_LEGACY_JKA {
+        (1000 / fx_fps.max(1)).max(1) as i32
+    } else {
+        authored_delay.max(1)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct EntityFxState { next_time: i32, one_shot_sequence: i32 }
 
@@ -247,24 +258,28 @@ fn fx_particle_interpolate(dst: &mut FxDraw, old: &FxDraw, t: f32) -> bool {
 /// Smooth a fully published particle snapshot over the next simulation tick.
 /// A one-tick visual lag keeps interpolation bounded (no physics extrapolation).
 fn interpolate_fx_particles(
-    frame: &mut FxFrame, previous: &HashMap<u64, FxDraw>, t: f32,
+    frame: &mut FxFrame, shared: &[FxDraw], previous: &HashMap<u64, FxDraw>, t: f32,
 ) {
     if previous.is_empty() { return; }
     let t = t.clamp(0.0, 1.0);
     let mut present = HashSet::with_capacity(frame.particle_draw_ids.len());
     for &(index, id) in &frame.particle_draw_ids {
         present.insert(id);
-        let Some(draw) = frame.draws.get_mut(index) else { continue; };
+        let Some(draw) = shared.get(index) else { continue; };
+        // Only particle sprites are copied for interpolation. Large line and
+        // electricity populations remain in the shared immutable worker frame.
+        let mut draw = draw.clone();
         if let Some(old) = previous.get(&id) {
-            if !fx_particle_interpolate(draw, old, t) {
-                fx_particle_fade(draw, t);
+            if !fx_particle_interpolate(&mut draw, old, t) {
+                fx_particle_fade(&mut draw, t);
             }
         } else {
-            fx_particle_fade(draw, t);
+            fx_particle_fade(&mut draw, t);
         }
+        frame.draw_overrides.push((index, draw));
     }
-    // A particle that expired in the latest tick fades instead of disappearing
-    // all at once. These are authored CPU sprites only, never sounds/decals.
+    // Stable worker draw indices are sorted by original draw index, as built
+    // by FxSystem::frame_impl; lookup in FxDrawStream is logarithmic.
     if t < 1.0 {
         for (&id, old) in previous {
             if !present.contains(&id) {
@@ -445,6 +460,25 @@ fn saber_flicker_radii(
     )
 }
 
+/// Intended TaystJK `sbak` core: a second RT_LINE with independent,
+/// time-based width, not another submission of the ordinary `saber` core.
+/// Equivalent to `fabs(sinf(cg.time / 400.0f)) * 0.1f + 0.8f`.
+fn sbak_core_radius(time_ms: i32) -> f32 {
+    0.8 + (time_ms as f32 / 400.0).sin().abs() * 0.1
+}
+
+fn sbak_core_draw(
+    tip: [f32; 3], base: [f32; 3], shader: &str, rgba: [u8; 4], time_ms: i32,
+) -> FxDraw {
+    FxDraw::Line {
+        start: tip,
+        end: base,
+        width: sbak_core_radius(time_ms),
+        rgba,
+        shader: shader.into(),
+    }
+}
+
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if length > 1.0e-6 {
@@ -474,6 +508,8 @@ pub fn profile_saber_blade_draws(
     color: i32,
     entity_alpha: f32,
     modern_sabers: bool,
+    saber_core_mode: u32,
+    time_ms: i32,
     rng: &mut Rng,
 ) -> Vec<FxDraw> {
     if length < 0.5 || radius <= 0.0 {
@@ -500,14 +536,14 @@ pub fn profile_saber_blade_draws(
             end: tip,
             width: radius * 1.8,
             rgba: glow_soft,
-            shader: glow_shader.to_owned(),
+            shader: glow_shader.into(),
         });
         draws.push(FxDraw::Line {
             start: line_base,
             end: tip,
             width: radius * 0.95,
             rgba: glow_full,
-            shader: glow_shader.to_owned(),
+            shader: glow_shader.into(),
         });
         draws.push(FxDraw::Sprite { shader_time: 0.0,
             origin,
@@ -536,13 +572,18 @@ pub fn profile_saber_blade_draws(
             shader: glow_shader.to_owned(),
         });
     }
-    draws.push(FxDraw::Line {
-        start: tip,
-        end: line_base,
-        width: core_radius,
-        rgba: white,
-        shader: line_shader.to_owned(),
-    });
+    if modern_sabers || matches!(saber_core_mode, 0 | 2) {
+        draws.push(FxDraw::Line {
+            start: tip,
+            end: line_base,
+            width: core_radius,
+            rgba: white,
+            shader: line_shader.into(),
+        });
+    }
+    if !modern_sabers && matches!(saber_core_mode, 1 | 2) {
+        draws.push(sbak_core_draw(tip, line_base, line_shader, white, time_ms));
+    }
     draws
 }
 
@@ -554,6 +595,8 @@ pub fn profile_saber_blade_draws(
 pub(crate) fn profile_saber_blade_draws_for_request(
     request: &PlayerFxRequest,
     modern_sabers: bool,
+    saber_core_mode: u32,
+    time_ms: i32,
     rng: &mut Rng,
 ) -> Vec<FxDraw> {
     let PlayerFxRequest::SaberBlade {
@@ -563,7 +606,7 @@ pub(crate) fn profile_saber_blade_draws_for_request(
     if *no_blade { return Vec::new(); }
     profile_saber_blade_draws(
         *origin, *direction, *length, *length_max, *radius, *color,
-        *entity_alpha, modern_sabers, rng,
+        *entity_alpha, modern_sabers, saber_core_mode, time_ms, rng,
     )
 }
 
@@ -1178,6 +1221,9 @@ pub struct WeaponFx {
     /// Worker output is reusable visual state. Transient sound/decal/GPU
     /// commands are drained once on first presentation, never replayed.
     cached_fx_tick: FxFrame,
+    /// Worker draw geometry is immutable until the next cg_fxFPS tick; the
+    /// presenter and renderer borrow this Arc across arbitrarily many frames.
+    cached_fx_draws: std::sync::Arc<Vec<FxDraw>>,
     /// Previous sample's authored particle draws only; avoids cloning tens
     /// of thousands of lines each tick merely to interpolate smoke sprites.
     previous_fx_particles: HashMap<u64, FxDraw>,
@@ -1235,6 +1281,8 @@ pub struct WeaponFx {
     /// OpenJK combines 3+ blade sabers into one dynamic light per saber.
     saber_multi_lights: HashMap<SaberLightKey, SaberLightAggregate>,
     modern_sabers: bool,
+    /// Live-toggleable legacy core composition (0 normal, 1 sbak, 2 both, 3 none).
+    saber_core_mode: u32,
     rt_lighting: bool,
     /// Presentation-only A/B switch for authored EV_SABER_HIT /
     /// saber-on-saber EV_SABER_BLOCK EFX. Existing tagged primitives remain
@@ -1304,6 +1352,7 @@ impl WeaponFx {
             last_end_frame_cpu_ms: [0.0; 3],
             pending_fx_tick: None,
             cached_fx_tick: FxFrame::default(),
+            cached_fx_draws: std::sync::Arc::new(Vec::new()),
             previous_fx_particles: HashMap::new(),
             next_fx_tick_time: None,
             published_fx_tick_time: 0,
@@ -1346,6 +1395,7 @@ impl WeaponFx {
             immediate_blades: Vec::new(),
             saber_multi_lights: HashMap::new(),
             modern_sabers: false,
+            saber_core_mode: 0,
             rt_lighting: false,
             saber_impact_fx: true,
             runner_culling: false,
@@ -1394,6 +1444,10 @@ impl WeaponFx {
     /// path remains OpenJK-compatible and is the default.
     pub fn set_modern_sabers(&mut self, enabled: bool) {
         self.modern_sabers = enabled;
+    }
+
+    pub fn set_saber_core_mode(&mut self, mode: u32) {
+        self.saber_core_mode = mode.min(3);
     }
 
     pub fn set_rt_lighting(&mut self, enabled: bool) {
@@ -1537,6 +1591,7 @@ impl WeaponFx {
             // longer a valid published visual snapshot.
             self.pending_fx_tick = None;
             self.cached_fx_tick = FxFrame::default();
+            self.cached_fx_draws = std::sync::Arc::new(Vec::new());
             self.previous_fx_particles.clear();
             self.next_fx_tick_time = None;
             // Start the new cadence from the next presented sample instead of
@@ -1555,6 +1610,7 @@ impl WeaponFx {
             self.async_fx_enabled = enabled;
             self.pending_fx_tick = None;
             self.cached_fx_tick = FxFrame::default();
+            self.cached_fx_draws = std::sync::Arc::new(Vec::new());
             self.previous_fx_particles.clear();
             self.next_fx_tick_time = None;
         }
@@ -1584,6 +1640,7 @@ impl WeaponFx {
         // receivers and cannot be mistaken for post-seek output.
         self.pending_fx_tick = None;
         self.cached_fx_tick = FxFrame::default();
+        self.cached_fx_draws = std::sync::Arc::new(Vec::new());
         self.previous_fx_particles.clear();
         self.next_fx_tick_time = None;
         self.published_fx_tick_time = time;
@@ -1649,6 +1706,7 @@ impl WeaponFx {
             // Never show the pre-rewind FX snapshot while the new one builds.
             self.pending_fx_tick = None;
             self.cached_fx_tick = FxFrame::default();
+            self.cached_fx_draws = std::sync::Arc::new(Vec::new());
             self.previous_fx_particles.clear();
             self.next_fx_tick_time = None;
             self.published_fx_tick_time = time;
@@ -2093,10 +2151,12 @@ impl WeaponFx {
                     self.fx_ticks_published = self.fx_ticks_published.wrapping_add(1);
                     self.previous_fx_particles.clear();
                     for &(idx, id) in &self.cached_fx_tick.particle_draw_ids {
-                        if let Some(draw) = self.cached_fx_tick.draws.get(idx) {
+                        if let Some(draw) = self.cached_fx_draws.get(idx) {
                             self.previous_fx_particles.insert(id, draw.clone());
                         }
                     }
+                    let mut frame = frame;
+                    self.cached_fx_draws = std::sync::Arc::new(std::mem::take(&mut frame.draws));
                     self.cached_fx_tick = frame;
                     self.pending_fx_tick = None;
                 }
@@ -2130,23 +2190,31 @@ impl WeaponFx {
             let skipped = ((now - due) / period).floor().max(0.0);
             self.next_fx_tick_time = Some(due + (skipped + 1.0) * period);
         }
-        // Cache continuous visuals, but consume event-like outputs exactly
-        // once. Cloning happens on the presentation thread only for the
-        // current, immutable draw snapshot; the worker never holds this lock.
+        // Cache continuous visuals, but move event-like outputs out before
+        // cloning: sounds, decals and GPU spawns must be consumed exactly once
+        // and do not need to be allocated/cloned on this presentation frame.
         let cloned_at = std::time::Instant::now();
+        let sounds = std::mem::take(&mut self.cached_fx_tick.sounds);
+        let shakes = std::mem::take(&mut self.cached_fx_tick.shakes);
+        let decals = std::mem::take(&mut self.cached_fx_tick.decals);
+        let ghoul2_decals = std::mem::take(&mut self.cached_fx_tick.ghoul2_decals);
+        let gpu_sparks = self.cached_fx_tick.gpu_sparks.take();
+        // Line shader paths are interned Arc<str>: cloning a large electricity
+        // geometry vector no longer allocates a String per line segment.
         let mut frame = self.cached_fx_tick.clone();
+        frame.sounds = sounds;
+        frame.shakes = shakes;
+        frame.decals = decals;
+        frame.ghoul2_decals = ghoul2_decals;
+        frame.gpu_sparks = gpu_sparks;
+        frame.shared_draws = Some(std::sync::Arc::clone(&self.cached_fx_draws));
         if !self.previous_fx_particles.is_empty() {
             let tick_period = 1000.0 / self.continuous_fx_fps.max(1) as f32;
             let t = (self.time.saturating_sub(self.published_fx_tick_time) as f32 / tick_period)
                 .clamp(0.0, 1.0);
-            interpolate_fx_particles(&mut frame, &self.previous_fx_particles, t);
+            interpolate_fx_particles(&mut frame, &self.cached_fx_draws, &self.previous_fx_particles, t);
         }
         self.last_snapshot_clone_ms = cloned_at.elapsed().as_secs_f64() * 1000.0;
-        self.cached_fx_tick.sounds.clear();
-        self.cached_fx_tick.shakes.clear();
-        self.cached_fx_tick.decals.clear();
-        self.cached_fx_tick.ghoul2_decals.clear();
-        self.cached_fx_tick.gpu_sparks = None;
         frame
     }
 
@@ -2243,7 +2311,7 @@ impl WeaponFx {
                 end: spec.end,
                 width: spec.size1 + (spec.size2 - spec.size1) * t,
                 rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 0],
-                shader: spec.shader.to_owned(),
+                shader: spec.shader.into(),
             });
             if promote_beams {
                 // Direct trap_FX_AddLine beams bypass .efx primitive spawn;
@@ -2466,7 +2534,9 @@ impl WeaponFx {
     pub fn entity_fx(&mut self, entity: &PresentedEntity, game: &ClientGameState) {
         let state = &entity.state;
         let fx_state = state.field_i32("modelindex2").unwrap_or(FX_STATE_OFF);
-        if fx_state == FX_STATE_OFF { return; }
+        // During a paused demo, the same snapshot is presented repeatedly.
+        // Never replay ET_FX births without advancing the game clock.
+        if fx_state == FX_STATE_OFF || self.repeated_time { return; }
         {
             let runtime = self.entity_fx.entry(entity.number).or_default();
             if runtime.next_time > self.time { return; }
@@ -2478,7 +2548,12 @@ impl WeaponFx {
         let delay = state.field_f32("speed").unwrap_or(0.0).max(0.0) as i32;
         let random = state.field_i32("time").unwrap_or(0).max(0);
         let jitter = (self.runner_rng.flrand(0.0, 1.0) * random as f32) as i32;
-        self.entity_fx.entry(entity.number).or_default().next_time = self.time.saturating_add(delay).saturating_add(jitter);
+        // Authored zero-delay continuous runners must not replay at the
+        // *presentation* FPS in fixed-rate mode (including hundreds of times
+        // between FX worker ticks). Legacy mode keeps its original semantics
+        // for advancing game timestamps; paused snapshots are guarded above.
+        let cadence = fx_runner_cadence_ms(delay, self.continuous_fx_fps);
+        self.entity_fx.entry(entity.number).or_default().next_time = self.time.saturating_add(cadence).saturating_add(jitter);
         let effect_index = state.field_i32("modelindex").unwrap_or(0);
         let Some(name) = game.effect_qpath(effect_index) else { return; };
         let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
@@ -3306,14 +3381,14 @@ impl WeaponFx {
                 end: tip,
                 width: radius * 1.8,
                 rgba: glow_soft,
-                shader: glow_shader.to_owned(),
+                shader: glow_shader.into(),
             });
             self.immediate_draws.push(FxDraw::Line {
                 start: line_base,
                 end: tip,
                 width: radius * 0.95,
                 rgba: glow_full,
-                shader: glow_shader.to_owned(),
+                shader: glow_shader.into(),
             });
             self.immediate_draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin,
@@ -3349,13 +3424,22 @@ impl WeaponFx {
         // OpenJK CG_DoSaber uses an RT_LINE from blade tip to one unit behind
         // the hilt origin, at radius / 3 (flickered), with the color-specific
         // line shader.
-        self.immediate_draws.push(FxDraw::Line {
-            start: tip,
-            end: line_base,
-            width: core_radius,
-            rgba: white,
-            shader: line_shader.to_owned(),
-        });
+        if self.modern_sabers || matches!(self.saber_core_mode, 0 | 2) {
+            self.immediate_draws.push(FxDraw::Line {
+                start: tip,
+                end: line_base,
+                width: core_radius,
+                rgba: white,
+                shader: line_shader.into(),
+            });
+        }
+        // An independent thin core, not an accidental second submission
+        // of the ordinary core. Both core choices leave the legacy glow intact.
+        if !self.modern_sabers && matches!(self.saber_core_mode, 1 | 2) {
+            self.immediate_draws.push(sbak_core_draw(
+                tip, line_base, line_shader, white, self.time,
+            ));
+        }
     }
 
     fn puff(&mut self, origin: [f32; 3], speed: f32, rotation: f32, color: [f32; 3], shader: &'static str) {
@@ -4232,10 +4316,18 @@ pub(crate) fn prepare_entity_event(
             PreparedFxEvent::PlayEffects { effects, beams: Vec::new(), status: "FX_MISC_MODEL_EXPLOSION" }
         }
         EntityEvent::EV_PLAY_EFFECT => {
+            // TaystJK CG_EntityEvent uses the temporary entity's evaluated
+            // position (CG_CheckEvents / cent->lerpOrigin), not es->origin.
+            // G_PlayEffect sends water-entry splashes as ET_EVENTS entities:
+            // their surface hit is in pos.trBase, while es->origin is zero.
+            // event.position already evaluates that trajectory at server_time.
             let mut dir = super::entity_vec3(state, "angles").unwrap_or([0.0; 3]);
             if dir == [0.0; 3] { dir[1] = 1.0; }
-            let origin = super::entity_vec3(state, "origin").unwrap_or(event.position);
-            PreparedFxEvent::PlayEffect { name: play_effect_type(event.parm), origin, dir }
+            PreparedFxEvent::PlayEffect {
+                name: play_effect_type(event.parm),
+                origin: event.position,
+                dir,
+            }
         }
         EntityEvent::EV_PLAY_EFFECT_ID | EntityEvent::EV_PLAY_PORTAL_EFFECT_ID => {
             let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
@@ -4574,6 +4666,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_delay_map_runner_uses_worker_cadence_without_throttling_authored_delay() {
+        assert_eq!(fx_runner_cadence_ms(0, 15), 66);
+        assert_eq!(fx_runner_cadence_ms(0, 250), 4);
+        assert_eq!(fx_runner_cadence_ms(25, 15), 25);
+        assert_eq!(fx_runner_cadence_ms(0, crate::fx::FX_FPS_LEGACY_JKA), 1);
+    }
+
+    #[test]
     fn fx_sprite_interpolation_tracks_ids_and_smooths_birth_death() {
         let sprite = |x: f32| FxDraw::Sprite {
             shader_time: 0.0, origin: [x, 0.0, 0.0], radius: 5.0,
@@ -4582,15 +4682,17 @@ mod tests {
         let previous: HashMap<u64, FxDraw> = [(10, sprite(0.0)), (11, sprite(2.0))].into();
         let mut frame = FxFrame::default();
         frame.particle_draw_ids = vec![(0, 10), (1, 12)];
-        frame.draws = vec![sprite(10.0), sprite(7.0)];
-        interpolate_fx_particles(&mut frame, &previous, 0.5);
-        assert_eq!(frame.draws.len(), 3);
-        let FxDraw::Sprite { origin, rgba, .. } = &frame.draws[0] else { panic!() };
+        let shared = std::sync::Arc::new(vec![sprite(10.0), sprite(7.0)]);
+        interpolate_fx_particles(&mut frame, &shared, &previous, 0.5);
+        frame.shared_draws = Some(shared);
+        let draws = crate::fx::system::FxDrawStream::from_frame(frame);
+        assert_eq!(draws.len(), 3);
+        let FxDraw::Sprite { origin, rgba, .. } = draws.get(0).unwrap() else { panic!() };
         assert_eq!(origin[0], 5.0);
         assert_eq!(rgba[3], 200);
-        let FxDraw::Sprite { rgba, .. } = &frame.draws[1] else { panic!() };
+        let FxDraw::Sprite { rgba, .. } = draws.get(1).unwrap() else { panic!() };
         assert_eq!(rgba[3], 100, "newborn fades in over one FX tick");
-        let FxDraw::Sprite { rgba, .. } = &frame.draws[2] else { panic!() };
+        let FxDraw::Sprite { rgba, .. } = draws.get(2).unwrap() else { panic!() };
         assert_eq!(rgba[3], 100, "expired particle fades out over one FX tick");
     }
 
@@ -4600,18 +4702,20 @@ mod tests {
         let mut fx = WeaponFx::new(assets);
         fx.time = 1000;
         fx.next_fx_tick_time = Some(2000.0); // no worker submission in this test
-        fx.cached_fx_tick.draws.push(FxDraw::Line {
+        std::sync::Arc::make_mut(&mut fx.cached_fx_draws).push(FxDraw::Line {
             start: [0.0; 3], end: [1.0, 2.0, 3.0], width: 1.0,
-            rgba: [255; 4], shader: "gfx/test".to_owned(),
+            rgba: [255; 4], shader: "gfx/test".into(),
         });
         fx.cached_fx_tick.sounds.push(FxSound {
             origin: [0.0; 3], qpath: "sound/test.wav".to_owned(),
         });
         let first = fx.end_async_fx_tick();
-        assert_eq!(first.draws.len(), 1);
+        assert_eq!(first.shared_draws.as_ref().unwrap().len(), 1);
         assert_eq!(first.sounds.len(), 1);
         let second = fx.end_async_fx_tick();
-        assert_eq!(second.draws.len(), 1, "continuous visual persists until next FX tick");
+        assert_eq!(second.shared_draws.as_ref().unwrap().len(), 1, "continuous visual persists until next FX tick");
+        assert!(std::sync::Arc::ptr_eq(first.shared_draws.as_ref().unwrap(), second.shared_draws.as_ref().unwrap()),
+            "presentation frames must share the worker geometry");
         assert!(second.sounds.is_empty(), "one-shot sound must never replay");
     }
 
@@ -4626,14 +4730,14 @@ mod tests {
             no_blade: false, no_dlight: false, no_wall_marks: false,
         };
         let mut rng = Rng::new(1234);
-        assert!(!profile_saber_blade_draws_for_request(&blade, false, &mut rng).is_empty());
-        assert!(!profile_saber_blade_draws_for_request(&blade, true, &mut rng).is_empty());
+        assert!(!profile_saber_blade_draws_for_request(&blade, false, 0, 0, &mut rng).is_empty());
+        assert!(!profile_saber_blade_draws_for_request(&blade, true, 0, 0, &mut rng).is_empty());
         assert!(profile_saber_light_allowed(&blade));
 
         let mut hidden = blade.clone();
         if let PlayerFxRequest::SaberBlade { no_blade, .. } = &mut hidden { *no_blade = true; }
         for modern in [false, true] {
-            assert!(profile_saber_blade_draws_for_request(&hidden, modern, &mut rng).is_empty(),
+            assert!(profile_saber_blade_draws_for_request(&hidden, modern, 0, 0, &mut rng).is_empty(),
                 "Profile must honor noBlade in both its classic and modern shader paths");
         }
         assert!(profile_saber_light_allowed(&hidden),
@@ -4641,12 +4745,12 @@ mod tests {
 
         let mut dark = blade.clone();
         if let PlayerFxRequest::SaberBlade { no_dlight, .. } = &mut dark { *no_dlight = true; }
-        assert!(!profile_saber_blade_draws_for_request(&dark, false, &mut rng).is_empty(),
+        assert!(!profile_saber_blade_draws_for_request(&dark, false, 0, 0, &mut rng).is_empty(),
             "noDlight alone must not remove the visible blade");
         assert!(!profile_saber_light_allowed(&dark));
         let mut fully_hidden = hidden.clone();
         if let PlayerFxRequest::SaberBlade { no_dlight, .. } = &mut fully_hidden { *no_dlight = true; }
-        assert!(profile_saber_blade_draws_for_request(&fully_hidden, false, &mut rng).is_empty());
+        assert!(profile_saber_blade_draws_for_request(&fully_hidden, false, 0, 0, &mut rng).is_empty());
         assert!(!profile_saber_light_allowed(&fully_hidden));
 
         let mut hidden_staff = hidden;
@@ -5074,15 +5178,47 @@ mod tests {
         )));
         assert!(classic.draws.iter().any(|draw| matches!(
             draw,
-            FxDraw::Line { shader, .. } if shader == "gfx/effects/sabers/red_line"
+            FxDraw::Line { shader, .. } if shader.as_ref() == "gfx/effects/sabers/red_line"
         )));
         assert!(classic.draws.iter().all(|draw| match draw {
             FxDraw::SaberGlow { shader, .. } => shader == "gfx/effects/sabers/red_glow",
-            FxDraw::Line { shader, .. } => shader == "gfx/effects/sabers/red_line",
+            FxDraw::Line { shader, .. } => shader.as_ref() == "gfx/effects/sabers/red_line",
             _ => false,
         }));
         assert_eq!(classic.draws.len(), 2, "one RT_SABER_GLOW plus one RT_LINE core");
 
+        fx.set_saber_core_mode(2);
+        fx.begin_frame(1000);
+        fx.player_fx(&blade);
+        let pulsed = fx.end_frame();
+        assert_eq!(pulsed.draws.len(), 3, "one glow, normal core, thin sbak core");
+        let (FxDraw::Line { start: normal_start, end: normal_end, shader: normal_shader, .. },
+             FxDraw::Line { start: pulse_start, end: pulse_end, width, shader: pulse_shader, .. }) =
+            (&pulsed.draws[1], &pulsed.draws[2]) else { panic!("expected two core lines"); };
+        assert_eq!((normal_start, normal_end, normal_shader),
+                   (pulse_start, pulse_end, pulse_shader));
+        assert!((*width - sbak_core_radius(1000)).abs() < 0.0001);
+        fx.begin_frame(1200);
+        fx.player_fx(&blade);
+        let next = fx.end_frame();
+        let FxDraw::Line { width: next_width, .. } = &next.draws[2] else { panic!() };
+        assert!((*next_width - sbak_core_radius(1200)).abs() < 0.0001);
+
+        // Every legacy mode must alter only core submissions; the glow remains.
+        for (mode, total, expected_lines) in [(0, 2, 1), (1, 2, 1), (2, 3, 2), (3, 1, 0)] {
+            fx.set_saber_core_mode(mode);
+            fx.begin_frame(1000);
+            fx.player_fx(&blade);
+            let output = fx.end_frame();
+            assert_eq!(output.draws.len(), total, "wrong draw count for core mode {mode}");
+            assert!(matches!(output.draws[0], FxDraw::SaberGlow { .. }));
+            assert_eq!(output.draws.iter().filter(|draw| matches!(draw, FxDraw::Line { .. })).count(), expected_lines);
+            if mode == 1 {
+                let FxDraw::Line { width, .. } = &output.draws[1] else { panic!("expected sbak only"); };
+                assert!((*width - sbak_core_radius(1000)).abs() < 0.0001);
+            }
+        }
+        fx.set_saber_core_mode(2);
         fx.set_modern_sabers(true);
         fx.begin_frame(1001);
         fx.player_fx(&blade);
@@ -5092,6 +5228,32 @@ mod tests {
             modern.draws.iter().filter(|draw| matches!(draw, FxDraw::Line { .. })).count(),
             3
         );
+    }
+
+    #[test]
+    fn sbak_core_profile_matches_live_and_respects_mode() {
+        let mut rng = Rng::new(1);
+        let legacy = profile_saber_blade_draws(
+            [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], 40.0, 40.0, 3.0,
+            2, 1.0, false, 2, 600, &mut rng,
+        );
+        assert_eq!(legacy.len(), 3);
+        let FxDraw::Line { width, shader, .. } = &legacy[2] else { panic!() };
+        assert!((*width - sbak_core_radius(600)).abs() < 0.0001);
+        assert_eq!(shader.as_ref(), "gfx/effects/sabers/yellow_line");
+        for (mode, expected) in [(0, 2), (1, 2), (2, 3), (3, 1)] {
+            let draws = profile_saber_blade_draws(
+                [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], 40.0, 40.0, 3.0,
+                2, 1.0, false, mode, 600, &mut rng,
+            );
+            assert_eq!(draws.len(), expected, "profile mode {mode}");
+            assert!(matches!(draws[0], FxDraw::SaberGlow { .. }));
+        }
+        let modern = profile_saber_blade_draws(
+            [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], 40.0, 40.0, 3.0,
+            2, 1.0, true, 2, 600, &mut rng,
+        );
+        assert_eq!(modern.len(), 5);
     }
 
     #[test]
@@ -5349,6 +5511,39 @@ mod event_beam_tests {
 
     fn prepare(event: &PresentationEvent) -> PreparedFxEvent {
         prepare_entity_event(event, &ClientGameState::new(), &[], &SaberDefinitions::default())
+    }
+
+    #[test]
+    fn water_entry_play_effect_uses_temp_entity_surface_hit_not_zero_origin() {
+        // TaystJK PM_WaterEvents -> G_PlayEffect(EFFECT_WATER_SPLASH,
+        // tr.endpos, tr.plane.normal) -> EV_PLAY_EFFECT (eventParm 12).
+        // G_TempEntity encodes the hit position in pos.trBase, not origin.
+        let splash = event(EntityEvent::EV_PLAY_EFFECT, 12, &[
+            ("angles[0]", 0.0f32.to_bits()),
+            ("angles[1]", 0.0f32.to_bits()),
+            ("angles[2]", 1.0f32.to_bits()),
+        ]);
+        let PreparedFxEvent::PlayEffect { name, origin, dir } = prepare(&splash)
+            else { panic!("expected the authored splash effect"); };
+        assert_eq!(name, Some("env/water_impact"));
+        assert_eq!(origin, splash.position, "temporary entity pos.trBase, not es->origin");
+        assert_eq!(dir, [0.0, 0.0, 1.0], "preserve the traced water-surface normal");
+    }
+
+    #[test]
+    fn play_effect_surface_position_is_shared_by_other_authored_liquid_effects() {
+        for (id, expected) in [(13, "env/acid_splash"), (14, "env/lava_splash")] {
+            let splash = event(EntityEvent::EV_PLAY_EFFECT, id, &[
+                ("origin[0]", 1.0f32.to_bits()),
+                ("origin[1]", 2.0f32.to_bits()),
+                ("origin[2]", 3.0f32.to_bits()),
+                ("angles[2]", 1.0f32.to_bits()),
+            ]);
+            let PreparedFxEvent::PlayEffect { name, origin, .. } = prepare(&splash)
+                else { panic!("expected authored liquid effect"); };
+            assert_eq!(name, Some(expected));
+            assert_eq!(origin, splash.position);
+        }
     }
 
     #[test]

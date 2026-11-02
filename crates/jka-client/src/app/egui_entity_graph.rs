@@ -1168,18 +1168,18 @@ fn flow_canvas(
         }
         painter.rect_filled(
             node,
-            egui::CornerRadius::same(3),
+            egui::CornerRadius::ZERO,
             if over { theme::CONTROL_HOVER() } else { theme::CONTROL() },
         );
         painter.rect_stroke(
             node,
-            egui::CornerRadius::same(3),
+            egui::CornerRadius::ZERO,
             Stroke::new(if hot { 2.5_f32 } else { 1.2_f32 }, if hot { Color32::WHITE } else { color }),
             egui::StrokeKind::Inside,
         );
         painter.rect_filled(
             Rect::from_min_size(node.left_top(), Vec2::new(4.0 * view.zoom.max(0.6), node.height())),
-            egui::CornerRadius::same(2),
+            egui::CornerRadius::ZERO,
             color,
         );
         if can_use && view.zoom >= 0.45 && !entity.targetname.is_empty() {
@@ -1191,7 +1191,7 @@ fn flow_canvas(
             let chip_hot = pointer.is_some_and(|p| chip.contains(p));
             painter.rect_filled(
                 chip,
-                egui::CornerRadius::same(2),
+                egui::CornerRadius::ZERO,
                 if chip_hot { theme::ACCENT_HOVER() } else { theme::ACCENT_DEEP() },
             );
             painter.text(

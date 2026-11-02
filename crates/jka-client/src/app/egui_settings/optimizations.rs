@@ -30,7 +30,7 @@ pub(in crate::app) const OPTIMIZATION_CVARS: &[(&str, &str, &str)] = &[
     ("r_fxZeroAlphaDiscard", "0", "0"),
     ("cg_eventWorkers", "1", "0"),
     ("r_cloudEmptySkip", "0", "0"),
-    ("r_fragmentShaderMode", "1", "0"),
+    ("r_fragmentShaderMode", "5", "0"),
     ("r_colorClearMode", "1", "0"),
     ("r_additiveStageFusion", "1", "0"),
     ("r_facePlaneCull", "0", "0"),
@@ -195,7 +195,7 @@ impl App {
         self.cvar_choice_row(
             ui,
             "Fragment shader mode",
-            "World shaders: 0 general; 1 material specialization (default); 2 material + minimal entries; 3 shared families; 4 generated stage recipes; 5 hybrid: compact common stages, generated complex operations, specialized compatibility fallback. Mode changes compile in the background and preserve quality settings.",
+            "World shaders: 0 general; 1 material specialization; 2 material + minimal entries; 3 shared families; 4 generated stage recipes; 5 hybrid (default): compact common stages, generated complex operations, specialized compatibility fallback. Mode changes compile in the background and preserve quality settings.",
             "r_fragmentShaderMode",
             &[("0", "General"), ("1", "Material"), ("2", "Material + minimal"), ("3", "Shared families"), ("4", "Generated pairs"), ("5", "Hybrid")],
         );

@@ -643,7 +643,8 @@ pub(crate) fn hud_stock_rect(
             }
         }
         HudElementId::Fps => {
-            let width = 7.0 * 6.0 * 1.55;
+            // Eight fixed columns match the live FPS readout's left anchor.
+            let width = 8.0 * 6.0 * 1.55;
             HudRect {
                 x: (w as f32 - 12.0 - width).max(12.0),
                 y: 12.0,
@@ -733,7 +734,8 @@ pub(crate) fn hud_stock_rect(
         HudElementId::SpeedometerJumps => {
             let s = &ctx.speedometer;
             let rows = ((s.jumps.clamp(1, 511) + 4) / 5) as f32;
-            virtual_rect(s.jumps_x, s.jumps_y + 96.0, 260.0, 20.0 * rows)
+            HudRect { x: s.jumps_x * sx, y: (s.jumps_y + 96.0) * sy,
+                      width: 260.0 * sy, height: 20.0 * rows * sy }
         }
         HudElementId::SpeedGraph => {
             use crate::speedometer::flag;
@@ -744,7 +746,8 @@ pub(crate) fn hud_stock_rect(
                 let framed = matches!(ctx.lagometer.mode, 1 | 2);
                 virtual_rect(x - coef, if framed {y} else {y-96.0}, 49.0*coef, if framed {48.0} else {144.0})
             } else {
-                virtual_rect(245.0, 368.0, 150.0, 22.0)
+                HudRect { x: 245.0 * sx, y: 368.0 * sy,
+                          width: 150.0 * sy, height: 22.0 * sy }
             }
         }
         HudElementId::StrafeGuide => {

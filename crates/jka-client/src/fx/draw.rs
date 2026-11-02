@@ -2,7 +2,7 @@
 //! RB_SurfaceOrientedQuad, RB_SurfaceLine (DoLine) and RB_SurfaceCylinder,
 //! built on the CPU against the final render view and batched per shader.
 
-use super::system::{make_normal_vectors, FxDraw};
+use super::system::{make_normal_vectors, FxDraw, FxDrawSource};
 use crate::{
     camera::Camera,
     materials::TextureData,
@@ -83,6 +83,9 @@ pub enum FxBlend {
     Modulate2x,
     /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
     Darken,
+    /// GL_ONE GL_ONE_MINUS_SRC_COLOR: classic screen blend, used by the
+    /// animated layers of gfx/hud/background in Jedi Academy.
+    Screen,
     /// No blendFunc.
     Opaque,
 }
@@ -99,6 +102,7 @@ impl FxBlend {
             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
             ["gl_dst_color", "gl_src_color"] => Self::Modulate2x,
             ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
+            ["gl_one", "gl_one_minus_src_color"] => Self::Screen,
             // GL_ONE GL_ZERO replaces the framebuffer: opaque whatever the texture alpha
             // (player entity-tint stages rely on this to keep their alpha mask unblended).
             [] | ["gl_one", "gl_zero"] => Self::Opaque,
@@ -122,6 +126,7 @@ impl FxBlend {
             Self::DstColorAdd => DynamicModelAlphaMode::DstColorAdd,
             Self::Modulate2x => DynamicModelAlphaMode::Modulate2x,
             Self::Darken => DynamicModelAlphaMode::Darken,
+            Self::Screen => DynamicModelAlphaMode::BlendUnlit,
             Self::Alpha | Self::Opaque => DynamicModelAlphaMode::BlendUnlit,
         }
     }
@@ -261,7 +266,8 @@ impl FxMaterial {
             | FxBlend::Modulate
             | FxBlend::DstColorAdd
             | FxBlend::Modulate2x
-            | FxBlend::Darken => 1.0,
+            | FxBlend::Darken
+            | FxBlend::Screen => 1.0,
             _ => generated_alpha,
         };
         [rgb[0], rgb[1], rgb[2], alpha]
@@ -308,23 +314,23 @@ impl Batch {
 /// every renderable stage of a shader. This matters for stock JKA effects such
 /// as `gfx/effects/sabers/saberBlur`, whose glow and hot core are two additive
 /// stages over the same trail quad.
-pub fn tessellate(
-    draws: &[FxDraw],
+pub fn tessellate<D: FxDrawSource + ?Sized>(
+    draws: &D,
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    tessellate_impl::<false>(draws, view, materials, &[])
+    tessellate_impl::<false, D>(draws, view, materials, &[])
 }
 
-pub fn tessellate_masked(
-    draws: &[FxDraw], view: &FxView,
+pub fn tessellate_masked<D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    tessellate_impl::<true>(draws, view, materials, visible)
+    tessellate_impl::<true, D>(draws, view, materials, visible)
 }
 
-fn tessellate_impl<const FILTER: bool>(
-    draws: &[FxDraw], view: &FxView,
+fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
     let mut batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
@@ -336,12 +342,12 @@ fn tessellate_impl<const FILTER: bool>(
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
-            | FxDraw::Line { shader, .. }
             | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader,
+            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            FxDraw::Line { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -394,30 +400,30 @@ fn tessellate_impl<const FILTER: bool>(
 /// This is intentionally an A/B path, not a semantic rewrite: draw order inside
 /// each material batch is preserved and the resulting vertex/index data uses the
 /// exact same `append_draw` implementation as the CPU reference path.
-pub fn tessellate_workers(
-    draws: &[FxDraw],
+pub fn tessellate_workers<D: FxDrawSource + ?Sized>(
+    draws: &D,
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    tessellate_workers_impl::<false>(draws, view, materials, &[])
+    tessellate_workers_impl::<false, D>(draws, view, materials, &[])
 }
 
-pub fn tessellate_workers_masked(
-    draws: &[FxDraw], view: &FxView,
+pub fn tessellate_workers_masked<D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    tessellate_workers_impl::<true>(draws, view, materials, visible)
+    tessellate_workers_impl::<true, D>(draws, view, materials, visible)
 }
 
-fn tessellate_workers_impl<const FILTER: bool>(
-    draws: &[FxDraw], view: &FxView,
+fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
     const PARALLEL_MIN_DRAWS: usize = 64;
     const PARALLEL_CHUNK_DRAWS: usize = 64;
 
     if draws.len() < PARALLEL_MIN_DRAWS {
-        return tessellate_impl::<FILTER>(draws, view, materials, visible);
+        return tessellate_impl::<FILTER, D>(draws, view, materials, visible);
     }
 
     let mut groups: HashMap<(String, usize, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
@@ -430,12 +436,12 @@ fn tessellate_workers_impl<const FILTER: bool>(
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
-            | FxDraw::Line { shader, .. }
             | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader,
+            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            FxDraw::Line { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -455,7 +461,7 @@ fn tessellate_workers_impl<const FILTER: bool>(
     }
 
     let Some(pool) = fx_tess_worker_pool() else {
-        return tessellate_impl::<FILTER>(draws, view, materials, visible);
+        return tessellate_impl::<FILTER, D>(draws, view, materials, visible);
     };
 
     let mut surfaces: Vec<_> = pool.install(|| groups
@@ -466,7 +472,7 @@ fn tessellate_workers_impl<const FILTER: bool>(
             let batch = if draw_indices.len() < PARALLEL_MIN_DRAWS {
                 let mut batch = Batch::default();
                 for draw_index in draw_indices {
-                    append_draw(&draws[draw_index], view, &mat, &mut batch);
+                    append_draw(draws.get(draw_index).expect("FX draw index"), view, &mat, &mut batch);
                 }
                 batch
             } else {
@@ -475,7 +481,7 @@ fn tessellate_workers_impl<const FILTER: bool>(
                     .map(|chunk| {
                         let mut batch = Batch::default();
                         for &draw_index in chunk {
-                            append_draw(&draws[draw_index], view, &mat, &mut batch);
+                            append_draw(draws.get(draw_index).expect("FX draw index"), view, &mat, &mut batch);
                         }
                         batch
                     })
@@ -539,19 +545,19 @@ fn fx_gpu_quad_instance(
 /// not authored motion, lifetime or orientation. GPU-eligible sprites,
 /// oriented quads, saber-glow beads and view-facing line/tail strips use this
 /// path. Complex geometry and tcMod stages keep the reference CPU tessellation.
-pub fn tessellate_gpu_particles(
-    draws: &[FxDraw],
+pub fn tessellate_gpu_particles<D: FxDrawSource + ?Sized>(
+    draws: &D,
     view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
 ) -> Vec<DynamicModelSurface> {
-    tessellate_gpu_particles_impl::<false>(draws, view, materials, &[])
+    tessellate_gpu_particles_impl::<false, D>(draws, view, materials, &[])
 }
 
-pub fn tessellate_gpu_particles_masked(
-    draws: &[FxDraw], view: &FxView,
+pub fn tessellate_gpu_particles_masked<D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    tessellate_gpu_particles_impl::<true>(draws, view, materials, visible)
+    tessellate_gpu_particles_impl::<true, D>(draws, view, materials, visible)
 }
 
 /// Stable visual sampling clock, *not* the display/renderer clock. A fixed
@@ -562,8 +568,8 @@ fn lightning_sample_seconds(seconds: f32) -> f32 {
     else { (seconds * fps as f32).floor() / fps as f32 }
 }
 
-fn tessellate_gpu_particles_impl<const FILTER: bool>(
-    draws: &[FxDraw], view: &FxView,
+fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
+    draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
     // Give each unique shader one integer key for this frame. At 100k+ FX
@@ -584,18 +590,18 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
             | FxDraw::OrientedQuad { shader, .. }
-            | FxDraw::Line { shader, .. }
             | FxDraw::Lightning { shader, .. }
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader,
+            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            FxDraw::Line { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
         };
-        let shader_index = if let Some(&index) = shader_indices.get(shader.as_str()) {
+        let shader_index = if let Some(&index) = shader_indices.get(shader) {
             index
         } else {
             let normalized = shader.to_ascii_lowercase();
@@ -607,7 +613,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool>(
                 normalized_indices.insert(normalized, index);
                 index
             };
-            shader_indices.insert(shader.as_str(), index);
+            shader_indices.insert(shader, index);
             index
         };
         let stages = &shader_materials[shader_index];
@@ -1615,6 +1621,7 @@ mod tests {
         );
         assert_eq!(FxBlend::from_blend_func(""), FxBlend::Opaque);
         assert_eq!(FxBlend::from_blend_func("GL_ONE GL_ZERO"), FxBlend::Opaque);
+        assert_eq!(FxBlend::from_blend_func("GL_ONE GL_ONE_MINUS_SRC_COLOR"), FxBlend::Screen);
         assert_eq!(
             FxBlend::from_blend_func("GL_DST_COLOR GL_ONE"),
             FxBlend::DstColorAdd

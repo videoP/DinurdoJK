@@ -1,6 +1,29 @@
 //! Authored river material controls; native defaults, generation unchanged.
 use super::cvar_prelude::*;
 app_cvars! {
+    APP_R_RIVERFOAMMINIMUMDEPTH {
+        runtime: CvarDef::new("r_riverFoamMinimumDepth", "60", "0..200", "Minimum water-column depth for new river foam in map units. Full depth weight is reached at 3.333 times this depth; zero removes the depth gate.", CvarType::Float {min:0.0,max:200.0}, CvarFlags::ARCHIVE, LatchScope::None,
+            |app:&App|CvarValue::Float(app.video.river_settings.foam_minimum_depth), |app,value|{let CvarValue::Float(v)=value else {unreachable!()};app.video.river_settings.foam_minimum_depth=v;app.commit_river_settings();Ok(())}),
+        config: CvarBinding { load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<f32>(){if v.is_finite(){s.river_settings.foam_minimum_depth=v.clamp(0.0,200.0);}}}), archive:Some((29133,|s|s.video.river_settings.foam_minimum_depth.to_string())), ..CvarBinding::NONE }, implementations: []
+    }
+    APP_R_RIVERUNDERWATERCOLOR {
+        runtime: CvarDef::new("r_riverUnderwaterColor", "0.078431375 0.15686275 0.19607843", "r g b (0..1)", "Hybrid underwater fog color for new rivers (sRGB).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c=app.video.river_settings.underwater_color; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },
+            |app,value| App::cvar_set_river_underwatercolor(app,"r_riverUnderwaterColor",&value.to_string())).with_text_setter(App::cvar_set_river_underwatercolor,None),
+        config: CvarBinding { load_video: Some(|settings,_,value,_| { if let Some(c)=parse_vec3(value) { if c.iter().all(|v|v.is_finite()) { settings.river_settings.underwater_color=c.map(|v|v.clamp(0.0,1.0)); } } }),
+            archive: Some((29130,|s|{let c=s.video.river_settings.underwater_color;format!("{} {} {}",c[0],c[1],c[2])})), ..CvarBinding::NONE },
+        implementations: [impl App { fn cvar_set_river_underwatercolor(&mut self,name:&str,value:&str)->Result<(),String> { let c: [f32;3]=Self::parse_cvar_floats(name,value)?; self.video.river_settings.underwater_color=c.map(|v|v.clamp(0.0,1.0)); self.commit_river_settings();Ok(()) } }]
+    }
+    APP_R_RIVERUNDERWATERVISIBILITY {
+        runtime: CvarDef::new("r_riverUnderwaterVisibility", "2304", "1..65536", "Underwater distance in map units at which blue transmission falls to five percent.", CvarType::Float {min:1.0,max:65536.0}, CvarFlags::ARCHIVE, LatchScope::None,
+            |app:&App|CvarValue::Float(app.video.river_settings.underwater_visibility), |app,value|{let CvarValue::Float(v)=value else {unreachable!()};app.video.river_settings.underwater_visibility=v;app.commit_river_settings();Ok(())}),
+        config: CvarBinding { load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<f32>(){if v.is_finite(){s.river_settings.underwater_visibility=v.clamp(1.0,65536.0);}}}), archive:Some((29131,|s|s.video.river_settings.underwater_visibility.to_string())), ..CvarBinding::NONE }, implementations: []
+    }
+    APP_R_RIVERUNDERWATERDARKENING {
+        runtime: CvarDef::new("r_riverUnderwaterDarkening", "2304", "1..65536", "Underwater downwelling-light depth distance in map units; larger values darken more slowly.", CvarType::Float {min:1.0,max:65536.0}, CvarFlags::ARCHIVE, LatchScope::None,
+            |app:&App|CvarValue::Float(app.video.river_settings.underwater_darkening), |app,value|{let CvarValue::Float(v)=value else {unreachable!()};app.video.river_settings.underwater_darkening=v;app.commit_river_settings();Ok(())}),
+        config: CvarBinding { load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<f32>(){if v.is_finite(){s.river_settings.underwater_darkening=v.clamp(1.0,65536.0);}}}), archive:Some((29132,|s|s.video.river_settings.underwater_darkening.to_string())), ..CvarBinding::NONE }, implementations: []
+    }
     APP_R_RIVERSCATTERINGCOLOR {
         runtime: CvarDef::new("r_riverScatteringColor", "0.765623 1 0.924169", "r g b (0..1)", "Color of light scattered through the river.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| { let c=app.video.river_settings.water.scattering; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },

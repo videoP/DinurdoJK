@@ -48,7 +48,8 @@ impl App {
     /// egui owns every menu overlay, not just the Video page.
     pub(in crate::app) fn egui_menu_active(&self) -> bool {
         let blocking_download_ui = self.connection_modal_active();
-        (blocking_download_ui
+        ((self.overlay == OverlayMode::Console && self.console_hl2)
+            || blocking_download_ui
             || self.siege_dialog.is_some()
             || matches!(
                 self.egui_display_overlay(),
@@ -71,7 +72,8 @@ impl App {
                     | OverlayMode::Telemarks
             ))
             && self.video_confirmation.is_none()
-            && (blocking_download_ui || self.loading.is_none())
+            && (self.overlay == OverlayMode::Console && self.console_hl2
+                || blocking_download_ui || self.loading.is_none())
             && !self.video.skip_ui
             && self.window.is_some()
             && self.render.is_some()
@@ -114,8 +116,40 @@ impl App {
         let confirmation = self.egui_confirmation_active();
         // Asset Viewer remains rendered behind the legacy console, but the
         // console must retain all keyboard/mouse input while it is open.
-        if !confirmation && self.overlay == OverlayMode::Console {
+        if !confirmation && self.overlay == OverlayMode::Console && !self.console_hl2 {
             return false;
+        }
+        // Keep the legacy console text editor (completion, history, search,
+        // clipboard and bindings) authoritative. Only pointer events are sent
+        // to egui's floating frame, and consumed there instead of selecting
+        // text in the old dropdown geometry.
+        if !confirmation && self.overlay == OverlayMode::Console && self.console_hl2 {
+            if let WindowEvent::CursorMoved { position, .. } = event {
+                self.cursor_position = (position.x, position.y);
+            }
+            // Keep egui's selectable log text copyable with Ctrl+C, while
+            // all command editing keys continue through the raw console path.
+            if self.modifiers.control_key() && matches!(event,
+                WindowEvent::KeyboardInput {
+                    event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::KeyC), .. }, ..
+                })
+            {
+                if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+                    let response = state.on_window_event(window, event);
+                    self.egui_repaint_requested |= response.repaint;
+                }
+                return true;
+            }
+            if matches!(event, WindowEvent::KeyboardInput { .. }
+                | WindowEvent::Ime(..) | WindowEvent::ModifiersChanged(..)) {
+                return false;
+            }
+            if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+                let response = state.on_window_event(window, event);
+                self.egui_repaint_requested |= response.repaint;
+            }
+            return matches!(event, WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. });
         }
         if !confirmation && !self.egui_menu_active() {
             return false;
@@ -443,6 +477,22 @@ impl App {
     // ------------------------------------------------------------- chrome --
 
     pub(in crate::app::egui_menu) fn build_egui_menu(&mut self, ui: &mut egui::Ui) {
+        if self.overlay == OverlayMode::Console && self.console_hl2 {
+            // Keep the originating setup/profile/game menu behind the floating
+            // console, just as the classic console does. It is safe to skip
+            // this background on the gameplay and loading screens.
+            if self.loading.is_none() && !matches!(self.overlay_before_console,
+                OverlayMode::None | OverlayMode::Chat | OverlayMode::Console)
+            {
+                self.build_egui_menu_underlay(ui);
+            }
+            self.egui_hl2_console(ui.ctx());
+            return;
+        }
+        self.build_egui_menu_underlay(ui);
+    }
+
+    fn build_egui_menu_underlay(&mut self, ui: &mut egui::Ui) {
         // emote_gallery captures include egui; keep the screen clear.
         if self.emote_gallery_active() {
             return;
@@ -958,7 +1008,7 @@ impl App {
         }
         let body = self.menu_shell(root.ctx()).body;
         super::shell_layout::region(root, "jka_menu_body_region", body, |ui| {
-                // Keep the Servers page at the same 1120-point canvas used by
+                // Keep the Servers page at the same 1480-point canvas used by
                 // the front-end browser so the two versions have identical
                 // column geometry and interaction positions. Profile remains a
                 // full-width special case for its renderer-owned preview.
@@ -966,7 +1016,7 @@ impl App {
                 let profile_page =
                     self.egui_display_overlay() == OverlayMode::Game && self.menu_selected == TOP_PROFILE;
                 let content_w = if server_page {
-                    ui.available_width().min(1120.0)
+                    ui.available_width().min(1480.0)
                 } else if profile_page || (self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_PK3) {
                     // The three-pane PK3 Manager needs the full canvas, but
                     // other Setup pages keep their familiar left column.

@@ -286,8 +286,12 @@ impl App {
         if inside(layout.play) { return Some(DemoTimelineHit::PlayPause); }
         if inside(layout.forward) { return Some(DemoTimelineHit::Forward); }
         if inside(layout.recorded) { return Some(DemoTimelineHit::Recorded); }
-        if inside(layout.free) { return Some(DemoTimelineHit::Free); }
-        if inside(layout.speed) { return Some(DemoTimelineHit::Speed); }
+        if inside(layout.speed) {
+            let rail = ui::demo_speed_rail(layout.speed);
+            return Some(DemoTimelineHit::Speed(
+                ((point[0] - rail[0]) / rail[2]).clamp(0.0, 1.0)
+            ));
+        }
         if inside(layout.track) {
             return Some(DemoTimelineHit::Track(
                 ((point[0] - layout.track[0]) / layout.track[2]).clamp(0.0, 1.0)
@@ -336,6 +340,52 @@ impl App {
             };
             self.publish_transient_ui();
         }
+    }
+
+    /// Speed drag is independent of the seek/scrub state. Click sets the
+    /// timescale immediately; drag adjusts continuously. Double-click resets
+    /// to exactly 1x without unpausing a paused demo.
+    pub(in crate::app) fn begin_demo_speed_slider(&mut self, fraction: f32) {
+        let now = Instant::now();
+        let (x, y) = self.cursor_position;
+        let double_click = self.demo_speed_last_click.is_some_and(|(previous, px, py)| {
+            now.saturating_duration_since(previous) <= Duration::from_millis(350)
+                && (x - px).abs() <= 8.0 && (y - py).abs() <= 8.0
+        });
+        self.demo_speed_last_click = if double_click { None } else { Some((now, x, y)) };
+        self.demo_speed_dragging = !double_click;
+        let rate = if double_click { 1.0 } else { ui::demo_speed_from_fraction(fraction) };
+        self.set_demo_speed_slider(rate);
+    }
+
+    fn set_demo_speed_slider(&mut self, rate: f64) {
+        let Some(session) = self.game_session.as_mut().filter(|session| !session.live) else {
+            return;
+        };
+        let current = session.timeline.map_or(1.0, |timeline| {
+            if timeline.rate > 0.0 { timeline.rate } else { timeline.resume_rate }
+        });
+        if (current - rate).abs() < 0.0001 { return; }
+        if session.set_playback_speed(Instant::now(), rate).is_ok() {
+            self.console_status = format!("DEMO SPEED: {rate:.2}X");
+            self.publish_transient_ui();
+        }
+    }
+
+    pub(in crate::app) fn update_demo_speed_slider(&mut self, x: f64) {
+        if !self.demo_speed_dragging { return; }
+        let Some(window) = self.window.as_ref() else { return; };
+        let size = window.inner_size();
+        let Some(layout) = ui::demo_timeline_layout(size.width, size.height, 0, 0, false) else { return; };
+        let rail = ui::demo_speed_rail(layout.speed);
+        let fraction = ((x as f32 - rail[0]) / rail[2]).clamp(0.0, 1.0);
+        self.set_demo_speed_slider(ui::demo_speed_from_fraction(fraction));
+    }
+
+    pub(in crate::app) fn finish_demo_speed_slider(&mut self) {
+        if !self.demo_speed_dragging { return; }
+        self.demo_speed_dragging = false;
+        self.sync_demo_camera_capture();
     }
 
     pub(in crate::app) fn cycle_demo_speed_ui(&mut self) {

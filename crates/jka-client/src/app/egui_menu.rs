@@ -18,6 +18,7 @@ mod neon_main;
 mod neon_submenu;
 mod profile;
 mod profile_studio;
+mod saber_color_picker;
 mod profile_emotes;
 mod resume;
 mod render_studio;
@@ -33,8 +34,10 @@ mod render_studio_layout;
 mod render_studio_ui;
 mod screenshots;
 mod servers;
+mod server_browser_layout;
 pub(in crate::app) mod settings_search;
 mod shell;
+mod hl2_console;
 mod solo;
 
 // The whole in-game menu, drawn with egui.
@@ -620,8 +623,13 @@ pub(super) fn binding_slot(
     color: egui::Color32,
     waiting: bool,
 ) -> egui::Response {
+    // Inherited bindings include the source command AND resolved key. Give
+    // those slots their own width rather than clipping the useful information.
+    let width = if text.starts_with("Inherit ") {
+        ui.available_width().min(455.0).max(190.0)
+    } else { 190.0 };
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(190.0, 24.0), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click_and_drag());
     let painter = ui.painter().clone();
     let fill = if waiting {
         theme::CONTROL_SELECTED()

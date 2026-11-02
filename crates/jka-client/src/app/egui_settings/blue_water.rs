@@ -23,7 +23,6 @@ impl App {
         super::ocean_slider_d(ui, "Lake wind direction", "Direction ripples travel, in degrees from +X toward world +Z.", &mut settings.lake.direction, d.direction, -180.0..=180.0, &mut changed);
         });
         if settings.lake.shader == 1 {
-            super::ocean_slider_d(ui, "Cheapwater player wakes", "Expanding ripples from players moving through or entering the water. Higher strength bends reflections and refraction more, at the same rendering cost. Zero disables the effect.", &mut settings.lake.wake_strength, d.wake_strength, 0.0..=10.0, &mut changed);
             super::ocean_slider_d(ui, "Lake transparency", "Maximum bed visibility in very shallow water: 0 is opaque, 1 is clear. Visibility falls smoothly to zero at Opaque depth.", &mut settings.lake.cheap_transmission, d.cheap_transmission, 0.0..=1.0, &mut changed);
             super::ocean_slider_d(ui, "Opaque depth (feet)", "Vertical bed depth where visibility is exactly zero. Default 8 feet leaves 3-inch water almost fully clear, then fades smoothly to opaque. Independent of depth clarity and color depth.", &mut settings.lake.opaque_depth, d.opaque_depth, 0.25..=100.0, &mut changed);
             super::ocean_slider_d(ui, "Cheapwater refraction", "Small screen-space distortion driven by the existing scrolling normals. No extra noise samples or ray tracing. Only applies with transparency above zero.", &mut settings.lake.cheap_refraction, d.cheap_refraction, 0.0..=0.05, &mut changed);

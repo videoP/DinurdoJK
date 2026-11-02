@@ -839,8 +839,8 @@ impl RenderStudio {
         let motion=self.timeline.clip_at_lane(time,lane)
             .map(|clip|clip.motion_at(time,self.timeline.interpolation != StudioInterpolation::Linear))
             .unwrap_or_default();
-        [88.0*zoom.clamp(0.45,2.5)+motion.position[0],18.0+motion.position[1],
-            -22.0+lane as f32*26.0+motion.position[2]]
+        [88.0*zoom.clamp(0.45,2.5)+motion.position[0],lane as f32*26.0+motion.position[1],
+            18.0+motion.position[2]]
     }
     /// Safe basename only: never let a project field select a parent directory.
     pub fn project_file_name(&self) -> String {
@@ -1271,22 +1271,22 @@ impl App {
             .map(|c|c.lane)
             .or_else(||self.render_studio.timeline.active_actors(time).first().map(|c|c.lane))
             .unwrap_or(0);
-        // Camera coordinates are X-forward, Y-up, Z-sideways. Secondary
-        // actors are spaced laterally on Z, never stacked vertically on Y.
+        // JKA authoring coordinates: Z up, actors spaced along Y.
         let target=self.render_studio.actor_center(self.profile_preview_zoom);
-        let eye=[0.0,-11.0,0.0];
+        let eye=[0.0,0.0,-11.0];
         let dx=target[0]-eye[0];
         let dy=target[1]-eye[1];
         let dz=target[2]-eye[2];
-        let yaw=(-dz).atan2(dx).to_degrees().rem_euclid(360.0);
-        let pitch=dy.atan2((dx*dx+dz*dz).sqrt()).to_degrees();
+        let yaw=dy.atan2(dx).to_degrees().rem_euclid(360.0);
+        let pitch=(-dz).atan2((dx*dx+dy*dy).sqrt()).to_degrees();
         if self.render_studio.timeline.camera_rig.active() {
             self.update_studio_camera_rig();
             let visible=self.studio_shot_camera();
+            let visible_position=super::scene::jka_position(visible.position.to_array());
             self.render_studio.timeline.begin_camera_edit();
             if let Some(key)=self.render_studio.timeline.selected_camera
                 .and_then(|i|self.render_studio.timeline.camera.get_mut(i)) {
-                for i in 0..3 {key.position[i]+=eye[i]-visible.position[i];}
+                for i in 0..3 {key.position[i]+=eye[i]-visible_position[i];}
                 key.yaw=yaw;key.pitch=pitch;
             }
         } else if let Some(key)=self.render_studio.timeline.selected_camera
@@ -1368,7 +1368,7 @@ impl App {
             return false;
         }
         let project = StudioProject {
-            version: 15,
+            version: 16,
             light_layers: self.render_studio.timeline.light_layers.clone(),
             scene_lighting: self.render_studio.timeline.scene_lighting.clone(),
             model: self.render_studio.model.clone(),
@@ -1431,7 +1431,7 @@ impl App {
             let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             if text.len() > 1_000_000 { return Err("Project exceeds 1 MB".into()); }
             let project: StudioProject = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            if project.version != 15 { return Err("Unsupported timeline project version".into()); }
+            if project.version != 16 { return Err("This project uses an older coordinate format. Create a new Z-up Studio project.".into()); }
             if !project.scene_lighting.valid() { return Err("Invalid Render Studio ambient / sun keys".into()); }
             if !super::render_studio_lights::valid_layers(&project.light_layers) { return Err("Invalid light layers or keyframes in project".into()); }
             if project.clips.len() > 500 || project.camera.len() > 500 || project.demos.len()>500 || project.director_shots.len()>500 {
@@ -1817,8 +1817,8 @@ impl App {
             let lane = clip.lane;
             let Some(key) = clip.motion.get_mut(k) else { continue };
             // Same native mapping as the stage (render_studio_spatial::motion_world).
-            let base_z = -22.0 + lane as f32 * 26.0;
-            let origin = [88.0 * zoom + key.position[0], key.position[1], base_z + key.position[2]];
+            let base_z = -22.0;
+            let origin = [88.0 * zoom + key.position[0], lane as f32 * 26.0 + key.position[1], base_z + key.position[2]];
             match studio_floor_origin_z(&mut world, origin) {
                 Some(z) => { key.position[2] = z - base_z; moved += 1; }
                 None => missed += 1,

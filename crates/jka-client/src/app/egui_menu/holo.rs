@@ -128,7 +128,7 @@ pub(in crate::app) fn glass() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(0x16, 0x14, 0x11, 0xD8))
         .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x5C, 0x53, 0x46, 0xB0)))
-        .corner_radius(egui::CornerRadius::same(10))
+        .corner_radius(egui::CornerRadius::ZERO)
 }
 
 /// Vertical fade behind a header: dark at the top edge, clear at the bottom,
@@ -184,10 +184,10 @@ pub(in crate::app) fn rail_item(ui: &mut egui::Ui, label: &str, selected: bool, 
     let painter = ui.painter();
     let hovered = response.hovered();
     if selected {
-        painter.rect_filled(rect.shrink2(vec2(6.0, 1.0)), 6.0, with_alpha(theme::ACCENT(), 0.10));
+        painter.rect_filled(rect.shrink2(vec2(6.0, 1.0)),egui::CornerRadius::ZERO, with_alpha(theme::ACCENT(), 0.10));
         blade(painter, pos2(rect.left() + 9.0, rect.top() + 6.0), pos2(rect.left() + 9.0, rect.bottom() - 6.0), 2.0, theme::ACCENT(), 1.0);
     } else if hovered {
-        painter.rect_filled(rect.shrink2(vec2(6.0, 1.0)), 6.0, with_alpha(theme::TEXT(), 0.05));
+        painter.rect_filled(rect.shrink2(vec2(6.0, 1.0)),egui::CornerRadius::ZERO, with_alpha(theme::TEXT(), 0.05));
     }
     let color = if selected { theme::ACCENT() } else if hovered { theme::TEXT() } else { theme::TEXT_DIM() };
     painter.text(pos2(rect.left() + inset, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.5), color);

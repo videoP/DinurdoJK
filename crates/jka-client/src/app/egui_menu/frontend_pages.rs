@@ -400,9 +400,11 @@ impl App {
     pub(in crate::app::egui_menu) fn egui_frontend_body(&mut self, root: &mut egui::Ui) {
         let body = self.menu_shell(root.ctx()).body;
         super::shell_layout::region(root, "jka_frontend_body_region", body, |ui| {
-                let max_w = if matches!(
+                let max_w = if self.frontend_page == FrontendPage::ServerBrowser {
+                    1480.0
+                } else if matches!(
                     self.frontend_page,
-                    FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo
+                    FrontendPage::SoloGame | FrontendPage::PlayDemo
                 ) {
                     1120.0
                 } else if matches!(

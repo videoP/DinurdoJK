@@ -1,8 +1,9 @@
 # World shader program modes
 
 The console control is `r_fragmentShaderMode 0..5`. Changes compile in the
-background and activate a complete pipeline set without a map reload. Mode 1
-remains the default; quality presets leave this experiment control alone.
+background and activate a complete pipeline set without a map reload. Mode 5
+(Hybrid) is the default for new settings and when applying quality presets;
+archived user settings can override it.
 
 | Mode | Policy |
 | --- | --- |
@@ -13,11 +14,12 @@ remains the default; quality presets leave this experiment control alone.
 | 4 | Generated vertex/fragment pairs for normalized stage recipes encountered by the map. |
 | **5** | **Hybrid:** mode-2-style compact specialized shaders for eligible common stages, structural generation for tcMods, nonstandard tcGen, waves, and live enhanced operations; mode-1-style specialization for remaining stages and unsupported effects. |
 
-Modes 3, 4 and 5 target Minimal Unified, Low and Medium. Their eligibility follows
-effective renderer features rather than a preset name. Unhandled configurations,
-autosprite2, special tcGen and three-stage legacy RGB composites use the existing
-specialized program. Sky and fused effect programs retain their dedicated paths.
-High and Ultra settings have not been changed or included in the validation scope.
+Modes 3, 4 and 5 were initially validated mainly on Minimal Unified, Low and
+Medium. Their eligibility follows effective renderer features rather than a preset
+name. Unhandled configurations, autosprite2, special tcGen and three-stage legacy
+RGB composites use the existing specialized program. Sky and fused effect programs
+retain their dedicated paths. Mode 5 is now the default across quality presets,
+but High and Ultra require separate hardware validation.
 
 Four common mode-3 families do not mean four pipeline objects: blend/depth/cull
 state, vertex entry, format and MSAA remain independent pipeline dependencies.

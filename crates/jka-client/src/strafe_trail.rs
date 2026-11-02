@@ -338,7 +338,7 @@ impl LoadedTrail {
                 start:[tick.origin[0]-offset[0],tick.origin[1]-offset[1],tick.origin[2]],
                 end:[tick.origin[0]+offset[0],tick.origin[1]+offset[1],tick.origin[2]],
                 width:width.max(1.0), rgba,
-                shader:TRAIL_SHADER.to_owned(),
+                shader:TRAIL_SHADER.into(),
             });
             if let Some(text) = labels.text(tick.seconds) {
                 append_formatted_time_marker(draws,
@@ -396,7 +396,7 @@ impl LoadedTrail {
                         end: segment.end,
                         width,
                         rgba: [rgb[0], rgb[1], rgb[2], alpha],
-                        shader: TRAIL_SHADER.to_owned(),
+                        shader: TRAIL_SHADER.into(),
                     });
                 }
             }
@@ -798,7 +798,7 @@ fn append_formatted_time_marker(draws: &mut Vec<FxDraw>, origin: [f32; 3], camer
                 draws.push(FxDraw::Line {
                     start:[pos[0],pos[1],pos[2]+z-0.5],
                     end:[pos[0],pos[1],pos[2]+z+0.5],width:1.7,
-                    rgba,shader:TRAIL_SHADER.to_owned(),
+                    rgba,shader:TRAIL_SHADER.into(),
                 });
             }
         } else if let Some(digit)=byte.checked_sub(b'0').filter(|d|*d<=9) {
@@ -834,7 +834,7 @@ fn append_live_segment(
         end: b.origin,
         width,
         rgba: [rgb[0], rgb[1], rgb[2], alpha],
-        shader: TRAIL_SHADER.to_owned(),
+        shader: TRAIL_SHADER.into(),
     });
 }
 

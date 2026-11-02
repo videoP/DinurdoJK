@@ -83,6 +83,7 @@ use demos::types::{
     DemoAdvance, DemoCameraSample, DemoConsoleFilter, DemoEventStat, DemoFakeView,
     DemoMetadataResult, DemoTimeline, DemoTimelineHit, DemoViewMode, RaceGhostLoadResult,
     SessionPhase, DEMO_FREE_SPEEDS, DEMO_FREE_SPEED_DEFAULT_INDEX,
+    DEMO_FREE_ALTATTACK_MULTIPLIER,
 };
 use display::{
     normalize_anti_aliasing, AppliedVideoMode, ApplyLatchedScope, ApplyVideoPath,
@@ -493,6 +494,11 @@ pub struct App {
     demo_view_outside_authoritative: bool,
     /// Demo-only noclip speed. weapnext/weapprev step this like a 3D editor wheel.
     demo_free_speed_index: usize,
+    /// Quick tap of the bound Walk action pauses the demo; holding Walk exposes UI.
+    demo_walk_pressed_at: Option<Instant>,
+    demo_walk_used: bool,
+    /// Custom previous-player bind doubles as held Freecam speed boost.
+    demo_previous_held: HashSet<BindKey>,
     server_browser_tx: Sender<BrowserCommand>,
     server_browser_rx: Receiver<BrowserEvent>,
     server_browser: BrowserUiState,
@@ -763,6 +769,10 @@ pub struct App {
     last_simulated_mouse_input: Option<InputLatencySample>,
     cursor_position: (f64, f64),
     demo_scrub_dragging: bool,
+    /// Live timescale slider drag (separate from timeline seeking).
+    demo_speed_dragging: bool,
+    /// Previous speed-rail click for double-click-to-reset (time, x, y).
+    demo_speed_last_click: Option<(Instant, f64, f64)>,
     demo_scrub_fraction: Option<f32>,
     demo_scrub_resume_rate: f64,
     demo_scrub_last_seek: Option<Instant>,
@@ -918,6 +928,8 @@ pub struct App {
     console_scroll: usize,
     console_size: ConsoleSize,
     console_scale: f32,
+    console_hl2: bool,
+    console_hl2_rect: [f32; 4],
     console_selection_anchor: Option<ConsolePoint>,
     console_selection_focus: Option<ConsolePoint>,
     console_selecting: bool,

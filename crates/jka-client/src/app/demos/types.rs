@@ -47,10 +47,9 @@ pub(in crate::app) enum DemoTimelineHit {
     Back,
     Forward,
     Recorded,
-    Free,
     Player(i32),
     TogglePlayerList,
-    Speed,
+    Speed(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +63,8 @@ pub(in crate::app) const DEMO_FREE_SPEEDS: [f32; 7] =
     [78.75, 157.5, 315.0, 630.0, 1260.0, 2520.0, 5040.0];
 
 pub(in crate::app) const DEMO_FREE_SPEED_DEFAULT_INDEX: usize = 3;
+/// While held, AltAttack boosts demo Freecam translation only.
+pub(in crate::app) const DEMO_FREE_ALTATTACK_MULTIPLIER: f32 = 4.0;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::app) struct DemoFakeView {

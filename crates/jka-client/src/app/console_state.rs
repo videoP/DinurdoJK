@@ -217,7 +217,8 @@ impl App {
             // every physical row is its own entry.
             let prefix = if self.console_timestamps {
                 format!(
-                    "^8[{:02}:{:02}:{:02}]^7 ",
+                    // TaystJK g_color_table[9] is gray; ^8 is orange.
+                    "^9[{:02}:{:02}:{:02}]^7 ",
                     record.local_time[0], record.local_time[1], record.local_time[2]
                 )
             } else {

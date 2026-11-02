@@ -254,16 +254,16 @@ app_cvars! {
         }, implementations: []
     }
     APP_R_LAKEWAKE {
-        runtime: CvarDef::new("r_lakeWake", "10", "0..10", "Cheapwater player wake/ripple strength. Stronger ripples use the same rendering work. Independent of the ocean interaction solver. 0 disables.",
-            CvarType::Float { min: 0.0, max: 10.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.wake_strength),
+        // Compatibility console alias only; never load a second independent
+        // wake strength from an old video.cfg or archive it a second time.
+        runtime: CvarDef::new("r_lakeWake", "1", "0..10",
+            "Legacy alias of r_oceanInteractionStrength. Player deformation strength is now global across ocean and lake renderers.",
+            CvarType::Float { min: 0.0, max: 10.0 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.interaction_strength.clamp(0.0, 10.0)),
             |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.wake_strength=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.wake_strength=v.clamp(0.0,10.0); } } }),
-            archive: Some((27376, |state| state.video.ocean_settings.lake.wake_strength.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
+                app.video.ocean_settings.interaction_strength=v;app.commit_ocean_settings();Ok(()) }),
+        config: CvarBinding::NONE,
+        implementations: []
     }
     APP_R_LAKEPLANAR {
         runtime: CvarDef::new("r_lakePlanar", "1", "0|1", "Compatibility alias: 1 selects lake Planar, 0 selects Sky. Use r_lakeReflectionMode for Sky/SSR/Planar comparisons.",
@@ -1201,7 +1201,7 @@ app_cvars! {
 
     APP_CG_WATERWAKE {
         runtime: CvarDef::new("cg_waterwake", "1", "0|1|2",
-            "0 off; 1 original JKA water wake on vanilla water; 2 enhanced vanilla wake and enabled Godot water interaction.",
+            "Global player water wake: 0 off; 1 regular JKA shader on unpromoted water; 2 enhanced JKA wake plus configured Godot and Cheapwater player interaction. Independent of r_oceanType.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.water_wake.to_string()),
             |app, value| App::cvar_set_water_wake(app, APP_CG_WATERWAKE.entry.name, &value.to_string()))
@@ -1224,8 +1224,8 @@ app_cvars! {
                 if let Some(session) = self.game_session.as_mut() {
                     session.water_wake_mode = mode;
                 }
-                // The stored r_oceanInteraction preference remains untouched.
-                // Only the renderer-facing copy is gated by mode 2.
+                // Keep saved Godot/Cheapwater preferences untouched. Only the
+                // renderer-facing copies are gated by the global wake mode.
                 self.commit_ocean_settings();
                 Ok(())
             }
@@ -2096,6 +2096,9 @@ app_cvars! {
                         self.video.ocean = Self::parse_cvar_bool(name, value)?;
                         if let Some(session) = self.game_session.as_mut() {
                             session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
+                            session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean
+                                && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1
+                                && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
                         }
                         // OFF releases the FFT resources immediately, and ON can be
                         // restored live only when the loaded world already carries its

@@ -104,6 +104,37 @@ pub const SPECTATOR_CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "CHANGE CAMERA TYPE", command: "toggle cg_thirdPerson 0 1 2", group: "Spectate" },
 ];
 
+/// Demo-only override actions. Without an override, each action inherits an
+/// existing normal/spectator binding; demo overrides never modify gameplay binds.
+/// Play/Pause inherits a *tap* of Walk so holding Walk still enables the demo UI.
+pub const DEMO_CONTROL_ACTIONS: &[ControlAction] = &[
+    ControlAction { label: "PLAY / PAUSE (TAP)", command: "demo_pause", group: "Demo" },
+    ControlAction { label: "NEXT PLAYER", command: "demo_next", group: "Demo" },
+    ControlAction { label: "PREVIOUS PLAYER / FREECAM BOOST", command: "demo_previous", group: "Demo" },
+    ControlAction { label: "CHANGE CAMERA TYPE", command: "demo_camera", group: "Demo" },
+    ControlAction { label: "ENTER FREECAM", command: "demo_freecam", group: "Demo" },
+];
+
+pub fn demo_inherit_command(command: &str) -> &'static str {
+    match command {
+        "demo_pause" => "+speed",
+        "demo_next" => "+attack",
+        "demo_previous" => "+altattack",
+        "demo_camera" => "toggle cg_thirdPerson 0 1 2",
+        "demo_freecam" => "+moveup",
+        _ => "",
+    }
+}
+
+pub fn spectator_inherit_command(command: &str) -> &str {
+    match command {
+        "follownext" => "+attack",
+        "followprev" => "+altattack",
+        "toggle cg_thirdPerson 0 1 2" => "saberAttackCycle",
+        _ => command,
+    }
+}
+
 /// Commands whose current DinurdoJK implementation is specifically tied to
 /// TaystJK/jaPRO integration. They are intentionally not shown on the Base JKA
 /// Controls page; the dynamic JAPRO section exposes them only while a jaPRO server is active.
@@ -128,6 +159,15 @@ pub fn spectator_selection(index: usize) -> usize {
     CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len() + index
 }
 
+pub fn demo_selection(index: usize) -> usize {
+    CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len() + SPECTATOR_CONTROL_ACTIONS.len() + index
+}
+
+pub fn is_demo_selection(selection: usize) -> bool {
+    let start = demo_selection(0);
+    selection >= start && selection < start + DEMO_CONTROL_ACTIONS.len()
+}
+
 pub fn control_action(selection: usize) -> Option<&'static ControlAction> {
     if let Some(action) = CONTROL_ACTIONS.get(selection) {
         return Some(action);
@@ -136,9 +176,12 @@ pub fn control_action(selection: usize) -> Option<&'static ControlAction> {
     if let Some(action) = JAPRO_CONTROL_ACTIONS.get(japro_index) {
         return Some(action);
     }
-    SPECTATOR_CONTROL_ACTIONS.get(
+    if let Some(action) = SPECTATOR_CONTROL_ACTIONS.get(
         selection.saturating_sub(CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()),
-    )
+    ) {
+        return Some(action);
+    }
+    DEMO_CONTROL_ACTIONS.get(selection.saturating_sub(demo_selection(0)))
 }
 
 #[cfg(test)]
@@ -158,11 +201,12 @@ pub fn is_spectator_selection(selection: usize) -> bool {
 pub struct Bindings {
     map: HashMap<BindKey, String>,
     spectator_map: HashMap<BindKey, String>,
+    demo_map: HashMap<BindKey, String>,
 }
 
 impl Default for Bindings {
     fn default() -> Self {
-        let mut bindings = Self { map: HashMap::new(), spectator_map: HashMap::new() };
+        let mut bindings = Self { map: HashMap::new(), spectator_map: HashMap::new(), demo_map: HashMap::new() };
         // Mirrors the stock MP mpdefault.cfg, which jaPRO also runs on (it ships no
         // default binds of its own). Commands this client does not implement yet
         // (+strafe, +lookup/+lookdown, +left/+right, centerview, +mlook,
@@ -275,6 +319,75 @@ impl Bindings {
         }
     }
 
+    pub fn get_demo(&self, key: BindKey) -> Option<&str> {
+        self.demo_map.get(&key).map(String::as_str)
+    }
+
+    pub fn demo_has_override(&self, command: &str) -> bool {
+        self.demo_map.values().any(|value| binding_contains_command(value, command))
+    }
+
+    pub fn set_demo(&mut self, key: BindKey, command: impl Into<String>) {
+        let command = command.into();
+        if !DEMO_CONTROL_ACTIONS.iter().any(|action| action.command == command) {
+            return; // Only the explicit demo verbs are legal demo overrides.
+        }
+        // A single key triggers at most one demo action.
+        self.demo_map.insert(key, command);
+    }
+
+    pub fn unbind_demo(&mut self, key: BindKey) -> bool {
+        self.demo_map.remove(&key).is_some()
+    }
+
+    pub fn clear_demo(&mut self) {
+        self.demo_map.clear();
+    }
+
+    pub fn unbind_demo_command(&mut self, command: &str) -> usize {
+        let before = self.demo_map.len();
+        self.demo_map.retain(|_, value| value != command);
+        before - self.demo_map.len()
+    }
+
+    pub fn demo_keys_for_command(&self, command: &str) -> Vec<BindKey> {
+        let mut keys: Vec<_> = self.demo_map.iter()
+            .filter_map(|(key, value)| (value == command).then_some(*key))
+            .collect();
+        keys.sort_by_key(|key| key_name(*key));
+        keys
+    }
+
+    pub fn display_for_demo_command(&self, command: &str) -> String {
+        let keys = self.demo_keys_for_command(command);
+        if !keys.is_empty() {
+            return keys.into_iter().map(key_name).collect::<Vec<_>>().join(" OR ");
+        }
+        let inherit = demo_inherit_command(command);
+        if command == "demo_camera" && self.spectator_keys_for_command(inherit).is_empty() {
+            let normal = spectator_inherit_command(inherit);
+            return format!("Inherit Normal ({normal}) · {}", self.display_for_command(normal));
+        }
+        let keys = if command == "demo_camera" {
+            self.spectator_keys_for_command(inherit)
+        } else {
+            self.keys_for_command(inherit)
+        };
+        let keys_text = if keys.is_empty() { "UNBOUND".to_owned() }
+            else { keys.into_iter().map(key_name).collect::<Vec<_>>().join(" OR ") };
+        let source = if command == "demo_camera" { "Spectate" } else { "Normal" };
+        format!("Inherit {source} ({inherit}) · {keys_text}")
+    }
+
+    pub fn display_for_spectator_inheritance(&self, command: &str) -> String {
+        let override_keys = self.spectator_keys_for_command(command);
+        if !override_keys.is_empty() {
+            return override_keys.into_iter().map(key_name).collect::<Vec<_>>().join(" OR ");
+        }
+        let normal = spectator_inherit_command(command);
+        format!("Inherit Normal ({normal}) · {}", self.display_for_command(normal))
+    }
+
     pub fn set(&mut self, key: BindKey, command: impl Into<String>) {
         let command = command.into();
         if command.is_empty() {
@@ -377,6 +490,13 @@ impl Bindings {
         }
     }
 
+    pub fn demo_sorted(&self) -> Vec<(BindKey, String)> {
+        let mut entries: Vec<_> = self.demo_map.iter()
+            .map(|(key, value)| (*key, value.clone())).collect();
+        entries.sort_by_key(|(key, _)| key_name(*key));
+        entries
+    }
+
     pub fn sorted(&self) -> Vec<(BindKey, String)> {
         let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value.clone())).collect();
         entries.sort_by_key(|(key, _)| key_name(*key));
@@ -408,6 +528,14 @@ impl Bindings {
             out.push_str(&escape_cfg(&command));
             out.push_str("\"\n");
         }
+        out.push_str("\n// Demo-only action overrides; missing actions inherit gameplay/spectator binds.\nunbinddemoall\n");
+        for (key, command) in self.demo_sorted() {
+            out.push_str("binddemo ");
+            out.push_str(&key_name(key));
+            out.push_str(" \"");
+            out.push_str(&escape_cfg(&command));
+            out.push_str("\"\n");
+        }
     }
 }
 
@@ -423,6 +551,18 @@ fn apply_cfg(bindings: &mut Bindings, text: &str) -> bool {
         if words[0].eq_ignore_ascii_case("unbindall") {
             bindings.clear();
             saw_bindings = true;
+            continue;
+        }
+        if words[0].eq_ignore_ascii_case("unbinddemoall") {
+            bindings.clear_demo();
+            saw_bindings = true;
+            continue;
+        }
+        if words[0].eq_ignore_ascii_case("binddemo") && words.len() >= 3 {
+            if let Some(key) = parse_key(&words[1]) {
+                bindings.set_demo(key, words[2..].join(" "));
+                saw_bindings = true;
+            }
             continue;
         }
         if words[0].eq_ignore_ascii_case("unbindspecall") {
@@ -517,12 +657,9 @@ pub fn canonical_movement_key(command: &str) -> Option<KeyCode> {
 }
 
 pub fn bind_key_for_code(code: KeyCode) -> BindKey {
-    BindKey::Keyboard(match code {
-        KeyCode::ControlRight => KeyCode::ControlLeft,
-        KeyCode::ShiftRight => KeyCode::ShiftLeft,
-        KeyCode::AltRight => KeyCode::AltLeft,
-        _ => code,
-    })
+    // Winit provides distinct physical codes for left and right modifiers.
+    // Preserve them so each side can have its own gameplay binding.
+    BindKey::Keyboard(code)
 }
 
 pub fn parse_key(name: &str) -> Option<BindKey> {
@@ -537,9 +674,12 @@ pub fn parse_key(name: &str) -> Option<BindKey> {
         "DOWNARROW" | "DOWN" => Some(KeyCode::ArrowDown),
         "LEFTARROW" | "LEFT" => Some(KeyCode::ArrowLeft),
         "RIGHTARROW" | "RIGHT" => Some(KeyCode::ArrowRight),
-        "ALT" => Some(KeyCode::AltLeft),
-        "CTRL" | "CONTROL" => Some(KeyCode::ControlLeft),
-        "SHIFT" => Some(KeyCode::ShiftLeft),
+        "ALT" | "LALT" | "LEFTALT" => Some(KeyCode::AltLeft),
+        "RALT" | "RIGHTALT" => Some(KeyCode::AltRight),
+        "CTRL" | "CONTROL" | "LCTRL" | "LCONTROL" | "LEFTCTRL" | "LEFTCONTROL" => Some(KeyCode::ControlLeft),
+        "RCTRL" | "RCONTROL" | "RIGHTCTRL" | "RIGHTCONTROL" => Some(KeyCode::ControlRight),
+        "SHIFT" | "LSHIFT" | "LEFTSHIFT" => Some(KeyCode::ShiftLeft),
+        "RSHIFT" | "RIGHTSHIFT" => Some(KeyCode::ShiftRight),
         "INS" | "INSERT" => Some(KeyCode::Insert),
         "DEL" | "DELETE" => Some(KeyCode::Delete),
         "PGUP" | "PAGEUP" => Some(KeyCode::PageUp),
@@ -608,9 +748,9 @@ pub fn key_name(key: BindKey) -> String {
             KeyCode::Escape => "ESCAPE".into(), KeyCode::Backspace => "BACKSPACE".into(),
             KeyCode::ArrowUp => "UPARROW".into(), KeyCode::ArrowDown => "DOWNARROW".into(),
             KeyCode::ArrowLeft => "LEFTARROW".into(), KeyCode::ArrowRight => "RIGHTARROW".into(),
-            KeyCode::AltLeft | KeyCode::AltRight => "ALT".into(),
-            KeyCode::ControlLeft | KeyCode::ControlRight => "CTRL".into(),
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => "SHIFT".into(),
+            KeyCode::AltLeft => "ALT".into(), KeyCode::AltRight => "RALT".into(),
+            KeyCode::ControlLeft => "CTRL".into(), KeyCode::ControlRight => "RCTRL".into(),
+            KeyCode::ShiftLeft => "SHIFT".into(), KeyCode::ShiftRight => "RSHIFT".into(),
             KeyCode::Insert => "INS".into(), KeyCode::Delete => "DEL".into(), KeyCode::PageUp => "PGUP".into(),
             KeyCode::PageDown => "PGDN".into(), KeyCode::Home => "HOME".into(), KeyCode::End => "END".into(),
             KeyCode::Pause => "PAUSE".into(), KeyCode::Semicolon => "SEMICOLON".into(), KeyCode::Quote => "APOSTROPHE".into(),
@@ -721,6 +861,43 @@ mod tests {
     }
 
     #[test]
+    fn left_and_right_modifiers_bind_independently_and_cfg_round_trip() {
+        let cases = [
+            (KeyCode::AltLeft, "ALT", "LALT", "+altattack"),
+            (KeyCode::AltRight, "RALT", "RIGHTALT", "+use"),
+            (KeyCode::ControlLeft, "CTRL", "LCTRL", "+attack"),
+            (KeyCode::ControlRight, "RCTRL", "RIGHTCTRL", "+force_grip"),
+            (KeyCode::ShiftLeft, "SHIFT", "LSHIFT", "+speed"),
+            (KeyCode::ShiftRight, "RSHIFT", "RIGHTSHIFT", "+force_drain"),
+        ];
+        let mut bindings = Bindings::default();
+        for (code, name, alias, command) in cases {
+            let key = BindKey::Keyboard(code);
+            assert_eq!(bind_key_for_code(code), key);
+            assert_eq!(parse_key(name), Some(key));
+            assert_eq!(parse_key(alias), Some(key));
+            assert_eq!(key_name(key), name);
+            bindings.set(key, command);
+        }
+        assert_ne!(bind_key_for_code(KeyCode::AltLeft), bind_key_for_code(KeyCode::AltRight));
+        assert_ne!(bind_key_for_code(KeyCode::ControlLeft), bind_key_for_code(KeyCode::ControlRight));
+        assert_ne!(bind_key_for_code(KeyCode::ShiftLeft), bind_key_for_code(KeyCode::ShiftRight));
+
+        // A normal config, including old ALT/CTRL/SHIFT binds, remains compatible.
+        let mut cfg = String::new();
+        bindings.write_cfg(&mut cfg);
+        let mut restored = Bindings::default();
+        assert!(apply_cfg(&mut restored, &cfg));
+        for (code, name, _, command) in cases {
+            assert!(cfg.contains(&format!("bind {name} \"{command}\"")));
+            assert_eq!(restored.get(BindKey::Keyboard(code)), Some(command));
+        }
+        // Rebinding one side does not alter the other side.
+        restored.unbind(BindKey::Keyboard(KeyCode::ControlRight));
+        assert_eq!(restored.get(BindKey::Keyboard(KeyCode::ControlLeft)), Some("+attack"));
+    }
+
+    #[test]
     fn spectator_bindings_override_and_fall_back() {
         let bindings = Bindings::default();
         assert_eq!(bindings.get(BindKey::Mouse(3)), Some("saberAttackCycle"));
@@ -737,6 +914,39 @@ mod tests {
         bindings.write_cfg(&mut text);
         assert!(text.contains("unbindspecall"));
         assert!(text.contains("bindspec MOUSE3 \"toggle cg_thirdPerson 0 1 2\""));
+    }
+
+    #[test]
+    fn demo_controls_inherit_live_normal_and_spectator_binds() {
+        let mut bindings = Bindings::default();
+        assert!(bindings.display_for_demo_command("demo_pause").contains("Inherit Normal (+speed)"));
+        assert!(bindings.display_for_demo_command("demo_camera").contains("Inherit Spectate (toggle cg_thirdPerson 0 1 2)"));
+        assert!(bindings.display_for_spectator_inheritance("follownext").contains("Inherit Normal (+attack)"));
+        bindings.set(BindKey::Keyboard(KeyCode::KeyG), "+speed");
+        assert!(bindings.display_for_demo_command("demo_pause").contains("G"));
+        bindings.set_demo(BindKey::Keyboard(KeyCode::KeyF), "demo_pause");
+        assert!(bindings.demo_has_override("demo_pause"));
+        assert_eq!(bindings.display_for_demo_command("demo_pause"), "F");
+        bindings.unbind_demo_command("demo_pause");
+        assert!(!bindings.demo_has_override("demo_pause"));
+        assert!(bindings.display_for_demo_command("demo_pause").starts_with("Inherit Normal (+speed)"));
+    }
+
+    #[test]
+    fn demo_binding_cfg_round_trip_does_not_change_gameplay_binds() {
+        let mut bindings = Bindings::default();
+        bindings.set_demo(BindKey::Keyboard(KeyCode::KeyF), "demo_pause");
+        bindings.set_demo(BindKey::Mouse(4), "demo_previous");
+        let mut text = String::new();
+        bindings.write_cfg(&mut text);
+        assert!(text.contains("unbinddemoall"));
+        assert!(text.contains("binddemo F \"demo_pause\""));
+        let mut loaded = Bindings::default();
+        assert!(apply_cfg(&mut loaded, &text));
+        assert_eq!(loaded.get_demo(BindKey::Keyboard(KeyCode::KeyF)), Some("demo_pause"));
+        assert_eq!(loaded.get_demo(BindKey::Mouse(4)), Some("demo_previous"));
+        assert_eq!(loaded.get(BindKey::Keyboard(KeyCode::KeyF)), Some("+useforce"));
+        assert_eq!(loaded.get(BindKey::Mouse(2)), Some("+altattack"));
     }
 
     #[test]
@@ -757,5 +967,10 @@ mod tests {
         assert!(is_spectator_selection(spectator));
         assert!(!is_japro_selection(spectator));
         assert_eq!(control_action(spectator).map(|action| action.command), Some("follownext"));
+
+        let demo = demo_selection(0);
+        assert!(is_demo_selection(demo));
+        assert!(!is_spectator_selection(demo));
+        assert_eq!(control_action(demo).map(|action| action.command), Some("demo_pause"));
     }
 }

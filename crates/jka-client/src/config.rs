@@ -134,6 +134,10 @@ pub struct ClientPresentationSettings {
     /// Public race archive root; `/index/...` is derived from this value.
     pub race_ghost_demo_base_url: String,
     pub console_timestamps: bool,
+    /// Optional floating Source/HL2-style console; the original is unchanged when false.
+    pub console_hl2: bool,
+    /// Floating window coordinates and dimensions, in egui points.
+    pub console_hl2_rect: [f32; 4],
     /// TaystJK con_scale: archived console character scale (0.2..10).
     pub console_scale: f32,
     /// TaystJK con_notifylines: recent console rows considered by Con_DrawNotify.
@@ -175,7 +179,7 @@ pub struct ClientPresentationSettings {
     pub japro: crate::japro_cg::JaproCgame,
     /// TaystJK-compatible server-browser masters (`sv_master1`..`sv_master5`).
     pub master_servers: [String; crate::server_browser::MAX_MASTER_SLOTS],
-    /// `cl_serverFilters`: server-browser hide flags, max ping and mod filter.
+    /// `cl_serverFilters`: server-browser hide flags, max ping, mod and gametype filters.
     pub server_filters: String,
 }
 
@@ -406,6 +410,8 @@ impl Default for ClientPresentationSettings {
             race_ghost_distance_delta: false,
             race_ghost_demo_base_url: "http://s.playja.pro/races".to_owned(),
             console_timestamps: true,
+            console_hl2: false,
+            console_hl2_rect: [160.0, 100.0, 840.0, 530.0],
             console_scale: 1.0,
             console_notify_lines: 3,
             console_notify_words: "0".to_owned(),
@@ -427,7 +433,7 @@ impl Default for ClientPresentationSettings {
             network: crate::net::NetworkSettings::default(),
             japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
-            server_filters: String::new(),
+            server_filters: crate::server_browser::DEFAULT_SERVER_FILTERS.to_owned(),
         }
     }
 }
@@ -726,8 +732,12 @@ pub(crate) fn verbose_config_from_snapshot(snapshot: &str) -> String {
             [verb, _, command, ..] if verb.eq_ignore_ascii_case("bindspec") => {
                 Some(bind_config_help(command, true))
             }
+            [verb, _, command, ..] if verb.eq_ignore_ascii_case("binddemo") => {
+                Some(format!("demo override: {command}"))
+            }
             [verb] if verb.eq_ignore_ascii_case("unbindall") => Some("Clear normal bindings first".to_owned()),
             [verb] if verb.eq_ignore_ascii_case("unbindspecall") => Some("Clear spectator overrides first".to_owned()),
+            [verb] if verb.eq_ignore_ascii_case("unbinddemoall") => Some("Clear demo overrides first".to_owned()),
             _ => None,
         };
         if let Some(note) = note.filter(|note| !note.is_empty()) {
@@ -2024,10 +2034,15 @@ mod tests {
         settings.river_settings.water.refraction=1.4;
         settings.river_settings.wave_amount=2.5;
         settings.river_settings.foam.gain=0.5;
+        settings.river_settings.foam_minimum_depth=1.25;
+        settings.river_settings.underwater_color=[0.1,0.3,0.5];
+        settings.river_settings.underwater_visibility=120.0;
+        settings.river_settings.underwater_darkening=640.0;
         save_video_settings(&path,settings,&crate::keybinds::Bindings::default(),&ClientPresentationSettings::default(),&AudioSettings::default()).unwrap();
         let loaded=load_video_settings(&path);
         std::fs::remove_file(path).unwrap();
         assert_eq!(loaded.river_settings.uniform(),settings.river_settings.uniform());
+        assert_eq!(loaded.river_settings.foam_minimum_depth,settings.river_settings.foam_minimum_depth);
     }
 
 }

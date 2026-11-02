@@ -17,7 +17,8 @@ pub(in crate::ui) fn build_game_timer(out: &mut Vec<UiVertex>, ui: &UiSnapshot, 
     // exposed: cg_drawTimer is just the classic M:SS readout here.
     let scale = 1.55;
     let glyph_w = 6.0 * scale;
-    let x = (w as f32 - 12.0 - label.chars().count() as f32 * glyph_w).max(12.0);
+    // Stable origin for the classic M:SS / MM:SS game timer.
+    let x = (w as f32 - 12.0 - 6.0 * glyph_w).max(12.0);
     let y = if ui.video.draw_fps == 1 { 34.0 } else { 12.0 };
     text(
         out,
@@ -45,8 +46,10 @@ pub(in crate::ui) fn build_hud_score(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w
     let glyph_w = 6.0 * scale;
     let right = stock.x + stock.width;
     let bottom = stock.y + stock.height;
+    // A fixed, left-aligned column inside the right-hand HUD score area.
+    // Old right-alignment shifted "Score: 9" when it became "Score: 10".
+    let x = (right - 16.0 * glyph_w).max(0.0);
     for (row, line) in score.lines.iter().enumerate() {
-        let x = (right - crate::ui::visible_jka_chars(line) as f32 * glyph_w).max(0.0);
         let y = bottom - (score.lines.len() - row) as f32 * 14.0 * sy;
         fixed_charset_text(out, line, x + sy, y + sy, glyph_w, 8.0 * scale,
             glyph_w, [0.0, 0.0, 0.0, 0.72], false, w, h);

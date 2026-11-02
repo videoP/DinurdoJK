@@ -34,7 +34,7 @@ pub fn build_vertices(
         // Keep the console usable during background map preparation/upload.
         // It is intentionally layered over the loading screen rather than
         // replacing it, so load progress remains visible behind the console.
-        if ui.mode == OverlayMode::Console {
+        if ui.mode == OverlayMode::Console && !ui.console_hl2 {
             build_console(&mut out, ui, width, height);
         }
         return out;
@@ -55,7 +55,8 @@ pub fn build_vertices(
     }
     match ui.mode {
         OverlayMode::None | OverlayMode::Chat => {}
-        OverlayMode::Console => build_console(&mut out, ui, width, height),
+        OverlayMode::Console if !ui.console_hl2 => build_console(&mut out, ui, width, height),
+        OverlayMode::Console => {},
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
         OverlayMode::Video
         | OverlayMode::Game
@@ -121,7 +122,8 @@ pub fn build_dynamic_static_vertices(
     // cg_drawHud; movement helpers and other screen overlays are not.
     if ui.video.draw_hud {
         build_hud(out, ui, width, height);
-        build_extension_hud(out, &ui.extension_hud, &ui.extension_images, width, height);
+        build_extension_hud(out, &ui.extension_hud, &ui.extension_images,
+            &ui.extension_shader_flags, width, height);
     }
 }
 

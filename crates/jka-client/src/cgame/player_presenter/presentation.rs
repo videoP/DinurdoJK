@@ -877,6 +877,7 @@ impl PlayerPresenter {
                     emote_taunt: Default::default(),
                     player_angles: PlayerAngleState::reset_from_angles(entity.angles),
                     last_angle_time: current_time,
+                    spine_transition: Default::default(),
                     head_look_yaw: None,
                     swim_angles: [0.0; 2],
                     swim_bank_angle: 0.0,
@@ -954,6 +955,7 @@ impl PlayerPresenter {
             // CG_ResetPlayerEntity when interpolation is broken.  This resets
             // the lerp frames and the persistent torso/legs angle swing state.
             runtime.animation.reset_player_entity();
+            runtime.spine_transition = Default::default();
             runtime.emote_taunt = Default::default();
             // OpenJK CG_ResetPlayerEntity clears/reseeds cent->pe torso/legs
             // swing state, but preserves clientInfo corrTime/lookTime/
@@ -1148,6 +1150,24 @@ impl PlayerPresenter {
         // Force-grip handoff must instead sample the exact normal player pose on
         // its first frame, then Rapier freezes that skinning pose internally.
         let rapier_corpse = corpse_ragdoll_requested && self.ragdolls.active();
+        let anim_blend = super::animation_blend_enabled();
+        let swing_fix = if anim_blend { super::saber_swing_fix() } else { 0 };
+        let swing_eligible = model.humanoid && entity.entity_type == ET_PLAYER
+            && entity.state.field_i32("weapon") == Some(WP_SABER)
+            && entity.state.field_i32("forceFrame").unwrap_or(0) == 0
+            && entity.state.field_i32("m_iVehicleNum").unwrap_or(0) == 0
+            && !ragdoll_requested && local_emote.is_none()
+            && e_flags & EF_DEAD == 0;
+        let previous_anims = runtime.animation.client_animation_ids();
+        let next_anims = (entity.state.field_i32("legsAnim").unwrap_or(0),
+            entity.state.field_i32("torsoAnim").unwrap_or(0));
+        let swing_boundary = swing_eligible
+            && super::swing_transition::split_boundary(previous_anims, next_anims)
+            && (jka_assets::animation::is_saber_animation(previous_anims.1)
+                || jka_assets::animation::is_saber_animation(next_anims.1));
+        let swing_blend_ms = if jka_assets::animation::is_flipping_animation(previous_anims.1)
+            || jka_assets::animation::is_flipping_animation(next_anims.1) { 200 } else { 100 };
+        if !swing_eligible { runtime.spine_transition = Default::default(); }
         let (mut axis, torso_angles) = if rapier_corpse {
             runtime.last_angle_time = current_time;
             (angles_to_axis([0.0, entity.angles[1], 0.0]), [0.0; 3])
@@ -1238,7 +1258,7 @@ impl PlayerPresenter {
             };
             let angle_entity = player_angle_entity(entity);
             let angle_render_origin = ghoul2_render_origin(entity);
-            let angle_result = bg_g2_player_angles(
+            let mut angle_result = bg_g2_player_angles(
                 &angle_entity,
                 current_time,
                 angle_render_origin,
@@ -1251,6 +1271,8 @@ impl PlayerPresenter {
                 Some(&motion_matrix),
                 &mut runtime.player_angles,
             )?;
+            runtime.spine_transition.apply(&mut angle_result, current_time, swing_fix,
+                swing_eligible, swing_boundary, swing_blend_ms);
             runtime.last_angle_time = current_time;
             let torso_angles = [
                 runtime.player_angles.torso_pitch_angle,
@@ -1380,7 +1402,7 @@ impl PlayerPresenter {
             &self.saber_scales,
             current_time,
             // Never blend idle through the hidden native taunt's bone state.
-            emote_animation_state.is_none(),
+            anim_blend && emote_animation_state.is_none() && !(swing_fix == 1 && swing_boundary),
             model.humanoid,
         )?;
 

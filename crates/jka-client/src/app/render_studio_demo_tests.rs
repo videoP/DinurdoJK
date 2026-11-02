@@ -8,6 +8,318 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
 };
 
+fn studio_saber_fixture() -> (StudioDemoSource, StudioDemoClip, StudioCameraKey) {
+    let base = PathBuf::from(std::env::var_os("DJK_STUDIO_TEST_BASE").unwrap());
+    let project = PathBuf::from(std::env::var_os("DJK_STUDIO_TEST_PROJECT").unwrap());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&project).unwrap()).unwrap();
+    let clip: StudioDemoClip = serde_json::from_value(json["demos"][0].clone()).unwrap();
+    let key: StudioCameraKey = serde_json::from_value(json["camera"][0].clone()).unwrap();
+    let path = project.parent().unwrap().join(clip.source_path.as_ref().unwrap());
+    let bytes: Arc<[u8]> = Arc::from(std::fs::read(&path).unwrap());
+    let probe = super::super::probe_demo_gamestate(&bytes).unwrap();
+    let game_dir = jka_assets::pk3::resolve_fs_game_directory(&base, &probe.fs_game).unwrap();
+    let (catalog, classes, mut player, entities, fx_assets) =
+        App::build_cgame_cpu_assets(&base, game_dir.as_deref(), false, true).unwrap();
+    player.set_async_loading(false);
+    let index = Arc::new(super::super::build_demo_index(&bytes).unwrap());
+    let mut playback = GameSession::new_with_recording(
+        format!("demos/{}.dm_26", clip.name), path.display().to_string(), bytes,
+        Some(index), catalog, classes, player, entities,
+        crate::cgame::weapon_fx::WeaponFx::new(fx_assets), None,
+    );
+    playback.read_until_map().unwrap();
+    playback.set_audio_suppressed(true);
+    playback.seek_demo(Instant::now(), 0).unwrap();
+    let source = StudioDemoSource {
+        id: STUDIO_REQUEST_BIT, progress: Arc::new(Default::default()), clip_index: 0,
+        name: clip.name.clone(), game: clip.game.clone(), game_dir, playback,
+        prepared: None, race_map: None, race_map_job: None, race_map_runners: Vec::new(),
+        race_map_reference: usize::MAX, collision: None, gpu_ready: false, failed: false,
+        revision: 0, last_sample_ms: Some(0), last_viewed_client: None,
+        shader_remaps: Default::default(), race_start_server_ms: None,
+        last_presentation_server_ms: None, audio_capture: None, race_audio_state: None,
+        studio_speedometer: Default::default(), wallrun_camera_yaw: Default::default(),
+        wallrun_camera_mode: 0,
+    };
+    (source, clip, key)
+}
+
+#[test]
+#[ignore = "requires DJK_STUDIO_TEST_BASE and DJK_STUDIO_TEST_PROJECT with an active saber demo"]
+fn studio_demo_follow_submits_saber_after_seek_and_pause() {
+    let (mut source, clip, mut key) = studio_saber_fixture();
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Follow, client: -1 };
+    key.demo_follow.perspective = StudioFollowPerspective::ThirdPerson;
+    let video = crate::ui::VideoSettings::default();
+    for time in [0.0, 1.1, 1.5, 2.5, 1.1, 1.1] {
+        let frame = source.sample(&clip, time, key, None, key, &video,
+            Default::default(), Default::default(), &[], false, false, None, [1280, 720], false,
+            false, Instant::now()).unwrap();
+        let ps = source.playback.presented_player_state().unwrap();
+        assert_eq!(ps.field_i32("weapon"), Some(3), "fixture must wield a saber");
+        assert_eq!(ps.field_i32("saberHolstered"), Some(0));
+        assert!(!frame.cloud_foreground.is_empty(), "no saber blade at {time}s");
+        assert!(frame.dynamic_models.iter().any(|m| m.raster_visible && m.vertex_count() > 0),
+            "no geometry at {time}s");
+        println!("[STUDIO SABER] {time}s: {} blades, {} surfaces", frame.cloud_foreground.len(), frame.dynamic_models.len());
+    }
+}
+
+/// Diagnostic replay of an authored demo through the real CPU presentation path.
+/// FPS is timeline FPS, including the project's speed remapping. No renderer or
+/// project writes; DJK_SWING_PROBE_OUTPUT names the JSONL trace to inspect.
+#[test]
+#[ignore = "requires installed assets, DJK_STUDIO_TEST_BASE, DJK_STUDIO_TEST_PROJECT and DJK_SWING_PROBE_OUTPUT"]
+fn studio_saber_swing_probe() {
+    use std::io::Write;
+    let fix = std::env::var("DJK_SWING_PROBE_FIX").ok().map(|s| s.parse::<u8>().unwrap())
+        .unwrap_or_else(crate::cgame::player_presenter::saber_swing_fix);
+    assert!(fix <= 2);
+    crate::cgame::player_presenter::set_saber_swing_fix(fix);
+    let anim_blend = std::env::var("DJK_SWING_PROBE_ANIM_BLEND").is_ok_and(|s| s == "0").then_some(false).unwrap_or(true);
+    crate::cgame::player_presenter::set_animation_blend(anim_blend);
+    let (mut source, mut clip, mut key) = studio_saber_fixture();
+    let number = |name: &str, default: f64| std::env::var(name).ok()
+        .map(|v| v.parse::<f64>().unwrap()).unwrap_or(default);
+    let fps = number("DJK_SWING_PROBE_FPS", 144.0);
+    let start = number("DJK_SWING_PROBE_START", 16.0);
+    let end = number("DJK_SWING_PROBE_END", 21.0);
+    if std::env::var_os("DJK_SWING_PROBE_NORMAL_SPEED").is_some() { clip.speed_keys.clear(); }
+    if let Ok(smooth) = std::env::var("DJK_SWING_PROBE_SMOOTH") {
+        source.playback.player_presenter.set_ghoul2_anim_smooth(smooth.parse().unwrap());
+    }
+    assert!(fps.is_finite() && fps > 0.0 && end > start && start >= 0.0);
+    // Use the camera in the screenshot, independent of subsequent saved edits.
+    key.position = [-8722.68, -15788.03, 677.74];
+    key.yaw = 230.1; key.pitch = 55.14;
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Free, client: -1 };
+    key.demo_follow.aim_enabled = false;
+    key.focus_target = None;
+    let path = PathBuf::from(std::env::var_os("DJK_SWING_PROBE_OUTPUT").unwrap());
+    let mut output = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let video = crate::ui::VideoSettings::default();
+    let now = Instant::now();
+    let mut samples = 0;
+    // Replay from the start so transition/blend/angle histories are populated.
+    for tick in 0..=(end * fps).ceil() as u64 {
+        let time = tick as f64 / fps;
+        let frame = source.sample(&clip, time, key, None, key, &video,
+            Default::default(), Default::default(), &[], true, false, None,
+            [1600, 900], false, false, now).unwrap();
+        if time < start { continue; }
+        let debug = source.playback.player_presenter.viewer_anim_debug().expect("viewer must be posed");
+        let ps = source.playback.presented_player_state().unwrap();
+        let entity = ps.field_i32("clientNum").unwrap() as u16;
+        let state = crate::cgame::presented_player_state_entity(ps).unwrap();
+        let fields: serde_json::Map<String, serde_json::Value> = ["legsAnim", "torsoAnim", "legsFlip",
+            "torsoFlip", "saberMove", "saberHolstered", "forcePowersActive", "fireflag", "brokenLimbs"]
+            .into_iter().map(|name| (name.into(), serde_json::json!(state.state.field_i32(name)))).collect();
+        let blades: Vec<_> = frame.cloud_foreground.iter().map(|b|
+            serde_json::json!({"start": b.start, "end": b.end})).collect();
+        let row = serde_json::json!({"fix": fix, "anim_blend": anim_blend, "timeline": time, "source_ms": clip.source_time_ms(time),
+            "pose_ms": debug.pose_time, "legs_anim": debug.legs_anim, "torso_anim": debug.torso_anim,
+            "origin": debug.origin, "angles": debug.angles, "render_yaw": debug.render_yaw,
+            "bones": debug.bones, "hilt": debug.hilt_world[0], "blade_base": debug.blade_world[0][0],
+            "blades": blades, "state": fields,
+            "animation": source.playback.player_presenter.swing_probe_animation(entity, debug.pose_time)});
+        writeln!(output, "{row}").unwrap();
+        samples += 1;
+    }
+    output.flush().unwrap();
+    assert!(samples > 0);
+    println!("[SWING PROBE] {samples} samples, {fps} timeline FPS, {start}..{end}s");
+}
+
+/// Reconstruct a directional wind-up/attack with the real loaded model and
+/// player presenter. Synthetic input isolates the animation from mouse motion,
+/// locomotion and snapshot cadence; it is not labeled as a recorded demo.
+#[test]
+#[ignore = "requires installed assets and DJK_STUDIO_TEST_BASE, DJK_STUDIO_TEST_PROJECT, DJK_SWING_PROBE_OUTPUT"]
+fn studio_saber_direction_blend_probe() {
+    use std::io::Write;
+    use crate::cgame::player_presenter as player;
+    let fix = std::env::var("DJK_SWING_PROBE_FIX").ok().map(|s| s.parse::<u8>().unwrap())
+        .unwrap_or_else(player::saber_swing_fix);
+    let blend = !std::env::var("DJK_SWING_PROBE_ANIM_BLEND").is_ok_and(|s| s == "0");
+    player::set_saber_swing_fix(fix);
+    player::set_animation_blend(blend);
+    let direction = std::env::var("DJK_SWING_PROBE_DIRECTION").unwrap_or_else(|_| "D".into());
+    let (windup, attack) = match direction.as_str() {
+        // bg_saber.c: positive rightmove (D) selects LS_A_L2R.
+        "D" => ("BOTH_S3_S1__L", "BOTH_A3__L__R"),
+        "A" => ("BOTH_S3_S1__R", "BOTH_A3__R__L"),
+        _ => panic!("direction must be A or D"),
+    };
+    let id = |name| jka_assets::animation::animation_index(name).unwrap() as i32;
+    let gait = std::env::var("DJK_SWING_PROBE_GAIT").unwrap_or_else(|_| "walk".into());
+    let (gait_anim, speed) = match gait.as_str() {
+        "stand" => (851,0.0_f32),
+        "walk" => (id("BOTH_WALK2"),125.0),
+        "run" => (id("BOTH_RUN2"),250.0),
+        _ => panic!("gait must be stand, walk or run"),
+    };
+    let phase = std::env::var("DJK_SWING_PROBE_PHASE").ok()
+        .map(|s| s.parse::<i32>().unwrap()).unwrap_or(0);
+    assert!((0..=2000).contains(&phase));
+    let click_ms = 400 + phase;
+    let attack_ms = click_ms + 1000;
+    let (mut source, clip, mut key) = studio_saber_fixture();
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Free, client: -1 };
+    source.sample(&clip, 0.0, key, None, key, &Default::default(),
+        Default::default(), Default::default(), &[], false, false, None,
+        [1600,900], false, false, Instant::now()).unwrap();
+    let ps = source.playback.presented_player_state().unwrap();
+    let mut entity = crate::cgame::presented_player_state_entity(ps).unwrap();
+    entity.angles = [0.0;3];
+    let origin = entity.origin;
+    let mut info = source.playback.client_game.client_info(usize::from(entity.number),
+        &source.playback.siege_classes).unwrap();
+    // Match GameSession's playerState-owned body: the recording retains
+    // spectator userinfo even though the playerState is actively wielding.
+    info.team = ps.persistant[3];
+    let presenter = &mut source.playback.player_presenter;
+    presenter.reset_for_seek();
+    presenter.set_ghoul2_anim_smooth(std::env::var("DJK_SWING_PROBE_SMOOTH").ok()
+        .map(|s| s.parse().unwrap()).unwrap_or(0.0));
+    presenter.studio_capture_demo_bones(&[(i32::from(entity.number), player::SABER_TIP_ANCHOR)]);
+    let mut output = std::io::BufWriter::new(std::fs::File::create(
+        std::env::var_os("DJK_SWING_PROBE_OUTPUT").unwrap()).unwrap());
+    let set = |entity: &mut crate::cgame::PresentedEntity, name: &str, value: i32| {
+        let index = jka_protocol::gamestate::ENTITY_FIELDS.iter().position(|(n,_)| *n == name).unwrap();
+        entity.state.fields[index] = value as u32;
+    };
+    let side = if direction == "D" { -1.0 } else { 1.0 };
+    set(&mut entity,"angles2[1]",(if direction == "D" {6.0_f32} else {2.0_f32}).to_bits() as i32);
+    set(&mut entity,"pos.trDelta[0]",0);
+    set(&mut entity,"pos.trDelta[1]",(side*speed).to_bits() as i32);
+    set(&mut entity,"pos.trDelta[2]",0);
+    // Hold D/A before clicking, then enter the wind-up. Different click phases
+    // sample different locomotion frames. Capture BOTH the click and attack
+    // boundaries so an opening hitch cannot be confused with the later slash.
+    for elapsed in (0..click_ms-50).step_by(5).chain(click_ms-50..=attack_ms+200) {
+        // PM_SetSaberMove(LS_READY) uses the active WALK2/RUN2 torso as well
+        // as the legs while moving with an ignited single saber.
+        let (legs, torso, saber_move) = if elapsed < click_ms { (gait_anim,gait_anim,1) }
+            else if elapsed < attack_ms { (gait_anim,id(windup),if direction=="D" {63}else{66}) }
+            else { (if speed>0.0 {gait_anim}else{id(attack)},id(attack),if direction=="D" {5}else{8}) };
+        set(&mut entity,"legsAnim",legs); set(&mut entity,"torsoAnim",torso);
+        set(&mut entity,"saberMove",saber_move);
+        entity.origin = [origin[0],origin[1]+side*speed*elapsed as f32/1000.0,origin[2]];
+        let time = 100_000 + elapsed;
+        let before = (elapsed == click_ms).then(|| presenter.swing_probe_animation(entity.number,time));
+        presenter.present_player_entity(&entity, &info, time, 1.0, None,
+            elapsed == 0, true, false, None, true).unwrap();
+        if elapsed < click_ms-50 { continue; }
+        let debug = presenter.viewer_anim_debug().unwrap();
+        let (start, end) = presenter.studio_demo_blade(i32::from(entity.number)).unwrap();
+        let row = serde_json::json!({"synthetic": true, "direction": direction, "gait": gait,
+            "phase_ms": phase, "click_ms": click_ms, "attack_ms": attack_ms, "fix": fix,
+            "anim_blend": blend, "windup": windup, "attack": attack,
+            "timeline": f64::from(elapsed)/1000.0, "source_ms": elapsed, "pose_ms": time,
+            "legs_anim": debug.legs_anim, "torso_anim": debug.torso_anim,
+            "origin": debug.origin, "angles": debug.angles, "render_yaw": debug.render_yaw,
+            "state": {"legsAnim": legs,"torsoAnim": torso,"saberMove": saber_move},
+            "animation_before": before,
+            "bones": debug.bones, "blades": [{"start": start,"end": end}],
+            "animation": presenter.swing_probe_animation(entity.number, time)});
+        writeln!(output,"{row}").unwrap();
+    }
+    output.flush().unwrap();
+    println!("[DIRECTION PROBE] {direction}, {gait}, phase={phase}, blend={blend}, fix={fix}");
+}
+
+#[test]
+#[ignore = "requires DJK_STUDIO_TEST_BASE and DJK_STUDIO_TEST_PROJECT with racepack9 assets"]
+fn studio_fixed_camera_edits_render_outside_recorded_pvs() {
+    let (mut source, clip, mut key) = studio_saber_fixture();
+    let base = PathBuf::from(std::env::var_os("DJK_STUDIO_TEST_BASE").unwrap());
+    let map_name = source.playback.map_name.clone().unwrap();
+    let options = scene::MapPrepareOptions { grass: false, voxel_probe_gi: false,
+        ocean: false, planar_reflections: false, planar_environment: false,
+        pbr_materials: false, ..Default::default() };
+    let map = scene::prepare_with_options(&base, source.game_dir.as_deref(), &map_name, options).unwrap();
+    source.prepared = Some(super::super::PreparedMapCache {
+        label: map_name, prepare_options: options, map: Arc::new(map),
+    });
+    let sample = source.playback.seek_demo(Instant::now(), 0).unwrap();
+    assert!(!source.visible_from_recorded(sample, [36.0, -21.0, 0.0]),
+        "fixture must exercise the camera fallback that ignored free-camera edits");
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Free, client: -1 };
+    key.demo_follow.aim_enabled = false;
+    key.focus_target = None;
+    for (position, yaw, pitch) in [([36.0, -21.0, 0.0], 185.0, -17.0),
+        ([136.0, 79.0, -100.0], 90.0, 24.0)] {
+        key.position = scene::jka_position(position); key.yaw = yaw; key.pitch = -pitch; key.fov = 86.0;
+        let frame = source.sample(&clip, 0.0, key, None, key, &Default::default(),
+            Default::default(), Default::default(), &[], false, false, None,
+            [1280, 720], false, false, Instant::now()).unwrap();
+        assert_eq!(frame.camera.position.to_array(), position);
+        assert!((frame.camera.yaw.to_degrees()-yaw).abs()<0.0001);
+        assert!((frame.camera.pitch.to_degrees()-pitch).abs()<0.0001);
+        assert!((frame.camera.cg_fov()-86.0).abs()<0.0001);
+        assert!(frame.area_mask.is_none());
+        assert_eq!(source.playback.studio_presentation_view.unwrap().camera_position(), position);
+        println!("[STUDIO FIXED CAMERA] output position={position:?} yaw={yaw} pitch={pitch}");
+    }
+}
+
+#[test]
+#[ignore = "requires DJK_STUDIO_TEST_BASE and DJK_STUDIO_TEST_PROJECT with a talking saber player"]
+fn studio_scene_observer_faces_chat_icon_in_all_fx_modes() {
+    let (mut source, clip, mut key) = studio_saber_fixture();
+    // Scene view must show the actor even when the authored shot is first person.
+    key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Follow, client: 0 };
+    key.demo_follow.perspective = StudioFollowPerspective::FirstPerson;
+    let ps = source.playback.presented_player_state().unwrap();
+    assert_ne!(ps.field_i32("eFlags").unwrap_or(0) & (1 << 13), 0, "fixture must show chat icon at 0s");
+    let target = glam::Vec3::from_array(scene::render_position(
+        super::super::playerstate_vec3(ps, "origin").unwrap())) + glam::Vec3::Y * 32.0;
+    for mode in [crate::ui::FxGeometryMode::Cpu, crate::ui::FxGeometryMode::CpuWorkers, crate::ui::FxGeometryMode::Gpu] {
+        let video = crate::ui::VideoSettings { fx_geometry: mode, ..Default::default() };
+        for offset in [glam::Vec3::new(160.0, 50.0, 0.0), glam::Vec3::new(0.0, 50.0, 160.0)] {
+            let direction = -offset.normalize();
+            let observer = StudioCameraKey {
+                position: scene::jka_position((target + offset).to_array()),
+                yaw: (-direction.z).atan2(direction.x).to_degrees(),
+                pitch: -direction.y.asin().to_degrees(),
+                ..Default::default()
+            };
+            let frame = source.sample(&clip, 0.0, key, None, key, &video,
+                Default::default(), Default::default(), &[], false, false, Some(observer),
+                [1280, 720], false, false, Instant::now()).unwrap();
+            assert_eq!(frame.camera.position.to_array(), scene::render_position(observer.position));
+            assert_ne!(frame.shot_camera.position, frame.camera.position);
+            assert!(frame.area_mask.is_none(), "recorded area mask cannot cull the observer view");
+            assert_eq!(source.playback.studio_presentation_view.unwrap().camera_position(), scene::render_position(observer.position));
+            assert!(source.playback.demo_hidden_view_client.is_none());
+            assert!(frame.dynamic_models.iter().any(|m| m.entity_num == 0 && m.raster_visible && m.vertex_count() > 0),
+                "Scene view must show the first-person shot's actor");
+            let icons: Vec<_> = frame.dynamic_models.iter().filter(|m|
+                m.texture.as_ref().is_some_and(|t| t.label.contains("chat_icon"))).collect();
+            assert!(!icons.is_empty(), "chat sprite missing in {mode:?}");
+            for icon in icons {
+                let normal = if let Some(gpu) = &icon.fx_gpu_sprites {
+                    let instance = &gpu.instances[0];
+                    glam::Vec3::from_slice(&instance.left[..3]).cross(glam::Vec3::from_slice(&instance.up[..3]))
+                } else {
+                    let points: Vec<_> = icon.indices[..3].iter().map(|&i|
+                        glam::Vec3::from_array(icon.vertices[i as usize].position)).collect();
+                    (points[1] - points[0]).cross(points[2] - points[0])
+                }.normalize();
+                assert!(normal.dot(frame.camera.forward()).abs() > 0.999,
+                    "{mode:?} chat icon still faces the old shot camera: {normal:?}");
+            }
+            println!("[STUDIO SCENE] {mode:?} chat faces observer at {:?}", observer.position);
+        }
+    }
+    // Leaving Scene view must restore the authored first-person presentation.
+    source.sample(&clip, 0.0, key, None, key, &Default::default(),
+        Default::default(), Default::default(), &[], false, false, None,
+        [1280, 720], false, false, Instant::now()).unwrap();
+    assert!(source.playback.studio_presentation_view.is_none());
+    assert_eq!(source.playback.demo_hidden_view_client, Some(0));
+}
+
 #[test]
 #[ignore = "requires DJK_STUDIO_TEST_BASE, timeline_project1 assets, GPU; run alone with DJK_HEADLESS=1"]
 fn studio_project_isolated_transition_and_gameplay_handoff() {
@@ -228,7 +540,7 @@ impl ApplicationHandler<UserEvent> for StudioRun {
             for sample in std::iter::once(&frame.outgoing).chain(frame.incoming.as_ref()) {
                 if std::env::var_os("DJK_STUDIO_TEST_TARGET").is_some() && self.step>0 && self.step_at.elapsed()>Duration::from_millis(100) {
                     let target=self.app.render_studio.timeline.effective_demo_camera_at(self.app.render_studio.timeline_time()).focus_target.unwrap();
-                    let delta=glam::Vec3::from_array(target)-sample.shot_camera.position;
+                    let delta=glam::Vec3::from_array(scene::render_position(target))-sample.shot_camera.position;
                     assert!((sample.lens.focus_distance-delta.length().clamp(1.0,65536.0)).abs()<0.01,"focus must use the actual resolved shot position");
                     if delta.length_squared()>1.0 {assert!(sample.shot_camera.forward().dot(delta.normalize())>0.999,"camera must aim at its focus handle");}
                 }
@@ -264,7 +576,7 @@ impl ApplicationHandler<UserEvent> for StudioRun {
                     .collect();
                 if std::env::var_os("DJK_STUDIO_TEST_TARGET").is_some() {
                     let camera=self.app.render_studio.scene_frame.as_ref().unwrap().outgoing.shot_camera;
-                    let point=(camera.position+camera.forward()*96.0).to_array();
+                    let point=scene::jka_position((camera.position+camera.forward()*96.0).to_array());
                     for key in &mut self.app.render_studio.timeline.camera {key.focus_target=Some(point);}
                     for shot in &mut self.app.render_studio.timeline.director_shots {shot.focus_target=Some(point);}
                 }

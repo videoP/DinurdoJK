@@ -9,6 +9,7 @@ struct RiverFoamField {
     grid:vec4<f32>,            // FoamDx, FoamGrid UnitToUV xy, unused
     sim:vec4<f32>,             // User.SimRes xy, Emitter.dx, unused
     frame:vec4<f32>,           // Engine.DeltaTime, Engine.Time, unused, unused
+    emission:vec4<f32>,        // authored depth start/full (cm); defaults 150/500
 }
 @group(0) @binding(0) var<uniform> foam:RiverFoamField;
 @group(0) @binding(1) var water:texture_2d_array<f32>; // height, depth, vx, vy (R32f layers)
@@ -49,7 +50,13 @@ fn river_foam_emit(unit:vec2<f32>)->f32 {
     let curvature=abs(((1.0-dot(n,right))+(1.0-dot(n,up)))*0.5);
     let speed=length(velocity);
     let strongest=max(river_foam_criterion(curl,1.0,3.0,1.0),river_foam_criterion(curvature,0.002,0.05,5.0));
-    let amount=1.0*strongest*river_foam_criterion(depth,150.0,500.0,1.0)*river_foam_criterion(speed,50.0,200.0,1.0);
+    // Zero minimum explicitly disables this gate; equal-edge smoothstep is
+    // undefined in WGSL. Positive wet depth was already checked above.
+    var depth_gate=1.0;
+    if foam.emission.y>foam.emission.x {
+        depth_gate=river_foam_criterion(depth,foam.emission.x,foam.emission.y,1.0);
+    }
+    let amount=1.0*strongest*depth_gate*river_foam_criterion(speed,50.0,200.0,1.0);
     return clamp(amount,0.0,1.0);
 }
 

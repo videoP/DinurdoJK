@@ -356,7 +356,9 @@ impl GameSession {
         } else {
             rendering_third_person(third_person, first_person_lightsaber, sample.policy)
         };
-        let ghoul2_view = if sample.teleported {
+        let ghoul2_view = if let Some(view) = self.studio_presentation_view {
+            Some(view)
+        } else if sample.teleported {
             None
         } else if !sample_third_person {
             ghoul2_view.map(|view| {
@@ -371,7 +373,8 @@ impl GameSession {
         };
         self.entity_presenter.update_md3_lod_view(ghoul2_view);
         self.entity_presenter.update_entity_area_mask(
-            self.current_snapshot.as_ref().map(|snapshot| snapshot.area_mask),
+            if self.studio_presentation_view.is_some() { None }
+            else { self.current_snapshot.as_ref().map(|snapshot| snapshot.area_mask) },
         );
         let audio_started = Instant::now();
         if !self.suppress_audio {
@@ -864,10 +867,15 @@ impl GameSession {
                 .field_i32("clientNum")
                 .unwrap_or(sample.client_num);
             if client_num >= 0 {
-                if let Some(info) = self
+                if let Some(mut info) = self
                     .client_game
                     .client_info(client_num as usize, &self.siege_classes)
                 {
+                    // The synthesized player is owned by playerState. A demo can
+                    // retain spectator userinfo while recording an active player
+                    // (jaPRO racepack9 does this). Using that stale team here
+                    // prevents CG_Player from attaching the recorded weapon.
+                    info.team = sample.policy.team;
                     let look_target_origin =
                         if entity.state.field_i32("hasLookTarget").unwrap_or(0) != 0 {
                             let look_target = entity.state.field_i32("lookTarget").unwrap_or(-1);
@@ -1086,7 +1094,8 @@ impl GameSession {
             fx_cpu_stage = Instant::now();
         }
         let mut fx_frame = self.weapon_fx.end_frame();
-        let fx_end_frame_draws = if fx_cpu_trace { fx_frame.draws.len() } else { 0 };
+        let shared_fx_count = fx_frame.shared_draws.as_ref().map_or(0, |draws| draws.len());
+        let fx_end_frame_draws = if fx_cpu_trace { shared_fx_count + fx_frame.draws.len() } else { 0 };
         if fx_cpu_trace {
             fx_cpu_times[2] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
             fx_cpu_times[6..9].copy_from_slice(&self.weapon_fx.end_frame_cpu_ms());
@@ -1126,7 +1135,7 @@ impl GameSession {
             }
         }
         let fx_extras_draws = if fx_cpu_trace {
-            fx_frame.draws.len().saturating_sub(fx_end_frame_draws)
+            (shared_fx_count + fx_frame.draws.len()).saturating_sub(fx_end_frame_draws)
         } else { 0 };
         if fx_cpu_trace {
             fx_cpu_times[3] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
@@ -1166,8 +1175,9 @@ impl GameSession {
         if crate::fx::diagnostics::enabled() {
             use crate::fx::diagnostics as diag;
             diag::set(diag::PROMOTION_LEVEL, self.promote_fx_lights as u64);
-            diag::add(diag::FX_DRAW_TOTAL, fx_frame.draws.len() as u64);
-            diag::add(diag::FX_DRAW_LINES, fx_frame.draws.iter()
+            diag::add(diag::FX_DRAW_TOTAL, (shared_fx_count + fx_frame.draws.len()) as u64);
+            diag::add(diag::FX_DRAW_LINES, fx_frame.shared_draws.iter().flat_map(|draws| draws.iter())
+                .chain(fx_frame.draws.iter())
                 .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Line { .. })).count() as u64);
             diag::report_if_due();
         }
@@ -1176,6 +1186,8 @@ impl GameSession {
             // audio/camera shakes and persistent marks while suppressing ALL
             // output that reaches the renderer, including FX-derived lighting.
             fx_frame.draws.clear();
+            fx_frame.shared_draws = None;
+            fx_frame.draw_overrides.clear();
             fx_frame.blades.clear();
             fx_frame.lights.clear();
             fx_frame.auto_light_candidates.clear();
@@ -1187,15 +1199,20 @@ impl GameSession {
             fx_cpu_times[4] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;
             fx_cpu_stage = Instant::now();
         }
-        let fx_draw_count = fx_frame.draws.len();
+        let fx_draw_count = fx_frame.shared_draws.as_ref().map_or(0, |draws| draws.len()) + fx_frame.draws.len();
         let fx_light_count = fx_frame.lights.len();
         let fx_mesh_count = if fx_cpu_trace {
-            fx_frame.draws.iter().filter(|draw| matches!(draw, crate::fx::system::FxDraw::Mesh { .. })).count()
+            fx_frame.shared_draws.iter().flat_map(|draws| draws.iter())
+                .chain(fx_frame.draws.iter())
+                .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Mesh { .. })).count()
         } else { 0 };
         self.gpu_commands = fx_frame.gpu_sparks.take();
         self.gpu_draw_indices = std::mem::take(&mut fx_frame.gpu_sprite_draw_indices);
         self.fx_runner_draws = fx_frame.runner_draws;
-        self.fx_draws = fx_frame.draws;
+        self.fx_draws = crate::fx::system::FxDrawStream::from_parts(
+            fx_frame.shared_draws.take(), std::mem::take(&mut fx_frame.draw_overrides),
+            std::mem::take(&mut fx_frame.draws),
+        );
         // At very high frame rates an idle map was allocating/dropping two
         // Arc<Vec<..>> headers on every client frame even with no saber blades
         // or FX lights. Existing snapshots may still own the prior Arc; keep

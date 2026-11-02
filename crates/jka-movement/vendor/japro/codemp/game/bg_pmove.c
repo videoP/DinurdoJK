@@ -1145,6 +1145,8 @@ void PM_ClipVelocity( vec3_t in, vec3_t normal, vec3_t out, float overbounce ) {
 	float	change;
 	float	oldInZ;
 	int		i;
+	vec3_t jka_before;
+	if (jka_jump_trace_enabled) VectorCopy(in, jka_before);
 
 	//pass in entitynum of hit entity?
 	//dotproduct instead of clipvelocity to the normal?
@@ -1177,6 +1179,7 @@ void PM_ClipVelocity( vec3_t in, vec3_t normal, vec3_t out, float overbounce ) {
 			out[2] = oldInZ;
 		}
 	}
+	JKA_JUMP_TRACE(2, jka_before, out, normal, 0, -1, -1, overbounce);
 }
 
 
@@ -3699,9 +3702,13 @@ static qboolean PM_CheckJump( void )
 						pm->ps->velocity[2] += pm->ps->stats[STAT_LASTJUMPSPEED];
 					}
 					else {
+						vec3_t jka_jump_before;
+						if (jka_jump_trace_enabled) VectorCopy(pm->ps->velocity, jka_jump_before);
 						pm->ps->velocity[2] = (forceJumpHeight[pm->ps->fd.forcePowerLevel[FP_LEVITATION]]-curHeight)/forceJumpHeight[pm->ps->fd.forcePowerLevel[FP_LEVITATION]]*forceJumpStrength[pm->ps->fd.forcePowerLevel[FP_LEVITATION]];//JUMP_VELOCITY;
 						pm->ps->velocity[2] /= 10;
 						pm->ps->velocity[2] += JUMP_VELOCITY;
+						JKA_JUMP_TRACE(1, jka_jump_before, pm->ps->velocity, vec3_origin, 0, -1, -1, 0);
+						if (jka_force_jump_slope_enabled) pml.forceJumpSlopeTarget = pm->ps->velocity[2];
 					}
 					pm->ps->pm_flags |= PMF_JUMP_HELD;
 				}
@@ -15517,7 +15524,12 @@ void PmoveSingle (pmove_t *pmove) {
 	//Wallbug fix end
 
 	if (pm->ps->persistant[PERS_TEAM] == TEAM_SPECTATOR) {
+		{
+		vec3_t jka_snap_before;
+		if (jka_jump_trace_enabled) VectorCopy(pm->ps->velocity, jka_snap_before);
 		trap->SnapVector( pm->ps->velocity );
+		JKA_JUMP_TRACE(6, jka_snap_before, pm->ps->velocity, vec3_origin, 0, -1, -1, 0);
+		}
 	}
 	else {
 		if ((IsRacemode(pm->ps) && (pm->ps->stats[STAT_MOVEMENTSTYLE] != MV_OCPM)) || (!IsRacemode(pm->ps) && (pm->pmove_float > 1))) {//japro fix racemode fps
@@ -15539,9 +15551,16 @@ void PmoveSingle (pmove_t *pmove) {
 			}
 			else
 			*/
-			trap->SnapVector( pm->ps->velocity ); // snap velocity to integer coordinates to save network bandwidth
+			{
+		vec3_t jka_snap_before;
+		if (jka_jump_trace_enabled) VectorCopy(pm->ps->velocity, jka_snap_before);
+		trap->SnapVector( pm->ps->velocity );
+		JKA_JUMP_TRACE(6, jka_snap_before, pm->ps->velocity, vec3_origin, 0, -1, -1, 0);
+		} // snap velocity to integer coordinates to save network bandwidth
 		}
 	}
+
+	JKA_JUMP_TRACE(4, pml.previous_velocity, pm->ps->velocity, pml.groundTrace.plane.normal, 0, -1, -1, 0);
 
  	if (pm->ps->pm_type == PM_JETPACK || gPMDoSlowFall || BG_IsNewJetpacking(pm->ps))
 	{

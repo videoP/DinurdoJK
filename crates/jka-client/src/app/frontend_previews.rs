@@ -272,6 +272,8 @@ impl App {
             blade_draws.extend(crate::cgame::weapon_fx::profile_saber_blade_draws_for_request(
                 request,
                 self.video.modern_sabers,
+                self.video.saber_core_mode,
+                current_time,
                 &mut flicker_rng,
             ));
         }
@@ -853,7 +855,7 @@ impl App {
                         // The renderer's preview stage uses Y-up and Z-sideways.
                         // Stagger characters horizontally, not vertically.
                         let actor_origin=[88.0*zoom+motion.position[0],
-                            motion.position[1],-22.0+lane as f32*26.0+motion.position[2]];
+                            lane as f32*26.0+motion.position[1],-22.0+motion.position[2]];
                         let presenter=self.asset_preview_player_presenter.as_mut()
                             .ok_or("Studio player presenter unavailable")?;
                         presenter.studio_pose_blend=blend.clone();

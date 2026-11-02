@@ -303,7 +303,7 @@ pub(in crate::app) struct StudioDirectorShot {
     pub comparison_camera: Option<super::render_studio_race::RaceCameraEdit>,
     #[serde(default)] pub lens: crate::renderer::StudioLens,
     #[serde(default,skip_serializing_if="Option::is_none")] pub focus_target: Option<[f32;3]>,
-    /// World camera position (renderer space): placed shots, or a dragged handle.
+    /// World camera position (JKA space, Z up): placed shots, or a dragged handle.
     #[serde(default,skip_serializing_if="Option::is_none")] pub position_override: Option<[f32;3]>,
     /// World camera position at the end of the shot (crane, drift).
     #[serde(default,skip_serializing_if="Option::is_none")] pub position_end: Option<[f32;3]>,
@@ -343,7 +343,7 @@ pub(in crate::app) struct StudioDirectorShot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub path_keys: Vec<StudioPathKey>,
 }
 
-/// One key of a planned camera path (renderer space).
+/// One key of a planned camera path (JKA space, Z up).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(in crate::app) struct StudioPathKey {
     /// 0..1 across the shot.
@@ -533,14 +533,14 @@ impl StudioTimeline {
         self.director_shots.iter().rev()
             .find(|shot| shot.enabled && shot.contains(time) && self.clip_at_lane(time, shot.actor_lane).is_some())
     }
-    /// Actor on `lane` at `time`: stage origin (renderer space, Y up) and
+    /// Actor on `lane` at `time`: stage origin (JKA space, Z up) and
     /// facing yaw (degrees), including smoothed transitions.
     pub fn stage_actor_at(&self, lane: usize, time: f64, zoom: f32, base_yaw: f32) -> Option<(glam::Vec3, f32)> {
         if !self.lane_is_visible(lane) { return None; }
         let index = self.clips.iter().position(|c| c.lane == lane && time >= c.start && time < c.end())?;
         let motion = self.blended_motion_at(index, time,
             self.interpolation != super::render_studio_timeline::StudioInterpolation::Linear);
-        Some((glam::Vec3::from_array(super::render_studio_spatial::motion_world(motion.position, lane, zoom)),
+        Some((glam::Vec3::from_array(super::render_studio_spatial::motion_origin(motion.position, lane, zoom)),
             base_yaw + motion.yaw))
     }
     /// Stage camera of the active Director shot (None: keyed camera applies).
@@ -556,9 +556,9 @@ impl StudioTimeline {
             let delta = glam::Vec3::from_array(offset);
             let delta = if local {
                 let (sn, cs) = yaw.to_radians().sin_cos();
-                glam::Vec3::new(cs * delta.x + sn * delta.z, delta.y, -sn * delta.x + cs * delta.z)
+                glam::Vec3::new(cs * delta.x - sn * delta.y, sn * delta.x + cs * delta.y, delta.z)
             } else { delta };
-            origin + glam::Vec3::Y * stage_anchor_height(anchor) + delta
+            origin + glam::Vec3::Z * stage_anchor_height(anchor) + delta
         };
         let anchor = point(rig.position_anchor, rig.position_offset, rig.position_local);
         let aim = if rig.aim_enabled { point(rig.aim_anchor, rig.aim_offset, rig.aim_local) } else { anchor };
@@ -574,18 +574,18 @@ impl StudioTimeline {
                 StudioFollowPerspective::FirstPerson => {
                     key.position = anchor.to_array();
                     key.yaw = yaw + yaw_offset;
-                    key.pitch = -rig.pitch_offset;
+                    key.pitch = rig.pitch_offset;
                     key.resolve_focus_target();
                     anchor
                 }
                 StudioFollowPerspective::ThirdPerson => {
                     let heading = if rig.motion_direction {
                         self.stage_actor_at(shot.actor_lane, (time - 0.15).max(0.0), zoom, base_yaw)
-                            .map(|(before, _)| origin - before).filter(|d| d.x.hypot(d.z) > 0.5)
-                            .map_or(yaw, |d| (-d.z).atan2(d.x).to_degrees())
+                            .map(|(before, _)| origin - before).filter(|d| d.x.hypot(d.y) > 0.5)
+                            .map_or(yaw, |d| d.y.atan2(d.x).to_degrees())
                     } else { yaw + yaw_offset };
                     let position = anchor - stage_forward(heading, rig.pitch_offset) * range
-                        + glam::Vec3::Y * rig.vertical_offset;
+                        + glam::Vec3::Z * rig.vertical_offset;
                     key.position = position.to_array();
                     look_at(&mut key, aim);
                     position
@@ -593,9 +593,9 @@ impl StudioTimeline {
                 StudioFollowPerspective::Orbit => {
                     let orbit_yaw = if rig.orbit_world_angles { yaw_offset } else { yaw + yaw_offset };
                     let r = orbit_yaw.to_radians();
-                    let right = glam::Vec3::new(r.sin(), 0.0, r.cos());
+                    let right = glam::Vec3::new(r.sin(), -r.cos(), 0.0);
                     let position = anchor - stage_forward(orbit_yaw, rig.pitch_offset) * range
-                        + glam::Vec3::Y * rig.vertical_offset + right * rig.horizontal_offset;
+                        + glam::Vec3::Z * rig.vertical_offset + right * rig.horizontal_offset;
                     key.position = position.to_array();
                     look_at(&mut key, aim);
                     position
@@ -638,20 +638,20 @@ pub(in crate::app) fn stage_anchor_height(anchor: StudioDemoAnchor) -> f32 {
     }
 }
 
-/// Renderer-space forward for a JKA yaw/pitch (positive pitch looks down),
+/// JKA-space forward for a JKA yaw/pitch (positive pitch looks down),
 /// the same convention as the demo sampler's orbit rig.
 pub(in crate::app) fn stage_forward(yaw: f32, pitch: f32) -> glam::Vec3 {
     let (sy, cy) = yaw.to_radians().sin_cos();
     let (sp, cp) = pitch.to_radians().sin_cos();
-    glam::Vec3::new(cy * cp, -sp, -sy * cp)
+    glam::Vec3::new(cy * cp, sy * cp, -sp)
 }
 
-/// Point a camera key at `target` (renderer space).
+/// Point a camera key at `target` (JKA space).
 pub(in crate::app) fn look_at(key: &mut StudioCameraKey, target: glam::Vec3) {
     let delta = target - glam::Vec3::from_array(key.position);
     if delta.length_squared() > 1e-6 {
-        key.yaw = (-delta.z).atan2(delta.x).to_degrees();
-        key.pitch = delta.y.atan2(delta.x.hypot(delta.z)).to_degrees().clamp(-89.0, 89.0);
+        key.yaw = delta.y.atan2(delta.x).to_degrees();
+        key.pitch = (-delta.z).atan2(delta.x.hypot(delta.y)).to_degrees().clamp(-89.0, 89.0);
     }
 }
 

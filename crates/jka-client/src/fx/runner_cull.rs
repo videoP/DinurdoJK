@@ -4,7 +4,7 @@
 
 use super::{
     draw::FxView,
-    system::{make_normal_vectors, FxDraw},
+    system::{make_normal_vectors, FxDraw, FxDrawSource},
 };
 use std::time::Instant;
 
@@ -39,9 +39,9 @@ pub struct RunnerCullScratch {
 }
 
 impl RunnerCullScratch {
-    pub fn mask(
+    pub fn mask<D: FxDrawSource + ?Sized>(
         &mut self,
-        draws: &[FxDraw],
+        draws: &D,
         owners: &[(usize, u16)],
         view: &FxView,
         report: bool,

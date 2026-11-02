@@ -33,6 +33,7 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
 // SingleLayerWaterComposite.usf: SSR over environment, EnvBRDF and shoreline
 // fade, Src=One/Dst=SrcAlpha. Above water TransmittanceToScene is exactly one.
 @fragment fn fs_composite(input:RiverOut,@builtin(front_facing) front:bool)->@location(0) vec4<f32> {
+    if input.eye_water.z > 0.5 { discard; }
     let eye = river_view.eye.xyz;
     let pixel_depth = dot(input.world - eye, river_view.forward.xyz); // GetPixelDepth
     // The bilateral slope tolerance (ddx_fine/ddy_fine), taken before the clip.

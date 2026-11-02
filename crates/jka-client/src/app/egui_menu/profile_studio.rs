@@ -207,10 +207,10 @@ fn studio_button(ui: &mut egui::Ui, text: &str, selected: bool, primary: bool, w
     let fill = fill.lerp_to_gamma(PLATE_LIFT(), if primary { hover * 0.17 } else { hover * 0.55 });
     let outline = if selected || primary { SKY() } else { EDGE() };
     let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(5), fill);
-    painter.rect_stroke(rect, egui::CornerRadius::same(5), egui::Stroke::new(1.0, outline), egui::StrokeKind::Inside);
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    painter.rect_stroke(rect, egui::CornerRadius::ZERO, egui::Stroke::new(1.0, outline), egui::StrokeKind::Inside);
     if selected && !primary {
-        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 1.0, SKY());
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),egui::CornerRadius::ZERO, SKY());
     }
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, text,
         egui::FontId::proportional(11.0), if primary { INK() } else { theme::TEXT() });
@@ -250,7 +250,7 @@ impl App {
     }
 
     fn studio_control_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
-        egui::Frame::new().fill(PLATE()).corner_radius(egui::CornerRadius::same(6))
+        egui::Frame::new().fill(PLATE()).corner_radius(egui::CornerRadius::ZERO)
             .stroke(egui::Stroke::new(1.0, EDGE())).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
                 ui.set_width((width - 28.0).max(1.0));
                 ui.set_min_height((height - 28.0).max(1.0));
@@ -446,8 +446,8 @@ impl App {
         let hovered = ui.ctx().animate_bool_with_time(response.id, response.hovered(), 0.12);
         let color = if selected { SKY() } else { EDGE().lerp_to_gamma(SKY(), hovered * 0.6) };
         let p = ui.painter();
-        p.rect_filled(rect, 4.0, if selected { PLATE_LIFT() } else { INK() });
-        p.rect_stroke(rect, 4.0, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color), egui::StrokeKind::Inside);
+        p.rect_filled(rect,egui::CornerRadius::ZERO, if selected { PLATE_LIFT() } else { INK() });
+        p.rect_stroke(rect,egui::CornerRadius::ZERO, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color), egui::StrokeKind::Inside);
         let image = egui::Rect::from_min_max(rect.min + egui::vec2(4.0, 4.0),
             egui::pos2(rect.max.x - 4.0, rect.max.y - 24.0));
         if let Some(texture) = self.profile_model_icon_texture(entry) {
@@ -464,8 +464,8 @@ impl App {
             &entry.model_name, egui::FontId::proportional(10.5), if selected { theme::TEXT() } else { MUTED() });
         if variant_count > 1 {
             let badge = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-24.0, 3.0), egui::vec2(20.0, 17.0));
-            ui.painter().rect_filled(badge, 3.0, PLATE_LIFT());
-            ui.painter().rect_stroke(badge, 3.0, egui::Stroke::new(1.0, SKY()), egui::StrokeKind::Inside);
+            ui.painter().rect_filled(badge,egui::CornerRadius::ZERO, PLATE_LIFT());
+            ui.painter().rect_stroke(badge,egui::CornerRadius::ZERO, egui::Stroke::new(1.0, SKY()), egui::StrokeKind::Inside);
             ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, variant_count.to_string(),
                 egui::FontId::proportional(10.0), theme::TEXT());
         }
@@ -511,7 +511,7 @@ impl App {
                             let chosen = skin.value.eq_ignore_ascii_case(
                                 self.profile_model_staged.as_deref()
                                     .unwrap_or(&self.solo_client_info.model_cvar()));
-                            ui.painter().rect_stroke(tile, 3.0, egui::Stroke::new(1.0,
+                            ui.painter().rect_stroke(tile,egui::CornerRadius::ZERO, egui::Stroke::new(1.0,
                                 if chosen { SKY() } else { EDGE() }), egui::StrokeKind::Inside);
                             if let Some(tex) = self.profile_model_icon_texture(skin) {
                                 let image = egui::Rect::from_min_max(tile.min + egui::vec2(2.0,2.0),
@@ -1121,33 +1121,42 @@ impl App {
             let color = if hand == 0 { self.network.color1 } else { self.network.color2 };
             let packed = if hand == 0 { self.network.sb_rgb1 } else { self.network.sb_rgb2 };
             let packed = if i32::from(color) == SABER_RGB && packed != 0 { packed }
+                else if i32::from(color) == crate::cgame::SABER_BLACK { 0 }
                 else { base_saber_rgb_packed(color) };
-            let mut rgb = [(packed & 255) as f32 / 255.0,
-                ((packed >> 8) & 255) as f32 / 255.0,
-                ((packed >> 16) & 255) as f32 / 255.0];
-            let picker = ui.color_edit_button_rgb(&mut rgb)
-                .on_hover_text("Blade color · Middle-click to restore blue");
-            if picker.clicked() || picker.clicked_by(egui::PointerButton::Middle) {
+            let rgb = [(packed & 255) as u8, ((packed >> 8) & 255) as u8,
+                ((packed >> 16) & 255) as u8];
+            let picker = super::saber_color_picker::saber_color_picker(ui, i32::from(color), rgb);
+            if picker.opened {
                 self.focus_profile_studio_camera(if hand == 0 { "saber:right" } else { "saber:left" });
             }
-            if picker.changed() {
-                let bytes = rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u32);
-                let packed = bytes[0] | bytes[1] << 8 | bytes[2] << 16;
-                if let Err(error) = self.profile_set_cvar(rgb_cvar, &packed.to_string()) {
-                    self.console_status = error;
-                }
+            if let Some(edit) = picker.edit {
                 let cosmetic = if hand == 0 { &self.network.global_hat } else { &self.network.global_cape };
-                let value = crate::global_cosmetics::encode(SABER_RGB as u8, cosmetic);
-                if let Err(error) = self.profile_set_cvar(color_cvar, &value) {
-                    self.console_status = error;
-                }
-                self.profile_preview_key = None;
-            }
-            if picker.clicked_by(egui::PointerButton::Middle) {
-                let cosmetic = if hand == 0 { &self.network.global_hat } else { &self.network.global_cape };
-                let color = crate::global_cosmetics::encode(4, cosmetic);
-                for (cvar, value) in [(color_cvar, color.as_str()), (rgb_cvar, "0")] {
-                    if let Err(error) = self.profile_set_cvar(cvar, value) { self.console_status = error; }
+                match edit {
+                    super::saber_color_picker::SaberColorEdit::CustomRgb(rgb) => {
+                        let packed = u32::from(rgb[0]) | (u32::from(rgb[1]) << 8)
+                            | (u32::from(rgb[2]) << 16);
+                        // Finish reading the cosmetic suffix before mutating self.
+                        let value = crate::global_cosmetics::encode(SABER_RGB as u8, cosmetic);
+                        if let Err(error) = self.profile_set_cvar(rgb_cvar, &packed.to_string()) {
+                            self.console_status = error;
+                        }
+                        if let Err(error) = self.profile_set_cvar(color_cvar, &value) {
+                            self.console_status = error;
+                        }
+                    }
+                    super::saber_color_picker::SaberColorEdit::Stock(mode) => {
+                        // Preserve suffix and last custom RGB. Presets switch the
+                        // authored glow/core shader instead of encoding an RGB.
+                        let value = crate::global_cosmetics::encode(mode as u8, cosmetic);
+                        if let Err(error) = self.profile_set_cvar(color_cvar, &value) {
+                            self.console_status = error;
+                        }
+                        if picker.middle_reset {
+                            if let Err(error) = self.profile_set_cvar(rgb_cvar, "0") {
+                                self.console_status = error;
+                            }
+                        }
+                    }
                 }
                 self.profile_preview_key = None;
             }
@@ -1222,7 +1231,7 @@ impl App {
         }
         let p = ui.painter().clone();
         let frame = rect.shrink(5.0);
-        p.rect_stroke(frame, 5.0, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
+        p.rect_stroke(frame,egui::CornerRadius::ZERO, egui::Stroke::new(1.0, EDGE()), egui::StrokeKind::Inside);
         let display = self.profile_model_staged.clone()
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
         let model_name = display.split('/').next().unwrap_or(&display);
@@ -1302,7 +1311,7 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().id_salt("studio_stage_tint")
             .max_rect(tint_area), |ui| {
             egui::Frame::new().fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 235), theme::PANEL_FILL()))
-                .corner_radius(egui::CornerRadius::same(5))
+                .corner_radius(egui::CornerRadius::ZERO)
                 .stroke(egui::Stroke::new(1.0, EDGE()))
                 .inner_margin(egui::Margin::same(7))
                 .show(ui, |ui| self.studio_character_tint(ui));
@@ -1427,7 +1436,7 @@ impl App {
                 .id_salt("studio_anny_stage_panel").max_rect(shape_panel), |ui| {
                 egui::Frame::new()
                     .fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245), theme::PANEL_FILL()))
-                    .corner_radius(egui::CornerRadius::same(5))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .stroke(egui::Stroke::new(1.0, EDGE()))
                     .inner_margin(egui::Margin::same(9))
                     .show(ui, |ui| {
@@ -1451,7 +1460,7 @@ impl App {
             ui.scope_builder(egui::UiBuilder::new()
                 .id_salt(("studio_stage_saber", hand)).max_rect(panel), |ui| {
                 egui::Frame::new().fill(crate::app::egui_theme::pick(egui::Color32::from_rgba_premultiplied(16, 24, 34, 245), theme::PANEL_FILL()))
-                    .corner_radius(egui::CornerRadius::same(5))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .stroke(egui::Stroke::new(1.0, EDGE()))
                     .inner_margin(egui::Margin::same(7))
                     .show(ui, |ui| self.studio_saber_editor(ui, hand));

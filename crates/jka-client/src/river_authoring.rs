@@ -1,7 +1,34 @@
 //! Local patch identity, independent materials and source-edit transactions.
-use crate::{river_runtime::LocalSource, river_settings::Settings};
+use crate::{
+    river_runtime::{LocalSource, SourceMode},
+    river_settings::Settings,
+};
 
 pub type Id = u64;
+
+/// Controls that can change without recapturing the bed or resetting water.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveControls {
+    pub mode: SourceMode,
+    pub discharge_cfs: Option<f32>,
+    pub speed: f32,
+}
+impl LiveControls {
+    pub fn from_source(source: LocalSource) -> Self {
+        Self {
+            mode: source.mode,
+            discharge_cfs: source.discharge_cfs,
+            speed: source.rate,
+        }
+    }
+    pub fn apply(self, mut source: LocalSource) -> Result<LocalSource, String> {
+        source.mode = self.mode;
+        source.discharge_cfs = self.discharge_cfs;
+        source.rate = self.speed;
+        source.validate()?;
+        Ok(source)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceParameters {
@@ -10,7 +37,10 @@ pub struct SourceParameters {
     pub width: f32,
     pub cells: u32,
     pub speed: f32,
-    /// None preserves Unreal's held-water-level source.
+    /// Selected UI mode; not inferred from the presence of an optional CFS cap.
+    pub mode: SourceMode,
+    /// In WaterLevel mode, None means unlimited, Some(q) caps inflow.
+    /// In Discharge mode, Some(q) is required.
     pub discharge_cfs: Option<f32>,
 }
 impl Default for SourceParameters {
@@ -21,11 +51,19 @@ impl Default for SourceParameters {
             width: 96.0,
             cells: 128,
             speed: 1.0,
+            mode: SourceMode::WaterLevel,
             discharge_cfs: None,
         }
     }
 }
 impl SourceParameters {
+    pub fn live(self) -> LiveControls {
+        LiveControls {
+            mode: self.mode,
+            discharge_cfs: self.discharge_cfs,
+            speed: self.speed,
+        }
+    }
     pub fn at(self, center: [f32; 3]) -> LocalSource {
         LocalSource {
             center,
@@ -34,6 +72,7 @@ impl SourceParameters {
             source_width: self.width,
             resolution: self.cells,
             rate: self.speed,
+            mode: self.mode,
             discharge_cfs: self.discharge_cfs,
         }
     }
@@ -44,6 +83,7 @@ impl SourceParameters {
             width: s.source_width,
             cells: s.resolution,
             speed: s.rate,
+            mode: s.mode,
             discharge_cfs: s.discharge_cfs,
         }
     }
@@ -117,6 +157,26 @@ impl Editor {
             }
         }
     }
+
+    pub fn finish_live(
+        &mut self,
+        id: Id,
+        requested: LiveControls,
+        source: LocalSource,
+        error: Option<String>,
+    ) {
+        if let Some(entry) = self.entry_mut(id) {
+            // Newer drags, rebuilds and removals supersede stale replies.
+            let mut same_layout = entry.definition.source;
+            same_layout.mode = source.mode;
+            same_layout.rate = source.rate;
+            same_layout.discharge_cfs = source.discharge_cfs;
+            if same_layout == source && entry.draft.live() == requested {
+                entry.definition.source = source;
+                entry.error = error;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +217,47 @@ mod tests {
         assert_eq!(editor.entries.len(), 1);
     }
     #[test]
+    fn river_height_mode_with_cfs_roundtrips_without_becoming_discharge_mode() {
+        let defaults = SourceParameters::default();
+        assert_eq!(defaults.mode, SourceMode::WaterLevel);
+        assert_eq!(defaults.discharge_cfs, None);
+        let limited = SourceParameters {
+            mode: SourceMode::WaterLevel,
+            discharge_cfs: Some(500.0),
+            ..defaults
+        };
+        let source = limited.at([0.0, 20.0, 50.0]);
+        assert_eq!(source.mode, SourceMode::WaterLevel);
+        assert_eq!(source.discharge_cfs, Some(500.0));
+        assert!(source.validate().is_ok());
+        assert_eq!(SourceParameters::from_source(source), limited);
+        let mut editor = Editor::default();
+        let definition = editor.add(source, Settings::default());
+        editor.finish(definition.id, Ok(source));
+        let entry = editor.entry_mut(definition.id).unwrap();
+        assert_eq!(entry.draft.mode, SourceMode::WaterLevel);
+        assert_eq!(entry.draft.discharge_cfs, Some(500.0));
+        assert_eq!(entry.definition.source.mode, SourceMode::WaterLevel);
+        assert_eq!(entry.draft.at(entry.definition.source.center), source);
+    }
+    #[test]
+    fn river_discharge_mode_requires_a_rate_and_roundtrips() {
+        let discharge = SourceParameters {
+            mode: SourceMode::Discharge,
+            discharge_cfs: Some(150.0),
+            ..Default::default()
+        };
+        let source = discharge.at([10.0, 20.0, 30.0]);
+        assert!(source.validate().is_ok());
+        assert_eq!(SourceParameters::from_source(source), discharge);
+        assert!(LocalSource {
+            discharge_cfs: None,
+            ..source
+        }
+        .validate()
+        .is_err());
+    }
+    #[test]
     fn river_discharge_validation_keeps_speed_and_cfs_separate() {
         let p = SourceParameters {
             speed: 10.0,
@@ -176,5 +277,50 @@ mod tests {
             .validate()
             .is_err());
         }
+    }
+
+    #[test]
+    fn river_live_controls_keep_geometry_and_ignore_stale_replies() {
+        let mut editor = Editor::default();
+        let source = editor.defaults.at([12.0, 34.0, 56.0]);
+        let definition = editor.add(source, Settings::default());
+        editor.finish(definition.id, Ok(source));
+        let controls = LiveControls {
+            mode: SourceMode::WaterLevel,
+            discharge_cfs: Some(75.0),
+            speed: 4.0,
+        };
+        let updated = controls.apply(source).unwrap();
+        assert_eq!(updated.center, source.center);
+        assert_eq!(updated.water_level, source.water_level);
+        assert_eq!(updated.source_width, source.source_width);
+        assert_eq!(updated.resolution, source.resolution);
+        let entry = editor.entry_mut(definition.id).unwrap();
+        entry.draft.speed = controls.speed;
+        entry.draft.discharge_cfs = controls.discharge_cfs;
+        editor.finish_live(
+            definition.id,
+            LiveControls::from_source(source),
+            source,
+            None,
+        );
+        assert_eq!(
+            editor.entry_mut(definition.id).unwrap().definition.source,
+            source
+        );
+        editor.finish_live(definition.id, controls, updated, None);
+        let entry = editor.entry_mut(definition.id).unwrap();
+        assert_eq!(entry.definition.source, updated);
+        assert!(!entry.pending, "live controls do not enter rebuild state");
+        editor.finish_live(
+            definition.id,
+            controls,
+            updated,
+            Some("inlet rejected".into()),
+        );
+        assert!(editor.entry_mut(definition.id).unwrap().error.is_some());
+        editor.clear();
+        editor.finish_live(definition.id, controls, updated, None);
+        assert!(editor.entries.is_empty());
     }
 }

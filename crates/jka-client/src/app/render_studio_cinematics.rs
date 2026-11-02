@@ -108,7 +108,7 @@ mod tests {
         let clip=scan(&mut AssetSearchPath::open(&fixture.0).unwrap()).unwrap().clips.remove(0);
         let mut studio=super::super::render_studio::RenderStudio::default();let before=studio.edit_snapshot().signature();
         studio.cinematic_preview=Some(StudioCinematicPreview {emote:clip.emote().unwrap(),clip,playing:false,time:1.,
-            started:Instant::now(),lane:0,camera:Default::default(),pivot:[88.,8.,0.]});
+            started:Instant::now(),lane:0,camera:Default::default(),pivot:[88.,0.,8.]});
         let (_,preview,range,time)=studio.active_animation();assert_eq!(time,1000);assert_eq!(range,Some((100,120)));
         assert!(!preview.unwrap().emote.looping);assert_eq!(studio.edit_snapshot().signature(),before);
         let preview=studio.cinematic_preview.as_mut().unwrap();preview.toggle();assert!(preview.elapsed()<0.1);
@@ -289,7 +289,7 @@ impl App {
                 let time=self.render_studio.timeline_time();self.render_studio.timeline.seek(time);
                 let lane=self.render_studio.timeline.selected_clip.and_then(|i|self.render_studio.timeline.clips.get(i)).map_or(0,|c|c.lane);
                 self.render_studio.cinematic_preview=Some(StudioCinematicPreview {clip,emote,playing:true,time:0.,
-                    started:Instant::now(),lane,camera:Default::default(),pivot:[88.*self.profile_preview_zoom.clamp(0.45,2.5),8.,0.]});
+                    started:Instant::now(),lane,camera:Default::default(),pivot:[88.*self.profile_preview_zoom.clamp(0.45,2.5),0.,8.]});
                 self.profile_preview_key=None;
             }
             Err(error)=>self.render_studio.status=error,

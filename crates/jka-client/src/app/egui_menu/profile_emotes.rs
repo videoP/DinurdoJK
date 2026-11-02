@@ -254,7 +254,7 @@ impl App {
                                             crate::app::egui_theme::pick(egui::Color32::from_rgb(45, 59, 75), theme::LINE_STRONG())
                                         },
                                     ))
-                                    .corner_radius(5)
+                                    .corner_radius(egui::CornerRadius::ZERO)
                                     .inner_margin(6)
                                     .show(ui, |ui| {
                                         ui.set_width((tile_width - 12.0).max(40.0));

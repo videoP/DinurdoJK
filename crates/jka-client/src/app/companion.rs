@@ -425,7 +425,7 @@ impl App {
                         egui::Frame::new()
                             .fill(egui::Color32::from_black_alpha(165))
                             .inner_margin(egui::Margin::symmetric(10, 6))
-                            .corner_radius(egui::CornerRadius::same(5))
+                            .corner_radius(egui::CornerRadius::ZERO)
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new(format!("SECONDARY POV · {name}"))

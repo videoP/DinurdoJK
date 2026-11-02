@@ -267,6 +267,12 @@ pub enum UserEvent {
     RenderStats(RenderStats),
     RendererError(String),
     RiverUpdated {id:crate::river_authoring::Id,result:Result<crate::river_runtime::LocalSource,String>},
+    RiverSourceUpdated {
+        id: crate::river_authoring::Id,
+        controls: crate::river_authoring::LiveControls,
+        source: crate::river_runtime::LocalSource,
+        error: Option<String>,
+    },
     SurfaceInspected(Option<SurfaceInspectorInfo>),
     MapLoadProgress {
         request_id: u64,

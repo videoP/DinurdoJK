@@ -70,7 +70,7 @@ fn package_pane(
             egui::Frame::new()
                 .fill(fill)
                 .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
-                .corner_radius(egui::CornerRadius::same(5))
+                .corner_radius(egui::CornerRadius::ZERO)
                 .inner_margin(egui::Margin::symmetric(10, 10))
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2((width - 20.0).max(1.0), (height - 20.0).max(1.0)));
@@ -182,7 +182,7 @@ impl App {
                 egui::Frame::new()
                     .fill(theme::RAIL_FILL())
                     .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG()))
-                    .corner_radius(egui::CornerRadius::same(5))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::symmetric(10, 10))
                     .show(ui, |ui| {
                         ui.set_min_size(egui::vec2((width - 20.0).max(1.0), (height - 20.0).max(1.0)));

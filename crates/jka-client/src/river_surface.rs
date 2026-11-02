@@ -14,7 +14,7 @@
 //! Not ported yet, each a documented
 //! difference from Unreal rather than a substitute: the refraction-mask pass
 //! (every copy texel reads as water),
-//! the underwater view, previous-frame WPO/motion vectors, local lights, fog,
+//! previous-frame WPO/motion vectors, local lights, air fog,
 //! cloud shadow, thin-glass sun transmission and the GGX energy LUTs
 //! (r.Shading.EnergyConservation 0).
 use crate::river_slw::{ClassicAmbient, PreintegratedGf, SceneSun};
@@ -79,6 +79,7 @@ pub fn shader_source() -> String {
         SHADER,
         crate::river_composite::TRACE_SHADER,
         crate::river_composite::SHADER,
+        include_str!("river_underwater.wgsl"),
     ]
     .join("\n")
 }
@@ -164,6 +165,8 @@ pub struct RiverSurface {
     env_layout: wgpu::BindGroupLayout,
     pipeline: Option<((wgpu::TextureFormat, u32), wgpu::RenderPipeline)>,
     composite: Option<wgpu::RenderPipeline>,
+    submerged: Option<wgpu::RenderPipeline>,
+    wire: Option<wgpu::RenderPipeline>,
     sky_layout: wgpu::BindGroupLayout,
     sky_group: wgpu::BindGroup,
     hzb: Option<crate::river_composite::DepthPyramid>,
@@ -330,6 +333,8 @@ impl RiverSurface {
             env_layout,
             pipeline: None,
             composite: None,
+            submerged: None,
+            wire: None,
             sky_layout,
             sky_group,
             hzb: None,
@@ -471,6 +476,27 @@ impl RiverSurface {
             cache: None,
         });
         self.composite = Some(composite);
+        self.submerged = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("river Hybrid underwater optics"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs_submerged"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_submerged"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: depth_format, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
+        }));
+        // A line polygon pipeline is created only on devices that enable the
+        // same wireframe feature used by the rest of r_showtris.
+        self.wire = device.features().contains(wgpu::Features::POLYGON_MODE_LINE).then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("river displaced mesh wireframe"), layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[Some(crate::river_grid_mesh::vertex_layout())] },
+                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_river_wire"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
+                primitive: wgpu::PrimitiveState { polygon_mode: wgpu::PolygonMode::Line, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState { format: depth_format, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
+            })
+        });
         self.pipeline = Some(((format, samples), pipeline));
     }
 
@@ -611,12 +637,18 @@ impl RiverSurface {
         }
     }
 
+    /// Capture completed river surfaces for the submerged medium. No second HZB.
+    pub fn capture_submerged(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, color: &wgpu::TextureView, depth: &wgpu::TextureView) {
+        if let Some(copy) = &self.copy { copy.capture(device, encoder, color, depth); }
+    }
+
     /// The per-river group: SimGridRT, NormalsRT, the classic indirect field
     /// and one FoamRT parity.
     pub fn body_group(
         &self,
         device: &wgpu::Device,
         origin_cm: [f64; 3],
+        mesh: jka_water::river::grid_mesh::GridMesh,
         textures: &crate::river_material::Textures,
         ambient: &ClassicAmbient,
         foam_rt: &wgpu::Texture,
@@ -626,7 +658,7 @@ impl RiverSurface {
         let origin = origin_cm.map(|v| v as f32);
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("river water body origin"),
-            contents: bytemuck::cast_slice(&[origin[0], origin[1], origin[2], 0.0]),
+            contents: bytemuck::cast_slice(&[origin[0], origin[1], origin[2], 0.0, mesh.size()[0], mesh.size()[1], mesh.cells()[0] as f32, mesh.cells()[1] as f32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let surface = textures.surface.create_view(&wgpu::TextureViewDescriptor {
@@ -737,6 +769,31 @@ impl RiverSurface {
         pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
         pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+    }
+
+    pub fn draw_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        let (Some(pipeline), Some(frame), Some(body)) = (&self.submerged, &self.frame, river.body_group()) else { return; };
+        pass.set_pipeline(pipeline);
+        self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.draw(0..3, 0..1);
+    }
+
+    pub fn draw_wire<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        let (Some(pipeline), Some(frame), Some(body)) = (&self.wire, &self.frame, river.body_group()) else { return; };
+        pass.set_pipeline(pipeline);
+        self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
+        pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+    }
+
+    fn bind_patch<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, frame: &'a wgpu::BindGroup, body: &'a wgpu::BindGroup) {
+        pass.set_bind_group(0, camera, &[]);
+        pass.set_bind_group(1, body, &[]);
+        pass.set_bind_group(2, shadow, &[]);
+        pass.set_bind_group(3, frame, &[]);
+        pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
+        pass.set_bind_group(5, &self.sky_group, &[]);
     }
 }
 
