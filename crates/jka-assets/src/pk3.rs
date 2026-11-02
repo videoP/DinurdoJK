@@ -55,6 +55,7 @@ impl IndexEntry {
 /// in parallel and cached process-wide (see [`shared_index`]).
 #[derive(Debug)]
 struct VfsIndex {
+    jk2_pure: Option<Arc<crate::jk2_pure::Jk2PurePolicy>>,
     archive_paths: Vec<PathBuf>,
     /// Entry count of each archive when it was indexed, to detect an archive
     /// that was replaced on disk before a lazily opened handle reads from it.
@@ -167,6 +168,8 @@ pub struct FilesystemRoots {
     pub jk2path: Option<PathBuf>,
     /// Session-only JK2 asset version: 2 for 1.02, 4 for 1.04. Never persisted.
     pub active_jk2: Option<u8>,
+    /// Immutable session-only JK2 pure policy; never saved in user settings.
+    pub jk2_pure: Option<Arc<crate::jk2_pure::Jk2PurePolicy>>,
     /// Always-on, highest-priority game directory name (not a path).
     pub forcegame: Option<String>,
 }
@@ -213,6 +216,7 @@ pub struct PackageInfo {
 struct PackagePolicy {
     disabled: HashSet<PathBuf>,
     incompatible: HashSet<PathBuf>,
+    jk2_pure: Option<Arc<crate::jk2_pure::Jk2PurePolicy>>,
     generation: u64,
 }
 
@@ -227,6 +231,7 @@ fn package_policy() -> &'static std::sync::RwLock<PackagePolicy> {
 pub fn package_enabled(path: &Path) -> bool {
     let state = package_policy().read().unwrap_or_else(PoisonError::into_inner);
     !state.incompatible.contains(path) && (is_stock_asset_archive(path) || !state.disabled.contains(path))
+        && state.jk2_pure.as_ref().is_none_or(|pure| pure.allows_package(path))
 }
 
 pub fn disabled_package_paths() -> HashSet<PathBuf> {
@@ -261,6 +266,7 @@ fn configure_package_policy(base: &Path, roots: &FilesystemRoots) {
     let mut state = package_policy().write().unwrap_or_else(PoisonError::into_inner);
     state.disabled = disabled;
     state.incompatible = incompatible;
+    state.jk2_pure = if roots.active_jk2.is_some() { roots.jk2_pure.clone() } else { None };
     state.generation = state.generation.wrapping_add(1);
 }
 
@@ -489,7 +495,7 @@ impl AssetSearchPath {
         let archives = archives
             .unwrap_or_else(|| (0..shared.archive_paths.len()).map(|_| None).collect());
         Self {
-            jk2_version: None,
+            jk2_version: shared.jk2_pure.as_ref().map(|policy| policy.version),
             shared,
             archives,
             allow_asset_overrides: true,
@@ -523,6 +529,7 @@ impl AssetSearchPath {
     }
 
     pub fn jk2_version(&self) -> Option<u8> { self.jk2_version }
+    pub fn jk2_pure_policy(&self) -> Option<&Arc<crate::jk2_pure::Jk2PurePolicy>> { self.shared.jk2_pure.as_ref() }
 
     /// Re-scan the same game directories and re-open every mounted archive.
     ///
@@ -536,7 +543,9 @@ impl AssetSearchPath {
     pub fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let (shared, archives) = shared_index(&self.shared.search_dirs)?;
         let allow_asset_overrides = self.allow_asset_overrides;
+        let jk2_version = self.jk2_version;
         *self = Self::from_shared(shared, archives);
+        self.jk2_version = jk2_version;
         self.allow_asset_overrides = allow_asset_overrides;
         Ok(())
     }
@@ -562,6 +571,7 @@ impl AssetSearchPath {
             Provider::Loose { path } => Ok(Some((path,None))),
             Provider::Archive { archive, entry } => {
                 let path=self.shared.archive_paths[archive].clone();
+                if let Some(pure) = &self.shared.jk2_pure { pure.record_read(&path, name); }
                 let file=self.archive_handle(archive)?.by_index(entry)?;
                 if normalize_asset_name(file.name()) != normalize_asset_name(name) { return Err("package changed since indexing".into()) }
                 if file.compression()!=zip::CompressionMethod::Stored { return Err(format!("{name}: nested bundles must use ZIP Store").into()) }
@@ -584,7 +594,9 @@ impl AssetSearchPath {
     pub fn indexed_provider_path(&self, name: &str, stock_only: bool) -> Option<&Path> {
         validate_asset_name(name).ok()?;
         let entry = self.shared.find(&normalize_asset_name(name))?;
-        let provider = if stock_only {
+        let provider = if self.shared.jk2_pure.is_some() {
+            &entry.first
+        } else if stock_only {
             entry.providers().find(|provider| self.provider_is_stock(provider))?
         } else if !self.allow_asset_overrides {
             entry
@@ -645,7 +657,7 @@ impl AssetSearchPath {
     }
 
     pub fn asset_overrides_allowed(&self) -> bool {
-        self.allow_asset_overrides
+        self.shared.jk2_pure.is_some() || self.allow_asset_overrides
     }
 
     /// Read only from a retail assets0..assets3 provider for this exact qpath.
@@ -693,10 +705,16 @@ impl AssetSearchPath {
                 let mut bytes=Vec::new();File::open(&path)?.take(limit as u64).read_to_end(&mut bytes)?;(bytes,path)
             }
         };
+        if let Some(pure) = &self.shared.jk2_pure {
+            if pure.allows_package(&source) { pure.record_read(&source, name); }
+        }
         Ok(Some(Asset {bytes,source}))
     }
 
     fn stock_provider(&self, key: &str) -> Option<Provider> {
+        // A server's pure namespace owns precedence, including the renderer's
+        // optional stock-first texture pass. Every indexed provider is allowed.
+        if self.shared.jk2_pure.is_some() { return self.shared.find(key).map(|e| e.first.clone()); }
         self.shared
             .find(key)?
             .providers()
@@ -705,7 +723,7 @@ impl AssetSearchPath {
     }
 
     fn provider_for_ordinary_read(&self, key: &str) -> Option<Provider> {
-        if !self.allow_asset_overrides {
+        if self.shared.jk2_pure.is_none() && !self.allow_asset_overrides {
             if let Some(stock) = self.stock_provider(key) {
                 return Some(stock);
             }
@@ -844,6 +862,7 @@ impl AssetSearchPath {
                         shared.archive_paths[archive].display()
                     );
                 }
+                if let Some(pure) = &shared.jk2_pure { pure.record_read(&shared.archive_paths[archive], name); }
                 Ok(Asset {
                     bytes,
                     source: shared.archive_paths[archive].clone(),
@@ -885,7 +904,7 @@ const RACY_WINDOW: Duration = Duration::from_secs(3);
 /// loose files.
 enum Source {
     Archive { path: PathBuf, size: u64 },
-    Loose(PathBuf),
+    Loose(PathBuf, Option<Arc<crate::jk2_pure::Jk2PurePolicy>>),
 }
 
 enum Scanned {
@@ -896,7 +915,7 @@ enum Scanned {
     Loose(Vec<(String, PathBuf)>),
 }
 
-fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
+fn plan_sources(dirs: &[PathBuf], pure: &Option<Arc<crate::jk2_pure::Jk2PurePolicy>>) -> Result<Vec<Source>, Box<dyn Error>> {
     // One consistent mount policy for this index build, even when the menu
     // applies a change while a background map worker is indexing packages.
     let disabled = disabled_package_paths();
@@ -913,7 +932,8 @@ fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_file() && is_archive_package(&path)
-                && !incompatible.contains(&path) && (is_stock_asset_archive(&path) || !disabled.contains(&path)) {
+                && !incompatible.contains(&path) && (is_stock_asset_archive(&path) || !disabled.contains(&path))
+                && pure.as_ref().is_none_or(|policy| policy.allows_package(&path)) {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
                 packages.push((path, size));
             }
@@ -934,7 +954,7 @@ fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
         // directory's PK3s, but before falling through to the lower-priority
         // base game. Indexing the directory here gives every asset class the
         // same behavior without renderer-specific filesystem fallbacks.
-        sources.push(Source::Loose(dir.clone()));
+        sources.push(Source::Loose(dir.clone(), pure.clone()));
     }
     Ok(sources)
 }
@@ -962,9 +982,10 @@ fn scan_source(source: &Source) -> Result<Scanned, String> {
             }
             Ok(Scanned::Archive(archive, keys))
         }
-        Source::Loose(root) => {
+        Source::Loose(root, pure) => {
             let mut files = Vec::<(String, PathBuf)>::new();
             collect_loose_files(root, root, &mut files).map_err(|error| error.to_string())?;
+            if let Some(pure) = pure { files.retain(|(key, _)| pure.allows_loose(key)); }
             files.sort_by(|a, b| a.0.cmp(&b.0));
             if let Some(pair) = files.windows(2).find(|pair| pair[0].0 == pair[1].0) {
                 return Err(format!(
@@ -992,7 +1013,7 @@ fn scan_sources(sources: &[Source]) -> Vec<Result<Scanned, String>> {
     }
     let mut order = (0..count).collect::<Vec<_>>();
     order.sort_by_key(|&index| match &sources[index] {
-        Source::Loose(_) => std::cmp::Reverse(u64::MAX),
+        Source::Loose(..) => std::cmp::Reverse(u64::MAX),
         Source::Archive { size, .. } => std::cmp::Reverse(*size),
     });
     let next = AtomicUsize::new(0);
@@ -1020,7 +1041,13 @@ fn scan_sources(sources: &[Source]) -> Vec<Result<Scanned, String>> {
 }
 
 fn build_index(dirs: &[PathBuf]) -> Result<(VfsIndex, ArchiveHandles), Box<dyn Error>> {
-    let sources = plan_sources(dirs)?;
+    let pure = package_policy().read().unwrap_or_else(PoisonError::into_inner).jk2_pure.clone()
+        .filter(|pure| pure.directories == dirs);
+    build_index_with_pure(dirs, pure)
+}
+
+fn build_index_with_pure(dirs: &[PathBuf], pure: Option<Arc<crate::jk2_pure::Jk2PurePolicy>>) -> Result<(VfsIndex, ArchiveHandles), Box<dyn Error>> {
+    let sources = plan_sources(dirs, &pure)?;
     let scans = scan_sources(&sources);
 
     let total = scans
@@ -1084,6 +1111,7 @@ fn build_index(dirs: &[PathBuf]) -> Result<(VfsIndex, ArchiveHandles), Box<dyn E
     let idle_archives = archive_paths.iter().map(|_| Mutex::default()).collect();
     Ok((
         VfsIndex {
+            jk2_pure: pure,
             archive_paths,
             archive_lens,
             archive_stock,
@@ -1338,6 +1366,63 @@ pub fn read_stock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jk2_pure_filters_every_read_route_and_keeps_policy_identity() {
+        use crate::jk2_pure::{parse_checksums, Jk2PurePolicy};
+        let root = test_root("jk2-pure-policy");
+        let base = root.join("base"); let game = root.join("mod");
+        fs::create_dir_all(&base).unwrap(); fs::create_dir_all(&game).unwrap();
+        let stock = base.join("assets0.pk3"); let patch = base.join("assets5.pk3");
+        let allowed = base.join("z_allowed.pk3"); let duplicate = game.join("override.pk3");
+        let forbidden = base.join("zz_forbidden.pk3"); let companion = base.join("zzz_companion.zip");
+        write_package_entries(&stock, &[("vm/cgame.qvm", b"cgame"), ("vm/ui.qvm", b"ui"), ("maps/test.bsp", b"map"), ("image.jpg", b"stock")]);
+        write_package_entries(&patch, &[("vm/cgame.qvm", b"patch-cgame"), ("vm/ui.qvm", b"patch-ui")]);
+        write_package(&allowed, "image.jpg", b"allowed");
+        write_package(&duplicate, "image.jpg", b"allowed");
+        write_package_entries(&forbidden, &[("vm/cgame.qvm", b"wrong-module"), ("image.jpg", b"wrong-image")]);
+        write_package(&companion, "image.jpg", b"companion");
+        fs::write(base.join("loose.jpg"), b"not allowed").unwrap();
+        fs::write(base.join("local.cfg"), b"local setting").unwrap();
+        let sums = [&stock, &patch, &allowed].map(|path| crate::pak_checksum::pk3_checksum(path).unwrap());
+        let dirs = vec![game.clone(), base.clone()];
+        let policy = Arc::new(Jk2PurePolicy::resolve(dirs.clone(), 2, 1234, sums.to_vec()).unwrap());
+        assert!(!policy.allows_package(&patch));
+        assert!(!policy.allows_package(&forbidden));
+        let (index, handles) = build_index_with_pure(&dirs, Some(Arc::clone(&policy))).unwrap();
+        let mut assets = AssetSearchPath::from_shared(Arc::new(index), Some(handles));
+        assets.set_allow_asset_overrides(false);
+        assert_eq!(assets.read("image.jpg", 64).unwrap().unwrap().source, duplicate);
+        assert_eq!(assets.read_stock("image.jpg", 64).unwrap().unwrap().bytes, b"allowed");
+        assert!(assets.read("loose.jpg", 64).unwrap().is_none());
+        assert!(!assets.contains_qpath("loose.jpg"));
+        assert!(assets.read_from_source("image.jpg", 64, &forbidden).unwrap().is_none());
+        assert!(assets.read_from_source("image.jpg", 64, &companion).unwrap().is_none());
+        assert_eq!(assets.read_prefix("local.cfg", 5).unwrap().unwrap().bytes, b"local");
+        assert_eq!(assets.read("vm/cgame.qvm", 64).unwrap().unwrap().source, stock);
+        assert_eq!(assets.fork().jk2_version(), Some(2));
+        let reply = policy.reply(&assets, "test").unwrap();
+        assert_eq!(reply.reported_paks, 2, "duplicate package checksum is reported once");
+        let stock_pure = crate::pak_checksum::pk3_pure_checksum(&stock, 1234).unwrap();
+        let addon_pure = crate::pak_checksum::pk3_pure_checksum(&allowed, 1234).unwrap();
+        assert_eq!(String::from_utf8(reply.command).unwrap(), format!("cp {stock_pure} {stock_pure} @ {addon_pure} {stock_pure} {}", (1234u32 ^ addon_pure as u32 ^ stock_pure as u32 ^ 2) as i32));
+        let next = Arc::new(Jk2PurePolicy::resolve(dirs.clone(), 4, 5678, sums.to_vec()).unwrap());
+        let (next_index, next_handles) = build_index_with_pure(&dirs, Some(Arc::clone(&next))).unwrap();
+        let mut next_assets = AssetSearchPath::from_shared(Arc::new(next_index), Some(next_handles));
+        assert_eq!(next_assets.read("vm/cgame.qvm", 64).unwrap().unwrap().source, patch);
+        assert!(next.reply(&assets, "test").is_err(), "old readers cannot produce a new-policy reply");
+        assert_eq!(assets.read("vm/cgame.qvm", 64).unwrap().unwrap().source, stock);
+        let missing = Arc::new(Jk2PurePolicy::resolve(dirs.clone(), 4, 5678, vec![sums[2]]).unwrap());
+        let (missing_index, missing_handles) = build_index_with_pure(&dirs, Some(Arc::clone(&missing))).unwrap();
+        let missing_assets = AssetSearchPath::from_shared(Arc::new(missing_index), Some(missing_handles));
+        assert!(missing.reply(&missing_assets, "test").unwrap_err().contains("vm/cgame.qvm"));
+        assert!(parse_checksums(b"1 -2 nope").is_err());
+        assert!(parse_checksums(b"").is_err());
+        assert_eq!(parse_checksums(b"1 -2 3").unwrap(), [1, -2, 3]);
+        drop(missing_assets); drop(next_assets); drop(assets);
+        // Only remove exact files created by this fixture; no recursive cleanup.
+        for path in [&stock, &patch, &allowed, &duplicate, &forbidden, &companion, &base.join("loose.jpg"), &base.join("local.cfg")] { fs::remove_file(path).unwrap(); }
+        fs::remove_dir(game).unwrap(); fs::remove_dir(base).unwrap(); fs::remove_dir(root).unwrap();
+    }
     use std::io::Write;
 
     #[test]
@@ -1734,6 +1819,7 @@ mod filesystem_roots_tests {
             cdpath: Some(PathBuf::from("/retail")),
             jk2path: Some(PathBuf::from("/jk2")),
             active_jk2: None,
+            jk2_pure: None,
             forcegame: Some("dinurdojk".into()),
         };
         assert_eq!(filesystem_write_directory(base, Some(game), &roots), PathBuf::from("/user/dinurdojk"));

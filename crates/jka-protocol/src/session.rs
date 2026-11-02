@@ -611,15 +611,6 @@ impl ClientSession {
         if self.reliable_acknowledge < self.reliable_sequence - MAX_RELIABLE_COMMANDS as i32 {
             self.reliable_acknowledge = self.reliable_sequence;
         }
-        // Reject before emitting Gamestate: the owner must never enter JKA's
-        // pure-checksum negotiation for a JK2 server, even for one event tick.
-        if self.jk2.is_some() && result.events.iter().any(|e| matches!(e, Event::Gamestate { .. }))
-            && self.decoder.configstrings.get(&CS_SYSTEMINFO)
-                .and_then(|info| info_value(info, b"sv_pure")).is_some_and(|value| atoi(value) != 0)
-        {
-            self.drop_connection("JK2 pure-server admission is not implemented in this spectating preview (sv_pure 0 required)".into());
-            return;
-        }
         for event in result.events {
             match event {
                 Event::Nop => {}
@@ -1226,8 +1217,9 @@ mod tests {
     }
 
     #[test]
-    fn jk2_pure_rejection_never_emits_a_jka_gamestate_event() {
+    fn jk2_pure_gamestate_reaches_owner_without_sending_jka_checksums() {
         let mut session = ClientSession::connect_jk2_preflight(addr(), USERINFO.to_vec(), 1, 777, 0, crate::jk2::Version::V104);
+        session.take_outgoing();
         session.state = ConnectionState::Connected;
         session.take_events();
         let mut w = crate::message::MessageWriter::new(16384).unwrap();
@@ -1244,10 +1236,13 @@ mod tests {
         w.write_bits(42, 32).unwrap();
         w.write_bits(9, 8).unwrap();
         session.parse_server_message(1, w.as_bytes(), 100);
-        assert_eq!(session.state(), ConnectionState::Disconnected);
+        assert_eq!(session.state(), ConnectionState::Connected);
         let events = session.take_events();
-        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Gamestate)));
-        assert!(events.iter().any(|e| matches!(e, SessionEvent::Disconnected(reason) if reason.contains("sv_pure 0 required"))));
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Gamestate)));
+        assert!(session.sv_pure());
+        assert_eq!(session.reliable_sequence, 1);
+        assert_eq!(session.reliable_commands[1], b"team spectator");
+        assert!(session.take_outgoing().is_empty());
     }
 
     #[test]

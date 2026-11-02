@@ -1,8 +1,8 @@
 //! Jedi Academy sv_pure checksum negotiation.
 //!
 //! Port of TaystJK's `CL_SendPureChecksums` + `FS_ReferencedPakPureChecksums`
-//! (codemp/client/cl_main.cpp, codemp/qcommon/files.cpp) for protocol 26, which is
-//! the only protocol this client speaks (`protocolswitch != 2`).
+//! (codemp/client/cl_main.cpp, codemp/qcommon/files.cpp) for protocol 26
+//! (`protocolswitch != 2`). JK2 uses jka_assets::jk2_pure instead.
 //!
 //! The reply is `cp <cgame> <ui> @ <general refs...> <encoded>` with no server id:
 //! `SV_VerifyPaks_f` reads the cgame checksum from argument 1.

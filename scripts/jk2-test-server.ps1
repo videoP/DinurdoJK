@@ -3,6 +3,7 @@ param(
     [ValidateSet('1.02', '1.04')][string]$Version = '1.04',
     [string]$GameData,
     [ValidateRange(1024, 65535)][int]$Port = 28079,
+    [ValidateSet(0, 1)][int]$Pure = 1,
     [ValidatePattern('^[A-Za-z0-9_/-]+$')][string]$Map = 'ffa_bespin',
     [switch]$Stop
 )
@@ -57,7 +58,7 @@ $rcon = [Guid]::NewGuid().ToString('N')
 $arguments = @(
     '+set', 'dedicated', '1', '+set', 'net_ip', '127.0.0.1', '+set', 'net_port', "$Port",
     '+set', 'fs_basepath', ('"' + $GameData + '"'), '+set', 'fs_homepath', ('"' + $serverHome + '"'),
-    '+set', 'mv_serverversion', $Version, '+set', 'sv_pure', '0', '+set', 'g_gametype', '0',
+    '+set', 'mv_serverversion', $Version, '+set', 'sv_pure', "$Pure", '+set', 'g_gametype', '0',
     '+set', 'g_teamAutoJoin', '0', '+set', 'sv_maxclients', '8', '+set', 'rconpassword', $rcon,
     '+map', $Map, '+addbot', 'Kyle', '4'
 )
@@ -81,7 +82,7 @@ $serverProcessId = $launch | python -c $launcher
 if ($LASTEXITCODE -ne 0) { throw 'Could not launch JK2MV (Python 3 is required).' }
 $process = Get-Process -Id ([int]$serverProcessId)
 @{ ProcessId = $process.Id; StartTime = $process.StartTime.ToFileTimeUtc().ToString();
-   Executable = $server; Version = $Version; Port = $Port; Rcon = $rcon } |
+   Executable = $server; Version = $Version; Port = $Port; Pure = $Pure; Rcon = $rcon } |
     ConvertTo-Json | Set-Content -LiteralPath $statePath
 $udp = [System.Net.Sockets.UdpClient]::new()
 $udp.Client.ReceiveTimeout = 300

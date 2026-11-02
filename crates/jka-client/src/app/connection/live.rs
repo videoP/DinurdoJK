@@ -91,7 +91,7 @@ impl App {
                 self.console_status = format!("CONNECTING TO {}...", target.to_ascii_uppercase());
                 self.reconnect_target = Some(jk2.map_or_else(|| target.to_owned(), |v| format!("jk2://{}/{target}", v.name())));
                 if jk2.is_some() {
-                    self.push_console_line("^3JK2 live preview: spectating only; native MVSDK prediction and pure-server admission are pending.");
+                    self.push_console_line("^3JK2 live preview: spectating only; native MVSDK prediction is pending.");
                 }
                 self.live_input = crate::net::LiveInput::default();
                 self.reset_remote_emotes();
@@ -454,6 +454,15 @@ impl App {
                 self.start_live_gamestate();
             }
             SessionEvent::ServerCommand(command) => {
+                if command.text.starts_with(b"cs 1 ") && self.game_session.as_ref().is_some_and(|s| s.live)
+                    && self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()
+                        && net.state() == ConnectionState::Active)
+                    && !self.jk2_pure_systeminfo_matches()
+                {
+                    self.disconnect_to_main_menu();
+                    self.disconnect_notice = Some("JK2 pure package requirements changed during the map; reconnect to reload them.".into());
+                    return;
+                }
                 self.observe_live_map_vote_command(&command.text);
                 if self.vote_map_preload_mode == 3 {
                     let raw = String::from_utf8_lossy(&command.text);
@@ -686,15 +695,26 @@ impl App {
         if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
             self.live_fs_game_hints.insert(server, fs_game.clone());
         }
-        match self.set_session_fs_game(&fs_game, "gamestate systeminfo") {
-            Ok(true) => self.start_live_cgame_prep(),
-            Ok(false) => {}
+        let jk2 = self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some());
+        let game_changed = match self.set_session_fs_game(&fs_game, "gamestate systeminfo") {
+            Ok(changed) => changed,
             Err(error) => {
                 self.push_console_line(format!("^1Rejected server fs_game: {error}"));
                 self.disconnect_to_main_menu();
                 return;
             }
-        }
+        };
+        let pure_changed = if jk2 {
+            match self.apply_jk2_pure_assets(&configstrings, checksum_feed, &map_name) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.disconnect_to_main_menu();
+                    self.disconnect_notice = Some(format!("JK2 pure assets: {error}"));
+                    return;
+                }
+            }
+        } else { false };
+        if game_changed || pure_changed { self.start_live_cgame_prep(); }
         if let Err(error) = scene::server_bsp_names(&configstrings) {
             self.push_console_line(format!("^1Rejected server BSP instances: {error}"));
             self.disconnect_to_main_menu();
@@ -740,12 +760,15 @@ impl App {
             // TaystJK CL_SendPureChecksums: sent on every pure server, whatever the
             // fs_game or gamename. Without a `cp` the server silently ignores all
             // usercmds and the client hangs awaiting a snapshot.
-            match crate::pure::build_pure_command(
-                &self.base,
-                self.game.as_deref(),
-                checksum_feed,
-                &map_name,
-            ) {
+            let response = if jk2 {
+                self.fs_roots.jk2_pure.as_ref().ok_or_else(|| "Missing JK2 pure policy".to_owned())
+                    .and_then(|policy| {
+                        let assets = jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()).map_err(|e| e.to_string())?;
+                        policy.reply(&assets, &map_name).map(|reply| crate::pure::PureReply {
+                            command: reply.command, reported_paks: reply.reported_paks, detail: reply.detail })
+                    })
+            } else { crate::pure::build_pure_command(&self.base, self.game.as_deref(), checksum_feed, &map_name) };
+            match response {
                 Ok(response) => {
                     let send_result = self
                         .net
@@ -754,16 +777,27 @@ impl App {
                         .and_then(|net| net.send_reliable_now(&response.command));
                     match send_result {
                         Ok(()) => self.push_console_line(format!(
-                            "^2sv_pure:^7 TaystJK pure reply sent ({} general PK3s; {}).",
-                            response.reported_paks, response.detail
+                            "^2sv_pure:^7 {} pure reply sent ({} general PK3s; {}).",
+                            if jk2 { "JK2MV" } else { "TaystJK" }, response.reported_paks, response.detail
                         )),
-                        Err(error) => self.push_console_line(format!(
-                            "^1sv_pure: failed to send pure checksum response: {error}"
-                        )),
+                        Err(error) => {
+                            if jk2 {
+                                self.disconnect_to_main_menu();
+                                self.disconnect_notice = Some(format!("JK2 pure reply could not be sent: {error}"));
+                                return;
+                            }
+                            self.push_console_line(format!("^1sv_pure: failed to send pure checksum response: {error}"));
+                        }
                     }
                 }
-                Err(error) => self
-                    .push_console_line(format!("^1sv_pure: stock PK3 reply unavailable: {error}")),
+                Err(error) => {
+                    if jk2 {
+                        self.disconnect_to_main_menu();
+                        self.disconnect_notice = Some(format!("JK2 pure reply unavailable: {error}"));
+                        return;
+                    }
+                    self.push_console_line(format!("^1sv_pure: stock PK3 reply unavailable: {error}"));
+                }
             }
         }
 

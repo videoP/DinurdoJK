@@ -292,10 +292,10 @@ are rejected until native MVSDK prediction is integrated. Stock JK2 userinfo
 uses plain color/team fields without modifying the user's JKA cosmetic settings.
 No physics accuracy or playable movement claim is made by this milestone.
 
-Pure servers are rejected with an explicit `sv_pure 0 required` error before a
-gamestate reaches JKA pure handling. Autodownload and live JK2 demo recording
-are disabled with explanatory messages; their existing JKA implementations are
-not used. Installed custom maps can be placed under `<client>/jk2/base`.
+Pure-server admission now uses the separate JK2 implementation described below.
+Autodownload and live JK2 demo recording remain disabled with explanatory
+messages; their existing JKA implementations are not used. Installed custom maps
+can be placed under `<client>/jk2/base`.
 
 For a private local test, run from this checkout:
 
@@ -309,7 +309,8 @@ For a private local test, run from this checkout:
 ```
 
 The helper reads `fs_jk2path` or accepts `-GameData`, starts the installed
-`jk2mvded.exe` bound to loopback with one Kyle bot and `sv_pure 0`, and reuses
+`jk2mvded.exe` bound to loopback with one Kyle bot and `sv_pure 1` (use `-Pure 0`
+for a non-pure test), and reuses
 `target/release/jk2` as its runtime home. It copies no binaries/build trees and
 does not write to the retail installation. Python 3 is required to launch this
 old server without an inherited console: PowerShell's hidden-window launch
@@ -335,8 +336,8 @@ Validation on November 2, 2026:
   re-entered CGame, disconnected, reconnected with the right game/version, then
   restored JKA packages on return to the menu. The final executable repeated the
   same sequence. Screenshot captures show authored moving character poses.
-- A pure-mode native-server check returned the explicit unsupported error,
-  never entered the game and did not attempt a JKA stock-PK3 reply.
+- The initial preview refused pure admission before JKA stock-PK3 handling;
+  the pure-admission increment below supersedes that restriction.
 - Reports: `artifacts/jk2-live-final.log`, `artifacts/jk2-102-live-smoke.log`,
   and `artifacts/jk2-pure-rejection.log`; associated screenshots/server dumps
   are under the normal runtime `base` output directories. Free spectator movement
@@ -344,7 +345,65 @@ Validation on November 2, 2026:
   suppresses capture, so its scripted `+forward` did not create movement input.
   No numerical JKA performance regression claim is made.
 
-Next: implement JK2 pure-package selection/checksum admission and native MVSDK
-prediction with explicit state conversion and differential command replay.
-Public discovery, downloads, arbitrary mod client modules, and full gameplay
-presentation remain separate work items.
+## JK2 pure-server admission
+
+JK2 1.02 and 1.04 now mount a session-specific pure namespace and send the
+native JK2 checksum reply. This does not change JKA's TaystJK pure implementation.
+
+- `sv_paks` is parsed as bounded signed package checksums, not trusted paths.
+  Local PK3s are checksummed with the existing CRC-array / MD4 algorithm and
+  matched to the server's allowed set. PK3 search priority remains local: the
+  pinned JK2MV implementation filters packages without reordering to `sv_paks`.
+  Version 1.02 still excludes assets2/5. Companion ZIPs are not native JK2 PK3s.
+- A new VFS index contains only permitted packages and JK2MV's allowed loose
+  file types (`cfg`, `fcf`, `menu`, `game`, `dat`, and that version's demos).
+  Ordinary reads, prefix reads, explicit-source reads and provider probes share
+  this namespace. Native pure priority takes precedence over the optional
+  stock-first asset preference. Existing readers retain their captured policy;
+  JKA asset reads collect no JK2 references.
+- General references are collected for map reads and retail-package reads;
+  non-base mod packages are referenced at mount time. Actual permitted providers
+  of `vm/cgame.qvm` and `vm/ui.qvm` supply their feed-keyed checksums. The client
+  continues using its ported CGame; it does not execute those QVMs or promise
+  arbitrary mod-module compatibility. Equivalent duplicate packages count once
+  in the general list. The final word is feed XOR general checksums XOR count.
+- Gamestate installation cancels speculative map/CGame work and rebuilds asset
+  catalogs under the new policy before sending `cp`. Missing required providers,
+  malformed lists or oversized replies fail with an explicit error. A changed
+  pure list/setting during an active map requires reconnecting; normal map
+  gamestates install a fresh policy and feed. Disconnects and offline demo
+  transitions clear the pure policy. Refresh also retains JK2 animation identity.
+
+Validation on November 2, 2026:
+
+- Six focused JK2 asset tests, all 17 filesystem tests, and all 61 protocol tests
+  passed. Filesystem regression checks reused the already-built test executable.
+  The new synthetic PK3 fixture covers unlisted modules/textures, loose-file
+  restrictions, explicit-source reads, stock-first precedence, duplicate checksums,
+  missing modules, version filtering, and old-reader isolation across feed changes.
+- Fast builds succeeded with the normal shared profile/cache/flags. The first
+  build compiled seven packages and reported about 177 MiB additional drive usage;
+  the final active-session guard change rebuilt only the client. No separate
+  target directory or binary baseline was created.
+- Native JK2MV 1.4.1 accepted both versions with `sv_pure 1`, delivered live
+  snapshots, and allowed following the Kyle bot. The 1.02 reply selected
+  assetsmv2 for cgame/UI and referenced assets0; the 1.04 registration referenced
+  assets2/0. Assets1 can gain a reference as models/textures load later.
+- On 1.04, Bespin admission, change to Yavin, disconnect/reconnect and restoration
+  to JKA succeeded with separate feed-keyed replies. Saved config hashes were
+  unchanged. The final executable repeated the sequence and transitioned directly
+  from pure live play into the supplied 1.04 demo before returning to JKA.
+- A disposable client admitted with valid checksums was then sent an intentionally
+  invalid `cp`. The native server dropped it and logged
+  `Unpure client detected. Invalid .PK3 files referenced!`. This verifies actual
+  server enforcement independently of the client's unit tests. The old server's
+  disconnect command itself omitted the reason; the native broadcast log supplied it.
+- Local reports: `artifacts/jk2-pure-104-final.log`,
+  `artifacts/jk2-pure-102-live.log`, `artifacts/jk2-pure-invalid-reply-confirmed.log`,
+  `artifacts/jk2-pure-native-verdict.txt`, and
+  `artifacts/jk2-pure-server-systeminfo.txt`. No public-server/mod matrix or JKA
+  FPS benchmark has been performed.
+
+Next: native MVSDK prediction with explicit state conversion and differential
+command replay. Public discovery, downloads, arbitrary mod client modules, and
+full gameplay presentation remain separate work items.

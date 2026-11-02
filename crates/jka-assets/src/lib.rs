@@ -8,6 +8,7 @@ pub mod skeleton;
 pub mod map;
 pub mod md3;
 pub mod pak_checksum;
+pub mod jk2_pure;
 pub mod pk3;
 pub mod roq;
 pub mod saber;
