@@ -150,6 +150,10 @@ impl PlayerPresenter {
         self.vehicle_definitions.get(vehicle_name)
     }
 
+    pub(crate) fn use_jk2_saber_defaults(&mut self) {
+        self.saber_definitions.install_jk2_native();
+    }
+
     pub fn new(mut assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
         jka_assets::body_shape::anny::configure_assets(&assets);
         let animations = load_humanoid_animations(&mut assets)?;

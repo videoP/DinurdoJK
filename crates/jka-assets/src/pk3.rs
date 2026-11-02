@@ -165,6 +165,8 @@ pub struct FilesystemRoots {
     pub cdpath: Option<PathBuf>,
     /// Separate JK2 GameData root. Never mounted by the JKA search path.
     pub jk2path: Option<PathBuf>,
+    /// Session-only JK2 asset version: 2 for 1.02, 4 for 1.04. Never persisted.
+    pub active_jk2: Option<u8>,
     /// Always-on, highest-priority game directory name (not a path).
     pub forcegame: Option<String>,
 }
@@ -210,6 +212,7 @@ pub struct PackageInfo {
 #[derive(Default)]
 struct PackagePolicy {
     disabled: HashSet<PathBuf>,
+    incompatible: HashSet<PathBuf>,
     generation: u64,
 }
 
@@ -223,7 +226,7 @@ fn package_policy() -> &'static std::sync::RwLock<PackagePolicy> {
 /// named PK3s in different roots and game directories.
 pub fn package_enabled(path: &Path) -> bool {
     let state = package_policy().read().unwrap_or_else(PoisonError::into_inner);
-    is_stock_asset_archive(path) || !state.disabled.contains(path)
+    !state.incompatible.contains(path) && (is_stock_asset_archive(path) || !state.disabled.contains(path))
 }
 
 pub fn disabled_package_paths() -> HashSet<PathBuf> {
@@ -248,8 +251,16 @@ fn read_disabled_packages(path: &Path) -> HashSet<PathBuf> {
 fn configure_package_policy(base: &Path, roots: &FilesystemRoots) {
     let path = disabled_packages_path(base, roots);
     let disabled = read_disabled_packages(&path);
+    let mut incompatible = HashSet::new();
+    if roots.active_jk2 == Some(2) {
+        for dir in filesystem_search_dirs(base, None, roots) {
+            incompatible.insert(dir.join("assets2.pk3"));
+            incompatible.insert(dir.join("assets5.pk3"));
+        }
+    }
     let mut state = package_policy().write().unwrap_or_else(PoisonError::into_inner);
     state.disabled = disabled;
+    state.incompatible = incompatible;
     state.generation = state.generation.wrapping_add(1);
 }
 
@@ -359,6 +370,23 @@ pub fn filesystem_game_layer_dirs(base: &Path, game: Option<&Path>, roots: &File
 /// never used as a mod override or write destination. The JK2 root is kept
 /// separate and must not contribute packages to this JKA search path.
 pub fn filesystem_search_dirs(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> Vec<PathBuf> {
+    if roots.active_jk2.is_some() {
+        // JK2 addons occupy their own writable namespace. The read-only retail
+        // root and these namespaces never fall through to JKA's base/cdpath.
+        let local = base.parent().unwrap_or(base).join("jk2");
+        let home = roots.homepath.as_ref().map(|p| p.join("jk2"));
+        let mut dirs = Vec::new();
+        if let Some(forced) = &roots.forcegame {
+            add_game_layer(&mut dirs, &local, home.as_deref(), std::ffi::OsStr::new(forced));
+        }
+        if let Some(name) = game.and_then(Path::file_name).filter(|name| *name != std::ffi::OsStr::new("base")) {
+            add_game_layer(&mut dirs, &local, home.as_deref(), name);
+            if let Some(root) = &roots.jk2path { add_unique_directory(&mut dirs, root.join(name)); }
+        }
+        add_game_layer(&mut dirs, &local, home.as_deref(), std::ffi::OsStr::new("base"));
+        if let Some(root) = &roots.jk2path { add_unique_directory(&mut dirs, root.join("base")); }
+        return dirs;
+    }
     let local = base.parent().unwrap_or(base);
     let home = roots.homepath.as_deref();
     let mut dirs = Vec::new();
@@ -408,6 +436,8 @@ pub struct AssetProviderInfo {
 }
 
 pub struct AssetSearchPath {
+    /// Captured when opened, so readers retain game identity across transitions.
+    jk2_version: Option<u8>,
     shared: Arc<VfsIndex>,
     /// Per-instance archive handles, opened lazily on the first read from each
     /// archive (a `ZipArchive` is not shareable and needs `&mut` to read). The
@@ -429,7 +459,9 @@ impl AssetSearchPath {
     /// Open an optional active mod/game directory above base priority.
     pub fn open_game(base: &Path, game: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let roots = configured_filesystem_roots(base);
-        Self::open_search_dirs(filesystem_search_dirs(base, game, &roots))
+        let mut assets = Self::open_search_dirs(filesystem_search_dirs(base, game, &roots))?;
+        assets.jk2_version = roots.active_jk2;
+        Ok(assets)
     }
 
     /// Open the search directories (highest priority first).
@@ -457,6 +489,7 @@ impl AssetSearchPath {
         let archives = archives
             .unwrap_or_else(|| (0..shared.archive_paths.len()).map(|_| None).collect());
         Self {
+            jk2_version: None,
             shared,
             archives,
             allow_asset_overrides: true,
@@ -468,6 +501,7 @@ impl AssetSearchPath {
     /// idle ones) on its first read from each archive.
     pub fn fork(&self) -> Self {
         let mut fork = Self::from_shared(Arc::clone(&self.shared), None);
+        fork.jk2_version = self.jk2_version;
         fork.allow_asset_overrides = self.allow_asset_overrides;
         fork
     }
@@ -487,6 +521,8 @@ impl AssetSearchPath {
     pub fn search_dirs(&self) -> &[PathBuf] {
         &self.shared.search_dirs
     }
+
+    pub fn jk2_version(&self) -> Option<u8> { self.jk2_version }
 
     /// Re-scan the same game directories and re-open every mounted archive.
     ///
@@ -864,6 +900,7 @@ fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
     // One consistent mount policy for this index build, even when the menu
     // applies a change while a background map worker is indexing packages.
     let disabled = disabled_package_paths();
+    let incompatible = package_policy().read().unwrap_or_else(PoisonError::into_inner).incompatible.clone();
     let mut sources = Vec::new();
     for dir in dirs {
         let entries = match fs::read_dir(dir) {
@@ -876,7 +913,7 @@ fn plan_sources(dirs: &[PathBuf]) -> Result<Vec<Source>, Box<dyn Error>> {
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_file() && is_archive_package(&path)
-                && (is_stock_asset_archive(&path) || !disabled.contains(&path)) {
+                && !incompatible.contains(&path) && (is_stock_asset_archive(&path) || !disabled.contains(&path)) {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
                 packages.push((path, size));
             }
@@ -1677,6 +1714,18 @@ mod filesystem_roots_tests {
     use super::*;
 
     #[test]
+    fn jk2_search_never_falls_back_to_jka_packages() {
+        let roots = FilesystemRoots {
+            cdpath: Some(PathBuf::from("/jka-retail")),
+            jk2path: Some(PathBuf::from("/jk2-retail")),
+            active_jk2: Some(2), ..Default::default()
+        };
+        assert_eq!(filesystem_search_dirs(Path::new("/client/base"), None, &roots), vec![
+            PathBuf::from("/client/jk2/base"), PathBuf::from("/jk2-retail/base")
+        ]);
+    }
+
+    #[test]
     fn layers_keep_forcegame_above_server_mod_and_retail_below_base() {
         let base = Path::new("/client/base");
         let game = Path::new("/client/japro");
@@ -1684,6 +1733,7 @@ mod filesystem_roots_tests {
             homepath: Some(PathBuf::from("/user")),
             cdpath: Some(PathBuf::from("/retail")),
             jk2path: Some(PathBuf::from("/jk2")),
+            active_jk2: None,
             forcegame: Some("dinurdojk".into()),
         };
         assert_eq!(filesystem_write_directory(base, Some(game), &roots), PathBuf::from("/user/dinurdojk"));

@@ -135,10 +135,9 @@ tooling or Render Studio parity a prerequisite for the first playable milestone.
 
 The first foundation change adds `fs_jk2path` to the root settings, console cvars,
 startup `+set` handling, bootstrap INI load/save, `writeconfig`, and `path`
-diagnostics. This setting is separate from the JKA mount search and currently
-only records the root for upcoming JK2 session support. The existing filesystem
-priority regression test now configures both retail roots and still expects only
-the JKA root to be searched.
+diagnostics. This setting is separate from the JKA mount search and supplies the
+root for JK2 demo sessions. The filesystem priority regression test configures
+both retail roots and still expects only JKA roots while JKA is active.
 
 This installation's ignored `target/release/DinurdoJK-paths.ini` now records
 `fs_jk2path=C:\Games\JK21.02\GameData`, preserving its existing JKA path. No personal
@@ -194,6 +193,70 @@ Validation on November 2, 2026:
   in-game command uses the same tested inspector on a background worker; its GUI
   dispatch has not been manually exercised in a game window.
 
-Live JK2 connectivity, version-specific asset mounting, rendering/playback,
-native prediction, and gameplay remain to be implemented. Diagnostic decoding
-is a first testable milestone, not a claim of playable JK2 support.
+## Visual demo playback milestone
+
+The built game now plays 1.02/1.04 recordings with the existing renderer, HUD,
+demo clock, pause, seek, and camera controls. In the console:
+
+```
+jk2_demo CoS-WickedR1
+jk2_demo imp495xAMoMAx
+```
+
+The first recording is 1.02 on ctf_yavin; the second is 1.04 on ctf_imperial.
+Both maps are present in the supplied retail assets. An absolute demo path also
+works with `jk2_demo` or as a positional executable argument. Name lookup uses
+the configured JK2 installation's `base/demos` and `base/jk2demos` directories.
+
+An offline adapter decodes the original JK2 recording, maps semantic identifiers,
+and constructs an internal in-memory stream for the existing presentation code.
+It does not overwrite or export the original demo or run movement prediction.
+The mapping includes configstrings, weapons/items, entity types, events, saber
+moves, animation IDs and restart bits, flags, stats, and powerups. Generated
+tables come from pinned MVSDK and vendored OpenJK enums; regeneration is optional
+and reference checkouts are not needed to build. JK2-only animation names retain
+their actual frames from JK2's animation.cfg in 353 additional presentation slots.
+Only a JK2 asset reader enables those slots; JKA keeps its original 1,543 slots.
+The native JK2 saber hilt/length is installed for JK2 sessions.
+
+JK2 asset reads use a separate local `jk2` namespace and `fs_jk2path`; they never
+fall back to JKA's overlapping packages. Version 1.02 excludes assets2/5, while
+1.04 includes them. Session replacement invalidates pending work and catalogs;
+disconnect restores the JKA roots. Existing user settings remain shared.
+
+Validation on November 2, 2026:
+
+- Fast build succeeded using the existing standard cache and flags.
+- All 55 protocol tests passed in the initial implementation run. After fixing
+  animation restart-bit and client-info separator handling, the focused real-demo
+  presentation test passed again. Five focused JK2 asset tests passed after the
+  final parser isolation change, including existing rig tests and the new authored
+  clip and filesystem isolation cases.
+- The final conversion check passed all 24 recordings / 1,157,342 snapshots.
+  Re-decoded presentation state preserved player poses, velocities, view angles,
+  timing, area masks, entity identities/trajectories, and player animation restart
+  mapping. This compares the adapter with the source decoder; it is not an
+  independent comparison against a running JK2MV client.
+- Offscreen rendered playback loaded both retail maps in one process, sought to
+  40 seconds / 4 seconds, paused, and captured screenshots. After disconnect,
+  JKA loaded its menu world and original animation table from JKA packages.
+  The user's saved game config hash was unchanged. Model-frame diagnostics
+  confirmed an authored jump clip was selected during the 1.02 capture. A second
+  capture after advancing one second showed the animated jump/saber pose.
+- Local reports: `artifacts/jk2-presentation-validation-final.json` and
+  `artifacts/jk2-playback-final.log`. The render check is not an FPS regression
+  benchmark or proof of native JK2 pose/effect parity.
+
+Known limits: conversion currently runs before playback starts and can stall the
+UI on long recordings; the generated stream is limited to 512 MiB. Some JK2-only
+events are omitted and counted (including body-queue copies and certain taunts);
+complete corpse/effect parity is not claimed. Custom maps still need their PK3s.
+Saga and 1.03 are explicitly unsupported. Render Studio parity is unvalidated.
+Pausing immediately after a seek can freeze the initial animation blend in a
+neutral pose; briefly resuming playback allows the pose to settle. This remains
+a presentation limitation to address before treating paused seeks as exact poses.
+
+Live JK2 connection, server admission/pure negotiation, native MVSDK prediction,
+and playable gameplay remain to be implemented. The next step is live 1.04
+connection/spectating with explicit version selection and isolated JK2 networking,
+followed by 1.02 compatibility and native movement validation.

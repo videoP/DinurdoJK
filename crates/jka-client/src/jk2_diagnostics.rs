@@ -63,7 +63,11 @@ pub(crate) fn inspect(path: &Path) -> Result<String, String> {
 /// stdout so PowerShell redirection and exit codes work normally.
 pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("--jk2-demo-info") {
+    let flag = args.next();
+    if !matches!(
+        flag.as_deref(),
+        Some("--jk2-demo-info" | "--jk2-presentation-info")
+    ) {
         return None;
     }
     let result = (|| {
@@ -80,7 +84,23 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
             .join("base");
         let roots = crate::filesystem_paths::load(&base);
         let path = resolve_demo(roots.jk2path.as_deref(), &name)?;
-        inspect(&path)
+        if flag.as_deref() == Some("--jk2-presentation-info") {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            File::open(&path)
+                .map_err(|e| e.to_string())?
+                .take(512 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() > 512 * 1024 * 1024 {
+                return Err("JK2 demo exceeds 512 MiB".into());
+            }
+            let converted = jka_protocol::jk2::presentation::convert_demo(&bytes)?;
+            let count = jka_protocol::jk2::presentation::validate_conversion(&bytes, &converted)?;
+            Ok(format!("JK2 {} presentation verified: {count} snapshots, {} bytes, {} unsupported event occurrences omitted. Camera/player poses and entity trajectories match the source.", converted.version.name(), converted.bytes.len(), converted.omitted_events))
+        } else {
+            inspect(&path)
+        }
     })();
     Some(match result {
         Ok(report) => {

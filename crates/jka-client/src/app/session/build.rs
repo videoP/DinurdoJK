@@ -68,8 +68,11 @@ impl App {
             siege_catalog.classes.len(), siege_catalog.teams.len(), siege_catalog.maps.len()
         );
         if let Some(error) = cancelled() { return Err(error); }
-        let player_presenter = PlayerPresenter::new(assets, pbr)
+        let mut player_presenter = PlayerPresenter::new(assets, pbr)
             .map_err(|error| format!("PLAYER ASSET ERROR: {error}"))?;
+        if jka_assets::pk3::configured_filesystem_roots(base).active_jk2.is_some() {
+            player_presenter.use_jk2_saber_defaults();
+        }
         if let Some(error) = cancelled() { return Err(error); }
         let entity_assets = open().map_err(|error| format!("ENTITY ASSET PATH ERROR: {error}"))?;
         let entity_presenter = EntityPresenter::new(entity_assets, pbr)

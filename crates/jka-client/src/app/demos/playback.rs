@@ -654,15 +654,34 @@ impl App {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
         let asset = jka_assets::pk3::Asset { bytes, source: path.to_path_buf() };
-        self.play_demo_asset(format!("demos/{stem}.dm_26"), asset, None)
+        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("dm_26");
+        self.play_demo_asset(format!("demos/{stem}.{extension}"), asset, None)
     }
 
     fn play_demo_asset(
         &mut self,
         qpath: String,
-        asset: jka_assets::pk3::Asset,
+        mut asset: jka_assets::pk3::Asset,
         start_elapsed_ms: Option<i32>,
     ) -> bool {
+        let extension = Path::new(&qpath).extension().and_then(|value| value.to_str()).unwrap_or_default();
+        let jk2 = if extension.eq_ignore_ascii_case("dm_15") || extension.eq_ignore_ascii_case("dm_16") {
+            let conversion = match jka_protocol::jk2::presentation::convert_demo(&asset.bytes) {
+                Ok(result) => result,
+                Err(error) => { self.push_console_line(format!("^1JK2 demo presentation: {error}")); return false; }
+            };
+            let minor = match conversion.version { jka_protocol::jk2::Version::V102 => 2, jka_protocol::jk2::Version::V104 => 4 };
+            let Some(root) = self.fs_roots.jk2path.as_ref() else {
+                self.push_console_line("^1Set fs_jk2path to the JK2 GameData directory first"); return false;
+            };
+            let required = if minor == 2 { &["assets0.pk3", "assets1.pk3"][..] } else { &["assets0.pk3", "assets1.pk3", "assets2.pk3", "assets5.pk3"][..] };
+            if let Some(missing) = required.iter().find(|name| !root.join("base").join(name).is_file()) {
+                self.push_console_line(format!("^1JK2 {} requires base/{missing} under fs_jk2path", conversion.version.name())); return false;
+            }
+            println!("JK2 {} presentation: {} snapshots, {} unmapped events omitted; source demo remains unchanged", conversion.version.name(), conversion.snapshots, conversion.omitted_events);
+            asset.bytes = conversion.bytes;
+            Some(minor)
+        } else { None };
         let source = asset.source.display().to_string();
         crate::logging::write_line_with_path(
             crate::logging::Level::Info,
@@ -688,6 +707,7 @@ impl App {
             || self.local_server.is_some()
             || !self.front_end;
         if transitioning_from_active_session { self.disconnect_for_demo_transition(); }
+        self.select_demo_asset_game(jk2);
         if let Err(error) =
             self.set_session_fs_game_preserving_rendered_world(&probe.fs_game, "demo gamestate")
         {

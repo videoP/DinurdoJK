@@ -2,6 +2,24 @@
 use crate::app::{App, Arc, ColorLutPreset, FullscreenMode, Path, PathBuf, RenderCommand, RendererBackend};
 
 impl App {
+    /// Change game assets only while replacing a session, before creating any
+    /// new CGame/map readers. Existing VFS owners keep their immutable indexes.
+    pub(in crate::app) fn select_demo_asset_game(&mut self, jk2: Option<u8>) {
+        if self.fs_roots.active_jk2 == jk2 { return; }
+        self.latest_request_id = self.latest_request_id.wrapping_add(1);
+        self.map_loader_latest_requested.store(self.latest_request_id, std::sync::atomic::Ordering::Release);
+        self.cancel_vote_map_prewarm();
+        self.cancel_live_cgame_prep();
+        self.prepared_map_cache = None;
+        self.cross_game_map_seed = None;
+        self.local_player_presenter = None;
+        self.fs_roots.active_jk2 = jk2;
+        jka_assets::pk3::configure_filesystem_roots(&self.base, self.fs_roots.clone());
+        self.pk3_manager_loaded = false;
+        self.reset_asset_catalogs_for_game_change();
+        self.invalidate_studio_sources();
+    }
+
     /// DinurdoJK's targeted equivalent of the useful part of OpenJK's
     /// FS_Restart: re-index content that may have appeared on disk and retry
     /// failed registrations, without tearing down the client/game session.

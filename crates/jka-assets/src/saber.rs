@@ -299,6 +299,14 @@ pub struct SaberDefinitions {
 }
 
 impl SaberDefinitions {
+    /// JK2 CG_Player uses the stock saber hilt and SABER_LENGTH_MAX=40.
+    /// Installed only for a JK2 presentation session; no JKA loadout changes.
+    pub fn install_jk2_native(&mut self) {
+        let mut definition = SaberDefinition::openjk_default("__jk2_native");
+        definition.model = "models/weapons2/saber/saber_w.glm".into();
+        definition.blades[0].length = 40.0;
+        self.definitions.insert("__jk2_native".into(), definition);
+    }
     pub fn get(&self, saber_name: &str) -> Option<&SaberDefinition> {
         self.definitions.get(&saber_name.to_ascii_lowercase())
     }

@@ -5,6 +5,8 @@
 //! from `codemp/game/anims.h`; do not reorder it.
 
 use crate::pk3::AssetSearchPath;
+#[path = "jk2_animation_names.rs"]
+mod jk2_names;
 
 pub const HUMANOID_ANIMATION_CFG: &str = "models/players/_humanoid/animation.cfg";
 pub const MAX_ANIMATIONS: usize = 1543;
@@ -37,7 +39,8 @@ impl AnimationSet {
     }
 
     pub fn name(animation_number: i32) -> Option<&'static str> {
-        usize::try_from(animation_number).ok().and_then(|index| ANIMATION_NAMES.get(index).copied())
+        usize::try_from(animation_number).ok().and_then(|index| ANIMATION_NAMES.get(index).copied()
+            .or_else(|| index.checked_sub(MAX_ANIMATIONS).and_then(|i| jk2_names::EXTRA_ANIMATION_NAMES.get(i).copied())))
     }
 }
 
@@ -47,11 +50,20 @@ pub fn load_humanoid_animations(search: &mut AssetSearchPath) -> Result<Animatio
         .read(HUMANOID_ANIMATION_CFG, MAX_ANIMATION_CFG_BYTES)
         .map_err(|error| format!("failed to read {HUMANOID_ANIMATION_CFG}: {error}"))?
         .ok_or_else(|| format!("missing {HUMANOID_ANIMATION_CFG}"))?;
-    parse_animation_cfg(&asset.bytes)
+    if search.jk2_version().is_some() { parse_jk2_animation_cfg(&asset.bytes) }
+    else { parse_animation_cfg(&asset.bytes) }
 }
 
 /// Port of `BG_ParseAnimationFile` for protocol-visible humanoid animation definitions.
 pub fn parse_animation_cfg(data: &[u8]) -> Result<AnimationSet, String> {
+    parse_animation_cfg_mode(data, false)
+}
+
+pub fn parse_jk2_animation_cfg(data: &[u8]) -> Result<AnimationSet, String> {
+    parse_animation_cfg_mode(data, true)
+}
+
+fn parse_animation_cfg_mode(data: &[u8], jk2: bool) -> Result<AnimationSet, String> {
     if data.len() >= 60_000 {
         return Err("animation.cfg exceeds OpenJK 60000-byte buffer".into());
     }
@@ -66,6 +78,8 @@ pub fn parse_animation_cfg(data: &[u8]) -> Result<AnimationSet, String> {
         let mut fields = line.split_whitespace();
         let Some(name) = fields.next() else { continue; };
         let Some(index) = animation_index(name) else { continue; };
+        if !jk2 && index >= MAX_ANIMATIONS { continue; }
+        if index >= animations.len() { animations.resize(MAX_ANIMATIONS + jk2_names::EXTRA_ANIMATION_NAMES.len(), Animation::default()); }
         let first_frame = parse_i32(fields.next(), line_number, name, "firstFrame")?;
         let num_frames = parse_i32(fields.next(), line_number, name, "numFrames")?;
         let loop_frames = parse_i32(fields.next(), line_number, name, "loopFrames")?;
@@ -96,6 +110,7 @@ fn strip_comments(line: &str) -> &str {
 
 pub fn animation_index(name: &str) -> Option<usize> {
     ANIMATION_NAMES.iter().position(|candidate| candidate.eq_ignore_ascii_case(name))
+        .or_else(|| jk2_names::EXTRA_ANIMATION_NAMES.iter().position(|candidate| candidate.eq_ignore_ascii_case(name)).map(|i| MAX_ANIMATIONS + i))
 }
 
 pub const ANIMATION_NAMES: [&str; MAX_ANIMATIONS] = [
@@ -1853,6 +1868,17 @@ const RUNNING_ANIMATIONS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn jk2_only_clips_keep_their_authored_frames() {
+        let cfg = b"BOTH_STAND1_RANDOM1 123 8 -1 20\nBOTH_STAND1 200 10 0 15\n";
+        let animations = super::parse_jk2_animation_cfg(cfg).unwrap();
+        assert_eq!(super::parse_animation_cfg(cfg).unwrap().animations.len(), super::MAX_ANIMATIONS);
+        let extra = super::animation_index("BOTH_STAND1_RANDOM1").unwrap();
+        assert!(extra >= super::MAX_ANIMATIONS && extra < 2048);
+        assert_eq!(super::AnimationSet::name(extra as i32), Some("BOTH_STAND1_RANDOM1"));
+        assert_eq!(animations.get(extra as i32).unwrap().first_frame, 123);
+        assert_eq!(animations.get(extra as i32).unwrap().frame_lerp, 50);
+    }
     use super::*;
 
     #[test]

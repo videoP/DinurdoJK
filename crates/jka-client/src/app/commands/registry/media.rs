@@ -3,6 +3,21 @@ use crate::app::{App, Instant};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_jk2_demo ["jk2_demo"] ("jk2_demo <demoname or absolute path>", "Play a JK2 1.02/1.04 recording using fs_jk2path assets and the existing demo controls.", CommandScope::Always) |self, command| {
+        let args = jka_protocol::commands::tokenize(command.as_bytes());
+        if args.len() != 2 {
+            self.push_console_line("usage: jk2_demo <demoname or absolute path>");
+            return CommandResult::Handled;
+        }
+        let result = std::str::from_utf8(&args[1]).map_err(|_| "Invalid JK2 demo path".to_owned())
+            .and_then(|name| crate::jk2_diagnostics::resolve_demo(self.fs_roots.jk2path.as_deref(), name));
+        match result {
+            Ok(path) => { self.play_demo_file(&path); }
+            Err(error) => self.push_console_line(format!("^1{error}")),
+        }
+        CommandResult::Handled
+    }
+
     cmd_cameraedit ["cameraedit", ] ("cameraedit", "Adjust the third-person camera with the mouse: scroll to zoom, drag to move, hold right mouse to aim.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
