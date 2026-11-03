@@ -25,7 +25,9 @@ fn to_rect(origin: egui::Pos2, b: [f32; 4]) -> Rect {
 
 /// Why a power cannot be changed, if it cannot.
 fn lock_reason(power: usize, disabled: u32, gametype: i32, force: &ProfileForceConfig) -> Option<&'static str> {
-    if disabled & (1u32 << power) != 0 && !matches!(power, 1 | 15 | 16) {
+    // normalize() zeroes every disabled power, Jump and Saber included, so an
+    // unlocked row could never keep a click.
+    if disabled & (1u32 << power) != 0 {
         Some("Disabled by this server (g_forcePowerDisable).")
     } else if gametype < 6 && matches!(power, 11 | 12) {
         Some("Team powers only work in team game types.")

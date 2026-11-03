@@ -71,7 +71,7 @@ $launch = @{ Executable = $server; Arguments = $arguments; Directory = $serverHo
     Stderr = (Join-Path $artifacts 'jk2-test-server-stderr.log') } | ConvertTo-Json -Compress
 $launcher = @'
 import json, subprocess, sys
-task = json.load(sys.stdin)
+task = json.loads(sys.stdin.buffer.read().decode('utf-8-sig'))  # PowerShell may pipe a BOM
 with open(task['Stdout'], 'w') as out, open(task['Stderr'], 'w') as err:
     args = [value.strip(chr(34)) for value in task['Arguments']]
     process = subprocess.Popen([task['Executable'], *args], cwd=task['Directory'],

@@ -72,23 +72,6 @@ impl App {
         let max_rank = value(b"g_maxForceRank", 7).clamp(0, 7) as u8;
         let disabled = value(b"g_forcePowerDisable", 0) as u32;
         let gametype = value(b"g_gametype", 0);
-
-        // TaystJK UI_HasSetSaberOnly, ported verbatim in behavior. Jedi Master
-        // never grants the free saber; duel modes use g_duelWeaponDisable and
-        // other modes use g_weaponDisable. WP_NONE=0, WP_SABER=3, WP_NUM=19.
-        let free_saber = if gametype == 2 {
-            false
-        } else {
-            let weapon_disable = if matches!(gametype, 3 | 4) {
-                value(b"g_duelWeaponDisable", 0)
-            } else {
-                value(b"g_weaponDisable", 0)
-            } as u32;
-            (0..19).all(|weapon| {
-                weapon == 0 || weapon == 3 || (weapon_disable & (1u32 << weapon)) != 0
-            })
-        };
-
         // UI_DrawForceSide: force-based teams pin Red to Dark and Blue to Light.
         let forced_side = if value(b"g_forceBasedTeams", 0) != 0 {
             self.game_session.as_ref().and_then(|session| {
@@ -110,6 +93,36 @@ impl App {
         } else {
             None
         };
+        if self.live_input.is_jk2() {
+            // JK2 gametype_t lacks GT_POWERDUEL, so GT_SINGLE_PLAYER onward is
+            // one lower than JKA's; report the JKA value the checks below use.
+            let gametype = if gametype >= 4 { gametype + 1 } else { gametype };
+            // MVSDK HasSetSaberOnly: JK2 weapon_t (WP_SABER=2, 16 weapons);
+            // only GT_TOURNAMENT reads g_duelWeaponDisable.
+            let free_saber = gametype != 2 && {
+                let weapon_disable =
+                    value(if gametype == 3 { b"g_duelWeaponDisable".as_slice() } else { b"g_weaponDisable" }, 0) as u32;
+                (1..16).filter(|&weapon| weapon != 2).all(|weapon| weapon_disable & (1u32 << weapon) != 0)
+            };
+            return (max_rank, disabled, gametype, free_saber, forced_side);
+        }
+
+        // TaystJK UI_HasSetSaberOnly, ported verbatim in behavior. Jedi Master
+        // never grants the free saber; duel modes use g_duelWeaponDisable and
+        // other modes use g_weaponDisable. WP_NONE=0, WP_SABER=3, WP_NUM=19.
+        let free_saber = if gametype == 2 {
+            false
+        } else {
+            let weapon_disable = if matches!(gametype, 3 | 4) {
+                value(b"g_duelWeaponDisable", 0)
+            } else {
+                value(b"g_weaponDisable", 0)
+            } as u32;
+            (0..19).all(|weapon| {
+                weapon == 0 || weapon == 3 || (weapon_disable & (1u32 << weapon)) != 0
+            })
+        };
+
         (max_rank, disabled, gametype, free_saber, forced_side)
     }
 
