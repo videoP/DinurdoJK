@@ -166,6 +166,8 @@ impl GameSession {
             water_wake: super::water_wake::WaterWakeTracker::default(),
             presented_player_state: None,
             duck_view_height: super::sampling::DuckViewHeight::default(),
+            scope_zoom: super::sampling::ScopeZoomState::default(),
+            pending_raw_out_of_ammo: Vec::new(),
             client_game: ClientGameState::new(),
             siege_catalog,
             siege_classes,

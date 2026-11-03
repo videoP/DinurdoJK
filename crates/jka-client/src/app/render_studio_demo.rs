@@ -29,6 +29,7 @@ pub(in crate::app) struct StudioSourceJob {
     pub index: usize,
     pub name: String,
     pub game: String,
+    pub demo_protocol: u8,
     pub progress: Arc<crate::runtime::LoadProgress>,
     /// Seeking uses the retained scene; it must never upload the map again.
     pub upload: bool,
@@ -42,6 +43,7 @@ pub(in crate::app) struct StudioDemoSource {
     pub clip_index: usize,
     pub name: String,
     pub game: String,
+    pub demo_protocol: u8,
     pub game_dir: Option<PathBuf>,
     pub playback: GameSession,
     pub prepared: Option<super::PreparedMapCache>,
@@ -877,24 +879,35 @@ impl App {
 
     fn open_studio_source(&mut self, index: usize) -> Result<(), String> {
         let clip = self.render_studio.timeline.demos[index].clone();
+        if clip.demo_protocol == 15 || clip.demo_protocol == 16 {
+            let root=self.fs_roots.jk2path.as_ref()
+                .ok_or("Set fs_jk2path to your JK2 GameData directory before previewing JK2 demos")?;
+            let required=if clip.demo_protocol==15 { & ["assets0.pk3","assets1.pk3"][..] }
+                else { &["assets0.pk3","assets1.pk3","assets2.pk3","assets5.pk3"][..] };
+            if let Some(missing)=required.iter().find(|name|!root.join("base").join(name).is_file()) {
+                return Err(format!("JK2 requires {missing} in {}",root.join("base").display()));
+            }
+        }
         let base = self.base.clone();
         let project_dir = self.studio_project_directory();
         let video = self.video;
         let forced = self.forced_player_models.clone();
-        let race_enabled = self.render_studio.timeline.demos.iter().any(|clip| clip.race_overlays.iter().any(|o| o.enabled));
+        let race_enabled = clip.demo_protocol == 26 && self.render_studio.timeline.demos.iter()
+            .any(|clip| clip.race_overlays.iter().any(|o| o.enabled));
         let shared_recording = self.render_studio.sources.iter()
-            .find(|s| source_pool::matches_recording(&clip, &s.name, &s.game))
+            .find(|s| source_pool::matches_recording(&clip, &s.name, &s.game, s.demo_protocol))
             .map(|s| (Arc::clone(&s.playback.demo_bytes), s.playback.demo_index.clone(),
                 s.playback.source.clone(), s.game_dir.clone(), s.race_start_server_ms));
         let id = self.render_studio.next_source_id;
         self.render_studio.next_source_id = id.wrapping_add(1) | STUDIO_REQUEST_BIT;
         let name = clip.name.clone();
         let game = clip.game.clone();
+        let demo_protocol=clip.demo_protocol;
         let progress = Arc::new(crate::runtime::LoadProgress::default());
         let worker_progress = Arc::clone(&progress);
         let worker = std::thread::Builder::new().name("studio-demo-load".into()).spawn(move || {
         let progress = worker_progress;
-        let qpath = format!("demos/{}.dm_26", clip.name);
+        let qpath = format!("demos/{}", clip.recording_file_name());
         let (bytes, demo_index, source, game_dir, race_start_server_ms) = if let Some(shared) = shared_recording {
             shared
         } else {
@@ -904,6 +917,15 @@ impl App {
         let metadata=std::fs::metadata(&path).map_err(|e|format!("{}: {e}",path.display()))?;
         if metadata.len()==0 || metadata.len()>512*1024*1024 {return Err("Invalid recording size".into());}
         let data=std::fs::read(&path).map_err(|e|format!("{}: {e}",path.display()))?;
+        let data=if clip.demo_protocol == 26 {data} else {
+            let converted=jka_protocol::jk2::presentation::convert_demo(&data)
+                .map_err(|e|format!("JK2 recording conversion failed: {e}"))?;
+            if converted.version.protocol() != u32::from(clip.demo_protocol) {
+                return Err(format!("JK2 recording protocol mismatch: project {}, recording {}",
+                    clip.demo_protocol,converted.version.protocol()));
+            }
+            converted.bytes
+        };
         // Match `/rGhost` race selection *once* per loaded authoritative
         // recording. It selects the final non-empty duelTime segment, not an
         // arbitrary current HUD timer or a continuously changing offset.
@@ -938,6 +960,7 @@ impl App {
             clip_index: index,
             name: clip.name,
             game: clip.game,
+            demo_protocol: clip.demo_protocol,
             game_dir,
             playback,
             prepared: None,
@@ -962,7 +985,7 @@ impl App {
         })
         }).map_err(|e| format!("Could not start Studio demo loader: {e}"))?;
         self.render_studio.source_job = Some(StudioSourceJob {
-            id, cancelled: false, index, name, game, worker, progress, upload: true,
+            id, cancelled: false, index, name, game, demo_protocol, worker, progress, upload: true,
         });
         Ok(())
     }
@@ -971,7 +994,7 @@ impl App {
         if !self.render_studio.source_job.as_ref().is_some_and(|j| j.worker.is_finished()) { return; }
         let job = self.render_studio.source_job.take().unwrap();
         let result = job.worker.join().unwrap_or_else(|_| Err("Studio demo loader panicked".into()));
-        let Some(index) = self.studio_source_clip(job.index, &job.name, &job.game).filter(|_| !job.cancelled) else { return; };
+        let Some(index) = self.studio_source_clip(job.index, &job.name, &job.game, job.demo_protocol).filter(|_| !job.cancelled) else { return; };
         let result = result.and_then(|mut source| {
             source.clip_index = index;
             self.configure_game_session(&mut source.playback, source.game_dir.as_deref(), false);
@@ -1021,6 +1044,7 @@ impl App {
         let index = source.clip_index;
         let name = source.name.clone();
         let game = source.game.clone();
+        let demo_protocol=source.demo_protocol;
         let job_progress = Arc::clone(&source.progress);
         let worker = std::thread::Builder::new().name("studio-demo-prepare".into()).spawn(move || {
         source.progress.set("Preparing demo scene", 0, 0);
@@ -1104,7 +1128,7 @@ impl App {
         });
         match worker {
             Ok(worker) => self.render_studio.source_prepares.push(StudioSourceJob {
-                id, cancelled: false, index, name, game, worker, upload: true,
+                id, cancelled: false, index, name, game, demo_protocol, worker, upload: true,
                 progress: job_progress,
             }),
             Err(error) => {
@@ -1120,7 +1144,7 @@ impl App {
             if !self.render_studio.source_prepares[i].worker.is_finished() { i += 1; continue; }
             let job = self.render_studio.source_prepares.remove(i);
             let result = job.worker.join().unwrap_or_else(|_| Err("Studio preparation worker panicked".into()));
-            let index = self.studio_source_clip(job.index, &job.name, &job.game).filter(|_| !job.cancelled);
+            let index = self.studio_source_clip(job.index, &job.name, &job.game, job.demo_protocol).filter(|_| !job.cancelled);
             if index.is_none() {
                 if !job.upload { self.render_command(RenderCommand::RemoveStudioSource(job.id)); }
                 continue;
@@ -1154,6 +1178,7 @@ impl App {
         let index = source.clip_index;
         let name = source.name.clone();
         let game = source.game.clone();
+        let demo_protocol=source.demo_protocol;
         let worker = std::thread::Builder::new().name("studio-demo-seek".into()).spawn(move || {
             let p = Arc::clone(&source.progress);
             source.playback.seek_demo_reporting(Instant::now(), target, move |done, total| p.set("Seeking recording", done, total))?;
@@ -1164,7 +1189,7 @@ impl App {
         });
         match worker {
             Ok(worker) => self.render_studio.source_prepares.push(StudioSourceJob {
-                id, cancelled: false, index, name, game, progress, upload: false, worker,
+                id, cancelled: false, index, name, game, demo_protocol, progress, upload: false, worker,
             }),
             Err(error) => {
                 self.render_command(RenderCommand::RemoveStudioSource(id));
@@ -1174,22 +1199,41 @@ impl App {
         }
     }
 
-    fn studio_source_clip(&self, preferred: usize, name: &str, game: &str) -> Option<usize> {
+    fn studio_source_clip(&self, preferred: usize, name: &str, game: &str, protocol: u8) -> Option<usize> {
         let clips = &self.render_studio.timeline.demos;
-        if clips.get(preferred).is_some_and(|c| source_pool::matches_recording(c, name, game)) {
+        if clips.get(preferred).is_some_and(|c| source_pool::matches_recording(c, name, game, protocol)) {
             Some(preferred)
-        } else { clips.iter().position(|c| source_pool::matches_recording(c, name, game)) }
+        } else { clips.iter().position(|c| source_pool::matches_recording(c, name, game, protocol)) }
     }
 
     /// Rebind clip borrowers without rebuilding their recording-owned state.
     fn reconcile_studio_sources(&mut self, active: &[usize], time: f64) -> Vec<usize> {
-        let desired = source_pool::requests_within(&self.render_studio.timeline.demos, active, time,
+        // Studio's map workers currently share the process filesystem root.
+        // Keep one game asset namespace mounted at a time, even though the
+        // PROJECT can contain recordings from all three protocols. Never warm
+        // the other game's assets using the current game's VFS.
+        let first=active.first().copied().or_else(|| self.render_studio.timeline.demos.iter()
+            .enumerate().filter(|(_,c)|c.end()>time)
+            .min_by(|(_,a),(_,b)|a.start.total_cmp(&b.start)).map(|(i,_)|i));
+        let protocol=first.and_then(|i|self.render_studio.timeline.demos.get(i))
+            .map(|c|c.demo_protocol).unwrap_or(26);
+        let target=match protocol {15=>Some(2),16=>Some(4),_=>None};
+        if self.fs_roots.active_jk2!=target {
+            // Do not change package policy while a worker still opens assets.
+            if self.render_studio.source_job.as_ref().is_some_and(|job|!job.worker.is_finished())
+                ||self.render_studio.source_prepares.iter().any(|job|!job.worker.is_finished()) {
+                return Vec::new();
+            }
+            self.select_demo_asset_game(target);
+        }
+        let mut desired = source_pool::requests_within(&self.render_studio.timeline.demos, active, time,
             self.render_studio.keep_demos_loaded, self.render_studio.scene_capacity);
+        desired.retain(|&i|self.render_studio.timeline.demos[i].demo_protocol==protocol);
         let candidates: Vec<_> = self.render_studio.sources.iter().map(|s| source_pool::Candidate {
-            id: s.id, index: s.clip_index, name: &s.name, game: &s.game, sampled_ms: s.last_sample_ms,
+            id: s.id, index: s.clip_index, name: &s.name, game: &s.game, protocol: s.demo_protocol, sampled_ms: s.last_sample_ms,
         }).chain(self.render_studio.source_job.iter().chain(&self.render_studio.source_prepares)
             .filter(|j| !j.cancelled).map(|j| source_pool::Candidate {
-                id: j.id, index: j.index, name: &j.name, game: &j.game, sampled_ms: None,
+                id: j.id, index: j.index, name: &j.name, game: &j.game, protocol: j.demo_protocol, sampled_ms: None,
             })).collect();
         let assigned = source_pool::assign(&self.render_studio.timeline.demos, &desired, &candidates, time);
         let binding = |id| assigned.iter().position(|a| *a == Some(id)).map(|i| desired[i]);
@@ -1360,6 +1404,10 @@ impl App {
     pub(in crate::app) fn toggle_studio_race_overlay_for_demo(
         &mut self, clip_index: usize, name: String, game: String,
     ) {
+        if self.render_studio.timeline.demos.get(clip_index).is_none_or(|c|c.demo_protocol!=26) {
+            self.render_studio.status="Race composites currently require JKA demo footage".into();
+            return;
+        }
         let exists=self.render_studio.timeline.demos.get(clip_index)
             .is_some_and(|c|c.race_overlays.iter().any(|o|o.name==name && o.game==game));
         let source_path=if exists {None} else {

@@ -16,6 +16,8 @@ struct NativeWorld {
     handle: NonNull<c_void>,
     model_count: usize,
     merged_brushes: usize,
+    /// Loaded by jk2mv's clip-map code (JK2 maps) instead of OpenJK's.
+    jk2: bool,
 }
 impl NativeWorld {
     fn has_inline_model(&self, index: i32) -> bool {
@@ -23,13 +25,52 @@ impl NativeWorld {
         // also must not be accepted as BSP model indices from a snapshot.
         index > 0 && (index as usize) < self.model_count
     }
+
+    fn trace(&self, out: &mut TraceResult, q: &TraceQuery, model: i32, origin: &[f32; 3], angles: &[f32; 3]) -> i32 {
+        let f = if self.jk2 { ffi::jk2_world_trace } else { ffi::jka_world_trace };
+        unsafe {
+            f(self.handle.as_ptr(), out, q.start.as_ptr(), q.mins.as_ptr(), q.maxs.as_ptr(), q.end.as_ptr(),
+              q.mask, model, origin.as_ptr(), angles.as_ptr())
+        }
+    }
+
+    fn trace_box_entity(&self, out: &mut TraceResult, q: &TraceQuery, mins: &[f32; 3], maxs: &[f32; 3], origin: &[f32; 3]) -> i32 {
+        let f = if self.jk2 { ffi::jk2_world_trace_box_entity } else { ffi::jka_world_trace_box_entity };
+        unsafe {
+            f(self.handle.as_ptr(), out, q.start.as_ptr(), q.mins.as_ptr(), q.maxs.as_ptr(), q.end.as_ptr(),
+              q.mask, mins.as_ptr(), maxs.as_ptr(), origin.as_ptr())
+        }
+    }
+
+    /// Untransformed CM_BoxTrace against an inline model (JK2 trigger touch).
+    fn trace_model(&self, out: &mut TraceResult, q: &TraceQuery, model: i32) -> i32 {
+        let zero = [0.0; 3];
+        if !self.jk2 {
+            // OpenJK worlds only reach this outside JK2 prediction.
+            return self.trace(out, q, model, &zero, &zero);
+        }
+        unsafe {
+            ffi::jk2_world_trace_model(self.handle.as_ptr(), out, q.start.as_ptr(), q.mins.as_ptr(), q.maxs.as_ptr(),
+                q.end.as_ptr(), q.mask, model)
+        }
+    }
+
+    fn contents(&self, point: &[f32; 3], model: i32, origin: &[f32; 3], angles: &[f32; 3]) -> i32 {
+        let f = if self.jk2 { ffi::jk2_world_contents } else { ffi::jka_world_contents };
+        unsafe { f(self.handle.as_ptr(), point.as_ptr(), model, origin.as_ptr(), angles.as_ptr()) }
+    }
+
+    fn error(&self) -> String {
+        if self.jk2 { jk2_error() } else { error() }
+    }
 }
 // CM globals and per-world checkcounts are serialized by the native recursive mutex.
 unsafe impl Send for NativeWorld {}
 unsafe impl Sync for NativeWorld {}
 impl Drop for NativeWorld {
     fn drop(&mut self) {
-        unsafe { ffi::jka_world_free(self.handle.as_ptr()) };
+        let free = if self.jk2 { ffi::jk2_world_free } else { ffi::jka_world_free };
+        unsafe { free(self.handle.as_ptr()) };
     }
 }
 
@@ -183,6 +224,7 @@ impl CollisionWorld {
             handle: native,
             model_count: bsp.models.len(),
             merged_brushes: 0,
+            jk2: false,
         };
         for (name, bytes, count) in imports {
             let offset = unsafe {
@@ -212,6 +254,27 @@ impl CollisionWorld {
         eprintln!("[COLLISION UNION] map-load candidates merged: {} brushes; cm_collisionMerge={} (original=0 / union=1)", native.merged_brushes, u8::from(collision_merge_enabled()));
         Ok(Self {
             backend: Arc::new(CollisionBackend::Native(native)),
+            source_visit: Vec::new(),
+            source_generation: 1,
+            source_candidates_scratch: Vec::new(),
+            placed: Arc::new(PlacedCollisionState::default()),
+        })
+    }
+
+    /// A JK2 map, clipped by the pinned jk2mv engine's clip-map code (as a
+    /// JK2 server clips it) rather than OpenJK's. No sub-BSPs or brush merge:
+    /// those are OpenJK/JKA features.
+    pub fn from_jk2_bsp(data: &[u8]) -> Result<Self, String> {
+        let bsp = validated_bsp(data)?;
+        let raw = unsafe { ffi::jk2_world_new(data.as_ptr(), data.len() as i32) };
+        let handle = NonNull::new(raw).ok_or_else(jk2_error)?;
+        Ok(Self {
+            backend: Arc::new(CollisionBackend::Native(NativeWorld {
+                handle,
+                model_count: bsp.models.len(),
+                merged_brushes: 0,
+                jk2: true,
+            })),
             source_visit: Vec::new(),
             source_generation: 1,
             source_candidates_scratch: Vec::new(),
@@ -400,6 +463,14 @@ fn validated_bsp(data: &[u8]) -> Result<Bsp, String> {
     if bsp.models.len() > 1024 {
         return Err("BSP exceeds OpenJK inline model limit".into());
     }
+    // OpenJK's CM_BoundBrush uses the first six brush sides as axial bounds,
+    // but it does not require their normals to match exact float bit patterns.
+    // Some stock-engine-compatible maps (e.g. Cemetery) have tiny off-axis
+    // components caused by their map compiler. Keep the original RBSP planes
+    // for native OpenJK traces instead of rejecting the whole collision world.
+    // Still reject materially misordered/nonaxial sides: OpenJK's bound and
+    // position-test fast paths cannot safely handle those as axial bounds.
+    const AXIAL_NORMAL_TOLERANCE: f32 = 0.0002;
     for brush in &bsp.brushes {
         if brush.sides.len() < 6 {
             return Err("Collision brush lacks six axial bounds".into());
@@ -408,7 +479,9 @@ fn validated_bsp(data: &[u8]) -> Result<Bsp, String> {
             let plane = bsp.planes[bsp.brush_sides[brush.sides.start + side].plane];
             let mut expected = [0.0; 3];
             expected[side / 2] = if side % 2 == 0 { -1.0 } else { 1.0 };
-            if plane.normal != expected {
+            if !plane.normal.iter().zip(expected).all(|(&actual, wanted)| {
+                actual.is_finite() && (actual - wanted).abs() <= AXIAL_NORMAL_TOLERANCE
+            }) || !plane.distance.is_finite() {
                 return Err("Collision brush axial planes are out of order".into());
             }
         }
@@ -429,6 +502,10 @@ fn error() -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+fn jk2_error() -> String {
+    unsafe { CStr::from_ptr(ffi::jk2_collision_error()).to_string_lossy().into_owned() }
 }
 
 /// A solid snapshot entity as CG_ClipMoveToEntities sees it.
@@ -498,35 +575,11 @@ impl CollisionWorld {
             }
         }
         let mut result = TraceResult::clear(q.end);
-        let ok = unsafe {
-            match clip {
-                EntityClip::InlineModel { index, origin, angles } => ffi::jka_world_trace(
-                    native.handle.as_ptr(),
-                    &mut result,
-                    q.start.as_ptr(),
-                    q.mins.as_ptr(),
-                    q.maxs.as_ptr(),
-                    q.end.as_ptr(),
-                    q.mask,
-                    index,
-                    origin.as_ptr(),
-                    angles.as_ptr(),
-                ),
-                EntityClip::Box { mins, maxs, origin } => ffi::jka_world_trace_box_entity(
-                    native.handle.as_ptr(),
-                    &mut result,
-                    q.start.as_ptr(),
-                    q.mins.as_ptr(),
-                    q.maxs.as_ptr(),
-                    q.end.as_ptr(),
-                    q.mask,
-                    mins.as_ptr(),
-                    maxs.as_ptr(),
-                    origin.as_ptr(),
-                ),
-            }
+        let ok = match clip {
+            EntityClip::InlineModel { index, origin, angles } => native.trace(&mut result, &q, index, &origin, &angles),
+            EntityClip::Box { mins, maxs, origin } => native.trace_box_entity(&mut result, &q, &mins, &maxs, &origin),
         };
-        assert_ne!(ok, 0, "{}", error());
+        assert_ne!(ok, 0, "{}", native.error());
         result.entity = ENTITY_NONE;
         result
     }
@@ -547,10 +600,8 @@ impl CollisionWorld {
         if !native.has_inline_model(index) {
             return 0;
         }
-        let contents = unsafe {
-            ffi::jka_world_contents(native.handle.as_ptr(), point.as_ptr(), index, origin.as_ptr(), angles.as_ptr())
-        };
-        assert_ne!(contents, -1, "{}", error());
+        let contents = native.contents(&point, index, &origin, &angles);
+        assert_ne!(contents, -1, "{}", native.error());
         contents
     }
 }
@@ -684,21 +735,8 @@ impl TraceWorld for CollisionWorld {
         let CollisionBackend::Native(native) = &*self.backend else { unreachable!() };
         let mut result = TraceResult::clear(q.end);
         let zero = [0.0; 3];
-        let ok = unsafe {
-            ffi::jka_world_trace(
-                native.handle.as_ptr(),
-                &mut result,
-                q.start.as_ptr(),
-                q.mins.as_ptr(),
-                q.maxs.as_ptr(),
-                q.end.as_ptr(),
-                q.mask,
-                0,
-                zero.as_ptr(),
-                zero.as_ptr(),
-            )
-        };
-        assert_ne!(ok, 0, "{}", error());
+        let ok = native.trace(&mut result, &q, 0, &zero, &zero);
+        assert_ne!(ok, 0, "{}", native.error());
         self.trace_placed(q, &mut result);
         result
     }
@@ -730,17 +768,24 @@ impl TraceWorld for CollisionWorld {
 
         let CollisionBackend::Native(native) = &*self.backend else { unreachable!() };
         let zero = [0.0; 3];
-        let contents = unsafe {
-            ffi::jka_world_contents(
-                native.handle.as_ptr(),
-                point.as_ptr(),
-                0,
-                zero.as_ptr(),
-                zero.as_ptr(),
-            )
-        };
-        assert_ne!(contents, -1, "{}", error());
+        let contents = native.contents(&point, 0, &zero, &zero);
+        assert_ne!(contents, -1, "{}", native.error());
         self.contents_placed(point, contents)
+    }
+
+    fn trace_model(&mut self, q: TraceQuery, index: i32) -> TraceResult {
+        let CollisionBackend::Native(native) = &*self.backend else {
+            return TraceResult::clear(q.end); // source maps have no inline models yet
+        };
+        // A snapshot model absent from the loaded BSP (map transition) is no
+        // contact, as for solid entities in `trace_entity`.
+        if !q.is_finite() || !native.has_inline_model(index) {
+            return TraceResult::clear(q.end);
+        }
+        let mut result = TraceResult::clear(q.end);
+        let ok = native.trace_model(&mut result, &q, index);
+        assert_ne!(ok, 0, "{}", native.error());
+        result
     }
 }
 

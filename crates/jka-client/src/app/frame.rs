@@ -376,9 +376,14 @@ impl App {
     /// CG_OutOfAmmoChange for EV_NOAMMO events the session queued.
     pub(in crate::app) fn apply_out_of_ammo_changes(&mut self) {
         let auto_switch = self.audio.game.auto_switch;
+        if self.live_input.is_jk2() {
+            self.apply_jk2_out_of_ammo_changes(i32::from(auto_switch));
+            return;
+        }
         let Some(session) = self.game_session.as_mut() else {
             return;
         };
+        session.pending_raw_out_of_ammo.clear();
         if session.pending_out_of_ammo.is_empty() && session.pending_weapon_select.is_empty() {
             return;
         }
@@ -399,6 +404,30 @@ impl App {
         for tag in picked {
             self.live_input
                 .pickup_autoswitch(&snapshot.player_state, tag, auto_switch);
+        }
+    }
+
+    /// JK2 EV_NOAMMO -> CG_OutOfAmmoChange and CG_ItemPickup auto-select.
+    fn apply_jk2_out_of_ammo_changes(&mut self, auto_switch: i32) {
+        let Some(session) = self.game_session.as_mut() else {
+            return;
+        };
+        session.pending_out_of_ammo.clear();
+        let dry = std::mem::take(&mut session.pending_raw_out_of_ammo);
+        let picked = std::mem::take(&mut session.pending_weapon_select);
+        if dry.is_empty() && picked.is_empty() {
+            return;
+        }
+        let Some(frame) = self.jk2_selection_frame() else {
+            return;
+        };
+        for parm in dry {
+            if let Err(error) = self.live_input.jk2_out_of_ammo(&frame, parm, auto_switch) {
+                self.push_console_line(format!("^1JK2 out-of-ammo selection: {error}"));
+            }
+        }
+        for tag in picked {
+            self.live_input.jk2_pickup(&frame, tag, auto_switch);
         }
     }
 

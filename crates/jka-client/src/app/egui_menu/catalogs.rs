@@ -63,6 +63,52 @@ impl App {
         let mut map_catalog_changed = false;
         for result in results {
             match result.payload {
+                CatalogPayload::Jk2DemoFolders { token, folders } => {
+                    if token != self.jk2_demo_browser.generation || !self.jk2_demo_browser.pending { continue; }
+                    match folders {
+                        Ok(folders) => {
+                            self.jk2_demo_browser.folders = folders;
+                            let folder_still_exists = self.jk2_demo_browser.folder.as_ref().is_some_and(|selected| {
+                                self.jk2_demo_browser.folders.iter().any(|folder| folder.path == *selected)
+                            });
+                            if !folder_still_exists {
+                                self.jk2_demo_browser.folder = self.jk2_demo_browser.folders.first().map(|folder| folder.path.clone());
+                            }
+                            if let Some(folder) = self.jk2_demo_browser.folder.clone() {
+                                self.ui_catalog.request(&self.base, None,
+                                    ui_catalog::CatalogRequest::Jk2DemoRecordings { token, folder });
+                            } else {
+                                self.jk2_demo_browser.pending = false;
+                            }
+                        }
+                        Err(error) => {
+                            self.jk2_demo_browser.pending = false;
+                            self.jk2_demo_browser.error = Some(error);
+                        }
+                    }
+                    if self.demo_browser_jk2 && self.frontend_page == crate::app::FrontendPage::PlayDemo { self.publish_ui(); }
+                }
+                CatalogPayload::Jk2DemoRecordings { token, folder, entries } => {
+                    if token != self.jk2_demo_browser.generation || !self.jk2_demo_browser.pending
+                        || self.jk2_demo_browser.folder.as_ref() != Some(&folder) { continue; }
+                    self.jk2_demo_browser.pending = false;
+                    match entries {
+                        Ok(entries) => {
+                            self.jk2_demo_browser.entries = entries;
+                            self.jk2_demo_browser.selected = self.jk2_demo_browser.selected.min(self.jk2_demo_browser.entries.len().saturating_sub(1));
+                        }
+                        Err(error) => self.jk2_demo_browser.error = Some(error),
+                    }
+                    if self.demo_browser_jk2 && self.frontend_page == crate::app::FrontendPage::PlayDemo { self.publish_ui(); }
+                }
+                CatalogPayload::Jk2DemoDetails { token, path, details } => {
+                    if token != self.jk2_demo_browser.generation { continue; }
+                    if self.jk2_demo_browser.details_pending.as_ref() == Some(&path) {
+                        self.jk2_demo_browser.details_pending = None;
+                    }
+                    self.jk2_demo_browser.details.insert(path, details);
+                    if self.demo_browser_jk2 && self.frontend_page == crate::app::FrontendPage::PlayDemo { self.publish_ui(); }
+                }
                 CatalogPayload::DemoGames { token, games } => {
                     if token != self.demo_catalog_generation || !self.demo_catalog_pending {
                         continue;
@@ -104,6 +150,7 @@ impl App {
                         }
                         Err(error) => self.demo_catalog_error = Some(error),
                     }
+                    if self.frontend_page == crate::app::FrontendPage::PlayDemo {self.publish_ui();}
                 }
                 CatalogPayload::ConsoleFiles(result) => {
                     self.ui_catalog.pending.console_files = false;

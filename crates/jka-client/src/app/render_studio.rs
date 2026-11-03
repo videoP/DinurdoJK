@@ -530,12 +530,26 @@ impl StudioEditHistory {
         self.baseline=Some(current);self.baseline_signature=Some(signature);
     }
 }
+/// A media-browser filter, never a project/scene-wide game lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(in crate::app) enum StudioLibraryGame { #[default] Jka, Jk2 }
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::app) enum StudioMediaTab { #[default] Jka, Fortnite, Cutscenes, Demos }
 #[derive(Clone)]
 pub(in crate::app) struct StudioMediaDrag {pub name: String, pub emote_id: Option<String>,
     pub cinematic:Option<super::render_studio_cinematics::StudioCinematicSource>,
-    pub demo_game:Option<String>}
+    pub demo_game:Option<String>,
+    /// Loose JK2 recording selected from fs_jk2path; copied to project on drop.
+    pub demo_path:Option<std::path::PathBuf>}
+
+pub(in crate::app) struct StudioJk2ImportJob {
+    pub project: std::path::PathBuf,
+    pub game: String,
+    pub time: f64,
+    pub layer: usize,
+    pub worker: std::thread::JoinHandle<Result<(std::path::PathBuf,Vec<u8>,i32),String>>,
+}
 
 #[derive(Clone)]
 pub(in crate::app) enum StudioClipboard {
@@ -617,8 +631,13 @@ pub(in crate::app) struct RenderStudio {
     pub animation_search: String,
     pub emote_search: String,
     pub demo_search: String,
+    pub library_game: StudioLibraryGame,
+    /// One persistent, non-draggable details modal; the content is produced by
+    /// Play Demo's shared inspector, not a second Studio-specific model.
+    pub demo_details: Option<String>,
     /// (name, game, time, demo layer) waiting for duration metadata.
     pub pending_demo_drop: Option<(String,String,f64,usize)>,
+    pub jk2_import: Option<StudioJk2ImportJob>,
     pub demo_preview: Option<StudioDemoPreview>,
     pub live_gpu_transitions: bool,
     /// Pixel rectangle supplied by egui for the embedded BSP scene.
@@ -745,7 +764,7 @@ pub(in crate::app) struct RenderStudio {
     /// Further assets dragged with `media_drag` (placed back to back).
     pub media_drag_group: Vec<StudioMediaDrag>,
     /// Demos of a group drop still waiting for their duration: (name, game, layer).
-    pub pending_demo_queue: std::collections::VecDeque<(String, String, usize)>,
+    pub pending_demo_queue: std::collections::VecDeque<(StudioMediaDrag, usize)>,
     pub navigation: super::render_studio_navigation::StudioPreviewNavigation,
     pub camera_rig_runtime: StudioCameraRigRuntime,
     pub camera_orbit_edit_runtime: StudioCameraRigRuntime,
@@ -778,7 +797,7 @@ impl Default for RenderStudio {
             sources: Vec::new(), source_job: None, source_prepares: Vec::new(), composite_search: String::new(), race_runtime: Vec::new(), next_source_id: 1u64 << 63, scene_frame: None, failed_sources: Default::default(), source_wait: None, pending_capture_rect: None,
             model: String::new(), model_search: String::new(),
             animation_search: String::new(), emote_search: String::new(),
-            demo_search: String::new(), pending_demo_drop: None,
+            demo_search: String::new(), library_game: StudioLibraryGame::Jka, demo_details: None, pending_demo_drop: None, jk2_import: None,
             demo_preview: None, live_gpu_transitions: true, demo_viewport: None,
             export_size: StudioExportSize::default(), capture_size: None,
             encoder_speed: StudioEncoderSpeed::default(), nvenc_preset: 0, crf: STUDIO_DEFAULT_CRF,
@@ -3127,7 +3146,7 @@ mod studio_capture_tests {
     #[test]
     fn preview_load_wait_does_not_survive_restart_and_play() {
         let mut studio=RenderStudio::default();
-        studio.timeline.demos.push(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"demo".into(),game:String::new(),start:0.0,
+        studio.timeline.demos.push(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"demo".into(),game:String::new(),start:0.0,
             duration_ms:10000,in_ms:0,out_ms:10000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()});
         studio.timeline.seek(6.5);studio.timeline.toggle_play();
         studio.source_wait=Some(((studio.timeline.playhead,studio.timeline.play_started,true),6.5));

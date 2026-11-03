@@ -97,7 +97,7 @@ fn main() {
     for file in ["bg_pmove", "bg_slidemove", "bg_panimate", "bg_saber", "bg_weapons", "bg_misc", "bg_multiversion", "animMappingTable", "q_math", "q_shared"] {
         jk2.file(format!("vendor/mvsdk/code/game/{file}.c"));
     }
-    jk2.file("native/jk2_movement.c").file("native/jk2_oracle.c").compile("jk2_mvsdk_pmove");
+    jk2.file("native/jk2_movement.c").file("native/jk2_context.c").file("native/jk2_select.c").file("native/jk2_oracle.c").compile("jk2_mvsdk_pmove");
     let mut collision = cc::Build::new();
     collision
         .cpp(true)
@@ -132,6 +132,43 @@ fn main() {
     collision
         .file("native/collision.cpp")
         .compile("jka_collision");
+
+    // JK2 maps use the pinned jk2mv engine's clip-map code, with jk2mv's own
+    // global defines (CMakeLists GlobalDefines + ReleaseDefines).
+    let mut jk2_collision = cc::Build::new();
+    jk2_collision
+        .cpp(true)
+        .include("vendor/jk2mv/src")
+        .include("native")
+        .define("BOTLIB", None)
+        .define("_JK2", None)
+        .define("FINAL_BUILD", None)
+        .define("NDEBUG", None)
+        .define("_CRT_SECURE_NO_WARNINGS", None)
+        .define("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR", None)
+        .warnings(false)
+        .flag_if_supported("/fp:precise")
+        .flag_if_supported("/EHsc")
+        .flag_if_supported("-fno-strict-aliasing")
+        .flag_if_supported("-ffp-contract=off");
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
+        jk2_collision.define("WIN32", None);
+    }
+    match env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() {
+        Some("x86_64") => {
+            jk2_collision.define("ARCH_X86_64", None);
+            if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
+                jk2_collision.define("WIN64", None);
+            }
+        }
+        Some("x86") => { jk2_collision.define("ARCH_X86", None); }
+        Some("aarch64") => { jk2_collision.define("ARCH_ARM64", None); }
+        _ => {}
+    }
+    for file in ["cm_load", "cm_trace", "cm_test", "cm_patch", "cm_polylib", "q_math", "q_shared"] {
+        jk2_collision.file(format!("native/jk2_{file}.cpp"));
+    }
+    jk2_collision.file("native/jk2_collision.cpp").compile("jk2_collision");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-changed=native");
 }

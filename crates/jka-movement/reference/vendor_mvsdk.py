@@ -73,6 +73,11 @@ for version in [102, 104]:
     tables += f"static const jk2_field fields_{version}[] = {{\n"
     tables += "".join(f'    {{"{name}", offsetof(playerState_t, {name}), {bits}}},\n' for name, bits in fields)
     tables += "};\n"
+for version in [102, 104]:
+    fields = re.findall(r'\("([^"]+)", (-?\d+)\)', re.search(rf'pub const ENTITY_FIELDS_{version}:.*?= &\[(.*?)\];', wire, re.S)[1])
+    tables += f"static const jk2_field entity_fields_{version}[] = {{\n"
+    tables += "".join(f'    {{"{name}", offsetof(entityState_t, {name}), {bits}}},\n' for name, bits in fields)
+    tables += "};\n"
 (crate / "native/jk2_fields.h").write_text(tables, newline="\n")
 
 # Name every native member, including timers and the complete Force struct.

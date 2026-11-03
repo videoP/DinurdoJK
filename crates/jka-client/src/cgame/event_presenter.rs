@@ -293,9 +293,13 @@ impl ViewKick {
     }
 
     /// Vertical eye offset at `time` (CG_OffsetFirstPersonView / CG_StepOffset).
-    /// The landing dip is a first-person-only effect; step smoothing also
-    /// applies to the third-person camera.
+    /// Both are first-person only: JK2 (MVSDK cg_view.c:856) and JKA call
+    /// CG_StepOffset solely from CG_OffsetFirstPersonView, never from the
+    /// third-person camera.
     pub fn offset(&self, time: i32, first_person: bool) -> f32 {
+        if !first_person {
+            return 0.0;
+        }
         let mut offset = 0.0;
         let step_elapsed = time - self.step_time;
         if (0..STEP_TIME).contains(&step_elapsed) {
@@ -308,7 +312,7 @@ impl ViewKick {
             offset -= self.step_change * progress;
         }
         let land_elapsed = time - self.land_time;
-        if first_person && land_elapsed >= 0 {
+        if land_elapsed >= 0 {
             if land_elapsed < LAND_DEFLECT_TIME {
                 offset += self.land_change * land_elapsed as f32 / LAND_DEFLECT_TIME as f32;
             } else if land_elapsed < LAND_DEFLECT_TIME + LAND_RETURN_TIME {
@@ -545,17 +549,18 @@ mod view_kick_tests {
     fn steps_accumulate_and_decay_over_step_time() {
         let mut kick = ViewKick::default();
         kick.step(2, 1_000); // 8 units
-        assert!((kick.offset(1_000, false) + 8.0).abs() < 1e-4);
-        assert!((kick.offset(1_100, false) + 4.0).abs() < 1e-4);
+        assert!((kick.offset(1_000, true) + 8.0).abs() < 1e-4);
+        assert!((kick.offset(1_100, true) + 4.0).abs() < 1e-4);
+        assert_eq!(kick.offset(1_000, false), 0.0, "third person has no step smoothing");
         kick.step(4, 1_100); // 16 more on top of the remaining 4
-        assert!((kick.offset(1_100, false) + 20.0).abs() < 1e-4);
-        assert_eq!(kick.offset(1_300, false), 0.0);
+        assert!((kick.offset(1_100, true) + 20.0).abs() < 1e-4);
+        assert_eq!(kick.offset(1_300, true), 0.0);
         kick.step(4, 5_000);
         kick.step(4, 5_000);
         kick.step(4, 5_000);
         kick.step(4, 5_000);
         kick.step(4, 5_000);
-        assert_eq!(kick.offset(5_000, false), -32.0, "MAX_STEP_CHANGE");
+        assert_eq!(kick.offset(5_000, true), -32.0, "MAX_STEP_CHANGE");
     }
 
     #[test]
@@ -565,13 +570,13 @@ mod view_kick_tests {
         let mut kick = ViewKick::default();
         kick.step(2, 1_008);
         kick.set_step_lead_ms(8);
-        assert_eq!(kick.offset(1_000, false), 0.0, "eye has not started rising yet");
-        assert_eq!(kick.offset(1_004, false), -4.0, "half the rise cancelled");
-        assert_eq!(kick.offset(1_008, false), -8.0);
-        assert!(kick.offset(1_108, false) > -8.0);
-        assert_eq!(kick.offset(1_208, false), 0.0);
+        assert_eq!(kick.offset(1_000, true), 0.0, "eye has not started rising yet");
+        assert_eq!(kick.offset(1_004, true), -4.0, "half the rise cancelled");
+        assert_eq!(kick.offset(1_008, true), -8.0);
+        assert!(kick.offset(1_108, true) > -8.0);
+        assert_eq!(kick.offset(1_208, true), 0.0);
         // A clock that rebased far behind the event must not resurrect it.
-        assert_eq!(kick.offset(100, false), 0.0);
+        assert_eq!(kick.offset(100, true), 0.0);
     }
 
     #[test]

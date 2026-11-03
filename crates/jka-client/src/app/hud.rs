@@ -260,6 +260,8 @@ impl App {
             killfeed: self.killfeed_ui(),
             scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
+            demo_browser: if self.front_end && self.frontend_page == crate::app::FrontendPage::PlayDemo
+                && self.overlay == OverlayMode::Game { Some(self.native_demo_browser_ui()) } else { None },
             prediction_debug,
             hud,
             team_overlay: self.team_overlay_ui(),
@@ -1269,7 +1271,9 @@ impl App {
             && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0);
         let zoom_scope = (zoom_mode == 1 || (zoom_mode == 2 && binoculars_allowed)).then(|| ui::UiZoomScope {
             mode: zoom_mode,
-            fov: ps.field_f32("zoomFov").unwrap_or(50.0),
+            // TaystJK's rotating insert uses cg_view.c's local zoomFov,
+            // NOT the networked Pmove progress field named zoomFov.
+            fov: session.scope_zoom.fov().unwrap_or(if zoom_mode == 2 { 80.0 } else { 50.0 }),
             time,
             yaw_deg: ps.field_f32("viewangles[1]").unwrap_or(0.0),
             // bg_weapons.h AMMO_POWERCELL=3; bg_weapons.c max=300.
@@ -1409,18 +1413,19 @@ impl App {
 
         // One table walk, not one walk per icon. The overlay may be sampled at
         // very high frame rates while tinfo itself updates comparatively slowly.
-        static TEAM_OVERLAY_ITEM_ICONS: std::sync::OnceLock<(
-            HashMap<i32, String>,
-            HashMap<i32, String>,
-        )> = std::sync::OnceLock::new();
-        let (weapon_icons, powerup_icons_by_tag) = TEAM_OVERLAY_ITEM_ICONS.get_or_init(|| {
+        // Keyed by the active game: JK2 icons come from JK2's own item list.
+        type ItemIcons = std::sync::OnceLock<(HashMap<i32, String>, HashMap<i32, String>)>;
+        static JKA_ITEM_ICONS: ItemIcons = std::sync::OnceLock::new();
+        static JK2_ITEM_ICONS: ItemIcons = std::sync::OnceLock::new();
+        let icons = if jka_assets::pk3::active_jk2().is_some() { &JK2_ITEM_ICONS } else { &JKA_ITEM_ICONS };
+        let (weapon_icons, powerup_icons_by_tag) = icons.get_or_init(|| {
             let mut weapon_icons = HashMap::<i32, String>::new();
             let mut powerup_icons_by_tag = HashMap::<i32, String>::new();
-            for index in 1..jka_movement::bg_item_count() {
-                let Some(item) = jka_movement::bg_item(index) else {
+            for index in 1..crate::items::item_count() {
+                let Some(item) = crate::items::item(index) else {
                     continue;
                 };
-                let Some(icon) = jka_movement::bg_item_icon(index) else {
+                let Some(icon) = crate::items::item_icon(index) else {
                     continue;
                 };
                 if item.item_type == 1 {

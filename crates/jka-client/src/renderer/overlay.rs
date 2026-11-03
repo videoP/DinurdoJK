@@ -36,6 +36,164 @@ pub(in crate::renderer) struct PendingUiLevelshot {
 pub(in crate::renderer) struct ScreenFxTexture {
     pub(in crate::renderer) _image: GpuImage,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
+    pub(in crate::renderer) encoded_bind_group: wgpu::BindGroup,
+}
+
+/// Keep authored 2D stages and implicit atlas materials in the same encoded
+/// sampling domain. The alternate view aliases the original texture allocation.
+fn encoded_image_view(image: &GpuImage) -> wgpu::TextureView {
+    if image._texture.format() == wgpu::TextureFormat::Rgba8UnormSrgb {
+        image._texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            ..Default::default()
+        })
+    } else {
+        image.view.clone()
+    }
+}
+
+pub(in crate::renderer) fn create_ui_texture_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    images: [&GpuImage; 9],
+    encoded: bool,
+) -> wgpu::BindGroup {
+    let views: Vec<_> = images.iter().map(|image| {
+        if encoded { encoded_image_view(image) } else { image.view.clone() }
+    }).collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(if encoded { "JKA encoded UI textures" } else { "JKA UI textures" }),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&views[3]) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[4]) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&views[5]) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&views[6]) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&views[7]) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&views[8]) },
+        ],
+    })
+}
+
+/// Rhai HUD image jobs use the existing priority-based asset pool, never a
+/// dedicated thread. Both caches are scoped to this renderer/game mount and
+/// are dropped when the extension HUD or active game is reset.
+pub(in crate::renderer) struct UiExtImageLoader {
+    base: PathBuf,
+    game: Option<PathBuf>,
+    results_tx: std::sync::mpsc::Sender<UiExtImageResult>,
+    results: std::sync::mpsc::Receiver<UiExtImageResult>,
+    cache: Arc<std::sync::Mutex<UiExtImageCache>>,
+    pending: bool,
+}
+
+#[derive(Default)]
+struct UiExtImageCache {
+    parsed: bool,
+    shaders: Option<std::collections::BTreeMap<String, jka_assets::shader::Shader>>,
+    /// Previously decoded authored stages: do not reparse/redecode an icon.
+    stages: HashMap<String, Vec<crate::fx::draw::FxMaterial>>,
+}
+
+struct UiExtImageResult {
+    wanted: Vec<String>,
+    first_new: usize,
+    pixels: Vec<Option<Vec<u8>>>,
+    shader_flags: Vec<bool>,
+    shader_stages: Vec<(usize, Vec<crate::fx::draw::FxMaterial>)>,
+}
+
+impl UiExtImageLoader {
+    fn start(base: PathBuf, game: Option<PathBuf>) -> Self {
+        let (results_tx, results) = std::sync::mpsc::channel();
+        Self {
+            base, game, results_tx, results,
+            cache: Arc::new(std::sync::Mutex::new(UiExtImageCache::default())),
+            pending: false,
+        }
+    }
+
+    /// Submit CPU-only work without waiting. If the queue is full, leave the
+    /// request unmarked so the renderer can retry on its next UI update.
+    fn enqueue(&mut self, wanted: Vec<String>, first_new: usize) -> bool {
+        let Some(pool) = crate::asset_jobs::pool() else { return false; };
+        let cache = Arc::downgrade(&self.cache);
+        let base = self.base.clone();
+        let game = self.game.clone();
+        let complete = self.results_tx.clone();
+        let queued = pool.submit_task(crate::asset_jobs::AssetPriority::Medium, move || {
+            // A HUD unload or game switch invalidates its cache and cancels
+            // queued work before any costly shader-library parsing begins.
+            let Some(cache) = cache.upgrade() else { return; };
+            if first_new > wanted.len() { return; }
+            let mut assets = match AssetSearchPath::open_game(&base, game.as_deref()) {
+                Ok(assets) => assets,
+                Err(err) => {
+                    eprintln!("Extension HUD image asset search: {err}");
+                    let count = wanted.len().saturating_sub(first_new);
+                    let _ = complete.send(UiExtImageResult {
+                        wanted, first_new,
+                        pixels: vec![None; count],
+                        shader_flags: vec![false; count],
+                        shader_stages: Vec::new(),
+                    });
+                    return;
+                }
+            };
+            let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !cache.parsed {
+                let started = Instant::now();
+                let mut warnings = Vec::new();
+                cache.shaders = match crate::materials::shader_library(
+                    &mut assets, &mut warnings, false,
+                ) {
+                    Ok((library, _)) => Some(library),
+                    Err(err) => { eprintln!("Extension HUD shader library: {err}"); None }
+                };
+                cache.parsed = true;
+                rverbose!(1, "UI extension shader library parsed on asset worker in {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1000.0);
+                for warning in warnings {
+                    rverbose!(2, "Extension HUD shader library: {warning}");
+                }
+            }
+            let (pixels, shader_flags) = decode_ui_extension_image_cells(
+                &mut assets, cache.shaders.as_ref(), &wanted[first_new..],
+            );
+            let mut shader_stages = Vec::new();
+            let mut stage_resolver: Option<crate::cgame::entity_presenter::EntityPresenter> = None;
+            for (offset, &authored) in shader_flags.iter().enumerate() {
+                if !authored { continue; }
+                let name = &wanted[first_new + offset];
+                if !cache.stages.contains_key(name) {
+                    if stage_resolver.is_none() {
+                        stage_resolver = AssetSearchPath::open_game(&base, game.as_deref())
+                            .ok().and_then(|assets|
+                                crate::cgame::entity_presenter::EntityPresenter::new(assets, false).ok());
+                    }
+                    let stages = stage_resolver.as_mut()
+                        .and_then(|resolver| resolver.fx_material_stages_if_present(name))
+                        .unwrap_or_default();
+                    cache.stages.insert(name.clone(), stages);
+                }
+                shader_stages.push((
+                    ui::ICON_NAMES.len() + first_new + offset,
+                    cache.stages.get(name).cloned().unwrap_or_default(),
+                ));
+            }
+            drop(cache);
+            let _ = complete.send(UiExtImageResult {
+                wanted, first_new, pixels, shader_flags, shader_stages,
+            });
+        });
+        if queued { self.pending = true; }
+        queued
+    }
 }
 
 impl Renderer {
@@ -145,52 +303,15 @@ impl Renderer {
         } else {
             &self._ui_splash
         };
-        self.ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA UI font bind group"),
-            layout: &self.ui_texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self._ui_font_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_small_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&splash.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_keys.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_icons.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_team_icons.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_ext_images.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_clean_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(&self._ui_avatars.view),
-                },
-            ],
-        });
+        let images = [
+            &self._ui_font, &self._ui_small_font, splash, &self._ui_keys,
+            &self._ui_icons, &self._ui_team_icons, &self._ui_ext_images,
+            &self._ui_clean_font, &self._ui_avatars,
+        ];
+        self.ui_bind_group = create_ui_texture_group(
+            &self.device, &self.ui_texture_layout, &self._ui_font_sampler, images, false);
+        self.ui_encoded_bind_group = create_ui_texture_group(
+            &self.device, &self.ui_texture_layout, &self._ui_font_sampler, images, true);
     }
 
     /// Bind the icon atlas the first time a draw list wants it: the lagometer's
@@ -434,78 +555,113 @@ impl Renderer {
         true
     }
 
-    /// Keep the extension image atlas in step with `ui_state.extension_images`.
-    ///
-    /// The slot list only grows while an extension is loaded, so this loads just
-    /// the images that are new and writes each into its own cell: nothing already
-    /// on screen is touched, and no frame ever re-reads the whole set from the
-    /// game files. A list that is not an extension of the last one (extensions
-    /// unloaded, or reloaded with different art) starts over with a blank atlas.
+    /// Resolve Rhai HUD assets off-thread. First-use shader-library parsing and
+    /// texture decoding never block a frame. The existing atlas and stable
+    /// slots remain visible until each background batch is ready for upload.
     pub(in crate::renderer) fn sync_ui_extension_images(&mut self) {
-        if self.ui_state.extension_images == self.ui_ext_image_key {
-            return;
-        }
-        let started = Instant::now();
         let wanted = self.ui_state.extension_images.clone();
         if wanted.is_empty() {
-            self._ui_ext_images = upload_texture(
-                &self.device,
-                &self.queue,
-                &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
-            );
-            self.ui_ext_image_key.clear();
-            self.ui_state.extension_shader_flags.clear();
-            self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
-            self.rebuild_ui_bind_group();
+            self.ui_ext_image_loader = None;
+            if !self.ui_ext_image_key.is_empty() {
+                self._ui_ext_images = upload_texture(
+                    &self.device, &self.queue,
+                    &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
+                );
+                self.ui_ext_image_key.clear();
+                self.ui_state.extension_shader_flags.clear();
+                self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
+                self.rebuild_ui_bind_group();
+            }
             return;
         }
-        if self.ui_ext_image_key.is_empty() || !wanted.starts_with(&self.ui_ext_image_key) {
-            self._ui_ext_images =
-                upload_texture(&self.device, &self.queue, &blank_ui_extension_atlas());
+
+        // A non-prefix update is a full HUD reload, not a request to reassign
+        // existing cell indices. Results from the old request are discarded.
+        if !wanted.starts_with(&self.ui_ext_image_key) {
+            self._ui_ext_images = upload_texture(
+                &self.device, &self.queue, &blank_ui_extension_atlas(),
+            );
             self.ui_ext_image_key.clear();
             self.ui_state.extension_shader_flags.clear();
             self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
             self.rebuild_ui_bind_group();
         }
-        let first_new = self.ui_ext_image_key.len();
-        let (cells, shader_flags) = load_ui_extension_images_with_shaders(
-            &self.base,
-            self.detail_texture_game.as_deref(),
-            &wanted[first_new..],
-        );
-        self.ui_state.extension_shader_flags.extend(shader_flags);
-        let cell = ui::EXT_IMAGE_CELL;
-        for (offset, pixels) in cells.iter().enumerate() {
-            let Some(pixels) = pixels else { continue };
-            let index = (first_new + offset) as u32;
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self._ui_ext_images._texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: (index % ui::EXT_IMAGE_COLUMNS) * cell,
-                        y: (index / ui::EXT_IMAGE_COLUMNS) * cell,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(cell * 4),
-                    rows_per_image: Some(cell),
-                },
-                wgpu::Extent3d { width: cell, height: cell, depth_or_array_layers: 1 },
-            );
+
+        let completed = self.ui_ext_image_loader.as_mut().and_then(|loader| {
+            match loader.results.try_recv() {
+                Ok(batch) => { loader.pending = false; Some(batch) }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    loader.pending = false;
+                    None
+                }
+            }
+        });
+        if let Some(batch) = completed {
+            if batch.first_new == self.ui_ext_image_key.len()
+                && wanted.starts_with(&batch.wanted)
+            {
+                let started = Instant::now();
+                let cell = ui::EXT_IMAGE_CELL;
+                for (offset, pixels) in batch.pixels.iter().enumerate() {
+                    let Some(pixels) = pixels else { continue };
+                    let index = (batch.first_new + offset) as u32;
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self._ui_ext_images._texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: (index % ui::EXT_IMAGE_COLUMNS) * cell,
+                                y: (index / ui::EXT_IMAGE_COLUMNS) * cell,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        pixels,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(cell * 4),
+                            rows_per_image: Some(cell),
+                        },
+                        wgpu::Extent3d { width: cell, height: cell, depth_or_array_layers: 1 },
+                    );
+                }
+                self.ui_state.extension_shader_flags.extend(batch.shader_flags);
+                for (index, stages) in batch.shader_stages {
+                    self.ui_icon_shader_materials.insert(index, stages);
+                }
+                self.ui_ext_image_key = batch.wanted;
+                // These vertices were built when the new shader flags were not
+                // yet available; retag them now for the authored-stage path.
+                self.rebuild_dynamic_ui();
+                rverbose!(1, "UI extension images: {} async-loaded, upload {:.2} ms ({} total)",
+                    batch.pixels.len(), started.elapsed().as_secs_f64() * 1000.0,
+                    self.ui_ext_image_key.len());
+            }
         }
-        rverbose!(
-            1,
-            "UI extension images: {} new in {:.1} ms ({} total)",
-            wanted.len() - first_new,
-            started.elapsed().as_secs_f64() * 1000.0,
-            wanted.len()
-        );
-        self.ui_ext_image_key = wanted;
+
+        if wanted == self.ui_ext_image_key { return; }
+        if self.ui_ext_image_loader.is_none() {
+            // Until the worker finishes, new HUD image slots must sample a
+            // correctly sized transparent atlas, not the startup 1x1 dummy.
+            if self.ui_ext_image_key.is_empty() {
+                self._ui_ext_images = upload_texture(
+                    &self.device, &self.queue, &blank_ui_extension_atlas(),
+                );
+                self.rebuild_ui_bind_group();
+            }
+            self.ui_ext_image_loader = Some(UiExtImageLoader::start(
+                self.base.clone(), self.detail_texture_game.clone(),
+            ));
+        }
+        let Some(loader) = self.ui_ext_image_loader.as_mut() else { return; };
+        if loader.pending { return; }
+        let first_new = self.ui_ext_image_key.len();
+        if !loader.enqueue(wanted, first_new) {
+            // Pool is temporarily saturated or unavailable. Retry on the next
+            // UI sync rather than blocking the render thread or losing icons.
+            rverbose!(2, "Extension HUD asset pool unavailable; retrying");
+        }
     }
 
     /// Read the movement key images and bind them. Runs once, the first time the
@@ -604,6 +760,112 @@ impl Renderer {
         self.rebuild_retained_ui();
     }
 
+    /// Encoded JKA 2D is enabled only when the destination is the *actual*
+    /// compatible SDR swapchain image. Never alias HDR, CRT, SMAA, Studio or
+    /// early-submit intermediates, and never introduce a framebuffer transfer.
+    pub(in crate::renderer) fn native_2d_encoded_surface_eligible(&self) -> bool {
+        self.hdr_output.is_none()
+            && self.offscreen_output.is_none()
+            && self.config.format.is_srgb()
+            && self.surface_unorm_alias_supported
+    }
+
+    /// Prepare both ordinary and authored shader stages together. Until all
+    /// required lazy PSOs are ready, draw the *whole* overlay with the normal
+    /// sRGB pipeline so no mixed-space stages or pipeline validation errors occur.
+    pub(in crate::renderer) fn ensure_encoded_2d_pipelines(&mut self) -> bool {
+        let format = self.config.format.remove_srgb_suffix();
+        // HardwareSceneOnly must not disable the encoded 2D target. Prepare a
+        // gamma-aware variant of BOTH the implicit HUD material and authored
+        // screen-FX stages, all targeting the same UNORM view without a copy.
+        let gamma_active = self.ui_gamma_active();
+        if gamma_active {
+            self.ensure_native_ui_gamma();
+        }
+        if gamma_active {
+            let gamma = self.ui_gamma_native.as_mut().expect("native UI gamma resources");
+            if gamma.encoded_pipeline.is_none() {
+                let key = PipelineJobKey::new("ui-encoded-hw-gamma", 0, pipeline_hash(&format));
+                if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                    gamma.encoded_pipeline = Some(pipeline);
+                } else {
+                    let device = self.device.clone();
+                    let layout = gamma.pipeline_layout.clone();
+                    let shader = gamma.shader.clone();
+                    self.pipeline_jobs.request(key, "native encoded UI + hardware gamma", move || {
+                        crate::renderer::create_ui_pipeline(&device, &layout, &shader, format)
+                    });
+                }
+            }
+            let mut needed = [None; 32];
+            for batch in self.screen_fx_batches.iter().chain(self.enemy_icon_batches.iter()) {
+                if let Some(slot) = needed.get_mut(batch.blend as usize) { *slot = Some(batch.blend); }
+            }
+            for batch in &self.ui_icon_shader_batches {
+                if let Some(slot) = needed.get_mut(batch.stage.blend as usize) { *slot = Some(batch.stage.blend); }
+            }
+            let mut all_ready = gamma.encoded_pipeline.is_some();
+            for blend in needed.into_iter().flatten() {
+                if gamma.encoded_fx_pipelines.contains_key(&blend) { continue; }
+                let key = PipelineJobKey::new("screen-fx-encoded-hw-gamma", blend as u32,
+                    pipeline_hash(&(format, blend)));
+                if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                    gamma.encoded_fx_pipelines.insert(blend, pipeline);
+                } else {
+                    let device = self.device.clone();
+                    let layout = gamma.fx_pipeline_layout.clone();
+                    let shader = gamma.fx_shader.clone();
+                    self.pipeline_jobs.request(key, "authored 2D stages + hardware gamma", move || {
+                        create_screen_fx_pipeline(&device, &layout, &shader, format, blend)
+                    });
+                    all_ready = false;
+                }
+            }
+            return all_ready;
+        }
+        if self.ui_encoded_pipeline.is_none() {
+            let key = PipelineJobKey::new("ui-encoded", 0, pipeline_hash(&format));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.ui_encoded_pipeline = Some(pipeline);
+            } else {
+                let device = self.device.clone();
+                let layout = self.ui_pipeline_layout.clone();
+                let shader = self.ui_shader.clone();
+                self.pipeline_jobs.request(key, "native UI legacy 2D blend", move || {
+                    crate::renderer::create_ui_pipeline(&device, &layout, &shader, format)
+                });
+            }
+        }
+        // Keep this allocation-free at competitive frame rates. Discover
+        // every blend variant requested by the authored materials, including
+        // variants added by future shader parsers (e.g. SCREEN blending).
+        let mut needed = [None; 32];
+        for batch in self.screen_fx_batches.iter().chain(self.enemy_icon_batches.iter()) {
+            if let Some(slot) = needed.get_mut(batch.blend as usize) { *slot = Some(batch.blend); }
+        }
+        for batch in &self.ui_icon_shader_batches {
+            if let Some(slot) = needed.get_mut(batch.stage.blend as usize) { *slot = Some(batch.stage.blend); }
+        }
+        let mut all_ready = self.ui_encoded_pipeline.is_some();
+        for blend in needed.into_iter().flatten() {
+            if self.screen_fx_encoded_pipelines.contains_key(&blend) { continue; }
+            let key = PipelineJobKey::new("screen-fx-encoded", blend as u32,
+                pipeline_hash(&(format, blend)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.screen_fx_encoded_pipelines.insert(blend, pipeline);
+            } else {
+                let device = self.device.clone();
+                let layout = self.screen_fx_pipeline_layout.clone();
+                let shader = self.screen_fx_shader.clone();
+                self.pipeline_jobs.request(key, "authored HUD legacy 2D blend", move || {
+                    create_screen_fx_pipeline(&device, &layout, &shader, format, blend)
+                });
+                all_ready = false;
+            }
+        }
+        all_ready
+    }
+
     pub(in crate::renderer) fn ensure_screen_fx_pipeline(&mut self, blend: FxBlend) {
         if self.screen_fx_pipelines.contains_key(&blend) {
             return;
@@ -646,31 +908,23 @@ impl Renderer {
         if !self.screen_fx_textures.contains_key(&key) {
             let image = upload_texture(&self.device, &self.queue, texture);
             self.baked_brightness.register(&image._texture);
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("JKA CGame screen FX bind group"),
-                layout: &self.screen_fx_texture_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&image.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(if texture.clamp {
-                            &self.screen_fx_sampler
-                        } else {
-                            &self.screen_fx_repeat_sampler
-                        }),
-                    },
-                ],
+            let sampler = if texture.clamp { &self.screen_fx_sampler } else { &self.screen_fx_repeat_sampler };
+            let make_group = |view: &wgpu::TextureView| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JKA CGame screen FX bind group"),
+                    layout: &self.screen_fx_texture_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                })
+            };
+            let bind_group = make_group(&image.view);
+            let encoded_view = encoded_image_view(&image);
+            let encoded_bind_group = make_group(&encoded_view);
+            self.screen_fx_textures.insert(key.clone(), ScreenFxTexture {
+                _image: image, bind_group, encoded_bind_group,
             });
-            self.screen_fx_textures.insert(
-                key.clone(),
-                ScreenFxTexture {
-                    _image: image,
-                    bind_group,
-                },
-            );
         }
         key
     }
@@ -1097,15 +1351,8 @@ impl Renderer {
             }
         }
         if segments.is_empty() { return; }
-        if self.ui_icon_shader_resolver.is_none() {
-            let Ok(assets) = AssetSearchPath::open_game(
-                &self.base, self.detail_texture_game.as_deref(),
-            ) else { return; };
-            match crate::cgame::entity_presenter::EntityPresenter::new(assets, false) {
-                Ok(resolver) => self.ui_icon_shader_resolver = Some(resolver),
-                Err(error) => { eprintln!("HUD shader resolver: {error}"); return; }
-            }
-        }
+        // Native authored icons still use the existing on-demand resolver;
+        // extension stages arrive pre-resolved from the HUD image worker.
         // Reuse resolved frame textures/PSOs. The resolver is never used in
         // the no-shader path, nor on subsequent frames for the same icon.
         let seconds = self.frame_time();
@@ -1120,12 +1367,23 @@ impl Renderer {
                 },
             });
             if !self.ui_icon_shader_materials.contains_key(&index) {
+                if self.ui_icon_shader_resolver.is_none() {
+                    let Ok(assets) = AssetSearchPath::open_game(
+                        &self.base, self.detail_texture_game.as_deref(),
+                    ) else { continue; };
+                    match crate::cgame::entity_presenter::EntityPresenter::new(assets, false) {
+                        Ok(resolver) => self.ui_icon_shader_resolver = Some(resolver),
+                        Err(error) => { eprintln!("HUD shader resolver: {error}"); continue; }
+                    }
+                }
                 let is_extension = index >= ui::ICON_NAMES.len();
                 let name = if is_extension {
-                    self.ui_state.extension_images.get(index - ui::ICON_NAMES.len())
-                        .map(String::as_str)
-                } else { ui::ICON_NAMES.get(index).copied() };
+                    self.ui_state.extension_images.get(index - ui::ICON_NAMES.len()).cloned()
+                } else {
+                    Some(ui::icon_name(index).into_owned()).filter(|name| !name.is_empty())
+                };
                 let Some(name) = name else { continue; };
+                let name = name.as_str();
                 let requested = if !is_extension &&
                     (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF).contains(&index)
                 { format!("{name}_na") } else { name.to_owned() };
@@ -1251,6 +1509,7 @@ impl Renderer {
         shaders: &'a HashMap<FxBlend, wgpu::RenderPipeline>,
         textures: &'a HashMap<String, ScreenFxTexture>,
         white: &'a wgpu::BindGroup,
+        encoded: bool,
     ) {
         if shader_batches.is_empty() {
             Self::draw_ui_batches(pass, ui_pipeline, ui_group,
@@ -1291,9 +1550,12 @@ impl Renderer {
                         if let Some(pipeline) = shaders.get(&batch.blend) {
                             let group = batch.texture_key.as_ref()
                                 .and_then(|key| textures.get(key))
-                                .map_or(white, |texture| &texture.bind_group);
+                                .map_or(white, |texture| if encoded { &texture.encoded_bind_group } else { &texture.bind_group });
                             pass.set_pipeline(pipeline);
                             pass.set_bind_group(0, group, &[]);
+                            if encoded {
+                                if let Some(gamma) = ui_gamma_group { pass.set_bind_group(1, gamma, &[]); }
+                            }
                             pass.draw(batch.range.clone(), 0..1);
                         }
                     }
@@ -1321,6 +1583,8 @@ impl Renderer {
         pipelines: &'a HashMap<FxBlend, wgpu::RenderPipeline>,
         textures: &'a HashMap<String, ScreenFxTexture>,
         white_bind_group: &'a wgpu::BindGroup,
+        encoded: bool,
+        encoded_gamma_group: Option<&'a wgpu::BindGroup>,
     ) {
         if vertex_count == 0 {
             return;
@@ -1334,9 +1598,10 @@ impl Renderer {
                 .texture_key
                 .as_ref()
                 .and_then(|key| textures.get(key))
-                .map_or(white_bind_group, |texture| &texture.bind_group);
+                .map_or(white_bind_group, |texture| if encoded { &texture.encoded_bind_group } else { &texture.bind_group });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
+            if let Some(gamma) = encoded_gamma_group { pass.set_bind_group(1, gamma, &[]); }
             pass.draw(batch.range.clone(), 0..1);
         }
     }
@@ -1344,7 +1609,7 @@ impl Renderer {
     /// With a menu open this runs *after* egui so the readout stays on top of
     /// the menu instead of being covered by it: these are status displays the
     /// player is usually watching while changing a setting.
-    pub(in crate::renderer) fn submit_ui_overlay(&mut self, frame_view: &wgpu::TextureView) {
+    pub(in crate::renderer) fn submit_ui_overlay(&mut self, frame_view: &wgpu::TextureView, encoded_surface: Option<&wgpu::TextureView>) {
         self.prepare_enemy_icon_shader();
         if self.enemy_icon_vertex_count == 0 && self.screen_fx_vertex_count == 0
             && self.ui_vertex_count == 0
@@ -1354,6 +1619,15 @@ impl Renderer {
         {
             return;
         }
+        let gamma_active = self.ui_gamma_active();
+        let encoded = encoded_surface.is_some();
+        let ui_gamma = if gamma_active { self.ui_gamma_native.as_ref() } else { None };
+        let encoded_gamma = if encoded { ui_gamma } else { None };
+        let encoded_gamma_group = encoded_gamma.map(|r| &r.encoded_group);
+        let ui_view = encoded_surface.unwrap_or(frame_view);
+        let ui_pipelines = if let Some(gamma) = encoded_gamma { &gamma.encoded_fx_pipelines }
+            else if encoded { &self.screen_fx_encoded_pipelines } else { &self.screen_fx_pipelines };
+        let ui_group = if encoded { &self.ui_encoded_bind_group } else { &self.ui_bind_group };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1363,7 +1637,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA UI overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: ui_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1384,22 +1658,27 @@ impl Renderer {
                 &self.screen_fx_vertex_buffer,
                 self.screen_fx_vertex_count,
                 &self.screen_fx_batches,
-                &self.screen_fx_pipelines,
+                ui_pipelines,
                 &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                &self.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
 
             // No extra scene pass: only the native UI pixels are counter-adjusted.
-            let ui_gamma = if self.ui_gamma_active() { self.ui_gamma_native.as_ref() } else { None };
-            let ui_pipeline = ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline);
-            if let Some(resources) = ui_gamma {
-                pass.set_bind_group(1, &resources.group, &[]);
+            let ui_pipeline = if let Some(gamma) = encoded_gamma {
+                gamma.encoded_pipeline.as_ref().expect("ready encoded gamma UI pipeline")
+            } else if encoded {
+                self.ui_encoded_pipeline.as_ref().expect("ready encoded UI pipeline")
+            } else {
+                ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline)
+            };
+            if let Some(group) = encoded_gamma_group.or_else(|| ui_gamma.map(|r| &r.group)) {
+                pass.set_bind_group(1, group, &[]);
             }
             Self::draw_ui_batches_shadered(
                 &mut pass,
                 ui_pipeline,
-                &self.ui_bind_group,
-                ui_gamma.map(|r| &r.group),
+                ui_group,
+                encoded_gamma_group.or_else(|| ui_gamma.map(|r| &r.group)),
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
                 &self.ui_transient_vertex_buffer,
@@ -1408,9 +1687,9 @@ impl Renderer {
                 self.ui_vertex_count,
                 &self.ui_icon_shader_buffer,
                 &self.ui_icon_shader_batches,
-                &self.screen_fx_pipelines,
+                ui_pipelines,
                 &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                &self.screen_fx_white_bind_group, encoded,
             );
             // The single enemy-info icon is a standalone authored multi-stage
             // shader. It never samples the 64x64 UI icon atlas.
@@ -1419,12 +1698,12 @@ impl Renderer {
                 &self.enemy_icon_vertex_buffer,
                 self.enemy_icon_vertex_count,
                 &self.enemy_icon_batches,
-                &self.screen_fx_pipelines,
+                ui_pipelines,
                 &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                &self.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
             if !self.egui_active {
-                self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
+                self.frame_time_graph.draw(&mut pass, ui_pipeline, ui_group);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -1896,7 +2175,9 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
             for warning in shader_warnings {
                 rverbose!(2, "UI icon shader library: {warning}");
             }
-            for (index, name) in ui::ICON_NAMES.iter().enumerate() {
+            for index in 0..ui::ICON_NAMES.len() {
+                let name = ui::icon_name(index);
+                let name = name.as_ref();
                 if name.is_empty() { continue; }
                 let requested = if (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_WEAPON_STAFF).contains(&index) {
                     format!("{name}_na")
@@ -2058,7 +2339,6 @@ pub(in crate::renderer) fn load_ui_extension_images_with_shaders(
     game: Option<&Path>,
     names: &[String],
 ) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
-    let cell = ui::EXT_IMAGE_CELL;
     let mut assets = match AssetSearchPath::open_game(base, game) {
         Ok(assets) => assets,
         Err(error) => {
@@ -2066,27 +2346,31 @@ pub(in crate::renderer) fn load_ui_extension_images_with_shaders(
             return (vec![None; names.len()], vec![false; names.len()]);
         }
     };
-    // Respect mod precedence and .oshader support exactly as native HUD icons.
     let mut warnings = Vec::new();
     let library = match crate::materials::shader_library(&mut assets, &mut warnings, false) {
         Ok((library, _)) => Some(library),
         Err(err) => { eprintln!("Extension HUD shader library: {err}"); None }
     };
     for warning in warnings { rverbose!(2, "Extension HUD shader library: {warning}"); }
-    let flags: Vec<bool> = names.iter().map(|name| library.as_ref().is_some_and(|library|
+    decode_ui_extension_image_cells(&mut assets, library.as_ref(), names)
+}
+
+/// Shared pure CPU decoding path, for the async loader and unit tests. The
+/// caller supplies a shader library parsed once for its active asset mount.
+fn decode_ui_extension_image_cells(
+    assets: &mut AssetSearchPath,
+    library: Option<&std::collections::BTreeMap<String, jka_assets::shader::Shader>>,
+    names: &[String],
+) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
+    let cell = ui::EXT_IMAGE_CELL;
+    let flags: Vec<bool> = names.iter().map(|name| library.is_some_and(|library|
         ui_icon_has_authored_shader(library, name))).collect();
     let pixels = names
         .iter().zip(flags.iter())
         .map(|(name, &authored)| {
-            if authored { return None; } // Do not decode/resize authored stages.
-
+            if authored { return None; } // Authored materials use standalone stages.
             let Some(image) = try_load_texture_asset_from_search_path(
-                &mut assets,
-                name,
-                true,
-                false,
-                true,
-                "extension HUD image",
+                assets, name, true, false, true, "extension HUD image",
             ) else {
                 eprintln!("Extension HUD image {name}: not found");
                 return None;

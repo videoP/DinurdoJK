@@ -6,6 +6,7 @@
 //! directories or the app-side generation change) and answers requests in FIFO
 //! order. The main thread only installs results.
 
+use super::jk2_demo_browser;
 use super::frontend::{
     self, AssetEntry, ProfileModelEntry, ProfileSaberEntry, SoloMapEntry,
 };
@@ -33,6 +34,9 @@ pub(super) enum CatalogRequest {
     ModelThumbnail { qpath: String },
     ConsoleFiles,
     DemoGames { token: u64 },
+    Jk2DemoFolders { token: u64, root: Option<PathBuf> },
+    Jk2DemoRecordings { token: u64, folder: PathBuf },
+    Jk2DemoDetails { token: u64, path: PathBuf },
     Demos { token: u64 },
     ChatLogs,
     ChatLogDetail { path: PathBuf },
@@ -60,6 +64,9 @@ pub(super) enum CatalogPayload {
     ModelThumbnail { qpath: String, image: Option<DecodedImage> },
     ConsoleFiles(Result<frontend::ConsoleFileCatalog, String>),
     DemoGames { token: u64, games: Result<Vec<String>, String> },
+    Jk2DemoFolders { token: u64, folders: Result<Vec<jk2_demo_browser::Folder>, String> },
+    Jk2DemoRecordings { token: u64, folder: PathBuf, entries: Result<Vec<jk2_demo_browser::Recording>, String> },
+    Jk2DemoDetails { token: u64, path: PathBuf, details: Result<jk2_demo_browser::Details, String> },
     Demos { token: u64, game: Option<PathBuf>, demos: Result<Vec<frontend::DemoEntry>, String> },
     ChatLogs(Result<Vec<ChatLogIndexEntry>, String>),
     ChatLogDetail { path: PathBuf, detail: Result<ChatLogDetail, String> },
@@ -201,6 +208,32 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         // potentially large recursive scan/parsing on this worker, but do not
         // pay for opening/reopening the game PK3 search path.
         match &job.request {
+            CatalogRequest::Jk2DemoFolders { token, root } => {
+                let payload = CatalogPayload::Jk2DemoFolders {
+                    token: *token,
+                    folders: jk2_demo_browser::scan_folders(root.as_deref()),
+                };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            CatalogRequest::Jk2DemoRecordings { token, folder } => {
+                let payload = CatalogPayload::Jk2DemoRecordings {
+                    token: *token,
+                    folder: folder.clone(),
+                    entries: jk2_demo_browser::scan_recordings(folder),
+                };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            CatalogRequest::Jk2DemoDetails { token, path } => {
+                let payload = CatalogPayload::Jk2DemoDetails {
+                    token: *token,
+                    path: path.clone(),
+                    details: jk2_demo_browser::inspect_recording(path),
+                };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
             CatalogRequest::DemoGames { token } => {
                 let payload = CatalogPayload::DemoGames {
                     token: *token,
@@ -275,7 +308,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error.clone()))),
                         CatalogRequest::ModelThumbnail { qpath } => Some(CatalogPayload::ModelThumbnail { qpath, image: None }),
                         CatalogRequest::ConsoleFiles => Some(CatalogPayload::ConsoleFiles(Err(error))),
-                        CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
+                        CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } | CatalogRequest::Jk2DemoFolders { .. } | CatalogRequest::Jk2DemoRecordings { .. } | CatalogRequest::Jk2DemoDetails { .. } => unreachable!("demo requests handled before VFS"),
                         // Handled before VFS open above.
                         CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => None,
                         CatalogRequest::Profile => Some(CatalogPayload::Profile(Err(error))),
@@ -312,7 +345,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
 
         let scan_started = Instant::now();
         let (label, payload) = match job.request {
-            CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
+            CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } | CatalogRequest::Jk2DemoFolders { .. } | CatalogRequest::Jk2DemoRecordings { .. } | CatalogRequest::Jk2DemoDetails { .. } => unreachable!("demo requests handled before VFS"),
             CatalogRequest::ConsoleFiles => (
                 "console files",
                 CatalogPayload::ConsoleFiles(Ok(frontend::scan_console_files(assets))),

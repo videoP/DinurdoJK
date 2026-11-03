@@ -3,11 +3,11 @@
 use super::StudioDemoClip;
 
 pub(super) fn same_recording(a: &StudioDemoClip, b: &StudioDemoClip) -> bool {
-    matches_recording(a, &b.name, &b.game)
+    matches_recording(a, &b.name, &b.game, b.demo_protocol)
 }
 
-pub(super) fn matches_recording(clip: &StudioDemoClip, name: &str, game: &str) -> bool {
-    clip.name.eq_ignore_ascii_case(name) && clip.game.eq_ignore_ascii_case(game)
+pub(super) fn matches_recording(clip: &StudioDemoClip, name: &str, game: &str, protocol: u8) -> bool {
+    clip.demo_protocol == protocol && clip.name.eq_ignore_ascii_case(name) && clip.game.eq_ignore_ascii_case(game)
 }
 
 fn same_recording_fade(a: &StudioDemoClip, b: &StudioDemoClip) -> bool {
@@ -68,6 +68,7 @@ pub(super) struct Candidate<'a> {
     pub index: usize,
     pub name: &'a str,
     pub game: &'a str,
+    pub protocol: u8,
     pub sampled_ms: Option<i32>,
 }
 
@@ -77,13 +78,13 @@ pub(super) fn assign(clips: &[StudioDemoClip], requests: &[usize], candidates: &
     // the incoming side of a same-recording transition.
     for (slot, &index) in requests.iter().enumerate() {
         result[slot] = candidates.iter().find(|c| c.index == index
-            && matches_recording(&clips[index], c.name, c.game)).map(|c| c.id);
+            && matches_recording(&clips[index], c.name, c.game, c.protocol)).map(|c| c.id);
     }
     for (slot, &index) in requests.iter().enumerate() {
         if result[slot].is_some() { continue; }
         let target = clips[index].source_time_ms(time.max(clips[index].start));
         result[slot] = candidates.iter().filter(|c| !result.contains(&Some(c.id))
-            && matches_recording(&clips[index], c.name, c.game))
+            && matches_recording(&clips[index], c.name, c.game, c.protocol))
             .min_by_key(|c| (c.sampled_ms.map_or(i64::MAX, |last| (i64::from(last) - i64::from(target)).abs()), c.id))
             .map(|c| c.id);
     }
@@ -94,7 +95,7 @@ pub(super) fn assign(clips: &[StudioDemoClip], requests: &[usize], candidates: &
 mod tests {
     use super::*;
     fn clip(name: &str, start: f64, end: f64) -> StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false, name: name.into(), game: String::new(), start, duration_ms: 30_000,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false, name: name.into(), game: String::new(), start, duration_ms: 30_000,
             in_ms: 0, out_ms: ((end - start) * 1000.0) as i32, speed_keys: vec![],
             transition_in: Default::default(), audio: Default::default(), layer: 0 }
     }
@@ -129,8 +130,8 @@ mod tests {
     #[test]
     fn bindings_survive_reorder_and_preserve_both_sides_of_a_fade() {
         let clips = vec![clip("a", 0.0, 3.0), clip("a", 2.0, 5.0), clip("a", 5.0, 8.0)];
-        let sources = [Candidate { id: 20, index: 2, name: "a", game: "", sampled_ms: Some(0) },
-            Candidate { id: 21, index: 1, name: "a", game: "", sampled_ms: Some(100) }];
+        let sources = [Candidate { protocol:26, id: 20, index: 2, name: "a", game: "", sampled_ms: Some(0) },
+            Candidate { protocol:26, id: 21, index: 1, name: "a", game: "", sampled_ms: Some(100) }];
         assert_eq!(assign(&clips, &[0, 1], &sources, 2.1), vec![Some(20), Some(21)]);
         let reordered = vec![clip("a", 0.0, 2.0), clip("b", 2.0, 3.0)];
         assert_eq!(assign(&reordered, &[0, 1], &sources, 0.0), vec![Some(20), None]);

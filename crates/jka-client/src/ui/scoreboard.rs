@@ -391,7 +391,7 @@ pub(crate) fn menu_layout(menu: &ScoreboardMenuUi, w: u32, h: u32) -> MenuLayout
     let (sw, sh) = (w as f32, h as f32);
     let width = 240.0 * s;
     let button_h = 34.0 * s;
-    let title_h = (if menu.confirm_kick { 56.0 } else { 36.0 }) * s;
+    let title_h = (if menu.confirm_kick { 56.0 } else if menu.detail.is_some() { 54.0 } else { 36.0 }) * s;
     let height = 8.0 * s * 2.0 + title_h + menu.actions.len() as f32 * (button_h + 3.0 * s);
     let x = (menu.anchor[0] as f32 + 6.0 * s).min(sw - width - 8.0 * s).max(8.0 * s);
     let y = (menu.anchor[1] as f32 + 6.0 * s).min(sh - height - 8.0 * s).max(8.0 * s);
@@ -642,21 +642,29 @@ pub(in crate::ui) fn build_scoreboard(
         rect_outline(out, mx, my, mw, mh, hairline, pal::RULE(), w, h);
         rect(out, mx, my, mw, (2.0 * s).max(1.0), pal::ACCENT(), w, h);
         let title_size = px(size::ROW) * 0.95;
-        let name = truncate_jka_text(&menu.name, 22);
+        let name = match &menu.title {
+            Some(title) => truncate_jka_text(title, 26),
+            None => truncate_jka_text(&menu.name, 22),
+        };
         if menu.confirm_kick {
             let heading = [popup.title[0], popup.title[1] + 2.0 * s, popup.title[2], 27.0 * s];
             let detail = [popup.title[0], popup.title[1] + 29.0 * s, popup.title[2], 22.0 * s];
             txt.draw(out, "ARE YOU SURE?", heading[0] + 8.0 * s, txt.baseline_in(heading, title_size), title_size, pal::ROSE_LIGHT());
             let target = truncate_jka_text(&format!("Vote to kick {}?", menu.name), 30);
             txt.draw(out, &target, detail[0] + 8.0 * s, txt.baseline_in(detail, px(size::META)), px(size::META), pal::TEXT());
+        } else if let Some(detail) = &menu.detail {
+            let heading = [popup.title[0], popup.title[1], popup.title[2], 27.0 * s];
+            let subheading = [popup.title[0], popup.title[1] + 27.0 * s, popup.title[2], 22.0 * s];
+            txt.draw(out, &name, heading[0] + 8.0 * s, txt.baseline_in(heading, title_size), title_size, pal::TEXT());
+            txt.draw(out, detail, subheading[0] + 8.0 * s, txt.baseline_in(subheading, px(size::META)), px(size::META), pal::ACCENT());
         } else {
             txt.draw(out, &name, popup.title[0] + 8.0 * s, txt.baseline_in(popup.title, title_size), title_size, pal::TEXT());
         }
         for (index, (&bounds, &action)) in popup.buttons.iter().zip(&menu.actions).enumerate() {
             let lit = hovered == Some(ScoreboardHit::Action(index));
             let tone = match action {
-                ScoreAction::Follow | ScoreAction::Mute | ScoreAction::Unmute | ScoreAction::CancelVoteKick => pal::ACCENT(),
                 ScoreAction::VoteKick | ScoreAction::ConfirmVoteKick | ScoreAction::ForceSpectate => pal::ROSE_LIGHT(),
+                _ => pal::ACCENT(),
             };
             if lit {
                 rect(out, bounds[0], bounds[1], bounds[2], bounds[3], pal::fade(tone, 0.22), w, h);
@@ -1177,7 +1185,7 @@ mod tests {
         let mut board = board((0..4).map(|i| entry(i, 0, i)).collect(), false);
         let row = board_layout(&board, 1920, 1080).halves[0].rows[0].0;
         let anchor = [(row[0] + 200.0) as i32, (row[1] + 4.0) as i32];
-        let menu = ScoreboardMenuUi { client: 0, name: "Player0".into(), anchor, actions: vec![ScoreAction::Mute, ScoreAction::VoteKick], confirm_kick: false };
+        let menu = ScoreboardMenuUi { client: 0, name: "Player0".into(), anchor, actions: vec![ScoreAction::Mute, ScoreAction::VoteKick], confirm_kick: false, title: None, detail: None };
         let popup = menu_layout(&menu, 1920, 1080);
         board.chrome.cursor = Some(ScoreboardCursorUi { pointer: None, hovered: None, menu: Some(menu) });
         let button = popup.buttons[1];
@@ -1185,11 +1193,24 @@ mod tests {
     }
 
     #[test]
+    fn translation_menu_has_room_for_rule_detail() {
+        let menu = ScoreboardMenuUi {
+            client: 4, name: "Acrobat".into(), anchor: [400, 300],
+            actions: vec![ScoreAction::TranslateAlways, ScoreAction::TranslateNever],
+            confirm_kick: false, title: Some("Acrobat".into()),
+            detail: Some("chat setting, AUTO".into()),
+        };
+        let layout = menu_layout(&menu, 1920, 1080);
+        assert!(layout.title[3] > 36.0 * scale(1080));
+        assert!(layout.buttons[0][1] >= layout.title[1] + layout.title[3]);
+    }
+
+    #[test]
     fn kick_confirmation_keeps_buttons_clickable() {
         let mut board = board(vec![entry(4, 0, 0)], false);
         let menu = ScoreboardMenuUi {
             client: 4, name: "Player4".into(), anchor: [400, 300],
-            actions: vec![ScoreAction::ConfirmVoteKick, ScoreAction::CancelVoteKick], confirm_kick: true,
+            actions: vec![ScoreAction::ConfirmVoteKick, ScoreAction::CancelVoteKick], confirm_kick: true, title: None, detail: None,
         };
         let popup = menu_layout(&menu, 1920, 1080);
         board.chrome.cursor = Some(ScoreboardCursorUi { pointer: None, hovered: None, menu: Some(menu) });

@@ -2262,7 +2262,7 @@ fn complex_sound_event(
             {
                 return none;
             }
-            let sounds = tables::weapon_sounds(weapon);
+            let sounds = tables::active_weapon_sounds(weapon);
             match if alt { sounds.alt_flash } else { sounds.flash } {
                 Some(qpath) => one(play(qpath, CHAN_WEAPON)),
                 None => none,
@@ -2271,6 +2271,10 @@ fn complex_sound_event(
         E::EV_CHANGE_WEAPON => {
             if duel_hides(game, number) {
                 return none;
+            }
+            // JK2 cg_event.c: cgs.media.selectSound for every weapon, saber included.
+            if jka_assets::pk3::active_jk2().is_some() {
+                return one(play(SELECT_SOUND, CHAN_AUTO));
             }
             let qpath = match tables::weapon_sounds(event.parm).select {
                 Some(select) => select,
@@ -2283,9 +2287,15 @@ fn complex_sound_event(
             if duel_hides(game, number) {
                 return none;
             }
-            let sounds = tables::weapon_sounds(event.parm);
+            // JK2 sends its own weapon number here; look it up as presented.
+            let weapon = if jka_assets::pk3::active_jk2().is_some() {
+                jka_protocol::jk2::presentation::presented_weapon(event.parm).unwrap_or(0)
+            } else {
+                event.parm
+            };
+            let sounds = tables::active_weapon_sounds(weapon);
             let qpath = if event.event == E::EV_WEAPON_CHARGE {
-                sounds.charge.or((event.parm == WP_DISRUPTOR).then_some(DISRUPTOR_ZOOM_LOOP))
+                sounds.charge.or((weapon == WP_DISRUPTOR).then_some(DISRUPTOR_ZOOM_LOOP))
             } else {
                 sounds.alt_charge
             };
@@ -2304,8 +2314,8 @@ fn complex_sound_event(
             if index < 1 && state.field_i32("isJediMaster").unwrap_or(0) != 0 {
                 return one(play(HOLOCRON_PICKUP_SOUND, CHAN_AUTO)); // a holocron most likely
             }
-            let item = jka_movement::bg_item(index);
-            let pickup = item.filter(|item| item.item_type != IT_TEAM).and_then(|_| jka_movement::bg_item_pickup_sound(index));
+            let item = crate::items::item(index);
+            let pickup = item.filter(|item| item.item_type != IT_TEAM).and_then(|_| crate::items::item_pickup_sound(index));
             match pickup {
                 Some(qpath) => {
                     let mut sound = PreparedSound::from(play(&qpath, CHAN_AUTO));
@@ -2319,7 +2329,7 @@ fn complex_sound_event(
             if local_ps(game, "duelInProgress") != 0 {
                 return none;
             }
-            match jka_movement::bg_item_pickup_sound(event.parm) {
+            match crate::items::item_pickup_sound(event.parm) {
                 Some(qpath) => local_sound(game, &qpath, CHAN_AUTO).and_then(one),
                 None => none,
             }
@@ -2687,7 +2697,7 @@ fn entity_loop(
 fn missile_loop(entity: &PresentedEntity) -> Option<LoopRequest> {
     let state = &entity.state;
     let weapon = state.field_i32("weapon").unwrap_or(0);
-    let sounds = tables::weapon_sounds(weapon);
+    let sounds = tables::active_weapon_sounds(weapon);
     let alt = state.field_i32("eFlags").unwrap_or(0) & EF_ALT_FIRING != 0;
     let qpath = if alt { sounds.alt_missile } else { sounds.missile }?;
     Some(LoopRequest { emitter: (u64::from(entity.number) << 8) | 3, qpath: qpath.to_owned(), origin: SoundOrigin::Fixed(entity.origin), volume: 1.0 })
@@ -3105,7 +3115,7 @@ mod tests {
             .map(str::to_owned),
         );
         for index in 1..80 {
-            if let Some(q) = jka_movement::bg_item_pickup_sound(index) {
+            if let Some(q) = crate::items::item_pickup_sound(index) {
                 paths.push(q);
             }
         }

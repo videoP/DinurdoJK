@@ -85,6 +85,10 @@ impl App {
     /// input) rather than opening anything.
     pub(in crate::app) fn egui_paint_needed(&self) -> bool {
         self.egui_menu_active()
+            || (self.classic_console_chat_menu_open()
+                && self.video_confirmation.is_none()
+                && self.window.is_some()
+                && self.render.is_some())
             || (self.model_placement.active
                 && self.video_confirmation.is_none()
                 && self.loading.is_none()
@@ -113,11 +117,13 @@ impl App {
     /// control rebinding needs the raw winit key/button rather than egui's
     /// logical key, so those events are handed back to the legacy handlers.
     pub(in crate::app) fn route_egui_window_event(&mut self, event: &WindowEvent) -> bool {
+        if self.native_demo_browser_event(event) { return true; }
         let confirmation = self.egui_confirmation_active();
         // Asset Viewer remains rendered behind the legacy console, but the
         // console must retain all keyboard/mouse input while it is open.
         if !confirmation && self.overlay == OverlayMode::Console && !self.console_hl2 {
-            return false;
+            // Only the chat translation popup, while open, takes pointer input.
+            return self.route_console_chat_menu_event(event);
         }
         // Keep the legacy console text editor (completion, history, search,
         // clipboard and bindings) authoritative. Only pointer events are sent
@@ -350,6 +356,9 @@ impl App {
         if !self.front_end { self.release_neon_chrome(); }
         self.poll_server_browser_events();
         self.poll_ui_catalog();
+        if self.front_end && self.frontend_page == FrontendPage::PlayDemo {
+            self.update_native_demo_browser();
+        }
         if self.tick_egui_confirmation() {
             return;
         }
@@ -500,6 +509,7 @@ impl App {
         if self.video.draw_entities {
             self.egui_entity_labels(ui);
         }
+        self.egui_console_chat_menu(ui.ctx());
         if !self.egui_menu_active() {
             // Noninteractive developer HUDs must not enter egui's input
             // catcher: mouse look, wheel and attacks are handled explicitly

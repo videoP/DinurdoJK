@@ -219,7 +219,7 @@ app_cvars! {
 
 
     APP_CG_CHATSTYLE {
-        runtime: CvarDef::new("cg_chatStyle", "1", "0..2",
+        runtime: CvarDef::new("cg_chatStyle", "2", "0..2",
             "Chat style: 0 classic top bar, 1 docked with modern font, 2 docked with classic JKA font.",
             CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(i32::from(app.chat_settings.style)),

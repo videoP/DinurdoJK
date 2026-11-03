@@ -1194,6 +1194,52 @@ impl DemoIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum DemoAssetKind { Map, PlayerModel, WorldModel, Npc, Saber }
+
+impl DemoAssetKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Map => "MAPS",
+            Self::PlayerModel => "PLAYER MODELS",
+            Self::WorldModel => "WORLD MODELS",
+            Self::Npc => "NPC MODELS",
+            Self::Saber => "SABERS",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DemoAssetReference {
+    pub kind: DemoAssetKind,
+    pub name: String,
+    /// Resolved against the SAME layered VFS (active mod + base + PK3s) as demo playback.
+    pub found_locally: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum DemoInspectorTab {
+    #[default]
+    Overview,
+    Players,
+    Rounds,
+    Console,
+    Assets,
+}
+
+impl DemoInspectorTab {
+    pub const ALL: [Self; 5] = [Self::Overview, Self::Players, Self::Rounds, Self::Console, Self::Assets];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "OVERVIEW",
+            Self::Players => "PLAYERS",
+            Self::Rounds => "ROUNDS & DUELS",
+            Self::Console => "CONSOLE",
+            Self::Assets => "REFERENCED ASSETS",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct DemoMetadata {
     pub size_bytes: usize,
@@ -1213,6 +1259,7 @@ pub(super) struct DemoMetadata {
     pub duels: Vec<DemoDuelStats>,
     pub console: Vec<DemoConsoleEntry>,
     pub kill_count: usize,
+    pub referenced_assets: Vec<DemoAssetReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -1484,7 +1531,74 @@ pub(super) fn index_demo_metadata(
         .ok_or_else(|| format!("{qpath}: not found"))?;
     let size_bytes = asset.bytes.len();
     let source = asset.source.display().to_string();
-    scan_demo_bytes(&asset.bytes, size_bytes, source).map(|(_, metadata)| metadata)
+    let (_, mut metadata) = scan_demo_bytes(&asset.bytes, size_bytes, source)?;
+    // The demo file may reside in an unrelated recording folder (e.g. taystjk)
+    // while its embedded fs_game is japlus. Playback switches to the *recorded*
+    // game before loading the map, so inventory checks must use that game + base,
+    // NOT the folder from which the .dm_26 was read.
+    let recorded_mod = metadata.fs_game.trim();
+    let safe_mod = !recorded_mod.is_empty()
+        && !recorded_mod.eq_ignore_ascii_case("base")
+        && !recorded_mod.contains('/') && !recorded_mod.contains('\\')
+        && Path::new(recorded_mod).components().count() == 1
+        && matches!(Path::new(recorded_mod).components().next(), Some(std::path::Component::Normal(_)));
+    let recorded_game = safe_mod.then(|| base.parent().unwrap_or(base).join(recorded_mod));
+    let mut playback_assets = AssetSearchPath::open_game(base, recorded_game.as_deref())
+        .map_err(|error| format!("demo referenced asset search: {error}"))?;
+    // Only VFS index membership is checked; BSP and model payloads are not read.
+    resolve_demo_asset_availability(&mut metadata, &mut playback_assets);
+    Ok(metadata)
+}
+
+fn record_player_asset_refs(info: &[u8], models: &mut BTreeSet<String>, sabers: &mut BTreeSet<String>) {
+    if let Some(model) = info_value(info, b"model").map(clean_quake_text) {
+        if !model.trim().is_empty() { models.insert(model); }
+    }
+    // OpenJK CG_NewClientInfo uses st and st2, not userinfo's saber1/saber2 cvars.
+    for key in [b"st".as_slice(), b"st2".as_slice()] {
+        if let Some(saber) = info_value(info, key).map(clean_quake_text) {
+            if !saber.trim().is_empty() && !saber.eq_ignore_ascii_case("none") {
+                sabers.insert(saber);
+            }
+        }
+    }
+}
+
+fn record_model_asset_ref(value: &[u8], models: &mut BTreeSet<String>, sabers: &mut BTreeSet<String>) {
+    let path = clean_quake_text(value);
+    if let Some(saber) = path.strip_prefix('@') {
+        if !saber.is_empty() { sabers.insert(saber.to_owned()); }
+    } else if path.starts_with("models/") {
+        models.insert(path);
+    }
+}
+
+fn resolve_demo_asset_availability(metadata: &mut DemoMetadata, assets: &mut AssetSearchPath) {
+    let saber_definitions = if metadata.referenced_assets.iter().any(|asset| asset.kind == DemoAssetKind::Saber) {
+        jka_assets::saber::load_saber_definitions(assets).ok()
+    } else { None };
+    for reference in &mut metadata.referenced_assets {
+        reference.found_locally = match reference.kind {
+            DemoAssetKind::Map => assets.contains_qpath(&format!("maps/{}.bsp", reference.name.trim_end_matches(".bsp"))),
+            DemoAssetKind::WorldModel | DemoAssetKind::Npc => {
+                let model = reference.name.split('*').next().unwrap_or("");
+                assets.contains_qpath(model)
+            }
+            DemoAssetKind::PlayerModel => {
+                // Player configstrings are model[/skin], not paths; JKA player
+                // models may be Ghoul2 or the legacy MD3 multipart format.
+                let name = reference.name.split('/').next().unwrap_or("").trim();
+                !name.is_empty() && [
+                    format!("models/players/{name}/model.glm"),
+                    format!("models/players/{name}/lower.md3"),
+                    format!("models/players/{name}/model.md3"),
+                    format!("models/players/{name}/source_model.json"),
+                ].iter().any(|path| assets.contains_qpath(path))
+            }
+            DemoAssetKind::Saber => saber_definitions.as_ref()
+                .is_some_and(|definitions| definitions.get(&reference.name).is_some()),
+        };
+    }
 }
 
 pub(super) fn build_demo_index(bytes: &[u8]) -> Result<DemoIndex, String> {
@@ -1526,6 +1640,10 @@ fn scan_demo_bytes(
     let mut transient_notices = Vec::<(i32, DemoConsoleKind, String)>::new();
     let mut scoreboards = Vec::<(i32, [i32; 2], Vec<DemoScoreEntry>)>::new();
     let mut kill_count = 0usize;
+    let mut player_model_refs = BTreeSet::<String>::new();
+    let mut model_qpath_refs = BTreeSet::<String>::new();
+    let mut saber_refs = BTreeSet::<String>::new();
+    let mut npc_qpath_refs = BTreeSet::<String>::new();
     let mut kill_markers = Vec::<DemoKillMarker>::new();
     let mut previous_event = [0i32; MAX_GENTITIES];
     let mut previous_present = [false; MAX_GENTITIES];
@@ -1558,6 +1676,13 @@ fn scan_demo_bytes(
             match event {
                 ServerMessageEvent::Gamestate { client_number, .. } => {
                     configstrings = decoder.configstrings.clone();
+                    for (&index, value) in &configstrings {
+                        if (CS_PLAYERS..CS_PLAYERS + 32).contains(&index) {
+                            record_player_asset_refs(value, &mut player_model_refs, &mut saber_refs);
+                        } else if (crate::cgame::CS_MODELS..crate::cgame::CS_SOUNDS).contains(&index) {
+                            record_model_asset_ref(value, &mut model_qpath_refs, &mut saber_refs);
+                        }
+                    }
                     recorded_client_num.get_or_insert(client_number);
                     pending_roster_refresh = true;
                     pending_map = decoder.map_name();
@@ -1638,6 +1763,11 @@ fn scan_demo_bytes(
                             if let Ok(index) = u16::try_from(index) {
                                 let value = args[2..].join(&b' ');
                                 configstrings.insert(index, value.clone());
+                                if (CS_PLAYERS..CS_PLAYERS + 32).contains(&index) {
+                                    record_player_asset_refs(&value, &mut player_model_refs, &mut saber_refs);
+                                } else if (crate::cgame::CS_MODELS..crate::cgame::CS_SOUNDS).contains(&index) {
+                                    record_model_asset_ref(&value, &mut model_qpath_refs, &mut saber_refs);
+                                }
                                 if index >= CS_PLAYERS && index < CS_PLAYERS + 32 {
                                     let slot = usize::from(index - CS_PLAYERS);
                                     update_player_slot(slot, &value, server_time, &mut active_players, &mut player_accum);
@@ -1767,6 +1897,19 @@ fn scan_demo_bytes(
                         if entity >= MAX_GENTITIES { continue; }
                         seen[entity] = true;
                         let entity_type = state.field_i32("eType").unwrap_or(0);
+                        if entity_type == crate::cgame::ET_NPC {
+                            if let Some(index) = state.field_i32("modelindex")
+                                .and_then(|value| u16::try_from(value).ok()) {
+                                if let Some(key) = crate::cgame::CS_MODELS.checked_add(index)
+                                    .filter(|&key| key < crate::cgame::CS_SOUNDS)
+                                {
+                                    if let Some(path) = configstrings.get(&key) {
+                                        let path = clean_quake_text(path);
+                                        if path.starts_with("models/") { npc_qpath_refs.insert(path); }
+                                    }
+                                }
+                            }
+                        }
                         let event_only = entity_type > ET_EVENTS;
                         let raw_event = if event_only {
                             entity_type - ET_EVENTS
@@ -1881,6 +2024,21 @@ fn scan_demo_bytes(
         }
     }
     let maps = map_usage;
+    // Preserve references seen earlier in the demo, not just the final gamestate.
+    // A QPath can appear in CS_MODELS for an NPC and a generic object; group
+    // actual ET_NPC references under NPCs instead of duplicating them.
+    let mut referenced_assets = Vec::<DemoAssetReference>::new();
+    let mut add_refs = |kind: DemoAssetKind, names: BTreeSet<String>| {
+        for name in names {
+            referenced_assets.push(DemoAssetReference { kind, name, found_locally: false });
+        }
+    };
+    add_refs(DemoAssetKind::Map, maps.iter().map(|map| map.map_name.clone()).collect());
+    add_refs(DemoAssetKind::PlayerModel, player_model_refs);
+    for npc in &npc_qpath_refs { model_qpath_refs.remove(npc); }
+    add_refs(DemoAssetKind::WorldModel, model_qpath_refs);
+    add_refs(DemoAssetKind::Npc, npc_qpath_refs);
+    add_refs(DemoAssetKind::Saber, saber_refs);
     for round in &mut rounds {
         round.start_ms = round.start_ms.saturating_sub(first).max(0);
     }
@@ -1972,6 +2130,7 @@ fn scan_demo_bytes(
         duels,
         console,
         kill_count,
+        referenced_assets,
     }))
 }
 
@@ -2196,5 +2355,35 @@ mod profile_rgb_catalog_tests {
         assert!(skins.contains(&"test/rgbalt"));
         assert!(skins.contains(&"weequay/sp"));
         assert!(skins.contains(&"test/hidden"));
+    }
+}
+
+#[cfg(test)]
+mod demo_referenced_asset_tests {
+    use super::*;
+
+    #[test]
+    fn player_references_use_wire_model_and_saber_keys() {
+        let mut models = BTreeSet::new();
+        let mut sabers = BTreeSet::new();
+        record_player_asset_refs(br"\n\Tester\model\jedi/blue\st\single_1\st2\single_2", &mut models, &mut sabers);
+        assert!(models.contains("jedi/blue"));
+        assert!(sabers.contains("single_1"));
+        assert!(sabers.contains("single_2"));
+        // Empty and unset st slots must not masquerade as required files.
+        record_player_asset_refs(br"\n\Tester\model\kyle/default\st\none", &mut models, &mut sabers);
+        assert!(!sabers.contains("none"));
+    }
+
+    #[test]
+    fn model_configstrings_separate_named_sabers_from_qpaths() {
+        let mut models = BTreeSet::new();
+        let mut sabers = BTreeSet::new();
+        record_model_asset_ref(b"models/players/wampa/model.glm*default", &mut models, &mut sabers);
+        record_model_asset_ref(b"@desann", &mut models, &mut sabers);
+        record_model_asset_ref(b"*1", &mut models, &mut sabers);
+        assert!(models.contains("models/players/wampa/model.glm*default"));
+        assert!(!models.contains("*1"));
+        assert!(sabers.contains("desann"));
     }
 }

@@ -3,7 +3,7 @@ use crate::app::{
     config, egui_pages, hitch, mpsc, normalize_anti_aliasing, quality, scene, server_browser,
     spawn_map_loader, ui, ui_catalog, App, Arc, AssetFilter, BTreeMap, BindKey, Bindings,
     BrowserUiState, Camera, ChatLogRangeFilter, ChatMode, ClientInfo, ConsoleSize,
-    DemoConsoleFilter, DemoViewMode, EntityGraphUi, ShaderRemapUi, EventLoopProxy, ForcedPlayerModels,
+    DemoConsoleFilter, DemoInspectorTab, DemoViewMode, EntityGraphUi, ShaderRemapUi, EventLoopProxy, ForcedPlayerModels,
     FrontendPage, HashMap, HashSet, Instant, KeyCode, MapLoadingState, ModifiersState, OverlayMode,
     PathBuf, PerfStats, PhysicsMapMesh, ProfileStudioCamera, SpectatorCameraState, ThirdPersonCameraState,
     UserEvent, VecDeque, VideoSection, VideoSettings, ViewLatchMode,
@@ -105,6 +105,14 @@ impl App {
         let mut server_browser =
             BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
         server_browser.apply_filters_string(&presentation.server_filters);
+        let other_server_browsers = [
+            server_browser::BrowserProtocol::Jk2_102,
+            server_browser::BrowserProtocol::Jk2_104,
+        ].map(|protocol| BrowserUiState::new_for_protocol(
+            &settings_dir,
+            protocol.default_masters().map(str::to_owned),
+            protocol,
+        ));
         let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
         let (race_ghost_tx, race_ghost_rx) = mpsc::channel();
         let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();
@@ -318,9 +326,17 @@ impl App {
             render_studio: Default::default(),
             render_studio_world_compositor: None,
             demo_entries: Vec::new(),
+            demo_browser_jk2: false,
+            jk2_demo_browser: Default::default(),
             demo_catalog_pending: false,
             demo_catalog_generation: 0,
             demo_selected: 0,
+            demo_inspector_tab: DemoInspectorTab::default(),
+            demo_assets_missing_only: false,
+            demo_native_list_scroll: 0,
+            demo_native_detail_scroll: 0,
+            demo_native_folder_open: false,
+            demo_native_folder_scroll: 0,
             demo_game_choices: Vec::new(),
             demo_game_filter: String::new(),
             demo_catalog_loaded: false,
@@ -375,6 +391,7 @@ impl App {
             server_browser_tx,
             server_browser_rx,
             server_browser,
+            other_server_browsers,
             game_session: None,
             water_wetness: crate::water_wetness::WetnessTracker::default(),
             siege_dialog: None,
@@ -410,6 +427,7 @@ impl App {
             camera_edit: None,
             vote_menu: egui_pages::VoteMenuState::default(),
             live_input: crate::net::LiveInput::default(),
+            jk2_forcepowers: None,
             emote_net_rx: crate::emote_net::Receiver::default(),
             live_buttons: HashSet::new(),
             live_button_sources: HashMap::new(),
@@ -588,6 +606,7 @@ impl App {
             console_lines: VecDeque::with_capacity(1024),
             console_line_kinds: VecDeque::with_capacity(1024),
             console_path_links: VecDeque::with_capacity(1024),
+            console_chat_ids: VecDeque::with_capacity(1024),
             console_timestamps: presentation.console_timestamps,
             console_notify_time: crate::app::cvar_registry().find("con_notifytime").expect("notify-time definition").entry.default.parse().expect("notify-time default"),
             console_notify_lines: presentation.console_notify_lines,
@@ -669,6 +688,7 @@ impl App {
             chat_input: String::new(),
             chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
+            chat_translation: crate::app::chat_translation::ChatTranslation::new(presentation.chat_translate.clone()),
             last_chat_refresh: Instant::now(),
             console_notify: VecDeque::with_capacity(64),
             last_console_notify_refresh: Instant::now(),

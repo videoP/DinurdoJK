@@ -9,6 +9,64 @@ pub(in crate::app) enum PlayerPresentationInput {
     Remote { angles: [f32; 3], no_predict: bool },
 }
 
+// TaystJK cg_view.c::CG_CalcFov owns `zoomFov` on the CGame side. The
+// playerState only networks zoomMode/zoomLocked (and an approximate hold
+// duration in zoomFov); it does NOT network the per-frame optical FOV.
+// Keep that presentation value apart from native Pmove and reuse it for
+// both the scene projection and CG_DrawZoomMask artwork.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::app) struct ScopeZoomState {
+    last: Option<ScopeZoomSample>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeZoomSample {
+    client_num: i32,
+    spawn_count: i32,
+    mode: i32,
+    fov: f32,
+    time_ms: f64,
+}
+
+impl ScopeZoomState {
+    pub(in crate::app) fn fov(self) -> Option<f32> {
+        self.last.filter(|last| last.mode == 1 || last.mode == 2)
+            .map(|last| last.fov)
+    }
+
+    pub(in crate::app) fn update(&mut self, ps: &jka_protocol::server::PlayerState,
+        time_ms: f64, reset: bool)
+    {
+        const MAX_ZOOM_FOV: f32 = 3.0; // TaystJK cg_local.h
+        let client_num = ps.field_i32("clientNum").unwrap_or(0);
+        let spawn_count = ps.persistant[4]; // PERS_SPAWN_COUNT
+        let mode = ps.field_i32("zoomMode").unwrap_or(0);
+        let locked = ps.field_i32("zoomLocked").unwrap_or(0) != 0;
+        let previous = self.last.filter(|last| !reset && time_ms.is_finite()
+            && time_ms >= last.time_ms && time_ms - last.time_ms <= 250.0
+            && client_num == last.client_num && spawn_count == last.spawn_count
+            && mode == last.mode);
+        let delta_ms = previous.map_or(0.0, |last| (time_ms - last.time_ms) as f32);
+        let fov = match mode {
+            1 => {
+                if let Some(last) = previous {
+                    if locked { last.fov } else { (last.fov.min(50.0) - delta_ms * 0.035).max(MAX_ZOOM_FOV) }
+                } else if locked {
+                    // Demo join/seek can start with an already locked scope.
+                    // Pmove's *networked* zoomFov is the held-time progress,
+                    // not the actual optical FOV (50 - progress).
+                    let progress = ps.field_f32("zoomFov").unwrap_or(0.0);
+                    if progress.is_finite() { (50.0 - progress).clamp(MAX_ZOOM_FOV, 50.0) }
+                    else { 50.0 }
+                } else { 50.0 }
+            }
+            2 => previous.map_or(80.0, |last| (last.fov - delta_ms * 0.075).max(40.0)),
+            _ => 80.0, // TaystJK resets zoomFov outside the weapon/binocular mode.
+        };
+        self.last = Some(ScopeZoomSample { client_num, spawn_count, mode, fov, time_ms });
+    }
+}
+
 impl GameSession {
     /// Rust counterpart of cg.predictedPlayerState for read-only consumers.
     pub(in crate::app) fn presented_player_state(
@@ -52,6 +110,7 @@ impl GameSession {
             presentation_time_ms,
             teleported || self.seeking_demo,
         );
+        self.scope_zoom.update(&ps, presentation_time_ms, teleported || self.seeking_demo);
         self.presented_player_state = Some(ps);
         Some(sample)
     }
@@ -357,6 +416,68 @@ mod tests {
     use jka_protocol::server::PlayerState;
 
     #[test]
+    fn disruptor_optical_zoom_animates_and_locks_without_using_networked_fov() {
+        let mut ps = PlayerState::default();
+        let mut zoom = ScopeZoomState::default();
+        ps.set_field_bits("zoomMode", 1);
+        ps.set_field_bits("zoomFov", 80.0f32.to_bits());
+        zoom.update(&ps, 1000.0, false);
+        assert_eq!(zoom.fov(), Some(50.0));
+        zoom.update(&ps, 1200.0, false);
+        assert!((zoom.fov().unwrap() - 43.0).abs() < 0.001);
+        ps.set_field_bits("zoomLocked", 1);
+        ps.set_field_bits("zoomFov", 7.0f32.to_bits());
+        zoom.update(&ps, 1250.0, false);
+        assert!((zoom.fov().unwrap() - 43.0).abs() < 0.001);
+        zoom.update(&ps, 1350.0, false);
+        assert!((zoom.fov().unwrap() - 43.0).abs() < 0.001);
+        ps.set_field_bits("zoomMode", 0);
+        zoom.update(&ps, 1400.0, false);
+        assert!(zoom.fov().is_none());
+        ps.set_field_bits("zoomMode", 1);
+        ps.set_field_bits("zoomLocked", 0);
+        zoom.update(&ps, 1500.0, false);
+        assert_eq!(zoom.fov(), Some(50.0));
+    }
+
+    #[test]
+    fn zoom_initializes_locked_demo_and_resets_on_seek_or_pov_change() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("zoomMode", 1);
+        ps.set_field_bits("zoomLocked", 1);
+        ps.set_field_bits("zoomFov", 31.0f32.to_bits());
+        let mut zoom = ScopeZoomState::default();
+        zoom.update(&ps, 5000.0, false);
+        assert_eq!(zoom.fov(), Some(19.0));
+        ps.set_field_bits("zoomLocked", 0);
+        zoom.update(&ps, 5020.0, false);
+        assert!((zoom.fov().unwrap() - 18.3).abs() < 0.001);
+        ps.set_field_bits("clientNum", 2);
+        zoom.update(&ps, 5040.0, false);
+        assert_eq!(zoom.fov(), Some(50.0));
+        ps.set_field_bits("zoomLocked", 1);
+        zoom.update(&ps, 1000.0, true);
+        assert_eq!(zoom.fov(), Some(19.0));
+    }
+
+    #[test]
+    fn binocular_zoom_progresses_independently_of_weapon_scope() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("zoomMode", 2);
+        let mut zoom = ScopeZoomState::default();
+        zoom.update(&ps, 1000.0, false);
+        assert_eq!(zoom.fov(), Some(80.0));
+        zoom.update(&ps, 1200.0, false);
+        assert_eq!(zoom.fov(), Some(65.0));
+        zoom.update(&ps, 1400.0, false);
+        assert_eq!(zoom.fov(), Some(50.0));
+        zoom.update(&ps, 1500.0, false);
+        assert_eq!(zoom.fov(), Some(42.5));
+        zoom.update(&ps, 1550.0, false);
+        assert_eq!(zoom.fov(), Some(40.0));
+    }
+
+    #[test]
     fn spectator_crouch_and_stand_ease_camera_over_tayst_duck_time_only() {
         let mut ps = PlayerState::default();
         ps.set_field_bits("pm_type", jka_movement::PM_SPECTATOR as u32);
@@ -472,6 +593,7 @@ mod tests {
             error: [1.0, 2.0, 3.0],
             command_angles: Some([0, jka_movement::angle_to_short(15.0), 0]),
             view_forced: false,
+            hidden_entities: Vec::new(),
         }
     }
 

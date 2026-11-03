@@ -32,7 +32,7 @@ fn studio_saber_fixture() -> (StudioDemoSource, StudioDemoClip, StudioCameraKey)
     playback.seek_demo(Instant::now(), 0).unwrap();
     let source = StudioDemoSource {
         id: STUDIO_REQUEST_BIT, progress: Arc::new(Default::default()), clip_index: 0,
-        name: clip.name.clone(), game: clip.game.clone(), game_dir, playback,
+        name: clip.name.clone(), game: clip.game.clone(), demo_protocol:26, game_dir, playback,
         prepared: None, race_map: None, race_map_job: None, race_map_runners: Vec::new(),
         race_map_reference: usize::MAX, collision: None, gpu_ready: false, failed: false,
         revision: 0, last_sample_ms: Some(0), last_viewed_client: None,

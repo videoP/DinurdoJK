@@ -23,6 +23,8 @@ use jka_protocol::{
 
 pub mod mod_support;
 pub(crate) mod jk2_prediction;
+pub(crate) mod jk2_input;
+pub(crate) use jk2_input::Jk2Frame;
 
 // ---------------------------------------------------------------- cvars --
 
@@ -209,7 +211,10 @@ impl NetworkSettings {
             ("color1", self.color1.to_string()), ("forcepowers", self.forcepowers.clone()),
             ("sex", self.sex.clone()), ("handicap", self.handicap.to_string()),
             ("password", self.password.clone()), ("team", "spectator".into()),
-            ("cg_predictItems", "0".into()), ("teamoverlay", u8::from(self.team_overlay).to_string()),
+            // jk2mv registers cg_predictItems as CVAR_USERINFO; the server
+            // only sends predictable pickup events when it is set.
+            ("cg_predictItems", u8::from(self.predict_items).to_string()),
+            ("teamoverlay", u8::from(self.team_overlay).to_string()),
         ] { set_info_value(&mut info, key.as_bytes(), value.as_bytes()); }
         info
     }
@@ -677,7 +682,7 @@ impl NetClient {
 /// holdable tag carried in `usercmd.invensel`. This queries the vendored
 /// OpenJK BG item table instead of hardcoding item indices.
 fn inventory_tag_for_item_index(index: i32) -> Option<u8> {
-    let item = jka_movement::bg_item(index)?;
+    let item = crate::items::item(index)?;
     (item.item_type == 6 && (1..12).contains(&item.tag)).then_some(item.tag as u8)
 }
 
@@ -702,6 +707,8 @@ pub struct LiveInput {
     emote_tx: Option<(u16, Instant)>,
     /// Per-axis latest press of the semantic +movement buttons.
     move_priority: [i8; 3],
+    /// JK2 connections: native CGame selection, the usercmd's source of truth.
+    jk2: Option<jk2_input::Jk2Selection>,
 }
 
 pub struct CommandButtons<'a> {
@@ -741,7 +748,8 @@ impl LiveInput {
 
     /// Immediate, ordinary server-authoritative taunt. No preamble or wait.
     pub fn queue_emote_taunt(&mut self, id: u16) -> bool {
-        if crate::emote_net_codec::payload(id).is_none() { return false; }
+        // JK2 has no GENCMD_TAUNT, and its cmd angles are never repurposed.
+        if self.jk2.is_some() || crate::emote_net_codec::payload(id).is_none() { return false; }
         self.generic_command = Some(27); // stock GENCMD_TAUNT
         self.emote_tx = Some((id, Instant::now()));
         true
@@ -776,6 +784,9 @@ impl LiveInput {
     pub fn sync_selection(&mut self, ps: &PlayerState) {
         self.delta_angles = ["delta_angles[0]", "delta_angles[1]", "delta_angles[2]"]
             .map(|field| ps.field_i32(field).unwrap_or(0));
+        if self.jk2.is_some() {
+            return; // sync_jk2 owns JK2 CGame selection
+        }
         let spawn_count = ps.persistant[4];
         if !self.weapon_initialized || spawn_count != self.last_spawn_count {
             self.set_selected_weapon(ps.field_i32("weapon").unwrap_or(0).clamp(0, 18) as u8);
@@ -803,7 +814,7 @@ impl LiveInput {
         let mut cmd = self.build_cmd(buttons, self.was_pressed, self.generic_command.unwrap_or(0));
         // Repeat only the same single-snapshot payload for a short bounded
         // interval: remote snapshot cadence is not synchronized to usercmds.
-        if let Some((id, started)) = self.emote_tx {
+        if let Some((id, started)) = self.emote_tx.filter(|_| self.jk2.is_none()) {
             if started.elapsed() <= std::time::Duration::from_millis(160) {
                 if !crate::emote_net_codec::encode_cmd_angles(&mut cmd.angles, self.delta_angles, id) {
                     self.emote_tx = None; // pitch clamp: fail safely
@@ -832,7 +843,8 @@ impl LiveInput {
             }
         }
         cmd.buttons |= was_pressed;
-        if cmd.buttons & BUTTON_FORCEPOWER != 0 && cmd.buttons & BUTTON_USE != 0 {
+        // jk2mv CL_CmdButtons has no FORCEPOWER+USE holdable remap.
+        if self.jk2.is_none() && cmd.buttons & BUTTON_FORCEPOWER != 0 && cmd.buttons & BUTTON_USE != 0 {
             cmd.buttons &= !BUTTON_FORCEPOWER;
             cmd.buttons |= BUTTON_USE_HOLDABLE;
         }
@@ -848,7 +860,7 @@ impl LiveInput {
         };
         let movespeed: i32 = if held("+speed") {
             cmd.buttons |= BUTTON_WALKING;
-            64
+            if self.jk2.is_some() { 46 } else { 64 } // jk2mv / OpenJK CL_KeyMove
         } else {
             127
         };
@@ -866,6 +878,9 @@ impl LiveInput {
         cmd.force_selection = self.force_select;
         cmd.inventory_selection = self.inventory_select;
         cmd.generic_command = generic_command;
+        if let Some(selection) = self.jk2 {
+            jk2_input::finish_move(selection, &mut cmd);
+        }
         for axis in 0..3 {
             cmd.angles[axis] = jka_movement::angle_to_short(self.view_angles[axis]);
         }
@@ -1734,6 +1749,10 @@ impl TraceWorld for PredictionWorld<'_> {
         }
         contents
     }
+
+    fn trace_model(&mut self, query: TraceQuery, index: i32) -> TraceResult {
+        self.world.trace_model(query, index)
+    }
 }
 
 /// Thin diagnostic wrapper around the real CG_Trace implementation. It does
@@ -1766,6 +1785,10 @@ impl TraceWorld for PredictionTraceWorld<'_, '_> {
 
     fn point_contents(&mut self, point: [f32; 3], pass_entity: i32) -> i32 {
         self.inner.point_contents(point, pass_entity)
+    }
+
+    fn trace_model(&mut self, query: TraceQuery, index: i32) -> TraceResult {
+        self.inner.trace_model(query, index)
     }
 }
 
@@ -1925,7 +1948,8 @@ impl Predictor {
     pub fn report_failure(&mut self, error: &str) {
         let now = Instant::now();
         if self.failure_logged_at.is_none_or(|last| now.duration_since(last).as_secs() >= 1) {
-            eprintln!("PREDICTION FAILED (falling back to interpolation): {error}");
+            // Through the miss queue, so the console and latest.log show it.
+            self.misses.push(format!("^1PREDICTION FAILED (falling back to interpolation): {error}"));
             self.failure_logged_at = Some(now);
         }
     }

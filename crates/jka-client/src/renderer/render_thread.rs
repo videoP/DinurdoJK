@@ -161,6 +161,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetTextureCompression(..) => "SetTextureCompression",
         RenderCommand::SetDetailTextures(..) => "SetDetailTextures",
         RenderCommand::SetDetailTexture { .. } => "SetDetailTexture",
+        RenderCommand::ForgetModelAssets => "ForgetModelAssets",
         RenderCommand::SetDetailTextureFade { .. } => "SetDetailTextureFade",
         RenderCommand::SetWireframeMask(..) => "SetWireframeMask",
         RenderCommand::SetShaderComplexity(..) => "SetShaderComplexity",
@@ -1431,6 +1432,7 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetDetailTexture { path, game }) => {
                         renderer.set_detail_texture(&path, game.as_deref())
                     }
+                    Ok(RenderCommand::ForgetModelAssets) => renderer.forget_model_assets(),
                     Ok(RenderCommand::SetDetailTextureFade { enabled, distance }) => {
                         renderer.set_detail_texture_fade(enabled, distance)
                     }

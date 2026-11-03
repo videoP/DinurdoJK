@@ -26,6 +26,16 @@ use crate::scene::{
     WorldGeometryChunk, LIGHTMAP_BY_VERTEX, MAX_FILE_BYTES,
 };
 
+/// Player collision by the engine of the game whose VFS the map came from:
+/// jk2mv's clip-map code for JK2, OpenJK's for JKA.
+fn map_collision_world(bytes: &[u8], jk2: bool) -> Result<jka_movement::CollisionWorld, String> {
+    if jk2 {
+        jka_movement::CollisionWorld::from_jk2_bsp(bytes)
+    } else {
+        jka_movement::CollisionWorld::from_bsp(bytes)
+    }
+}
+
 /// A shading normal is not a geometric face plane: q3map phong terrain can
 /// have varying heights even when its RBSP surface kind is Planar. Reject by
 /// a plane only when every vertex actually lies on it; otherwise use bounds.
@@ -225,9 +235,10 @@ pub(in crate::scene) fn prepare_internal(
 
         if !options.visual_only && seed_collision.is_none() {
             let collision_bytes = Arc::clone(&bytes);
+            let jk2 = assets.jk2_version().is_some();
             collision_pending = Some(jobs.submit(Task::MapCollision, move || {
                 let started = Instant::now();
-                let result = jka_movement::CollisionWorld::from_bsp(collision_bytes.as_slice());
+                let result = map_collision_world(collision_bytes.as_slice(), jk2);
                 (result, started.elapsed().as_secs_f64() * 1000.0)
             })?);
         }
@@ -292,7 +303,7 @@ pub(in crate::scene) fn prepare_internal(
         } else if let Some(hit) = seed_collision {
             Some(hit)
         } else {
-            match jka_movement::CollisionWorld::from_bsp(bytes.as_slice()) {
+            match map_collision_world(bytes.as_slice(), assets.jk2_version().is_some()) {
                 Ok(world) => Some(world),
                 Err(error) => {
                     warnings.push(format!("Player collision unavailable: {error}"));

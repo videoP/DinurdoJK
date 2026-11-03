@@ -20,9 +20,13 @@ struct VertexOut {
 @group(0) @binding(5) var ui_icons: texture_2d<f32>;
 @group(0) @binding(6) var ui_team_icons: texture_2d<f32>;
 @group(0) @binding(7) var ui_ext_images: texture_2d<f32>;
+// Clean TrueType UI font (scoreboard, kill feed), mipped; see ui::text::clean_text.
+@group(0) @binding(8) var ui_clean_font: texture_2d<f32>;
+// Every model's icon_default (scoreboard avatars); see renderer::sync_ui_avatars.
+@group(0) @binding(9) var ui_avatars: texture_2d<f32>;
 
-// HW-scene-only compensates just the native HUD pixels before the desktop ramp.
-// Gamma applies to encoded display values, *not* linear lighting values.
+// Same source controls both ordinary sRGB and encoded UNORM output.
+// In encoded mode the RGB sampled from the atlas is already encoded.
 @group(1) @binding(0) var<uniform> ui_gamma: vec4<f32>;
 fn encode_srgb(v: vec3<f32>) -> vec3<f32> {
     let c = clamp(v, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -49,6 +53,9 @@ fn vs_main(input: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    // Gradients in uniform control flow, for the mipped clean font below.
+    let uv_dx = dpdx(input.uv);
+    let uv_dy = dpdy(input.uv);
     if input.textured < 0.5 {
         return compensate_ui(input.color);
     }
@@ -69,9 +76,13 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     } else if input.textured < 6.5 {
         // Dynamic CG_DrawTeamOverlay model/weapon/powerup atlas.
         return compensate_ui(textureSampleLevel(ui_team_icons, ui_font_sampler, input.uv, 0.0) * input.color);
-    } else {
+    } else if input.textured < 7.5 {
         // Game images requested by extension hud_image() calls.
         return compensate_ui(textureSampleLevel(ui_ext_images, ui_font_sampler, input.uv, 0.0) * input.color);
+    } else if input.textured < 8.5 {
+        glyph = textureSampleGrad(ui_clean_font, ui_font_sampler, input.uv, uv_dx, uv_dy);
+    } else {
+        return compensate_ui(textureSampleLevel(ui_avatars, ui_font_sampler, input.uv, 0.0) * input.color);
     }
     return compensate_ui(vec4<f32>(input.color.rgb, input.color.a * glyph.a));
 }

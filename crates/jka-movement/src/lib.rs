@@ -321,6 +321,12 @@ impl TraceQuery {
 pub trait TraceWorld {
     fn trace(&mut self, query: TraceQuery) -> TraceResult;
     fn point_contents(&mut self, point: [f32; 3], pass_entity: i32) -> i32;
+    /// `trap_CM_BoxTrace` against inline model `*index` at its BSP position
+    /// (CG_TouchTriggerPrediction). Worlds without BSP brush models have none
+    /// to touch.
+    fn trace_model(&mut self, query: TraceQuery, _index: i32) -> TraceResult {
+        TraceResult::clear(query.end)
+    }
 }
 
 /// Read-only projection of the full native player state and latest Pmove results.

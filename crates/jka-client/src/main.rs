@@ -42,6 +42,7 @@ mod cgame;
 mod global_cosmetics;
 mod profile_wire;
 mod chat_log;
+mod chat_translation;
 mod clipboard;
 mod cloud_noise;
 mod cloud_wind;
@@ -63,6 +64,7 @@ mod extensions;
 mod fx;
 mod grass;
 mod foliage;
+mod items;
 mod japro_cg;
 mod jump_shade;
 mod keybinds;
@@ -166,6 +168,22 @@ fn apply_windows_vulkan_loader_compat() -> bool {
 #[cfg(not(windows))]
 fn apply_windows_vulkan_loader_compat() -> bool {
     false
+}
+
+/// `App` is ~145 KB. Held by value, `main` kept three App-sized slots (the
+/// `Result`, the match binding and the local), ~440 KB of the 1 MB main-thread
+/// stack, live for the whole event loop. Synchronous CGame/session builds
+/// inside window events then overflowed it (JK2 demo launch on -Faster).
+/// Never inlined, so the by-value copies are released before `run_app`.
+#[inline(never)]
+fn new_boxed_app(
+    base: PathBuf,
+    game: Option<PathBuf>,
+    source: scene::MapSource,
+    launch_map: bool,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<Box<app::App>, String> {
+    app::App::new(base, game, source, launch_map, proxy).map(Box::new)
 }
 
 fn spawn_terminal_command_reader(proxy: EventLoopProxy<UserEvent>) {
@@ -628,7 +646,7 @@ fn main() -> std::process::ExitCode {
     let startup_screenshot_metadata = options.screenshot_metadata.clone();
     let startup_demo_path = options.demo_path.clone();
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppBegin);
-    let mut application = match app::App::new(
+    let mut application = match new_boxed_app(
         options.base,
         game_dir,
         options.source,
@@ -653,7 +671,7 @@ fn main() -> std::process::ExitCode {
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppReady);
     spawn_terminal_command_reader(terminal_proxy);
 
-    match event_loop.run_app(&mut application) {
+    match event_loop.run_app(&mut *application) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Event loop failed: {error}");

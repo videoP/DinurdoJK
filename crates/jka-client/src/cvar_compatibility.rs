@@ -106,7 +106,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", swim_turn_bank: 0.7", "")
         .replace(", swim_turn_bank: 1.0", "")
         .replace(", move_lean: 0.75", "")
-        .replace(", footstep_trace: false", "");
+        .replace(", footstep_trace: false", "")
+        .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -186,6 +187,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_oceanInteractionFade ")
                     && !line.starts_with("seta r_oceanInteractionDamping ")
                     && !line.starts_with("seta r_oceanInteractionEdgeFade ")
+                    && !line.starts_with("seta cg_chatTranslate")
             })
             .map(|line| format!("{line}\n"))
             .collect::<String>();

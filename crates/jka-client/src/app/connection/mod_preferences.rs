@@ -728,6 +728,14 @@ impl App {
     pub(in crate::app) fn japro_effective_fov(&self, now: Instant) -> f32 {
         const ZOOM_OUT_TIME_MS: f32 = 100.0;
         let base = self.camera.cg_fov();
+        // CG_CalcFov gives the disruptor / binoculars priority over the
+        // independent +zoom binding. Use the same per-frame fov as the HUD.
+        // Do not apply the recorder's scope to detached demo cameras.
+        if self.current_player_state().is_some() {
+            if let Some(fov) = self.game_session.as_ref().and_then(|session| session.scope_zoom.fov()) {
+                return fov;
+            }
+        }
         let Some(transition_at) = self.japro_zoom_transition_at else {
             return base;
         };

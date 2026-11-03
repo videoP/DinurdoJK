@@ -1,5 +1,6 @@
 //! app::egui_settings module facade. Implementations are grouped by responsibility.
 mod account;
+mod chat_translation;
 mod blue_water;
 mod clouds;
 mod native_environment;

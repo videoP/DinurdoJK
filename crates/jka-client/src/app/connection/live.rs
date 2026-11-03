@@ -91,9 +91,11 @@ impl App {
                 self.console_status = format!("CONNECTING TO {}...", target.to_ascii_uppercase());
                 self.reconnect_target = Some(jk2.map_or_else(|| target.to_owned(), |v| format!("jk2://{}/{target}", v.name())));
                 if jk2.is_some() {
-                    self.push_console_line("^3JK2 live preview: spectating only; native MVSDK prediction is pending.");
+                    self.push_console_line("^3JK2: joining as spectator; use /team free (or a team) to play. Native MVSDK prediction; server owns combat results.");
                 }
                 self.live_input = crate::net::LiveInput::default();
+                self.live_input.set_jk2(jk2.is_some());
+                self.jk2_forcepowers = None;
                 self.reset_remote_emotes();
                 self.predictor.reset();
                 self.pending_frontend_map_launch = false;
@@ -273,6 +275,10 @@ impl App {
                 let ps = ps.player_state.clone();
                 self.live_input.sync_selection(&ps);
             }
+            if let Some(frame) = self.jk2_selection_frame() {
+                self.live_input.sync_jk2(&frame);
+            }
+            self.handle_jk2_force_rank();
             self.apply_out_of_ammo_changes();
             let empty = HashSet::new();
             let buttons = crate::net::CommandButtons {
@@ -414,8 +420,16 @@ impl App {
                 // socket that accepted connectResponse. Stamp it once the first
                 // active snapshot is reached so "Last visited" is meaningful.
                 if state == ConnectionState::Active {
-                    if let Some(address) = self.net.as_ref().map(|net| net.session().server()) {
-                        if let Err(error) = self.server_browser.remember_history(address) {
+                    if let Some((address, protocol)) = self.net.as_ref().map(|net| {
+                        let session = net.session();
+                        let protocol = match session.jk2_version() {
+                            Some(jka_protocol::jk2::Version::V102) => crate::server_browser::BrowserProtocol::Jk2_102,
+                            Some(jka_protocol::jk2::Version::V104) => crate::server_browser::BrowserProtocol::Jk2_104,
+                            None => crate::server_browser::BrowserProtocol::Jka,
+                        };
+                        (session.server(), protocol)
+                    }) {
+                        if let Err(error) = self.server_browser_for_mut(protocol).remember_history(address) {
                             eprintln!("SERVER BROWSER: could not save history: {error}");
                         }
                     }
@@ -910,6 +924,9 @@ impl App {
         self.game_session = Some(session);
         self.sync_shader_remap_presenters();
         self.predictor.reset();
+        if self.live_input.is_jk2() {
+            self.live_input.set_jk2(true); // CG_Init selection state
+        }
         self.local_server = None;
         println!(
             "NET: gamestate {map_name} clientNum={client_num} configstrings={}",

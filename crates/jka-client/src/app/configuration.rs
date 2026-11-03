@@ -126,10 +126,11 @@ impl App {
             killfeed: self.killfeed_settings,
             scoreboard: self.scoreboard_settings,
             chat: self.chat_settings,
+            chat_translate: self.chat_translation.settings.clone(),
             network: self.network.clone(),
             japro: self.japro_cg,
-            master_servers: self.server_browser.master_servers.clone(),
-            server_filters: self.server_browser.filters_string(),
+            master_servers: self.server_browser_for(crate::server_browser::BrowserProtocol::Jka).master_servers.clone(),
+            server_filters: self.server_browser_for(crate::server_browser::BrowserProtocol::Jka).filters_string(),
         };
         let path = self.config_path.clone();
         let fs_roots = self.fs_roots.clone();

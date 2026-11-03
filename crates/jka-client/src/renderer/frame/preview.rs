@@ -215,7 +215,7 @@ impl Renderer {
         if !clean_video_frame {
             self.submit_egui(&frame_view);
             if self.egui_active {
-                self.submit_ui_overlay(&frame_view);
+                self.submit_ui_overlay(&frame_view, None);
             }
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;

@@ -26,6 +26,10 @@ pub fn build_vertices(
         build_splash_background(&mut out, width, height, splash_size.filter(|_| ui.startup_splash_art));
         return out;
     }
+    if ui.demo_browser.is_some() {
+        crate::ui::demo_browser::build(&mut out, ui, width, height);
+        return out;
+    }
     if let Some(loading) = &ui.loading {
         build_loading_screen(&mut out, loading, width, height, splash_size);
         if let Some(progress) = &ui.shader_compile_progress {

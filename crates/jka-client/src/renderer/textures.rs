@@ -623,7 +623,11 @@ pub(in crate::renderer) fn upload_texture_picmip(
                 } else {
                     wgpu::TextureUsages::empty()
                 },
-            view_formats: &[],
+            // A native encoded-space material can reinterpret the exact same RGBA
+            // allocation without sRGB decoding. No second texture or upload.
+            view_formats: if format == wgpu::TextureFormat::Rgba8UnormSrgb {
+                &[wgpu::TextureFormat::Rgba8Unorm]
+            } else { &[] },
         },
         wgpu::util::TextureDataOrder::LayerMajor,
         bytes,
@@ -669,7 +673,11 @@ pub(in crate::renderer) fn upload_texture(
                 } else {
                     wgpu::TextureUsages::empty()
                 },
-            view_formats: &[],
+            // A native encoded-space material can reinterpret the exact same RGBA
+            // allocation without sRGB decoding. No second texture or upload.
+            view_formats: if format == wgpu::TextureFormat::Rgba8UnormSrgb {
+                &[wgpu::TextureFormat::Rgba8Unorm]
+            } else { &[] },
         },
         wgpu::util::TextureDataOrder::LayerMajor,
         bytes,

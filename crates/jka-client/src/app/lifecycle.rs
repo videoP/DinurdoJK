@@ -2759,6 +2759,26 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.overlay == OverlayMode::Console && !self.console_hl2 => {
+                // Chat rows open the translation menu (an egui popup).
+                let size = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.inner_size())
+                    .unwrap_or_default();
+                if let Some(point) = self.console_point_at(
+                    size.width,
+                    size.height,
+                    self.cursor_position.0,
+                    self.cursor_position.1,
+                ) {
+                    self.open_console_chat_menu(point.line);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } if self.overlay == OverlayMode::Console => {

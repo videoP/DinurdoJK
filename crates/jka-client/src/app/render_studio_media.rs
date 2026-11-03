@@ -85,13 +85,17 @@ impl App {
     }
     /// Store a demo's unmodified bytes. Return a project-relative media path.
     pub(in crate::app) fn studio_copy_demo_bytes(&self, source: &Path, bytes: &[u8]) -> Result<String, String> {
-        if bytes.is_empty() || bytes.len() as u64 > MAX_DEMO_BYTES {return Err("Invalid or oversized DM26 recording".into());}
+        if bytes.is_empty() || bytes.len() as u64 > MAX_DEMO_BYTES {return Err("Invalid or oversized demo recording".into());}
         let hash: [u8; 32] = Sha256::digest(bytes).into();
         let dir = self.studio_media_directory("demos");
         fs::create_dir_all(&dir).map_err(|e|e.to_string())?;
-        let target = dir.join(name_for(source, &hash, "dm_26"));
+        let ext=source.extension().and_then(|s|s.to_str()).unwrap_or("dm_26").to_ascii_lowercase();
+        if !["dm_26","dm_15","dm_16"].contains(&ext.as_str()) {
+            return Err(format!("Unsupported demo extension: {ext}"));
+        }
+        let target = dir.join(name_for(source, &hash, &ext));
         if !target.exists() {
-            let temp = target.with_extension(format!("dm_26.partial-{}", std::process::id()));
+            let temp = target.with_extension(format!("{ext}.partial-{}", std::process::id()));
             let result = (|| -> std::io::Result<()> {
                 let mut out = fs::File::create(&temp)?;
                 out.write_all(bytes)?;

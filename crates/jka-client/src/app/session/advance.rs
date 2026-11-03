@@ -299,6 +299,10 @@ impl GameSession {
             _ => None,
         };
         if let Some(prediction) = &predicted {
+            // CG_AddPacketEntities runs after prediction and skips EF_NODRAW.
+            if !prediction.hidden_entities.is_empty() {
+                self.presented_entities.retain(|e| !prediction.hidden_entities.contains(&e.number));
+            }
             // Only recorded commands commit predictable events or other discrete state.
             // Unsent render Pmove can never dispatch one-shot audio/effects.
             let now = &prediction.committed;
@@ -960,23 +964,35 @@ impl GameSession {
                             .event_presenter
                             .view_kick()
                             .offset(target_server_time, true);
-                        dynamic_models.extend(
-                            self.entity_presenter.present_view_weapon(
-                                entity.number,
-                                sample.policy.weapon,
-                                weapon_view_origin,
-                                sample.view_angles,
-                                sample.velocity,
-                                sample.bob_cycle,
-                                target_server_time,
-                                self.event_presenter
-                                    .view_kick()
-                                    .weapon_land_offset(target_server_time),
-                                hand_frame,
-                                hand_oldframe,
-                                hand_backlerp,
-                            )?,
+                        let view_weapon = self.entity_presenter.present_view_weapon(
+                            entity.number,
+                            sample.policy.weapon,
+                            weapon_view_origin,
+                            sample.view_angles,
+                            sample.velocity,
+                            sample.bob_cycle,
+                            target_server_time,
+                            self.event_presenter
+                                .view_kick()
+                                .weapon_land_offset(target_server_time),
+                            hand_frame,
+                            hand_oldframe,
+                            hand_backlerp,
                         );
+                        match view_weapon {
+                            Ok(models) => dynamic_models.extend(models),
+                            // CG_RegisterWeapon only warns about a missing weapon
+                            // model; CG_AddViewWeapon then draws nothing. A missing
+                            // asset must not end the session.
+                            Err(error) => {
+                                static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                                let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if !warned.contains(&error) {
+                                    eprintln!("VIEW WEAPON {}: {error}", sample.policy.weapon);
+                                    warned.push(error);
+                                }
+                            }
+                        }
                     }
                 }
             }

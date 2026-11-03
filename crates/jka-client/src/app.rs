@@ -5,6 +5,7 @@ pub(crate) use display::AntiAliasingChoice;
 mod killfeed;
 mod match_stats;
 mod chat_anim;
+mod chat_translation;
 mod scoreboard_cursor;
 mod capture;
 mod chat;
@@ -127,6 +128,7 @@ mod egui_telemarks;
 mod egui_theme;
 mod egui_trace_menu;
 mod frontend;
+mod jk2_demo_browser;
 mod menu_ambience;
 mod hitch;
 mod map_editor;
@@ -142,7 +144,7 @@ use egui_shader_remap::ShaderRemapUi;
 use egui_menu::VideoSection;
 use frontend::{
     build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, ChatLogRangeFilter,
-    DemoConsoleKind, DemoEntry, DemoIndex, DemoMetadata, FrontendPage, ProfileModelEntry,
+    DemoConsoleKind, DemoEntry, DemoIndex, DemoMetadata, DemoInspectorTab, FrontendPage, ProfileModelEntry,
     ProfileSaberEntry, SoloMapEntry,
 };
 use map_editor::{ExternalMapChange, MapEditor};
@@ -182,7 +184,7 @@ use crate::{
         RenderStats, ScreenshotOutput, SurfaceInspectorInfo, SurfaceInspectorSection, UserEvent,
     },
     scene::{self, SpawnPoint},
-    server_browser::{self, BrowserCommand, BrowserEvent, BrowserUiState, ServerSource},
+    server_browser::{self, BrowserCommand, BrowserRequest, BrowserProtocol, BrowserUiState, TaggedBrowserEvent, ServerSource},
     ui::{
         self, ChatMode, CloudRenderResolution, CloudType, ColorLutPreset, ConsolePathLinkUi,
         ConsoleSearchMatch, ConsoleSelection, ConsoleSize, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode, DemoKillMarkerUi,
@@ -437,9 +439,18 @@ pub struct App {
     /// Last physical viewport sent to the world compositor (command dedup).
     render_studio_world_compositor: Option<[u32; 4]>,
     demo_entries: Vec<DemoEntry>,
+    /// Play -> Demo only; Render Studio always retains the JKA catalog.
+    demo_browser_jk2: bool,
+    jk2_demo_browser: jk2_demo_browser::Browser,
     demo_catalog_pending: bool,
     demo_catalog_generation: u64,
     demo_selected: usize,
+    demo_inspector_tab: DemoInspectorTab,
+    demo_assets_missing_only: bool,
+    demo_native_list_scroll: usize,
+    demo_native_detail_scroll: usize,
+    demo_native_folder_open: bool,
+    demo_native_folder_scroll: usize,
     demo_game_choices: Vec<String>,
     /// Demo browser source directory. Empty means the base game directory.
     demo_game_filter: String,
@@ -499,9 +510,11 @@ pub struct App {
     demo_walk_used: bool,
     /// Custom previous-player bind doubles as held Freecam speed boost.
     demo_previous_held: HashSet<BindKey>,
-    server_browser_tx: Sender<BrowserCommand>,
-    server_browser_rx: Receiver<BrowserEvent>,
+    server_browser_tx: Sender<BrowserRequest>,
+    server_browser_rx: Receiver<TaggedBrowserEvent>,
     server_browser: BrowserUiState,
+    /// Inactive game browsers retain their lists, selected servers and history.
+    other_server_browsers: [BrowserUiState; 2],
     game_session: Option<GameSession>,
     /// Snapshot-rate water brush immersion and per-body-region drying.
     water_wetness: crate::water_wetness::WetnessTracker,
@@ -580,6 +593,11 @@ pub struct App {
     /// The Vote page's forms.
     vote_menu: egui_pages::VoteMenuState,
     live_input: crate::net::LiveInput,
+    /// JK2 connection only: `forcepowers` legalized for the server's `nfr`
+    /// rank, paired with the `forcepowers` value it was derived from. Sent in
+    /// JK2 userinfo only while that setting is unchanged; a new loadout is
+    /// sent as chosen and legalized again on the server's next `nfr`.
+    jk2_forcepowers: Option<(String, String)>,
     emote_net_rx: crate::emote_net::Receiver,
     /// Lowercased `+command` kbuttons currently held (IN_KeyDown state).
     live_buttons: HashSet<String>,
@@ -813,6 +831,8 @@ pub struct App {
     /// Only explicit engine metadata can populate this; console text is never parsed
     /// speculatively for path-looking strings.
     console_path_links: VecDeque<Vec<ConsolePathLink>>,
+    /// Received chat message per console row, parallel to `console_lines`.
+    console_chat_ids: VecDeque<Option<u64>>,
     console_timestamps: bool,
     /// TaystJK `con_notifytime`: seconds a recent console row remains over gameplay.
     /// Session-only, matching upstream's non-archive cvar flag.
@@ -943,6 +963,8 @@ pub struct App {
     chat_input: String,
     chat_player_completion: Option<ChatPlayerCompletionCycle>,
     chat_lines: VecDeque<ChatRecord>,
+    /// `cg_chatTranslate*`: received messages, pending and finished translations.
+    chat_translation: chat_translation::ChatTranslation,
     last_chat_refresh: Instant,
     video_selected: usize,
     /// Which section of Setup -> Video the left rail is showing.

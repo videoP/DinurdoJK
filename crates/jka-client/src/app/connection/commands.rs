@@ -98,7 +98,10 @@ impl App {
             })
             .unwrap_or_default();
         let info = if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
-            self.network.jk2_userinfo(&self.solo_client_info.model_cvar())
+            let mut info = self.network.jk2_userinfo(&self.solo_client_info.model_cvar());
+            let powers = self.jk2_effective_forcepowers();
+            jka_protocol::session::set_info_value(&mut info, b"forcepowers", powers.as_bytes());
+            info
         } else { self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info) };
         let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
         let Some(net) = self.net.as_mut() else {
@@ -265,6 +268,13 @@ impl App {
         let local_active = self.game_session.as_ref().is_some_and(|session| session.live && session.local);
         if !self.live_connected() && !local_active { return false; }
         let action = crate::app::command_registry().find(verb).and_then(|def| def.game_command);
+        if let Some(selection) = action.filter(|action| {
+            !matches!(action, GameCommand::Generic(_) | GameCommand::Flipkick | GameCommand::AmRun)
+        }) {
+            if self.execute_jk2_selection(selection, &words) {
+                return true;
+            }
+        }
         match action {
             Some(GameCommand::AmRun) => {
                 if self.active_server_mod() == crate::net::mod_support::ServerMod::Japro {
@@ -276,6 +286,13 @@ impl App {
                 return true;
             }
             Some(GameCommand::Flipkick) => { self.start_japro_flipkick(); return true; }
+            Some(GameCommand::Generic(value))
+                if self.live_input.is_jk2()
+                    && jka_protocol::jk2::presentation::wire_generic_command(value).is_none() =>
+            {
+                self.push_console_line(format!("^3{verb}: JK2 has no such generic command"));
+                return true;
+            }
             Some(GameCommand::Generic(value)) => {
                 let local_supported = local_active && self.local_server.as_ref()
                     .is_some_and(|server| server.supports_generic_command(value));

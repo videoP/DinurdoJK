@@ -205,11 +205,29 @@ struct FxWorker {
     missing: HashSet<String>, last_sample_time: Option<i32>,
 }
 
+/// The effect pinned MVSDK CGame plays where the JKA CGame plays `name`.
+/// Every other weapon, explosion, spawn and Force effect has the same path.
+fn jk2_effect_name(name: &str) -> &str {
+    let stem = name.strip_suffix(".efx").unwrap_or(name);
+    match stem {
+        // EV_SABER_HIT on a person / CG_SaberCompWork: one blood_sparks set.
+        "saber/blood_sparks_mp" | "saber/blood_sparks_25_mp" | "saber/blood_sparks_50_mp" => "saber/blood_sparks.efx",
+        // EV_SABER_HIT on anything else, and saber-on-world trace sparks.
+        "saber/saber_cut" | "sparks/spark_nosnd" => "saber/spark.efx",
+        // EFFECT_SPARK_EXPLOSION.
+        "sparks/spark_explosion" => "spark_explosion.efx",
+        _ => name,
+    }
+}
+
 impl FxWorker {
     fn effect(&mut self, name: &str) -> EffectId {
         if let Some(id) = self.ids.get(name) { return *id; }
+        let name_in = name;
+        let name = if self.assets.jk2_version().is_some() { jk2_effect_name(name) } else { name };
         let assets = &mut self.assets;
         let id = self.fx.register(name, &mut |path| assets.read(path, MAX_EFX_BYTES).ok().flatten().map(|a| a.bytes));
+        let name = name_in;
         if id == 0 && self.missing.insert(name.to_ascii_lowercase()) { println!("FX: effect {name} unavailable"); }
         self.ids.insert(name.to_owned(), id);
         id

@@ -416,9 +416,15 @@ impl Renderer {
         // roll back to the last known-good renderer instead of waiting on the
         // video confirmation timeout with a dead screen.
         if let Some((_,_,_,scene_config)) = &shared { config = scene_config.clone(); }
+        let present_config = super::context::presentation_config(&config, surface_linear_present);
+        // Cached eligibility: never consult the presentation environment or
+        // recompute the surface configuration in the per-frame HUD path.
+        let surface_unorm_alias_supported = !offscreen && !native_hdr_selected
+            && config.format.is_srgb()
+            && present_config.format == config.format.remove_srgb_suffix()
+            && present_config.view_formats.contains(&config.format);
         if !offscreen {
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let present_config = super::context::presentation_config(&config, surface_linear_present);
         rverbose!(1, "Swapchain: {:?} view {:?} alpha {:?}", present_config.format, config.format, present_config.alpha_mode);
         surface.configure(&device, &present_config);
         if let Some(error) = error_scope.pop().await {
@@ -1320,52 +1326,14 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JKA UI font bind group"),
-            layout: &ui_texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&ui_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&ui_small_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&ui_splash.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&ui_keys.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&ui_icons.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&ui_team_icons.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&ui_ext_images.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&ui_clean_font.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(&ui_avatars.view),
-                },
-            ],
-        });
+        let ui_images = [
+            &ui_font, &ui_small_font, &ui_splash, &ui_keys, &ui_icons,
+            &ui_team_icons, &ui_ext_images, &ui_clean_font, &ui_avatars,
+        ];
+        let ui_bind_group = super::overlay::create_ui_texture_group(
+            &device, &ui_texture_layout, &ui_font_sampler, ui_images, false);
+        let ui_encoded_bind_group = super::overlay::create_ui_texture_group(
+            &device, &ui_texture_layout, &ui_font_sampler, ui_images, true);
         let ui_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA retained UI vertices"),
             size: UI_BUFFER_BYTES,
@@ -2549,6 +2517,9 @@ impl Renderer {
             inspector_entity_num: None,
             blob_mark_buffer: jka_assets::bsp::MarkBuffer::default(),
             ui_pipeline,
+            ui_encoded_pipeline: None,
+            ui_shader,
+            ui_pipeline_layout,
             screen_fx_shader,
             screen_fx_texture_layout,
             screen_fx_pipeline_layout,
@@ -2556,6 +2527,7 @@ impl Renderer {
             screen_fx_repeat_sampler,
             screen_fx_white_bind_group,
             screen_fx_pipelines: HashMap::new(),
+            screen_fx_encoded_pipelines: HashMap::new(),
             screen_fx_textures: HashMap::new(),
             screen_fx_vertex_buffer,
             screen_fx_vertex_count: 0,
@@ -2574,6 +2546,7 @@ impl Renderer {
             ui_icon_shader_batches: Vec::new(),
             ui_texture_layout,
             ui_bind_group,
+            ui_encoded_bind_group,
             _ui_font: ui_font,
             _ui_small_font: ui_small_font,
             _ui_clean_font: ui_clean_font,
@@ -2591,6 +2564,7 @@ impl Renderer {
             ui_team_icon_key: Vec::new(),
             _ui_ext_images: ui_ext_images,
             ui_ext_image_key: Vec::new(),
+            ui_ext_image_loader: None,
             ui_binding_is_unknown_map: false,
             _ui_unknown_map: ui_unknown_map,
             ui_unknown_map_size,
@@ -2851,6 +2825,7 @@ impl Renderer {
             acquire_probe_acquire_ms: 0.0,
             acquire_probe_submit_ms: 0.0,
             surface_linear_present,
+            surface_unorm_alias_supported,
             early_present_target: None,
             tinted_glass_enabled: false,
             tinted_glass_debug: 0,

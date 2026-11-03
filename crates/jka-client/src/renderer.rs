@@ -953,6 +953,10 @@ struct Renderer {
     /// Scratch for the per-frame blob shadow projection (no allocation once warm).
     blob_mark_buffer: jka_assets::bsp::MarkBuffer,
     ui_pipeline: wgpu::RenderPipeline,
+    // Lazily compiled encoded-space variant of the same native UI shader.
+    ui_encoded_pipeline: Option<wgpu::RenderPipeline>,
+    ui_shader: wgpu::ShaderModule,
+    ui_pipeline_layout: wgpu::PipelineLayout,
     screen_fx_shader: wgpu::ShaderModule,
     screen_fx_texture_layout: wgpu::BindGroupLayout,
     screen_fx_pipeline_layout: wgpu::PipelineLayout,
@@ -960,6 +964,7 @@ struct Renderer {
     screen_fx_repeat_sampler: wgpu::Sampler,
     screen_fx_white_bind_group: wgpu::BindGroup,
     screen_fx_pipelines: HashMap<FxBlend, wgpu::RenderPipeline>,
+    screen_fx_encoded_pipelines: HashMap<FxBlend, wgpu::RenderPipeline>,
     screen_fx_textures: HashMap<String, ScreenFxTexture>,
     screen_fx_vertex_buffer: wgpu::Buffer,
     screen_fx_vertex_count: u32,
@@ -981,6 +986,7 @@ struct Renderer {
     ui_icon_shader_batches: Vec<overlay::UiIconShaderBatch>,
     ui_texture_layout: wgpu::BindGroupLayout,
     ui_bind_group: wgpu::BindGroup,
+    ui_encoded_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_small_font: GpuImage,
     /// Clean TrueType UI font (binding 8) and its metrics.
@@ -1009,6 +1015,8 @@ struct Renderer {
     ui_team_icon_key: Vec<String>,
     _ui_ext_images: GpuImage,
     ui_ext_image_key: Vec<String>,
+    /// Persistent async loader; retains its parsed shader library across batches.
+    ui_ext_image_loader: Option<overlay::UiExtImageLoader>,
     /// True while bind group binding 3 holds the unknown-map art rather than the
     /// splash/levelshot, so a rebuild for another binding keeps the right image.
     ui_binding_is_unknown_map: bool,
@@ -1346,6 +1354,7 @@ struct Renderer {
     acquire_probe_submit_ms: f64,
     /// The surface supports the UNORM twin of the sRGB render format.
     surface_linear_present: bool,
+    surface_unorm_alias_supported: bool,
     early_present_target: Option<EarlyPresentTarget>,
     tinted_glass_enabled: bool,
     tinted_glass_debug: u32,

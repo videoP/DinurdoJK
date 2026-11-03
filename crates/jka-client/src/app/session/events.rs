@@ -63,6 +63,10 @@ impl GameSession {
         let duel = ps.field_i32("duelInProgress").unwrap_or(0) != 0;
         let duel_index = ps.field_i32("duelIndex").unwrap_or(-1);
         let number = i32::from(event.entity_num);
+        // JK2 cg_event.c decodes its own eventParm (weapon or weapon+16).
+        if number == local && self.pending_raw_out_of_ammo.len() < 8 {
+            self.pending_raw_out_of_ammo.push(event.parm);
+        }
         if number != local
             || (duel && local != number && duel_index != number)
             || ps.field_i32("m_iVehicleNum").unwrap_or(0) != 0
@@ -508,10 +512,10 @@ impl GameSession {
         } else {
             event.parm
         };
-        let Some(item) = jka_movement::bg_item(index).filter(|_| index >= 1) else {
+        let Some(item) = crate::items::item(index).filter(|_| index >= 1) else {
             return;
         };
-        if let Some(icon) = jka_movement::bg_item_icon(index) {
+        if let Some(icon) = crate::items::item_icon(index) {
             self.item_pickup = Some((icon, Instant::now()));
         }
         const IT_WEAPON: i32 = 1;

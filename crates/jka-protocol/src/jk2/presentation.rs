@@ -38,6 +38,51 @@ pub fn animation(version: Version, value: i32) -> Result<i32, String> {
         .ok_or_else(|| format!("Unknown JK2 {} animation {value}", version.name()))
 }
 
+/// JK2 trType_t -> presentation trType_t. JK2 has no TR_NONLINEAR_STOP, so
+/// its TR_SINE (4) and TR_GRAVITY (5) are JKA's 5 and 6.
+fn trajectory_type(value: i32) -> i32 {
+    match value {
+        4 | 5 => value + 1,
+        _ => value,
+    }
+}
+
+/// JK2 weapon_t -> presentation (JKA) weapon_t.
+pub fn presented_weapon(weapon: i32) -> Option<i32> {
+    mapped(ids::WEAPONS, weapon).filter(|&value| value < 19)
+}
+
+/// Presentation weapon_t -> JK2 weapon_t; `None` for JKA-only weapons.
+pub fn wire_weapon(weapon: i32) -> Option<i32> {
+    (0..16).find(|&value| presented_weapon(value) == Some(weapon))
+}
+
+/// JK2 holdable_t tag -> presentation tag (HI_DATAPAD has none).
+pub fn presented_holdable(tag: i32) -> Option<i32> {
+    mapped(ids::HOLDABLES, tag).filter(|&value| value < 12)
+}
+
+/// Presentation bg_itemlist index -> the JK2 item it was mapped from.
+pub fn wire_item(index: i32) -> Option<i32> {
+    (0..ids::ITEMS.len() as i32).find(|&item| mapped(ids::ITEMS, item) == Some(index))
+}
+
+/// JK2 powerup_t (also IT_TEAM flag tags) -> presentation powerup_t.
+pub fn presented_powerup(tag: i32) -> Option<i32> {
+    mapped(ids::POWERUPS, tag)
+}
+
+/// Presentation genCmds_t -> JK2 genCmds_t (pinned MVSDK/OpenJK q_shared.h):
+/// 1..=19 are shared; JK2 has GENCMD_SABERATTACKCYCLE (JKA 26) as 20 and no
+/// jetpack/bacta-big/dispenser/E-Web/cloak or taunt/bow/meditate/flourish/gloat.
+pub fn wire_generic_command(command: u8) -> Option<u8> {
+    match command {
+        0..=19 => Some(command),
+        26 => Some(20),
+        _ => None,
+    }
+}
+
 fn bitmask(table: &[i32], value: i32) -> i32 {
     table
         .iter()
@@ -142,9 +187,9 @@ impl Adapter {
             .and_then(crate::entity_event::EntityEvent::from_i32);
         use crate::entity_event::EntityEvent;
         match name {
-            Some(EntityEvent::EV_ITEM_PICKUP | EntityEvent::EV_GLOBAL_ITEM_PICKUP) => {
-                mapped(ids::ITEMS, parm).unwrap_or(0)
-            }
+            // EV_ITEM_PICKUP carries the item's entity number (g_items.c
+            // Touch_Item); only the global pickup carries a bg_itemlist index.
+            Some(EntityEvent::EV_GLOBAL_ITEM_PICKUP) => mapped(ids::ITEMS, parm).unwrap_or(0),
             Some(EntityEvent::EV_OBITUARY) => mapped(ids::DEATH_CAUSES, parm).unwrap_or(0),
             _ => parm,
         }
@@ -193,6 +238,7 @@ impl Adapter {
                 "eType" => mapped(ids::ENTITY_TYPES, ty)
                     .ok_or_else(|| format!("Unknown JK2 entity type {ty}"))?,
                 "eFlags" => flags(value),
+                "pos.trType" | "apos.trType" => trajectory_type(value),
                 "legsAnim" | "torsoAnim" => animation(version, value)?,
                 "weapon" => mapped(ids::WEAPONS, value).unwrap_or(0),
                 "saberMove" => {
@@ -286,17 +332,14 @@ impl Adapter {
             };
             ps.set_field_bits(name, value as u32);
         }
+        // JK2's on/off state is the qboolean `saberHolstered` (mirrored to the
+        // entity's `shouldtarget`); `saberActive` only latches on first swing.
         ps.set_field_bits(
             "saberHolstered",
-            if raw
-                .fields
-                .field_i32("saberActive")
-                .unwrap_or(0)
-                != 0
-            {
-                0
-            } else {
+            if raw.fields.field_i32("saberHolstered").unwrap_or(0) != 0 {
                 2
+            } else {
+                0
             },
         );
         ps.set_field_bits("standheight", 32);

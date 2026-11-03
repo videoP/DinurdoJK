@@ -253,6 +253,27 @@ pub const ICON_NAMES: [&str; ICON_RAGE_RECOVERY + 1] = {
     names
 };
 
+/// The asset an atlas cell loads for the installed game. On a JK2 filesystem
+/// weapon and inventory cells use JK2's own bg_itemlist icons (presentation
+/// IDs index them); cells for JKA-only weapons/holdables stay empty.
+pub fn icon_name(index: usize) -> std::borrow::Cow<'static, str> {
+    let name = std::borrow::Cow::Borrowed(ICON_NAMES.get(index).copied().unwrap_or(""));
+    if jka_assets::pk3::active_jk2().is_none() {
+        return name;
+    }
+    let cell = |base: usize, len: usize| index.checked_sub(base).filter(|&offset| offset < len);
+    let tagged = if let Some(weapon) = cell(ICON_WEAPON_BASE, WEAPON_ICON_NAMES.len())
+        .or_else(|| cell(ICON_WEAPON_NO_AMMO_BASE, WEAPON_ICON_NAMES.len()))
+    {
+        crate::items::tagged_icon(1, weapon as i32)
+    } else if let Some(tag) = cell(ICON_INVENTORY_BASE, INVENTORY_ICON_NAMES.len()) {
+        crate::items::tagged_icon(6, tag as i32)
+    } else {
+        return name;
+    };
+    tagged.map_or(std::borrow::Cow::Borrowed(""), std::borrow::Cow::Owned)
+}
+
 /// Atlas cell of the first image crosshair.
 pub(in crate::ui) const ICON_CROSSHAIR_BASE: usize = 2;
 

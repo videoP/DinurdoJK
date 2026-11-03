@@ -1053,24 +1053,9 @@ pub(in crate::cgame::player_presenter) fn animation_number(name: &str) -> Option
 }
 
 /// CG_InitG2Weapons: g2WeaponInstances[giTag] = world_model[0] of the last
-/// IT_WEAPON item with that tag (later bg_itemlist entries overwrite).
+/// IT_WEAPON item with that tag, from the active game's bg_itemlist.
 pub(in crate::cgame::player_presenter) fn weapon_world_model(weapon: i32) -> Option<String> {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<HashMap<i32, String>> = OnceLock::new();
-    TABLE
-        .get_or_init(|| {
-            let mut table = HashMap::new();
-            for index in 1..jka_movement::bg_item_count() {
-                if let Some(item) = jka_movement::bg_item(index) {
-                    if item.item_type == 1 && !item.world_model.is_empty() {
-                        table.insert(item.tag, item.world_model);
-                    }
-                }
-            }
-            table
-        })
-        .get(&weapon)
-        .cloned()
+    crate::items::weapon_world_model(weapon)
 }
 
 /// RF_FORCE_ENT_ALPHA below 1 needs a blended pass for normally opaque stages.

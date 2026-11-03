@@ -26,6 +26,7 @@ impl RenderStudio {
         self.director_anchor = None;
         self.director_popup_open = false;
         self.pending_demo_drop = None;
+        self.jk2_import = None;
         self.pending_demo_queue.clear();
         self.cinematic_preview = None;
         self.emote = None;
@@ -155,7 +156,7 @@ mod new_project_tests {
     fn new_project_clears_old_content_jobs_and_undo_without_reusing_source_ids() {
         let mut studio = RenderStudio::default();
         studio.init_history();
-        studio.timeline.demos.push(StudioDemoClip { source_path: None,
+        studio.timeline.demos.push(StudioDemoClip { demo_protocol:26, source_path: None,
             comparison: None,
             race_overlays: vec![],
             pov_trail: Default::default(),
@@ -181,7 +182,10 @@ mod new_project_tests {
         ));
         studio
             .pending_demo_queue
-            .push_back(("old".into(), String::new(), 0));
+            .push_back((crate::app::render_studio::StudioMediaDrag {
+                name:"old".into(),demo_game:Some(String::new()),
+                demo_path:None,emote_id:None,cinematic:None,
+            },0));
         studio.pending_demo_drop = Some(("old".into(), String::new(), 0.0, 0));
         studio.route_job = Some(StudioRouteJob {
             worker: std::thread::spawn(|| Ok(Default::default())),

@@ -407,7 +407,7 @@ impl Renderer {
         if !clean {
             self.submit_egui(&view);
             if self.egui_active {
-                self.submit_ui_overlay(&view);
+                self.submit_ui_overlay(&view, None);
             }
         }
         if let Some(output) = &self.hdr_output {

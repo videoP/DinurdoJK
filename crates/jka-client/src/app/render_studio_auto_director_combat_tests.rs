@@ -43,7 +43,7 @@ fn kill(ms: i32, attacker: i32, victim: i32, position: Vec3) -> CombatEvent {
 }
 
 fn job(path: DirectorPath) -> ClipJob {
-    let clip = StudioDemoClip { source_path: None,
+    let clip = StudioDemoClip { demo_protocol:26, source_path: None,
         comparison: None,
         race_overlays: Vec::new(),
         pov_trail: Default::default(),

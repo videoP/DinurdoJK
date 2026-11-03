@@ -193,6 +193,14 @@ pub fn configure_filesystem_roots(base: &Path, roots: FilesystemRoots) {
     configure_package_policy(base, &roots);
 }
 
+/// The JK2 version whose filesystem is installed (live JK2 or JK2 demo), if any.
+pub fn active_jk2() -> Option<u8> {
+    FILESYSTEM_ROOTS
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|state| state.as_ref().and_then(|state| state.roots.active_jk2))
+}
+
 pub fn configured_filesystem_roots(base: &Path) -> FilesystemRoots {
     FILESYSTEM_ROOTS
         .get()

@@ -1013,4 +1013,25 @@ commands! {
         }
     }
 
+    cmd_chat_translate_status ["chatTranslateStatus", ] ("chatTranslateStatus", "Show chat translation settings, request counts and the last service error.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        if words.len() != 1 {
+            return CommandResult::Unhandled;
+        }
+        let settings = &self.chat_translation.settings;
+        let target = crate::chat_translation::lang::resolve_target(&settings.target);
+        let line = format!(
+            "^3TRANSLATION:^7 mode {:?}, {} into {} ({}), display {:?}",
+            settings.mode,
+            settings.provider.label(),
+            crate::chat_translation::lang::name(target),
+            target,
+            settings.display,
+        );
+        let status = self.chat_translation.status_line();
+        self.push_console_line(line);
+        self.push_console_line(format!("^3TRANSLATION:^7 {status}"));
+        CommandResult::Handled
+    }
+
 }

@@ -1,12 +1,23 @@
 //! Optional, UI-local inverse of the Windows SDR display gamma ramp.
 //! No extra scene work: only menu frames receive the transparent egui pass.
 //! The native HUD uses its own fragment variant over existing geometry.
-use super::{create_ui_pipeline, Renderer};
+use super::{create_ui_pipeline, FxBlend, Renderer};
+use std::collections::HashMap;
 
 pub(super) struct NativeUiGamma {
     pub pipeline: wgpu::RenderPipeline,
     pub group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    // Gamma compensation is applied to encoded RGB when the destination is
+    // the swapchain's UNORM view, not to linear RGB in an sRGB target.
+    pub encoded_group: wgpu::BindGroup,
+    encoded_uniform: wgpu::Buffer,
+    pub pipeline_layout: wgpu::PipelineLayout,
+    pub shader: wgpu::ShaderModule,
+    pub fx_pipeline_layout: wgpu::PipelineLayout,
+    pub fx_shader: wgpu::ShaderModule,
+    pub encoded_pipeline: Option<wgpu::RenderPipeline>,
+    pub encoded_fx_pipelines: HashMap<FxBlend, wgpu::RenderPipeline>,
 }
 
 pub(super) struct EguiUiGamma {
@@ -38,6 +49,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let encoded_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HW scene-only encoded UI gamma"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let gamma_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("HW scene-only native UI gamma layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -50,6 +67,10 @@ impl Renderer {
             label: Some("HW scene-only native UI gamma group"), layout: &gamma_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
         });
+        let encoded_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HW scene-only encoded UI gamma group"), layout: &gamma_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: encoded_uniform.as_entire_binding() }],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("HW scene-only native UI pipeline layout"),
             bind_group_layouts: &[Some(&self.ui_texture_layout), Some(&gamma_layout)], immediate_size: 0,
@@ -59,14 +80,34 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("../ui_scene_gamma.wgsl").into()),
         });
         let pipeline = create_ui_pipeline(device, &layout, &shader, self.config.format);
-        self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&uniform_values(self.gamma, self.config.format.is_srgb())));
-        self.ui_gamma_native = Some(NativeUiGamma { pipeline, group, uniform });
+        let fx_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("HW scene-only encoded screen FX layout"),
+            bind_group_layouts: &[Some(&self.screen_fx_texture_layout), Some(&gamma_layout)],
+            immediate_size: 0,
+        });
+        let fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HW scene-only encoded screen FX shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../screen_fx_scene_gamma.wgsl").into()),
+        });
+        self.queue.write_buffer(&uniform, 0,
+            bytemuck::cast_slice(&uniform_values(self.gamma, self.config.format.is_srgb())));
+        self.queue.write_buffer(&encoded_uniform, 0,
+            bytemuck::cast_slice(&uniform_values(self.gamma, false)));
+        self.ui_gamma_native = Some(NativeUiGamma {
+            pipeline, group, uniform, encoded_group, encoded_uniform,
+            pipeline_layout: layout, shader, fx_pipeline_layout, fx_shader,
+            encoded_pipeline: None, encoded_fx_pipelines: HashMap::new(),
+        });
     }
 
     pub(super) fn sync_ui_gamma_uniforms(&mut self) {
         let values = uniform_values(self.gamma, self.config.format.is_srgb());
         let bytes = bytemuck::cast_slice(&values);
-        if let Some(resources) = &self.ui_gamma_native { self.queue.write_buffer(&resources.uniform, 0, bytes); }
+        if let Some(resources) = &self.ui_gamma_native {
+            self.queue.write_buffer(&resources.uniform, 0, bytes);
+            self.queue.write_buffer(&resources.encoded_uniform, 0,
+                bytemuck::cast_slice(&uniform_values(self.gamma, false)));
+        }
         if let Some(resources) = &self.ui_gamma_egui { self.queue.write_buffer(&resources.uniform, 0, bytes); }
     }
 

@@ -6,6 +6,7 @@
 //! Mutes are purely client-side: a muted client's chat and voice commands are
 //! dropped before they reach the chat box, console or chat log, and the
 //! scoreboard marks their row.
+use crate::app::chat_translation::{RuleChange, RuleMode};
 use crate::app::{App, Instant, OverlayMode};
 use crate::ui::{
     ScoreAction, ScoreboardChrome, ScoreboardCursorUi, ScoreboardHit, ScoreboardMenuUi,
@@ -47,13 +48,17 @@ fn plain_name(name: &str) -> String {
 
 /// Context menu actions: only a live spectator can follow a playing target.
 /// Mute and voting remain available to ordinary players.
-fn score_actions(own: bool, spectating: bool, playable: bool, muted: bool, live: bool, japro: bool) -> Vec<ScoreAction> {
+fn score_actions(own: bool, spectating: bool, playable: bool, muted: bool, live: bool, japro: bool, translate: bool) -> Vec<ScoreAction> {
     if own { return Vec::new(); }
     let mut actions = Vec::new();
     if spectating && playable {
         actions.push(ScoreAction::Follow);
     }
     actions.push(if muted { ScoreAction::Unmute } else { ScoreAction::Mute });
+    // Per-player chat translation rules need live client slots.
+    if translate && live {
+        actions.push(ScoreAction::Translate);
+    }
     if live {
         actions.push(ScoreAction::VoteKick);
         if japro { actions.push(ScoreAction::ForceSpectate); }
@@ -224,6 +229,7 @@ impl App {
             self.muted_clients.contains_key(&client),
             session.live,
             self.active_server_mod() == crate::net::mod_support::ServerMod::Japro,
+            self.chat_translation.settings.mode != crate::chat_translation::Mode::Off,
         );
         (!actions.is_empty()).then(|| ScoreboardMenuUi {
             client,
@@ -231,7 +237,38 @@ impl App {
             anchor: [pointer[0] as i32, pointer[1] as i32],
             actions,
             confirm_kick: false,
+            title: None,
+            detail: None,
         })
+    }
+
+    /// The per-player translation submenu, titled with the current rule.
+    fn translation_score_menu(&self, menu: ScoreboardMenuUi) -> ScoreboardMenuUi {
+        let (mode, source) = self.chat_translation.rule(menu.client, &menu.name);
+        let mut actions = Vec::new();
+        if mode != RuleMode::Always { actions.push(ScoreAction::TranslateAlways); }
+        if mode != RuleMode::Never { actions.push(ScoreAction::TranslateNever); }
+        if mode != RuleMode::Default { actions.push(ScoreAction::TranslateDefault); }
+        actions.push(ScoreAction::TranslateLanguages);
+        actions.push(ScoreAction::TranslateDone);
+        let mode_text = match mode {
+            RuleMode::Default => "chat setting",
+            RuleMode::Always => "always",
+            RuleMode::Never => "never",
+        };
+        let plain = crate::logging::strip_jka_colors(&menu.name);
+        let detail = format!("{mode_text}, {}", source.map_or("auto".to_owned(), str::to_ascii_uppercase));
+        ScoreboardMenuUi { actions, confirm_kick: false, title: Some(plain), detail: Some(detail), ..menu }
+    }
+
+    /// Rule changes apply to the player still in the slot; otherwise nothing.
+    fn change_score_translation_rule(&mut self, menu: ScoreboardMenuUi, change: RuleChange) {
+        if self.score_target_is_current(&menu, false) {
+            self.change_chat_translation_rule(menu.client, &menu.name, change);
+            self.scoreboard_cursor.menu = Some(self.translation_score_menu(menu));
+        } else {
+            self.push_console_line("^3Translation:^7 player left or changed slots");
+        }
     }
 
     fn apply_score_action(&mut self, menu: ScoreboardMenuUi, action: ScoreAction) {
@@ -279,6 +316,27 @@ impl App {
                     self.forward_command_to_server(&crate::vote::forcespec_vote(client));
                 }
             }
+            ScoreAction::Translate => {
+                self.scoreboard_cursor.menu = Some(self.translation_score_menu(menu));
+            }
+            ScoreAction::TranslateAlways => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Always)),
+            ScoreAction::TranslateNever => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Never)),
+            ScoreAction::TranslateDefault => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Default)),
+            ScoreAction::TranslateLanguages => {
+                let actions = (0..crate::ui::SCOREBOARD_TRANSLATE_LANGUAGES.len())
+                    .map(|index| ScoreAction::TranslateHint(index as u8))
+                    .collect();
+                let title = format!("{plain} usually writes:");
+                self.scoreboard_cursor.menu = Some(ScoreboardMenuUi { actions, title: Some(title), detail: None, ..menu });
+            }
+            ScoreAction::TranslateHint(index) => {
+                let code = crate::ui::SCOREBOARD_TRANSLATE_LANGUAGES
+                    .get(usize::from(index))
+                    .map(|&(code, _)| code)
+                    .filter(|code| !code.is_empty());
+                self.change_score_translation_rule(menu, RuleChange::Source(code));
+            }
+            ScoreAction::TranslateDone => {}
         }
     }
 
@@ -447,15 +505,18 @@ mod tests {
     #[test]
     fn spectator_popup_follows_active_players_but_not_spectators_or_self() {
         use super::{score_actions, ScoreAction};
-        assert_eq!(score_actions(false, true, true, false, true, false),
+        assert_eq!(score_actions(false, true, true, false, true, false, false),
             vec![ScoreAction::Follow, ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(false, true, false, false, true, false),
+        assert_eq!(score_actions(false, true, false, false, true, false, false),
             vec![ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(true, true, true, false, true, true), Vec::new());
-        assert_eq!(score_actions(false, false, true, false, true, false),
+        assert_eq!(score_actions(true, true, true, false, true, true, true), Vec::new());
+        assert_eq!(score_actions(false, false, true, false, true, false, false),
             vec![ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(false, true, true, true, true, true),
+        assert_eq!(score_actions(false, true, true, true, true, true, false),
             vec![ScoreAction::Follow, ScoreAction::Unmute, ScoreAction::VoteKick, ScoreAction::ForceSpectate]);
+        assert_eq!(score_actions(false, false, true, false, true, false, true),
+            vec![ScoreAction::Mute, ScoreAction::Translate, ScoreAction::VoteKick]);
+        assert_eq!(score_actions(false, false, true, false, false, false, true), vec![ScoreAction::Mute]);
     }
 
     #[test]

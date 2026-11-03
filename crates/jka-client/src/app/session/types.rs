@@ -19,6 +19,9 @@ pub(in crate::app) struct LivePredictionFrame {
     pub(in crate::app) error: [f32; 3],
     pub(in crate::app) command_angles: Option<[i32; 3]>,
     pub(in crate::app) view_forced: bool,
+    /// Packet entities CGame no longer draws after prediction (JK2
+    /// CG_TouchItem's EF_NODRAW on a predicted pickup).
+    pub(in crate::app) hidden_entities: Vec<u16>,
 }
 
 pub(in crate::app) fn snapshot_owns_playerstate_events(
@@ -115,6 +118,10 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) presented_player_state: Option<jka_protocol::server::PlayerState>,
     /// TaystJK-style 100 ms crouch eye-height transition, presentation only.
     pub(in crate::app) duck_view_height: super::sampling::DuckViewHeight,
+    /// Local EV_NOAMMO eventParms as received, for JK2's CGame decoding.
+    pub(in crate::app) pending_raw_out_of_ammo: Vec<i32>,
+    /// Client-side TaystJK optical zoom, separate from Pmove's networked zoomFov.
+    pub(in crate::app) scope_zoom: super::sampling::ScopeZoomState,
     pub(in crate::app) client_game: ClientGameState,
     pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,

@@ -27,6 +27,7 @@ impl App {
         let fade_ms = f64::from(settings.fade_time.max(0.5)) * 1000.0;
         let history_ms = f64::from(settings.history_time.max(settings.fade_time)) * 1000.0;
         let recent_from = self.chat_lines.len().saturating_sub(usize::from(settings.history_lines));
+        let translation_display = self.chat_translation.settings.display;
         let chat_lines = self
             .chat_lines
             .iter()
@@ -45,13 +46,17 @@ impl App {
                 } else {
                     ((fade_ms - age_ms) / 1_000.0) as f32
                 };
-                Some(UiChatLine {
-                    text: line.text.clone(),
+                // A translation updates the line in place: same slot, age and fade.
+                let (text, below) = crate::app::chat_translation::hud_chat_text(translation_display, line);
+                let ui_line = |text| UiChatLine {
+                    text,
                     team: line.team,
                     alpha: alpha.clamp(0.0, 1.0),
                     enter: (age_ms / 220.0).clamp(0.0, 1.0) as f32,
-                })
+                };
+                Some(std::iter::once(ui_line(text)).chain(below.map(ui_line)))
             })
+            .flatten()
             .collect();
 
         let center_print = self.center_print.as_ref().and_then(|print| {
@@ -126,6 +131,7 @@ impl App {
         self.chat_lines.clear();
         self.console_notify.clear();
         self.center_print = None;
+        self.cancel_chat_translations();
 
         let chat_start = elapsed_ms.saturating_sub(10_000);
         for entry in notices
@@ -146,6 +152,8 @@ impl App {
                 team: entry.kind == DemoConsoleKind::TeamChat,
                 created: now,
                 demo_elapsed_ms: Some(f64::from(entry.elapsed_ms)),
+                chat_id: None,
+                translation: None,
             });
         }
         if let Some(entry) = notices.iter().rev().find(|entry| {

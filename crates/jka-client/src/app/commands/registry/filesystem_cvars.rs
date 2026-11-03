@@ -92,7 +92,12 @@ impl App {
     fn set_fs_jk2path(&mut self, value: &str) -> Result<(), String> {
         let mut proposed = self.fs_roots.clone();
         proposed.jk2path = crate::filesystem_paths::parse_root(&self.base, value)?;
-        self.store_fs_roots(proposed)
+        let changed = proposed.jk2path != self.fs_roots.jk2path;
+        self.store_fs_roots(proposed)?;
+        // The Play -> Demo JK2 catalog must never keep the old install's
+        // recordings after fs_jk2path is changed in the console.
+        if changed { self.jk2_demo_browser.reset(); }
+        Ok(())
     }
 
     fn set_fs_forcegame(&mut self, value: &str) -> Result<(), String> {

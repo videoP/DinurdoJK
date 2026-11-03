@@ -1117,6 +1117,8 @@ pub enum RenderCommand {
         path: String,
         game: Option<PathBuf>,
     },
+    /// The asset game changed: forget qpath-keyed model GPU caches.
+    ForgetModelAssets,
     SetDetailTextureFade {
         enabled: bool,
         distance: f32,

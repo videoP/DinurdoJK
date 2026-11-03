@@ -1788,6 +1788,7 @@ impl App {
                                     error: [0.0; 3],
                                     command_angles: frame.angles,
                                     view_forced: false,
+                                    hidden_entities: frame.hidden,
                                 }))
                             }
                             Err(error) => {
@@ -1840,6 +1841,7 @@ impl App {
                         error,
                         command_angles: predictor.predicted_command_angles(),
                         view_forced: predictor.view_forced(),
+                        hidden_entities: Vec::new(),
                     }))
                 };
                 playback.advance_to_with_prediction(

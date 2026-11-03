@@ -272,6 +272,7 @@ fn console_resize_grip(ctx: &egui::Context, window_rect: egui::Rect) -> Option<(
 
 impl App {
     pub(in crate::app) fn egui_hl2_console(&mut self, ctx: &egui::Context) {
+        self.ensure_chat_translation_fonts(ctx);
         // Keep a small inset so even the resize edges remain reachable.
         let viewport = ctx.content_rect().shrink(5.0);
         let work_area = console_work_area(viewport);
@@ -357,6 +358,7 @@ impl App {
                 // autocomplete is visible, preventing Tab from resizing it.
                 let log_height = (ui.available_height() - 45.0).max(65.0);
                 let mut reveal_path = None;
+                let mut chat_action = None;
                 egui::Frame::new()
                     .fill(LOG_BG)
                     .stroke(egui::Stroke::new(1.0, EDGE))
@@ -375,15 +377,31 @@ impl App {
                                 for index in range {
                                     let Some(line) = self.console_lines.get(index) else { continue; };
                                     let kind = self.console_line_kinds.get(index).copied().unwrap_or_default();
-                                    let job = console_line_job(line, kind);
+                                    // Chat rows carry their message id; a translated
+                                    // message is shown through it, never re-parsed.
+                                    let chat_id = self.console_chat_ids.get(index).copied().flatten()
+                                        .filter(|&id| self.chat_translation.has_message(id));
+                                    let translated = chat_id.and_then(|id| self.console_chat_translation_line(line, id));
+                                    let job = console_line_job(translated.as_deref().unwrap_or(line), kind);
                                     let response = ui.add(egui::Label::new(job).selectable(true).truncate());
-                                    if let Some(target) = self.console_path_links.get(index)
-                                        .and_then(|links| links.first()).map(|link| link.target.clone())
-                                    {
+                                    let path_target = self.console_path_links.get(index)
+                                        .and_then(|links| links.first()).map(|link| link.target.clone());
+                                    if chat_id.is_some() || path_target.is_some() {
                                         response.context_menu(|ui| {
-                                            if ui.button("Reveal linked file").clicked() {
-                                                reveal_path = Some(target.clone());
-                                                ui.close();
+                                            if let Some(id) = chat_id {
+                                                if let Some(action) = self.chat_translation_menu(ui, id) {
+                                                    chat_action = Some(action);
+                                                    ui.close();
+                                                }
+                                            }
+                                            if let Some(target) = &path_target {
+                                                if chat_id.is_some() {
+                                                    ui.separator();
+                                                }
+                                                if ui.button("Reveal linked file").clicked() {
+                                                    reveal_path = Some(target.clone());
+                                                    ui.close();
+                                                }
                                             }
                                         });
                                     }
@@ -392,6 +410,9 @@ impl App {
                     });
                 if let Some(target) = reveal_path {
                     let _ = self.reveal_console_path(&target);
+                }
+                if let Some(action) = chat_action {
+                    self.apply_chat_menu_action(action);
                 }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(">").monospace().color(DIM));

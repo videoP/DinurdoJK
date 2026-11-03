@@ -343,6 +343,8 @@ impl StudioDemoAudio {
         self.keys.sort_by(|a,b|a.time.total_cmp(&b.time));
     }
 }
+pub(in crate::app) const fn studio_jka_demo_protocol() -> u8 { 26 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(in crate::app) struct StudioDemoClip {
     /// A retained ghost-group presentation. Its explicit clock supports holds,
@@ -351,8 +353,11 @@ pub(in crate::app) struct StudioDemoClip {
     pub comparison: Option<Box<super::render_studio_race::RaceComparison>>,
     /// Name relative to demos/ without .dm_26.
     pub name: String,
-    /// Game directory name (empty string is base).
+    /// Game directory name (empty string is base). Independent of protocol.
     pub game: String,
+    /// Source demo wire protocol. Old projects default to JKA (26).
+    #[serde(default = "studio_jka_demo_protocol")]
+    pub demo_protocol: u8,
     /// Project-managed recording, relative to render-studio/. Legacy clips use the JKA VFS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
@@ -383,6 +388,11 @@ pub(in crate::app) struct StudioDemoClip {
     pub hide_other_players: bool,
 }
 impl StudioDemoClip {
+    pub fn recording_file_name(&self) -> String {
+        if self.demo_protocol == 26 { format!("{}.dm_26",self.name) }
+        else { self.name.clone() }
+    }
+
     pub fn duration(&self) -> f64 {
         if let Some(race) = &self.comparison { return race.duration(); }
         studio_speed_span(&self.speed_keys,f64::from(self.in_ms)/1000.0,f64::from(self.out_ms)/1000.0).max(0.001)
@@ -441,6 +451,9 @@ impl StudioDemoClip {
     }
     pub fn valid(&self) -> bool {
         self.comparison.as_ref().is_none_or(|race| race.valid(self.duration_ms)) &&
+        matches!(self.demo_protocol,15|16|26) &&
+        (self.demo_protocol==26 || self.name.to_ascii_lowercase().ends_with(
+            if self.demo_protocol==15 {".dm_15"} else {".dm_16"})) &&
         !self.name.is_empty() && self.name.len()<=240 &&
         !self.name.contains('\\') && !self.name.contains(':') &&
         self.name.split('/').all(|part|!part.is_empty() && part!="." && part!="..") &&
@@ -2432,7 +2445,7 @@ mod demo_track_tests {
     #[test]
     fn demo_is_independent_of_character_tracks_and_uses_ms() {
         let mut tl=StudioTimeline::default();tl.snap=false;
-        tl.add_demo(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"race".into(),game:String::new(),start:3.0,
+        tl.add_demo(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"race".into(),game:String::new(),start:3.0,
             duration_ms:5000,in_ms:1000,out_ms:4000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()});
         assert_eq!(tl.demo_row(0),1);
         assert_eq!(tl.demos[0].duration(),3.0);
@@ -2440,7 +2453,7 @@ mod demo_track_tests {
         assert_eq!(tl.demo_at(4.25).unwrap().name,"race");
         assert!(tl.demo_at(6.0).is_none());
         assert_eq!(tl.duration(),6.0);
-        let second=StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"next".into(),game:String::new(),start:4.0,
+        let second=StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"next".into(),game:String::new(),start:4.0,
             duration_ms:4000,in_ms:0,out_ms:2000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()};
         tl.add_demo(second);
         assert_eq!(tl.demos[1].start,6.0);
@@ -2450,7 +2463,7 @@ mod demo_track_tests {
     #[test]
     fn demo_trim_preserves_source_clock_and_original_end() {
         let mut tl=StudioTimeline::default();tl.snap=false;
-        tl.add_demo(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"clip".into(),game:String::new(),start:3.0,
+        tl.add_demo(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"clip".into(),game:String::new(),start:3.0,
             duration_ms:10_000,in_ms:1_000,out_ms:5_000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()});
         tl.trim_demo(0,StudioDemoDragKind::In,3.0,1000,5000,0.5);
         assert_eq!(tl.demos[0].in_ms,1500);
@@ -2465,9 +2478,9 @@ mod demo_track_tests {
     #[test]
     fn demo_trim_can_author_overlap_but_cannot_swallow_neighbors_or_source_bounds() {
         let mut tl=StudioTimeline::default();tl.snap=false;
-        tl.add_demo(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"first".into(),game:String::new(),start:2.0,
+        tl.add_demo(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"first".into(),game:String::new(),start:2.0,
             duration_ms:10_000,in_ms:1000,out_ms:3000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()});
-        tl.add_demo(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"second".into(),game:String::new(),start:5.0,
+        tl.add_demo(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"second".into(),game:String::new(),start:5.0,
             duration_ms:10_000,in_ms:2000,out_ms:4000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()});
         // A longer OUT trim may create a transition, but must stop before
         // engulfing the entire following demo, not jump to another position.
@@ -2488,10 +2501,10 @@ mod demo_track_tests {
     }
     #[test]
     fn demo_path_validation_rejects_directory_traversal() {
-        let clip=StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"../danger".into(),game:String::new(),start:0.0,
+        let clip=StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"../danger".into(),game:String::new(),start:0.0,
             duration_ms:1000,in_ms:0,out_ms:1000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()};
         assert!(!clip.valid());
-        assert!(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"good/subdir".into(),..clip}.valid());
+        assert!(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"good/subdir".into(),..clip}.valid());
     }
 }
 
@@ -2506,7 +2519,7 @@ mod speed_remap_tests {
             tail_frames:0,playback:StudioClipPlayback::Hold,speed_keys:vec![], blend:Default::default() }
     }
     fn demo() -> StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"recording".into(),game:String::new(),start:2.0,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"recording".into(),game:String::new(),start:2.0,
             duration_ms:5000,in_ms:1000,out_ms:4000,speed_keys:vec![],transition_in:Default::default(),audio:Default::default()}
     }
     #[test]
@@ -2698,7 +2711,7 @@ mod speed_remap_tests {
 mod demo_transition_tests {
     use super::*;
     fn demo(name:&str,start:f64)->StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:name.into(),game:String::new(),start,duration_ms:4000,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:name.into(),game:String::new(),start,duration_ms:4000,
             in_ms:0,out_ms:4000,speed_keys:vec![],transition_in:StudioDemoTransition::Cut,audio:Default::default()}
     }
     #[test]
@@ -2959,7 +2972,7 @@ mod linked_demo_audio_tests {
     use super::*;
 
     fn demo() -> StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"linked".into(),game:String::new(),start:2.0,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,layer:0,name:"linked".into(),game:String::new(),start:2.0,
             duration_ms:5000,in_ms:500,out_ms:4500,
             speed_keys:Vec::new(),transition_in:StudioDemoTransition::Cut,
             audio:StudioDemoAudio::default()}
@@ -3039,7 +3052,7 @@ mod linked_demo_audio_tests {
 mod demo_layer_tests {
     use super::*;
     fn demo(name:&str,start:f64,layer:usize)->StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,name:name.into(),game:String::new(),start,duration_ms:4000,in_ms:0,out_ms:4000,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,name:name.into(),game:String::new(),start,duration_ms:4000,in_ms:0,out_ms:4000,
             speed_keys:vec![],transition_in:Default::default(),audio:Default::default(),layer}
     }
     #[test]
@@ -3070,6 +3083,29 @@ mod demo_layer_tests {
         assert!(tl.demos[0].hud_overrides.is_empty() && tl.demos[1].hud_overrides.is_empty());
         assert_eq!(tl.demos[2].hud_overrides,unselected);
     }
+    #[test]
+    fn mixed_project_preserves_demo_protocol_and_legacy_default() {
+        let mut jka=demo("jka",0.0,0);
+        let mut jk2_102=demo("old.dm_15",4.0,0);
+        let mut jk2_104=demo("new.dm_16",8.0,0);
+        jk2_102.demo_protocol=15;
+        jk2_104.demo_protocol=16;
+        assert!(jka.valid() && jk2_102.valid() && jk2_104.valid());
+        assert_eq!(jka.recording_file_name(),"jka.dm_26");
+        assert_eq!(jk2_102.recording_file_name(),"old.dm_15");
+        let mut tl=StudioTimeline::default();
+        tl.demos=vec![jka.clone(),jk2_102.clone(),jk2_104.clone()];
+        let encoded=serde_json::to_value(&tl.demos).unwrap();
+        let decoded:Vec<StudioDemoClip>=serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.iter().map(|d|d.demo_protocol).collect::<Vec<_>>(),[26,15,16]);
+        let mut old=serde_json::to_value(&jka).unwrap();
+        old.as_object_mut().unwrap().remove("demo_protocol");
+        let restored:StudioDemoClip=serde_json::from_value(old).unwrap();
+        assert_eq!(restored.demo_protocol,26);
+        jka.demo_protocol=15;
+        assert!(!jka.valid(),"JK2 recordings must have their real extension");
+    }
+
     #[test] fn parallel_layers_overlap_and_the_top_visible_layer_plays() {
         let mut tl=StudioTimeline::default();tl.snap=false;
         tl.add_demo(demo("a",0.0,0));

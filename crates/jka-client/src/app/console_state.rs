@@ -133,6 +133,7 @@ impl App {
         self.console_notify.clear();
         self.last_console_notify_refresh = Instant::now();
         self.console_path_links.clear();
+        self.console_chat_ids.clear();
         self.console_scroll = 0;
         self.console_selection_anchor = None;
         self.console_selection_focus = None;
@@ -149,6 +150,7 @@ impl App {
         line: String,
         path_links: Vec<ConsolePathLink>,
         kind: crate::logging::ConsoleLineKind,
+        chat_id: Option<u64>,
     ) {
         const MAX_CONSOLE_LINES: usize = 10_000;
         let preserve_scroll = self.console_scroll > 0;
@@ -157,6 +159,7 @@ impl App {
             self.console_lines.pop_front();
             self.console_line_kinds.pop_front();
             self.console_path_links.pop_front();
+            self.console_chat_ids.pop_front();
 
             let shift_point = |point: Option<ConsolePoint>| {
                 point.map(|point| ConsolePoint {
@@ -188,6 +191,7 @@ impl App {
         self.console_lines.push_back(line);
         self.console_line_kinds.push_back(kind);
         self.console_path_links.push_back(path_links);
+        self.console_chat_ids.push_back(chat_id);
         self.mark_companion_console_dirty();
 
         // If the user has scrolled up to inspect/select older output, keep the
@@ -254,7 +258,7 @@ impl App {
                         })
                     })
                     .collect();
-                self.append_console_line(line, path_links, record.console_kind);
+                self.append_console_line(line, path_links, record.console_kind, record.chat_id);
             }
             changed = true;
         }
@@ -334,9 +338,13 @@ impl App {
         line: impl Into<String>,
         kind: crate::logging::ConsoleLineKind,
         notify_eligible: bool,
+        chat_id: Option<u64>,
     ) {
         let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
-        crate::logging::write_console_line(kind, format_args!("{line}"));
+        match chat_id {
+            Some(id) => crate::logging::write_chat_console_line(kind, format_args!("{line}"), id),
+            None => crate::logging::write_console_line(kind, format_args!("{line}")),
+        }
         let team = matches!(kind, crate::logging::ConsoleLineKind::TeamChat | crate::logging::ConsoleLineKind::TeamChatMention | crate::logging::ConsoleLineKind::TeamChatCommandEcho);
         self.record_console_notify_print(&line, notify_eligible && !skip_notify, team);
 
@@ -353,7 +361,7 @@ impl App {
         line: impl Into<String>,
         kind: crate::logging::ConsoleLineKind,
     ) {
-        self.push_console_line_kind_with_notify(line, kind, true);
+        self.push_console_line_kind_with_notify(line, kind, true, None);
     }
 
     /// TaystJK `trap->Print("*%s\n", ...)`: keep a line in console scrollback
@@ -365,7 +373,18 @@ impl App {
         line: impl Into<String>,
         kind: crate::logging::ConsoleLineKind,
     ) {
-        self.push_console_line_kind_with_notify(line, kind, false);
+        self.push_console_line_kind_with_notify(line, kind, false, None);
+    }
+
+    /// A received chat line: [`Self::push_console_line_no_notify`] plus the
+    /// message id its console row keeps for the translation menu.
+    pub(in crate::app) fn push_console_chat_line(
+        &mut self,
+        line: impl Into<String>,
+        kind: crate::logging::ConsoleLineKind,
+        chat_id: u64,
+    ) {
+        self.push_console_line_kind_with_notify(line, kind, false, Some(chat_id));
     }
 
     /// Rust-side equivalent of TaystJK `CL_ConsolePrint`: engine/game console

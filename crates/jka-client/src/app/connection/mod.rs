@@ -4,6 +4,7 @@ pub(in crate::app) mod downloads;
 pub(in crate::app) mod lifecycle;
 pub(in crate::app) mod live;
 pub(in crate::app) mod jk2_pure;
+pub(in crate::app) mod jk2_selection;
 pub(in crate::app) mod mod_preferences;
 pub(in crate::app) mod password;
 pub(in crate::app) mod prepare;

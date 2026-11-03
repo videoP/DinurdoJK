@@ -13,14 +13,14 @@ impl StudioPickerKind {
         let Some(ext) = path.extension().and_then(|s|s.to_str()) else {return false};
         match self {
             Self::Audio => ["wav", "mp3", "flac", "ogg"].iter().any(|v|ext.eq_ignore_ascii_case(v)),
-            Self::Demo => ext.eq_ignore_ascii_case("dm_26"),
+            Self::Demo => ["dm_26","dm_15","dm_16"].iter().any(|x|ext.eq_ignore_ascii_case(x)),
         }
     }
     pub(super) fn title(self) -> &'static str {
-        match self {Self::Audio => "Import audio files", Self::Demo => "Import DM26 recordings"}
+        match self {Self::Audio => "Import audio files", Self::Demo => "Import JKA / JK2 recordings"}
     }
     fn description(self) -> &'static str {
-        match self {Self::Audio => "WAV / MP3 / FLAC / OGG", Self::Demo => "Jedi Academy demo (.dm_26)"}
+        match self {Self::Audio => "WAV / MP3 / FLAC / OGG", Self::Demo => "JKA .dm_26 / JK2 .dm_15 and .dm_16"}
     }
 }
 

@@ -29,7 +29,9 @@ incremental = true
 [profile.faster]
 inherits = "release"
 opt-level = 0
-debug = 0
+# Keep line tables for crash dumps. The executable stays unoptimized; this only
+# emits the external PDB used to resolve native stack traces.
+debug = 1
 lto = "off"
 codegen-units = 16
 incremental = false

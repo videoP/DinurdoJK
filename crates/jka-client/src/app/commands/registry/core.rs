@@ -2,6 +2,28 @@
 use crate::app::{split_console_script, App, ChatMode, ConsoleCvarSetResult};
 
 use super::{CommandDef, CommandResult, CommandScope};
+
+// Many float-backed cvars display with fixed decimal places (e.g. 16.000 or
+// 0.300), while binds normally use short forms (16, 0.3). Preserve exact text
+// comparisons for string cvars, but treat equivalent finite numbers as equal.
+fn toggle_value_matches(current: &str, candidate: &str) -> bool {
+    current == candidate
+        || matches!(
+            (current.parse::<f64>(), candidate.parse::<f64>()),
+            (Ok(lhs), Ok(rhs)) if lhs.is_finite() && rhs.is_finite() && lhs == rhs
+        )
+}
+
+fn next_explicit_toggle_value<'a>(current: &str, values: &'a [&str]) -> &'a str {
+    debug_assert!(!values.is_empty());
+    values
+        .iter()
+        .take(values.len().saturating_sub(1))
+        .position(|candidate| toggle_value_matches(current, candidate))
+        .map(|index| values[index + 1])
+        .unwrap_or(values[0])
+}
+
 commands! {
     cmd_emote_gallery ["emote_gallery"] ("emote_gallery <first> [count] [samples] | ids <EID,...> [samples] | stop", "Render emotes offline on the Profile stage from four angles at scrubbed times; PNGs and report.json go to emote-gallery/.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
@@ -529,14 +551,7 @@ commands! {
             self.push_console_line("^3toggle:^7 nothing to toggle to".to_owned());
             return CommandResult::Handled;
         } else {
-            let values = &words[2..];
-            let next = values
-                .iter()
-                .take(values.len().saturating_sub(1))
-                .position(|candidate| *candidate == current.as_str())
-                .map(|index| values[index + 1])
-                .unwrap_or(values[0]);
-            next.to_owned()
+            next_explicit_toggle_value(&current, &words[2..]).to_owned()
         };
         match self.set_console_cvar_from_console(name, &target) {
             Ok(ConsoleCvarSetResult::Applied) => {}
@@ -571,4 +586,33 @@ commands! {
         CommandResult::Handled
     }
 
+}
+
+#[cfg(test)]
+mod explicit_toggle_tests {
+    use super::{next_explicit_toggle_value, toggle_value_matches};
+
+    #[test]
+    fn cycles_float_cvars_even_when_getter_formats_three_decimal_places() {
+        assert_eq!(next_explicit_toggle_value("16.000", &["16", "-16"]), "-16");
+        assert_eq!(next_explicit_toggle_value("-16.000", &["16", "-16"]), "16");
+        assert_eq!(next_explicit_toggle_value("0.300", &["0.3", "0"]), "0");
+        assert_eq!(next_explicit_toggle_value("0.000", &["0.3", "0"]), "0.3");
+    }
+
+    #[test]
+    fn cycles_multiple_values_and_defaults_to_first_when_unmatched() {
+        assert_eq!(next_explicit_toggle_value("2.000", &["1", "2", "3"]), "3");
+        assert_eq!(next_explicit_toggle_value("3.000", &["1", "2", "3"]), "1");
+        assert_eq!(next_explicit_toggle_value("unknown", &["1", "2", "3"]), "1");
+        assert_eq!(next_explicit_toggle_value("bar", &["foo", "bar"]), "foo");
+    }
+
+    #[test]
+    fn preserves_string_matching_without_conflating_nonfinite_numbers() {
+        assert!(toggle_value_matches("foo", "foo"));
+        assert!(!toggle_value_matches("foo", "FOO"));
+        assert!(!toggle_value_matches("NaN", "nan"));
+        assert!(!toggle_value_matches("inf", "Infinity"));
+    }
 }

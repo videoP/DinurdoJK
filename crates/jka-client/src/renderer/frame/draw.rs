@@ -1556,6 +1556,19 @@ impl Renderer {
         } else {
             None
         };
+        // One display-space blending policy for implicit UI icons and authored
+        // 2D stages. Only a direct SDR surface can be aliased without copies;
+        // preserve the existing pipeline for CRT/SMAA/HDR/Studio/offscreen.
+        let legacy_ui_candidate = !early_submit && !present_copy
+            && studio_composite.is_none() && !self.smaa_enabled && !crt_active
+            && !menu_backdrop_active && self.native_2d_encoded_surface_eligible();
+        let legacy_ui_ready = legacy_ui_candidate && self.ensure_encoded_2d_pipelines();
+        let native_ui_unorm_view = if legacy_ui_ready && legacy_unorm_view.is_none() {
+            frame.as_ref().map(|frame| self.surface_texture_unorm_view(frame))
+        } else { None };
+        let native_ui_encoded_view = if legacy_ui_ready {
+            legacy_unorm_view.as_ref().or(native_ui_unorm_view.as_ref())
+        } else { None };
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
         // A Studio world capture must never silently fall back to copying the
@@ -8054,10 +8067,18 @@ impl Renderer {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, false);
             if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
+            let encoded = native_ui_encoded_view.is_some();
+            let ui_target = native_ui_encoded_view.unwrap_or(final_output);
+            let ui_gamma = if native_ui_gamma_active { self.ui_gamma_native.as_ref() } else { None };
+            let encoded_gamma = if encoded { ui_gamma } else { None };
+            let encoded_gamma_group = encoded_gamma.map(|r| &r.encoded_group);
+            let fx_pipelines = if let Some(gamma) = encoded_gamma { &gamma.encoded_fx_pipelines }
+                else if encoded { &self.screen_fx_encoded_pipelines } else { &self.screen_fx_pipelines };
+            let ui_group = if encoded { &self.ui_encoded_bind_group } else { &self.ui_bind_group };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: final_output,
+                    view: ui_target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -8075,21 +8096,26 @@ impl Renderer {
                 &self.screen_fx_vertex_buffer,
                 self.screen_fx_vertex_count,
                 &self.screen_fx_batches,
-                &self.screen_fx_pipelines,
+                fx_pipelines,
                 &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                &self.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
             // No extra scene pass: only the native UI pixels are counter-adjusted.
-            let ui_gamma = if native_ui_gamma_active { self.ui_gamma_native.as_ref() } else { None };
-            let ui_pipeline = ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline);
-            if let Some(resources) = ui_gamma {
-                pass.set_bind_group(1, &resources.group, &[]);
+            let ui_pipeline = if let Some(gamma) = encoded_gamma {
+                gamma.encoded_pipeline.as_ref().expect("ready encoded gamma UI pipeline")
+            } else if encoded {
+                self.ui_encoded_pipeline.as_ref().expect("ready legacy 2D pipeline")
+            } else {
+                ui_gamma.map_or(&self.ui_pipeline, |r| &r.pipeline)
+            };
+            if let Some(group) = encoded_gamma_group.or_else(|| ui_gamma.map(|r| &r.group)) {
+                pass.set_bind_group(1, group, &[]);
             }
             Self::draw_ui_batches_shadered(
                 &mut pass,
                 ui_pipeline,
-                &self.ui_bind_group,
-                ui_gamma.map(|r| &r.group),
+                ui_group,
+                encoded_gamma_group.or_else(|| ui_gamma.map(|r| &r.group)),
                 &self.ui_dynamic_vertex_buffer,
                 self.ui_dynamic_vertex_count,
                 &self.ui_transient_vertex_buffer,
@@ -8098,22 +8124,22 @@ impl Renderer {
                 self.ui_vertex_count,
                 &self.ui_icon_shader_buffer,
                 &self.ui_icon_shader_batches,
-                &self.screen_fx_pipelines,
+                fx_pipelines,
                 &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                &self.screen_fx_white_bind_group, encoded,
             );
             Self::draw_screen_fx_batches(
                 &mut pass, &self.enemy_icon_vertex_buffer,
                 self.enemy_icon_vertex_count, &self.enemy_icon_batches,
-                &self.screen_fx_pipelines, &self.screen_fx_textures,
-                &self.screen_fx_white_bind_group,
+                fx_pipelines, &self.screen_fx_textures,
+                &self.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
             if !self.egui_active {
-                self.frame_time_graph.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
+                self.frame_time_graph.draw(&mut pass, ui_pipeline, ui_group);
             }
             if tile_cost_overlay_ready {
                 if let Some(overlay) = self.tile_cost_overlay.as_ref() {
-                    overlay.draw(&mut pass, ui_pipeline, &self.ui_bind_group);
+                    overlay.draw(&mut pass, ui_pipeline, ui_group);
                 }
             }
             drop(pass);
@@ -8370,7 +8396,7 @@ impl Renderer {
             && self.crt_scope == ui::CrtScope::SceneHud && !menu_backdrop_active
             && (self.studio_world_viewport.is_none() || self.ui_state.mode == ui::OverlayMode::Console);
         if stream_scene_hud_crt {
-            self.submit_ui_overlay(crt_view.as_ref().expect("CRT resources must exist while enabled"));
+            self.submit_ui_overlay(crt_view.as_ref().expect("CRT resources must exist while enabled"), None);
             self.submit_crt(&frame_view);
         }
         self.submit_egui(ui_composite_target);
@@ -8385,7 +8411,7 @@ impl Renderer {
             // Editor chrome owns this window. A recorded demo's native HUD,
             // crosshair and scoreboard must not paint over the Studio panels.
             // The developer console remains usable while editing.
-            self.submit_ui_overlay(ui_composite_target);
+            self.submit_ui_overlay(ui_composite_target, native_ui_encoded_view);
         }
         if crt_everything {
             self.submit_crt(&frame_view);

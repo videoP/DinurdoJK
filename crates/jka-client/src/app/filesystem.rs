@@ -30,6 +30,12 @@ impl App {
         self.pk3_manager_loaded = false;
         self.invalidate_studio_sources();
         self.reset_asset_catalogs_for_game_change();
+        if self.front_end && self.frontend_page == crate::app::FrontendPage::PlayDemo {
+            // Start an async rescan immediately for whichever game is visible.
+            // Other tabs will scan lazily when selected. Catalog generation
+            // guards discard any pre-restart results still in flight.
+            self.update_native_demo_browser();
+        }
         if self.front_end && self.frontend_page == crate::app::FrontendPage::RenderStudio {
             self.render_studio_update_backdrop();
         }
@@ -286,6 +292,7 @@ impl App {
             path: "auto".to_owned(),
             game: self.game.clone(),
         });
+        self.render_command(RenderCommand::ForgetModelAssets);
         self.demo_catalog_loaded = false;
         self.demo_catalog_pending = false;
         self.demo_catalog_generation = self.demo_catalog_generation.wrapping_add(1);
@@ -295,6 +302,10 @@ impl App {
         self.demo_metadata_cache.clear();
         self.demo_metadata_errors.clear();
         self.demo_metadata_inflight.clear();
+        // The JK2 browser has its own loaded flag and async generation. A
+        // filesystem restart must invalidate it too, or new .dm_15/.dm_16
+        // recordings remain invisible until the process is restarted.
+        self.jk2_demo_browser.reset();
     }
 
     /// Resolve a game-relative write without letting the feature decide whether

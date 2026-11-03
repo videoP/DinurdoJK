@@ -85,6 +85,11 @@ fn target(server: SocketAddr, account_type: AccountType) -> String {
     format!("{TARGET_PREFIX}{}/{server}", account_type.key())
 }
 
+#[cfg(windows)]
+fn secret_target(name: &str) -> String {
+    format!("DinurdoJK/secret/{name}")
+}
+
 #[cfg(any(windows, test))]
 fn parse_target(value: &str) -> Option<(SocketAddr, AccountType)> {
     let value = value.strip_prefix(TARGET_PREFIX)?;
@@ -94,7 +99,7 @@ fn parse_target(value: &str) -> Option<(SocketAddr, AccountType)> {
 
 #[cfg(windows)]
 mod platform {
-    use super::{parse_target, target, AccountType, Credential, SavedAccount, TARGET_PREFIX};
+    use super::{parse_target, secret_target, target, AccountType, Credential, SavedAccount, TARGET_PREFIX};
     use std::{
         ffi::{c_void, OsStr},
         net::SocketAddr,
@@ -191,8 +196,25 @@ mod platform {
         username: &str,
         password: &str,
     ) -> Result<(), String> {
-        let mut target = wide(&target(server, account_type));
-        let mut comment = server_name
+        write_target(&target(server, account_type), server_name, username, password)
+    }
+
+    /// Generic secrets (service API keys), never listed with the accounts.
+    pub fn save_secret(name: &str, secret: &str) -> Result<(), String> {
+        write_target(&secret_target(name), None, "DinurdoJK", secret)
+    }
+
+    pub fn read_secret(name: &str) -> Result<Option<String>, String> {
+        Ok(read_target(&secret_target(name))?.map(|credential| credential.password))
+    }
+
+    pub fn delete_secret(name: &str) -> Result<(), String> {
+        delete_target(&secret_target(name))
+    }
+
+    fn write_target(target: &str, comment: Option<&str>, username: &str, password: &str) -> Result<(), String> {
+        let mut target = wide(target);
+        let mut comment = comment
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(wide);
@@ -233,7 +255,11 @@ mod platform {
         server: SocketAddr,
         account_type: AccountType,
     ) -> Result<Option<Credential>, String> {
-        let target = wide(&target(server, account_type));
+        read_target(&target(server, account_type))
+    }
+
+    fn read_target(target: &str) -> Result<Option<Credential>, String> {
+        let target = wide(target);
         let mut raw: *mut CredentialW = ptr::null_mut();
         let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut raw) };
         if ok == 0 {
@@ -272,7 +298,11 @@ mod platform {
     }
 
     pub fn delete(server: SocketAddr, account_type: AccountType) -> Result<(), String> {
-        let target = wide(&target(server, account_type));
+        delete_target(&target(server, account_type))
+    }
+
+    fn delete_target(target: &str) -> Result<(), String> {
+        let target = wide(target);
         let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
         if ok == 0 {
             let code = unsafe { GetLastError() } as i32;
@@ -360,12 +390,21 @@ mod platform {
     pub fn list() -> Result<Vec<SavedAccount>, String> {
         Ok(Vec::new())
     }
+    pub fn save_secret(_name: &str, _secret: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+    pub fn read_secret(_name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    pub fn delete_secret(_name: &str) -> Result<(), String> {
+        Ok(())
+    }
     pub const fn supported() -> bool {
         false
     }
 }
 
-pub use platform::{delete, list, read, save, supported};
+pub use platform::{delete, delete_secret, list, read, read_secret, save, save_secret, supported};
 
 #[cfg(test)]
 mod tests {

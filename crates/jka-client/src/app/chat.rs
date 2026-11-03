@@ -162,6 +162,8 @@ impl App {
             team: matches!(mode, ChatMode::Team),
             created: now,
             demo_elapsed_ms: self.current_demo_elapsed_ms(now),
+            chat_id: None,
+            translation: None,
         });
         self.last_chat_refresh = Instant::now();
     }

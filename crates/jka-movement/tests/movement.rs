@@ -281,6 +281,36 @@ fn offline_speed_rage_and_regeneration_are_separate_from_prediction() {
 }
 
 #[test]
+fn slightly_nonaxial_bsp_bounds_load_using_openjk_collision() {
+    // Some compiled JKA maps have tiny residual components in one of the
+    // first six brush planes (Cemetery has components up to ~0.00015544).
+    // OpenJK accepts these planes and still uses its native collision code.
+    let bytes = rewrite_lumps(&Map::floor().bytes(), |lumps| {
+        // Plane 0 is -X; tilt its Z component just as in Cemetery.
+        lumps[2][8..12].copy_from_slice(&0.00015544042f32.to_le_bytes());
+    });
+    let mut world = CollisionWorld::from_bsp(&bytes).expect("near-axial BSP is valid");
+    let hit = world.trace(TraceQuery {
+        start: [0.0, 0.0, 128.0],
+        end: [0.0, 0.0, -128.0],
+        mins: [0.0; 3],
+        maxs: [0.0; 3],
+        pass_entity: 0,
+        mask: 1,
+    });
+    assert!(hit.fraction < 1.0 && hit.normal[2] > 0.9, "{hit:?}");
+}
+
+#[test]
+fn materially_nonaxial_bsp_bounds_remain_rejected() {
+    let bytes = rewrite_lumps(&Map::floor().bytes(), |lumps| {
+        // A rotated leading side cannot act as a native axial brush bound.
+        lumps[2][8..12].copy_from_slice(&0.5f32.to_le_bytes());
+    });
+    assert!(CollisionWorld::from_bsp(&bytes).is_err());
+}
+
+#[test]
 fn invalid_collision_references_are_rejected_even_without_pvs() {
     let bytes = Map::floor().bytes();
     let offset = |lump: usize| {

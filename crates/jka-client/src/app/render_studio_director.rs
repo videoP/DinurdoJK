@@ -662,7 +662,7 @@ mod tests {
 
     fn timeline() -> StudioTimeline {
         let mut tl = StudioTimeline::default();
-        tl.demos.push(StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false, name: "a".into(), game: String::new(), start: 0.0, duration_ms: 20_000,
+        tl.demos.push(StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false, name: "a".into(), game: String::new(), start: 0.0, duration_ms: 20_000,
             in_ms: 0, out_ms: 20_000, speed_keys: vec![], transition_in: Default::default(), audio: Default::default(), layer: 0 });
         tl
     }
@@ -1105,7 +1105,7 @@ pub(in crate::app) fn build_route_comparison_plan(runs: &[StudioRouteRun], thres
     let highlights=comparison.phases.iter().filter(|p|p.kind==super::render_studio_race::RacePhaseKind::Replay).count();
     let section_count=comparison.phases.iter().map(|p|p.section).max().unwrap_or(0);
     let length = comparison.duration();
-    let clip = StudioDemoClip { source_path: None,
+    let clip = StudioDemoClip { demo_protocol:26, source_path: None,
         comparison:Some(Box::new(comparison)),race_overlays:Vec::new(),pov_trail:Default::default(),
         hud_overrides:Default::default(),hide_other_players:true,name:fast.name.clone(),game:fast.game.clone(),
         start:0.0,duration_ms:fast.duration_ms,in_ms:0,out_ms:fast.duration_ms,speed_keys:vec![],

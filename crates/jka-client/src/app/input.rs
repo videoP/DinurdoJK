@@ -176,6 +176,11 @@ impl App {
                     }
                 }
             }
+            // TaystJK's Force menu runs `uiScript setForce same` on close;
+            // closing Profile likewise applies edits not yet sent by APPLY.
+            if self.profile_has_pending_changes() {
+                self.apply_profile_changes();
+            }
         }
         self.profile_preview_active = active;
         if active {

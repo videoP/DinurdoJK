@@ -54,7 +54,7 @@ impl App {
             if open {
                 ui.spacing_mut().item_spacing.y=1.0;
                 for clip in clips {
-                    let _=self.egui_render_studio_media_tile(ui,StudioMediaDrag {name:clip.label.clone(),emote_id:None,cinematic:Some(clip.source.clone()),demo_game:None},locked);
+                    let _=self.egui_render_studio_media_tile(ui,StudioMediaDrag {name:clip.label.clone(),emote_id:None,cinematic:Some(clip.source.clone()),demo_game:None,demo_path:None},locked);
                 }
                 ui.spacing_mut().item_spacing.y=5.0;
             }

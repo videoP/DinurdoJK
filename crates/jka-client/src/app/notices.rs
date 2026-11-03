@@ -19,6 +19,9 @@ pub(in crate::app) struct ChatRecord {
     pub(in crate::app) created: Instant,
     /// Demo timeline position when this line was authored. Live sessions use wall time.
     pub(in crate::app) demo_elapsed_ms: Option<f64>,
+    /// Received message this line shows (chat translation); `None` for local echoes.
+    pub(in crate::app) chat_id: Option<u64>,
+    pub(in crate::app) translation: Option<crate::app::chat_translation::ChatRecordTranslation>,
 }
 
 /// One row in the classic transparent top-left console-notify timestamp ring.
@@ -461,6 +464,8 @@ impl App {
             .current_snapshot()
             .map(|snapshot| snapshot.server_time);
         let rewards_match_viewer = session.client_game.presentation_player_state().is_some();
+        let chat_from_demo = !session.live;
+        let own_client = self.net.as_ref().map(|net| net.session().client_num());
         let notices = session.client_game.drain_notices();
         let misses = std::mem::take(&mut self.predictor.misses);
         for miss in misses {
@@ -486,7 +491,7 @@ impl App {
                         }
                     }
                 }
-                crate::cgame::CgameNotice::Chat { team, kind, text, sender } => {
+                crate::cgame::CgameNotice::Chat { team, kind, text, sender, body_start } => {
                     let text = crate::cgame::bytes_to_lossless_ascii(&text);
                     // Scoreboard mutes are client-side: the line never reaches
                     // the chat box, console or chat log.
@@ -541,7 +546,23 @@ impl App {
                         (false, true) => crate::logging::ConsoleLineKind::NotifyMention,
                         (false, false) => crate::logging::ConsoleLineKind::Normal,
                     };
-                    self.push_console_line_no_notify(text.clone(), console_kind);
+                    // The id ties the console row and chat-box line to one message
+                    // for translation. One char per byte, so byte offsets are char offsets.
+                    let sender_name = sender
+                        .and_then(|client| usize::try_from(client).ok())
+                        .and_then(|slot| self.game_session.as_ref()?.client_game.client_name(slot))
+                        .unwrap_or_default();
+                    let chat_id = self.record_chat_message(crate::app::chat_translation::ReceivedChat {
+                        kind,
+                        team,
+                        demo: chat_from_demo,
+                        own: sender.is_some() && sender == own_client,
+                        sender,
+                        sender_name,
+                        text: &text,
+                        body_start,
+                    });
+                    self.push_console_chat_line(text.clone(), console_kind, chat_id);
                     if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
                         self.chat_lines.pop_front();
                     }
@@ -555,9 +576,12 @@ impl App {
                         team,
                         created: now,
                         demo_elapsed_ms,
+                        chat_id: Some(chat_id),
+                        translation: None,
                     });
                     self.last_chat_refresh = Instant::now();
                     self.publish_transient_ui();
+                    self.auto_translate_chat(chat_id);
                 }
                 crate::cgame::CgameNotice::CenterPrint(text) => {
                     // JKA/Tayst `cp` is presentation-only: CG_ServerCommand calls

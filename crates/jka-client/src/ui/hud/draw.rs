@@ -230,9 +230,11 @@ pub(in crate::ui) fn hud_texts(
     );
     let value_scale = 1.6 * s;
     // Reserve four normal-width glyph cells (up to 9999).  A varying label
-    // must never change the screen x of the first digit.
-    const VALUE_COLUMN_CHARS: f32 = 4.0;
-    let value_column_width = VALUE_COLUMN_CHARS * 6.0 * value_scale;
+    // must never change the screen x of the first digit; longer words (saber
+    // style names) widen the column so they end inside the panel.
+    const VALUE_COLUMN_CHARS: usize = 4;
+    let value_chars = value.chars().count().max(VALUE_COLUMN_CHARS);
+    let value_column_width = value_chars as f32 * 6.0 * value_scale;
     text(
         out,
         value,

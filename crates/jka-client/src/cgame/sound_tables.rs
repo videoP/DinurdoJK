@@ -175,6 +175,26 @@ pub fn weapon_sounds(weapon: i32) -> WeaponSounds {
     }
 }
 
+/// Pinned MVSDK `CG_RegisterWeapon` sounds, for a presentation weapon. JK2
+/// has no per-weapon select sounds (EV_CHANGE_WEAPON plays SELECT_SOUND) and
+/// registers the rocket hum as `missileloop.wav`, which retail JK2 does not
+/// ship, so its rockets fly silently.
+pub fn jk2_weapon_sounds(weapon: i32) -> WeaponSounds {
+    const JK2_ROCKET_LOOP: &str = "sound/weapons/rocket/missileloop.wav";
+    let mut sounds = weapon_sounds(weapon);
+    sounds.select = None;
+    if weapon == WP_ROCKET_LAUNCHER {
+        sounds.missile = Some(JK2_ROCKET_LOOP);
+        sounds.alt_missile = Some(JK2_ROCKET_LOOP);
+    }
+    sounds
+}
+
+/// The active game's `CG_RegisterWeapon` sounds for a presentation weapon.
+pub fn active_weapon_sounds(weapon: i32) -> WeaponSounds {
+    if jka_assets::pk3::active_jk2().is_some() { jk2_weapon_sounds(weapon) } else { weapon_sounds(weapon) }
+}
+
 /// `holdable_t` values CG_UseItem plays a sound for.
 pub const HI_SEEKER: i32 = 1;
 pub const HI_MEDPAC: i32 = 3;

@@ -1,11 +1,147 @@
 # JK2 1.02 / 1.04 support
 
-**Next deliverable: a playable-team build.** Joining/spectating is already
-demonstrated. Continue with native remote context, JK2 command selection,
-playing-state prediction and team admission, then spawn/movement/combat tests.
-Use [the next-step handoff](<Development Docs/JK2_NEXT_HANDOFF.md>) as the
-implementation entry point. Client gameplay remains native MVSDK C/FFI; the
-private test endpoint is the existing JK2MV executable, with no server fork.
+**Current deliverable: the playable-team checkpoint** (section below). Native
+remote context, JK2 command selection, playing-state prediction and team
+admission are implemented; the focused-window playtest is the next step. Use
+[the next-step handoff](<Development Docs/JK2_NEXT_HANDOFF.md>) as the entry
+point. Client gameplay remains native MVSDK C/FFI; the private test endpoint is
+the existing JK2MV executable, with no server fork.
+
+## Playable-team checkpoint (November 2, 2026)
+
+**Remote client context.** The native player owns a prediction-side copy of
+`cg_entities[0..31].currentState` in native SDK structs (`jk2_context.c`).
+Every raw wire snapshot since the last one, in order, is transitioned as
+`CG_SetInitialSnapshot`/`CG_TransitionSnapshot` do: the snapshot playerstate
+becomes its client slot through the SDK's `BG_PlayerStateToEntityState`, each
+present client entity replaces its slot (1.02 torso/legs mapped with the
+pinned table), and absent clients keep their last state. A new gamestate
+(CG_Init) starts from zero. Before each replayed command the host runs a
+verbatim copy of pinned `CG_EntityStateToPlayerState` into fresh `cgSendPS`
+slots and binds `bgClients`. During a lock it sets the lock-facing angles
+from `cg.snap->ps` and the opponent's lerped origin, which is taken from the
+previous frame because CGame predicts before `CG_AddPacketEntities`. After
+Pmove it writes torso/legs, `forceFrame` and `saberMove` back into the
+context. Per-command checkpoints and a per-frame `context_transaction`
+restore the context on native error, collision failure or panic. Preview
+clones carry their own copy, so an unsent command never commits opponent
+state. The direct oracle runs the same projection, writeback and lock facing.
+The explicit "saber-lock prediction requires remote client state" error remains
+for a player without a transitioned snapshot.
+
+**Command selection.** JK2 connections keep CGame's own selection state in
+native JK2 IDs (`cg.weaponSelect`, `cg.forceSelect`, `cg.itemSelect`; -1 is
+sent as 255), and `LiveInput::build_cmd` writes it into both transmitted and
+preview usercmds. The pinned CGame commands run in C on raw wire states
+(`jk2_select.c`): `CG_WeaponSelectable` with the gameplay version's
+`weaponData`, `CG_Next/PrevWeapon_f`, `CG_Weapon_f` (including its
+`sv_saberswitch` slot 1), `CG_OutOfAmmoChange`, and the Force/inventory
+cycling through the compiled `BG_CycleForce`/`BG_CycleInven`. `CG_Respawn`,
+`CG_ItemPickup` auto-select, raw `EV_NOAMMO` parm decoding and the
+`CG_DrawForceSelect` expiry refresh are ported. jk2mv `CL_KeyMove` walks at 46
+(JKA 64), and `CL_CmdButtons` has no FORCEPOWER+USE remap. Generic
+commands map once at `CL_FinishMove`. IDs 1–19 are shared, and JKA's
+`GENCMD_SABERATTACKCYCLE` (26) is JK2's 20. JKA-only generics (taunt, emotes,
+jetpack, dispensers, …) and TaystJK's `weaplast`/`weaponclean`/`invuse` say
+explicitly that JK2 has no such command. The HUD keeps reading presentation
+mirrors. `ClientSession` no longer zeroes JK2 selections; it only replaces
+values outside the JK2 enums with "none".
+
+**Playing states and teams.** The predictor now runs for the local client's
+own playerstate outside follow mode, including dead, frozen and intermission
+states. One host exception remains: a spectator-team `PM_NORMAL` first
+snapshot is shown from snapshots until the server runs a command.
+`MASK_PLAYERSOLID` drops `CONTENTS_BODY` for the spectator team and when the
+previous prediction is `PM_DEAD`. **Correction:** JK2's `CONTENTS_BODY` is
+`0x100` (pinned `surfaceflags.h`), not Q3's `0x02000000`. The earlier
+spectator path cleared the wrong bit, so the claim below that spectators
+excluded bodies was not true until this change. `spectator_server_timing` is
+set only for `PM_SPECTATOR` states. Playing states use the CGame contract,
+which matches `ClientThink_real`. Unsent input changes only continuous display
+fields, as in the JKA predictor, and `CG_AdjustPositionForMover` runs after
+the replay. Playing-state comparisons add `weapon`, `weaponstate`,
+`weaponTime` and `saberMove` to the spectator list. Server combat results
+(damage, knockback, Force effects, server events) still appear as reported
+divergences. They are never folded into prediction or smoothed.
+`add_reliable_command` no longer blocks JK2 team requests. The automatic
+`team spectator` is queued once per connection, so a later gamestate (map
+change/restart) keeps a playing-team choice.
+
+**Velocity snapping.** The JK2 host's `trap_SnapVector` previously called
+OpenJK's `Sys_SnapVector`. That rounds halves away from zero and keeps
+`-0.0`. jk2mv, the engine authority for JK2 clients and servers, converts
+through integers with SSE `cvtps2dq`/`cvtdq2ps` (round-half-even, `+0.0`).
+The host now does the same; a native regression pins the semantics.
+Spectator comparisons were unaffected; playing-state velocity mismatches
+dropped from up to 14 units to up to 6.
+
+**Force rank (`nfr`).** Pinned `WP_InitForcePowers` returns a client to
+`TEAM_SPECTATOR` on its first spawn, or when its `forcepowers` exceed the
+server's rank, and sends `nfr <rank> <menu> <team>`. The app never consumed
+this action before. On JK2 it now legalizes the configuration with the pinned
+`BG_LegalizedForcePowers`, using the server's own inputs (`g_gametype`,
+`HasSetSaberOnly` from `g_weaponDisable`/`g_duelWeaponDisable`,
+`g_forcePowerDisable`, `g_forceBasedTeams`). It sends that in JK2 userinfo
+only for this connection, without changing the saved JKA-shared
+`forcepowers`, and tells the player to join again. The private server
+announces rank 6, and the default `7-1-…` configuration is rank 7. JK2's own
+UI shows its force menu at this point; DinurdoJK has no JK2 force menu yet. A
+team change within 5 s of the previous one is refused by SetTeam
+(`@@@NOSWITCH`), including the automatic join-time `team spectator`.
+
+**Live validation (1.04, private JK2MV, pure 1, variable timing, one bot).**
+`loopback_104` (spectator, corrected mask `0x11`) passed: 119 comparisons, 84
+bit-exact, 0 divergences, maximum origin/velocity component errors 0.000122 /
+0.000061. `loopback_play_104` used the production paths: `team free` through
+`add_reliable_command`, the `nfr` userinfo response, then a second
+`team free`. It reached `pm_type=0`, `mask=0x111`, server timing 0, with
+3,723 locally predicted playing frames and 509 units of movement. Commands
+covered forward, strafe, jump, crouch, turning, attack, alt-attack and a weapon
+cycle. While playing, 16 of 200 acknowledged comparisons exceeded the 1/1024
+bound. Most first differences were float-level `origin[2]` (~1e-6). There was
+one sustained ~0.11–0.17 `origin[1]` offset where the server held exactly
+`-920.0` (a contact case, wall or bot body, not yet identified), some
+1–6 unit velocity steps, and one `torsoAnim` transient at the weapon switch.
+These are reported, not suppressed or bounded away. The playing test asserts
+spawn and predicted movement; only the spectator test asserts zero divergence.
+1.02 live runs were not repeated in this session (the helper runs 1.04).
+
+Focused checks: 16 native JK2 tests, 16 protocol JK2 tests and 12 client JK2
+tests pass, plus the two live 1.04 loopback runs above. `build.ps1 -Fast`
+staged `target/release/DinurdoJK.exe`.
+
+Not yet ported or verified: a JK2 force-power menu, the scoreboard/`cg_draw2D` conditions of
+the force-select expiry, and `cg.snap->ps` mutations by CGame selection
+commands. Server-authoritative damage, death and Force effects are not
+predicted. There has been no focused-window playtest, saber-lock test
+against a live opponent, or 1.02 playing run.
+
+## Trigger touch prediction (November 2, 2026, later)
+
+Pinned `CG_TouchTriggerPrediction` / `CG_TouchItem` now run in C after every
+replayed command's Pmove (`native/jk2_context.c` `jk2_touch_triggers`; host
+substitutions listed there). Inputs mirror CGame:
+
+- `cg_entities[].currentState` for trigger types (ET_ITEM, ET_PUSH_TRIGGER,
+  ET_TELEPORT_TRIGGER) is prediction-owned C state, transitioned with every
+  wire snapshot (`Player::transition_world`), including the 1.02 anim mapping
+  and the `mvsdk_svFlags` SUBMODEL_TIME2 / SUBMODEL_WORKAROUND fixups.
+- The trigger list is the prediction base snapshot's entity order
+  (`set_triggers`), like `CG_BuildSolidList`.
+- `trap_CM_BoxTrace(model)` is a new jk2mv `CM_BoxTrace` export
+  (`jk2_world_trace_model`) reached through `TraceWorld::trace_model`.
+- `EF_NODRAW`/`miscTime` mutations and `cg.hyperspace` are checkpointed per
+  command, marked per frame, and deep-copied for the preview clone. Predicted
+  pickups are dropped from presented entities after prediction.
+- JK2 userinfo now sends the real `cg_predictItems` (jk2mv registers it as
+  `CVAR_USERINFO`); it was hard-coded `0`.
+
+Not presented: `cg.hyperspace` (RDF_HYPERSPACE view) is computed but the
+renderer does not react to it. Separate gap found while porting: the existing
+solid-entity list (`prediction_solid_entities`) does not apply the
+`mvsdk_svFlags` BBOX/submodel fixups. Native test
+`native_trigger_touch_predicts_jump_pad_teleporter_and_item_pickup` covers
+both versions, oracle parity, preview isolation and rollback. Not playtested.
 
 ## Live prediction continuation (November 2, 2026)
 

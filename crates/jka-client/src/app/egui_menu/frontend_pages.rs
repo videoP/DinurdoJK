@@ -36,6 +36,16 @@ impl App {
             }
         }
         self.release_neon_main_menu();
+        // Play Demo's title, selector, tabs, list and inspector are all native
+        // Taffy/WGPU. Keep only the shared GPU footer and global modal overlays;
+        // neither the egui header nor its body should paint over this screen.
+        if self.frontend_page == FrontendPage::PlayDemo
+            && self.egui_display_overlay() != OverlayMode::Video {
+            self.egui_frontend_neon_footer(ui);
+            self.egui_disconnect_notice(ui);
+            self.egui_frontend_quit_confirmation(ui);
+            return;
+        }
         // Render Studio is a full-height editor, not a frontend menu page.
         // It owns its header and workspace: no reserved footer strip, and no
         // GPU neon footer over the preview or timeline. This also clears any
@@ -398,6 +408,9 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_body(&mut self, root: &mut egui::Ui) {
+        // Play Demo is authored by Taffy and rendered in the native WGPU UI pass.
+        // Suppress the shell glass and all egui widgets on this page.
+        if self.frontend_page == FrontendPage::PlayDemo { return; }
         let body = self.menu_shell(root.ctx()).body;
         super::shell_layout::region(root, "jka_frontend_body_region", body, |ui| {
                 let max_w = if self.frontend_page == FrontendPage::ServerBrowser {
@@ -463,7 +476,7 @@ impl App {
             FrontendPage::Play => self.draw_neon_frontend_submenu(ui, crate::neon_menu::MenuPage::Play),
             FrontendPage::ServerBrowser => self.egui_server_browser_page(ui),
             FrontendPage::SoloGame => self.egui_solo_game_page(ui),
-            FrontendPage::PlayDemo => self.egui_play_demo_page(ui),
+            FrontendPage::PlayDemo => {},
             FrontendPage::Profile => self.egui_profile_studio(ui),
             FrontendPage::Controls => self.egui_controls_page(ui),
             FrontendPage::ChatLogs => self.egui_chat_log_browser_page(ui),

@@ -434,13 +434,13 @@ impl StreamOutput {
                 &renderer.screen_fx_batches,
                 &renderer.screen_fx_pipelines,
                 &renderer.screen_fx_textures,
-                &renderer.screen_fx_white_bind_group,
+                &renderer.screen_fx_white_bind_group, false, None,
             );
             Renderer::draw_screen_fx_batches(
                 &mut pass, &renderer.enemy_icon_vertex_buffer,
                 renderer.enemy_icon_vertex_count, &renderer.enemy_icon_batches,
                 &renderer.screen_fx_pipelines, &renderer.screen_fx_textures,
-                &renderer.screen_fx_white_bind_group,
+                &renderer.screen_fx_white_bind_group, false, None,
             );
             if !vertices.is_empty() {
                 // Match the local presentation's native HUD gamma adjustment.

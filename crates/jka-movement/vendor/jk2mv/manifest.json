@@ -1,0 +1,90 @@
+{
+    "repository":  "https://github.com/mvdevs/jk2mv",
+    "revision":  "7d601454c3db68492289d4d4e3dc30bff39e4246",
+    "files":  [
+                  {
+                      "path":  "LICENSE",
+                      "sha256":  "e518f2e10cf977a0baa04b74d919c8d67c7c723a8beaf69e4227af98f8a51f6c"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_load.cpp",
+                      "sha256":  "9ad26c563a201ccc5fa5148afc67e7d530ee4093d532f9d39a5884f4e51d89d6"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_local.h",
+                      "sha256":  "6db84c432d05a2b089a2b5784e94812c00eb907839be84e73308369c35725b66"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_patch.cpp",
+                      "sha256":  "3d703505da60682ae2198c591cbc161a73b70c81ef8ddaa0afc727b4ae7c07f7"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_patch.h",
+                      "sha256":  "5360046ac8260bdf0ff395b728a408c6a56eac721bc9a932f503c26686cdc6c7"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_polylib.cpp",
+                      "sha256":  "32fb32ebc486afd0a799a30fe2f06f6086f4f0c09d57d21392a0c0810eb8b13e"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_polylib.h",
+                      "sha256":  "c445b00998730eb6319c781f1161ff4e0f2d4278fade975dcf53aa30595b6472"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_public.h",
+                      "sha256":  "d9faf85b860fdc2a7c9626315e8715cf8b5ee0dc6d88cb7f824b0cf42c6e4785"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_test.cpp",
+                      "sha256":  "87bcedb310eeb1f3251d928bde1d604b5b9af7c2b47521c5c5780a6feded349d"
+                  },
+                  {
+                      "path":  "src/qcommon/cm_trace.cpp",
+                      "sha256":  "f5d1debf3951a054e6691802877e9d9326fee98a379366fe8b050534a033747b"
+                  },
+                  {
+                      "path":  "src/qcommon/q_math.cpp",
+                      "sha256":  "a5752eff3e9e26262bcdf01efe567d9380ecd2106d438a890b0ea0115ab0da0b"
+                  },
+                  {
+                      "path":  "src/qcommon/q_shared.cpp",
+                      "sha256":  "b5e2f69709947aece0ffb30afd8f12051975709519889b23ed2984d66ec4798b"
+                  },
+                  {
+                      "path":  "src/qcommon/q_shared.h",
+                      "sha256":  "355751994c8ad5d3e4a4ad9a783a68118c5acbbbb16a4f01c762f738ed797239"
+                  },
+                  {
+                      "path":  "src/qcommon/qcommon.h",
+                      "sha256":  "1866dcb2783b66b76f8f7df21e792a87483d48eb86cd05bdb55d10dbbffc7f3c"
+                  },
+                  {
+                      "path":  "src/qcommon/qfiles.h",
+                      "sha256":  "43d9e4fcea11abcc27201a6be5d3c6a8d7ec775097974e1f97f75367ed42743e"
+                  },
+                  {
+                      "path":  "src/qcommon/tags.h",
+                      "sha256":  "d6b3d6205d42a65cc13273c1cbd9f06ebf9dc867cca98f6f86148bab79fc4d2f"
+                  },
+                  {
+                      "path":  "src/api/mvapi.h",
+                      "sha256":  "17387cb1bcd8c661b864af793b758d53e37d14f8a4533f4ba3521ab21470b13b"
+                  },
+                  {
+                      "path":  "src/api/mvmenu.h",
+                      "sha256":  "2e6b9ef6c0388206920b3f40b40d385a6d88930e6834fdc1f31f8c6448a5f7e0"
+                  },
+                  {
+                      "path":  "src/sys/sys_public.h",
+                      "sha256":  "0245af137bef7f2ffdafa56f88dac75b3c329bb2bef2e685887b4d35f7658249"
+                  },
+                  {
+                      "path":  "src/cgame/tr_types.h",
+                      "sha256":  "fab14a7c9409486b37481b8fd25a8965f605f8274b92818a28cd09599f1d5f44"
+                  },
+                  {
+                      "path":  "src/game/surfaceflags.h",
+                      "sha256":  "8454aa66bbaea73cc83a74f8ee893e4ba9b6395ef53b714be80275efe64cefe0"
+                  }
+              ]
+}

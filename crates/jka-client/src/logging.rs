@@ -57,6 +57,8 @@ pub struct LogRecord {
     pub local_time: [u16; 3],
     pub path_links: Vec<LogPathLink>,
     pub console_kind: ConsoleLineKind,
+    /// Received chat message this line prints (console translation menu).
+    pub chat_id: Option<u64>,
 }
 
 const MAX_UI_LOG_LINES: usize = 10_000;
@@ -295,7 +297,7 @@ pub fn write_line(level: Level, args: fmt::Arguments<'_>) {
         Level::Info => ConsoleLineKind::Normal,
         Level::Error => ConsoleLineKind::Error,
     };
-    write_line_inner(level, kind, args, Vec::new());
+    write_line_inner(level, kind, args, Vec::new(), None);
 }
 
 /// Write a console/log line with an explicit UI semantic class. The normal
@@ -304,7 +306,13 @@ pub fn write_console_line(kind: ConsoleLineKind, args: fmt::Arguments<'_>) {
     // Console presentation metadata is deliberately independent of logger
     // severity. Existing engine-authored console failures historically logged
     // as Info; tagging them as an Error row must not reroute them to stderr.
-    write_line_inner(Level::Info, kind, args, Vec::new());
+    write_line_inner(Level::Info, kind, args, Vec::new(), None);
+}
+
+/// A received chat line. The id is metadata for the console row, so the
+/// message is never found again by parsing rendered text.
+pub fn write_chat_console_line(kind: ConsoleLineKind, args: fmt::Arguments<'_>, chat_id: u64) {
+    write_line_inner(Level::Info, kind, args, Vec::new(), Some(chat_id));
 }
 
 /// Write an engine-authored console/log line with an explicitly trusted local
@@ -317,7 +325,7 @@ pub fn write_line_with_path(level: Level, args: fmt::Arguments<'_>, path: impl I
         Level::Info => ConsoleLineKind::Normal,
         Level::Error => ConsoleLineKind::Error,
     };
-    write_line_inner(level, kind, args, vec![LogPathLink { label, target }]);
+    write_line_inner(level, kind, args, vec![LogPathLink { label, target }], None);
 }
 
 fn write_line_inner(
@@ -325,6 +333,7 @@ fn write_line_inner(
     console_kind: ConsoleLineKind,
     args: fmt::Arguments<'_>,
     path_links: Vec<LogPathLink>,
+    chat_id: Option<u64>,
 ) {
     let message = args.to_string();
     let plain = strip_jka_colors(&message);
@@ -343,6 +352,7 @@ fn write_line_inner(
                 local_time: local_hms(),
                 path_links,
                 console_kind,
+                chat_id,
             };
             logger.ui_lines.push_back(record.clone());
             if let Some(sink) = &logger.ui_sink {

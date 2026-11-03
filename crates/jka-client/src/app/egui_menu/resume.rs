@@ -120,7 +120,7 @@ impl App {
             } else if can_join {
                 "Spawn in at the next available spawn point."
             } else {
-                "No spawn point is available on this map."
+                "Local play requires loaded map collision and player animations."
             },
             can_join,
         ) {

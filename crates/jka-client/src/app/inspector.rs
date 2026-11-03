@@ -986,7 +986,7 @@ impl App {
         // source as the presenter so the inspector does not print plausible but
         // wrong qpaths.
         let item = (kind == EntityPresentationKind::Item)
-            .then(|| jka_movement::bg_item(model_index))
+            .then(|| crate::items::item(model_index))
             .flatten();
         let actor_info = match kind {
             EntityPresentationKind::Player => {

@@ -21,10 +21,7 @@ pub(crate) fn resolve_demo(root: Option<&Path>, name: &str) -> Result<PathBuf, S
         let base = root
             .ok_or("Set fs_jk2path to your JK2 GameData directory first")?
             .join("base");
-        vec![
-            base.join("demos").join(given),
-            base.join("jk2demos").join(given),
-        ]
+        vec![base.join("demos").join(given)]
     };
     if given.extension().is_some_and(|ext| {
         !ext.to_str().is_some_and(|ext| {
@@ -45,7 +42,7 @@ pub(crate) fn resolve_demo(root: Option<&Path>, name: &str) -> Result<PathBuf, S
     match matches.len() {
         1 => Ok(matches.remove(0)),
         0 => Err(format!(
-            "No JK2 demo found for {name}; checked base/demos and base/jk2demos"
+            "No JK2 demo found for {name}; checked base/demos"
         )),
         _ => Err("Multiple JK2 demos match; specify the extension or absolute path".into()),
     }

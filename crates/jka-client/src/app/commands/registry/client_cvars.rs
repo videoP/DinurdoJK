@@ -2614,7 +2614,7 @@ app_cvars! {
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
-                |app: &App| CvarValue::String(app.server_browser.filters_string()),
+                |app: &App| CvarValue::String(app.server_browser_for(server_browser::BrowserProtocol::Jka).filters_string()),
                 |app, value| App::cvar_set_cl_serverfilters(app, APP_CL_SERVERFILTERS.entry.name, &value.to_string()),
             )
             .with_text_setter(App::cvar_set_cl_serverfilters, None),
@@ -2628,7 +2628,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_set_cl_serverfilters(&mut self, _name: &str, value: &str) -> Result<(), String> {
-                    self.server_browser.apply_filters_string(value);
+                    self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).apply_filters_string(value);
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
@@ -2663,7 +2663,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_get_sv_master1(&self) -> String {
-                    self.server_browser.master_servers[0].clone()
+                    self.server_browser_for(server_browser::BrowserProtocol::Jka).master_servers[0].clone()
                 }
                 fn cvar_set_sv_master1(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let lower = "sv_master1".to_owned();
@@ -2678,11 +2678,11 @@ app_cvars! {
                         if master.len() > 255 {
                             return Err(format!("{name}: master address is too long"));
                         }
-                        self.server_browser.master_servers[slot] = master.to_owned();
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_servers[slot] = master.to_owned();
                         if !master.is_empty() {
-                            self.server_browser.master_drafts[slot] = master.to_owned();
+                            self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_drafts[slot] = master.to_owned();
                         }
-                        self.server_browser.status_text =
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).status_text =
                             "Master server settings changed â€” press Refresh to query them".to_owned();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -2719,7 +2719,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_get_sv_master2(&self) -> String {
-                    self.server_browser.master_servers[1].clone()
+                    self.server_browser_for(server_browser::BrowserProtocol::Jka).master_servers[1].clone()
                 }
                 fn cvar_set_sv_master2(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let lower = "sv_master2".to_owned();
@@ -2734,11 +2734,11 @@ app_cvars! {
                         if master.len() > 255 {
                             return Err(format!("{name}: master address is too long"));
                         }
-                        self.server_browser.master_servers[slot] = master.to_owned();
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_servers[slot] = master.to_owned();
                         if !master.is_empty() {
-                            self.server_browser.master_drafts[slot] = master.to_owned();
+                            self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_drafts[slot] = master.to_owned();
                         }
-                        self.server_browser.status_text =
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).status_text =
                             "Master server settings changed â€” press Refresh to query them".to_owned();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -2775,7 +2775,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_get_sv_master3(&self) -> String {
-                    self.server_browser.master_servers[2].clone()
+                    self.server_browser_for(server_browser::BrowserProtocol::Jka).master_servers[2].clone()
                 }
                 fn cvar_set_sv_master3(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let lower = "sv_master3".to_owned();
@@ -2790,11 +2790,11 @@ app_cvars! {
                         if master.len() > 255 {
                             return Err(format!("{name}: master address is too long"));
                         }
-                        self.server_browser.master_servers[slot] = master.to_owned();
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_servers[slot] = master.to_owned();
                         if !master.is_empty() {
-                            self.server_browser.master_drafts[slot] = master.to_owned();
+                            self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_drafts[slot] = master.to_owned();
                         }
-                        self.server_browser.status_text =
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).status_text =
                             "Master server settings changed â€” press Refresh to query them".to_owned();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -2831,7 +2831,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_get_sv_master4(&self) -> String {
-                    self.server_browser.master_servers[3].clone()
+                    self.server_browser_for(server_browser::BrowserProtocol::Jka).master_servers[3].clone()
                 }
                 fn cvar_set_sv_master4(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let lower = "sv_master4".to_owned();
@@ -2846,11 +2846,11 @@ app_cvars! {
                         if master.len() > 255 {
                             return Err(format!("{name}: master address is too long"));
                         }
-                        self.server_browser.master_servers[slot] = master.to_owned();
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_servers[slot] = master.to_owned();
                         if !master.is_empty() {
-                            self.server_browser.master_drafts[slot] = master.to_owned();
+                            self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_drafts[slot] = master.to_owned();
                         }
-                        self.server_browser.status_text =
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).status_text =
                             "Master server settings changed â€” press Refresh to query them".to_owned();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -2887,7 +2887,7 @@ app_cvars! {
         implementations: [
             impl App {
                 fn cvar_get_sv_master5(&self) -> String {
-                    self.server_browser.master_servers[4].clone()
+                    self.server_browser_for(server_browser::BrowserProtocol::Jka).master_servers[4].clone()
                 }
                 fn cvar_set_sv_master5(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let lower = "sv_master5".to_owned();
@@ -2902,11 +2902,11 @@ app_cvars! {
                         if master.len() > 255 {
                             return Err(format!("{name}: master address is too long"));
                         }
-                        self.server_browser.master_servers[slot] = master.to_owned();
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_servers[slot] = master.to_owned();
                         if !master.is_empty() {
-                            self.server_browser.master_drafts[slot] = master.to_owned();
+                            self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).master_drafts[slot] = master.to_owned();
                         }
-                        self.server_browser.status_text =
+                        self.server_browser_for_mut(server_browser::BrowserProtocol::Jka).status_text =
                             "Master server settings changed â€” press Refresh to query them".to_owned();
                         self.mark_config_dirty();
                         self.publish_ui();

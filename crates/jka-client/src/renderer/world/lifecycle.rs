@@ -523,6 +523,23 @@ impl Renderer {
         }
     }
 
+    /// The asset game (JK2/JKA or fs_game) changed. Ghoul2 GPU meshes and the
+    /// RT skinned caches are keyed by model qpath alone, and the same qpath
+    /// (models/players/kyle/model.glm) names different GLMs and skeletons in
+    /// another game. Drop them so the new game's models upload their own.
+    pub(in crate::renderer) fn forget_model_assets(&mut self) {
+        let models = &mut self.dynamic_model_renderer;
+        models.ghoul2_meshes.clear();
+        if let Some(rt) = models.rt_skinning.as_mut() {
+            rt.meshes.clear();
+        }
+        models.model_bundles.clear();
+        if let Some(rt) = self.ray_traced_shadows.as_mut() {
+            rt.skinned_blas_cache.clear();
+            rt.skinned_alpha_attributes.clear();
+        }
+    }
+
     pub(in crate::renderer) fn unload_map(&mut self) {
         self.clear_live_rivers();
         self.studio_active_world = None;

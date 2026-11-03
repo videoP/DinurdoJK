@@ -11,6 +11,8 @@ pub(crate) struct LiveDecoder {
     pub wire: Decoder,
     adapter: Adapter,
     big: BigConfigString,
+    /// The connection's one default `team spectator` request was queued.
+    pub default_team_sent: bool,
 }
 
 #[cfg(test)]
@@ -86,7 +88,7 @@ mod tests {
 
 impl LiveDecoder {
     pub fn new(version: Version) -> Self {
-        Self { version, wire: Decoder::for_live(version), adapter: Adapter::default(), big: BigConfigString::default() }
+        Self { version, wire: Decoder::for_live(version), adapter: Adapter::default(), big: BigConfigString::default(), default_team_sent: false }
     }
 
     pub fn parse(&mut self, sequence: i32, payload: &[u8], view: &mut server::Decoder)

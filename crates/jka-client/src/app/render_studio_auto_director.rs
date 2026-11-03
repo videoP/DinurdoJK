@@ -3416,7 +3416,7 @@ mod tests {
     }
 
     fn clip(ms: i32) -> StudioDemoClip {
-        StudioDemoClip { source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail: Default::default(), hud_overrides:Default::default(), hide_other_players:false,
+        StudioDemoClip { demo_protocol:26, source_path: None, comparison: None, race_overlays: Vec::new(), pov_trail: Default::default(), hud_overrides:Default::default(), hide_other_players:false,
             name: "run".into(), game: String::new(), start: 2.0, duration_ms: ms, in_ms: 0, out_ms: ms, speed_keys: vec![],
             transition_in: Default::default(), audio: Default::default(), layer: 0 }
     }

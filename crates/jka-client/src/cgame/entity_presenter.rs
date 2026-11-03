@@ -1679,8 +1679,8 @@ impl EntityPresenter {
         draws: &mut Vec<DynamicModelSurface>,
     ) {
         let index = entity.state.field_i32("modelindex").unwrap_or(0);
-        let Some(item) = jka_movement::bg_item(index) else {
-            self.log_entity_once(entity, &format!("bad item index {index} (bg_numItems {})", jka_movement::bg_item_count()));
+        let Some(item) = crate::items::item(index) else {
+            self.log_entity_once(entity, &format!("bad item index {index} (bg_numItems {})", crate::items::item_count()));
             return;
         };
         if index > 0 && !game.server_registers_item(index as usize) {
@@ -2282,8 +2282,8 @@ impl EntityPresenter {
         // CG_RegisterWeapon walks bg_itemlist to find the IT_WEAPON entry with
         // this giTag. There is one authoritative view_model in the pinned table;
         // never synthesize a weapon filename from the world model.
-        let item = (1..jka_movement::bg_item_count())
-            .filter_map(jka_movement::bg_item)
+        let item = (1..crate::items::item_count())
+            .filter_map(crate::items::item)
             .find(|item| item.item_type == IT_WEAPON && item.tag == weapon_num)
             .ok_or_else(|| format!("weapon {weapon_num} has no IT_WEAPON bg_itemlist entry"))?;
         if item.view_model.is_empty() {
@@ -4651,7 +4651,7 @@ models/map_objects/factory/glass_b
                             &entities, &game, snapshot.server_time, &mut ghoul2, &mut weapon_fx, false,
                         );
                         for entity in entities.iter().filter(|entity| entity.entity_type == super::super::ET_ITEM) {
-                            let item = jka_movement::bg_item(entity.state.field_i32("modelindex").unwrap_or(0)).unwrap();
+                            let item = crate::items::item(entity.state.field_i32("modelindex").unwrap_or(0)).unwrap();
                             let own = draws.iter().filter(|surface| surface.entity_num == entity.number).collect::<Vec<_>>();
                             if !own.is_empty() {
                                 *drawn.entry(item.classname.clone()).or_insert(0) += 1;

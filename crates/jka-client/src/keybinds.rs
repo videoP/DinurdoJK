@@ -311,12 +311,19 @@ impl Bindings {
 
     /// Spectator binds override normal binds one key at a time. Missing
     /// spectator entries inherit the normal bind instead of becoming unbound.
+    /// Right Alt/Ctrl/Shift inherit their corresponding left-side bind until
+    /// explicitly bound. This is a lookup fallback, not a copied config bind.
     pub fn get_resolved(&self, key: BindKey, spectating: bool) -> Option<&str> {
-        if spectating {
-            self.get_spectator(key).or_else(|| self.get(key))
-        } else {
-            self.get(key)
-        }
+        let lookup = |key| {
+            if spectating {
+                self.get_spectator(key).or_else(|| self.get(key))
+            } else {
+                self.get(key)
+            }
+        };
+        // An explicitly assigned right-side bind wins in every context.
+        // If absent, resolve the left-side bind in the same context.
+        lookup(key).or_else(|| left_modifier_for_right(key).and_then(lookup))
     }
 
     pub fn get_demo(&self, key: BindKey) -> Option<&str> {
@@ -656,6 +663,17 @@ pub fn canonical_movement_key(command: &str) -> Option<KeyCode> {
     })
 }
 
+/// EternalJK-style opt-in right-modifier binds: an unbound right-side key
+/// behaves like its left counterpart without modifying the saved bindings.
+fn left_modifier_for_right(key: BindKey) -> Option<BindKey> {
+    Some(BindKey::Keyboard(match key {
+        BindKey::Keyboard(KeyCode::AltRight) => KeyCode::AltLeft,
+        BindKey::Keyboard(KeyCode::ControlRight) => KeyCode::ControlLeft,
+        BindKey::Keyboard(KeyCode::ShiftRight) => KeyCode::ShiftLeft,
+        _ => return None,
+    }))
+}
+
 pub fn bind_key_for_code(code: KeyCode) -> BindKey {
     // Winit provides distinct physical codes for left and right modifiers.
     // Preserve them so each side can have its own gameplay binding.
@@ -895,6 +913,40 @@ mod tests {
         // Rebinding one side does not alter the other side.
         restored.unbind(BindKey::Keyboard(KeyCode::ControlRight));
         assert_eq!(restored.get(BindKey::Keyboard(KeyCode::ControlLeft)), Some("+attack"));
+    }
+
+    #[test]
+    fn right_modifier_fallback_respects_spectator_and_cfg_rules() {
+        let left = BindKey::Keyboard(KeyCode::AltLeft);
+        let right = BindKey::Keyboard(KeyCode::AltRight);
+        let mut bindings = Bindings::default();
+        bindings.clear();
+        bindings.clear_spectator();
+        bindings.set(left, "+attack");
+        bindings.set_spectator(left, "followprev");
+        assert_eq!(bindings.get_resolved(right, false), Some("+attack"));
+        assert_eq!(bindings.get_resolved(right, true), Some("followprev"));
+
+        // Explicit right binds override inherited left binds in both contexts.
+        bindings.set(right, "+use");
+        assert_eq!(bindings.get_resolved(right, true), Some("+use"));
+        bindings.set_spectator(right, "follownext");
+        assert_eq!(bindings.get_resolved(right, true), Some("follownext"));
+        assert!(bindings.unbind_spectator(right));
+        assert_eq!(bindings.get_resolved(right, true), Some("+use"));
+        assert!(bindings.unbind(right));
+        assert_eq!(bindings.get_resolved(right, true), Some("followprev"));
+
+        // Saving must not synthesize a right bind from the inherited left one.
+        let mut cfg = String::new();
+        bindings.write_cfg(&mut cfg);
+        assert!(cfg.contains("bind ALT \"+attack\""));
+        assert!(!cfg.lines().any(|line| line.starts_with("bind RALT ")));
+        let mut restored = Bindings::default();
+        assert!(apply_cfg(&mut restored, &cfg));
+        assert_eq!(restored.get(right), None);
+        assert_eq!(restored.get_resolved(right, false), Some("+attack"));
+        assert_eq!(restored.get_resolved(right, true), Some("followprev"));
     }
 
     #[test]

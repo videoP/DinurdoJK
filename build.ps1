@@ -74,7 +74,7 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 # (no flag)  Cargo 'release' profile: fat LTO, codegen-units=1. Use it for final FPS
 #            numbers and shipping. A one-line change costs ~6.5 min (the LTO step).
 # -Fast      Optimized iteration: ThinLTO, codegen-units=16, incremental ON.
-# -Faster    Visual-only iteration: opt-level=0, LTO off, incremental OFF.
+# -Faster    Visual-only iteration: opt-level=0, LTO off, incremental OFF, PDB enabled.
 # Each profile has its own cache (target\fast, target\faster).
 # Both stage their executable into target\release; neither builds jka-probe.
 if ($Fast -and $Faster) { throw 'Choose -Fast or -Faster, not both.' }
@@ -296,7 +296,7 @@ try {
             Preserve-RunningExecutable
             Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force
         }
-        if (-not $Faster) { Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb') }
+        Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb')
         Get-ChildItem -LiteralPath $buildDirectory -Filter '*.dll' | ForEach-Object { Sync-RuntimeFile $_.FullName }
     }
     Set-Content -LiteralPath "$executable.mode" -Value "$buildMode $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
@@ -318,7 +318,7 @@ try {
     }
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO, codegen-units 16, incremental ON)' }
-    if ($Faster) { Write-Host '(-Faster: visual-only, opt-level 0, LTO off, incremental OFF)' }
+    if ($Faster) { Write-Host '(-Faster: visual-only, opt-level 0, LTO off, incremental OFF, PDB enabled)' }
 } finally {
     # Normal builds never recursively scan target output or query NTFS file IDs.
     # Full file sizes and hard-link accounting are opt-in via -CacheAudit.

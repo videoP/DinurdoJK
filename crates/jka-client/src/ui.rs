@@ -27,6 +27,7 @@ mod studio_race_map;
 pub(crate) use studio_race_map::{StudioRaceMap, MAX_MAP_TRIANGLES};
 mod console;
 mod demo;
+pub mod demo_browser;
 mod frametime_graph;
 pub(crate) use frametime_graph::{build_frame_time_graph_vertices, FrameGraphSummary};
 mod tile_cost;
@@ -88,7 +89,7 @@ use hud::movement::{
     center_print_lines, icon_cell_uv, movement_keys_origin, ICON_CROSSHAIR_BASE, ICON_FORCE_BASE,
     ICON_TEXTURE_SOURCE, TEAM_ICON_TEXTURE_SOURCE,
 };
-pub use hud::movement::{ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub use hud::movement::{icon_name, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
 pub(crate) const ICON_SHADER_SOURCE_BASE: f32 = hud::movement::ICON_SHADER_SOURCE_BASE;
 pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF, ICON_INVENTORY_BASE};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
@@ -257,7 +258,7 @@ impl ChatSettings {
 
 impl Default for ChatSettings {
     fn default() -> Self {
-        Self { style: 1, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
+        Self { style: 2, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
     }
 }
 
@@ -500,7 +501,29 @@ pub struct ScoreboardMenuUi {
     /// Confirmation replaces the regular actions; a kick vote cannot be sent
     /// directly from the first click.
     pub confirm_kick: bool,
+    /// Heading in place of the player name (translation submenus).
+    pub title: Option<String>,
+    /// Secondary status line, kept separate so rule and language are never
+    /// clipped by a long player name.
+    pub detail: Option<String>,
 }
+
+/// Language hints offered in the scoreboard translation submenu; index 0 is
+/// automatic detection. The console menu offers every language.
+pub static SCOREBOARD_TRANSLATE_LANGUAGES: [(&str, &str); 12] = [
+    ("", "AUTO-DETECT"),
+    ("ru", "RUSSIAN"),
+    ("uk", "UKRAINIAN"),
+    ("es", "SPANISH"),
+    ("pt", "PORTUGUESE"),
+    ("fr", "FRENCH"),
+    ("de", "GERMAN"),
+    ("pl", "POLISH"),
+    ("tr", "TURKISH"),
+    ("it", "ITALIAN"),
+    ("zh", "CHINESE"),
+    ("en", "ENGLISH"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreAction {
@@ -511,6 +534,17 @@ pub enum ScoreAction {
     ConfirmVoteKick,
     CancelVoteKick,
     ForceSpectate,
+    /// Opens the per-player chat translation submenu.
+    Translate,
+    TranslateAlways,
+    TranslateNever,
+    /// Clear the mode: follow the global setting.
+    TranslateDefault,
+    /// Opens the language hint list.
+    TranslateLanguages,
+    /// Index into [`SCOREBOARD_TRANSLATE_LANGUAGES`].
+    TranslateHint(u8),
+    TranslateDone,
 }
 
 impl ScoreAction {
@@ -523,6 +557,15 @@ impl ScoreAction {
             Self::ConfirmVoteKick => "YES, CALL KICK VOTE",
             Self::CancelVoteKick => "CANCEL",
             Self::ForceSpectate => "VOTE SPECTATE",
+            Self::Translate => "TRANSLATION...",
+            Self::TranslateAlways => "ALWAYS TRANSLATE",
+            Self::TranslateNever => "NEVER TRANSLATE",
+            Self::TranslateDefault => "USE CHAT SETTING",
+            Self::TranslateLanguages => "LANGUAGE HINT...",
+            Self::TranslateHint(index) => SCOREBOARD_TRANSLATE_LANGUAGES
+                .get(usize::from(index))
+                .map_or("AUTO-DETECT", |&(_, label)| label),
+            Self::TranslateDone => "DONE",
         }
     }
 }
@@ -1507,6 +1550,7 @@ pub struct UiSnapshot {
     /// instead of the spectator's own row.
     pub scoreboard_focus_client: Option<i32>,
     pub demo_timeline: Option<DemoTimelineUi>,
+    pub demo_browser: Option<demo_browser::DemoBrowserUi>,
     pub prediction_debug: Option<PredictionDebugUi>,
     pub hud: Option<HudState>,
     pub team_overlay: Option<TeamOverlayUi>,
@@ -1628,6 +1672,7 @@ impl Default for UiSnapshot {
             killfeed: None,
             scoreboard_focus_client: None,
             demo_timeline: None,
+            demo_browser: None,
             prediction_debug: None,
             hud: None,
             team_overlay: None,

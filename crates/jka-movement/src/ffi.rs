@@ -16,6 +16,8 @@ pub(crate) type TraceFn = unsafe extern "C" fn(
     i32,
 );
 pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) -> i32;
+pub(crate) type ModelTraceFn =
+    unsafe extern "C" fn(*mut c_void, *mut TraceResult, *const f32, *const f32, *const f32, i32);
 unsafe extern "C" {
     pub fn jka_player_roll_debug(player: *const c_void, out: *mut RollPredictionDebug);
     pub fn jka_full_body_taunt(torso_anim: i32, legs_anim: i32) -> i32;
@@ -157,6 +159,52 @@ unsafe extern "C" {
         angles: *const f32,
     ) -> i32;
     pub fn jka_world_trace_box_entity(
+        world: *mut c_void,
+        out: *mut TraceResult,
+        start: *const f32,
+        mins: *const f32,
+        maxs: *const f32,
+        end: *const f32,
+        mask: i32,
+        box_mins: *const f32,
+        box_maxs: *const f32,
+        origin: *const f32,
+    ) -> i32;
+    // jk2mv's clip-map code for JK2 maps (native/jk2_collision.cpp); the same
+    // contracts as the jka_world_* functions above.
+    pub fn jk2_world_new(data: *const u8, length: i32) -> *mut c_void;
+    pub fn jk2_world_free(world: *mut c_void);
+    pub fn jk2_collision_error() -> *const c_char;
+    pub fn jk2_world_trace_model(
+        world: *mut c_void,
+        out: *mut TraceResult,
+        start: *const f32,
+        mins: *const f32,
+        maxs: *const f32,
+        end: *const f32,
+        mask: i32,
+        model: i32,
+    ) -> i32;
+    pub fn jk2_world_trace(
+        world: *mut c_void,
+        out: *mut TraceResult,
+        start: *const f32,
+        mins: *const f32,
+        maxs: *const f32,
+        end: *const f32,
+        mask: i32,
+        model: i32,
+        origin: *const f32,
+        angles: *const f32,
+    ) -> i32;
+    pub fn jk2_world_contents(
+        world: *mut c_void,
+        point: *const f32,
+        model: i32,
+        origin: *const f32,
+        angles: *const f32,
+    ) -> i32;
+    pub fn jk2_world_trace_box_entity(
         world: *mut c_void,
         out: *mut TraceResult,
         start: *const f32,
@@ -334,6 +382,47 @@ pub(crate) unsafe extern "C" fn contents_callback<W: TraceWorld>(
             1
         }
     }
+}
+/// CG_TouchTriggerPrediction's stationary box trace against one inline model.
+pub(crate) unsafe extern "C" fn model_trace_callback<W: TraceWorld>(
+    context: *mut c_void,
+    out: *mut TraceResult,
+    origin: *const f32,
+    mins: *const f32,
+    maxs: *const f32,
+    model: i32,
+) {
+    let callbacks = unsafe { &mut *context.cast::<Callbacks<'_, W>>() };
+    let origin = unsafe { vector(origin) };
+    let query = unsafe {
+        TraceQuery {
+            start: origin,
+            mins: trace_extent(mins),
+            maxs: trace_extent(maxs),
+            end: origin,
+            pass_entity: ENTITY_NONE,
+            mask: -1,
+        }
+    };
+    if callbacks.failure.is_some() || !query.is_finite() {
+        callbacks.failure.get_or_insert_with(|| format!("Non-finite model trace: {query:?} model={model}"));
+        unsafe { *out = TraceResult::clear(query.end) };
+        return;
+    }
+    IN_CALLBACK.set(true);
+    let result = catch_unwind(AssertUnwindSafe(|| callbacks.world.trace_model(query, model)));
+    IN_CALLBACK.set(false);
+    let trace = match result {
+        Ok(trace) if trace.fraction.is_finite() && trace.end.iter().all(|v| v.is_finite()) => trace,
+        other => {
+            callbacks.failure = Some(match other {
+                Ok(trace) => format!("Invalid model trace result {trace:?} for model {model} query {query:?}"),
+                Err(_) => format!("Model trace callback panicked for model {model} query {query:?}"),
+            });
+            TraceResult::clear(query.end)
+        }
+    };
+    unsafe { *out = trace };
 }
 
 #[cfg(test)]

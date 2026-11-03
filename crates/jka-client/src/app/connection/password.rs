@@ -33,6 +33,10 @@ impl App {
         self.server_password_prompt = None;
         // Password-required browser joins should keep their early map hint
         // after the dialog, too. A direct hostname /connect stays unchanged.
+        if prompt.target.starts_with("jk2://") {
+            self.connect_to_server(&prompt.target);
+            return;
+        }
         let hint = prompt
             .target
             .parse::<std::net::SocketAddr>()

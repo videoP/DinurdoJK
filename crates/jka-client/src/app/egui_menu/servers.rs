@@ -1,6 +1,7 @@
 //! Servers.
+use crate::server_browser::BrowserEvent;
 use crate::app::egui_menu::{
-    server_browser_layout, jka_colored_text, mpsc, refresh_icon, server_browser, theme, App, BrowserCommand, BrowserEvent,
+    server_browser_layout, jka_colored_text, mpsc, refresh_icon, server_browser, theme, App, BrowserCommand, BrowserRequest, BrowserProtocol,
     Duration, Instant, ServerSource,
 };
 
@@ -148,19 +149,57 @@ fn mod_filter_layout(text: &str, font_id: egui::FontId) -> egui::text::LayoutJob
 }
 
 impl App {
+    pub(in crate::app) fn server_browser_for(&self, protocol: BrowserProtocol) -> &server_browser::BrowserUiState {
+        if self.server_browser.protocol == protocol {
+            &self.server_browser
+        } else {
+            self.other_server_browsers.iter().find(|tab| tab.protocol == protocol)
+                .expect("inactive browser protocol")
+        }
+    }
+
+    pub(in crate::app) fn server_browser_for_mut(&mut self, protocol: BrowserProtocol) -> &mut server_browser::BrowserUiState {
+        if self.server_browser.protocol == protocol {
+            &mut self.server_browser
+        } else {
+            self.other_server_browsers.iter_mut().find(|tab| tab.protocol == protocol)
+                .expect("inactive browser protocol")
+        }
+    }
+
+    fn send_browser_command(&self, command: BrowserCommand) -> Result<(), String> {
+        self.server_browser_tx.send(BrowserRequest {
+            protocol: self.server_browser.protocol,
+            command,
+        }).map_err(|_| "Server browser worker is unavailable".to_owned())
+    }
+
+    /// Changing game tabs never moves JKA settings into JK2 (or vice versa).
+    fn select_server_browser_protocol(&mut self, protocol: BrowserProtocol) {
+        if self.server_browser.protocol == protocol { return; }
+        let target = self.other_server_browsers.iter().position(|tab| tab.protocol == protocol)
+            .expect("inactive browser protocol");
+        std::mem::swap(&mut self.server_browser, &mut self.other_server_browsers[target]);
+        if !self.server_browser.internet_requested_once {
+            self.request_server_refresh(ServerSource::Internet);
+        }
+        self.egui_repaint_requested = true;
+    }
+
     pub(in crate::app::egui_menu) fn poll_server_browser_events(&mut self) {
         let mut changed = false;
         loop {
             match self.server_browser_rx.try_recv() {
-                Ok(event) => {
-                    let completed_server_info = match &event {
+                Ok(tagged) => {
+                    let protocol = tagged.protocol;
+                    let completed_server_info = match &tagged.event {
                         BrowserEvent::ServerInfo(status) => Some((
                             status.address,
                             server_browser::format_server_status(status),
                         )),
                         _ => None,
                     };
-                    self.server_browser.handle_event(event);
+                    self.server_browser_for_mut(protocol).handle_event(tagged.event);
                     if let Some((address, dump)) = completed_server_info {
                         // `Get server info` is an explicit fresh getstatus request.
                         // Copy the complete result and mirror the same text into
@@ -177,10 +216,9 @@ impl App {
                         let text = format!(
                             "Full getstatus for {address} copied to clipboard and console"
                         );
-                        self.server_browser.status_text = text.clone();
-                        self.server_browser
-                            .source_status
-                            .insert(self.server_browser.source, text);
+                        let browser = self.server_browser_for_mut(protocol);
+                        browser.status_text = text.clone();
+                        browser.source_status.insert(browser.source, text);
                     }
                     changed = true;
                 }
@@ -193,55 +231,43 @@ impl App {
             }
         }
 
-        // Autojoin is intentionally driven from the menu tick rather than the
-        // server-browser page itself, so it keeps waiting even if the player
-        // closes the browser or switches to another menu page. A full server is
-        // polled cheaply in-place; once getinfo reports a free client slot we
-        // stop polling and use the normal connect path.
-        if let Some((source, address)) = self.server_browser.autojoin {
-            let slot_open = self
-                .server_browser
-                .servers
-                .get(&address)
-                .is_some_and(|server| {
-                    server.max_clients > 0 && server.clients < server.max_clients
-                });
+        // Keep autojoin polling active even when a different protocol tab is
+        // visible. Network results are tagged, so no off-tab getinfo can
+        // overwrite the currently selected game's server list.
+        for protocol in BrowserProtocol::ALL {
+            let Some((source, address)) = self.server_browser_for(protocol).autojoin else { continue; };
+            let browser = self.server_browser_for(protocol);
+            let slot_open = browser.servers.get(&address).is_some_and(|server| {
+                server.protocol == protocol.protocol()
+                    && server.max_clients > 0 && server.clients < server.max_clients
+            });
             if slot_open {
-                self.server_browser.autojoin = None;
-                self.server_browser.autojoin_last_query = None;
+                let browser = self.server_browser_for_mut(protocol);
+                browser.autojoin = None;
+                browser.autojoin_last_query = None;
                 let text = format!("Slot opened on {address}; connecting…");
-                self.server_browser
-                    .source_status
-                    .insert(source, text.clone());
-                self.server_browser.status_text = text;
-                self.connect_browser_server(address);
+                browser.source_status.insert(source, text.clone());
+                browser.status_text = text;
+                self.connect_browser_server_for_protocol(protocol, address);
                 changed = true;
             } else {
-                let due = self
-                    .server_browser
-                    .autojoin_last_query
+                let due = self.server_browser_for(protocol).autojoin_last_query
                     .is_none_or(|last| last.elapsed() >= Duration::from_millis(1500));
                 if due {
-                    if self
-                        .server_browser_tx
-                        .send(BrowserCommand::RefreshServer {
-                            source,
-                            address,
-                            quiet: true,
-                        })
-                        .is_ok()
-                    {
-                        self.server_browser.autojoin_last_query = Some(Instant::now());
+                    let sent = self.server_browser_tx.send(BrowserRequest {
+                        protocol,
+                        command: BrowserCommand::RefreshServer { source, address, quiet: true },
+                    }).is_ok();
+                    let browser = self.server_browser_for_mut(protocol);
+                    if sent {
+                        browser.autojoin_last_query = Some(Instant::now());
                         let text = format!("Autojoin: waiting for a slot on {address}…");
-                        self.server_browser
-                            .source_status
-                            .insert(source, text.clone());
-                        self.server_browser.status_text = text;
+                        browser.source_status.insert(source, text.clone());
+                        browser.status_text = text;
                     } else {
-                        self.server_browser.autojoin = None;
-                        self.server_browser.autojoin_last_query = None;
-                        self.server_browser.status_text =
-                            "Server browser worker is unavailable".to_owned();
+                        browser.autojoin = None;
+                        browser.autojoin_last_query = None;
+                        browser.status_text = "Server browser worker is unavailable".to_owned();
                     }
                     changed = true;
                 }
@@ -266,7 +292,7 @@ impl App {
                 addresses: self.server_browser.addresses_for_source(source),
             },
         };
-        if self.server_browser_tx.send(command).is_err() {
+        if self.send_browser_command(command).is_err() {
             let text = "Server browser worker is unavailable".to_owned();
             self.server_browser
                 .source_status
@@ -299,8 +325,7 @@ impl App {
         self.server_browser.selected = Some(address);
         self.server_browser.details = self.server_browser.status_cache.get(&address).cloned();
         let _ = self
-            .server_browser_tx
-            .send(BrowserCommand::QueryStatus(address));
+            .send_browser_command(BrowserCommand::QueryStatus(address));
         self.egui_repaint_requested = true;
     }
 
@@ -311,7 +336,7 @@ impl App {
         &self,
         address: std::net::SocketAddr,
     ) -> Option<(String, String)> {
-        self.server_browser
+        self.server_browser_for(BrowserProtocol::Jka)
             .servers
             .get(&address)
             .filter(|server| server.protocol == 26 && !server.map.trim().is_empty())
@@ -322,27 +347,41 @@ impl App {
         &mut self,
         address: std::net::SocketAddr,
     ) {
-        if self
-            .server_browser
-            .servers
-            .get(&address)
+        self.connect_browser_server_for_protocol(self.server_browser.protocol, address);
+    }
+
+    fn connect_browser_server_for_protocol(
+        &mut self,
+        protocol: BrowserProtocol,
+        address: std::net::SocketAddr,
+    ) {
+        let target = match protocol {
+            BrowserProtocol::Jka => address.to_string(),
+            BrowserProtocol::Jk2_102 => format!("jk2://1.02/{address}"),
+            BrowserProtocol::Jk2_104 => format!("jk2://1.04/{address}"),
+        };
+        if self.server_browser_for(protocol).servers.get(&address)
             .is_some_and(|server| server.need_password)
             && self.network.password.is_empty()
         {
+            // Retain the JK2 version in the pending password dialog.
             self.show_server_password_prompt(
-                address.to_string(),
+                target,
                 Some("This server requires a password.".to_owned()),
             );
             return;
         }
-        // Browser refresh already resolved the map and mod for this endpoint.
-        // Treat them as hints, never as server admission: a fresh infoResponse
-        // (and later gamestate) will reconcile them with authoritative state.
-        let hint = self.browser_map_hint(address);
-        self.connect_to_server_with_hint(
-            &address.to_string(),
-            hint.as_ref().map(|(map, game)| (map.as_str(), game.as_str())),
-        );
+        match protocol {
+            BrowserProtocol::Jka => {
+                let hint = self.browser_map_hint(address);
+                self.connect_to_server_with_hint(
+                    &target,
+                    hint.as_ref().map(|(map, game)| (map.as_str(), game.as_str())),
+                );
+            }
+            BrowserProtocol::Jk2_102 => self.connect_to_jk2_server("1.02", &address.to_string()),
+            BrowserProtocol::Jk2_104 => self.connect_to_jk2_server("1.04", &address.to_string()),
+        }
     }
 
     /// Taffy owns the column cell. Within it, use explicit, pixel-aligned
@@ -505,7 +544,9 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 if ui.button("Reset default").clicked() {
-                                    self.server_browser.mod_filter = server_browser::DEFAULT_MOD_FILTER.to_owned();
+                                    self.server_browser.mod_filter = if self.server_browser.protocol == BrowserProtocol::Jka {
+                                        server_browser::DEFAULT_MOD_FILTER
+                                    } else { "" }.to_owned();
                                 }
                                 if ui.button("Clear").clicked() {
                                     self.server_browser.mod_filter.clear();
@@ -517,7 +558,7 @@ impl App {
                                 self.server_browser.gametype_filter = 0;
                             }
                             ui.separator();
-                            for &(gametype, label) in &server_browser::GAMETYPE_FILTER_OPTIONS {
+                            for &(gametype, label) in self.server_browser.gametype_options() {
                                 let bit = server_browser::gametype_filter_bit(gametype);
                                 let mut selected = self.server_browser.gametype_filter & bit != 0;
                                 if ui.checkbox(&mut selected, label).changed() {
@@ -588,6 +629,17 @@ impl App {
             "SERVER BROWSER",
             "Multiplayer servers  ·  click a header to sort, or its arrow to filter",
         );
+
+        // Game tabs stay outside the Taffy list/detail workspace. Each tab
+        // owns its own discovery cache, source selection and filters.
+        ui.horizontal(|ui| {
+            for protocol in BrowserProtocol::ALL {
+                if theme::chip(ui, protocol.label(), self.server_browser.protocol == protocol).clicked() {
+                    self.select_server_browser_protocol(protocol);
+                }
+            }
+        });
+        ui.add_space(6.0);
 
         // Claim one stable viewport; Taffy splits it into a dominant browser
         // and a secondary inspector, stacking them at narrower widths.
@@ -661,14 +713,18 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.small_button("RESTORE DEFAULTS").clicked() {
                             pending_master_changes.clear();
-                            for (slot, default) in server_browser::DEFAULT_MASTER_CVARS.iter().enumerate() {
+                            for (slot, default) in self.server_browser.protocol.default_masters().iter().enumerate() {
                                 self.server_browser.master_drafts[slot] = (*default).to_owned();
                                 pending_master_changes.push((slot, (*default).to_owned()));
                             }
                         }
                     });
                     ui.add_space(4.0);
-                    let slot_labels = ["RAVEN", "JKHUB", "OUNED", "CUSTOM", "CUSTOM"];
+                    let slot_labels = if self.server_browser.protocol == BrowserProtocol::Jka {
+                        ["RAVEN", "JKHUB", "OUNED", "CUSTOM", "CUSTOM"]
+                    } else {
+                        ["JKHUB", "JK2MV", "OUNED", "CUSTOM", "CUSTOM"]
+                    };
                     for slot in 0..server_browser::MAX_MASTER_SLOTS {
                         let current = self.server_browser.master_servers[slot].clone();
                         let mut enabled = !current.trim().is_empty();
@@ -679,12 +735,14 @@ impl App {
                             ui.checkbox(&mut enabled, "");
                             theme::label(
                                 ui,
-                                theme::plain(&format!("sv_master{}", slot + 1), 10.5, theme::TEXT_DIM()),
+                                theme::plain(&format!("{}{}", if self.server_browser.protocol == BrowserProtocol::Jka {
+                                    "sv_master"
+                                } else { "jk2_master" }, slot + 1), 10.5, theme::TEXT_DIM()),
                             );
                             let edit = ui.add_sized(
                                 [320.0, 22.0],
                                 egui::TextEdit::singleline(&mut draft).hint_text(if slot < 3 {
-                                    server_browser::DEFAULT_MASTER_CVARS[slot]
+                                    self.server_browser.protocol.default_masters()[slot]
                                 } else {
                                     "master.example.org[:port]"
                                 }),
@@ -704,7 +762,7 @@ impl App {
                         if enabled != was_enabled {
                             if enabled {
                                 let restore = if draft.trim().is_empty() {
-                                    server_browser::DEFAULT_MASTER_CVARS[slot].to_owned()
+                                    self.server_browser.protocol.default_masters()[slot].to_owned()
                                 } else {
                                     draft.trim().to_owned()
                                 };
@@ -723,7 +781,12 @@ impl App {
             ui.add_space(12.0);
             if ui.small_button("Restore filter defaults").clicked() {
                 self.server_browser.apply_filters_string(server_browser::DEFAULT_SERVER_FILTERS);
-                self.mark_config_dirty();
+                if self.server_browser.protocol != BrowserProtocol::Jka {
+                    self.server_browser.mod_filter.clear();
+                }
+                if self.server_browser.protocol == BrowserProtocol::Jka {
+                    self.mark_config_dirty();
+                }
                 self.egui_repaint_requested = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -753,9 +816,15 @@ impl App {
         });
 
         // Apply edits after rendering the popup, outside the nested egui Ui.
-        for (slot, value) in pending_master_changes {
-            let cvar = format!("sv_master{}", slot + 1);
-            if let Err(error) = self.set_console_cvar(&cvar, &value) {
+        if self.server_browser.protocol == BrowserProtocol::Jka {
+            for (slot, value) in pending_master_changes {
+                let cvar = format!("sv_master{}", slot + 1);
+                if let Err(error) = self.set_console_cvar(&cvar, &value) {
+                    self.server_browser.status_text = error;
+                }
+            }
+        } else if !pending_master_changes.is_empty() {
+            if let Err(error) = self.server_browser.set_jk2_masters(&pending_master_changes) {
                 self.server_browser.status_text = error;
             }
         }
@@ -840,8 +909,7 @@ impl App {
             if due && !candidates.is_empty()
                 && !self.server_browser.refreshing.contains(&self.server_browser.source)
             {
-                if self.server_browser_tx
-                    .send(BrowserCommand::QueryStatusBatch(candidates.clone()))
+                if self.send_browser_command(BrowserCommand::QueryStatusBatch(candidates.clone()))
                     .is_ok()
                 {
                     self.server_browser.status_pending.extend(candidates);
@@ -1141,7 +1209,11 @@ impl App {
                 && !self.server_browser.direct_connect.trim().is_empty()
             {
                 let target = self.server_browser.direct_connect.trim().to_owned();
-                self.connect_to_server(&target);
+                match self.server_browser.protocol {
+                    BrowserProtocol::Jka => self.connect_to_server(&target),
+                    BrowserProtocol::Jk2_102 => self.connect_to_jk2_server("1.02", &target),
+                    BrowserProtocol::Jk2_104 => self.connect_to_jk2_server("1.04", &target),
+                }
             }
         });
         });
@@ -1158,7 +1230,11 @@ impl App {
                         return;
                     };
                     let server = self.server_browser.servers.get(&address).cloned()
-                        .unwrap_or_else(|| server_browser::ServerEntry::placeholder(address));
+                        .unwrap_or_else(|| {
+                            let mut entry = server_browser::ServerEntry::placeholder(address);
+                            entry.protocol = self.server_browser.protocol.protocol();
+                            entry
+                        });
                     let hostname = if server.hostname.is_empty() {
                         address.to_string()
                     } else {
@@ -1344,8 +1420,7 @@ impl App {
         }
         if let Some(address) = get_server_info_after {
             if self
-                .server_browser_tx
-                .send(BrowserCommand::GetServerInfo(address))
+                .send_browser_command(BrowserCommand::GetServerInfo(address))
                 .is_ok()
             {
                 self.server_browser.status_text =
@@ -1358,8 +1433,7 @@ impl App {
         }
         if let Some(address) = refresh_one_after {
             if self
-                .server_browser_tx
-                .send(BrowserCommand::RefreshServer {
+                .send_browser_command(BrowserCommand::RefreshServer {
                     source: self.server_browser.source,
                     address,
                     quiet: false,

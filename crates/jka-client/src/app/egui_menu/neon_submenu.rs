@@ -129,6 +129,7 @@ impl App {
             2 => {
                 self.frontend_page = FrontendPage::PlayDemo;
                 self.egui_repaint_requested = true;
+                self.publish_ui();
             }
             _ => {}
         }

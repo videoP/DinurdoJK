@@ -742,6 +742,9 @@ pub enum CgameNotice {
         text: Vec<u8>,
         /// Sending client, when the server named it (client-side mutes).
         sender: Option<i32>,
+        /// Byte offset in `text` where the message body starts, past the
+        /// sender prefix and its colour code; `None` if not separable.
+        body_start: Option<usize>,
     },
     /// `cp`: CG_CenterPrint.
     CenterPrint(Vec<u8>),
@@ -1060,6 +1063,19 @@ impl ClientGameState {
 
     pub fn drain_server_actions(&mut self) -> Vec<CgameServerAction> {
         self.pending_server_actions.drain(..).collect()
+    }
+
+    /// `nfr` (new force rank) notices as (rank, open menu, team).
+    pub fn drain_new_force_ranks(&mut self) -> Vec<(i32, bool, i32)> {
+        let mut ranks = Vec::new();
+        self.pending_server_actions.retain(|action| match *action {
+            CgameServerAction::NewForceRank { rank, open_menu, team } => {
+                ranks.push((rank, open_menu, team));
+                false
+            }
+            _ => true,
+        });
+        ranks
     }
 
     /// Drain only Siege UI/state actions. Shader remaps, force-rank changes and
@@ -1592,7 +1608,7 @@ impl ClientGameState {
         text.extend_from_slice(speaker_name);
         text.extend_from_slice(b"^7: ");
         text.extend_from_slice(description.as_bytes());
-        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text, sender: i32::try_from(speaker).ok() })
+        Some(CgameNotice::Chat { team: true, kind: ChatKind::Voice, text, sender: i32::try_from(speaker).ok(), body_start: None })
     }
 
     pub fn presentation_event_count(&self) -> usize {
@@ -2361,7 +2377,8 @@ impl ClientGameState {
             let kind = if team { ChatKind::Team } else { ChatKind::Say };
             // OpenJK G_SayTo appends the sender's client number after the text.
             let sender = parts.get(2).copied().and_then(parse_i32_ascii);
-            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)), sender });
+            let body_start = chat_body_start(&arg(1));
+            self.notices.push_back(CgameNotice::Chat { team, kind, text: strip_escape(arg(1)), sender, body_start });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"lchat") || name.eq_ignore_ascii_case(b"ltchat") {
@@ -2370,9 +2387,11 @@ impl ClientGameState {
             }
             // "%s^7<%s> ^%s%s": name, location, colour, message.
             let text = [arg(1), b"^7<".to_vec(), arg(2), b"> ^".to_vec(), arg(3), arg(4)].concat();
+            // The message is its own argument here; everything before it is prefix.
+            let body_start = Some(strip_escape(text[..text.len() - arg(4).len()].to_vec()).len());
             let team = name.eq_ignore_ascii_case(b"ltchat");
             let sender = parts.get(5).copied().and_then(parse_i32_ascii);
-            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text), sender });
+            self.notices.push_back(CgameNotice::Chat { team, kind: ChatKind::Located, text: strip_escape(text), sender, body_start });
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"cps") {
@@ -2866,6 +2885,21 @@ fn score_record_stride(extended_deaths: bool, count: usize, token_count: usize) 
     } else {
         other
     }
+}
+
+/// Where the message body of a `chat`/`tchat` line starts, as a byte offset
+/// into the line after CG_RemoveChatEscapeChar. G_Say ends the sender prefix
+/// with the escape char `\x19` and ": " (`name^7\x19: ^2text`), which players
+/// cannot type, so its first occurrence is the boundary. The colour code that
+/// follows belongs to the prefix.
+fn chat_body_start(raw: &[u8]) -> Option<usize> {
+    let separator = raw.windows(3).position(|window| window == b"\x19: ")? + 3;
+    let mut start = separator - raw[..separator].iter().filter(|&&byte| byte == 0x19).count();
+    let stripped: Vec<u8> = raw.iter().copied().filter(|&byte| byte != 0x19).collect();
+    if stripped.get(start) == Some(&b'^') && stripped.get(start + 1).is_some_and(|&byte| byte != b'^') {
+        start += 2;
+    }
+    Some(start.min(stripped.len()))
 }
 
 pub fn bytes_to_lossless_ascii(value: &[u8]) -> String {
@@ -3676,6 +3710,19 @@ fn entity_vec3(entity: &EntityState, prefix: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_body_starts_after_the_escaped_separator_and_colour() {
+        // G_Say: say, say_team and tell prefixes.
+        let say = b"Na:me^7\x19: ^2hi: there";
+        let start = chat_body_start(say).unwrap();
+        let stripped: Vec<u8> = say.iter().copied().filter(|&byte| byte != 0x19).collect();
+        assert_eq!(&stripped[start..], b"hi: there");
+        let team = b"\x19(Bob^7\x19)\x19: ^5go";
+        let stripped: Vec<u8> = team.iter().copied().filter(|&byte| byte != 0x19).collect();
+        assert_eq!(&stripped[chat_body_start(team).unwrap()..], b"go");
+        assert_eq!(chat_body_start(b"server: no escape"), None);
+    }
 
     /// `oktry2.dm_26` (TaystJK recording): vehicle #112 has modelindex=4,
     /// and the same snapshot's server commands register both the actual GLM

@@ -6,7 +6,7 @@
 //! Taffy computes every pane part; `render_studio_ui` paints the chrome.
 use super::App;
 use super::render_studio_ui::palette as theme;
-use crate::app::render_studio::{StudioBackground, StudioVideoFormat, StudioMediaTab, StudioMediaDrag, StudioExportSize, StudioEncoderSpeed};
+use crate::app::render_studio::{StudioBackground, StudioVideoFormat, StudioLibraryGame, StudioMediaTab, StudioMediaDrag, StudioExportSize, StudioEncoderSpeed};
 use super::render_studio_layout;
 use super::render_studio_spatial::studio_layer_color;
 use super::render_studio_ui::{self as sui, ButtonKind, Icon};
@@ -585,19 +585,23 @@ impl App {
         // Metadata indexing runs on the existing demo-browser worker. Complete
         // any pending library drop only after its real duration is known.
         if self.render_studio.media_tab==StudioMediaTab::Demos ||
-            self.render_studio.pending_demo_drop.is_some() || !self.render_studio.pending_demo_queue.is_empty() {
+            self.render_studio.pending_demo_drop.is_some() || self.render_studio.jk2_import.is_some() || !self.render_studio.pending_demo_queue.is_empty() {
+            if self.render_studio.jk2_import.is_some() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+            }
             self.poll_demo_metadata_jobs();
-            if self.render_studio.pending_demo_drop.is_none() {
-                if let Some((name,game,layer))=self.render_studio.pending_demo_queue.pop_front() {
+            self.studio_poll_jk2_import();
+            if self.render_studio.pending_demo_drop.is_none() && self.render_studio.jk2_import.is_none() {
+                if let Some((asset,layer))=self.render_studio.pending_demo_queue.pop_front() {
                     let at=self.render_studio.timeline.demos.iter().filter(|c|c.layer==layer)
                         .map(|c|c.end()).fold(0.0,f64::max);
-                    self.render_studio_queue_demo_drop(name,game,at,layer);
+                    self.studio_queue_media_demo(asset,at,layer);
                 }
             }
             if let Some((name,game,time,layer))=self.render_studio.pending_demo_drop.clone() {
                 if let Some(metadata)=self.demo_metadata_cache.get(&name).cloned() {
                     self.render_studio.pending_demo_drop=None;
-                    self.render_studio_place_demo(name,game,time,metadata.duration_ms,layer,None);
+                    self.render_studio_place_demo(name,game,time,metadata.duration_ms,layer,None,26);
                 } else if let Some(error)=self.demo_metadata_errors.get(&name).cloned() {
                     self.render_studio.pending_demo_drop=None;
                     self.render_studio.status=format!("Demo indexing failed: {error}");
@@ -896,6 +900,7 @@ impl App {
             rect(panels.ruler),rect(panels.tracks),rect(panels.scrollbar),locked);
         if ui.ctx().input(|i|i.pointer.any_released()) {self.render_studio.media_drag=None;self.render_studio.media_drag_group.clear();}
         self.egui_render_studio_project_dialogs(ui.ctx());
+        self.egui_render_studio_demo_details(ui.ctx());
         self.egui_render_studio_file_picker(ui.ctx());
         self.egui_render_studio_model_picker(ui.ctx());
         self.egui_render_studio_render_dialog(ui.ctx());
@@ -985,6 +990,9 @@ impl App {
     /// bit, this checks for a focused edit widget, so shortcuts still work
     /// after clicking a timeline item even if the page owns keyboard input.
     fn studio_keyboard_shortcuts(&mut self, ctx:&egui::Context) {
+        // The demo inspector is modal. Do not let shortcuts act on the hidden
+        // timeline/selection while the user is inspecting the recording.
+        if self.render_studio.demo_details.is_some() { return; }
         let typing = ctx.text_edit_focused();
         let (play,left,right,split,mark_in,mark_out) = ctx.input(|i| (
             i.key_pressed(egui::Key::Space),i.key_pressed(egui::Key::ArrowLeft),
@@ -1224,7 +1232,7 @@ impl App {
         if back {self.render_studio.cinematic_preview=None;changed=true;}
         if let Some((clip,lane))=add {
             let time=self.render_studio.timeline_time();
-            self.render_studio_drop_media(StudioMediaDrag {name:clip.label,emote_id:None,cinematic:Some(clip.source),demo_game:None},time,lane);changed=true;
+            self.render_studio_drop_media(StudioMediaDrag {name:clip.label,emote_id:None,cinematic:Some(clip.source),demo_game:None,demo_path:None},time,lane);changed=true;
         }
         if changed {self.profile_preview_key=None;ui.ctx().request_repaint();}
     }
@@ -1242,6 +1250,12 @@ impl App {
     }
 
     fn egui_render_studio_media_library(&mut self, ui: &mut egui::Ui, inspector_inline: bool) {
+        // This filters source media, not the contents of a project. Projects
+        // can contain both games and the filter does not alter playback state.
+        sui::tab_strip(ui,&mut self.render_studio.library_game,&[
+            (StudioLibraryGame::Jka,"JKA"),(StudioLibraryGame::Jk2,"JK2"),
+        ]);
+        ui.add_space(5.0);
         sui::tab_strip(ui,&mut self.render_studio.media_tab,&[
             (StudioMediaTab::Jka,"Anims"),(StudioMediaTab::Fortnite,"Emotes"),
             (StudioMediaTab::Cutscenes,"Cinematics"),(StudioMediaTab::Demos,"Demos"),
@@ -1250,6 +1264,10 @@ impl App {
         let locked=self.studio_locked();
         match self.render_studio.media_tab {
             StudioMediaTab::Jka => {
+                if self.render_studio.library_game==StudioLibraryGame::Jk2 {
+                    sui::hint(ui,"JK2 animation catalogs require the JK2 model/GLA binding; no JKA animation is listed as a JK2 asset.");
+                    return;
+                }
                 sui::search_field(ui,&mut self.render_studio.animation_search,"Search JKA animations");
                 let needle=self.render_studio.animation_search.trim().to_ascii_lowercase();
                 let all:Vec<&'static str>=(0..1600).filter_map(jka_movement::animation_name)
@@ -1260,7 +1278,7 @@ impl App {
                 self.studio_media_list(ui,"studio_jka_list",inspector_inline,|app,ui| {
                     if all.is_empty(){sui::hint(ui,"No matching animations.");}
                     for name in all.iter().take(150) {
-                        app.egui_render_studio_media_tile(ui,StudioMediaDrag {name:(*name).to_owned(),emote_id:None,cinematic:None,demo_game:None},locked);
+                        app.egui_render_studio_media_tile(ui,StudioMediaDrag {name:(*name).to_owned(),emote_id:None,cinematic:None,demo_game:None,demo_path:None},locked);
                     }
                 });
             }
@@ -1273,7 +1291,7 @@ impl App {
                     .take(150).map(|emote| {
                         let variant=crate::emotes::default_variant_index(emote);
                         let resolved=emote.variants.get(variant).unwrap_or(emote);
-                        StudioMediaDrag {name:crate::emotes::display_title(emote).to_owned(),emote_id:Some(resolved.id.clone()),cinematic:None,demo_game:None}
+                        StudioMediaDrag {name:crate::emotes::display_title(emote).to_owned(),emote_id:Some(resolved.id.clone()),cinematic:None,demo_game:None,demo_path:None}
                     }).collect::<Vec<_>>());
                 ui.add_space(2.0);
                 self.studio_media_list(ui,"studio_emote_list",inspector_inline,|app,ui| match choices {
@@ -1285,7 +1303,11 @@ impl App {
                 });
             }
             StudioMediaTab::Cutscenes => self.studio_media_list(ui,"studio_cinematic_list",inspector_inline,
-                |app,ui| app.egui_studio_cinematic_library(ui,locked)),
+                |app,ui| {
+                    if app.render_studio.library_game==StudioLibraryGame::Jk2 {
+                        sui::hint(ui,"JK2 cinematic banks are not indexed yet; select JKA to browse the JKA banks.");
+                    } else { app.egui_studio_cinematic_library(ui,locked); }
+                }),
             StudioMediaTab::Demos => self.studio_media_list(ui,"studio_demo_list",inspector_inline,
                 |app,ui| app.egui_render_studio_demo_library(ui,locked)),
         }
@@ -1309,6 +1331,16 @@ impl App {
     }
 
     fn egui_render_studio_demo_library(&mut self,ui:&mut egui::Ui,locked:bool) {
+        if self.render_studio.library_game==StudioLibraryGame::Jk2 {
+            self.ensure_jk2_demo_catalog();
+            ui.add_enabled_ui(!locked,|ui| {
+                if sui::button(ui,Some(Icon::Open),"Import JKA / JK2 from PC…",ButtonKind::Primary,true).clicked() {
+                    self.render_studio.file_picker.open(crate::app::render_studio_picker::StudioPickerKind::Demo);
+                }
+            });
+            self.egui_render_studio_jk2_demo_library(ui,locked);
+            return;
+        }
         self.ensure_demo_catalog();
         if let Some(error)=&self.demo_catalog_error {
             sui::callout(ui,&format!("Demo scan failed: {error}"),theme::WARNING());return;
@@ -1316,7 +1348,7 @@ impl App {
         ui.spacing_mut().item_spacing.y=5.0;
         let games=self.demo_game_choices.clone();
         let mut changed=false;
-        sui::prop_row(ui,"Game folder",|ui| {
+        sui::prop_row(ui,"JKA folder",|ui| {
             sui::combo_box("studio_demo_game").width(ui.available_width())
                 .selected_text(if self.demo_game_filter.is_empty(){"base"}else{&self.demo_game_filter})
                 .show_ui(ui,|ui| {
@@ -1328,6 +1360,7 @@ impl App {
         });
         if changed {
             self.render_studio.pending_demo_drop=None;
+            self.render_studio.demo_details=None;
             self.reset_demo_browser_catalog();self.ensure_demo_catalog();
         }
         ui.add_enabled_ui(!locked, |ui| {
@@ -1353,14 +1386,13 @@ impl App {
         }
         ui.label(egui::RichText::new(status).small().color(theme::TEXT_FAINT()));
         ui.add_enabled_ui(!locked,|ui| {
-            if sui::button(ui,Some(Icon::Open),"Import DM26 from PC…",ButtonKind::Primary,true).clicked() {
+            if sui::button(ui,Some(Icon::Open),"Import JKA / JK2 from PC…",ButtonKind::Primary,true).clicked() {
                 self.render_studio.file_picker.open(crate::app::render_studio_picker::StudioPickerKind::Demo);
             }
         });
         sui::search_field(ui,&mut self.render_studio.demo_search,"Search demos");
         if self.demo_catalog_pending {
             ui.horizontal(|ui|{ui.spinner();sui::hint(ui,"Scanning demo folders…");});
-            return;
         }
         let needle=self.render_studio.demo_search.trim().to_ascii_lowercase();
         let names:Vec<_>=self.demo_entries.iter().map(|entry|entry.demo_name.clone())
@@ -1375,16 +1407,26 @@ impl App {
             for name in names.iter().take(250) {
                 let row=self.egui_render_studio_media_tile(ui,StudioMediaDrag {
                     name:name.clone(),emote_id:None,cinematic:None,
-                    demo_game:Some(self.demo_game_filter.clone()),
+                    demo_game:Some(self.demo_game_filter.clone()),demo_path:None,
                 },locked);
                 // Keep the media browser focused on choosing recordings. A
                 // right-click assigns one to any specific demo timeline clip.
                 row.context_menu(|ui| {
                     sui::editor_style(ui);
                     ui.set_min_width(260.0);
+                    if ui.button("Demo details…").clicked() {
+                        self.render_studio.demo_details = Some(name.clone());
+                        self.ensure_demo_metadata(name);
+                        // Opens the single, shared inspector in a static modal.
+                        // The hover card stays the fast, compact summary.
+                        self.demo_inspector_tab = crate::app::frontend::DemoInspectorTab::Assets;
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.menu_button("Add as composite to…", |ui| {
                         ui.set_min_width(280.0);
                         let targets = self.render_studio.timeline.demos.iter().enumerate()
+                            .filter(|(_,clip)|clip.demo_protocol==26)
                             .map(|(i,clip)| (i,clip.name.clone(),clip.game.clone(),clip.start,clip.layer,
                                 clip.race_overlays.iter().any(|o|o.name==*name && o.game==self.demo_game_filter)))
                             .collect::<Vec<_>>();
@@ -1415,11 +1457,158 @@ impl App {
         }
     }
 
+    fn egui_render_studio_jk2_demo_library(&mut self,ui:&mut egui::Ui,locked:bool) {
+        if let Some(error)=self.jk2_demo_browser.error.clone() {
+            sui::callout(ui,&error,theme::WARNING());return;
+        }
+        let folders=self.jk2_demo_browser.folders.clone();
+        let current=self.jk2_demo_browser.folder.clone();
+        let mut choose=None;
+        sui::prop_row(ui,"JK2 folder",|ui| {
+            sui::combo_box("studio_jk2_demo_folder").width(ui.available_width())
+                .selected_text(folders.iter().find(|f|Some(&f.path)==current.as_ref())
+                    .map(|f|f.label.as_str()).unwrap_or("Select folder"))
+                .show_ui(ui,|ui| {
+                    for folder in &folders {
+                        if ui.selectable_label(current.as_ref()==Some(&folder.path),&folder.label).clicked() {
+                            choose=Some(folder.path.clone());
+                        }
+                    }
+                });
+        });
+        if let Some(path)=choose {self.select_jk2_demo_folder(path);}
+        if self.jk2_demo_browser.pending {
+            ui.horizontal(|ui|{ui.spinner();sui::hint(ui,"Scanning JK2 demos…");});
+        }
+        let needle=self.render_studio.demo_search.trim().to_ascii_lowercase();
+        let entries=self.jk2_demo_browser.entries.iter().filter(|e|needle.is_empty()
+            ||e.filename.to_ascii_lowercase().contains(&needle)).take(250).cloned().collect::<Vec<_>>();
+        sui::search_field(ui,&mut self.render_studio.demo_search,"Search JK2 demos");
+        sui::hint(ui,&format!("{} JK2 recordings",entries.len()));
+        for entry in entries {
+            let game=entry.path.parent().and_then(|d|d.parent()).and_then(|d|d.file_name())
+                .map(|n|n.to_string_lossy().into_owned()).unwrap_or_else(||"base".into());
+            self.egui_render_studio_media_tile(ui,StudioMediaDrag {
+                name:entry.filename,emote_id:None,cinematic:None,
+                demo_game:Some(game),demo_path:Some(entry.path),
+            },locked);
+        }
+    }
+
+    /// The large Studio viewer is just another host for Play Demo's inspector
+    /// data. There is no Studio copy of the Overview/Players/Rounds/Console/
+    /// Referenced Assets builders; both use `demo_browser_inspector_lines`.
+    /// The native Play Demo page draws these rows via WGPU/Taffy, whereas this
+    /// modal hosts them in egui because Studio's editor runs inside egui.
+    fn egui_render_studio_demo_details(&mut self, ctx: &egui::Context) {
+        use crate::app::frontend::DemoInspectorTab;
+        use crate::ui::demo_browser::{LineKind, TABS, FILTERS};
+        let Some(name) = self.render_studio.demo_details.clone() else { return; };
+        self.ensure_demo_metadata(&name);
+        let screen=ctx.content_rect();
+        let width=(screen.width()*0.88).clamp(360.0, 1450.0).min((screen.width()-28.0).max(1.0));
+        let height=(screen.height()*0.86).max(260.0).min((screen.height()-35.0).max(1.0));
+        let (close, ())=Self::studio_modal(ctx,"studio_demo_shared_inspector",&format!("DEMO DETAILS  /  {name}"),width,|ui| {
+            ui.set_min_height(height);
+            let content_width=(width-28.0).max(100.0);
+            if let Some(metadata)=self.demo_metadata_cache.get(&name) {
+                ui.label(egui::RichText::new(Self::demo_browser_summary(metadata))
+                    .color(theme::TEXT_DIM()));
+            } else if let Some(error)=self.demo_metadata_errors.get(&name) {
+                sui::callout(ui,&format!("Unable to index demo: {error}"),theme::WARNING());
+            } else {
+                ui.horizontal(|ui|{ui.spinner();sui::hint(ui,"Indexing recording and local assets…");});
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x=5.0;
+                for (i,label) in TABS.iter().enumerate() {
+                    let selected=self.demo_inspector_tab==DemoInspectorTab::ALL[i];
+                    if ui.selectable_label(selected,*label).clicked() {
+                        self.demo_inspector_tab=DemoInspectorTab::ALL[i];
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if self.demo_inspector_tab==DemoInspectorTab::Assets {
+                    ui.checkbox(&mut self.demo_assets_missing_only,"Missing only");
+                } else if self.demo_inspector_tab==DemoInspectorTab::Console {
+                    for (i,label) in FILTERS.iter().enumerate() {
+                        let value=match i {1=>crate::app::DemoConsoleFilter::Print,
+                            2=>crate::app::DemoConsoleFilter::Chat,3=>crate::app::DemoConsoleFilter::Event,
+                            _=>crate::app::DemoConsoleFilter::All};
+                        if ui.selectable_label(self.demo_console_filter==value,*label).clicked() {
+                            self.demo_console_filter=value;
+                        }
+                    }
+                } else {
+                    ui.label(egui::RichText::new(self.demo_inspector_tab.label()).color(theme::ACCENT()));
+                }
+            });
+            ui.separator();
+            // Single scroll owner. Modal height is fixed; no nested group scrollers.
+            let scroll_height=(height-173.0).max(90.0);
+            egui::ScrollArea::vertical().id_salt(("studio_demo_shared_rows",&name,self.demo_inspector_tab as u8))
+                .max_height(scroll_height).auto_shrink([false,false]).show(ui,|ui| {
+                    ui.set_min_width(content_width);
+                    if let Some(metadata)=self.demo_metadata_cache.get(&name) {
+                        // Exact same rows/asset statuses as the native Taffy viewer.
+                        for item in Self::demo_browser_inspector_lines(metadata,self.demo_inspector_tab,
+                            self.demo_assets_missing_only,self.demo_console_filter) {
+                            let color=match item.present {
+                                Some(true)=>egui::Color32::from_rgb(110,219,148),
+                                Some(false)=>egui::Color32::from_rgb(255,100,110),
+                                None=>theme::TEXT(),
+                            };
+                            match item.kind {
+                                LineKind::Heading=>{
+                                    ui.add_space(9.0);
+                                    let b=ui.available_rect_before_wrap();
+                                    ui.painter().rect_filled(egui::Rect::from_min_size(b.min,egui::vec2(b.width(),30.0)),
+                                        egui::CornerRadius::ZERO,sui::PANE());
+                                    ui.label(egui::RichText::new(&item.title).strong().color(theme::ACCENT()));
+                                    ui.add_space(3.0);
+                                }
+                                LineKind::Note=>{ui.label(egui::RichText::new(&item.title).small().color(theme::TEXT_DIM()));}
+                                LineKind::Value | LineKind::Entry=>{
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(content_width);
+                                        if item.present.is_some() {
+                                            ui.label(egui::RichText::new("●").color(color));
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.label(egui::RichText::new(&item.title).color(color));
+                                            if !item.subtitle.is_empty() {
+                                                ui.label(egui::RichText::new(&item.subtitle).color(theme::TEXT_DISABLED()).small());
+                                            }
+                                        });
+                                        if !item.right.is_empty() {
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+                                                ui.label(egui::RichText::new(&item.right).color(if item.present.is_some(){color}else{theme::TEXT_DIM()}).monospace().small());
+                                            });
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        }
+                    }
+                });
+        });
+        if close {self.render_studio.demo_details=None;}
+    }
+
     /// The selected DEMO POV clip owns these references. No new source or
     /// renderer is created here: all actors still use the existing /rGhost
     /// track decoder and playback-time alignment.
     fn egui_studio_composite_inspector(&mut self,ui:&mut egui::Ui,clip_index:usize) {
-        if self.render_studio.timeline.demos.get(clip_index).is_none(){return;}
+        let Some(clip)=self.render_studio.timeline.demos.get(clip_index) else {return;};
+        if clip.demo_protocol!=26 {
+            sui::hint(ui,"JK2 footage supports the same timeline and camera tools. Race-ghost composites require a JKA demo scene.");
+            return;
+        }
         if self.render_studio.timeline.demos[clip_index].comparison.is_some() {
             let clip=&mut self.render_studio.timeline.demos[clip_index];
             let reference=clip.comparison.as_ref().map(|race| {
@@ -1570,12 +1759,91 @@ impl App {
         }
     }
 
+    fn studio_queue_media_demo(&mut self,asset:StudioMediaDrag,time:f64,layer:usize) {
+        if let Some(path)=asset.demo_path {
+            self.studio_queue_jk2_demo_import(path,asset.demo_game.unwrap_or_default(),time,layer);
+        } else if let Some(game)=asset.demo_game {
+            self.render_studio_queue_demo_drop(asset.name,game,time,layer);
+        }
+    }
+
+    /// The conversion and validation happen off the UI thread. The project
+    /// retains the unmodified JK2 recording, never its converted presentation.
+    fn studio_queue_jk2_demo_import(&mut self,path:std::path::PathBuf,game:String,time:f64,layer:usize) {
+        if self.render_studio.jk2_import.is_some() {
+            self.render_studio.status="Another JK2 demo import is running".into();return;
+        }
+        let project=self.studio_project_directory();
+        let worker=std::thread::Builder::new().name("studio-jk2-import".into()).spawn(move || {
+            let meta=std::fs::metadata(&path).map_err(|e|format!("{}: {e}",path.display()))?;
+            if meta.len()==0 || meta.len()>512*1024*1024 {return Err("Invalid JK2 recording size".into());}
+            let bytes=std::fs::read(&path).map_err(|e|format!("{}: {e}",path.display()))?;
+            let converted=jka_protocol::jk2::presentation::convert_demo(&bytes)?;
+            let extension=path.extension().and_then(|s|s.to_str()).unwrap_or_default();
+            let expected=match converted.version {
+                jka_protocol::jk2::Version::V102 => "dm_15",
+                jka_protocol::jk2::Version::V104 => "dm_16",
+            };
+            if !extension.eq_ignore_ascii_case(expected) {
+                return Err(format!("JK2 header is {}, but the file extension is .{extension}",converted.version.name()));
+            }
+            let index=crate::app::build_demo_index(&converted.bytes)
+                .map_err(|e|format!("Cannot index JK2 demo: {e}"))?;
+            let duration=index.duration_ms();
+            if !(1..=36_000_000).contains(&duration) {return Err("JK2 recording has no usable active POV".into());}
+            Ok((path,bytes,duration))
+        });
+        match worker {
+            Ok(worker)=> {
+                self.render_studio.jk2_import=Some(crate::app::render_studio::StudioJk2ImportJob {
+                    project,game,time,layer,worker,
+                });
+                self.render_studio.status="Importing JK2 demo…".into();
+            }
+            Err(error)=>self.render_studio.status=format!("Cannot start JK2 import: {error}"),
+        }
+    }
+
+    fn studio_poll_jk2_import(&mut self) {
+        if !self.render_studio.jk2_import.as_ref().is_some_and(|j|j.worker.is_finished()) {return;}
+        let job=self.render_studio.jk2_import.take().unwrap();
+        let result=job.worker.join().unwrap_or_else(|_|Err("JK2 import worker panicked".into()));
+        // A new/opened project invalidates any import launched by the old one.
+        if job.project!=self.studio_project_directory() {return;}
+        match result {
+            Ok((path,bytes,duration))=> {
+                let owned=match self.studio_copy_demo_bytes(&path,&bytes) {
+                    Ok(owned)=>owned,
+                    Err(error)=>{self.render_studio.status=format!("JK2 import failed: {error}");return;}
+                };
+                let name=path.file_name().map(|n|n.to_string_lossy().into_owned()).unwrap_or_default();
+                let protocol=if path.extension().and_then(|x|x.to_str()).is_some_and(|x|x.eq_ignore_ascii_case("dm_15")) {15} else {16};
+                self.render_studio_place_demo(name,job.game,job.time,duration,job.layer,Some(owned),protocol);
+            }
+            Err(error)=>self.render_studio.status=format!("JK2 demo import failed: {error}"),
+        }
+    }
+
     /// Native Explorer picker imports recordings from any readable disk location.
     pub(in crate::app) fn studio_import_demo_files(&mut self, files:Vec<std::path::PathBuf>) {
         let mut count=0usize;
         for source in files {
-            if !source.extension().and_then(|e|e.to_str()).is_some_and(|e|e.eq_ignore_ascii_case("dm_26")) {
-                self.render_studio.status=format!("Not a DM26 demo: {}",source.display());continue;
+            let ext=source.extension().and_then(|e|e.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("dm_15") || ext.eq_ignore_ascii_case("dm_16") {
+                let at=self.render_studio.timeline.demos.iter().map(|c|c.end())
+                    .fold(self.render_studio.timeline_time(),f64::max);
+                if self.render_studio.jk2_import.is_none() {
+                    self.studio_queue_jk2_demo_import(source,String::new(),at,0);
+                } else {
+                    self.render_studio.pending_demo_queue.push_back((StudioMediaDrag {
+                        name:source.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                        demo_game:Some(String::new()),demo_path:Some(source),emote_id:None,cinematic:None,
+                    },0));
+                }
+                continue;
+            }
+            if !ext.eq_ignore_ascii_case("dm_26") {
+                self.render_studio.status=format!("Unsupported recording: {}",source.display());continue;
             }
             let bytes=match std::fs::read(&source) {
                 Ok(bytes) if !bytes.is_empty() && bytes.len()<=512*1024*1024 =>bytes,
@@ -1598,7 +1866,7 @@ impl App {
             let layer=0usize;
             let at=self.render_studio.timeline.demos.iter().filter(|c|c.layer==layer)
                 .map(|c|c.end()).fold(self.render_studio.timeline_time(),f64::max);
-            self.render_studio_place_demo(name,game,at,duration,layer,Some(owned));
+            self.render_studio_place_demo(name,game,at,duration,layer,Some(owned),26);
             count+=1;
         }
         if count>0 {self.render_studio.status=format!("Imported {count} DM26 demo(s) into project media");}
@@ -1609,7 +1877,7 @@ impl App {
             self.render_studio.status="Demo directory changed while dragging; retry the drop".into();return;
         }
         if let Some(metadata)=self.demo_metadata_cache.get(&name) {
-            self.render_studio_place_demo(name,game,time,metadata.duration_ms,layer,None);
+            self.render_studio_place_demo(name,game,time,metadata.duration_ms,layer,None,26);
         } else if let Some(error)=self.demo_metadata_errors.get(&name) {
             self.render_studio.status=format!("Cannot add demo: {error}");
         } else {
@@ -1618,7 +1886,7 @@ impl App {
             self.render_studio.status="Indexing demo to determine its real duration…".into();
         }
     }
-    fn render_studio_place_demo(&mut self,name:String,game:String,time:f64,duration_ms:i32,layer:usize,imported:Option<String>) {
+    fn render_studio_place_demo(&mut self,name:String,game:String,time:f64,duration_ms:i32,layer:usize,imported:Option<String>,demo_protocol:u8) {
         if !(1..=36_000_000).contains(&duration_ms) {
             self.render_studio.status="Demo contains no usable active POV snapshots, or exceeds the editor's 10-hour limit".into();return;
         }
@@ -1629,7 +1897,7 @@ impl App {
                 Err(error)=>{self.render_studio.status=format!("Cannot copy demo into project: {error}");return;}
             },
         };
-        let clip=StudioDemoClip { source_path: Some(source_path), comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,name,game,start:time,duration_ms,in_ms:0,out_ms:duration_ms,speed_keys:vec![],transition_in:Default::default(),audio:Default::default(),layer};
+        let clip=StudioDemoClip { demo_protocol, source_path: Some(source_path), comparison: None, race_overlays: Vec::new(), pov_trail:Default::default(), hud_overrides:Default::default(), hide_other_players:false,name,game,start:time,duration_ms,in_ms:0,out_ms:duration_ms,speed_keys:vec![],transition_in:Default::default(),audio:Default::default(),layer};
         if !clip.valid() {
             self.render_studio.status="Invalid demo source path or metadata".into();return;
         }
@@ -1680,6 +1948,118 @@ impl App {
         if !shift || anchor.is_none() {self.render_studio.library_anchor=Some(key);}
     }
 
+    /// The demo library borrows Play Demo's already-indexed metadata. This is
+    /// deliberately a compact hover card: no second scrolling inspector and no
+    /// re-reading demos on the UI thread.
+    fn studio_demo_hover_card(ui: &mut egui::Ui, name: &str, meta: &crate::app::frontend::DemoMetadata) {
+        use crate::app::frontend::DemoAssetKind;
+        const FOUND: egui::Color32 = egui::Color32::from_rgb(112, 211, 143);
+        const MISSING: egui::Color32 = egui::Color32::from_rgb(235, 100, 108);
+
+        ui.set_min_width(300.0);
+        ui.set_max_width(410.0);
+        ui.label(egui::RichText::new(name).strong().size(14.0).color(theme::TEXT()));
+        ui.label(egui::RichText::new(format!("{} · {} · {} players",
+            Self::format_demo_time(meta.duration_ms),
+            Self::demo_gametype_name(meta.gametype), meta.players.len()))
+            .small().color(theme::TEXT_DIM()));
+        if let Some(server) = &meta.server_name {
+            ui.label(egui::RichText::new(server).small().color(theme::TEXT_FAINT()));
+        }
+        if !meta.fs_game.is_empty() {
+            ui.label(egui::RichText::new(format!("Recorded mod: {}", meta.fs_game))
+                .small().color(theme::TEXT_FAINT()));
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("MAPS").strong().color(theme::ACCENT()));
+        if meta.maps.is_empty() {
+            sui::hint(ui, "No map identified in this recording.");
+        } else {
+            for map in meta.maps.iter().take(4) {
+                // Map presence comes from the same recorded-mod + base VFS
+                // inventory shown by Play Demo's Referenced Assets tab.
+                let found = meta.referenced_assets.iter().find(|asset|
+                    asset.kind == DemoAssetKind::Map && asset.name == map.map_name)
+                    .map(|asset| asset.found_locally);
+                ui.horizontal(|ui| {
+                    ui.colored_label(match found {Some(true)=>FOUND,Some(false)=>MISSING,None=>theme::TEXT_FAINT()},
+                        map.map_name.as_str());
+                    ui.label(egui::RichText::new(Self::format_demo_time(map.duration_ms))
+                        .monospace().small().color(theme::TEXT_DISABLED()));
+                    if found == Some(false) {ui.colored_label(MISSING,"MISSING");}
+                });
+            }
+            if meta.maps.len() > 4 {
+                sui::hint(ui,&format!("+{} more maps (full list in Play Demo)",meta.maps.len()-4));
+            }
+        }
+
+        let missing = meta.referenced_assets.iter().filter(|a| !a.found_locally).count();
+        let found = meta.referenced_assets.len() - missing;
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("REFERENCED ASSETS").strong().color(theme::ACCENT()));
+            ui.colored_label(FOUND,format!("{found} found"));
+            ui.colored_label(if missing>0 {MISSING} else {FOUND}, format!("{missing} missing"));
+        });
+        // Show each kind, with missing entries first. Found assets are sampled;
+        // all references remain available in Play Demo's full Assets tab.
+        // Caps prevent giant mouseover windows on heavily modded demos.
+        for kind in [DemoAssetKind::PlayerModel, DemoAssetKind::WorldModel,
+            DemoAssetKind::Npc, DemoAssetKind::Saber] {
+            let group: Vec<_> = meta.referenced_assets.iter().filter(|a| a.kind == kind).collect();
+            if group.is_empty() {continue;}
+            let absent = group.iter().filter(|a| !a.found_locally).count();
+            let present = group.len() - absent;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(kind.label()).strong().small().color(theme::TEXT_DIM()));
+                ui.label(egui::RichText::new(format!("{present} found · {absent} missing"))
+                    .small().color(if absent>0 {MISSING} else {FOUND}));
+            });
+            let entries: Vec<_> = group.iter().copied().filter(|a| !a.found_locally)
+                .chain(group.iter().copied().filter(|a| a.found_locally))
+                .take(4).collect();
+            for asset in &entries {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(if asset.found_locally {"✓"} else {"×"})
+                        .color(if asset.found_locally {FOUND} else {MISSING}));
+                    ui.label(egui::RichText::new(asset.name.as_str())
+                        .color(if asset.found_locally {FOUND} else {MISSING}).small());
+                });
+            }
+            if group.len()>entries.len() {
+                sui::hint(ui,&format!("+{} more (full list in Play Demo → Assets)", group.len()-entries.len()));
+            }
+        }
+        if meta.referenced_assets.is_empty() {
+            sui::hint(ui,"No asset references detected in this recording.");
+        }
+        ui.separator();
+        sui::hint(ui,"Green = available locally · Red = missing · Drag onto the DEMO POV track");
+    }
+
+    /// Wait until the pointer settles on a particular demo before submitting a
+    /// potentially heavy background metadata scan. A single context-scoped
+    /// hover identity is shared across ALL rows; passing over 100 demos never
+    /// submits 100 decoding jobs.
+    fn studio_demo_hover_should_index(ui: &egui::Ui, key: &str) -> bool {
+        let id = egui::Id::new("studio_demo_hover_index_debounce");
+        let now = ui.input(|input| input.time);
+        let began = ui.ctx().data_mut(|data| {
+            if let Some((previous, since)) = data.get_temp::<(String, f64)>(id) {
+                if previous == key {return since;}
+            }
+            data.insert_temp(id,(key.to_owned(),now));
+            now
+        });
+        if now - began >= 0.25 {
+            true
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(260));
+            false
+        }
+    }
+
     /// One browser row per source. Returns the row response so callers can
     /// layer row actions (e.g. the race-actor button) over it.
     pub(super) fn egui_render_studio_media_tile(&mut self,ui:&mut egui::Ui,asset:StudioMediaDrag,locked:bool)->egui::Response {
@@ -1687,7 +2067,9 @@ impl App {
             else if asset.cinematic.is_some() {(Icon::Cinematic,theme::WARNING())}
             else if asset.emote_id.is_some() {(Icon::Emote,sui::SPEED)}
             else {(Icon::Anim,theme::ACCENT())};
-        let meta=if asset.demo_game.is_some() {
+        let meta=if asset.demo_path.is_some() {
+            asset.name.rsplit_once('.').map(|(_,ext)|ext.to_ascii_uppercase()).unwrap_or_default()
+        } else if asset.demo_game.is_some() {
             if let Some(meta)=self.demo_metadata_cache.get(&asset.name) {Self::format_demo_time(meta.duration_ms)}
             else if self.demo_metadata_inflight.contains(&asset.name) {"indexing…".to_owned()} else {String::new()}
         } else {String::new()};
@@ -1703,7 +2085,7 @@ impl App {
             self.studio_library_click(key.clone(),ctrl,shift);
         }
         if r.clicked() {
-            if asset.demo_game.is_some() {self.ensure_demo_metadata(&asset.name);}
+            if asset.demo_game.is_some() && asset.demo_path.is_none() {self.ensure_demo_metadata(&asset.name);}
             if let Some(source)=asset.cinematic.as_ref() {
                 ui.ctx().memory_mut(|m|if let Some(id)=m.focused(){m.surrender_focus(id);});
                 self.preview_studio_cinematic(source);
@@ -1717,14 +2099,14 @@ impl App {
                 let group:Vec<StudioMediaDrag>=self.render_studio.library_rows.iter()
                     .filter(|(k,a)|*k!=key && self.render_studio.library_selection.contains(k) && a.demo_game.is_some()==demo)
                     .map(|(_,a)|a.clone()).collect();
-                for item in &group {if item.demo_game.is_some() {self.ensure_demo_metadata(&item.name);}}
+                for item in &group {if item.demo_game.is_some() && item.demo_path.is_none() {self.ensure_demo_metadata(&item.name);}}
                 self.render_studio.media_drag_group=group;
             } else {
                 self.render_studio.library_selection=vec![key.clone()];
                 self.render_studio.library_anchor=Some(key.clone());
             }
             self.render_studio.cinematic_preview=None;self.profile_preview_key=None;
-            if asset.demo_game.is_some() {self.ensure_demo_metadata(&asset.name);}
+            if asset.demo_game.is_some() && asset.demo_path.is_none() {self.ensure_demo_metadata(&asset.name);}
             self.render_studio.media_drag_duration=asset.emote_id.as_deref()
                 .and_then(|id|crate::emotes::catalog(&self.base).ok().and_then(|catalog| {
                     catalog.iter().flat_map(|root|std::iter::once(root).chain(root.variants.iter()))
@@ -1736,17 +2118,41 @@ impl App {
             self.render_studio.media_drag=Some(asset.clone());
         }
         if r.dragged() {ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);}
+        if let Some(path)=asset.demo_path.as_ref() {
+            return r.on_hover_text(format!("JK2 recording: {}\nDrag onto the DEMO POV track to import",path.display()));
+        }
+        if asset.demo_game.is_some() {
+            if r.hovered() && !self.demo_metadata_cache.contains_key(&asset.name)
+                && !self.demo_metadata_inflight.contains(&asset.name)
+                && !self.demo_metadata_errors.contains_key(&asset.name)
+                && Self::studio_demo_hover_should_index(ui, &key)
+            {
+                self.ensure_demo_metadata(&asset.name);
+            }
+            return r.on_hover_ui(|ui| {
+                sui::editor_style(ui);
+                if let Some(meta) = self.demo_metadata_cache.get(&asset.name) {
+                    Self::studio_demo_hover_card(ui, &asset.name, meta);
+                } else if let Some(error) = self.demo_metadata_errors.get(&asset.name) {
+                    ui.colored_label(theme::DANGER(),format!("Could not inspect recording: {error}"));
+                } else {
+                    ui.label(egui::RichText::new(&asset.name).strong());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        sui::hint(ui, if self.demo_metadata_inflight.contains(&asset.name) {
+                            "Indexing map and asset references…"
+                        } else {
+                            "Hover briefly to inspect map and missing assets…"
+                        });
+                    });
+                }
+            });
+        }
         let details=asset.cinematic.as_ref().and_then(|source|self.render_studio.cinematics.catalog.as_ref()
             .and_then(|r|r.as_ref().ok()).and_then(|catalog|catalog.clips.iter().find(|clip|clip.source==*source)))
             .map(|clip|format!("{}\n{} / {}\n{} frames, {:.2} FPS, source loopFrames {}\nClick to preview; drag onto a character track",clip.label,
                 clip.source.gla,clip.source.animation,clip.frame_count,clip.fps,clip.loop_frames))
-            .unwrap_or_else(||if let Some(meta)=asset.demo_game.as_ref().and_then(|_|self.demo_metadata_cache.get(&asset.name)) {
-                format!("demos/{}.dm_26\n{} · {} snapshots · {}\nDrag onto the DEMO POV track.",asset.name,
-                    Self::format_demo_time(meta.duration_ms),meta.snapshot_count,
-                    meta.recorded_player_name.as_deref().unwrap_or("POV unknown"))
-            } else if asset.demo_game.is_some() {
-                format!("demos/{}.dm_26\nClick to index its duration; drag onto the DEMO POV track.",asset.name)
-            } else {format!("{}\nDrag onto a character track",asset.name)});
+            .unwrap_or_else(||format!("{}\nDrag onto a character track",asset.name));
         r.on_hover_text(details)
     }
 
@@ -1885,7 +2291,9 @@ impl App {
             if self.render_studio.dm26_export.is_some() {
                 sui::hint(ui,"Writing DM26 snapshots…");
             } else {
-                let available = self.render_studio.timeline.demos.iter().any(|clip| !self.render_studio.timeline.demo_layer_hidden(clip.layer));
+                let available = self.render_studio.timeline.demos.iter().any(|clip|
+                    clip.demo_protocol==26 && !self.render_studio.timeline.demo_layer_hidden(clip.layer))
+                    && self.render_studio.timeline.demos.iter().all(|clip|clip.demo_protocol==26);
                 if sui::button_row(ui,&[(Some(Icon::Export),"Export playable demo (.dm_26)",ButtonKind::Normal,available)]).is_some() {
                     self.start_render_studio_dm26_export();
                 }
@@ -3285,10 +3693,9 @@ impl App {
                                     let group=std::mem::take(&mut self.render_studio.media_drag_group);
                                     if inside && asset.demo_game.is_some() && layer.is_some() {
                                         let layer=layer.unwrap_or(0);
-                                        self.render_studio_queue_demo_drop(asset.name,asset.demo_game.unwrap(),from_x(p.x),layer);
-                                        // The rest follow back to back once each duration is known.
+                                        self.studio_queue_media_demo(asset,from_x(p.x),layer);
                                         for item in group {
-                                            if let Some(game)=item.demo_game {self.render_studio.pending_demo_queue.push_back((item.name,game,layer));}
+                                            if item.demo_game.is_some() {self.render_studio.pending_demo_queue.push_back((item,layer));}
                                         }
                                     } else if inside && asset.demo_game.is_none() && (new_track || lane.is_some()) {
                                         // The empty slot below the tracks creates the track.
@@ -3585,7 +3992,7 @@ impl App {
             if let Some(i)=self.render_studio.timeline.selected_demo {
                 if self.render_studio.audio.selected_demo_audio==Some(i) {
                     if let Some(clip)=self.render_studio.timeline.demos.get(i) {
-                        sui::inspector_title(ui,sui::AUDIO,"Linked demo audio",&format!("{}.dm_26",clip.name),
+                        sui::inspector_title(ui,sui::AUDIO,"Linked demo audio",&clip.recording_file_name(),
                             "follows the demo's position, trims and speed");
                         self.egui_studio_demo_audio_inspector(ui,i,now);
                         if sui::button_row(ui,&[(Some(Icon::Demo),"Edit parent demo footage",ButtonKind::Normal,true)]).is_some() {
@@ -3679,8 +4086,9 @@ impl App {
     fn egui_studio_demo_inspector(&mut self,ui:&mut egui::Ui,i:usize,clip:StudioDemoClip,now:f64) {
         use crate::app::render_studio_timeline::StudioDemoTransition;
         let fps=self.render_studio.fps;
-        sui::inspector_title(ui,sui::DEMO,"Demo footage",&format!("{}.dm_26",clip.name),
-            &format!("{} · {} – {}",if clip.game.is_empty(){"base"}else{&clip.game},
+        sui::inspector_title(ui,sui::DEMO,"Demo footage",&clip.recording_file_name(),
+            &format!("{} / {} · {} – {}",match clip.demo_protocol {15=>"JK2 1.02",16=>"JK2 1.04",_=>"JKA"},
+                if clip.game.is_empty(){"base"}else{&clip.game},
                 sui::timecode(clip.start,fps),sui::timecode(clip.end(),fps)));
         let has_transition=self.render_studio.timeline.demo_has_transition(i);
         let comparison=clip.comparison.is_some();
@@ -4808,6 +5216,10 @@ impl App {
     /// Only with nothing left to cancel does it ask before leaving.
     pub(in crate::app) fn render_studio_escape(&mut self) {
         self.egui_repaint_requested = true;
+        // EgUi's modal also receives Escape, but the raw winit handler runs
+        // independently. Consume this key at the same modal boundary so it
+        // cannot clear timeline selection or open the Leave Studio prompt.
+        if self.render_studio.demo_details.take().is_some() { return; }
         let ctx = self.egui_ctx.clone();
         if self.render_studio.show_new_project {
             self.render_studio.show_new_project=false;
@@ -4931,7 +5343,8 @@ impl App {
 
 /// Stable identity of a library row across frames.
 fn studio_library_key(asset:&StudioMediaDrag)->String {
-    if let Some(game)=&asset.demo_game {format!("demo:{game}/{}",asset.name)}
+    if let Some(path)=&asset.demo_path {format!("jk2demo:{}",path.display())}
+    else if let Some(game)=&asset.demo_game {format!("demo:{game}/{}",asset.name)}
     else if let Some(id)=&asset.emote_id {format!("emote:{id}")}
     else if let Some(source)=&asset.cinematic {format!("cinematic:{}/{}",source.gla,source.animation)}
     else {format!("anim:{}",asset.name)}

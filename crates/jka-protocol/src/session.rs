@@ -621,7 +621,13 @@ impl ClientSession {
                 Event::Gamestate { server_command_sequence, .. } => {
                     self.server_command_sequence = server_command_sequence;
                     self.gamestate_parsed();
-                    if self.jk2.is_some() {
+                    // Join JK2 servers as a spectator once per connection. Later
+                    // gamestates (map change / restart) keep the server's
+                    // persistent session team, including a playing-team choice.
+                    if self.jk2.as_ref().is_some_and(|jk2| !jk2.default_team_sent) {
+                        if let Some(jk2) = self.jk2.as_mut() {
+                            jk2.default_team_sent = true;
+                        }
                         if let Err(error) = self.add_reliable_command(b"team spectator", false) {
                             self.drop_connection(error);
                             return;
@@ -758,13 +764,6 @@ impl ClientSession {
 
     /// CL_AddReliableCommand. Fails on overflow (ERR_DROP "Client command overflow").
     pub fn add_reliable_command(&mut self, text: &[u8], is_disconnect: bool) -> Result<(), String> {
-        if self.jk2.is_some() {
-            let args = tokenize(text);
-            if args.first().is_some_and(|s| s.eq_ignore_ascii_case(b"team"))
-                && args.get(1).is_some_and(|s| !s.eq_ignore_ascii_case(b"spectator") && !s.eq_ignore_ascii_case(b"s")) {
-                return Err("JK2 supports native free-spectator prediction; playing teams await remote combat context validation".into());
-            }
-        }
         let unacknowledged = self.reliable_sequence - self.reliable_acknowledge;
         let limit = MAX_RELIABLE_COMMANDS as i32;
         if (is_disconnect && unacknowledged > limit) || (!is_disconnect && unacknowledged >= limit) {
@@ -794,12 +793,13 @@ impl ClientSession {
         }
         cmd.server_time = server_time;
         if self.jk2.is_some() {
-            // Spectator navigation / follow only. JKA selection/generic IDs
-            // must never be sent as JK2 gameplay IDs.
-            cmd.weapon = 0;
-            cmd.force_selection = 0;
-            cmd.inventory_selection = 0;
-            cmd.generic_command = 0;
+            // Callers convert selections to JK2 CGame IDs. Never transmit a
+            // value outside JK2's weapon_t / forcePowers_t / holdable_t /
+            // genCmds_t: replace it with no weapon, selection or command.
+            if cmd.weapon >= 16 { cmd.weapon = 0; }
+            if cmd.force_selection >= 18 && cmd.force_selection != 255 { cmd.force_selection = 255; }
+            if cmd.inventory_selection >= 7 && cmd.inventory_selection != 255 { cmd.inventory_selection = 255; }
+            if cmd.generic_command > 20 { cmd.generic_command = 0; }
         }
         self.cmd_number += 1;
         self.cmds[self.cmd_number as usize & (CMD_BACKUP - 1)] = cmd;
@@ -1199,14 +1199,21 @@ mod tests {
             assert_eq!(session.server_commands[8], command.text);
             assert!(session.take_events().iter().any(|e| matches!(e,
                 SessionEvent::ServerCommand(c) if c.sequence == 8 && c.text.starts_with(b"cs 1131 "))));
-            assert!(session.add_reliable_command(b"team red", false).is_err());
+            // Playing-team requests go through the ordinary reliable path.
+            assert!(session.add_reliable_command(b"team free", false).is_ok());
             assert!(session.add_reliable_command(b"team spectator", false).is_ok());
             session.set_primed(40);
-            let number = session.create_command(UserCmd { weapon: 4, generic_command: 7, forward_move: 127, ..Default::default() }).unwrap();
+            // Valid JK2 wire selections are stored exactly; anything outside
+            // the JK2 enums becomes no weapon / selection / generic command.
+            let number = session.create_command(UserCmd { weapon: 4, force_selection: 255, inventory_selection: 3,
+                generic_command: 20, forward_move: 127, ..Default::default() }).unwrap();
             let cmd = session.command(number).unwrap();
-            assert_eq!(cmd.weapon, 0);
-            assert_eq!(cmd.generic_command, 0);
+            assert_eq!((cmd.weapon, cmd.force_selection, cmd.inventory_selection, cmd.generic_command), (4, 255, 3, 20));
             assert_eq!(cmd.forward_move, 127);
+            let number = session.create_command(UserCmd { weapon: 16, force_selection: 18, inventory_selection: 7,
+                generic_command: 27, ..Default::default() }).unwrap();
+            let cmd = session.command(number).unwrap();
+            assert_eq!((cmd.weapon, cmd.force_selection, cmd.inventory_selection, cmd.generic_command), (0, 255, 255, 0));
         }
     }
 
@@ -1277,20 +1284,23 @@ mod tests {
         session.take_outgoing();
         session.state = ConnectionState::Connected;
         session.take_events();
-        let mut w = crate::message::MessageWriter::new(16384).unwrap();
-        w.write_bits(0, 32).unwrap();
-        w.write_bits(2, 8).unwrap(); // JK2 svc_gamestate
-        w.write_bits(0, 32).unwrap();
-        for (index, text) in [(0, b"\\protocol\\16\\version\\JK2MP: v1.04\\mapname\\ffa_bespin".as_slice()), (1, b"\\sv_pure\\1\\sv_serverid\\99")] {
-            w.write_bits(3, 8).unwrap();
-            w.write_bits(index, 16).unwrap();
-            netchan::write_string(&mut w, text).unwrap();
-        }
-        w.write_bits(9, 8).unwrap(); // JK2 svc_EOF inside gamestate
-        w.write_bits(0, 32).unwrap();
-        w.write_bits(42, 32).unwrap();
-        w.write_bits(9, 8).unwrap();
-        session.parse_server_message(1, w.as_bytes(), 100);
+        let gamestate = |reliable: i32| {
+            let mut w = crate::message::MessageWriter::new(16384).unwrap();
+            w.write_bits(reliable, 32).unwrap();
+            w.write_bits(2, 8).unwrap(); // JK2 svc_gamestate
+            w.write_bits(0, 32).unwrap();
+            for (index, text) in [(0, b"\\protocol\\16\\version\\JK2MP: v1.04\\mapname\\ffa_bespin".as_slice()), (1, b"\\sv_pure\\1\\sv_serverid\\99")] {
+                w.write_bits(3, 8).unwrap();
+                w.write_bits(index, 16).unwrap();
+                netchan::write_string(&mut w, text).unwrap();
+            }
+            w.write_bits(9, 8).unwrap(); // JK2 svc_EOF inside gamestate
+            w.write_bits(0, 32).unwrap();
+            w.write_bits(42, 32).unwrap();
+            w.write_bits(9, 8).unwrap();
+            w.as_bytes().to_vec()
+        };
+        session.parse_server_message(1, &gamestate(0), 100);
         assert_eq!(session.state(), ConnectionState::Connected);
         let events = session.take_events();
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Gamestate)));
@@ -1298,6 +1308,12 @@ mod tests {
         assert_eq!(session.reliable_sequence, 1);
         assert_eq!(session.reliable_commands[1], b"team spectator");
         assert!(session.take_outgoing().is_empty());
+        // A later gamestate (map change) keeps a playing-team choice.
+        session.add_reliable_command(b"team free", false).unwrap();
+        session.parse_server_message(2, &gamestate(2), 200);
+        assert!(session.take_events().iter().any(|e| matches!(e, SessionEvent::Gamestate)));
+        assert_eq!(session.reliable_sequence, 2);
+        assert_eq!(session.reliable_commands[2], b"team free");
     }
 
     #[test]

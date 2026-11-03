@@ -169,6 +169,18 @@ impl Renderer {
             return;
         }
         self.detail_texture_game = next_game;
+        // The HUD image worker holds a filesystem snapshot and parsed shaders
+        // for the previous mod. Drop it before requesting new mod artwork.
+        self.ui_ext_image_loader = None;
+        self.ui_ext_image_key.clear();
+        self.ui_state.extension_shader_flags.clear();
+        self.ui_icon_shader_resolver = None;
+        self.ui_icon_shader_materials.clear();
+        self._ui_ext_images = crate::renderer::upload_texture(
+            &self.device, &self.queue,
+            &crate::renderer::overlay::blank_ui_extension_atlas(),
+        );
+        self.rebuild_ui_bind_group();
         // The enemy-info shader resolver owns its own VFS/material cache.
         // A mod switch must never retain the previous mod's icon shaders.
         self.enemy_icon_key = None;

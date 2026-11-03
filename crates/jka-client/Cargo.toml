@@ -39,6 +39,9 @@ meshopt = "=0.6.2"
 oximedia-lut = "=0.2.1"
 smaa = { path = "../../vendor/smaa-0.21.0" }
 serde_json = "=1.0.151"
+# Chat translation: local language detection and legacy chat code pages.
+whatlang = "=0.18.0"
+encoding_rs = "=0.8.41"
 sha2 = "=0.10.9"
 ed25519-dalek = "=2.2.0"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }

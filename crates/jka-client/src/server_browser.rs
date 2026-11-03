@@ -1,8 +1,8 @@
-//! Asynchronous Jedi Academy server discovery.
+//! Asynchronous JKA and JK2 server discovery.
 //!
-//! The wire protocol intentionally follows OpenJK/JKA compatibility:
+//! The wire protocol intentionally follows the Quake 3/OpenJK/JK2MV browser:
 //! * Internet: `getservers <protocol>` to a master server, then `getinfo` each address.
-//! * LAN: broadcast `getinfo` across the stock JKA server-port range.
+//! * LAN: broadcast `getinfo` across the selected game's server-port range.
 //! * Details: `getstatus` for the selected server's player list.
 //!
 //! Unlike the legacy client this is isolated on a worker thread.  The UI/main
@@ -26,6 +26,61 @@ pub const DEFAULT_MOD_FILTER: &str = "-MBII,-MBIIOpenBeta";
 /// Fourth field is the selected gametype bitmask; 0 means show every mode.
 /// A three-field value from older saved configs remains supported.
 pub const DEFAULT_SERVER_FILTERS: &str = "12|0|-MBII,-MBIIOpenBeta|0";
+/// The game/protocol is part of every query and every result. JK2's two
+/// supported versions deliberately have independent browser lists and settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrowserProtocol {
+    Jka,
+    Jk2_102,
+    Jk2_104,
+}
+
+impl BrowserProtocol {
+    pub const ALL: [Self; 3] = [Self::Jka, Self::Jk2_102, Self::Jk2_104];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jka => "JKA",
+            Self::Jk2_102 => "JK2 1.02",
+            Self::Jk2_104 => "JK2 1.04",
+        }
+    }
+    pub fn protocol(self) -> u32 {
+        match self {
+            Self::Jka => PROTOCOL_VERSION,
+            Self::Jk2_102 => jka_protocol::jk2::Version::V102.protocol(),
+            Self::Jk2_104 => jka_protocol::jk2::Version::V104.protocol(),
+        }
+    }
+    pub fn master_port(self) -> u16 {
+        match self {
+            Self::Jka => 29060,
+            Self::Jk2_102 | Self::Jk2_104 => 28060,
+        }
+    }
+    pub fn first_server_port(self) -> u16 {
+        match self {
+            Self::Jka => FIRST_SERVER_PORT,
+            Self::Jk2_102 | Self::Jk2_104 => 28070,
+        }
+    }
+    pub fn default_masters(self) -> [&'static str; MAX_MASTER_SLOTS] {
+        match self {
+            Self::Jka => DEFAULT_MASTER_CVARS,
+            Self::Jk2_102 | Self::Jk2_104 => [
+                "master.jkhub.org", "master.jk2mv.org", "master.ouned.de", "", "",
+            ],
+        }
+    }
+    fn settings_suffix(self) -> &'static str {
+        match self {
+            Self::Jka => "",
+            Self::Jk2_102 => "-jk2-102",
+            Self::Jk2_104 => "-jk2-104",
+        }
+    }
+}
+
 
 /// Stock JKA gametypes plus a catch-all for unknown/custom gametype numbers.
 /// Values are intentionally server protocol ids, not UI list positions.
@@ -42,6 +97,11 @@ pub const GAMETYPE_FILTER_OPTIONS: [(i32, &str); 11] = [
     (9, "CTY"),
     (-1, "Unknown / Custom"),
 ];
+pub const JK2_GAMETYPE_FILTER_OPTIONS: [(i32, &str); 9] = [
+    (0, "FFA"), (1, "Holocron"), (2, "Jedi Master"), (3, "Duel"),
+    (4, "Single Player"), (5, "Team FFA"), (7, "CTF"),
+    (8, "CTY"), (-1, "Unknown / Custom"),
+];
 const GAMETYPE_FILTER_MASK: u16 = (1 << GAMETYPE_FILTER_OPTIONS.len()) - 1;
 
 /// Unknown values share the single catch-all bit at index 10.
@@ -56,7 +116,6 @@ const INFO_WAIT: Duration = Duration::from_millis(2200);
 const STATUS_WAIT: Duration = Duration::from_millis(900);
 const MAX_MASTER_SERVERS: usize = 4096;
 const MAX_PACKET: usize = 64 * 1024;
-const MASTER_PORT: u16 = 29060;
 
 /// TaystJK/OpenJK-style master slots. TaystJK supports five `sv_masterN` cvars:
 /// Raven, JKHub, and Ouned by default, with slots 4-5 empty for custom masters.
@@ -123,6 +182,13 @@ impl ServerEntry {
     }
 
     pub fn gametype_label(&self) -> &'static str {
+        if self.protocol == 15 || self.protocol == 16 {
+            return match self.gametype {
+                0 => "FFA", 1 => "HOLOCRON", 2 => "JEDI MASTER",
+                3 => "DUEL", 4 => "SINGLE PLAYER", 5 => "TEAM FFA",
+                7 => "CTF", 8 => "CTY", _ => "UNKNOWN",
+            };
+        }
         match self.gametype {
             0 => "FFA",
             1 => "HOLOCRON",
@@ -212,6 +278,7 @@ impl<'a> ModFilters<'a> {
 }
 
 pub struct BrowserUiState {
+    pub protocol: BrowserProtocol,
     pub source: ServerSource,
     pub servers: HashMap<SocketAddr, ServerEntry>,
     pub source_addresses: HashMap<ServerSource, HashSet<SocketAddr>>,
@@ -269,6 +336,7 @@ pub struct BrowserUiState {
     pub master_drafts: [String; MAX_MASTER_SLOTS],
     favorites_path: std::path::PathBuf,
     history_path: std::path::PathBuf,
+    master_path: Option<std::path::PathBuf>,
 }
 
 impl BrowserUiState {
@@ -336,7 +404,7 @@ impl BrowserUiState {
         let selected = self.gametype_filter.count_ones();
         match selected {
             0 => "All gametypes".to_owned(),
-            1 => GAMETYPE_FILTER_OPTIONS
+            1 => self.gametype_options()
                 .iter()
                 .find(|(gametype, _)| self.gametype_filter & gametype_filter_bit(*gametype) != 0)
                 .map(|(_, label)| (*label).to_owned())
@@ -345,12 +413,37 @@ impl BrowserUiState {
         }
     }
 
+    pub fn gametype_options(&self) -> &'static [(i32, &'static str)] {
+        match self.protocol {
+            BrowserProtocol::Jka => &GAMETYPE_FILTER_OPTIONS,
+            BrowserProtocol::Jk2_102 | BrowserProtocol::Jk2_104 => &JK2_GAMETYPE_FILTER_OPTIONS,
+        }
+    }
+
     pub fn new(
         settings_dir: &Path,
         master_servers: [String; MAX_MASTER_SLOTS],
     ) -> Self {
-        let favorites_path = settings_dir.join("server-favorites.txt");
-        let history_path = settings_dir.join("server-history.txt");
+        Self::new_for_protocol(settings_dir, master_servers, BrowserProtocol::Jka)
+    }
+
+    pub fn new_for_protocol(
+        settings_dir: &Path,
+        master_servers: [String; MAX_MASTER_SLOTS],
+        protocol: BrowserProtocol,
+    ) -> Self {
+        let suffix = protocol.settings_suffix();
+        let favorites_path = settings_dir.join(format!("server-favorites{suffix}.txt"));
+        let history_path = settings_dir.join(format!("server-history{suffix}.txt"));
+        let master_path = (protocol != BrowserProtocol::Jka)
+            .then(|| settings_dir.join(format!("server-masters{suffix}.txt")));
+        let master_servers = master_path.as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| {
+                let rows: Vec<_> = text.lines().map(str::to_owned).collect();
+                (rows.len() == MAX_MASTER_SLOTS).then(|| std::array::from_fn(|i| rows[i].clone()))
+            })
+            .unwrap_or(master_servers);
         let mut favorites = load_address_list(&favorites_path);
         favorites.sort_unstable();
         let mut history_rows = load_history_list(&history_path);
@@ -366,12 +459,13 @@ impl BrowserUiState {
             .filter_map(|(address, visited)| visited.map(|visited| (address, visited)))
             .collect();
         let mut master_drafts = master_servers.clone();
-        for (slot, default) in DEFAULT_MASTER_CVARS.iter().enumerate() {
+        for (slot, default) in protocol.default_masters().iter().enumerate() {
             if master_drafts[slot].trim().is_empty() && !default.is_empty() {
                 master_drafts[slot] = (*default).to_owned();
             }
         }
         Self {
+            protocol,
             source: ServerSource::Internet,
             servers: HashMap::new(),
             source_addresses: HashMap::new(),
@@ -383,7 +477,7 @@ impl BrowserUiState {
             hide_full: false,
             hide_bots: true,
             hide_connecting: true,
-            mod_filter: DEFAULT_MOD_FILTER.to_owned(),
+            mod_filter: if protocol == BrowserProtocol::Jka { DEFAULT_MOD_FILTER } else { "" }.to_owned(),
             gametype_filter: 0,
             max_ping: 0,
             sort: BrowserSort::Ping,
@@ -409,7 +503,21 @@ impl BrowserUiState {
             master_drafts,
             favorites_path,
             history_path,
+            master_path,
         }
+    }
+
+    /// JK2 master configuration is independent of archived JKA sv_masterN cvars.
+    pub fn set_jk2_masters(&mut self, updates: &[(usize, String)]) -> Result<(), String> {
+        let Some(path) = &self.master_path else { return Ok(()); };
+        let mut next = self.master_servers.clone();
+        for (slot, value) in updates {
+            if *slot < MAX_MASTER_SLOTS { next[*slot] = value.clone(); }
+        }
+        std::fs::write(path, next.join("\n") + "\n")
+            .map_err(|error| format!("Could not save JK2 masters: {error}"))?;
+        self.master_servers = next;
+        Ok(())
     }
 
     pub fn handle_event(&mut self, event: BrowserEvent) {
@@ -521,7 +629,11 @@ impl BrowserUiState {
                 self.servers
                     .get(&address)
                     .cloned()
-                    .unwrap_or_else(|| ServerEntry::placeholder(address))
+                    .unwrap_or_else(|| {
+                        let mut entry = ServerEntry::placeholder(address);
+                        entry.protocol = self.protocol.protocol();
+                        entry
+                    })
             })
             .collect()
     }
@@ -592,6 +704,18 @@ impl BrowserUiState {
 }
 
 #[derive(Debug)]
+pub struct BrowserRequest {
+    pub protocol: BrowserProtocol,
+    pub command: BrowserCommand,
+}
+
+#[derive(Debug)]
+pub struct TaggedBrowserEvent {
+    pub protocol: BrowserProtocol,
+    pub event: BrowserEvent,
+}
+
+#[derive(Debug)]
 pub enum BrowserCommand {
     RefreshInternet { masters: Vec<String> },
     RefreshLan,
@@ -640,7 +764,7 @@ pub enum BrowserEvent {
     },
 }
 
-pub fn spawn() -> Result<(Sender<BrowserCommand>, Receiver<BrowserEvent>), String> {
+pub fn spawn() -> Result<(Sender<BrowserRequest>, Receiver<TaggedBrowserEvent>), String> {
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     thread::Builder::new()
@@ -650,8 +774,9 @@ pub fn spawn() -> Result<(Sender<BrowserCommand>, Receiver<BrowserEvent>), Strin
     Ok((command_tx, event_rx))
 }
 
-fn worker(commands: Receiver<BrowserCommand>, events: Sender<BrowserEvent>) {
-    while let Ok(command) = commands.recv() {
+fn worker(commands: Receiver<BrowserRequest>, event_tx: Sender<TaggedBrowserEvent>) {
+    while let Ok(BrowserRequest { protocol, command }) = commands.recv() {
+        let events = ScopedEventSender { sender: &event_tx, protocol };
         let result = match command {
             BrowserCommand::RefreshInternet { masters } => refresh_internet(&events, masters),
             BrowserCommand::RefreshLan => refresh_lan(&events),
@@ -680,18 +805,30 @@ fn worker(commands: Receiver<BrowserCommand>, events: Sender<BrowserEvent>) {
     }
 }
 
+/// Retain the simple event API inside worker jobs while tagging each event
+/// with its originating protocol, even after a different UI tab is selected.
+struct ScopedEventSender<'a> {
+    sender: &'a Sender<TaggedBrowserEvent>,
+    protocol: BrowserProtocol,
+}
+impl ScopedEventSender<'_> {
+    fn send(&self, event: BrowserEvent) -> Result<(), ()> {
+        self.sender.send(TaggedBrowserEvent { protocol: self.protocol, event }).map_err(|_| ())
+    }
+}
+
 type WorkerResult = Result<(), (Option<ServerSource>, String)>;
 
-fn refresh_internet(events: &Sender<BrowserEvent>, masters: Vec<String>) -> WorkerResult {
+fn refresh_internet(events: &ScopedEventSender<'_>, masters: Vec<String>) -> WorkerResult {
     let source = ServerSource::Internet;
     events
         .send(BrowserEvent::RefreshStarted(source))
         .map_err(|_| (Some(source), "browser UI disconnected".to_owned()))?;
-    let addresses = discover_master_servers(&masters).map_err(|message| (Some(source), message))?;
+    let addresses = discover_master_servers(&masters, events.protocol).map_err(|message| (Some(source), message))?;
     query_info_batch(events, source, addresses)
 }
 
-fn refresh_lan(events: &Sender<BrowserEvent>) -> WorkerResult {
+fn refresh_lan(events: &ScopedEventSender<'_>) -> WorkerResult {
     let source = ServerSource::Lan;
     events
         .send(BrowserEvent::RefreshStarted(source))
@@ -714,7 +851,7 @@ fn refresh_lan(events: &Sender<BrowserEvent>) -> WorkerResult {
         for offset in 0..NUM_SERVER_PORTS {
             let address = SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::BROADCAST,
-                FIRST_SERVER_PORT + offset,
+                events.protocol.first_server_port() + offset,
             ));
             socket
                 .send_to(&request, address)
@@ -734,7 +871,7 @@ fn refresh_lan(events: &Sender<BrowserEvent>) -> WorkerResult {
                 let Ok(info) = parse_info_response(&buf[..len], &challenge) else {
                     continue;
                 };
-                if info.protocol != PROTOCOL_VERSION {
+                if info.protocol != events.protocol.protocol() {
                     continue;
                 }
                 seen.insert(from);
@@ -760,7 +897,7 @@ fn refresh_lan(events: &Sender<BrowserEvent>) -> WorkerResult {
 }
 
 fn refresh_addresses(
-    events: &Sender<BrowserEvent>,
+    events: &ScopedEventSender<'_>,
     source: ServerSource,
     addresses: Vec<SocketAddr>,
 ) -> WorkerResult {
@@ -771,7 +908,7 @@ fn refresh_addresses(
 }
 
 fn refresh_server(
-    events: &Sender<BrowserEvent>,
+    events: &ScopedEventSender<'_>,
     source: ServerSource,
     address: SocketAddr,
     quiet: bool,
@@ -800,7 +937,7 @@ fn refresh_server(
                 let Ok(info) = parse_info_response(&buf[..len], &challenge) else {
                     continue;
                 };
-                if info.protocol != PROTOCOL_VERSION {
+                if info.protocol != events.protocol.protocol() {
                     continue;
                 }
                 let server = server_from_info(address, &info, sent.elapsed());
@@ -825,7 +962,7 @@ fn refresh_server(
     Ok(())
 }
 
-fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String> {
+fn discover_master_servers(masters: &[String], protocol: BrowserProtocol) -> Result<Vec<SocketAddr>, String> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|e| format!("master browser socket: {e}"))?;
     socket
@@ -834,7 +971,7 @@ fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String
 
     // Ask for the complete candidate set; empty/full filtering is instant and local in the UI.
     let mut request = b"\xff\xff\xff\xffgetservers ".to_vec();
-    request.extend_from_slice(PROTOCOL_VERSION.to_string().as_bytes());
+    request.extend_from_slice(protocol.protocol().to_string().as_bytes());
     request.extend_from_slice(b" empty full");
     let enabled: Vec<_> = masters
         .iter()
@@ -850,7 +987,7 @@ fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String
         let addresses = if master.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
             master.to_socket_addrs()
         } else {
-            (master, MASTER_PORT).to_socket_addrs()
+            (master, protocol.master_port()).to_socket_addrs()
         };
         match addresses {
             Ok(addresses) => {
@@ -864,7 +1001,7 @@ fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String
     resolved.sort_unstable();
     resolved.dedup();
     if resolved.is_empty() {
-        return Err("No enabled Jedi Academy master server could be resolved".to_owned());
+        return Err("No enabled master server could be resolved".to_owned());
     }
 
     for address in &resolved {
@@ -895,7 +1032,7 @@ fn discover_master_servers(masters: &[String]) -> Result<Vec<SocketAddr>, String
 }
 
 fn query_info_batch(
-    events: &Sender<BrowserEvent>,
+    events: &ScopedEventSender<'_>,
     source: ServerSource,
     mut addresses: Vec<SocketAddr>,
 ) -> WorkerResult {
@@ -948,7 +1085,7 @@ fn query_info_batch(
                 let Ok(info) = parse_info_response(&buf[..len], &challenge) else {
                     continue;
                 };
-                if info.protocol != PROTOCOL_VERSION {
+                if info.protocol != events.protocol.protocol() {
                     continue;
                 }
                 responded_addresses.insert(from);
@@ -999,19 +1136,19 @@ fn fetch_status(address: SocketAddr) -> Result<ServerStatus, (Option<ServerSourc
     Err((None, format!("Server status timed out: {address}")))
 }
 
-fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerResult {
+fn query_status(events: &ScopedEventSender<'_>, address: SocketAddr) -> WorkerResult {
     let status = fetch_status(address)?;
     let _ = events.send(BrowserEvent::Status(status));
     Ok(())
 }
 
-fn get_server_info(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerResult {
+fn get_server_info(events: &ScopedEventSender<'_>, address: SocketAddr) -> WorkerResult {
     let status = fetch_status(address)?;
     let _ = events.send(BrowserEvent::ServerInfo(status));
     Ok(())
 }
 
-fn query_status_batch(events: &Sender<BrowserEvent>, mut addresses: Vec<SocketAddr>) -> WorkerResult {
+fn query_status_batch(events: &ScopedEventSender<'_>, mut addresses: Vec<SocketAddr>) -> WorkerResult {
     addresses.retain(SocketAddr::is_ipv4);
     addresses.sort_unstable();
     addresses.dedup();
@@ -1295,6 +1432,47 @@ pub fn save_address_list(path: &Path, addresses: &[SocketAddr]) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_tabs_use_their_own_wire_protocols_and_ports() {
+        assert_eq!(BrowserProtocol::Jka.protocol(), 26);
+        assert_eq!(BrowserProtocol::Jk2_102.protocol(), 15);
+        assert_eq!(BrowserProtocol::Jk2_104.protocol(), 16);
+        assert_eq!(BrowserProtocol::Jka.master_port(), 29060);
+        assert_eq!(BrowserProtocol::Jk2_102.master_port(), 28060);
+        assert_eq!(BrowserProtocol::Jk2_104.first_server_port(), 28070);
+        assert_eq!(BrowserProtocol::Jka.first_server_port(), 29070);
+    }
+
+    #[test]
+    fn jk2_browsers_are_isolated_from_jka_and_each_other() {
+        let dir = Path::new("nonexistent-browser-game-tab-test-path");
+        let mut jka = BrowserUiState::new(dir, DEFAULT_MASTER_CVARS.map(str::to_owned));
+        let mut jk2 = BrowserUiState::new_for_protocol(
+            dir, BrowserProtocol::Jk2_102.default_masters().map(str::to_owned),
+            BrowserProtocol::Jk2_102,
+        );
+        let jk2_104 = BrowserUiState::new_for_protocol(
+            dir, BrowserProtocol::Jk2_104.default_masters().map(str::to_owned),
+            BrowserProtocol::Jk2_104,
+        );
+        assert_eq!(jka.protocol, BrowserProtocol::Jka);
+        assert_eq!(jk2.protocol, BrowserProtocol::Jk2_102);
+        assert_eq!(jk2_104.protocol, BrowserProtocol::Jk2_104);
+        assert!(jka.mod_filter.contains("MBII"));
+        assert!(jk2.mod_filter.is_empty());
+        assert_ne!(jka.favorites_path, jk2.favorites_path);
+        assert_ne!(jk2.history_path, jk2_104.history_path);
+        assert_ne!(jka.master_servers, jk2.master_servers);
+        let address: SocketAddr = "127.0.0.1:28070".parse().unwrap();
+        jk2.handle_event(BrowserEvent::Server {
+            source: ServerSource::Internet,
+            server: ServerEntry { protocol: 15, ..ServerEntry::placeholder(address) },
+        });
+        assert_eq!(jk2.servers_for_current_source().len(), 1);
+        assert!(jka.servers_for_current_source().is_empty());
+        assert!(jk2_104.servers_for_current_source().is_empty());
+    }
 
     #[test]
     fn mod_filter_negative_and_positive_terms() {
