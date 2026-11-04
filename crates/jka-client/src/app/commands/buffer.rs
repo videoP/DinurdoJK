@@ -43,6 +43,22 @@ pub(in crate::app) fn normalize_cfg_qpath(name: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// `wait N` runs on the authored input-command clock during live play. In
+/// menus / demos, no usercmd clock exists, so retain a real-time fallback.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) enum ConsoleWait {
+    UserCmds(u32),
+    Realtime(crate::app::Instant),
+}
+
+impl ConsoleWait {
+    fn authored_usercmd(&mut self) {
+        if let Self::UserCmds(remaining) = self {
+            *remaining = remaining.saturating_sub(1);
+        }
+    }
+}
+
 pub(in crate::app) const MAX_CONSOLE_COMMAND_BUFFER_BYTES: usize = 128 * 1024;
 
 pub(in crate::app) const MAX_CONSOLE_COMMANDS_PER_FRAME: usize = 4096;
@@ -229,11 +245,13 @@ impl App {
             if self.perf_sample.is_some() || self.quit_requested {
                 break;
             }
-            if let Some(until) = self.console_wait_until {
-                if crate::app::Instant::now() < until {
-                    break;
-                }
-                self.console_wait_until = None;
+            match self.console_wait {
+                Some(ConsoleWait::UserCmds(remaining)) if remaining != 0
+                    && self.net.as_ref().is_some_and(|net|
+                        net.state() >= jka_protocol::session::ConnectionState::Primed) => break,
+                Some(ConsoleWait::Realtime(until)) if crate::app::Instant::now() < until => break,
+                Some(_) => self.console_wait = None,
+                None => {}
             }
             let Some(command) = self.console_command_buffer.pop_front() else {
                 break;
@@ -262,6 +280,23 @@ impl App {
             self.send_userinfo();
         }
         executed != 0
+    }
+
+    /// Advance a pending wait only when a movement command actually exists.
+    /// Rendering, prediction previews and send-packet retries are not frames.
+    pub(in crate::app) fn console_usercmd_authored(&mut self) {
+        if let Some(wait) = &mut self.console_wait {
+            wait.authored_usercmd();
+        }
+    }
+
+    /// For a catch-up tick with multiple authored commands, execute a resumed
+    /// script before sampling the *next* command. Otherwise +tap/wait/-tap
+    /// could all collapse into the same single input sample.
+    pub(in crate::app) fn resume_console_after_usercmd(&mut self) {
+        if matches!(self.console_wait, Some(ConsoleWait::UserCmds(0))) {
+            self.process_console_command_buffer();
+        }
     }
 
     pub(in crate::app) fn exec_cfg_file(&mut self, name: &str, quiet: bool) {
@@ -392,5 +427,35 @@ mod config_comment_tests {
         assert_eq!(split_console_script(compact), split_console_script(verbose));
         assert_eq!(split_console_script("// heading;ignored\necho ok; // skip\necho yes\n"),
             ["echo ok", "echo yes"]);
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::ConsoleWait;
+
+    #[test]
+    fn gameplay_wait_counts_authored_usercmds_not_render_ticks() {
+        // +moveup; wait 2; -moveup must generate two held commands even
+        // when the host produces multiple commands in one render frame.
+        let mut wait = ConsoleWait::UserCmds(2);
+        assert!(matches!(wait, ConsoleWait::UserCmds(2)));
+        // Any number of render ticks without an authored command is inert.
+        assert!(matches!(wait, ConsoleWait::UserCmds(2)));
+        wait.authored_usercmd();
+        assert!(matches!(wait, ConsoleWait::UserCmds(1)));
+        wait.authored_usercmd();
+        assert!(matches!(wait, ConsoleWait::UserCmds(0)));
+        // Never underflow if another usercmd is sampled before dispatch.
+        wait.authored_usercmd();
+        assert!(matches!(wait, ConsoleWait::UserCmds(0)));
+    }
+
+    #[test]
+    fn realtime_waits_do_not_advance_on_usercmds() {
+        let deadline = crate::app::Instant::now();
+        let mut wait = ConsoleWait::Realtime(deadline);
+        wait.authored_usercmd();
+        assert!(matches!(wait, ConsoleWait::Realtime(value) if value == deadline));
     }
 }

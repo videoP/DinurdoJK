@@ -1,4 +1,4 @@
-//! Scoreboard interaction: M3 while the board is up frees the mouse,
+//! Scoreboard interaction: +altattack while the board is up toggles the mouse,
 //! a click on a player opens a popup (follow, mute, vote kick, vote spectate), and
 //! the footer offers YES/NO while a vote is open. Hit testing uses the same
 //! Taffy layout the renderer draws (`ui::scoreboard_hit_test`).
@@ -85,6 +85,40 @@ impl App {
         self.publish_transient_ui();
     }
 
+    /// The scoreboard borrows alternate attack as a *toggle*, not a held
+    /// gameplay attack. Only a fresh +altattack press while the board is up
+    /// changes mouse mode; the matching -altattack has no scoreboard action.
+    pub(in crate::app) fn scoreboard_altattack_press(&mut self) -> bool {
+        if self.overlay != OverlayMode::None || self.front_end
+            || self.game_session.is_none() || !self.scoreboard_should_show()
+        {
+            return false;
+        }
+        if self.scoreboard_cursor.active {
+            self.close_scoreboard_cursor();
+        } else {
+            self.open_scoreboard_cursor();
+        }
+        true
+    }
+
+    /// While the mouse is free, normal captured-mouse binding dispatch is
+    /// disabled. Recognize only whichever mouse button the player actually
+    /// bound to +altattack, so it can also close scoreboard mouse mode.
+    fn scoreboard_altattack_mouse_button(&self, button: MouseButton) -> bool {
+        let number = match button {
+            MouseButton::Left => 1,
+            MouseButton::Right => 2,
+            MouseButton::Middle => 3,
+            MouseButton::Back => 4,
+            MouseButton::Forward => 5,
+            _ => return false,
+        };
+        self.bindings
+            .get_resolved(crate::app::BindKey::Mouse(number), self.spectator_binding_context())
+            .is_some_and(|binding| crate::app::keybinds::binding_contains_command(binding, "+altattack"))
+    }
+
     pub(in crate::app) fn close_scoreboard_cursor(&mut self) {
         if !self.scoreboard_cursor.active {
             return;
@@ -111,9 +145,13 @@ impl App {
             return false;
         }
         match event {
-            WindowEvent::MouseInput { state, button: MouseButton::Middle, .. } => {
+            WindowEvent::MouseInput { state, button, .. }
+                if active && self.scoreboard_altattack_mouse_button(*button) =>
+            {
+                // The released cursor bypasses normal gameplay mouse binds.
+                // Dispatch this *one* scoreboard command explicitly instead.
                 if *state == ElementState::Pressed {
-                    if active { self.close_scoreboard_cursor() } else { self.open_scoreboard_cursor() }
+                    self.scoreboard_altattack_press();
                 }
                 true
             }

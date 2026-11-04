@@ -240,18 +240,8 @@ struct Options {
 
 impl Options {
     fn parse() -> Result<Self, String> {
-        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        let directory = executable.parent().ok_or("Cannot locate executable")?;
-        let adjacent = directory.join("base");
-        let development = directory.parent().unwrap_or(directory).join("base");
         let mut options = Self {
-            base: if adjacent.is_dir() {
-                adjacent
-            } else if development.is_dir() {
-                development
-            } else {
-                adjacent
-            },
+            base: filesystem_paths::default_base_directory()?,
             source: scene::MapSource::Bsp("mp/ffa3".into()),
             launch_map: false,
             game: None,
@@ -469,6 +459,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     jka_assets::pk3::configure_filesystem_roots(&options.base, fs_roots.clone());
+    // Before anything creates DinurdoJK/cache or DinurdoJK/render-studio.
+    for line in jka_assets::pk3::migrate_legacy_dinurdojk_data(&options.base) {
+        println!("[DINURDOJK DATA] moved {line}");
+    }
 
     // A missing retail installation is not fatal (2D menu and tools still work).
     // Explain the fix once on startup instead of flooding the console with

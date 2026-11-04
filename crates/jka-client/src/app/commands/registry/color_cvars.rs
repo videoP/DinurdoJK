@@ -1038,6 +1038,66 @@ app_cvars! {
         ]
     }
 
+    APP_R_OVERBRIGHTBITS {
+        runtime: CvarDef::new("r_overBrightBits", "auto", "auto|0|1", "OpenJK output overbright: auto selects 1 on JK2 servers, 0 elsewhere. Requires next map load or vid_restart; windowed WGPU emulates the output gain.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
+            |app| CvarValue::String(App::cvar_get_r_overbrightbits(app)),
+            |app, value| App::cvar_set_r_overbrightbits(app, APP_R_OVERBRIGHTBITS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_overbrightbits, Some(|name, value| {
+                crate::app::overbright_value(value)
+                    .map(|bits| crate::app::overbright_text(bits).to_owned())
+                    .ok_or_else(|| format!("{name}: expected auto, 0, or 1"))
+            })),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(mode) = crate::app::overbright_value(value) { settings.overbright_bits = mode; }
+            }),
+            archive: Some((148, |state| crate::app::overbright_text(state.video.overbright_bits).to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_get_r_overbrightbits(&self) -> String {
+                crate::app::overbright_text(self.video.overbright_bits).to_owned()
+            }
+            fn cvar_set_r_overbrightbits(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let bits = crate::app::overbright_value(value)
+                    .ok_or_else(|| format!("{name}: expected auto, 0, or 1"))?;
+                self.video.overbright_bits = bits;
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_MAPOVERBRIGHTBITS {
+        runtime: CvarDef::new("r_mapOverBrightBits", "auto", "auto|0|1", "OpenJK map lightmap/vertex/lightgrid authoring range: auto selects 1 on JK2 servers, 0 elsewhere. Requires next map load or vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
+            |app| CvarValue::String(App::cvar_get_r_mapoverbrightbits(app)),
+            |app, value| App::cvar_set_r_mapoverbrightbits(app, APP_R_MAPOVERBRIGHTBITS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_mapoverbrightbits, Some(|name, value| {
+                crate::app::overbright_value(value)
+                    .map(|bits| crate::app::overbright_text(bits).to_owned())
+                    .ok_or_else(|| format!("{name}: expected auto, 0, or 1"))
+            })),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(mode) = crate::app::overbright_value(value) { settings.map_overbright_bits = mode; }
+            }),
+            archive: Some((149, |state| crate::app::overbright_text(state.video.map_overbright_bits).to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_get_r_mapoverbrightbits(&self) -> String {
+                crate::app::overbright_text(self.video.map_overbright_bits).to_owned()
+            }
+            fn cvar_set_r_mapoverbrightbits(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let bits = crate::app::overbright_value(value)
+                    .ok_or_else(|| format!("{name}: expected auto, 0, or 1"))?;
+                self.video.map_overbright_bits = bits;
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_GAMMAMETHOD {
         runtime: CvarDef::new("r_gammaMethod", "", "shader | baked | hardware | hardware_scene", "Brightness strategy: shader post, baked textures, Windows SDR display ramp, or hardware ramp with UI counter-compensation. Also accepts 0, 1, 2, 3.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_gammamethod(app)), |app, value| App::cvar_set_r_gammamethod(app, APP_R_GAMMAMETHOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_gammamethod, None),
         config: CvarBinding {

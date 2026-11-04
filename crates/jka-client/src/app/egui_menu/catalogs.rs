@@ -268,7 +268,9 @@ impl App {
                     self.ui_catalog.pending.profile = false;
                     self.apply_profile_catalog(result);
                 }
-                CatalogPayload::SoloMaps(result) => {
+                // A list for the previously picked game; its replacement is queued.
+                CatalogPayload::SoloMaps { jk2, .. } if jk2 != self.solo_catalog_for => {}
+                CatalogPayload::SoloMaps { maps: result, .. } => {
                     map_catalog_changed = true;
                     self.ui_catalog.pending.solo_maps = false;
                     match result {

@@ -65,8 +65,8 @@ impl Renderer {
         };
         let (width, height) = if active {
             (
-                self.config.width.max(1).div_ceil(scale_divisor),
-                self.config.height.max(1).div_ceil(scale_divisor),
+                self.targets.render_size.0.div_ceil(scale_divisor),
+                self.targets.render_size.1.div_ceil(scale_divisor),
             )
         } else {
             (1, 1)

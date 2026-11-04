@@ -22,13 +22,13 @@ impl App {
         self.updater.error = None;
         self.updater.downloading = true;
         self.updater.downloaded = 0;
-        self.updater.total = release.archive_size;
+        self.updater.total = 0; // stage() calculates changed-file bytes after local SHA-256 checks
         let proxy = self.proxy.clone();
         let spawned = std::thread::Builder::new().name("github-update-download".into()).spawn(move || {
             let mut last_report = 0;
             let result = crate::updater::stage(&release, |received, total| {
                 // Throttle event-loop messages, even for gigabyte-scale assets.
-                if received == total || received.saturating_sub(last_report) >= 1024 * 1024 {
+                if received == 0 || received == total || received.saturating_sub(last_report) >= 1024 * 1024 {
                     let _ = proxy.send_event(UserEvent::Update(Event::Progress { received, total }));
                     last_report = received;
                 }

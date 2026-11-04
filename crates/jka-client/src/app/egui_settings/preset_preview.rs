@@ -13,7 +13,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
     Some(match name {
         name if name.starts_with("r_glass") => Reset::Glass(crate::console::find(name)?.name),
         "r_maxFrameLatency" => Reset::Video(ui::VIDEO_ROW_MAX_FRAME_LATENCY),
-        "r_ext_multisample" | "r_fxaa" | "r_smaa" | "r_taa" =>
+        "r_dlss" | "r_ext_multisample" | "r_fxaa" | "r_smaa" | "r_taa" =>
             Reset::Video(ui::VIDEO_ROW_ANTI_ALIASING),
         "r_texturemode" | "r_ext_texture_filter_anisotropic" =>
             Reset::Video(ui::VIDEO_ROW_TEXTURE_FILTER),
@@ -85,7 +85,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
     use VideoSection as S;
     Some(match name {
         name if name.starts_with("r_glass") && row_for_preset_cvar(name).is_some() => S::Glass,
-        "r_maxFrameLatency" | "r_ext_multisample" | "r_fxaa" | "r_smaa" | "r_taa"
+        "r_maxFrameLatency" | "r_dlss" | "r_ext_multisample" | "r_fxaa" | "r_smaa" | "r_taa"
         | "r_texturemode" | "r_ext_texture_filter_anisotropic" | "r_detailTextures" => S::Display,
         "r_distanceCullScale" | "r_subdivisions" | "r_lodCurveError" | "r_patchStitching"
         | "r_lodScale" | "r_lodbias" => S::Geometry,
@@ -344,6 +344,7 @@ mod tests {
         assert_eq!(row_for_preset_cvar("r_clouds"), Some(theme::Reset::Environment(ui::ENV_ROW_CLOUDS)));
         assert_eq!(row_for_preset_cvar("r_reflectionQuality"), Some(theme::Reset::Video(ui::VIDEO_ROW_SSR)));
         assert_eq!(row_for_preset_cvar("r_fxaa"), row_for_preset_cvar("r_taa"));
+        assert_eq!(row_for_preset_cvar("r_dlss"), row_for_preset_cvar("r_ext_multisample"));
         assert_eq!(row_for_preset_cvar("r_worldPath"), None);
     }
 
@@ -359,6 +360,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(preset_cvar_section("r_dlss"), Some(VideoSection::Display));
         assert_eq!(preset_cvar_section("r_drawfog"), Some(VideoSection::Weather));
         assert_eq!(preset_cvar_section("r_clouds"), Some(VideoSection::Clouds));
         assert_eq!(preset_cvar_section("r_cloudShadows"), Some(VideoSection::Clouds));

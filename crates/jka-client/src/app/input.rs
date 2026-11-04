@@ -1,8 +1,36 @@
 //! Input.
 use crate::app::{
     keybinds, App, Arc, BindKey, CursorGrabMode, DemoViewMode, ElementState, FrontendPage, HashSet,
-    Instant, KeyCode, KeyEvent, MouseButton, OverlayMode, RenderCommand,
+    Duration, Instant, KeyCode, KeyEvent, MouseButton, OverlayMode, RenderCommand,
 };
+
+/// TaystJK samples mouse4/5 every other engine frame. That would run hundreds
+/// or thousands of times per second against DinurdoJK's uncapped renderer;
+/// approximate its normal 125 FPS cadence using a 16ms monotonic interval.
+const MOUSE_REPEAT_INTERVAL: Duration = Duration::from_millis(16);
+
+fn mouse_repeat_enabled(mode: u8, button: u8) -> bool {
+    match (mode, button) {
+        (1..=2, 4) | (1, 5) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod mouse_repeat_tests {
+    use super::mouse_repeat_enabled;
+
+    #[test]
+    fn matches_taystjk_mouse4_mouse5_modes() {
+        assert!(!mouse_repeat_enabled(0, 4));
+        assert!(!mouse_repeat_enabled(0, 5));
+        assert!(mouse_repeat_enabled(1, 4));
+        assert!(mouse_repeat_enabled(1, 5));
+        assert!(mouse_repeat_enabled(2, 4));
+        assert!(!mouse_repeat_enabled(2, 5));
+        assert!(!mouse_repeat_enabled(2, 1));
+    }
+}
 
 impl App {
     /// Connection/download dialogs are drawn even when the normal gameplay
@@ -22,6 +50,32 @@ impl App {
             })
     }
 
+    /// 2D input still owns the native pointer: keep it visible and confined to
+    /// our client area while this window has focus. On Alt+Tab, minimize, or
+    /// renderer restart, release the OS clip immediately. Studio free-look has
+    /// its own relative-mouse grab and must not be overwritten here.
+    pub(in crate::app) fn sync_visible_cursor_grab(&mut self) {
+        if self.captured || self.render_studio.navigation.looking {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let should_confine = self.window_focused
+            && !self.renderer_restart_suspended
+            && !super::lifecycle::headless()
+            && size.width > 0
+            && size.height > 0;
+        let confined = should_confine
+            && window.set_cursor_grab(CursorGrabMode::Confined).is_ok();
+        if !confined {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+        }
+        self.mouse_grab_mode = if confined { "ui-confined" } else { "none" };
+        window.set_cursor_visible(true);
+    }
+
     pub(in crate::app) fn set_capture(&mut self, captured: bool) {
         // A focus regain, left click, or set_overlay(None) must not re-lock the
         // cursor while a map/download modal is open over live gameplay.
@@ -39,15 +93,36 @@ impl App {
             self.noclip_alt_down = false;
         }
         if self.captured == captured {
-            // egui can update OS cursor visibility after the last capture call.
-            // Reassert it even when the logical state hasn't changed.
-            if let Some(window) = &self.window { window.set_cursor_visible(!captured); }
+            // A focus change or egui pass can alter the OS cursor state even
+            // when the gameplay-capture flag itself has not changed.
+            if captured {
+                if let Some(window) = &self.window { window.set_cursor_visible(false); }
+            } else {
+                self.sync_visible_cursor_grab();
+            }
             return;
         }
         let Some(window) = &self.window else {
             return;
         };
         if captured {
+            // On Windows a Locked grab starts at the current *screen* cursor
+            // position. After Alt+Tab (particularly to another monitor), that
+            // position can be outside our client rect and the subsequent click
+            // goes to the other monitor. Move inside BEFORE the grab, regardless
+            // of windowed / borderless / Vulkan exclusive fullscreen. Doing
+            // this at the capture transition also covers non-focus restore
+            // paths (menus, mouse re-entry, and display-mode transitions).
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                let center = crate::app::PhysicalPosition::new(
+                    (size.width / 2) as i32,
+                    (size.height / 2) as i32,
+                );
+                if let Err(error) = window.set_cursor_position(center) {
+                    eprintln!("Mouse capture: cursor recenter failed: {error}");
+                }
+            }
             let grab_mode = if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
                 Some("locked")
             } else if window.set_cursor_grab(CursorGrabMode::Confined).is_ok() {
@@ -68,12 +143,11 @@ impl App {
             } else {
                 self.captured = false;
                 self.mouse_grab_mode = "none";
+                self.sync_visible_cursor_grab();
             }
         } else {
-            let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
             self.captured = false;
-            self.mouse_grab_mode = "none";
+            self.sync_visible_cursor_grab();
         }
     }
 
@@ -106,6 +180,7 @@ impl App {
         let was_zoomed = self.live_buttons.contains("+zoom");
         self.keys.clear();
         self.mouse_buttons_down.clear();
+        self.mouse_repeat_next = [None; 2];
         self.demo_walk_pressed_at = None;
         self.demo_walk_used = false;
         self.demo_previous_held.clear();
@@ -289,6 +364,7 @@ impl App {
             self.keys.clear();
             self.movement_keys.clear();
             self.mouse_buttons_down.clear();
+            self.mouse_repeat_next = [None; 2];
             self.noclip_primary_down = false;
             self.noclip_alt_down = false;
             self.set_capture(false);
@@ -473,7 +549,7 @@ impl App {
         }
         if !self.scores_showing && was_scores_showing {
             // Letting go of the scores key closes the board, and with it the
-            // M2/M3 cursor, even while the cursor is up.
+            // +altattack mouse mode, even while the cursor is up.
             self.close_scoreboard_cursor();
         }
         if self.scores_showing && !was_scores_showing {
@@ -523,6 +599,13 @@ impl App {
                 self.execute_input_button_command(&format!("+altattack {redirect_source}"));
                 return true;
             }
+        }
+
+        // While viewing the scoreboard, +altattack toggles its free cursor
+        // instead of firing the weapon or changing demo POV. The -altattack
+        // release stays inert; this is a toggle, just like the old M3 mode.
+        if plus_verb == "+altattack" && is_down && self.scoreboard_altattack_press() {
+            return true;
         }
 
         // Demo mouse attack bindings are POV controls in this client. Keep the
@@ -763,6 +846,7 @@ impl App {
             self.keys.clear();
             self.movement_keys.clear();
             self.mouse_buttons_down.clear();
+            self.mouse_repeat_next = [None; 2];
             self.emote_radial_search.pinned = true;
             self.emote_radial_search.request_focus = true;
             self.emote_radial_search.selection = 0;
@@ -899,7 +983,25 @@ impl App {
         key: BindKey,
         source_key: BindKey,
     ) {
-        if self.handle_demo_override(key, true) { return; }
+        self.execute_binding_down_from(key, source_key, false);
+    }
+
+    /// OS autorepeat / held-mouse repeat. Plain commands execute again just as
+    /// in TaystJK; kbuttons keep their original down source until key-up.
+    pub(in crate::app) fn execute_binding_repeat_from(
+        &mut self,
+        key: BindKey,
+        source_key: BindKey,
+    ) {
+        self.execute_binding_down_from(key, source_key, true);
+    }
+
+    fn execute_binding_down_from(&mut self, key: BindKey, source_key: BindKey, repeat: bool) {
+        // Demo command overrides are application actions, not repeatable binds.
+        if repeat && self.demo_playback_active() && self.bindings.get_demo(key).is_some() {
+            return;
+        }
+        if !repeat && self.handle_demo_override(key, true) { return; }
         let spectator_context = self.spectator_binding_context();
         let Some(binding) = self
             .bindings
@@ -924,7 +1026,7 @@ impl App {
             }
             let verb = command.split_whitespace().next().unwrap_or("");
             if verb.starts_with('+') {
-                buffered.push(format!("{command} {source}"));
+                if !repeat { buffered.push(format!("{command} {source}")); }
             } else {
                 buffered.push(command.to_owned());
             }
@@ -933,6 +1035,38 @@ impl App {
         // +commands. That ordering is what makes `+speed; wait 2; +movedown`
         // activate crouch only after the wait has elapsed.
         self.append_console_commands(buffered);
+    }
+
+    /// Drive mouse4/5 repetition from elapsed real time, not renderer frames.
+    /// Only genuine held buttons that currently belong to gameplay may repeat.
+    /// Missed periods are deliberately not backfilled after a hitch.
+    pub(in crate::app) fn tick_mouse_repeat(&mut self) {
+        // Leave the hot loop almost immediately when no repeatable mouse
+        // button is held; even an enabled repeat mode should be negligible.
+        if self.in_mouserepeat == 0
+            || !(self.mouse_buttons_down.contains(&4) || self.mouse_buttons_down.contains(&5))
+            || !self.window_focused || self.front_end
+            || self.overlay != OverlayMode::None || self.connection_modal_active()
+            || !(self.captured || self.spectator_binding_context())
+        {
+            return;
+        }
+        let now = Instant::now();
+        let initial_interval = MOUSE_REPEAT_INTERVAL
+            + Duration::from_millis(u64::from(self.in_mouserepeat_delay));
+        for (index, button) in [(0, 4_u8), (1, 5_u8)] {
+            if !mouse_repeat_enabled(self.in_mouserepeat, button)
+                || !self.mouse_buttons_down.contains(&button)
+            {
+                self.mouse_repeat_next[index] = None;
+                continue;
+            }
+            let deadline = self.mouse_repeat_next[index].get_or_insert(now + initial_interval);
+            if now >= *deadline {
+                *deadline = now + MOUSE_REPEAT_INTERVAL;
+                self.execute_binding_repeat_from(BindKey::Mouse(button), BindKey::Mouse(button));
+            }
+        }
     }
 
     pub(in crate::app) fn execute_binding_release(&mut self, key: BindKey) {

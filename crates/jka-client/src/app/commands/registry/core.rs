@@ -200,10 +200,9 @@ commands! {
     }
 
     cmd_wait ["wait", ] ("wait [frames]", "Pause execution of the remaining command buffer for one or more cl_commandRate frames.", CommandScope::Always) |self, command| {
-        // Keep OpenJK/TaystJK Cmd_TokenizeString + atoi argument semantics, but
-        // use DinurdoJK's usercmd clock as the frame authority. Rendering is
-        // deliberately decoupled from movement here, so com_maxfps must not
-        // change the duration of gameplay-oriented wait scripts.
+        // OpenJK/TaystJK `wait N` advances by engine/client frames. In our
+        // decoupled client the equivalent gameplay frame is an *authored*
+        // usercmd, not a render frame or an approximate wall-clock interval.
         let args = jka_protocol::commands::tokenize(command.as_bytes());
         let frames = match args.as_slice() {
             [_verb, argument] => {
@@ -213,12 +212,20 @@ commands! {
             [_verb] | [_verb, _, ..] => 1,
             _ => return CommandResult::Unhandled,
         };
-        self.console_wait_until = if frames == 0 {
+        self.console_wait = if frames == 0 {
             None
+        } else if self.net.as_ref().is_some_and(|net|
+            net.state() >= jka_protocol::session::ConnectionState::Primed)
+        {
+            Some(crate::app::commands::buffer::ConsoleWait::UserCmds(frames))
         } else {
+            // No live usercmd producer (menu/demo/loading): don't strand
+            // config scripts on a movement clock that cannot advance.
             let rate = f64::from(self.network.command_rate.max(15));
-            Some(crate::app::Instant::now()
-                + crate::app::Duration::from_secs_f64(f64::from(frames) / rate))
+            Some(crate::app::commands::buffer::ConsoleWait::Realtime(
+                crate::app::Instant::now()
+                    + crate::app::Duration::from_secs_f64(f64::from(frames) / rate),
+            ))
         };
         CommandResult::Handled
     }
@@ -313,7 +320,8 @@ commands! {
         self.push_console_line(format!("^2FS:^7 basepath = {}", self.base.parent().unwrap_or(&self.base).display()));
         self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(portable)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 cdpath = {}", effective.cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
-        self.push_console_line(format!("^2FS:^7 jk2path = {} (separate JK2 root; not mounted in JKA)", effective.jk2path.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 jk2basepath = {} (local JK2 base; not mounted in JKA)", jka_assets::pk3::jk2_base_directory(&self.base, &effective).display()));
+        self.push_console_line(format!("^2FS:^7 jk2cdpath = {} (JK2 retail fallback; not mounted in JKA)", effective.jk2cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
         self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));
         for (i, dir) in jka_assets::pk3::filesystem_search_dirs(&self.base, self.game.as_deref(), &effective).iter().enumerate() {
@@ -523,11 +531,12 @@ commands! {
             return CommandResult::Handled;
         }
         let name = words[1];
-        let Some(entry) = crate::console::find(name) else {
+        let entry = crate::console::find(name);
+        if entry.is_none() && self.network.user_cvar(name).is_none() {
             self.push_console_error(format!("^1Cvar {name} does not exist."));
             return CommandResult::Handled;
-        };
-        if entry.kind != crate::console::EntryKind::Cvar {
+        }
+        if entry.is_some_and(|entry| entry.kind != crate::console::EntryKind::Cvar) {
             self.push_console_error(format!("^1{name} is not a cvar."));
             return CommandResult::Handled;
         }
@@ -536,17 +545,22 @@ commands! {
             return CommandResult::Handled;
         };
         let target = if words.len() == 2 {
-            let Some(values) = crate::console::declared_integer_options(entry) else {
-                self.push_console_line(format!(
-                        "^3toggle:^7 {name} has no declared discrete options; use `{name} !` for a logical 0/1 flip or pass explicit values"
-                    ));
-                return CommandResult::Handled;
-            };
-            values
-                .iter()
-                .position(|candidate| candidate == &current)
-                .map(|index| values[(index + 1) % values.len()].clone())
-                .unwrap_or_else(|| values[0].clone())
+            if let Some(entry) = entry {
+                let Some(values) = crate::console::declared_integer_options(entry) else {
+                    self.push_console_line(format!(
+                            "^3toggle:^7 {name} has no declared discrete options; use `{name} !` for a logical 0/1 flip or pass explicit values"
+                        ));
+                    return CommandResult::Handled;
+                };
+                values
+                    .iter()
+                    .position(|candidate| candidate == &current)
+                    .map(|index| values[(index + 1) % values.len()].clone())
+                    .unwrap_or_else(|| values[0].clone())
+            } else {
+                // TaystJK toggles unknown-but-created cvars numerically.
+                (if current.parse::<f64>().unwrap_or(0.0) == 0.0 { "1" } else { "0" }).to_owned()
+            }
         } else if words.len() == 3 {
             self.push_console_line("^3toggle:^7 nothing to toggle to".to_owned());
             return CommandResult::Handled;
@@ -556,7 +570,7 @@ commands! {
         match self.set_console_cvar_from_console(name, &target) {
             Ok(ConsoleCvarSetResult::Applied) => {}
             Ok(ConsoleCvarSetResult::Latched) => {
-                self.push_console_line(format!("^7{} will be changed upon restarting.", entry.name))
+                self.push_console_line(format!("^7{name} will be changed upon restarting."))
             }
             Ok(ConsoleCvarSetResult::Unchanged) => {}
             Err(error) => self.push_console_error(format!("^1{error}")),
@@ -564,25 +578,41 @@ commands! {
         return CommandResult::Handled;
     }
 
-    cmd_set ["set", "seta", "sets", "setu"] ("set <variable> <value>", "Set a client cvar; legacy flag forms are accepted.", CommandScope::Always) |self, command| {
-        // Cvar_Set_f family: `set <name> <value ...>` is `<name> <value>`.
-        let set_form = command
-            .split_once(char::is_whitespace)
-            .map(|(_, rest)| rest.trim().to_owned());
-        if let Some(rest) = set_form {
-            let Some((name, value)) = rest.split_once(char::is_whitespace) else {
-                self.push_console_line("^3usage:^7 set <variable> <value>");
-                return CommandResult::Handled;
-            };
-            let value = value.trim().trim_matches('"');
-            match self.set_console_cvar(name, value) {
-                Ok(()) => {}
-                Err(error) => self.push_console_error(format!("^1{error}")),
+    cmd_set ["set", "seta", "sets", "setu"] ("set[u|a|s] <variable> <value>", "Create or set a cvar; setu marks userinfo, seta archives, sets marks serverinfo (TaystJK behavior).", CommandScope::Always) |self, command| {
+        let (verb, rest) = command.split_once(char::is_whitespace)
+            .map(|(verb, rest)| (verb, rest.trim())).unwrap_or((command, ""));
+        let Some((name, value)) = rest.split_once(char::is_whitespace) else {
+            if !rest.is_empty() {
+                if let Some(value) = self.console_cvar_value(rest) {
+                    self.push_console_line(format!("^3{rest}^7 = \"{value}\""));
+                } else {
+                    self.push_console_error(format!("^1Cvar {rest} does not exist."));
+                }
+            } else {
+                self.push_console_line(format!("^3usage:^7 {verb} <variable> <value>"));
             }
             return CommandResult::Handled;
+        };
+        // `Cmd_ArgsFrom(2)` preserves a multi-word value. A surrounding
+        // quoted pair is a single value just as in TaystJK.
+        let value = value.trim().strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value.trim());
+        if crate::console::find(name).is_some() {
+            match self.set_console_cvar_from_console(name, value) {
+                Ok(ConsoleCvarSetResult::Latched) => self.push_console_line(format!(
+                    "^7{name} will be changed upon restarting.")),
+                Ok(_) => {},
+                Err(error) => self.push_console_error(format!("^1{error}")),
+            }
+        } else {
+            let flags = if verb.eq_ignore_ascii_case("seta") { crate::net::UserCvarFlags::ARCHIVE }
+                else if verb.eq_ignore_ascii_case("setu") { crate::net::UserCvarFlags::USERINFO }
+                else if verb.eq_ignore_ascii_case("sets") { crate::net::UserCvarFlags::SERVERINFO }
+                else { crate::net::UserCvarFlags::NONE };
+            if let Err(error) = self.set_user_created_cvar(name, value, flags) {
+                self.push_console_error(format!("^1{error}"));
+            }
         }
-
-        self.push_console_line("^3usage:^7 set <variable> <value>");
         CommandResult::Handled
     }
 

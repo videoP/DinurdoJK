@@ -78,6 +78,9 @@ impl Jk2PurePolicy {
         let disabled = pk3::disabled_package_paths();
         let mut packages = Vec::new();
         for dir in &directories {
+            // The DinurdoJK folder only holds the client's own packages, which a
+            // server never lists: skip checksumming them on every connect.
+            if pk3::is_package_only_dir(dir) { continue; }
             let entries = match fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -134,14 +137,17 @@ impl Jk2PurePolicy {
         })
     }
 
-    pub fn allows_package(&self, path: &Path) -> bool {
-        self.packages.iter().any(|p| p.path == path)
+    /// Local packages always mount, exactly as on JKA: JKA's sv_pure never
+    /// restricts what the client loads locally, it only decides what the client
+    /// reports. A package the server did not list (`packages`) is therefore
+    /// mounted but never reported; `reply` only reports listed packages.
+    pub fn allows_package(&self, _path: &Path) -> bool {
+        true
     }
 
-    pub fn allows_loose(&self, qpath: &str) -> bool {
-        let extension = qpath.rsplit('.').next().unwrap_or_default();
-        matches!(extension, "cfg" | "fcf" | "menu" | "game" | "dat")
-            || extension == if self.version == 2 { "dm_15" } else { "dm_16" }
+    /// Loose files are unrestricted for the same reason as [`Self::allows_package`].
+    pub fn allows_loose(&self, _qpath: &str) -> bool {
+        true
     }
 
     pub(crate) fn record_read(&self, path: &Path, qpath: &str) {
@@ -167,14 +173,17 @@ impl Jk2PurePolicy {
         {
             return Err("JK2 pure reply requires an asset view of the current policy".into());
         }
+        // Local packages the server did not list may shadow a qpath (they are
+        // mounted but invisible to the server), so the package to report is the
+        // highest-priority provider that the server *did* list.
         let provider = |qpath: &str| -> Result<&PurePak, String> {
-            let path = assets.indexed_provider_path(qpath, false).ok_or_else(|| {
-                format!("JK2 pure package missing for {qpath}; install the server's matching PK3")
-            })?;
-            self.packages
+            assets
+                .indexed_providers(qpath)
                 .iter()
-                .find(|p| p.path == path)
-                .ok_or_else(|| format!("JK2 pure forbids loose/unlisted provider for {qpath}"))
+                .find_map(|info| self.packages.iter().find(|p| info.archive && p.path == info.source))
+                .ok_or_else(|| {
+                    format!("JK2 pure package missing for {qpath}; install the server's matching PK3")
+                })
         };
         let cgame = provider("vm/cgame.qvm")?;
         let ui = provider("vm/ui.qvm")?;
@@ -239,7 +248,7 @@ pub struct PureReply {
 fn in_base(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
-        .is_some_and(|n| n.eq_ignore_ascii_case("base"))
+        .is_some_and(|n| n.eq_ignore_ascii_case("base") || n.eq_ignore_ascii_case(pk3::JK2_BASE_FOLDER))
 }
 fn retail(path: &Path) -> bool {
     in_base(path)
@@ -248,4 +257,24 @@ fn retail(path: &Path) -> bool {
                 .iter()
                 .any(|name| n.eq_ignore_ascii_case(name))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlisted_local_packages_mount_but_are_never_reported() {
+        let policy = Jk2PurePolicy {
+            version: 4,
+            feed: 0,
+            directories: Vec::new(),
+            server_checksums: Vec::new(),
+            packages: Vec::new(),
+            referenced: Mutex::new(HashSet::new()),
+        };
+        assert!(policy.allows_package(Path::new("/game/DinurdoJK/dinurdo-assets.pk3")));
+        assert!(policy.allows_package(Path::new("/game/jk2_base/custom.pk3")));
+        assert!(policy.allows_loose("textures/anything.jpg"));
+    }
 }

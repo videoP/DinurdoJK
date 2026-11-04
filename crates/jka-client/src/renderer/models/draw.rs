@@ -95,6 +95,7 @@ impl DynamicModelRenderer {
         if sprites.instances.is_empty() {
             return true;
         }
+        self.fx_rope_present |= sprites.rope;
         let instances = sprites.instances.as_slice();
         let first_instance = u32::try_from(fx_sprite_instances.len()).unwrap_or(u32::MAX);
         fx_sprite_instances.extend_from_slice(instances);
@@ -107,6 +108,7 @@ impl DynamicModelRenderer {
             wireframe_class: surface.wireframe_class,
             authored_glow: surface.authored_glow,
             lightning: sprites.lightning,
+            rope: sprites.rope,
         });
         return true;
     }
@@ -147,7 +149,12 @@ impl DynamicModelRenderer {
                     .iter()
                     .any(|draw| draw.alpha_mode == alpha_mode)
                 {
-                    self.ensure_fx_sprite_pipeline(jobs, device, alpha_mode);
+                    if self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == alpha_mode && !draw.rope) {
+                        self.ensure_fx_sprite_pipeline(jobs, device, alpha_mode);
+                    }
+                    if self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == alpha_mode && draw.rope) {
+                        self.ensure_fx_rope_pipeline(jobs, device);
+                    }
                     if prepare_authored_glow
                         && self
                             .fx_sprite_draws
@@ -213,6 +220,7 @@ impl DynamicModelRenderer {
         }
         self.draws.clear();
         self.fx_sprite_draws.clear();
+        self.fx_rope_present = false;
         self.resident_fx_draws.clear();
         self.resident_fx_slots.clear();
         self.resident_fx_frame = None;
@@ -749,6 +757,7 @@ impl DynamicModelRenderer {
         if !draw_bytes.is_empty() {
             crate::renderer::igpu_ab_model_upload(queue, &self.skin_draw_buffer, draw_bytes, self.igpu_ab_mode);
         }
+        self.update_object_motion(device, queue, &gpu_draw_data, &bones);
 
         self.scratch_vertices = vertices;
         self.scratch_indices = indices;
@@ -977,38 +986,74 @@ impl DynamicModelRenderer {
                         })
                     })
                 {
-                    let pipeline = if authored_glow_only {
-                        self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
-                    } else {
-                        self.fx_sprite_pipeline(alpha_mode)
-                    };
-                    let Some(pipeline) = pipeline else {
-                        // Runtime-lazy PSO still compiling; skip this FX variant for
-                        // the handful of frames needed to finish rather than hitch.
-                        continue;
-                    };
-                    if capture_calls { calls.set_pipeline += 1; }
-                    pass.set_pipeline(pipeline);
-                    let mut current_texture = None;
-                    for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
-                        draw.alpha_mode == alpha_mode
-                            && Some(draw.entity_num) != excluded_entity
-                            && (!authored_glow_only || draw.authored_glow)
-                    }), self.dynamic_batch_draws) {
-                        let bind_group = draw
-                            .texture_key
-                            .as_ref()
-                            .and_then(|key| self.textures.get(key))
-                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                        if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
-                            || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
-                        {
-                            if capture_calls { calls.set_bind_group += 1; }
-                            pass.set_bind_group(1, bind_group, &[]);
-                            current_texture = Some(bind_group);
+                    if !self.fx_rope_present {
+                        let pipeline = if authored_glow_only {
+                            self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
+                        } else {
+                            self.fx_sprite_pipeline(alpha_mode)
+                        };
+                        if let Some(pipeline) = pipeline {
+                            if capture_calls { calls.set_pipeline += 1; }
+                            pass.set_pipeline(pipeline);
+                            let mut current_texture = None;
+                            for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
+                                draw.alpha_mode == alpha_mode
+                                    && Some(draw.entity_num) != excluded_entity
+                                    && (!authored_glow_only || draw.authored_glow)
+                            }), self.dynamic_batch_draws) {
+                                let bind_group = draw.texture_key.as_ref()
+                                    .and_then(|key| self.textures.get(key))
+                                    .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                                if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
+                                    || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                                {
+                                    if capture_calls { calls.set_bind_group += 1; }
+                                    pass.set_bind_group(1, bind_group, &[]);
+                                    current_texture = Some(bind_group);
+                                }
+                                if capture_calls { calls.fx_draw += 1; }
+                                pass.draw(0..if draw.lightning { 144 } else { 6 }, instances);
+                            }
                         }
-                        if capture_calls { calls.fx_draw += 1; }
-                        pass.draw(0..if draw.lightning { 144 } else { 6 }, instances);
+                    } else {
+                        let mut current_pipeline_rope = None;
+                        let mut current_texture = None;
+                        for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
+                            draw.alpha_mode == alpha_mode
+                                && Some(draw.entity_num) != excluded_entity
+                                && (!authored_glow_only || draw.authored_glow)
+                        }), self.dynamic_batch_draws) {
+                            if current_pipeline_rope != Some(draw.rope) {
+                                let pipeline = if draw.rope {
+                                    self.fx_rope_pipeline.as_ref()
+                                } else if authored_glow_only {
+                                    self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
+                                } else {
+                                    self.fx_sprite_pipeline(alpha_mode)
+                                };
+                                // Shader/PSO work is queued in the background only
+                                // when there is a live rope to draw.
+                                let Some(pipeline) = pipeline else { continue; };
+                                if capture_calls { calls.set_pipeline += 1; }
+                                pass.set_pipeline(pipeline);
+                                current_pipeline_rope = Some(draw.rope);
+                                current_texture = None;
+                            }
+                            let bind_group = draw
+                                .texture_key
+                                .as_ref()
+                                .and_then(|key| self.textures.get(key))
+                                .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                            if !(self.model_state_cache || self.igpu_ab_mode & 2 != 0)
+                                || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                            {
+                                if capture_calls { calls.set_bind_group += 1; }
+                                pass.set_bind_group(1, bind_group, &[]);
+                                current_texture = Some(bind_group);
+                            }
+                            if capture_calls { calls.fx_draw += 1; }
+                            pass.draw(0..if draw.lightning || draw.rope { 144 } else { 6 }, instances);
+                        }
                     }
                 }
                 if let Some(profiler) = gpu_profiler.as_deref_mut() {
@@ -1256,7 +1301,7 @@ impl DynamicModelRenderer {
             for draw in self
                 .fx_sprite_draws
                 .iter()
-                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0)
+                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0 && !draw.rope)
             {
                 if !bound {
                     pass.set_pipeline(pipeline);
@@ -1266,9 +1311,26 @@ impl DynamicModelRenderer {
                     bound = true;
                 }
                 pass.draw(
-                    0..if draw.lightning { 144 } else { 6 },
+                    0..if draw.lightning || draw.rope { 144 } else { 6 },
                     draw.first_instance..draw.first_instance.saturating_add(draw.instance_count),
                 );
+            }
+        }
+
+        if let Some(pipeline) = &self.fx_rope_wireframe_pipeline {
+            let mut bound = false;
+            for draw in self.fx_sprite_draws.iter()
+                .filter(|draw| draw.rope && mask & draw.wireframe_class.mask_bit() != 0)
+            {
+                if !bound {
+                    pass.set_pipeline(pipeline);
+                    pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+                    pass.set_bind_group(0, camera, &[]);
+                    pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                    bound = true;
+                }
+                pass.draw(0..144,
+                    draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
             }
         }
 
@@ -1309,6 +1371,21 @@ impl DynamicModelRenderer {
         pass: &mut wgpu::RenderPass<'a>,
         camera: &'a wgpu::BindGroup,
     ) {
+        // DLSS: entities write their own motion vectors instead of keeping
+        // the world's (models/motion.rs).
+        let motion = self.object_motion.then(|| {
+            self.motion.pipelines.as_ref().zip(self.motion.skin_bind_group())
+        }).flatten();
+        if let Some((pipelines, skin_motion)) = motion {
+            self.draw_depth_only_impl(
+                pass,
+                camera,
+                [(&pipelines.md3, &pipelines.skin), (&pipelines.md3_mask, &pipelines.skin_mask)],
+                None,
+                Some(skin_motion),
+            );
+            return;
+        }
         self.draw_depth_only(
             pass,
             camera,
@@ -1382,6 +1459,16 @@ impl DynamicModelRenderer {
         pipelines: [(&'a wgpu::RenderPipeline, &'a wgpu::RenderPipeline); 2],
         entities: Option<&std::collections::HashSet<u16>>,
     ) {
+        self.draw_depth_only_impl(pass, camera, pipelines, entities, None);
+    }
+
+    /// `skin_motion`: group 3 of the DLSS Ghoul2 motion prepass pipelines.
+    fn draw_depth_only_impl<'a>(
+        &'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup,
+        pipelines: [(&'a wgpu::RenderPipeline, &'a wgpu::RenderPipeline); 2],
+        entities: Option<&std::collections::HashSet<u16>>,
+        skin_motion: Option<&'a wgpu::BindGroup>,
+    ) {
         let prepass_modes = [
             (
                 DynamicModelAlphaMode::Opaque,
@@ -1440,6 +1527,9 @@ impl DynamicModelRenderer {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(1, &self.fallback_bind_group, &[]);
                         pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                        if let Some(group) = skin_motion {
+                            pass.set_bind_group(3, group, &[]);
+                        }
                         bound = true;
                     }
                     if alpha_mode == DynamicModelAlphaMode::Mask {

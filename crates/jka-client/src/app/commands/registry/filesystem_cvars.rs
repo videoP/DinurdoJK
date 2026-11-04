@@ -30,14 +30,25 @@ app_cvars! {
         config: CvarBinding::NONE,
         implementations: []
     }
-    APP_FS_JK2PATH {
+    APP_FS_JK2BASEPATH {
         runtime: CvarDef::new(
-            "fs_jk2path", "", "path to JK2 GameData",
-            "Separate read-only JK2 asset root containing base/. Saved for JK2 support; never mounted in JKA. Restart required.",
+            "fs_jk2basepath", "", "local JK2 base directory",
+            "JK2's independent base directory, default GameData/jk2_base (JK2 mods are jk2_<mod> folders beside it). Overrides fs_jk2cdpath/base; never mounted in JKA. Restart required. Empty restores default.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |app| CvarValue::String(app.fs_roots.jk2path.as_ref().map_or(String::new(), |p| p.display().to_string())),
-            |app, value| App::set_fs_jk2path(app, &value.to_string())
-        ).with_text_setter(|app, _, value| App::set_fs_jk2path(app, value), None),
+            |app| CvarValue::String(jka_assets::pk3::jk2_base_directory(&app.base, &app.fs_roots).display().to_string()),
+            |app, value| App::set_fs_jk2basepath(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_jk2basepath(app, value), None),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_FS_JK2CDPATH {
+        runtime: CvarDef::new(
+            "fs_jk2cdpath", "", "path to JK2 GameData",
+            "Optional lowest-priority read-only JK2 retail GameData root containing base/. Local fs_jk2basepath takes precedence. Never mounted in JKA. Restart required.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.fs_roots.jk2cdpath.as_ref().map_or(String::new(), |p| p.display().to_string())),
+            |app, value| App::set_fs_jk2cdpath(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_jk2cdpath(app, value), None),
         config: CvarBinding::NONE,
         implementations: []
     }
@@ -89,13 +100,22 @@ impl App {
         self.store_fs_roots(proposed)
     }
 
-    fn set_fs_jk2path(&mut self, value: &str) -> Result<(), String> {
+    fn set_fs_jk2basepath(&mut self, value: &str) -> Result<(), String> {
         let mut proposed = self.fs_roots.clone();
-        proposed.jk2path = crate::filesystem_paths::parse_root(&self.base, value)?;
-        let changed = proposed.jk2path != self.fs_roots.jk2path;
+        proposed.jk2basepath = crate::filesystem_paths::parse_root(&self.base, value)?;
+        let changed = proposed.jk2basepath != self.fs_roots.jk2basepath;
+        self.store_fs_roots(proposed)?;
+        if changed { self.jk2_demo_browser.reset(); }
+        Ok(())
+    }
+
+    fn set_fs_jk2cdpath(&mut self, value: &str) -> Result<(), String> {
+        let mut proposed = self.fs_roots.clone();
+        proposed.jk2cdpath = crate::filesystem_paths::parse_root(&self.base, value)?;
+        let changed = proposed.jk2cdpath != self.fs_roots.jk2cdpath;
         self.store_fs_roots(proposed)?;
         // The Play -> Demo JK2 catalog must never keep the old install's
-        // recordings after fs_jk2path is changed in the console.
+        // recordings after fs_jk2cdpath is changed in the console.
         if changed { self.jk2_demo_browser.reset(); }
         Ok(())
     }

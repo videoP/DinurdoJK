@@ -508,6 +508,7 @@ mod armor_shield_event_tests {
         // eventParm 58. EntityPresenter owns the world-space MD3 shell.
         let event = PresentationEvent {
             receive_sequence: 13,
+            predicted_fire_command_time: None,
             source_entity_num: 49,
             entity_num: 49,
             event: EntityEvent::EV_SHIELD_HIT,

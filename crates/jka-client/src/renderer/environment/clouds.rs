@@ -52,8 +52,8 @@ impl Renderer {
         if !(self.clouds_enabled || self.thermal_vision != 0) || self.cloud_foreground.is_empty() {
             return (packed, 0.0);
         }
-        let width = self.config.width.max(1) as f32;
-        let height = self.config.height.max(1) as f32;
+        let width = self.targets.render_size.0 as f32;
+        let height = self.targets.render_size.1 as f32;
         // Rows of a perspective view-projection scale view space by the focal
         // length, so the y row's length is the vertical focal factor.
         let focal_y = view_proj.row(1).truncate().length();

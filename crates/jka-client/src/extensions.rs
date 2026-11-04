@@ -21,8 +21,12 @@ use jka_protocol::entity_event::EntityEvent;
 use serde::{Deserialize, Serialize};
 
 const MAX_EXTENSIONS: usize = 64;
+/// Maximum number of distinct JKA weapons in an extension-defined scroll order.
+const MAX_WEAPON_CYCLE: usize = 16;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+const MAX_HUD_USER_SHADERS: usize = 16;
+const MAX_HUD_SHADER_BYTES: usize = 32 * 1024;
 const SCAN_INTERVAL: Duration = Duration::from_millis(500);
 const API_VERSION: u32 = 1;
 const UPDATE_INTERVAL: Duration = Duration::from_millis(16); // <= ~62 Hz script tick
@@ -43,6 +47,8 @@ pub struct GameStateSnapshot {
     pub is_demo: bool,
     /// Framebuffer size HUD widgets are drawn into, in pixels.
     pub screen_size: [u32; 2],
+    /// Local pending JKA weapon selection; absent in demos and when following.
+    pub selected_weapon: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,9 +178,29 @@ fn player_map(ps: &PlayerState) -> Map {
         map.insert(name.into(), vec3(v));
     }
     map.insert("client_num".into(), Dynamic::from_int(i64::from(ps.field_i32("clientNum").unwrap_or(-1))));
-    map.insert("weapon".into(), Dynamic::from_int(i64::from(ps.field_i32("weapon").unwrap_or(0))));
-    map.insert("pm_type".into(), Dynamic::from_int(i64::from(ps.field_i32("pm_type").unwrap_or(0))));
+    map.insert("weapon".into(), Dynamic::from_int(i64::from(weapon)));
+    map.insert("weapon_selected".into(), Dynamic::from_int(i64::from(weapon)));
+    map.insert("weapon_owned_bits".into(), Dynamic::from_int(i64::from(ps.stats[4])));
+    // Use the *same* ammo/ownership criteria as LiveInput weapon selection.
+    let selectable_bits = (1..=MAX_WEAPON_CYCLE as i32)
+        .filter(|&wp| crate::net::LiveInput::selectable(ps, wp))
+        .fold(0_i64, |mask, wp| mask | (1_i64 << wp));
+    map.insert("weapon_selectable_bits".into(), Dynamic::from_int(selectable_bits));
+    let pm_type = ps.field_i32("pm_type").unwrap_or(0);
+    let pm_flags = ps.field_i32("pm_flags").unwrap_or(0);
+    map.insert("pm_type".into(), Dynamic::from_int(i64::from(pm_type)));
+    // PM_SPECTATOR=4, PMF_FOLLOW=4096 (OpenJK). Follow spectators see a player's HUD.
+    map.insert("is_free_spectator".into(), Dynamic::from_bool(pm_type == 4 && pm_flags & 4096 == 0));
     map.insert("duel_time".into(), Dynamic::from_int(i64::from(ps.field_i32("duelTime").unwrap_or(0))));
+    map
+}
+
+/// Keep the network/equipped ps.weapon separate from the immediate local selection.
+fn player_map_selected(ps: &PlayerState, selected: Option<u8>) -> Map {
+    let mut map = player_map(ps);
+    if let Some(selected) = selected {
+        map.insert("weapon_selected".into(), Dynamic::from_int(i64::from(selected)));
+    }
     map
 }
 
@@ -211,7 +237,7 @@ fn event_map(event: &GameEvent) -> Map {
 
 // Immutable presentation commands. Never expose UiVertex, wgpu or native pointers to Rhai.
 const MAX_HUD_WIDGETS: usize = 16;
-const MAX_HUD_COMMANDS: usize = 256;
+pub const MAX_HUD_COMMANDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudCommand {
@@ -221,6 +247,14 @@ pub enum HudCommand {
     Circle { x: f32, y: f32, radius: f32, color: [f32; 4] },
     /// A game image (`gfx/...`) stretched over the rect and tinted by `color`.
     Image { name: String, x: f32, y: f32, w: f32, h: f32, color: [f32; 4] },
+    /// A source subrectangle in original image pixels, using the ordinary UI
+    /// image atlas. Negative destination sizes may mirror the sprite.
+    ImageRegion { name: String, x: f32, y: f32, w: f32, h: f32,
+        source: [f32; 4], color: [f32; 4] },
+    /// The shader source lives inside this extension's shaders/ directory.
+    /// The renderer runs the WGSL every present; Rhai provides only parameters.
+    ShaderImage { name: String, shader: String, x: f32, y: f32, w: f32, h: f32,
+        color: [f32; 4], params: [f32; 4] },
 }
 
 /// Screen corner a widget's placement offset is measured from.
@@ -249,7 +283,10 @@ impl HudAnchor {
 }
 
 /// Distinct game images one frame of widgets may reference (atlas capacity).
-pub const MAX_HUD_IMAGES: usize = 32;
+/// Rhai extensions retain their original 32-image budget; the shared UI atlas
+/// additionally accommodates the 31 built-in stock HUD pictures and Siege art.
+pub const MAX_EXTENSION_HUD_IMAGES: usize = 32;
+pub const MAX_HUD_IMAGES: usize = 64;
 
 /// Plain HUD art names and authored `fx/hud/` materials only: no file
 /// extensions, traversal or arbitrary filesystem path access.
@@ -261,13 +298,13 @@ fn valid_hud_image(name: &str) -> bool {
 }
 
 /// Give every wanted image an atlas slot. Slots only ever grow (first come, first
-/// served, capped at `MAX_HUD_IMAGES`), so an image that leaves the screen for a
+/// served, capped at `MAX_EXTENSION_HUD_IMAGES`), so an image that leaves the screen for a
 /// frame keeps its cell and the renderer never has to rebuild the atlas from the
 /// game files mid-play. Returns true when a slot was added.
 fn assign_image_slots<'a>(slots: &mut Vec<String>, wanted: impl IntoIterator<Item = &'a str>) -> bool {
     let before = slots.len();
     for name in wanted {
-        if slots.len() >= MAX_HUD_IMAGES { break; }
+        if slots.len() >= MAX_EXTENSION_HUD_IMAGES { break; }
         if !slots.iter().any(|slot| slot == name) { slots.push(name.to_owned()); }
     }
     slots.len() != before
@@ -392,6 +429,27 @@ struct HudScriptState {
     widgets: BTreeMap<String, HudWidget>,
     /// Images the script will draw, declared up front by `hud_preload`.
     preload: BTreeSet<String>,
+    /// Validated fixed order for weapnext/weapprev, authored by this extension.
+    weapon_cycle: Vec<u8>,
+    shader_paths: BTreeMap<String, String>,
+    shader_sources: BTreeMap<String, String>,
+}
+
+/// Reject invalid, duplicated or out-of-range weapon IDs at the script boundary.
+/// An empty array explicitly disables the extension's override.
+fn weapon_cycle_order(values: rhai::Array) -> Option<Vec<u8>> {
+    if values.len() > MAX_WEAPON_CYCLE { return None; }
+    let mut seen = 0_u32;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let Ok(weapon) = value.as_int() else { return None; };
+        if !(1..=MAX_WEAPON_CYCLE as i64).contains(&weapon) { return None; }
+        let bit = 1_u32 << weapon;
+        if seen & bit != 0 { return None; }
+        seen |= bit;
+        out.push(weapon as u8);
+    }
+    Some(out)
 }
 
 fn bounded_color(values: rhai::Array) -> Option<[f32; 4]> {
@@ -404,6 +462,24 @@ fn bounded_color(values: rhai::Array) -> Option<[f32; 4]> {
         color[i] = value.clamp(0.0, 1.0) as f32;
     }
     Some(color)
+}
+
+fn shader_params(values: rhai::Array) -> Option<[f32; 4]> {
+    if values.len() != 4 { return None; }
+    let mut out = [0.0_f32; 4];
+    for (i, value) in values.into_iter().enumerate() {
+        let f = if let Ok(f) = value.as_float() { f }
+            else if let Ok(n) = value.as_int() { n as f64 } else { return None };
+        if !f.is_finite() || f.abs() > 64.0 { return None; }
+        out[i] = f as f32;
+    }
+    Some(out)
+}
+
+fn valid_shader_asset(path: &str) -> bool {
+    path.len() <= 80 && path.starts_with("shaders/") && path.ends_with(".wgsl")
+        && !path.contains("..") && !path.contains("//")
+        && path.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'/' | b'_' | b'-' | b'.'))
 }
 
 fn hud_number(value: rhai::FLOAT) -> Option<f32> {
@@ -460,7 +536,8 @@ enum Response {
     Snapshot(Vec<ExtensionInfo>),
     Saved(String),
     Diagnostic(String),
-    Hud(Vec<HudWidget>, NativeHudMask, Vec<String>),
+    /// HUD + validated weapon cycle order, both sent by the extension worker.
+    Hud(Vec<HudWidget>, NativeHudMask, Vec<String>, Vec<u8>, Vec<(String, String)>),
 }
 
 /// Owned by App on the main thread; neither the engine nor AST crosses this boundary.
@@ -478,6 +555,10 @@ pub struct Manager {
     pub new_id: String,
     pub diagnostic: String,
     pub hud_widgets: Vec<HudWidget>,
+    /// Cached on the main thread. Wheel input never runs Rhai or locks a worker.
+    pub weapon_cycle: Vec<u8>,
+    /// Fully qualified shader ID -> validated WGSL body. Loaded only on activation.
+    pub hud_shaders: Vec<(String, String)>,
     /// Union of every running extension's `hides_native_hud`.
     pub native_hidden: NativeHudMask,
     /// Atlas slot per extension image (grow-only while any extension is loaded).
@@ -510,6 +591,8 @@ impl Manager {
             new_id: String::new(),
             diagnostic: String::new(),
             hud_widgets: Vec::new(),
+            weapon_cycle: Vec::new(),
+            hud_shaders: Vec::new(),
             native_hidden: NativeHudMask::default(),
             hud_images: Vec::new(),
             hud_preload: Vec::new(),
@@ -562,7 +645,12 @@ impl Manager {
                 Response::Saved(id) => {
                     if self.selected.as_deref() == Some(&id) { self.editor_dirty = false; }
                 }
-                Response::Hud(widgets, hidden, preload) => {
+                Response::Hud(widgets, hidden, preload, cycle, shaders) => {
+                    self.weapon_cycle = cycle;
+                    if self.hud_shaders != shaders {
+                        self.hud_shaders = shaders;
+                        hud_changed = true;
+                    }
                     if self.hud_widgets != widgets || self.native_hidden != hidden {
                         self.hud_widgets = widgets;
                         self.native_hidden = hidden;
@@ -587,7 +675,11 @@ impl Manager {
             return !std::mem::take(&mut self.hud_images).is_empty();
         }
         let drawn = self.hud_widgets.iter().flat_map(|w| w.commands.iter())
-            .filter_map(|c| match c { HudCommand::Image { name, .. } => Some(name.as_str()), _ => None });
+            .filter_map(|c| match c {
+                HudCommand::Image { name, .. } | HudCommand::ImageRegion { name, .. }
+                    | HudCommand::ShaderImage { name, .. } => Some(name.as_str()),
+                _ => None,
+            });
         let wanted = self.hud_preload.iter().map(String::as_str).chain(drawn);
         assign_image_slots(&mut self.hud_images, wanted)
     }
@@ -726,19 +818,35 @@ struct Worker {
     last_hud: Vec<HudWidget>,
     last_hidden: NativeHudMask,
     last_preload: Vec<String>,
+    last_cycle: Vec<u8>,
+    last_shaders: Vec<(String, String)>,
 }
 
 impl Worker {
     fn new(base: PathBuf, game: Option<PathBuf>, response: Sender<Response>) -> Self {
         Self {
             root: base.join("extensions"), base, game, response, slots: BTreeMap::new(), revision: 0, force_reload: BTreeSet::new(),
-            last_hud: Vec::new(), last_hidden: NativeHudMask::default(), last_preload: Vec::new(),
+            last_hud: Vec::new(), last_hidden: NativeHudMask::default(), last_preload: Vec::new(), last_cycle: Vec::new(), last_shaders: Vec::new(),
         }
     }
 
     fn native_hidden(&self) -> NativeHudMask {
         self.slots.values().filter_map(|slot| slot.active.as_ref())
             .fold(NativeHudMask::default(), |mask, active| mask.union(active.effective_hides()))
+    }
+
+    /// Only one enabled and healthy extension may own weapon scroll. Ambiguous
+    /// overrides fall back to native ordering rather than depending on load order.
+    fn active_weapon_cycle(&self) -> Vec<u8> {
+        let mut chosen = None;
+        for active in self.slots.values().filter_map(|slot| slot.active.as_ref()) {
+            if active.failed_hooks.contains("on_update") { continue; }
+            let hud = active.hud.lock().unwrap_or_else(|e| e.into_inner());
+            if hud.weapon_cycle.is_empty() { continue; }
+            if chosen.is_some() { return Vec::new(); }
+            chosen = Some(hud.weapon_cycle.clone());
+        }
+        chosen.unwrap_or_default()
     }
 
     fn run(mut self, rx: Receiver<Command>, frames: Receiver<BridgeFrame>) {
@@ -966,7 +1074,8 @@ impl Worker {
             }
         }
         // A hook failure releases its native elements, so re-check the mask too.
-        if hud_changed || self.native_hidden() != self.last_hidden { self.send_hud(); }
+        if hud_changed || self.native_hidden() != self.last_hidden
+            || self.active_weapon_cycle() != self.last_cycle { self.send_hud(); }
     }
 
     fn send_hud(&mut self) {
@@ -975,6 +1084,13 @@ impl Worker {
                 let hud = active.hud.lock().unwrap_or_else(|e| e.into_inner());
                 hud.widgets.values().cloned().map(|mut widget| {
                     widget.key = format!("{id}/{}", widget.key);
+                    // Shader IDs are scoped to the extension; one package cannot
+                    // accidentally use another package's shader or parameters.
+                    for command in &mut widget.commands {
+                        if let HudCommand::ShaderImage { shader, .. } = command {
+                            *shader = format!("{id}/{shader}");
+                        }
+                    }
                     widget
                 }).collect::<Vec<_>>()
             })
@@ -982,12 +1098,23 @@ impl Worker {
         let hidden = self.native_hidden();
         let preload: Vec<String> = self.slots.values().filter_map(|slot| slot.active.as_ref())
             .flat_map(|active| active.hud.lock().unwrap_or_else(|e| e.into_inner()).preload.iter().cloned().collect::<Vec<_>>())
-            .collect::<BTreeSet<_>>().into_iter().take(MAX_HUD_IMAGES).collect();
-        if widgets != self.last_hud || hidden != self.last_hidden || preload != self.last_preload {
+            .collect::<BTreeSet<_>>().into_iter().take(MAX_EXTENSION_HUD_IMAGES).collect();
+        let cycle = self.active_weapon_cycle();
+        let shaders: Vec<(String, String)> = self.slots.iter()
+            .filter_map(|(id, slot)| slot.active.as_ref().map(|active| (id, active)))
+            .flat_map(|(id, active)| {
+                let state = active.hud.lock().unwrap_or_else(|e| e.into_inner());
+                state.shader_sources.iter().map(|(name, source)|
+                    (format!("{id}/{name}"), source.clone())).collect::<Vec<_>>()
+            }).take(MAX_HUD_USER_SHADERS).collect();
+        if widgets != self.last_hud || hidden != self.last_hidden
+            || preload != self.last_preload || cycle != self.last_cycle || shaders != self.last_shaders {
             self.last_hud = widgets.clone();
             self.last_hidden = hidden;
             self.last_preload = preload.clone();
-            let _ = self.response.send(Response::Hud(widgets, hidden, preload));
+            self.last_cycle = cycle.clone();
+            self.last_shaders = shaders.clone();
+            let _ = self.response.send(Response::Hud(widgets, hidden, preload, cycle, shaders));
         }
     }
 
@@ -1000,15 +1127,15 @@ impl Worker {
             .set_max_array_size(4_096)
             .set_max_map_size(1_024);
         let tx = self.response.clone();
-        let id = id.to_owned();
+        let diagnostic_id = id.to_owned();
         engine.on_print(move |message| {
-            let _ = tx.send(Response::Diagnostic(format!("{id}: {message}")));
+            let _ = tx.send(Response::Diagnostic(format!("{diagnostic_id}: {message}")));
         });
         let state: Arc<Mutex<Option<GameStateSnapshot>>> = Arc::new(Mutex::new(None));
         let presented = Arc::clone(&state);
         engine.register_fn("playerstate", move || -> Dynamic {
             presented.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                .and_then(|s| s.presented.as_ref()).map(player_map)
+                .and_then(|s| s.presented.as_ref().map(|ps| player_map_selected(ps, s.selected_weapon)))
                 .map_or(Dynamic::UNIT, Dynamic::from_map)
         });
         let authoritative = Arc::clone(&state);
@@ -1050,13 +1177,34 @@ impl Worker {
             width: rhai::FLOAT, height: rhai::FLOAT, anchor: rhai::ImmutableString| -> bool {
             HudAnchor::parse(&anchor).is_some_and(|anchor| register(&id, &name, width, height, anchor))
         });
+        // Declaration runs on the extension worker, not from input handlers.
+        // Scripts can choose their on-screen fixed-slot order, including weapons
+        // normally omitted from the native twelve-slot bar. Invalid declarations
+        // do not replace the last valid order.
+        let weapon_hud = Arc::clone(&hud);
+        engine.register_fn("hud_weapon_cycle", move |values: rhai::Array| -> bool {
+            let Some(order) = weapon_cycle_order(values) else { return false; };
+            weapon_hud.lock().unwrap_or_else(|p| p.into_inner()).weapon_cycle = order;
+            true
+        });
         // Declare images the script will draw so they are loaded when it starts,
         // not the first time they appear on screen.
+        // Declare packaged WGSL modules at top level. There is no runtime
+        // source string evaluation, arbitrary path access or per-frame compile.
+        let shader_hud = Arc::clone(&hud);
+        engine.register_fn("hud_shader", move |name: rhai::ImmutableString, path: rhai::ImmutableString| -> bool {
+            if !valid_id(&name) || !valid_shader_asset(&path) { return false; }
+            let mut state = shader_hud.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.shader_paths.contains_key(name.as_str())
+                && state.shader_paths.len() >= MAX_HUD_USER_SHADERS { return false; }
+            state.shader_paths.insert(name.to_string(), path.to_string());
+            true
+        });
         let preload_hud = Arc::clone(&hud);
         engine.register_fn("hud_preload", move |name: rhai::ImmutableString| {
             if !valid_hud_image(&name) { return; }
             let mut state = preload_hud.lock().unwrap_or_else(|p| p.into_inner());
-            if state.preload.len() < MAX_HUD_IMAGES { state.preload.insert(name.to_string()); }
+            if state.preload.len() < MAX_EXTENSION_HUD_IMAGES { state.preload.insert(name.to_string()); }
         });
         let image_hud = Arc::clone(&hud);
         engine.register_fn("hud_image", move |id: rhai::ImmutableString, name: rhai::ImmutableString,
@@ -1066,6 +1214,42 @@ impl Worker {
                 (hud_number(x), hud_number(y), hud_number(w), hud_number(h), bounded_color(color)) {
                 if w != 0.0 && h != 0.0 {
                     append_hud(&image_hud, &id, HudCommand::Image { name: name.to_string(), x, y, w, h, color });
+                }
+            }
+        });
+        let region_hud = Arc::clone(&hud);
+        engine.register_fn("hud_image_region", move |id: rhai::ImmutableString,
+            name: rhai::ImmutableString, x: rhai::FLOAT, y: rhai::FLOAT,
+            w: rhai::FLOAT, h: rhai::FLOAT, sx: rhai::FLOAT, sy: rhai::FLOAT,
+            sw: rhai::FLOAT, sh: rhai::FLOAT, color: rhai::Array| {
+            if !valid_hud_image(&name) { return; }
+            if let (Some(x), Some(y), Some(w), Some(h), Some(sx), Some(sy), Some(sw), Some(sh), Some(color)) =
+                (hud_number(x), hud_number(y), hud_number(w), hud_number(h), hud_number(sx), hud_number(sy),
+                 hud_number(sw), hud_number(sh), bounded_color(color)) {
+                if w == 0.0 || h == 0.0 || sx < 0.0 || sy < 0.0 || sw <= 0.0 || sh <= 0.0 { return; }
+                append_hud(&region_hud, &id, HudCommand::ImageRegion {
+                    name: name.to_string(), x, y, w, h, source: [sx, sy, sw, sh], color,
+                });
+            }
+        });
+        let shaded_hud = Arc::clone(&hud);
+        engine.register_fn("hud_image_shader", move |id: rhai::ImmutableString,
+            image: rhai::ImmutableString, shader: rhai::ImmutableString,
+            x: rhai::FLOAT, y: rhai::FLOAT, w: rhai::FLOAT, h: rhai::FLOAT,
+            color: rhai::Array, values: rhai::Array| {
+            if !valid_hud_image(&image) || !valid_id(&shader) { return; }
+            if let (Some(x), Some(y), Some(w), Some(h), Some(color), Some(params)) =
+                (hud_number(x), hud_number(y), hud_number(w), hud_number(h),
+                 bounded_color(color), shader_params(values)) {
+                if w == 0.0 || h == 0.0 { return; }
+                // Only registered, validated shaders can be drawn.
+                let valid = shaded_hud.lock().unwrap_or_else(|e| e.into_inner())
+                    .shader_sources.contains_key(shader.as_str());
+                if valid {
+                    append_hud(&shaded_hud, &id, HudCommand::ShaderImage {
+                        name: image.to_string(), shader: shader.to_string(),
+                        x, y, w, h, color, params,
+                    });
                 }
             }
         });
@@ -1115,6 +1299,31 @@ impl Worker {
         let mut scope = Scope::new();
         engine.run_ast_with_scope(&mut scope, &ast)
             .map_err(|e| format!("Runtime error: {e}"))?;
+        // Source loading and Naga validation are off the input and render
+        // threads. The only valid source root is this extension package.
+        let declared = hud.lock().unwrap_or_else(|e| e.into_inner()).shader_paths.clone();
+        if !declared.is_empty() {
+            let mut assets = AssetSearchPath::open_game(&self.base, self.game.as_deref())
+                .map_err(|e| format!("HUD shader asset search: {e}"))?;
+            let mut resolved = BTreeMap::new();
+            for (name, path) in declared {
+                let full = format!("extensions/{id}/{path}");
+                let source = read_asset_text(&mut assets, &full, MAX_HUD_SHADER_BYTES)
+                    .map_err(|e| format!("{full}: {e}"))?;
+                if source.is_empty() || source.len() >= MAX_HUD_SHADER_BYTES {
+                    return Err(format!("{full}: shader must be 1..{} bytes", MAX_HUD_SHADER_BYTES-1));
+                }
+                let combined = format!("{}\n{}\n{}", include_str!("hud_extension_shader_header.wgsl"),
+                    source, include_str!("hud_extension_shader_footer.wgsl"));
+                let module = naga::front::wgsl::parse_str(&combined)
+                    .map_err(|e| format!("{full}: WGSL: {}", e.emit_to_string(&combined)))?;
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all()).validate(&module)
+                    .map_err(|e| format!("{full}: shader validation: {e}"))?;
+                resolved.insert(name, source);
+            }
+            hud.lock().unwrap_or_else(|e| e.into_inner()).shader_sources = resolved;
+        }
         Ok(Active { engine, ast, scope, state, failed_hooks: BTreeSet::new(), hud, hides: NativeHudMask::default() })
     }
 
@@ -1268,6 +1477,65 @@ mod tests {
         assert_eq!(state.get("client_num").unwrap().as_int().unwrap(), 4);
     }
     #[test]
+    fn weapon_cycle_declaration_is_strict_and_cached_on_worker() {
+        let integers = |numbers: &[i64]| -> rhai::Array {
+            numbers.iter().copied().map(Dynamic::from_int).collect()
+        };
+        assert_eq!(weapon_cycle_order(integers(&[3, 4, 15, 16])), Some(vec![3, 4, 15, 16]));
+        assert_eq!(weapon_cycle_order(integers(&[])), Some(Vec::new()));
+        assert!(weapon_cycle_order(integers(&[3, 3])).is_none());
+        assert!(weapon_cycle_order(integers(&[0, 3])).is_none());
+        assert!(weapon_cycle_order(integers(&[17])).is_none());
+        assert!(weapon_cycle_order(integers(&(1..=17).collect::<Vec<_>>())).is_none());
+        assert!(weapon_cycle_order(vec![Dynamic::from("weapon")]).is_none());
+
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(PathBuf::from("unused"), None, tx);
+        let active = worker.compile("custom", r#"
+            hud_weapon_cycle([3, 4, 5, 15, 16]);
+            hud_register("bar", "Bar", 100.0, 40.0);
+        "#).unwrap();
+        assert_eq!(active.hud.lock().unwrap().weapon_cycle, [3, 4, 5, 15, 16]);
+        assert!(worker.active_weapon_cycle().is_empty());
+        let mut info = ExtensionInfo {
+            id: "custom".into(), name: "Custom".into(), enabled: true,
+            running: true, revision: 1, error: None, source: String::new(),
+            editable: false, hides: NativeHudMask::default(),
+        };
+        worker.slots.insert("custom".into(), Slot {
+            fingerprint: (String::new(), String::new(), false),
+            info: info.clone(), active: Some(active), source_path: None,
+        });
+        assert_eq!(worker.active_weapon_cycle(), [3, 4, 5, 15, 16]);
+        info.id = "conflict".into();
+        let conflict = worker.compile("conflict", "hud_weapon_cycle([6, 7]);").unwrap();
+        worker.slots.insert("conflict".into(), Slot {
+            fingerprint: (String::new(), String::new(), false),
+            info, active: Some(conflict), source_path: None,
+        });
+        assert!(worker.active_weapon_cycle().is_empty(), "multiple owners must not override input");
+        worker.slots.remove("conflict");
+        assert_eq!(worker.active_weapon_cycle(), [3, 4, 5, 15, 16]);
+        worker.slots.remove("custom");
+        assert!(worker.active_weapon_cycle().is_empty(), "disable/unload restores native cycling");
+    }
+
+    #[test]
+    fn weapon_state_map_distinguishes_equipped_and_pending_selection() {
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("weapon", 5);
+        ps.stats[4] = (1 << 3) | (1 << 5) | (1 << 15);
+        for ammo in &mut ps.ammo { *ammo = 999; }
+        let state = player_map_selected(&ps, Some(15));
+        assert_eq!(state["weapon"].as_int().unwrap(), 5);
+        assert_eq!(state["weapon_selected"].as_int().unwrap(), 15);
+        assert_eq!(state["weapon_owned_bits"].as_int().unwrap(), ps.stats[4] as i64);
+        let selectable = state["weapon_selectable_bits"].as_int().unwrap();
+        assert_ne!(selectable & (1 << 15), 0);
+        assert_eq!(selectable & (1 << 16), 0);
+    }
+
+    #[test]
     fn hud_registration_and_update_emit_bounded_draw_commands() {
         let (tx, _rx) = mpsc::channel();
         let worker = Worker::new(PathBuf::from("unused"), None, tx);
@@ -1344,6 +1612,7 @@ hides_native_hud = ['health', 'speedometer']
         *active.state.lock().unwrap() = Some(GameStateSnapshot {
             presented: Some(ps), authoritative: None, map_name: "t".into(), server_time: 1000,
             viewer_client: Some(0), is_live: true, is_demo: false, screen_size: [1920, 1080],
+            selected_weapon: None,
         });
         active.hud.lock().unwrap().widgets.get_mut("ups").unwrap().commands.clear();
         active.callback("on_update", None).unwrap();
@@ -1353,65 +1622,15 @@ hides_native_hud = ['health', 'speedometer']
         assert_eq!(texts, ["1000", "peak 1000"]);
     }
 
-    fn jka_hud_commands(
-        active: &mut Active, health: i32, armor: i32, weapon: i32, ammo: i32, screen: [u32; 2],
-    ) -> Vec<HudCommand> {
-        let mut ps = PlayerState::default();
-        ps.stats[0] = health;
-        ps.stats[5] = armor;
-        ps.stats[8] = 100;
-        ps.set_field_bits("weapon", weapon as u32);
-        ps.set_field_bits("fd.forcePower", 60);
-        if let Some((index, _, _)) = jka_movement::weapon_info(weapon) {
-            if index > 0 { ps.ammo[index as usize] = ammo; }
-        }
-        *active.state.lock().unwrap() = Some(GameStateSnapshot {
-            presented: Some(ps), authoritative: None, map_name: "t".into(), server_time: 5000,
-            viewer_client: Some(0), is_live: true, is_demo: false, screen_size: screen,
-        });
-        for widget in active.hud.lock().unwrap().widgets.values_mut() { widget.commands.clear(); }
-        active.callback("on_update", None).unwrap();
-        let hud = active.hud.lock().unwrap();
-        hud.widgets.values().flat_map(|w| w.commands.clone()).collect()
-    }
-
     #[test]
-    fn bundled_jka_hud_draws_the_stock_tics_and_numbers() {
-        let (tx, rx) = mpsc::channel();
-        let worker = Worker::new(PathBuf::from("unused"), None, tx);
-        let manifest: Manifest = toml::from_str(include_str!("../extensions/jka-hud/extension.toml")).unwrap();
-        let mask = NativeHudMask::from_names(&manifest.hides_native_hud).unwrap();
-        assert!(mask.contains(NativeHud::Health) && mask.contains(NativeHud::Ammo) && !mask.contains(NativeHud::Speedometer));
-        let mut active = worker.compile("jka-hud", include_str!("../extensions/jka-hud/main.rhai")).unwrap();
-        while let Ok(message) = rx.try_recv() { if let Response::Diagnostic(m) = message { println!("{m}"); } }
-        {
-            let hud = active.hud.lock().unwrap();
-            assert_eq!(hud.widgets["left"].anchor, HudAnchor::BottomLeft);
-            assert_eq!(hud.widgets["right"].anchor, HudAnchor::BottomRight);
-        }
-        // Full health, 40 armor, blaster (weapon 5, 300 max ammo) at 75 rounds.
-        let commands = jka_hud_commands(&mut active, 100, 40, 5, 75, [1920, 1080]);
-        let images: Vec<&str> = commands.iter().filter_map(|c| match c {
-            HudCommand::Image { name, .. } => Some(name.as_str()), _ => None }).collect();
-        let count = |needle: &str| images.iter().filter(|n| n.starts_with(needle)).count();
-        assert_eq!(count("gfx/hud/hudleft"), 2);
-        assert_eq!(count("gfx/hud/health_tic"), 4);
-        assert_eq!(count("gfx/hud/armor_tic"), 2); // 40 of 100 -> one full tic + a partial
-        assert_eq!(count("gfx/hud/force_tic"), 3); // 60 of 100 -> two full + a partial
-        assert_eq!(count("gfx/hud/ammo_tic"), 1); // 75 of 300 -> inc 75 -> exactly one tic
-        assert!(images.contains(&"gfx/2d/numbers/t_one"));
-        assert!(images.iter().all(|n| valid_hud_image(n)), "{images:?}");
-        // Mirrored right frame, scaled by 1080/480 = 2.25.
-        let mirrored = commands.iter().any(|c| matches!(c, HudCommand::Image { name, w, .. }
-            if name == "gfx/hud/hudleft" && (*w + 112.0 * 2.25).abs() < 0.01));
-        assert!(mirrored);
-        // A saber shows its style art and "--" instead of ammo.
-        let saber = jka_hud_commands(&mut active, 100, 0, 3, 0, [1920, 1080]);
-        assert!(saber.iter().any(|c| matches!(c, HudCommand::Text { text, .. } if text == "--")));
-        // A resolution change re-registers at the new scale.
-        let _ = jka_hud_commands(&mut active, 100, 0, 3, 0, [1280, 720]);
-        let hud = active.hud.lock().unwrap();
-        assert!((hud.widgets["left"].width - 128.0 * 1.5).abs() < 0.01, "{}", hud.widgets["left"].width);
+    fn shader_paths_are_extension_local_and_strictly_bounded() {
+        assert!(valid_shader_asset("shaders/liquid.wgsl"));
+        assert!(!valid_shader_asset("../shader.wgsl"));
+        assert!(!valid_shader_asset("shaders/../../bad.wgsl"));
+        assert!(!valid_shader_asset("gfx/material.wgsl"));
+        assert!(!valid_shader_asset("shaders/other.wgsl?foo"));
+        assert!(shader_params(vec![0.5_f64.into(), 1_i64.into(), 0_i64.into(), 0_i64.into()]).is_some());
+        assert!(shader_params(vec![f64::NAN.into(), 0_i64.into(), 0_i64.into(), 0_i64.into()]).is_none());
     }
 
     #[test]
@@ -1438,7 +1657,7 @@ hides_native_hud = ['health', 'speedometer']
         assert_eq!(slots, ["gfx/b", "gfx/a", "gfx/c"]);
         let many: Vec<String> = (0..64).map(|i| format!("gfx/i{i}")).collect();
         assign_image_slots(&mut slots, many.iter().map(String::as_str));
-        assert_eq!(slots.len(), MAX_HUD_IMAGES);
+        assert_eq!(slots.len(), MAX_EXTENSION_HUD_IMAGES);
     }
 
     #[test]

@@ -33,6 +33,18 @@ fn igpu_ab_model_upload(queue: &wgpu::Queue, buffer: &wgpu::Buffer, bytes: &[u8]
     queue.write_buffer(buffer, 0, bytes);
 }
 
+// Session-only A/B: use RBSP solid brush/patch collision instead of authored world.
+// Atomic allows a live console toggle without a frame-wide settings rebuild.
+static COLLISION_WORLD_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn collision_world_only() -> bool {
+    COLLISION_WORLD_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn set_collision_world_only(enabled: bool) {
+    COLLISION_WORLD_ONLY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Native Vulkan RGB565 swapchain A/B. No offscreen conversion or resolution change.
 static RGB565_REQUESTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static RGB565_EFFECTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -159,12 +171,18 @@ mod bindings;
 mod capture;
 mod companion;
 mod context;
+mod collision_world;
 mod diagnostics;
 mod environment;
 mod frame;
 mod frametime_graph;
 mod glass;
 mod initialize;
+#[cfg(feature = "nvidia-dlss")]
+mod dlss;
+#[cfg(not(feature = "nvidia-dlss"))]
+#[path = "renderer/dlss_off.rs"]
+mod dlss;
 pub(crate) mod gpu_adapter;
 mod input_diagnostic;
 
@@ -183,6 +201,7 @@ mod portal_depth;
 mod post;
 mod reflections;
 mod render_thread;
+mod shared_present_probe;
 mod static_ao;
 mod spectator_highlight;
 mod stream_output;
@@ -226,7 +245,7 @@ use capture::{
     encode_screenshot_job, ScreenshotDestination, ScreenshotEncodeJob, ScreenshotReadbackBuffer,
 };
 use companion::{CompanionRenderThread, CompanionSceneFrame};
-use context::{no_vsync_mode, supported_msaa, temporal_jitter};
+use context::{dlss_jitter, no_vsync_mode, supported_msaa, temporal_jitter};
 use diagnostics::debug_geometry::{
     create_screen_fx_pipeline, create_surface_inspector_pipeline, create_ui_pipeline,
     DebugVolumeRenderer,
@@ -488,7 +507,7 @@ use crate::{
     },
     ui::{
         self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
-        DofMode, DofQuality, DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode,
+        DlssMode, DlssModel, DofMode, DofQuality, DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode,
         EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode,
         PlanarReflectionDebugMode, PlanarReflectionMode, PuddleQuality, PvsMode, RainIntensity,
         ReflectionQuality, RendererBackend, SunVisibilityMode, TextureFilter, UiSnapshot, UiVertex,
@@ -790,6 +809,9 @@ fn device_lost_reason() -> String {
 pub(crate) mod hdr_output;
 
 struct Renderer {
+    /// Pipeline is compiled only when collision-only world mode is first used.
+    collision_world_pipeline: Option<collision_world::CollisionWorldPipeline>,
+    collision_world_job: Option<collision_world::CollisionWorldJob>,
     model_frame_log: crate::model_frame_log::ModelFrameLog,
     base: PathBuf,
     /// Retained so auxiliary surfaces can query capabilities against the same GPU adapter.
@@ -955,6 +977,7 @@ struct Renderer {
     ui_pipeline: wgpu::RenderPipeline,
     // Lazily compiled encoded-space variant of the same native UI shader.
     ui_encoded_pipeline: Option<wgpu::RenderPipeline>,
+    ui_encoded_format: Option<wgpu::TextureFormat>,
     ui_shader: wgpu::ShaderModule,
     ui_pipeline_layout: wgpu::PipelineLayout,
     screen_fx_shader: wgpu::ShaderModule,
@@ -984,6 +1007,10 @@ struct Renderer {
     ui_icon_shader_buffer: wgpu::Buffer,
     ui_icon_shader_vertices: Vec<UiVertex>,
     ui_icon_shader_batches: Vec<overlay::UiIconShaderBatch>,
+    /// Optional third-party fragment effects for extension images. No resources
+    /// are allocated and no new pipelines compiled without an active shader.
+    hud_shader_sources: Vec<(String, String)>,
+    hud_shader_gpu: Option<overlay::HudShaderGpu>,
     ui_texture_layout: wgpu::BindGroupLayout,
     ui_bind_group: wgpu::BindGroup,
     ui_encoded_bind_group: wgpu::BindGroup,
@@ -1131,6 +1158,8 @@ struct Renderer {
     detail_texture_fade: bool,
     detail_texture_fade_distance: f32,
     gamma: f32,
+    /// Emulated OpenJK output shift (0 or 1); never requires hardware gamma.
+    overbright_bits: u8,
     baked_brightness: brightness::BakedBrightness,
     gamma_method: crate::gamma::GammaMethod,
     /// True only after Windows confirms the display gamma ramp is installed.
@@ -1159,6 +1188,14 @@ struct Renderer {
     fxaa_enabled: bool,
     smaa_enabled: bool,
     taa_enabled: bool,
+    /// Native-resolution DLAA through NVIDIA NGX (`nvidia-dlss` builds on an
+    /// NGX-capable Vulkan device). No GPU work when disabled.
+    dlss_requested: bool,
+    /// Set after an NGX init/evaluation error; cleared when DLAA is toggled.
+    dlss_failed: bool,
+    dlss_mode: DlssMode,
+    dlss_model: DlssModel,
+    dlss: dlss::DlssState,
     rt_taa_mode: u32,
     contact_shadows_enabled: bool,
     sun_override: bool,

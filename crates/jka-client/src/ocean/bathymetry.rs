@@ -46,7 +46,7 @@ pub fn start(
     full: &[DrawBatch],
     map_hash: u64,
     base: &Path,
-    game: Option<&Path>,
+    _game: Option<&Path>,
 ) -> Option<Arc<Job>> {
     let selection_started = Instant::now();
     let entries = super::surfaces::collect(vertices, coarse, full);
@@ -140,7 +140,7 @@ pub fn start(
         }
     }
     let key = [map_hash, bathymetry::fingerprint(&descriptor)];
-    let directory = game.unwrap_or(base).join("cache/coastal").join(format!(
+    let directory = jka_assets::pk3::dinurdojk_cache_directory(base).join("coastal").join(format!(
         "v{}-{:016x}-{:016x}",
         bathymetry::CACHE_VERSION,
         key[0],

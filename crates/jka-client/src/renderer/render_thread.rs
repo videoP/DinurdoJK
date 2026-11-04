@@ -1,6 +1,7 @@
 //! Thread.
 use crate::renderer::diagnostics::perf_capture::{LoopSections, PerfCapture};
 use crate::renderer::diagnostics::sky_sweep::SkyPerfSweep;
+use crate::renderer::diagnostics::shitter_sweep::ShitterSweep;
 use crate::renderer::diagnostics::tile_cost::{parse_pass, TileCostOverlay, TileCostProbe};
 use crate::renderer::TileCostCommand;
 use crate::renderer::{
@@ -154,6 +155,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetEarlySubmit(..) => "SetEarlySubmit",
         RenderCommand::SetPresentCopy(..) => "SetPresentCopy",
         RenderCommand::RunAcquireProbe(..) => "RunAcquireProbe",
+        RenderCommand::StartShitterSweep { .. } => "StartShitterSweep",
+        RenderCommand::ProbeSharedPresent => "ProbeSharedPresent",
         RenderCommand::SetInputLateLatch(..) => "SetInputLateLatch",
         RenderCommand::SetMsaa(..) => "SetMsaa",
         RenderCommand::SetTextureFilter(..) => "SetTextureFilter",
@@ -185,6 +188,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetWorldFlares(..) => "SetWorldFlares",
         RenderCommand::SetFpsCap(..) => "SetFpsCap",
         RenderCommand::SetGamma(..) => "SetGamma",
+        RenderCommand::SetOverbrightBits(..) => "SetOverbrightBits",
         RenderCommand::SetGammaMethod(..) => "SetGammaMethod",
         RenderCommand::SetHardwareGammaActive(..) => "SetHardwareGammaActive",
         RenderCommand::PrepareGammaMethod(..) => "PrepareGammaMethod",
@@ -373,7 +377,7 @@ impl RenderThread {
         if backend == RendererBackend::Dx12 {
             // wgpu has no DX12 pipeline cache and DXC takes ~120 ms per large
             // shader, so the patched wgpu-hal keeps compiled bytecode here.
-            std::env::set_var("DINURDOJK_DX12_SHADER_CACHE", base.join("cache").join("dx12_shaders"));
+            std::env::set_var("DINURDOJK_DX12_SHADER_CACHE", jka_assets::pk3::dinurdojk_cache_directory(&base).join("dx12_shaders"));
             instance_desc.backend_options.dx12.shader_compiler = match &dxc_path {
                 Some(path) => wgpu::Dx12Compiler::DynamicDxc {
                     dxc_path: path.to_string_lossy().into_owned(),
@@ -386,7 +390,13 @@ impl RenderThread {
                 }
             };
         }
-        let instance = wgpu::Instance::new(instance_desc);
+        // NGX must register its Vulkan instance extensions before WGPU creates
+        // the instance; without the nvidia-dlss feature this is Instance::new.
+        let instance = if backend == RendererBackend::Vulkan {
+            super::dlss::create_instance(instance_desc)
+        } else {
+            wgpu::Instance::new(instance_desc)
+        };
         let (instance, surface) = match instance.create_surface(window.clone()) {
             Ok(surface) => (instance, surface),
             Err(error) if backend == RendererBackend::Dx12 && dxc_path.is_some() => {
@@ -519,6 +529,11 @@ impl RenderThread {
 
     pub fn tile_cost(&self, command: TileCostCommand) -> Result<(), &'static str> {
         self.command_tx.send(RenderCommand::TileCost(command))
+            .map_err(|_| "renderer command channel closed")
+    }
+
+    pub fn start_shitter_sweep(&self, path: PathBuf) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::StartShitterSweep { path })
             .map_err(|_| "renderer command channel closed")
     }
 
@@ -673,6 +688,9 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         fxaa: video.fxaa,
         smaa: video.smaa,
         taa: video.taa,
+        dlss: video.dlss,
+        dlss_mode: video.dlss_mode,
+        dlss_model: video.dlss_model,
         rt_taa: video.rt_taa,
         contact_shadows: video.contact_shadows,
         fog_mode: video.fog_mode,
@@ -957,6 +975,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut frame_pace_anchor = Instant::now();
     let mut stats_frames = 0_u64;
     let mut last_info = FrameInfo::default();
+    let mut shitter_sweep: Option<ShitterSweep> = None;
     let mut competitive_fps_started = Instant::now();
     let mut competitive_fps_frames: u32 = 0;
     let mut competitive_prepare_ms = 0.0;
@@ -1397,10 +1416,36 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_max_frame_latency(latency)
                     }
                     Ok(RenderCommand::SetEarlySubmit(enabled)) => {
+                        if let Some(mut sweep) = shitter_sweep.take() {
+                            fps_cap = sweep.restore(&mut renderer);
+                            frame_pace_anchor = Instant::now();
+                        }
                         renderer.early_submit_enabled = enabled;
                     }
                     Ok(RenderCommand::SetPresentCopy(enabled)) => {
+                        if let Some(mut sweep) = shitter_sweep.take() {
+                            fps_cap = sweep.restore(&mut renderer);
+                            frame_pace_anchor = Instant::now();
+                        }
                         renderer.present_copy_enabled = enabled;
+                    }
+                    Ok(RenderCommand::StartShitterSweep { path }) => {
+                        if perf_capture.is_some() || sky_sweep.is_some() || tile_probe.is_some()
+                            || renderer.acquire_probe_started.is_some()
+                        {
+                            eprintln!("[SHITTER SWEEP] Another renderer diagnostic is active; finish it first");
+                        } else if renderer.offscreen_output.is_some() {
+                            eprintln!("[SHITTER SWEEP] Requires the normal game swapchain (not Studio output)");
+                        } else {
+                            if let Some(mut old) = shitter_sweep.take() {
+                                fps_cap = old.restore(&mut renderer);
+                            }
+                            shitter_sweep = Some(ShitterSweep::new(path, &mut renderer, fps_cap));
+                            // Bypass only the render-thread FPS limiter during the test.
+                            // App/cvar configuration remains untouched and is restored.
+                            fps_cap = 0;
+                            frame_pace_anchor = Instant::now();
+                        }
                     }
                     Ok(RenderCommand::RunAcquireProbe(seconds)) => {
                         if renderer.offscreen_output.is_some() {
@@ -1414,6 +1459,13 @@ pub(in crate::renderer) fn render_thread_main(
                             println!("[JKA ACQUIRE PROBE] Starting {}s clear-only test (normal rendering resumes automatically)", renderer.acquire_probe_seconds);
                             frame_pace_anchor = Instant::now();
                         }
+                    }
+                    Ok(RenderCommand::ProbeSharedPresent) => {
+                        // On-demand read-only native query. No swapchain recreation,
+                        // frame synchronization, or change to the presentation path.
+                        crate::renderer::shared_present_probe::run(
+                            &renderer.device, &renderer.surface,
+                        );
                     }
                     Ok(RenderCommand::SetInputLateLatch(enabled)) => {
                         input_latelatch = enabled;
@@ -1479,7 +1531,13 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_world_stage_debug(draw_bsp_model_surfaces, probe);
                     },
                     Ok(RenderCommand::SetFastSky(mode)) => renderer.set_fast_sky(mode),
-                    Ok(RenderCommand::SetCompetitiveAb(mode)) => renderer.set_competitive_ab(mode),
+                    Ok(RenderCommand::SetCompetitiveAb(mode)) => {
+                        if let Some(mut sweep) = shitter_sweep.take() {
+                            fps_cap = sweep.restore(&mut renderer);
+                            frame_pace_anchor = Instant::now();
+                        }
+                        renderer.set_competitive_ab(mode);
+                    },
                     Ok(RenderCommand::SetWorldFlares(enabled)) => {
                         if renderer.world_flares_enabled != enabled {
                             renderer.world_flares.invalidate_history();
@@ -1491,12 +1549,21 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.world_flares_enabled = enabled;
                     }
                     Ok(RenderCommand::SetFpsCap(cap)) => {
+                        if let Some(mut sweep) = shitter_sweep.take() {
+                            fps_cap = sweep.restore(&mut renderer);
+                        }
                         if fps_cap != cap {
                             fps_cap = cap;
                             frame_pace_anchor = Instant::now();
                         }
                     },
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
+                    Ok(RenderCommand::SetOverbrightBits(bits)) => {
+                        if renderer.overbright_bits != bits.min(1) {
+                            renderer.overbright_bits = bits.min(1);
+                            renderer.refresh_output_gamma();
+                        }
+                    },
                     Ok(RenderCommand::SetGammaMethod(method)) => {
                         gamma_preparation = None;
                         renderer.set_gamma_method(method);
@@ -1899,7 +1966,8 @@ pub(in crate::renderer) fn render_thread_main(
                         // the UI uses its egui photo fallback until then.
                         neon_compositor_ready_notified = false;
                     }
-                    Ok(RenderCommand::SetExtensionHud(widgets, hidden, images)) => renderer.set_extension_hud(widgets, hidden, images),
+                    Ok(RenderCommand::SetExtensionHud(widgets, hidden, images, shaders)) =>
+                        renderer.set_extension_hud(widgets, hidden, images, shaders),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
                         console_notify_lines,
@@ -2071,6 +2139,11 @@ pub(in crate::renderer) fn render_thread_main(
                                 Ok(background)=>Some(background),Err(error)=>{eprintln!("Profile background: {error}");None}
                             });
                     }
+                    Ok(RenderCommand::BuildCollisionWorld {
+                        map_hash, root, game, source, allow_asset_overrides,
+                    }) => renderer.request_collision_world(
+                        map_hash, root, game, source, allow_asset_overrides,
+                    ),
                     Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
                     Ok(RenderCommand::GrowInlineInstances { map }) => {
                         renderer.load_map(*map);
@@ -2402,6 +2475,17 @@ pub(in crate::renderer) fn render_thread_main(
         }
         if render_result.is_err() {
             renderer.retry_inline_transforms();
+        }
+        // The sweep observes only successful presented frames. Sampling is
+        // amortized across each phase and never captures a pipeline-switch frame.
+        if let (Some(sweep), Ok(info)) = (shitter_sweep.as_mut(), render_result.as_ref()) {
+            if sweep.record(info, &mut renderer) {
+                if let Some(done) = shitter_sweep.take() {
+                    fps_cap = done.fps_cap();
+                    frame_pace_anchor = Instant::now();
+                    done.finish();
+                }
+            }
         }
         if matches!(renderer.competitive_ab, 4 | 9 | 14 | 15) || renderer.competitive_ab >= 16 {
             competitive_fps_frames = competitive_fps_frames.saturating_add(1);

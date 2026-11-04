@@ -7,7 +7,7 @@
 //!
 //! * an unhandled-exception filter that appends a report (exception code,
 //!   faulting module + offset, stack, memory state) to `latest.log` and writes
-//!   a minidump beside the exe;
+//!   a minidump beside it (`<GameData>/DinurdoJK/logs`);
 //! * `write_hang_dump`, which writes a minidump of a *live* process so a wedged
 //!   driver call can be inspected after the fact;
 //! * a one-shot description of the machine (OS, CPU, RAM) for the log header.

@@ -45,9 +45,9 @@ fn name_for(source: &Path, bytes_hash: &[u8; 32], ext: &str) -> String {
 }
 
 impl App {
-    /// Game installation root/render-studio, NOT base/render-studio or fs_game/render-studio.
+    /// <GameData>/DinurdoJK/render-studio, NOT base/render-studio or fs_game/render-studio.
     pub(in crate::app) fn studio_media_root(&self) -> PathBuf {
-        self.base.parent().unwrap_or(&self.base).join("render-studio")
+        jka_assets::pk3::dinurdojk_directory(&self.base).join("render-studio")
     }
     pub(in crate::app) fn studio_project_directory_for(&self, name: &str) -> PathBuf {
         let file = RenderStudio::project_file_name_for(name);

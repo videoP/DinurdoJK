@@ -115,6 +115,19 @@ struct EntityLightingSettings {
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 @group(2) @binding(0) var<storage, read> bones: array<BoneMatrix>;
 @group(2) @binding(1) var<storage, read> skin_draws: array<SkinDraw>;
+// DLSS motion prepass only (models/motion.rs): last frame's bone palette and
+// the previous transform of the instance at the same draw index. Bindings sit
+// far above the glass bindings this module also declares at group 3.
+struct SkinMotion {
+    axis0: vec4<f32>,
+    axis1: vec4<f32>,
+    axis2: vec4<f32>,
+    origin: vec4<f32>,
+    // x: previous bone base, y: 1 when a previous pose exists.
+    params: vec4<u32>,
+};
+@group(3) @binding(16) var<storage, read> previous_bones: array<BoneMatrix>;
+@group(3) @binding(17) var<storage, read> skin_motion: array<SkinMotion>;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -726,6 +739,10 @@ fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>, heat_alpha: f32)
 
 @vertex
 fn vs_prepass(input: VertexIn, @builtin(instance_index) draw_index: u32) -> PrepassVertexOut {
+    return prepass_vertex(input, draw_index);
+}
+
+fn prepass_vertex(input: VertexIn, draw_index: u32) -> PrepassVertexOut {
     let draw = skin_draws[draw_index];
     let model_position = skin_position(
         input.position,
@@ -757,6 +774,96 @@ fn vs_prepass(input: VertexIn, @builtin(instance_index) draw_index: u32) -> Prep
 @fragment
 fn fs_prepass(input: PrepassVertexOut) -> PrepassOut {
     return prepass_output(input.world_position, input.normal, input.heat_alpha);
+}
+
+// skin_position against last frame's palette.
+fn previous_skin_position(
+    position: vec3<f32>,
+    bone_indices: vec4<u32>,
+    weights: vec4<f32>,
+    weight_count: u32,
+    bone_base: u32,
+) -> vec3<f32> {
+    let p0 = transform_point(previous_bones[bone_base + bone_indices.x], position);
+    if weight_count <= 1u {
+        return p0;
+    }
+    let p1 = transform_point(previous_bones[bone_base + bone_indices.y], position);
+    if weight_count == 2u {
+        return weights.x * (p0 - p1) + p1;
+    }
+    let p2 = transform_point(previous_bones[bone_base + bone_indices.z], position);
+    if weight_count == 3u {
+        let residual = 1.0 - weights.x - weights.y;
+        return weights.x * p0 + weights.y * p1 + residual * p2;
+    }
+    let p3 = transform_point(previous_bones[bone_base + bone_indices.w], position);
+    let residual = 1.0 - weights.x - weights.y - weights.z;
+    return weights.x * p0 + weights.y * p1 + weights.z * p2 + residual * p3;
+}
+
+struct PrepassMotionVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) world_position: vec3<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) heat_alpha: f32,
+    // Unjittered clip positions now and last frame; divided per fragment.
+    @location(4) current_clip: vec4<f32>,
+    @location(5) previous_clip: vec4<f32>,
+};
+
+// DLSS motion prepass: object + skeletal motion from last frame's transform
+// and bones; instances without a previous pose get camera-only motion.
+@vertex
+fn vs_prepass_motion(input: VertexIn, @builtin(instance_index) draw_index: u32) -> PrepassMotionVertexOut {
+    let base = prepass_vertex(input, draw_index);
+    let motion = skin_motion[draw_index];
+    var previous_position = base.world_position;
+    if (motion.params.y != 0u) {
+        let model_position = previous_skin_position(
+            input.position,
+            input.bone_indices,
+            input.weights,
+            input.weight_count,
+            motion.params.x,
+        );
+        let world = motion.origin.xyz
+            + motion.axis0.xyz * model_position.x
+            + motion.axis1.xyz * model_position.y
+            + motion.axis2.xyz * model_position.z;
+        previous_position = foliage_model_position(jka_to_render(world), motion.axis0.w, camera.foliage_wind);
+    }
+    var output: PrepassMotionVertexOut;
+    output.clip_position = base.clip_position;
+    output.uv = base.uv;
+    output.world_position = base.world_position;
+    output.normal = base.normal;
+    output.heat_alpha = base.heat_alpha;
+    output.current_clip = camera.unjittered_view_proj * vec4<f32>(base.world_position, 1.0);
+    output.previous_clip = camera.previous_unjittered_view_proj * vec4<f32>(previous_position, 1.0);
+    return output;
+}
+
+fn clip_motion(current: vec4<f32>, previous: vec4<f32>) -> vec2<f32> {
+    return (current.xy / current.w - previous.xy / previous.w) * vec2<f32>(0.5, -0.5);
+}
+
+@fragment
+fn fs_prepass_motion(input: PrepassMotionVertexOut) -> PrepassOut {
+    var out = prepass_output(input.world_position, input.normal, input.heat_alpha);
+    out.motion_vector = clip_motion(input.current_clip, input.previous_clip);
+    return out;
+}
+
+@fragment
+fn fs_prepass_mask_motion(input: PrepassMotionVertexOut) -> PrepassOut {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
+    var out = prepass_output(input.world_position, input.normal, input.heat_alpha);
+    out.motion_vector = clip_motion(input.current_clip, input.previous_clip);
+    return out;
 }
 
 @fragment

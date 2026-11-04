@@ -23,7 +23,7 @@ impl Renderer {
     pub(in crate::renderer) fn ocean_render_ready(&self) -> bool {
         self.ocean_enabled && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ocean)
             && self.ocean.as_ref().is_some_and(|ocean| ocean.original_surface_ready(
-                (self.config.width, self.config.height, self.msaa_samples, self.scene_format())))
+                (self.targets.render_size.0, self.targets.render_size.1, self.msaa_samples, self.scene_format())))
     }
 
     pub(in crate::renderer) fn ocean_clipmap_quality(&self) -> Option<usize> {

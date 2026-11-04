@@ -83,8 +83,10 @@ impl App {
         self.restore_frontend_world_after_studio();
         if self.extensions.poll() {
             self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
+                ui::append_native_hud_images(&mut images, self.video.hud_style,
+                    self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
-                images }));
+                images }, self.extensions.hud_shaders.clone()));
             if self.overlay == OverlayMode::HudEdit {
                 self.egui_repaint_requested = true;
             }
@@ -110,6 +112,9 @@ impl App {
         if console_changed && self.overlay == OverlayMode::Console {
             self.publish_ui();
         }
+        // TaystJK mouse4/5 hold repeats; time-gated so 2000 render FPS
+        // cannot spam the command queue. Repeats keep +buttons latched.
+        self.tick_mouse_repeat();
         let commands_executed = self.process_console_command_buffer();
         // /vid_restart may have executed inside Cbuf_Execute; stop this very
         // frame before it can send one more +attack or advance local physics.
@@ -186,9 +191,8 @@ impl App {
             }
         }
 
-        // TaystJK CG_DoAsync runs each CGame frame before the input command is
-        // consumed, so synthetic +moveup/-moveup affects this frame's usercmd.
-        self.tick_japro_flipkick();
+        // Multiplayer advances flipkick only when an actual usercmd is authored
+        // in tick_network. Render frames can greatly outnumber those commands.
         self.tick_network(dt);
         self.tick_japro_userinfo_updates();
         self.tick_demo_scrub_preview(now);
@@ -227,6 +231,9 @@ impl App {
                 self.live_input.sync_selection(&ps);
             }
             self.apply_out_of_ammo_changes();
+            // Solo currently authors one input sample per application frame;
+            // keep its existing path separate from network-command pacing.
+            self.tick_japro_flipkick();
             let command_buttons = crate::net::CommandButtons {
                 active: &self.live_buttons,
                 forced_moveup: self.japro_flipkick_moveup,
@@ -359,6 +366,19 @@ impl App {
             self.combat_ui_was_active = false;
         }
 
+        // Keep the JK2 icon-background animation smooth without republishing
+        // transient HUD geometry for the whole 1.4s selection dwell time.
+        if self.live_input.is_jk2() && self.video.hud_style == 1 {
+            let animating = [self.force_select_until, self.weapon_select_until, self.inventory_select_until]
+                .into_iter().flatten().any(|until| {
+                    let remaining = until.saturating_duration_since(now).as_millis();
+                    remaining > 0 && (remaining > 1400 || remaining <= 130)
+                });
+            if animating {
+                self.publish_transient_ui();
+            }
+        }
+
         if self.force_select_until.is_some_and(|until| now >= until) {
             self.force_select_until = None;
             self.publish_transient_ui();
@@ -438,6 +458,16 @@ impl App {
                         let size = w.inner_size();
                         [size.width, size.height]
                     }),
+                    // Never show the local weapon selection when following
+                    // another player or during demo playback.
+                    selected_weapon: if (session.live || session.local)
+                        && !self.live_input.is_jk2()
+                        && session.presented_player_state().is_some_and(|ps| {
+                            ps.field_i32("pm_flags").unwrap_or(0) & 4096 == 0
+                        })
+                        && (session.local || self.net.as_ref().is_some_and(|net| {
+                            Some(net.session().client_num()) == session.client_game.presentation_client_num()
+                        })) { Some(self.live_input.weapon_select) } else { None },
                 });
             self.extensions.submit_frame(now, state);
         }

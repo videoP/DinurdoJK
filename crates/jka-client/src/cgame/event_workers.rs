@@ -267,6 +267,7 @@ mod tests {
     fn event(sequence: u64, kind: EntityEvent) -> PresentationEvent {
         PresentationEvent {
             receive_sequence: sequence,
+            predicted_fire_command_time: None,
             source_entity_num: sequence as u16,
             entity_num: sequence as u16,
             event: kind,

@@ -212,6 +212,20 @@ impl App {
         self.publish_ui();
     }
 
+    pub(in crate::app) fn set_dlss_mode(&mut self, mode: crate::ui::DlssMode) {
+        self.video.dlss_mode = mode;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_dlss_model(&mut self, model: crate::ui::DlssModel) {
+        self.video.dlss_model = model;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn set_dof_mode(&mut self, mode: DofMode) {
         self.video.dof_mode = mode;
         // A fresh installation starts with zero intensity. Selecting a visible
@@ -661,6 +675,9 @@ impl App {
             fxaa: self.video.fxaa,
             smaa: self.video.smaa,
             taa: self.video.taa,
+            dlss: self.video.dlss,
+            dlss_mode: self.video.dlss_mode,
+            dlss_model: self.video.dlss_model,
             rt_taa: self.video.rt_taa,
             contact_shadows: self.video.contact_shadows,
             fog_mode: self.video.fog_mode,

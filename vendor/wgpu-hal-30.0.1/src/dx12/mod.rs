@@ -1004,6 +1004,21 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 }
 
+impl CommandEncoder {
+    /// DinurdoJK patch: borrow the currently recording native D3D12 command
+    /// list for external operations such as NVIDIA NGX. This list remains
+    /// owned by wgpu-hal.
+    ///
+    /// # Safety
+    /// The caller must hold exclusive access through wgpu's `as_hal_mut`,
+    /// and must not close, reset, submit, or retain this list. Do not resume
+    /// ordinary wgpu recording in the same encoder after an NGX call, because
+    /// NGX may change the native graphics state and descriptor heaps.
+    pub unsafe fn raw_command_list(&self) -> Option<&Direct3D12::ID3D12GraphicsCommandList> {
+        self.list.as_ref()
+    }
+}
+
 unsafe impl Send for CommandEncoder {}
 unsafe impl Sync for CommandEncoder {}
 

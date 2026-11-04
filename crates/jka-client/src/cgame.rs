@@ -5,6 +5,7 @@
 //! network source both feed the same decoded `Snapshot` values into this layer.
 
 mod player_animation;
+pub(crate) mod remote_smoothing;
 #[allow(dead_code)]
 pub(crate) mod player_state;
 pub(crate) mod footsteps;
@@ -17,6 +18,7 @@ pub(crate) mod jiggle;
 mod saber_throw;
 pub mod item_presenter;
 pub mod weapon_fx;
+pub(crate) mod grapple;
 pub(crate) mod saber_melt;
 pub mod sound_presenter;
 pub(crate) mod sound_tables;
@@ -387,6 +389,42 @@ impl PresentedEntity {
     }
 }
 
+
+/// Weapon/presentation capabilities advertised in jaPRO serverinfo.
+/// TaystJK `bg_public.h` JAPRO_CINFO_* and JAPRO_CINFO2_*.
+/// These masks do NOT advertise the independent WT_BOWCASTER_SPRD,
+/// WT_FLECHETTE_SPRD, WT_FLECHETTE_ALT_SPRD, WT_STAKE_GUN,
+/// WT_PROJECTILE_GRAVITY or g_projectileVelocityScale settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JaproWeaponFeatures {
+    pub lightning_gun: bool,             // jcinfo 1 << 11; stun-baton alt hitscan
+    pub unlagged_projectiles: bool,       // jcinfo 1 << 13
+    pub screen_shake_disabled: bool,      // jcinfo 1 << 14
+    pub unlagged_hitscan: bool,           // jcinfo 1 << 16
+    pub shocklance: bool,                // jcinfo 1 << 17; stun-baton main hitscan
+    pub gun_roll: bool,                  // jcinfo 1 << 18; movement, not a projectile
+    pub pseudorandom_fire: bool,         // jcinfo 1 << 19; cmd.serverTime seed
+    pub projectile_sniper: bool,         // jcinfo 1 << 29
+    pub tribes_weapons: bool,            // jcinfo2 1 << 4
+}
+
+impl JaproWeaponFeatures {
+    pub fn from_masks(jcinfo: i32, jcinfo2: i32) -> Self {
+        let has = |mask: i32, bit: u32| (mask as u32 & (1u32 << bit)) != 0;
+        Self {
+            lightning_gun: has(jcinfo, 11),
+            unlagged_projectiles: has(jcinfo, 13),
+            screen_shake_disabled: has(jcinfo, 14),
+            unlagged_hitscan: has(jcinfo, 16),
+            shocklance: has(jcinfo, 17),
+            gun_roll: has(jcinfo, 18),
+            pseudorandom_fire: has(jcinfo, 19),
+            projectile_sniper: has(jcinfo, 29),
+            tribes_weapons: has(jcinfo2, 4),
+        }
+    }
+}
+
 /// Renderer/audio-independent equivalent of the event identity produced by
 /// OpenJK `CG_CheckEvents`.  The semantic `event` has EV_EVENT_BITS removed;
 /// `raw_event` is retained for diagnostics and exact transition verification.
@@ -395,6 +433,9 @@ pub struct PresentationEvent {
     /// Monotonic client receive-queue sequence. Zero means the event has been
     /// constructed but has not yet crossed the receive queue boundary.
     pub receive_sequence: u64,
+    /// Exact predicted usercmd time for locally generated weapon fire events.
+    /// None for packet/snapshot events, which must not spawn a second shot.
+    pub predicted_fire_command_time: Option<i32>,
     pub source_entity_num: u16,
     pub entity_num: u16,
     pub event: EntityEvent,
@@ -1518,6 +1559,9 @@ impl ClientGameState {
         let position = player_state_vec3(ps, "origin").unwrap_or([0.0; 3]);
         self.presentation_events.push(PresentationEvent {
             receive_sequence: 0,
+            predicted_fire_command_time: if matches!(event, EntityEvent::EV_FIRE_WEAPON | EntityEvent::EV_ALT_FIRE) {
+                ps.field_i32("commandTime")
+            } else { None },
             source_entity_num: state.number,
             entity_num: state.number,
             event,
@@ -1708,12 +1752,26 @@ impl ClientGameState {
             .and_then(parse_i32_ascii)
     }
 
-    /// `cgs.jcinfo2`.
+    /// TaystJK `cgs.jcinfo` (jaPRO serverinfo feature mask).
+    pub fn japro_cinfo(&self) -> i32 {
+        self.configstring(CS_SERVERINFO)
+            .filter(|_| self.is_japro())
+            .and_then(|info| info_value(info, b"jcinfo"))
+            .and_then(parse_i32_ascii)
+            .unwrap_or(0)
+    }
+
+    /// `cgs.jcinfo2`; never accept spoofed jaPRO bits from other mods.
     pub fn japro_cinfo2(&self) -> i32 {
         self.configstring(CS_SERVERINFO)
+            .filter(|_| self.is_japro())
             .and_then(|info| info_value(info, b"jcinfo2"))
             .and_then(parse_i32_ascii)
             .unwrap_or(0)
+    }
+
+    pub fn japro_weapon_features(&self) -> JaproWeaponFeatures {
+        JaproWeaponFeatures::from_masks(self.japro_cinfo(), self.japro_cinfo2())
     }
 
     /// jaPRO `IsRacemode(&cg.predictedPlayerState)`: the viewer is in a timed race
@@ -3177,6 +3235,7 @@ fn check_entity_event(
     Ok(EventCheckOutcome {
         event: Some(PresentationEvent {
             receive_sequence: 0,
+            predicted_fire_command_time: None,
             source_entity_num: state.number,
             entity_num,
             event,
@@ -3710,6 +3769,21 @@ fn entity_vec3(entity: &EntityState, prefix: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japro_weapon_feature_bits_are_read_from_the_correct_mask() {
+        let bits = JaproWeaponFeatures::from_masks(
+            (1 << 11) | (1 << 13) | (1 << 14) | (1 << 16) | (1 << 17)
+                | (1 << 18) | (1 << 19) | (1 << 29),
+            1 << 4,
+        );
+        assert!(bits.lightning_gun && bits.unlagged_projectiles);
+        assert!(bits.screen_shake_disabled && bits.unlagged_hitscan);
+        assert!(bits.shocklance && bits.gun_roll && bits.pseudorandom_fire);
+        assert!(bits.projectile_sniper && bits.tribes_weapons);
+        let wrong_mask = JaproWeaponFeatures::from_masks(1 << 4, 1 << 19);
+        assert!(!wrong_mask.tribes_weapons && !wrong_mask.pseudorandom_fire);
+    }
 
     #[test]
     fn chat_body_starts_after_the_escaped_separator_and_colour() {

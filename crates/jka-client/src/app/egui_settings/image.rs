@@ -24,13 +24,53 @@ impl App {
             "Edge smoothing, cheapest first. FXAA and SMAA are screen-space \
              filters, MSAA supersamples geometry edges only, and TAA \
              accumulates jittered frames so it also resolves shader and \
-             specular aliasing the others leave behind.",
+             specular aliasing the others leave behind. NVIDIA DLSS, \
+             offered on Vulkan, is NVIDIA's learned temporal resolve and can \
+             also upscale from a lower internal resolution.",
             theme::Reset::Video(ui::VIDEO_ROW_ANTI_ALIASING),
             current,
             &labels,
         ) {
             self.video_selected = ui::VIDEO_ROW_ANTI_ALIASING;
             self.change_video_setting(target as i32 - current as i32);
+        }
+        if self.video.dlss {
+            const DLSS_MODES: [(ui::DlssMode, &str); 5] = [
+                (ui::DlssMode::UltraPerformance, "Ultra Performance"),
+                (ui::DlssMode::Performance, "Performance"),
+                (ui::DlssMode::Balanced, "Balanced"),
+                (ui::DlssMode::Quality, "Quality"),
+                (ui::DlssMode::Dlaa, "DLAA"),
+            ];
+            if let Some(mode) = segmented_row(
+                ui,
+                "DLSS mode",
+                "r_dlssMode: DLAA anti-aliases at full resolution. Quality, \
+                 Balanced, Performance and Ultra Performance render the world at \
+                 a lower resolution and let DLSS upscale it: faster, softer.",
+                theme::Reset::None,
+                self.video.dlss_mode,
+                &DLSS_MODES,
+            ) {
+                self.set_dlss_mode(mode);
+            }
+            const DLSS_MODELS: [(ui::DlssModel, &str); 3] = [
+                (ui::DlssModel::Cnn, "CNN (2.0)"),
+                (ui::DlssModel::Transformer, "Transformer (4.0)"),
+                (ui::DlssModel::Transformer2, "Transformer 2 (4.5)"),
+            ];
+            if let Some(model) = segmented_row(
+                ui,
+                "DLSS model",
+                "r_dlssModel: which NVIDIA network runs. CNN is the older, \
+                 cheaper model; Transformer and Transformer 2 are sharper and \
+                 more stable in motion but cost more GPU time.",
+                theme::Reset::None,
+                self.video.dlss_model,
+                &DLSS_MODELS,
+            ) {
+                self.set_dlss_model(model);
+            }
         }
 
         const FILTERS: [(TextureFilter, &str); 7] = [

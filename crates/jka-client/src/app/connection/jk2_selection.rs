@@ -142,7 +142,7 @@ impl App {
         };
         match result {
             Ok(Outcome::Selected) => {
-                let until = Some(Instant::now() + Duration::from_millis(1400));
+                let until = Some(Instant::now() + Duration::from_millis(1530));
                 match action {
                     GameCommand::ForceNext | GameCommand::ForcePrev => {
                         self.force_select_until = until;

@@ -48,11 +48,12 @@ pub(super) fn content_hash(data: &[u8]) -> u64 {
     hash
 }
 fn cache_path(job: &Job, lod: usize) -> PathBuf {
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let root = jka_assets::pk3::installed_dinurdojk_directory().map(|dir| dir.join("cache")).unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("DinurdoJK")
+    });
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     job.key.hash(&mut hasher);
-    root.join("DinurdoJK").join("md3-lod-v2")
+    root.join("md3-lod-v2")
         .join(format!("{:016x}-{:016x}-{lod}.bin", hasher.finish(), job.hash))
 }
 fn read_cache(path: &PathBuf, model: &Model) -> Option<Vec<Vec<u32>>> {

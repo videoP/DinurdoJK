@@ -347,7 +347,7 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_str(),
-            FxDraw::Line { shader, .. } => shader.as_ref(),
+            FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -441,7 +441,7 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_str(),
-            FxDraw::Line { shader, .. } => shader.as_ref(),
+            FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -581,7 +581,10 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     let mut normalized_indices: HashMap<String, usize> = HashMap::new();
     let mut shader_materials: Vec<Vec<FxMaterial>> = Vec::new();
     let mut cpu_batches: HashMap<(usize, usize, usize), (FxMaterial, Batch)> = HashMap::new();
-    let mut sprite_batches: HashMap<(usize, usize, usize, bool), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
+    // The two procedural classes each need a different vertex count/pipeline.
+    // Rope is distinct from Force Lightning: it never enters lightning's
+    // collision compute or forces those shader variants to initialize.
+    let mut sprite_batches: HashMap<(usize, usize, usize, bool, bool), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
 
     for (draw_index, draw) in draws.iter().enumerate() {
@@ -595,7 +598,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_str(),
-            FxDraw::Line { shader, .. } => shader.as_ref(),
+            FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
@@ -628,11 +631,30 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                 append_draw(draw, view, mat, &mut entry.1);
                 continue;
             }
+            if let FxDraw::Rope { start, end, spring, phase, speed, .. } = draw {
+                let instances = &mut sprite_batches
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false, true))
+                    .or_insert_with(|| (mat.clone(), Vec::new())).1;
+                let start = scene::render_position(*start);
+                let end = scene::render_position(*end);
+                let spring = scene::render_position(*spring);
+                // Both layers share the exact procedural centerline. Width and
+                // alpha are per-instance, not separate per-segment FX draws.
+                for (layer, rgba) in [(2.0, [255, 28, 35, 68]), (3.0, [235, 48, 49, 235])] {
+                    instances.push(FxGpuSpriteInstance {
+                        origin: [start[0], start[1], start[2], layer],
+                        left: [end[0], end[1], end[2], *phase],
+                        up: [spring[0], spring[1], spring[2], *speed],
+                        color: mat.vertex_color(rgba, view.seconds),
+                    });
+                }
+                continue;
+            }
             if let FxDraw::Lightning { start, end, width, chaos, seed, rgba, .. } = draw {
                 // 4 tiny bolt instances rather than 24 CPU tessellated segments.
                 // The vertex shader expands each to a curved, camera-facing ribbon.
                 let instances = &mut sprite_batches
-                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), true))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), true, false))
                     .or_insert_with(|| (mat.clone(), Vec::new())).1;
                 let color = mat.vertex_color(*rgba, view.seconds);
                 let a = scene::render_position(*start);
@@ -662,7 +684,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             // four CPU vertices and indexed triangles every presentation frame.
             if let FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } = draw {
                 let instances = &mut sprite_batches
-                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false, false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1;
                 let color = mat.vertex_color(*rgba, view.seconds);
@@ -710,7 +732,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             };
             if let Some((origin, left, up, rgba)) = billboard {
                 sprite_batches
-                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false))
+                    .entry((shader_index, stage_index, frame_slot(draw, view, mat), false, false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1
                     .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, draw_seconds(draw, view))));
@@ -750,7 +772,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
         sprite_batches
             .into_iter()
             .filter(|(_, (_, instances))| !instances.is_empty())
-            .map(|((_, _, slot, lightning), (mat, instances))| DynamicModelSurface {
+            .map(|((_, _, slot, lightning, rope), (mat, instances))| DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Fx,
                 authored_lighting: false,
                 material_trace: None,
@@ -764,7 +786,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: Some(FxGpuSprites {
-                resident: None, instances: Arc::new(instances), blob_shadow: false, lightning }),
+                resident: None, instances: Arc::new(instances), blob_shadow: false, lightning, rope }),
                 texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
@@ -859,6 +881,7 @@ pub fn tessellate_resident_sprites(
                 instances: Arc::new(fallback_instances),
                 blob_shadow: false,
                 lightning: false,
+                rope: false,
             }),
             texture: mat.texture_at_time(view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
@@ -886,7 +909,7 @@ pub fn tessellate_resident_sprites(
                 resident: Some(crate::renderer::FxGpuResidentSprites {
                     frame: Arc::clone(&frame), slots: Arc::new(Vec::new()),
                 }),
-                instances: Arc::new(Vec::new()), blob_shadow: false, lightning: false,
+                instances: Arc::new(Vec::new()), blob_shadow: false, lightning: false, rope: false,
             }),
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,
@@ -990,6 +1013,71 @@ fn append_batch(dst: &mut Batch, mut src: Batch) {
     dst.vertices.append(&mut src.vertices);
     dst.indices
         .extend(src.indices.into_iter().map(|index| index.saturating_add(base)));
+}
+
+// Keep this CPU reference path numerically close to fx_rope.wgsl. It is
+// used by cg_fxGpuParticles=0 / FX worker tessellation and Render Studio.
+// The 25-node centerline is shared by BOTH layers and the two vertices at
+// each node are indexed by adjoining triangles, never independently joined.
+const GRAPPLE_ROPE_SEGMENTS: usize = 24;
+
+fn grapple_rope_point(start: [f32; 3], end: [f32; 3], spring: [f32; 3],
+    phase: f32, speed: f32, t: f32) -> [f32; 3]
+{
+    if t <= 0.0 { return start; }
+    if t >= 1.0 { return end; }
+    let ray = sub(end, start);
+    let size = length(ray).max(0.001);
+    let dir = scale(ray, 1.0 / size);
+    let reference = if dir[2].abs() > 0.94 { [0.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let side = normalize(cross(dir, reference));
+    let normal = cross(dir, side);
+    let spring = sub(spring, scale(dir, dot(spring, dir)));
+    let flight = (speed / 650.0).clamp(0.0, 1.0);
+    let wave = (0.12 + 2.8 * flight) * (size / 240.0).clamp(0.0, 1.0);
+    let droop = (size * (0.008 + 0.007 * flight)).min(12.0);
+    let packet = std::f32::consts::TAU * 2.25 * t - phase;
+    let transverse = add(scale(side, wave * packet.sin()),
+        scale(normal, 0.55 * wave * (packet * 0.76 + 0.75).sin()));
+    let curve = add(scale(spring, 0.85), transverse);
+    let point = add(add(start, scale(ray, t)),
+        scale(curve, (std::f32::consts::PI * t).sin()));
+    add(point, [0.0, 0.0, -4.0 * droop * t * (1.0 - t)])
+}
+
+fn append_grapple_rope_cpu(batch: &mut Batch, view: &FxView, mat: &FxMaterial,
+    start: [f32; 3], end: [f32; 3], spring: [f32; 3], phase: f32, speed: f32, seconds: f32)
+{
+    let mut points = [[0.0; 3]; GRAPPLE_ROPE_SEGMENTS + 1];
+    for (i, point) in points.iter_mut().enumerate() {
+        *point = grapple_rope_point(start, end, spring, phase, speed,
+            i as f32 / GRAPPLE_ROPE_SEGMENTS as f32);
+    }
+    // Contiguous indexed strips; two layers share a centerline but have
+    // independent widths/colors. Both sides are drawn by Batch::triangle.
+    for (width, rgba) in [(2.05, [255, 28, 35, 68]), (0.95, [235, 48, 49, 235])] {
+        let color = mat.vertex_color(rgba, seconds);
+        let mut nodes = [[0u32; 2]; GRAPPLE_ROPE_SEGMENTS + 1];
+        for i in 0..=GRAPPLE_ROPE_SEGMENTS {
+            let prev = points[i.saturating_sub(1)];
+            let next = points[(i + 1).min(GRAPPLE_ROPE_SEGMENTS)];
+            let tangent = normalize(sub(next, prev));
+            let mut across = cross(tangent, sub(view.origin, points[i]));
+            if length(across) < 0.0001 {
+                let reference = if tangent[2].abs() > 0.94 { [0.0, 1.0, 0.0] }
+                                else { [0.0, 0.0, 1.0] };
+                across = cross(tangent, reference);
+            }
+            let offset = scale(normalize(across), width);
+            let uv_y = i as f32 / GRAPPLE_ROPE_SEGMENTS as f32;
+            nodes[i][0] = batch.vertex(add(points[i], offset), [0.0, uv_y], color);
+            nodes[i][1] = batch.vertex(sub(points[i], offset), [1.0, uv_y], color);
+        }
+        for i in 0..GRAPPLE_ROPE_SEGMENTS {
+            batch.triangle(nodes[i][0], nodes[i][1], nodes[i+1][0]);
+            batch.triangle(nodes[i+1][0], nodes[i][1], nodes[i+1][1]);
+        }
+    }
 }
 
 fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch) {
@@ -1121,6 +1209,9 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             let v3 = batch.vertex(sub(*end, scale(right, *width)), [1.0, 1.0], color);
             batch.triangle(v0, v1, v2);
             batch.triangle(v2, v1, v3);
+        }
+        FxDraw::Rope { start, end, spring, phase, speed, .. } => {
+            append_grapple_rope_cpu(batch, view, mat, *start, *end, *spring, *phase, *speed, seconds);
         }
         FxDraw::Quad { positions, uvs, rgba, .. } => {
             let color = mat.vertex_color(*rgba, seconds);
@@ -1363,6 +1454,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn grapple_rope_gpu_and_cpu_are_contiguous_and_endpoints_are_exact() {
+        let start = [1.0, 2.0, 24.0];
+        let end = [230.0, 75.0, 140.0];
+        let draw = FxDraw::Rope {
+            start, end, spring: [1.2, -0.7, 2.4], phase: 1.1,
+            speed: 930.0, shader: "$grapple_rope".into(),
+        };
+        let gpu = tessellate_gpu_particles(&[draw.clone()], &view(),
+            &mut |_| vec![white(FxBlend::Alpha)]);
+        assert_eq!(gpu.len(), 1);
+        let instances = gpu[0].fx_gpu_sprites.as_ref().expect("procedural rope");
+        assert!(instances.rope);
+        assert!(!instances.lightning);
+        assert_eq!(instances.instances.len(), 2, "halo + core, not 48 FX quads");
+        assert_eq!(instances.instances[0].origin[3], 2.0);
+        assert_eq!(instances.instances[1].origin[3], 3.0);
+        assert_eq!(instances.instances[0].origin[..3], scene::render_position(start));
+        assert_eq!(instances.instances[0].left[..3], scene::render_position(end));
+
+        let cpu = tessellate(&[draw], &view(),
+            &mut |_| vec![white(FxBlend::Alpha)]);
+        assert_eq!(cpu.len(), 1);
+        assert!(cpu[0].fx_gpu_sprites.is_none());
+        // Two 25-node strips, with only TWO vertices per node, shared by
+        // both triangles of every adjacent section.
+        assert_eq!(cpu[0].vertices.len(), 2 * (GRAPPLE_ROPE_SEGMENTS + 1) * 2);
+        assert_eq!(cpu[0].indices.len(), 2 * GRAPPLE_ROPE_SEGMENTS * 2 * 6);
+        let position = |index: usize| cpu[0].vertices[index].position;
+        for layer in 0..2 {
+            let base = layer * (GRAPPLE_ROPE_SEGMENTS + 1) * 2;
+            for (node, target) in [(0, start), (GRAPPLE_ROPE_SEGMENTS, end)] {
+                let center = scale(add(position(base + 2 * node), position(base + 2 * node + 1)), 0.5);
+                let expected = scene::render_position(target);
+                assert!(center.iter().zip(expected).all(|(a, b)| (*a - b).abs() < 0.0001));
+            }
+        }
+    }
 
     #[test]
     fn saber_melt_lit_skin_writes_depth_and_is_not_alpha_blended() {

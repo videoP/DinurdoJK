@@ -1,6 +1,6 @@
 //! Settings video.
 use crate::ui::{
-    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofMode, DofQuality,
+    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DlssMode, DlssModel, DofMode, DofQuality,
     DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode,
     FootprintMode, FullscreenMode, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode,
     CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, PlanarReflectionDebugMode,
@@ -38,6 +38,9 @@ pub struct VideoSettings {
     /// Latched to the next map load.
     pub texture_compression: u8,
     pub msaa_samples: u32,
+    /// Desktop uses the monitor desktop mode at startup, not a fixed pixel size.
+    /// resolution always holds the resolved dimensions used by the renderer.
+    pub resolution_desktop: bool,
     pub resolution: [u32; 2],
     pub window_position: Option<[i32; 2]>,
     pub window_maximized: bool,
@@ -59,6 +62,8 @@ pub struct VideoSettings {
     pub draw_2d: bool,
     /// TaystJK cg_drawHud: core health/shield/ammo/force HUD, not movement tools.
     pub draw_hud: bool,
+    /// 0: DinurdoJK panels; 1: Native multiplayer HUD from active JK2/JKA protocol.
+    pub hud_style: u8,
     pub pvs_mode: PvsMode,
     pub face_plane_cull: bool,
     pub fps_cap: u32,
@@ -295,6 +300,10 @@ pub struct VideoSettings {
     pub physics_debug_draw: bool,
     pub physics_stats: bool,
     pub gamma: f32,
+    /// 2 = automatic: JK2 server -> 1, JKA/local/menu -> 0.
+    /// 0 / 1 force the corresponding OpenJK overbright bit count.
+    pub overbright_bits: u8,
+    pub map_overbright_bits: u8,
     pub gamma_method: crate::gamma::GammaMethod,
     /// Model lighting brightness on the same scale as `gamma`. While
     /// `model_brightness_locked` it tracks the master slider and adds nothing.
@@ -336,6 +345,9 @@ pub struct VideoSettings {
     pub fxaa: bool,
     pub smaa: bool,
     pub taa: bool,
+    pub dlss: bool,
+    pub dlss_mode: DlssMode,
+    pub dlss_model: DlssModel,
     /// 0 off, 1 regional temporal resolve, 2 influence-mask debug. Retains MSAA.
     pub rt_taa: u32,
     pub contact_shadows: bool,
@@ -665,6 +677,17 @@ mod flare_cvar_tests {
     }
 }
 
+impl VideoSettings {
+    /// Automatically follow the currently connected server, never a BSP filename.
+    pub fn effective_overbright_bits(&self, jk2_server: bool) -> u8 {
+        if self.overbright_bits <= 1 { self.overbright_bits } else { u8::from(jk2_server) }
+    }
+
+    pub fn effective_map_overbright_bits(&self, jk2_server: bool) -> u8 {
+        if self.map_overbright_bits <= 1 { self.map_overbright_bits } else { u8::from(jk2_server) }
+    }
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         let mut settings = Self {
@@ -673,7 +696,7 @@ impl Default for VideoSettings {
             lod_curve_error: 250.0,
             no_curves: false,
             speeds: 0,
-            fullscreen: FullscreenMode::Windowed,
+            fullscreen: FullscreenMode::Exclusive,
             renderer_backend: RendererBackend::Vulkan,
             gpu_adapter: 0,
             vsync: VsyncMode::Fast,
@@ -682,7 +705,8 @@ impl Default for VideoSettings {
             present_copy: false,
             texture_compression: 0,
             msaa_samples: 1,
-            resolution: [1280, 800],
+            resolution_desktop: true,
+            resolution: [1280, 800], // Safe pre-monitor fallback; resolved on window creation.
             window_position: None,
             window_maximized: false,
             texture_filter: TextureFilter::Trilinear,
@@ -695,6 +719,7 @@ impl Default for VideoSettings {
             skip_ui: false,
             draw_2d: true,
             draw_hud: true,
+            hud_style: 0,
             pvs_mode: PvsMode::Auto,
             face_plane_cull: false,
             fps_cap: 0,
@@ -839,6 +864,8 @@ impl Default for VideoSettings {
             physics_debug_draw: false,
             physics_stats: false,
             gamma: 1.0,
+            overbright_bits: 2,
+            map_overbright_bits: 2,
             gamma_method: crate::gamma::GammaMethod::Shader,
             model_brightness: 1.0,
             model_brightness_locked: true,
@@ -866,6 +893,9 @@ impl Default for VideoSettings {
             fxaa: false,
             smaa: false,
             taa: false,
+            dlss: false,
+            dlss_mode: DlssMode::Dlaa,
+            dlss_model: DlssModel::Transformer,
             rt_taa: 1,
             contact_shadows: false,
             fog_mode: FogMode::Off,

@@ -132,6 +132,7 @@ mod jk2_demo_browser;
 mod menu_ambience;
 mod hitch;
 mod map_editor;
+mod lead_indicator;
 mod quality;
 mod race_ghost;
 mod race_ghost_web;
@@ -284,6 +285,10 @@ pub struct App {
     solo_map_selected: usize,
     solo_catalog_loaded: bool,
     solo_catalog_error: Option<String>,
+    /// Solo Game page asset game: `None` = JKA, `Some(2|4)` = JK2 1.02/1.04.
+    solo_asset_game: Option<u8>,
+    /// Asset game the loaded or pending `solo_maps` scan belongs to.
+    solo_catalog_for: Option<u8>,
     solo_levelshot_texture: Option<egui::TextureHandle>,
     solo_levelshot_texture_map: Option<String>,
     source_maps: Vec<SoloMapEntry>,
@@ -738,6 +743,7 @@ pub struct App {
     /// thread still projects accepted labels every frame for smooth late-latched motion.
     player_names: ui::PlayerNameSettings,
     player_name_visible: [bool; 32],
+    lead_indicator_visible: [bool; 32],
     race_ghost_label_visible: [bool; 128],
     player_name_scan_at: Instant,
     /// The follow name last sent to the renderer; CG_DrawFollow re-reads it every
@@ -776,6 +782,10 @@ pub struct App {
     /// Which Controls tab is showing (index into the action groups, then Mouse).
     controls_section: usize,
     mouse_buttons_down: HashSet<u8>,
+    /// Mouse4/Mouse5 repeat deadlines, decoupled from render FPS.
+    mouse_repeat_next: [Option<Instant>; 2],
+    in_mouserepeat: u8,
+    in_mouserepeat_delay: u32,
     modifiers: ModifiersState,
     captured: bool,
     mouse_grab_mode: &'static str,
@@ -882,6 +892,7 @@ pub struct App {
     jump_height_shade: bool,
     /// cg_screenShake.
     screen_shake: u8,
+    simulated_projectiles: bool,
     /// cg_headLook: head target visuals only; authoritative targets unchanged.
     head_look: u8,
     /// Archived, client-side directional swim pose strength.
@@ -898,6 +909,8 @@ pub struct App {
     japro_zoom_fov: f32,
     /// Console-configured first-person view bobbing / velocity tilt.
     view_bob: ViewBobSettings,
+    /// Archived TaystJK viewmodel presentation controls (not networked).
+    view_weapon: crate::camera::ViewWeaponSettings,
     japro_zoom_transition_at: Option<Instant>,
     /// TaystJK CG_DoAsync flipkick state/cvars.
     japro_fk_duration: i32,
@@ -918,7 +931,7 @@ pub struct App {
     chat_anim: chat_anim::State,
     /// Client-side mutes from the scoreboard: client number -> name when muted.
     muted_clients: std::collections::HashMap<i32, String>,
-    /// M2/M3 on the scoreboard: free cursor, hover and the player popup.
+    /// +altattack on the scoreboard: free cursor, hover and player popup.
     scoreboard_cursor: scoreboard_cursor::ScoreboardCursor,
     /// When the current session reached the game (wall clock, monotonic).
     session_joined: Option<(String, Instant)>,
@@ -929,9 +942,9 @@ pub struct App {
     /// OpenJK Cbuf-style pending commands. `exec` and `vstr` insert at the
     /// front; interactive/startup commands append at the back.
     console_command_buffer: VecDeque<String>,
-    /// Command-buffer `wait` deadline. DinurdoJK decouples rendering from
-    /// usercmd production, so one wait "frame" is one cl_commandRate interval.
-    console_wait_until: Option<Instant>,
+    /// During live play `wait` counts authored movement commands rather than
+    /// wall-clock intervals or render ticks; menus use a timed fallback.
+    console_wait: Option<commands::buffer::ConsoleWait>,
     /// OpenJK `map`/`devmap` block inside Cbuf_Execute until the level is
     /// spawned, so the rest of a script (`+devmap x +setviewpos ...`) runs
     /// against the new world. Map preparation here is asynchronous; while this
@@ -1025,6 +1038,9 @@ pub struct App {
     hdr_available_modes: u8,
     hdr_modes_known: bool,
     applied_resolution: [u32; 2],
+    applied_resolution_desktop: bool,
+    /// Captured before switching the monitor into Vulkan exclusive mode.
+    desktop_resolution: Option<[u32; 2]>,
     applied_grass: bool,
     applied_ocean: bool,
     video_confirmation: Option<VideoConfirmation>,
@@ -1183,3 +1199,14 @@ mod snapshot_playerstate_transition_tests;
 #[cfg(test)]
 #[path = "app/tests/reflection_prep_tests.rs"]
 mod reflection_prep_tests;
+
+/// Quake-style overbright cvar values. 2 is the per-server automatic default.
+pub(crate) fn overbright_value(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" => Some(0), "1" => Some(1), "auto" => Some(2), _ => None,
+    }
+}
+
+pub(crate) fn overbright_text(mode: u8) -> &'static str {
+    match mode { 0 => "0", 1 => "1", _ => "auto" }
+}

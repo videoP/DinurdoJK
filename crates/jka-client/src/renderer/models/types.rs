@@ -386,6 +386,7 @@ pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
     pub(in crate::renderer) authored_glow: bool,
     pub(in crate::renderer) lightning: bool,
+    pub(in crate::renderer) rope: bool,
 }
 
 pub(in crate::renderer) struct DynamicPreparedDraw {
@@ -461,6 +462,9 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Bit per `DynamicModelAlphaMode::index` with a prepared MD3 draw this frame.
     pub(in crate::renderer) model_alpha_mask: u16,
     pub(in crate::renderer) fx_sprite_shader: Option<wgpu::ShaderModule>,
+    pub(in crate::renderer) fx_rope_shader: Option<wgpu::ShaderModule>,
+    pub(in crate::renderer) fx_rope_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) fx_rope_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_surface_format: wgpu::TextureFormat,
     pub(in crate::renderer) fx_sprite_samples: u32,
     pub(in crate::renderer) fx_sprite_wireframe_pipeline: Option<wgpu::RenderPipeline>,
@@ -528,6 +532,8 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_instance_buffer: wgpu::Buffer,
     pub(in crate::renderer) fx_sprite_instance_capacity: u64,
     pub(in crate::renderer) fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
+    /// Frame-local fast gate: ordinary FX uses its original single-pipeline loop.
+    pub(in crate::renderer) fx_rope_present: bool,
     pub(in crate::renderer) lightning_gpu: Option<super::lightning_gpu::LightningGpu>,
     pub(in crate::renderer) lightning_gpu_attempted: bool,
     /// Allocated only after the first eligible resident particle is submitted.
@@ -553,6 +559,11 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Entity number for each entry in `skin_draw_buffer`, preserving identity even
     /// when Ghoul2 surfaces are instanced across multiple players.
     pub(in crate::renderer) skin_instance_entities: Vec<u16>,
+    /// DLSS active: entity prepass writes motion vectors (see motion.rs).
+    pub(in crate::renderer) object_motion: bool,
+    pub(in crate::renderer) motion: super::motion::ObjectMotion,
+    pub(in crate::renderer) motion_layout: wgpu::BindGroupLayout,
+    pub(in crate::renderer) skin_motion_pipeline_layout: wgpu::PipelineLayout,
     pub(in crate::renderer) ghoul2_batch_draws: Ghoul2BatchMode,
     pub(in crate::renderer) model_state_cache: bool,
     pub(in crate::renderer) dynamic_batch_draws: bool,

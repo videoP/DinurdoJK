@@ -93,6 +93,7 @@ pub(in crate::renderer) fn fx_runs<'a>(
                     || next.wireframe_class != first.wireframe_class
                     || next.authored_glow != first.authored_glow
                     || next.lightning != first.lightning
+                    || next.rope != first.rope
                 {
                     break;
                 }
@@ -223,6 +224,7 @@ mod tests {
             wireframe_class: DynamicWireframeClass::Effect,
             authored_glow: false,
             lightning: false,
+            rope: false,
         }
     }
 
@@ -232,6 +234,16 @@ mod tests {
         let mut b = sprite(1, 2);
         b.lightning = true;
         assert_eq!(fx_runs([&a, &b].into_iter(), true).count(), 2);
+    }
+
+    #[test]
+    fn rope_never_merges_with_sprites_or_lightning() {
+        let a = sprite(1, 0);
+        let mut rope = sprite(1, 2);
+        rope.rope = true;
+        let mut bolt = sprite(1, 4);
+        bolt.lightning = true;
+        assert_eq!(fx_runs([&a, &rope, &bolt].into_iter(), true).count(), 3);
     }
 
     #[test]

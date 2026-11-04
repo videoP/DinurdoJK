@@ -30,6 +30,18 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_HUDSTYLE {
+        runtime: super::hud::APP_HUD_STYLE.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                if let Ok(style) = value.parse::<u8>() { settings.hud_style = style.min(1); }
+            }),
+            archive: Some((455, |state| state.video.hud_style.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_DRAWFPS {
         runtime: super::hud::APP_DRAW_FPS.copy(),
         config: CvarBinding {

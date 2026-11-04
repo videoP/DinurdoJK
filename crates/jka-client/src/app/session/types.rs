@@ -116,6 +116,10 @@ pub(in crate::app) struct GameSession {
     /// once per presentation frame from prediction's provisional display state
     /// or snapshot interpolation, with input-owned view angles applied.
     pub(in crate::app) presented_player_state: Option<jka_protocol::server::PlayerState>,
+    /// Live per-frame client-only viewmodel controls; independent of server snapshots.
+    pub(in crate::app) view_weapon: crate::camera::ViewWeaponSettings,
+    /// cg_fov on the 4:3 baseline, sampled before the session presents weapons.
+    pub(in crate::app) view_weapon_world_fov: f32,
     /// TaystJK-style 100 ms crouch eye-height transition, presentation only.
     pub(in crate::app) duck_view_height: super::sampling::DuckViewHeight,
     /// Local EV_NOAMMO eventParms as received, for JK2's CGame decoding.
@@ -123,6 +127,8 @@ pub(in crate::app) struct GameSession {
     /// Client-side TaystJK optical zoom, separate from Pmove's networked zoomFov.
     pub(in crate::app) scope_zoom: super::sampling::ScopeZoomState,
     pub(in crate::app) client_game: ClientGameState,
+    /// Live-only, independently clocked remote-player visual snapshot ring.
+    pub(in crate::app) remote_smoothing: crate::cgame::remote_smoothing::RemoteSmoothing,
     pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
     /// TaystJK `sxd` teammate stat-viewer cache. Entries are server-time stamped

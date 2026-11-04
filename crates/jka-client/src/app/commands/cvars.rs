@@ -6,6 +6,7 @@ impl App {
         super::registry::cvar_registry()
             .get(self, name)
             .map(|value| value.to_string())
+            .or_else(|| self.network.user_cvar(name).map(|cvar| cvar.value.clone()))
     }
 
     pub(in crate::app) fn parse_console_bool(value: &str) -> Option<bool> {
@@ -47,8 +48,10 @@ impl App {
         name: &str,
         value: &str,
     ) -> Result<ConsoleCvarSetResult, String> {
-        let entry =
-            crate::console::find(name).ok_or_else(|| format!("Cvar {name} does not exist."))?;
+        let Some(entry) = crate::console::find(name) else {
+            self.set_console_cvar(name, value)?;
+            return Ok(ConsoleCvarSetResult::Applied);
+        };
         if entry.latch == crate::console::LatchScope::None {
             self.set_console_cvar(name, value)?;
             return Ok(ConsoleCvarSetResult::Applied);
@@ -122,11 +125,36 @@ impl App {
             }
         }
     }
+    /// Set a user-created cvar with Quake set/seta/setu/sets flag semantics.
+    pub(in crate::app) fn set_user_created_cvar(
+        &mut self, name: &str, value: &str, flags: crate::net::UserCvarFlags,
+    ) -> Result<(), String> {
+        if crate::console::find(name).is_some() {
+            return Err(format!("{name} is already a registered command or cvar"));
+        }
+        let previous = self.network.user_cvar(name);
+        let was_archived = previous.is_some_and(|cv| cv.flags.contains(crate::net::UserCvarFlags::ARCHIVE));
+        let had_userinfo = previous.is_some_and(|cv| cv.flags.contains(crate::net::UserCvarFlags::USERINFO));
+        let changed = self.network.set_user_cvar(name, value, flags)?;
+        let Some(updated) = self.network.user_cvar(name) else { unreachable!() };
+        let archived = updated.flags.contains(crate::net::UserCvarFlags::ARCHIVE);
+        let userinfo = updated.flags.contains(crate::net::UserCvarFlags::USERINFO);
+        if changed && (was_archived || archived) { self.mark_config_dirty(); }
+        if changed && (had_userinfo || userinfo) { self.request_userinfo_send(); }
+        Ok(())
+    }
+
     pub(in crate::app) fn set_console_cvar(
         &mut self,
         name: &str,
         value: &str,
     ) -> Result<(), String> {
-        super::registry::cvar_registry().set(self, name, value)
+        if super::registry::cvar_registry().find(name).is_some() {
+            return super::registry::cvar_registry().set(self, name, value);
+        }
+        if self.network.user_cvar(name).is_some() {
+            return self.set_user_created_cvar(name, value, crate::net::UserCvarFlags::NONE);
+        }
+        Err(format!("Cvar {name} does not exist."))
     }
 }

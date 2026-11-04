@@ -1,4 +1,5 @@
 //! Loading.
+use super::loading_layout::{self, ConnectionPromptUi};
 use crate::ui::{
     lighten, rect, rect_gradient, text, textured_rect_with_source, with_alpha, MapLoadingBar,
     MapLoadingUi, UiVertex, HUD_INK_BOTTOM, HUD_INK_TOP, HUD_VALUE,
@@ -73,6 +74,20 @@ pub(in crate::ui) fn loading_fraction(bar: &MapLoadingBar) -> f32 {
     }
 }
 
+/// Keep the file extension and both ends of a long PK3 name visible without
+/// drawing into the adjacent progress track. The full path remains in footer.
+fn short_download_name(remote_name: &str, max_chars: usize) -> String {
+    let filename = remote_name.rsplit(['/', '\\']).next().unwrap_or(remote_name);
+    let len = filename.chars().count();
+    if len <= max_chars {
+        return filename.to_owned();
+    }
+    let tail = 5.min(max_chars.saturating_sub(3));
+    let head = max_chars.saturating_sub(tail + 3);
+    let suffix = filename.chars().skip(len - tail).collect::<String>();
+    format!("{}...{}", filename.chars().take(head).collect::<String>(), suffix)
+}
+
 pub(in crate::ui) fn build_background_progress(
     out: &mut Vec<UiVertex>,
     progress: &MapLoadingBar,
@@ -137,218 +152,325 @@ pub(in crate::ui) fn build_background_progress(
     );
 }
 
+/// Complete fullscreen loading art, matching JKA/TaystJK's 2D fullscreen
+/// presentation. A 4:3 fallback is stretched to the viewport rather than
+/// cropped. Native widescreen variants are selected by the renderer first.
 pub(in crate::ui) fn build_splash_background(
-    out: &mut Vec<UiVertex>,
-    w: u32,
-    h: u32,
-    splash_size: Option<[u32; 2]>,
+    out: &mut Vec<UiVertex>, w: u32, h: u32, splash_size: Option<[u32; 2]>,
 ) {
-    rect(
-        out,
-        0.0,
-        0.0,
-        w as f32,
-        h as f32,
-        [0.0, 0.0, 0.0, 1.0],
-        w,
-        h,
-    );
+    rect(out, 0.0, 0.0, w as f32, h as f32, [0.0, 0.0, 0.0, 1.0], w, h);
+    if splash_size.is_some_and(|size| size[0] > 0 && size[1] > 0) {
+        textured_rect_with_source(out, 0.0, 0.0, w as f32, h as f32,
+            [0.0, 0.0], [1.0, 1.0], [1.0; 4], 3.0, w, h);
+    }
+}
 
-    if let Some([image_w, image_h]) = splash_size.filter(|size| size[0] > 0 && size[1] > 0) {
-        // Cover the window without distorting the original splash artwork.
-        let scale = (w as f32 / image_w as f32).max(h as f32 / image_h as f32);
-        let draw_w = image_w as f32 * scale;
-        let draw_h = image_h as f32 * scale;
-        let x = (w as f32 - draw_w) * 0.5;
-        let y = (h as f32 - draw_h) * 0.5;
-        textured_rect_with_source(
-            out,
-            x,
-            y,
-            draw_w,
-            draw_h,
-            [0.0, 0.0],
-            [1.0, 1.0],
-            [1.0, 1.0, 1.0, 1.0],
-            3.0,
-            w,
-            h,
-        );
+// The entire connecting screen is composed in the native WGPU UI pass.
+// Taffy supplies the rectangles; UiText supplies a high-resolution font atlas;
+// neon-menu's *actual tube-font geometry* supplies the authored headings.
+// No egui painter, egui font or egui pointer response is used here.
+use super::text::UiText;
+use crate::neon_menu::font::{self as neon_font, Prim};
+use super::loading_layout::ConnectionAction;
+
+type B = [f32; 4];
+
+fn ellipsize(txt: &UiText<'_>, value: &str, px: f32, max_w: f32) -> String {
+    if txt.width(value, px) <= max_w { return value.to_owned(); }
+    let ellipsis = "...";
+    let budget = (max_w - txt.width(ellipsis, px)).max(0.0);
+    let mut result = String::new();
+    for ch in value.chars() {
+        let mut candidate = result.clone();
+        candidate.push(ch);
+        if txt.width(&candidate, px) > budget { break; }
+        result.push(ch);
+    }
+    result.push_str(ellipsis);
+    result
+}
+
+/// Keep the basename, .pk3 suffix and maximum readable prefix inside the
+/// Taffy label cell. Raw substring length is not a font-width measurement.
+fn fit_download_label(txt: &UiText<'_>, name: &str, px: f32, max_w: f32) -> String {
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if txt.width(basename, px) <= max_w { return basename.to_owned(); }
+    let chars: Vec<char> = basename.chars().collect();
+    for total in (8..chars.len()).rev() {
+        let tail = 6.min(total.saturating_sub(3));
+        let head = total - tail - 3;
+        let candidate = format!("{}...{}", chars.iter().take(head).copied().collect::<String>(),
+            chars.iter().skip(chars.len() - tail).copied().collect::<String>());
+        if txt.width(&candidate, px) <= max_w { return candidate; }
+    }
+    ellipsize(txt, basename, px, max_w)
+}
+
+fn draw_line(txt: &UiText<'_>, out: &mut Vec<UiVertex>, value: &str,
+    b: B, px: f32, color: [f32; 4], w: u32, h: u32)
+{
+    let _ = (w, h); // UiText owns viewport dimensions.
+    let line = ellipsize(txt, value, px, b[2].max(1.0));
+    txt.draw(out, &line, b[0], txt.baseline_in(b, px), px, color);
+}
+
+/// Word wrap by *font advance* (not an assumed fixed 6px character width).
+/// At most two lines fit in the Taffy-reserved status/explanation cell.
+fn wrap_two(txt: &UiText<'_>, value: &str, px: f32, max_w: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in value.split_whitespace() {
+        let candidate = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
+        if !line.is_empty() && txt.width(&candidate, px) > max_w {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() { line.push(' '); }
+        line.push_str(word);
+    }
+    if !line.is_empty() { lines.push(line); }
+    if lines.len() > 2 {
+        let rest = lines[1..].join(" ");
+        lines.truncate(1);
+        lines.push(ellipsize(txt, &rest, px, max_w));
+    }
+    for line in &mut lines { *line = ellipsize(txt, line, px, max_w); }
+    lines
+}
+
+fn draw_two_lines(txt: &UiText<'_>, out: &mut Vec<UiVertex>, value: &str,
+    b: B, px: f32, color: [f32; 4])
+{
+    let lines = wrap_two(txt, value, px, b[2]);
+    let line_height = (px * 1.22).min(b[3] * 0.5);
+    let block_h = (lines.len() as f32) * line_height;
+    let mut y = b[1] + (b[3] - block_h).max(0.0) * 0.5;
+    for line in lines {
+        txt.draw(out, &line, b[0], txt.baseline_in([b[0], y, b[2], line_height], px), px, color);
+        y += line_height;
+    }
+}
+
+fn neon_stroke(out: &mut Vec<UiVertex>, p: [f32; 2], q: [f32; 2],
+    radius: f32, color: [f32; 4], w: u32, h: u32)
+{
+    let dx = q[0] - p[0];
+    let dy = q[1] - p[1];
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.001 { return; }
+    let n = [-dy * radius / len, dx * radius / len];
+    let xy = |x: f32, y: f32| [2.0 * x / w.max(1) as f32 - 1.0,
+        1.0 - 2.0 * y / h.max(1) as f32];
+    let v = |point| UiVertex { position: point, uv: [0.0, 0.0], color, textured: 0.0 };
+    let a = xy(p[0] + n[0], p[1] + n[1]);
+    let b = xy(p[0] - n[0], p[1] - n[1]);
+    let c = xy(q[0] - n[0], q[1] - n[1]);
+    let d = xy(q[0] + n[0], q[1] + n[1]);
+    out.extend_from_slice(&[v(a), v(b), v(c), v(a), v(c), v(d)]);
+}
+
+/// Draw the very same Star Jedi outline / stroke-tube letterforms as the main
+/// neon menu, not a scaled copy of the 6x8 JKA bitmap atlas.
+fn neon_heading(out: &mut Vec<UiVertex>, text: &str, b: B, max_cap: f32,
+    color: [f32; 4], w: u32, h: u32)
+{
+    let glyphs = neon_font::place(text);
+    let width = neon_font::measure(text);
+    if width <= 0.0 { return; }
+    let cap = max_cap.min(b[2] / width).min(b[3] * 0.83).max(1.0);
+    let base = b[1] + (b[3] + cap) * 0.5;
+    let radius = (neon_font::tube_ratio() * cap).clamp(0.55, 1.25);
+    for (pass, radius_multiplier, alpha) in [(0, 2.9, 0.14), (1, 1.0, 1.0)] {
+        let _ = pass;
+        let ink = [color[0], color[1], color[2], color[3] * alpha];
+        let r = radius * radius_multiplier;
+        for placed in &glyphs {
+            let origin_x = b[0] + placed.x * cap;
+            let point = |p: [f32; 2]| [origin_x + p[0] * cap, base - p[1] * cap];
+            for prim in placed.glyph.prims.iter() {
+                match *prim {
+                    Prim::Line {a, b} => neon_stroke(out, point(a), point(b), r, ink, w, h),
+                    Prim::Arc {c, r: arc_r, start, sweep} => {
+                        let segments = ((sweep.abs() / 15.0).ceil() as usize).clamp(2, 32);
+                        let mut last = [c[0] + arc_r * start.to_radians().cos(),
+                            c[1] + arc_r * start.to_radians().sin()];
+                        for i in 1..=segments {
+                            let angle = (start + sweep * i as f32 / segments as f32).to_radians();
+                            let next = [c[0] + arc_r * angle.cos(), c[1] + arc_r * angle.sin()];
+                            neon_stroke(out, point(last), point(next), r, ink, w, h);
+                            last = next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn title(txt: &UiText<'_>, out: &mut Vec<UiVertex>, value: &str, b: B,
+    cap: f32, color: [f32; 4], w: u32, h: u32)
+{
+    // Not every installed Star Jedi font contains digits, punctuation or
+    // mod map names. Keep the full readable name when it cannot be tubed.
+    let supported = value.chars().all(|ch| ch.is_whitespace() || neon_font::glyph(ch).is_some());
+    if supported { neon_heading(out, value, b, cap, color, w, h); }
+    else { draw_line(txt, out, value, b, cap, color, w, h); }
+}
+
+fn paint_button(txt: &UiText<'_>, out: &mut Vec<UiVertex>, bounds: B, label: &str,
+    main: bool, enabled: bool, hovered: bool, s: f32, w: u32, h: u32)
+{
+    let [x, y, bw, bh] = bounds;
+    let bg = if !enabled { [0.055, 0.071, 0.103, 0.82] }
+        else if hovered && main { [0.08, 0.30, 0.39, 0.99] }
+        else if hovered { [0.16, 0.20, 0.32, 0.99] }
+        else if main { [0.050, 0.19, 0.25, 0.95] }
+        else { [0.071, 0.087, 0.14, 0.95] };
+    rect(out, x, y, bw, bh, bg, w, h);
+    rect_gradient(out, x, y, bw, if hovered { 2.0 } else { 1.0 },
+        if main { LOAD_CYAN } else { LOAD_LABEL },
+        if main { LOAD_MAGENTA } else { LOAD_FAINT },
+        if main { LOAD_CYAN } else { LOAD_LABEL },
+        if main { LOAD_MAGENTA } else { LOAD_FAINT }, w, h);
+    if hovered && enabled {
+        // Visible feedback on both primary and secondary choices.
+        super::rect_outline(out, x, y, bw, bh, 1.3, with_alpha(LOAD_CYAN, 0.73), w, h);
+        rect(out, x + 1.0, y + bh - 3.0, bw - 2.0, 2.0, with_alpha(LOAD_CYAN, 0.4), w, h);
+    }
+    let px = 14.0 * s;
+    let text = ellipsize(txt, label, px, (bw - 20.0 * s).max(1.0));
+    txt.draw_centered(out, &text, bounds, px, if !enabled { LOAD_FAINT }
+        else if hovered { [1.0, 1.0, 1.0, 1.0] }
+        else if main { [0.90, 0.98, 1.0, 1.0] } else { LOAD_LABEL });
+}
+
+fn paint_connection_prompt(txt: &UiText<'_>, out: &mut Vec<UiVertex>, prompt: &ConnectionPromptUi,
+    g: &loading_layout::DialogLayout, hovered: Option<ConnectionAction>, s: f32, w: u32, h: u32)
+{
+    rect(out, 0.0, 0.0, w as f32, h as f32, [0.002, 0.004, 0.014, 0.69], w, h);
+    let [x, y, bw, bh] = g.panel;
+    rect_gradient(out, x, y, bw, bh, [0.018, 0.028, 0.063, 0.99], [0.018, 0.028, 0.063, 0.99],
+        [0.025, 0.037, 0.072, 0.99], [0.025, 0.037, 0.072, 0.99], w, h);
+    neon_edge(out, x, y, bw, 2.0, -1.0, w, h);
+    match prompt {
+        ConnectionPromptUi::MissingMap { map_name, reason, can_download } => {
+            draw_line(txt, out, "THE SERVER USES A MAP NOT INSTALLED LOCALLY", g.kicker, 12.5*s, LOAD_CYAN, w, h);
+            title(txt, out, "MAP NOT FOUND", g.title, 24.0*s, [0.90, 0.97, 1.0, 1.0], w, h);
+            rect(out, g.subject[0], g.subject[1], g.subject[2], g.subject[3], [0.045, 0.065, 0.12, 0.99], w, h);
+            draw_line(txt, out, map_name, [g.subject[0]+13.0*s, g.subject[1], g.subject[2]-26.0*s, g.subject[3]],
+                18.0*s, LOAD_AMBER, w, h);
+            draw_two_lines(txt, out, reason, g.explanation, 14.0*s, LOAD_LABEL);
+            // Help is two separate lines within the one Taffy reserved cell.
+            let half = g.help[3] * 0.5;
+            draw_line(txt, out, "Choose how to continue:", [g.help[0],g.help[1],g.help[2],half], 13.0*s, LOAD_LABEL, w, h);
+            draw_line(txt, out, if *can_download { "HTTP preferred; legacy JKA download used when enabled." }
+                else { "Autodownload is disabled in Setup > Network." },
+                [g.help[0],g.help[1]+half,g.help[2],half], 12.0*s,
+                if *can_download { LOAD_FAINT } else { LOAD_AMBER }, w, h);
+            paint_button(txt, out, g.primary, "AUTO-DOWNLOAD & CONNECT", true, *can_download,
+                hovered == Some(ConnectionAction::Download), s, w, h);
+            paint_button(txt, out, g.secondary, "CONNECT ANYWAY", false, true,
+                hovered == Some(ConnectionAction::ConnectAnyway), s, w, h);
+            paint_button(txt, out, g.tertiary, "ABORT", false, true,
+                hovered == Some(ConnectionAction::Abort), s, w, h);
+        }
+        ConnectionPromptUi::Password { target, message, masked_len } => {
+            draw_line(txt, out, "AUTHENTICATION REQUIRED", g.kicker, 12.5*s, LOAD_CYAN, w, h);
+            title(txt, out, "SERVER PASSWORD", g.title, 24.0*s, [0.90, 0.97, 1.0, 1.0], w, h);
+            rect(out,g.subject[0],g.subject[1],g.subject[2],g.subject[3],[0.05,0.08,0.14,0.99],w,h);
+            let max = (g.subject[2] / (10.0*s)).floor().max(1.0) as usize;
+            let bullets = "*".repeat((*masked_len).min(max.saturating_sub(1)));
+            draw_line(txt, out, if bullets.is_empty() {"PASSWORD"} else {&bullets},
+                [g.subject[0]+13.0*s,g.subject[1],g.subject[2]-26.0*s,g.subject[3]],
+                17.0*s, if bullets.is_empty() {LOAD_FAINT} else {[0.95,0.98,1.0,1.0]},w,h);
+            draw_line(txt, out, target, g.explanation, 14.0*s, LOAD_LABEL, w, h);
+            draw_two_lines(txt, out, message.as_deref().unwrap_or("Enter the password to connect."),
+                g.help, 13.5*s, if message.is_some() {LOAD_AMBER} else {LOAD_LABEL});
+            paint_button(txt, out, g.primary, "CONNECT", true, true,
+                hovered == Some(ConnectionAction::PasswordConnect), s, w, h);
+            paint_button(txt, out, g.secondary, "CANCEL", false, true,
+                hovered == Some(ConnectionAction::PasswordCancel), s, w, h);
+        }
     }
 }
 
 pub(in crate::ui) fn build_loading_screen(
-    out: &mut Vec<UiVertex>,
-    loading: &MapLoadingUi,
-    w: u32,
-    h: u32,
-    splash_size: Option<[u32; 2]>,
+    out: &mut Vec<UiVertex>, ui: &crate::ui::UiSnapshot,
+    loading: &MapLoadingUi, small_font: Option<&crate::ui::ProportionalFont>,
+    w: u32, h: u32, splash_size: Option<[u32; 2]>,
 ) {
-    build_splash_background(out, w, h, splash_size);
-
-    // Darken the lower half so the panel reads over any splash artwork.
-    let fade_h = h as f32 * 0.55;
-    let clear = [0.0, 0.0, 0.02, 0.0];
-    let dark = [0.0, 0.0, 0.02, 0.80];
-    rect_gradient(
-        out,
-        0.0,
-        h as f32 - fade_h,
-        w as f32,
-        fade_h,
-        clear,
-        clear,
-        dark,
-        dark,
-        w,
-        h,
-    );
-
-    // Renderer setup includes CPU index/patch work, texture compression,
-    // wgpu uploads, pipeline compilation, and the first rendered frame. It is
-    // NOT a measured GPU transfer progress bar. Keep it indeterminate rather
-    // than falsely reporting completion percentages.
-    let upload_bar = MapLoadingBar {
-        label: "RENDERER SETUP",
-        completed: 0,
-        total: 1,
-        skipped: false,
+    build_splash_background(out,w,h,splash_size);
+    let fade_h = h as f32 * 0.59;
+    rect_gradient(out, 0.0, h as f32-fade_h, w as f32, fade_h,
+        [0.0,0.0,0.02,0.0], [0.0,0.0,0.02,0.0],
+        [0.0,0.0,0.02,0.79], [0.0,0.0,0.02,0.79], w, h);
+    let g = loading_layout::layout(loading,w,h);
+    let hovered = loading.pointer.and_then(|p| g.hit_test(p, loading.connection_prompt.as_ref()));
+    let txt = UiText::new(ui, small_font, w, h);
+    let s = g.text_scale;
+    let [x,y,pw,ph] = g.panel;
+    rect_gradient(out,x,y,pw,ph,[0.012,0.016,0.038,0.94],[0.012,0.016,0.038,0.94],
+        [0.022,0.028,0.064,0.96],[0.022,0.028,0.064,0.96],w,h);
+    neon_edge(out,x,y,pw,2.0,-1.0,w,h);
+    title(&txt,out,if loading.joining_server {"JOINING SERVER"} else {"LOADING MAP"},
+        g.kicker,14.0*s,LOAD_CYAN,w,h);
+    let heading = loading.map_name.to_ascii_uppercase();
+    title(&txt,out,&heading,g.heading,25.0*s,[0.92,0.98,1.0,1.0],w,h);
+    let visible: Vec<&MapLoadingBar> = loading.bars.iter().filter(|bar| !bar.skipped).collect();
+    let overall = if visible.is_empty() {0.0} else {
+        visible.iter().map(|b| if b.label == "SERVER CONTENT" {
+            loading.download_overall_fraction.unwrap_or_else(|| loading_fraction(b))
+        } else {loading_fraction(b)}).sum::<f32>() / visible.len() as f32
     };
-    let mut visible: Vec<&MapLoadingBar> = loading
-        .bars
-        .iter()
-        .filter(|bar| !(bar.skipped || (loading.preparation_finished && bar.total == 0)))
-        .collect();
-    if loading.preparation_finished {
-        visible.push(&upload_bar);
+    let percent = format!("{}%",(overall*100.0).round() as u32);
+    txt.draw_right(out, &percent, g.percentage[0]+g.percentage[2],
+        txt.baseline_in(g.percentage,18.0*s),18.0*s,LOAD_AMBER);
+    progress_track(out, g.overall_track[0],g.overall_track[1],g.overall_track[2],
+        g.overall_track[3],overall,LOAD_CYAN,LOAD_MAGENTA,w,h);
+    for (bar,cells) in visible.iter().zip(g.rows.iter()) {
+        let done = bar.total>0 && bar.completed>=bar.total;
+        let fraction=loading_fraction(bar);
+        let label = if bar.label == "SERVER CONTENT" {
+            if let Some(name) = loading.download_file_name.as_deref() {
+                fit_download_label(&txt, name, 13.6*s, cells[0][2])
+            } else {bar.label.to_owned()}
+        } else {bar.label.to_owned()};
+        draw_line(&txt,out,&label,cells[0],13.6*s,
+            if bar.no_work || bar.total==0 {LOAD_FAINT} else {LOAD_LABEL},w,h);
+        let (from,to) = if bar.no_work {(with_alpha(LOAD_FAINT,0.35),LOAD_FAINT)}
+            else if done {(with_alpha(LOAD_DONE,0.6),LOAD_DONE)}
+            else {(with_alpha(LOAD_CYAN,0.5),LOAD_CYAN)};
+        progress_track(out,cells[1][0],cells[1][1]+cells[1][3]*0.42,
+            cells[1][2],(cells[1][3]*0.17).max(3.0),fraction,from,to,w,h);
+        let status = if bar.no_work {"N/A".to_owned()} else if bar.total==0 {"WAIT".to_owned()}
+            else if done {"DONE".to_owned()} else if bar.total==1 {"WORKING".to_owned()}
+            else if bar.label=="SERVER CONTENT" {format!("{}%",(fraction*100.0).floor() as u32)}
+            else {format!("{}/{}",bar.completed,bar.total)};
+        draw_line(&txt,out,&status,cells[2],12.4*s,
+            if bar.no_work || bar.total==0 {LOAD_FAINT} else if done {LOAD_DONE} else {LOAD_LABEL},w,h);
     }
-    let overall = if visible.is_empty() {
-        0.0
-    } else {
-        visible.iter().map(|bar| loading_fraction(bar)).sum::<f32>() / visible.len() as f32
-    };
+    if let Some(status) = loading.status_line.as_deref() {
+        let [fx,fy,fw,fh]=g.status;
+        rect(out,fx,fy+1.0*s,fw,1.0*s,with_alpha(LOAD_CYAN,0.25),w,h);
+        draw_two_lines(&txt,out,status,[fx,fy+5.0*s,fw,(fh-5.0*s).max(1.0)],13.7*s,LOAD_LABEL);
+    }
+    if let Some(cancel) = g.cancel {
+        paint_button(&txt,out,cancel,"CANCEL CONNECTION",false,true,
+            hovered==Some(ConnectionAction::CancelJoin),s,w,h);
+    }
+}
 
-    let panel_w = (w as f32 - 48.0).clamp(360.0, 760.0);
-    let row_h = 27.0;
-    let rows_y = 82.0;
-    let panel_h = rows_y + visible.len() as f32 * row_h + 20.0;
-    let x = (w as f32 - panel_w) * 0.5;
-    let y = (h as f32 - panel_h - 34.0).max(24.0);
-    rect_gradient(
-        out,
-        x,
-        y,
-        panel_w,
-        panel_h,
-        [0.012, 0.016, 0.038, 0.92],
-        [0.012, 0.016, 0.038, 0.92],
-        [0.022, 0.028, 0.064, 0.94],
-        [0.022, 0.028, 0.064, 0.94],
-        w,
-        h,
-    );
-    neon_edge(out, x, y, panel_w, 2.0, -1.0, w, h);
-
-    // Header: kicker, map name, overall percentage.
-    text(out, "LOADING", x + 22.0, y + 15.0, 1.1, LOAD_CYAN, w, h);
-    text(
-        out,
-        &loading.map_name.to_ascii_uppercase(),
-        x + 22.0,
-        y + 29.0,
-        2.2,
-        [0.95, 0.97, 1.0, 1.0],
-        w,
-        h,
-    );
-    let percent = format!("{}%", (overall * 100.0).round() as u32);
-    let percent_w = percent.len() as f32 * 6.0 * 2.2;
-    text(
-        out,
-        &percent,
-        x + panel_w - 22.0 - percent_w,
-        y + 29.0,
-        2.2,
-        LOAD_AMBER,
-        w,
-        h,
-    );
-    progress_track(
-        out,
-        x + 22.0,
-        y + 58.0,
-        panel_w - 44.0,
-        6.0,
-        overall,
-        LOAD_CYAN,
-        LOAD_MAGENTA,
-        w,
-        h,
-    );
-
-    let bar_x = x + 174.0;
-    let bar_w = panel_w - 270.0;
-    for (index, bar) in visible.iter().enumerate() {
-        let row_y = y + rows_y + index as f32 * row_h;
-        let done = bar.total > 0 && bar.completed >= bar.total;
-        let fraction = loading_fraction(bar);
-        text(
-            out,
-            bar.label,
-            x + 22.0,
-            row_y + 4.0,
-            1.25,
-            if bar.total == 0 {
-                LOAD_FAINT
-            } else {
-                LOAD_LABEL
-            },
-            w,
-            h,
-        );
-        let (from, to) = if done {
-            (with_alpha(LOAD_DONE, 0.6), LOAD_DONE)
-        } else {
-            (with_alpha(LOAD_CYAN, 0.5), LOAD_CYAN)
-        };
-        progress_track(
-            out,
-            bar_x,
-            row_y + 6.0,
-            bar_w,
-            6.0,
-            fraction,
-            from,
-            to,
-            w,
-            h,
-        );
-        let status = if bar.total == 0 {
-            "WAIT".to_string()
-        } else if done {
-            "DONE".to_string()
-        } else if bar.total == 1 {
-            // A single inline step has no meaningful "0/1".
-            "WORKING".to_string()
-        } else {
-            format!("{}/{}", bar.completed, bar.total)
-        };
-        text(
-            out,
-            &status,
-            x + panel_w - 76.0,
-            row_y + 4.0,
-            1.2,
-            if done {
-                LOAD_DONE
-            } else if bar.total == 0 {
-                LOAD_FAINT
-            } else {
-                LOAD_LABEL
-            },
-            w,
-            h,
-        );
+/// Modal draws last so it stays above the classic console; only the native
+/// Taffy UI owns its pointer and keyboard handling.
+pub(in crate::ui) fn build_loading_modal(
+    out: &mut Vec<UiVertex>, ui: &crate::ui::UiSnapshot, loading: &MapLoadingUi,
+    small_font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
+) {
+    let Some(prompt) = loading.connection_prompt.as_ref() else {return;};
+    let g = loading_layout::layout(loading,w,h);
+    if let Some(dialog) = g.dialog.as_ref() {
+        let hovered = loading.pointer.and_then(|p| g.hit_test(p,Some(prompt)));
+        let txt = UiText::new(ui, small_font, w, h);
+        paint_connection_prompt(&txt,out,prompt,dialog,hovered,g.text_scale,w,h);
     }
 }
 
@@ -398,4 +520,26 @@ pub(in crate::ui) fn build_shader_compile_progress(
         out, x + 12.0, y + panel_h - 15.0, panel_w - 24.0, 5.0,
         loading_fraction(progress), with_alpha(LOAD_CYAN, 0.6), LOAD_CYAN, w, h,
     );
+}
+
+#[cfg(test)]
+mod download_label_tests {
+    use super::{neon_heading, short_download_name, LOAD_CYAN};
+
+    #[test]
+    fn loading_headings_reuse_neon_menu_vector_letterforms() {
+        let mut out = Vec::new();
+        neon_heading(&mut out, "MAP NOT FOUND", [20.0, 10.0, 360.0, 38.0],
+            24.0, LOAD_CYAN, 1280, 720);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|v| v.textured == 0.0));
+    }
+
+    #[test]
+    fn download_label_updates_filename_without_overflowing_its_column() {
+        assert_eq!(short_download_name("japro/map.pk3", 19), "map.pk3");
+        let long = short_download_name("japro/extremely_long_custom_map_pack.pk3", 19);
+        assert!(long.chars().count() <= 19);
+        assert!(long.ends_with("k.pk3"));
+    }
 }

@@ -4,6 +4,7 @@ pub(in crate::renderer) mod fixture_lighting;
 pub(in crate::renderer) mod pipelines;
 pub(in crate::renderer) mod prepare;
 pub(in crate::renderer) mod md3_cache;
+pub(in crate::renderer) mod motion;
 pub(in crate::renderer) mod bundles;
 pub(in crate::renderer) mod skinning;
 pub(in crate::renderer) mod state;

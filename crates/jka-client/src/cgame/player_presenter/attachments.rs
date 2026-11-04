@@ -86,6 +86,13 @@ pub enum PlayerFxRequest {
         /// Authored OpenJK noWallMarks/noWallMarks2 for the active blade style.
         no_wall_marks: bool,
     },
+    /// TaystJK CG_AddPlayerWeapon: charging glow at Ghoul2 model 1, bolt 0.
+    WeaponCharge {
+        origin: [f32; 3],
+        weapon: i32,
+        state: i32,
+        start_ms: i32,
+    },
     /// CG_ForcePushBlur's LE_PUFF path (two sprites drifting sideways).
     PushPuffs { origin: [f32; 3] },
     /// CG_ForceGripEffect (a red puff and a red saber-glow puff).
@@ -110,6 +117,13 @@ pub(in crate::cgame::player_presenter) const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4
 
 pub(in crate::cgame::player_presenter) const JETPACK_MODEL: &str =
     "models/weapons2/jetpack/model.glm";
+
+#[inline]
+fn jetpack_needs_pose(render_model: bool, e_flags: i32) -> bool {
+    // Visible pack: render its GLM. Hidden FPLS pack: only evaluate its child
+    // bolts when an active exhaust effect needs them.
+    render_model || e_flags & EF_JETPACK_ACTIVE != 0
+}
 
 pub(in crate::cgame::player_presenter) const PW_DISINT_4: i32 = 9;
 
@@ -314,7 +328,8 @@ impl PlayerPresenter {
     /// The legacy renderer copies a preloaded Ghoul2 jetpack instance into
     /// model index 3, whose parent bolt is player bolt 2 (`*chestg`). This
     /// renderer has no mutable multi-model Ghoul2 instance, so the equivalent
-    /// is a child GLM pose rooted directly at the chest bolt.
+    /// is a child GLM pose rooted directly at the chest bolt. In first-person
+    /// FPLS, suppress model slot 3 but keep active jet exhaust effects.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::cgame::player_presenter) fn append_jetpack(
         &mut self,
@@ -326,7 +341,14 @@ impl PlayerPresenter {
         player_origin: [f32; 3],
         current_time: i32,
         entity_alpha: f32,
+        render_model: bool,
     ) -> Result<(), String> {
+        let e_flags = entity.state.field_i32("eFlags").unwrap_or(0);
+        // An inactive first-person pack needs neither the child GLM asset nor
+        // chest/nozzle bolt evaluation. Active exhaust remains world-visible.
+        if !jetpack_needs_pose(render_model, e_flags) {
+            return Ok(());
+        }
         let Some(chest_bolt) = model_bolt_matrix_timed(
             &mut self.perf,
             &player_model.glm,
@@ -347,24 +369,24 @@ impl PlayerPresenter {
         )?)?;
         record_pose_eval(&mut self.perf, pose_started);
 
-        let mut jetpack_draws = self.render_glm_surfaces(
-            entity.number,
-            JETPACK_MODEL,
-            &jetpack.glm,
-            &jetpack.gla,
-            &jetpack.surfaces,
-            None,
-            &jetpack_pose,
-            0,
-            player_axis,
-            player_origin,
-            [1.0, 1.0, 1.0, entity_alpha],
-            None,
-            true,
-        )?;
-        draws.append(&mut jetpack_draws);
-
-        let e_flags = entity.state.field_i32("eFlags").unwrap_or(0);
+        if render_model {
+            let mut jetpack_draws = self.render_glm_surfaces(
+                entity.number,
+                JETPACK_MODEL,
+                &jetpack.glm,
+                &jetpack.gla,
+                &jetpack.surfaces,
+                None,
+                &jetpack_pose,
+                0,
+                player_axis,
+                player_origin,
+                [1.0, 1.0, 1.0, entity_alpha],
+                None,
+                true,
+            )?;
+            draws.append(&mut jetpack_draws);
+        }
         if e_flags & EF_JETPACK_ACTIVE == 0 {
             return Ok(());
         }
@@ -471,6 +493,7 @@ impl PlayerPresenter {
         player_origin: [f32; 3],
         current_time: i32,
         entity_alpha: f32,
+        emit_charge_fx: bool,
     ) -> Result<(), String> {
         let qpath = weapon_world_model(weapon).ok_or("weapon has no Ghoul2 world model")?;
         let Some(hand_bolt) = model_bolt_matrix_timed(
@@ -503,10 +526,54 @@ impl PlayerPresenter {
             player_axis,
             player_origin,
             [1.0, 1.0, 1.0, entity_alpha],
-            None,
+            crate::renderer::collision_world_only().then(|| (
+                Some(super::presentation::collision_world_equipment_texture()),
+                crate::renderer::DynamicModelAlphaMode::Opaque,
+                false,
+            )),
             true,
         )?;
         draws.append(&mut weapon_draws);
+        // CG_AddPlayerWeapon samples the animated Ghoul2 weapon's flash bolt,
+        // not the player eye position or an approximate hand offset.  The
+        // weapon pose is already parented to *r_hand above. The *flash surface
+        // is the first bolt registered on TaystJK's weapon model instance.
+        if emit_charge_fx && crate::cgame::weapon_fx::weapon_charge(
+            weapon,
+            entity.state.field_i32("modelindex2").unwrap_or(0),
+            entity.state.field_i32("constantLight").unwrap_or(0),
+            current_time,
+        ).is_some() {
+            if let Some(muzzle) = model_bolt_matrix_timed(
+                &mut self.perf, &weapon_model.glm, &weapon_model.gla, &pose, "*flash",
+            )? {
+                let origin = transform_jka_model_point(
+                    [muzzle[0][3], muzzle[1][3], muzzle[2][3]],
+                    player_axis, player_origin,
+                );
+                self.fx_requests.push(PlayerFxRequest::WeaponCharge {
+                    origin,
+                    weapon,
+                    state: entity.state.field_i32("modelindex2").unwrap_or(0),
+                    start_ms: entity.state.field_i32("constantLight").unwrap_or(0),
+                });
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod first_person_jetpack_tests {
+    use super::*;
+
+    #[test]
+    fn fpls_only_evaluates_hidden_jetpack_when_exhaust_is_active() {
+        // Model slot 3 stays off in first person. Without active flames, do
+        // not even load/pose the jetpack; with flames, keep nozzle bolt FX.
+        assert!(!jetpack_needs_pose(false, EF_JETPACK));
+        assert!(jetpack_needs_pose(false, EF_JETPACK | EF_JETPACK_ACTIVE));
+        // Third-person/remote jetpack models retain their normal draw path.
+        assert!(jetpack_needs_pose(true, EF_JETPACK));
     }
 }

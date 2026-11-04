@@ -97,7 +97,7 @@ fn main() {
     for file in ["bg_pmove", "bg_slidemove", "bg_panimate", "bg_saber", "bg_weapons", "bg_misc", "bg_multiversion", "animMappingTable", "q_math", "q_shared"] {
         jk2.file(format!("vendor/mvsdk/code/game/{file}.c"));
     }
-    jk2.file("native/jk2_movement.c").file("native/jk2_context.c").file("native/jk2_select.c").file("native/jk2_oracle.c").compile("jk2_mvsdk_pmove");
+    jk2.file("native/jk2_movement.c").file("native/jk2_angles.c").file("native/jk2_context.c").file("native/jk2_select.c").file("native/jk2_oracle.c").compile("jk2_mvsdk_pmove");
     let mut collision = cc::Build::new();
     collision
         .cpp(true)

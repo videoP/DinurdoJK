@@ -1,5 +1,5 @@
 //! Session build.
-use crate::app::{App, Arc, EntityPresenter, GameSession, LocalServer, Path, PlayerPresenter};
+use crate::app::{App, Arc, EntityPresenter, GameSession, LocalServer, Path, PlayerPresenter, Instant};
 
 impl App {
     pub(in crate::app) fn build_cgame_cpu_assets(
@@ -167,6 +167,7 @@ impl App {
             .set_saber_staff_multi_color(self.saber_staff_multi_color);
         session.weapon_fx.set_saber_trail(self.saber_trail);
         session.player_presenter.set_speed_trail(self.speed_trail);
+        session.weapon_fx.set_simulated_projectiles(self.simulated_projectiles);
         session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
         session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
         session.weapon_fx.set_fx_physics(self.video.fx_physics);
@@ -293,6 +294,9 @@ impl App {
             session.live_snapshots.pop_front();
         }
         session.snapshots = session.snapshots.saturating_add(1);
+        if crate::cgame::remote_smoothing::mode() != 0 {
+            session.remote_smoothing.receive(&snapshot, Instant::now());
+        }
         session.live_snapshots.push_back(snapshot);
     }
 

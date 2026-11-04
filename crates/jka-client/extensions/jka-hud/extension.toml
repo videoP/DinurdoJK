@@ -1,5 +1,0 @@
-api_version = 1
-name = "Jedi Academy HUD"
-entry = "main.rhai"
-# Replaces the native status HUD with the retail multiplayer HUD (ui/hud.menu).
-hides_native_hud = ["health", "shield", "ammo", "force"]

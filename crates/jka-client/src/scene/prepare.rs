@@ -23,7 +23,7 @@ use crate::scene::{
     Instant, LegacyDlightSurface, MapJobPool, MapLoadTimings, MapPrepareOptions, Path,
     PrepStageKeys, PreparedMap, PreparedPortalDrawPlan, SourceMapLighting, SpawnPoint,
     StageFingerprint, SurfaceKind, SurfaceMaterial, Task, TextureData, Textures, Vec3,
-    WorldGeometryChunk, LIGHTMAP_BY_VERTEX, MAX_FILE_BYTES,
+    WorldGeometryChunk, LIGHTMAP_BY_VERTEX, MAX_FILE_BYTES, overbright_rgb, shift_lightmap_rgba,
 };
 
 /// Player collision by the engine of the game whose VFS the map came from:
@@ -527,11 +527,21 @@ pub(in crate::scene) fn prepare_internal(
     // An atlas cannot preserve the q3map2 lightmap/deluxemap pairing or FP16
     // companion values without building a second typed atlas. Keep the classic
     // atlas for ordinary 8-bit maps and use per-page textures for richer data.
-    let atlas = (embedded_lightmap_pages > 0
+    let mut atlas = (embedded_lightmap_pages > 0
         && bounded_uvs
         && !world_deluxe_mapping
         && !options.float_lightmap)
         .then(|| Atlas::new(&bsp.lightmaps));
+    if let Some(atlas) = atlas.as_mut() {
+        if options.map_overbright_bits != options.overbright_bits {
+            for pixel in atlas.rgba.chunks_exact_mut(4) {
+                let rgb = overbright_rgb(
+                    [pixel[0], pixel[1], pixel[2]], options.map_overbright_bits, options.overbright_bits,
+                );
+                pixel[..3].copy_from_slice(&rgb);
+            }
+        }
+    }
 
     let mut external_lightmaps = Vec::new();
     let mut external_deluxemaps = Vec::new();
@@ -544,7 +554,10 @@ pub(in crate::scene) fn prepare_internal(
             // TaystJK skips absent external pages and later substitutes vertex
             // lighting for shaders that reference them. Keep the same behavior
             // instead of failing the entire BSP; real decode errors still fail.
-            let Some(image) = load_external_lightmap(&mut assets, name, page, options.float_lightmap)? else {
+            let Some(image) = load_external_lightmap(
+                &mut assets, name, page, options.float_lightmap,
+                options.map_overbright_bits, options.overbright_bits,
+            )? else {
                 missing_external_lightmaps.insert(page);
                 continue;
             };
@@ -609,7 +622,8 @@ pub(in crate::scene) fn prepare_internal(
     } else {
         external_lightmaps.len()
     };
-    let static_light_grid = prepare_static_light_grid(&bsp, &mut assets, name, &mut warnings)?;
+    let static_light_grid = prepare_static_light_grid(&bsp, &mut assets, name, &mut warnings,
+        options.map_overbright_bits, options.overbright_bits)?;
     load_timings.lightmap_ms = lightmap_stage.elapsed().as_secs_f64() * 1000.0;
     phase_lap(&mut load_timings, 2, &mut phase_clock);
 
@@ -629,6 +643,7 @@ pub(in crate::scene) fn prepare_internal(
             yaw: spawn.yaw.to_radians(),
             initial: spawn.initial,
             no_humans: spawn.no_humans,
+            fallback: false,
         })
         .collect();
     if spawns.is_empty() {
@@ -639,6 +654,7 @@ pub(in crate::scene) fn prepare_internal(
         spawns.push(SpawnPoint {
             position,
             yaw: 0.0,
+            fallback: true,
             ..SpawnPoint::default()
         });
     }
@@ -1003,7 +1019,10 @@ pub(in crate::scene) fn prepare_internal(
                     (None, Some(_)) => raw_lightmap_uv,
                     _ => [-1.0, -1.0],
                 };
-                let color = vertex.color[color_slot as usize].map(|v| f32::from(v) / 255.0);
+                let raw = vertex.color[color_slot as usize];
+                let shifted = overbright_rgb([raw[0], raw[1], raw[2]], options.map_overbright_bits, options.overbright_bits);
+                let color = [shifted[0], shifted[1], shifted[2], raw[3]]
+                    .map(|v| f32::from(v) / 255.0);
                 geometry.push(GpuVertex {
                     position: render_position(vertex.position),
                     uv: vertex.texcoord,
@@ -1452,6 +1471,21 @@ pub(in crate::scene) fn prepare_internal(
         );
     }
 
+    if options.overbright_bits != 0 {
+        // OpenJK identityLight = 1 / (1 << overbrightBits). Scale only
+        // rgbGen identityLighting, not rgbGen identity or authored vertex alpha.
+        fn identity_scale(batch: &mut crate::scene::DrawBatch, scale: f32) {
+            if matches!(batch.rgb_gen, jka_assets::shader::RgbGen::IdentityLighting) {
+                for channel in &mut batch.color[..3] { *channel *= scale; }
+            }
+            for companion in &mut batch.additive_companions { identity_scale(companion, scale); }
+        }
+        let scale = 1.0 / f32::from(1u8 << options.overbright_bits.min(1));
+        for batch in batches.iter_mut().chain(pvs_batches.iter_mut()).chain(inline_batches.iter_mut()) {
+            identity_scale(batch, scale);
+        }
+    }
+
     phase_lap(&mut load_timings, 7, &mut phase_clock);
     let mut lights = bsp_dynamic_lights(&bsp);
     let entity_light_count = lights.len();
@@ -1679,6 +1713,7 @@ pub(in crate::scene) fn prepare_internal(
                 } else {
                     embedded_lightmap_texture(source_page, &pages[source_page])
                 };
+                shift_lightmap_rgba(&mut lightmap, options.map_overbright_bits, options.overbright_bits);
                 if options.float_lightmap {
                     materials::promote_lightmap_to_float(&mut lightmap);
                 }
@@ -1696,6 +1731,7 @@ pub(in crate::scene) fn prepare_internal(
                 } else {
                     embedded_lightmap_texture(source_page, page)
                 };
+                shift_lightmap_rgba(&mut lightmap, options.map_overbright_bits, options.overbright_bits);
                 if options.float_lightmap {
                     materials::promote_lightmap_to_float(&mut lightmap);
                 }

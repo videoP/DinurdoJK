@@ -5,6 +5,21 @@ use crate::app::{
 };
 use std::io::Write;
 
+/// Downsample UI publishes: at most 1% increments for known file sizes,
+/// or every 256 KiB while the server hasn't provided a Content-Length.
+/// File boundaries and the arrival of a known size always publish: the label
+/// must change to the new PK3 immediately, and WORKING must become 0%.
+fn download_ui_bucket(state: Option<&LiveDownloadState>) -> Option<(usize, bool, u64)> {
+    state.map(|state| {
+        let known_total = state.total.filter(|total| *total > 0);
+        let unit = match known_total {
+            Some(total) => state.received.saturating_mul(100) / total,
+            None => state.received / (256 * 1024),
+        };
+        (state.index, known_total.is_some(), unit)
+    })
+}
+
 impl App {
     /// CL_InitDownloads / FS_ComparePaks. The gamestate supplies the complete
     /// referenced-PK3 list, so this starts only after the pre-connect dialog's
@@ -92,6 +107,7 @@ impl App {
         });
         self.egui_repaint_requested = true;
         self.start_live_download_current();
+        self.publish_ui();
     }
 
     pub(in crate::app) fn start_live_download_current(&mut self) {
@@ -224,6 +240,7 @@ impl App {
     }
 
     pub(in crate::app) fn poll_live_download(&mut self) {
+        let before = download_ui_bucket(self.live_download.as_ref());
         let events = match self.live_download.as_ref().map(|state| &state.transfer) {
             Some(LiveDownloadTransfer::Http { rx }) => rx.try_iter().collect::<Vec<_>>(),
             _ => return,
@@ -282,12 +299,16 @@ impl App {
                 }
             }
         }
+        if download_ui_bucket(self.live_download.as_ref()) != before {
+            self.publish_ui();
+        }
     }
 
     pub(in crate::app) fn handle_live_download_block(
         &mut self,
         block: jka_protocol::server::DownloadBlock,
     ) {
+        let before = download_ui_bucket(self.live_download.as_ref());
         if !matches!(
             self.live_download.as_ref().map(|state| &state.transfer),
             Some(LiveDownloadTransfer::Legacy { .. })
@@ -420,6 +441,9 @@ impl App {
             self.start_live_download_current();
         }
         self.egui_repaint_requested = true;
+        if download_ui_bucket(self.live_download.as_ref()) != before {
+            self.publish_ui();
+        }
     }
 
     pub(in crate::app) fn finish_live_autodownload(&mut self) {
@@ -469,6 +493,7 @@ impl App {
             return;
         }
         self.egui_repaint_requested = true;
+        self.publish_ui();
     }
 
     pub(in crate::app) fn fail_live_autodownload(&mut self, map_name: &str, error: String) {

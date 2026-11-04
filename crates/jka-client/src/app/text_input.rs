@@ -359,7 +359,7 @@ impl App {
                 self.chat_player_completion = None;
                 self.set_overlay(OverlayMode::None);
             }
-            KeyCode::Enter if !event.repeat => self.submit_chat(),
+            KeyCode::Enter | KeyCode::NumpadEnter if !event.repeat => self.submit_chat(),
             KeyCode::Tab => {
                 if !event.repeat {
                     if self.chatbox_completion {

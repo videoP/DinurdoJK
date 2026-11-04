@@ -596,7 +596,7 @@ impl Renderer {
                 },
                 0.0,
                 0.0,
-                0.0,
+                f32::from(self.overbright_bits), // reserved .w: OpenJK output shift
             ],
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
@@ -661,8 +661,8 @@ impl Renderer {
         };
         let uniform = SsaoTemporalUniform {
             viewport_history: [
-                self.config.width.max(1) as f32,
-                self.config.height.max(1) as f32,
+                self.targets.render_size.0 as f32,
+                self.targets.render_size.1 as f32,
                 if self.ssao_history_valid { 1.0 } else { 0.0 },
                 0.0,
             ],
@@ -694,8 +694,8 @@ impl Renderer {
         };
         let uniform = SsrTemporalUniform {
             viewport_history: [
-                self.config.width.max(1) as f32,
-                self.config.height.max(1) as f32,
+                self.targets.render_size.0 as f32,
+                self.targets.render_size.1 as f32,
                 // r_ssrDebug 6 holds the temporal accumulation permanently
                 // invalid, so every frame is a fresh trace. The blend weight is
                 // 0.90 while the camera is still and falls away with motion, so

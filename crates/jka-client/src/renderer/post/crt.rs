@@ -17,6 +17,7 @@ pub(in crate::renderer) struct CrtResources {
     format: wgpu::TextureFormat,
     _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,
+    pub(in crate::renderer) encoded_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
@@ -27,7 +28,8 @@ pub(in crate::renderer) struct CrtResources {
 }
 
 impl CrtResources {
-    fn texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
+    fn texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView, wgpu::TextureView) {
+        let encoded_view_formats = [format.remove_srgb_suffix()];
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA CRT presentation intermediate"),
             size: wgpu::Extent3d {
@@ -40,10 +42,14 @@ impl CrtResources {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            view_formats: if format.is_srgb() { &encoded_view_formats } else { &[] },
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
+        let encoded_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(format.remove_srgb_suffix()),
+            ..Default::default()
+        });
+        (texture, view, encoded_view)
     }
 
     fn uniform_values(renderer: &Renderer) -> CrtUniform {
@@ -73,7 +79,7 @@ impl CrtResources {
         let width = renderer.config.width.max(1);
         let height = renderer.config.height.max(1);
         let format = renderer.config.format;
-        let (texture, view) = Self::texture(device, width, height, format);
+        let (texture, view, encoded_view) = Self::texture(device, width, height, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA CRT source sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -202,6 +208,7 @@ impl CrtResources {
             format,
             _texture: texture,
             view,
+            encoded_view,
             sampler,
             layout,
             uniform,
@@ -216,7 +223,7 @@ impl CrtResources {
         self.width = renderer.config.width.max(1);
         self.height = renderer.config.height.max(1);
         self.format = renderer.config.format;
-        let (texture, view) = Self::texture(&renderer.device, self.width, self.height, self.format);
+        let (texture, view, encoded_view) = Self::texture(&renderer.device, self.width, self.height, self.format);
         let bind_group = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA CRT bind group"),
             layout: &self.layout,
@@ -228,6 +235,7 @@ impl CrtResources {
         });
         self._texture = texture;
         self.view = view;
+        self.encoded_view = encoded_view;
         self.bind_group = bind_group;
     }
 }

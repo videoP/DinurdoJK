@@ -228,6 +228,8 @@ pub struct JaproCgame {
     pub race_start_y: f32,
     /// `cg_startGoal`: start speed at which the readout turns green (0 = never).
     pub start_goal: f32,
+    /// TaystJK cg_leadIndicator: 0 off, 1 snapshot-ping, >=2 manual latency (ms).
+    pub lead_indicator: f32,
     /// `cg_specHud`: draw team-coloured through-wall player outlines while spectating or watching demos.
     pub spec_hud: bool,
     /// `cg_specFollowFastest`: while spectating, automatically follow the fastest player.
@@ -262,6 +264,7 @@ impl Default for JaproCgame {
             race_start_x: 300.0,
             race_start_y: 280.0,
             start_goal: 0.0,
+            lead_indicator: 0.0,
             spec_hud: true,
             follow_fastest: false,
             speedometer: crate::speedometer::Settings::default(),
@@ -978,6 +981,13 @@ mod tests {
     #[test]
     fn cvars_round_trip() {
         let mut settings = JaproCgame::default();
+        settings.set_cvar("cg_leadIndicator", "1").unwrap().unwrap();
+        assert_eq!(settings.lead_indicator, 1.0);
+        settings.set_cvar("cg_leadIndicator", "105").unwrap().unwrap();
+        assert_eq!(settings.cvar_value("CG_LEADINDICATOR").as_deref(), Some("105"));
+        assert!(settings.set_cvar("cg_leadIndicator", "-1").unwrap().is_err());
+        assert!(settings.set_cvar("cg_leadIndicator", "5.5").unwrap().is_err());
+        assert!(settings.set_cvar("cg_leadIndicator", "2100").unwrap().is_err());
         settings.set_cvar("cg_stylePlayer", "260").unwrap().unwrap();
         settings.set_cvar("cg_raceTimer", "9").unwrap().unwrap();
         settings.set_cvar("cg_raceTimerY", "300.5").unwrap().unwrap();
@@ -1012,6 +1022,7 @@ mod tests {
         assert_eq!(settings.drain_fx, 2, "clamps to the documented 0..2 range");
         let mut text = String::new();
         settings.write_cfg(&mut text);
+        assert!(text.contains("seta cg_leadIndicator \"105\""));
         assert!(text.contains("seta cg_stylePlayer \"260\""));
         assert!(text.contains("seta cg_lagometer \"4\"") && text.contains("seta cg_lagometerX \"60\""));
         assert!(text.contains("seta cg_drainFX \"2\""));

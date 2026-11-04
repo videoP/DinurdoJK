@@ -450,6 +450,7 @@ app_cvars! {
                 apply_latched: Some(|settings, value| {
                     if let Ok(height) = value.parse::<u32>() {
                         settings.resolution[1] = height.max(240);
+                        settings.resolution_desktop = false;
                     }
                 }),
                 archive: Some((2, |state| {
@@ -475,6 +476,7 @@ app_cvars! {
                         } else {
                             self.video.resolution[1] = parsed.max(240);
                         }
+                        self.video.resolution_desktop = false;
                         self.mark_config_dirty();
                         self.console_status = format!(
                             "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
@@ -519,6 +521,7 @@ app_cvars! {
                 apply_latched: Some(|settings, value| {
                     if let Ok(width) = value.parse::<u32>() {
                         settings.resolution[0] = width.max(320);
+                        settings.resolution_desktop = false;
                     }
                 }),
                 archive: Some((1, |state| {
@@ -544,6 +547,7 @@ app_cvars! {
                         } else {
                             self.video.resolution[1] = parsed.max(240);
                         }
+                        self.video.resolution_desktop = false;
                         self.mark_config_dirty();
                         self.console_status = format!(
                             "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
@@ -1190,6 +1194,34 @@ app_cvars! {
         }]
     }
 
+    APP_R_COLLISION_WORLD {
+        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 flat shaded compiled visible BSP surfaces (not the Steam Audio collision mesh), flat team-colored player bodies and gunmetal weapons/hilts, simplified untextured saber blades. No world lightmaps or authored material passes; normal HUD unchanged. Source-.map preview maps have no compiled competitive mesh. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app: &App| CvarValue::String(u8::from(crate::renderer::collision_world_only()).to_string()),
+            |app, value| App::cvar_set_collision_world(app, APP_R_COLLISION_WORLD.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_collision_world, Some(|name, value| {
+            value.trim().parse::<u8>().ok().filter(|v| *v <= 1)
+                .map(|v| v.to_string())
+                .ok_or_else(|| format!("{name}: expected 0 or 1"))
+        })),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_collision_world(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = match value.trim() {
+                    "0" => false, "1" => true,
+                    _ => return Err(format!("{name}: expected 0 or 1")),
+                };
+                crate::renderer::set_collision_world_only(enabled);
+                if enabled {
+                    // No map-load work is scheduled while the cvar is off.
+                    self.ensure_collision_world_mesh();
+                }
+                self.console_status = format!("COLLISION WORLD: {}", if enabled { "ON" } else { "OFF" });
+                self.push_console_line(format!("[COLLISION WORLD] {} (full player rendering retained)", if enabled { "ON" } else { "OFF" }));
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_COMPETITIVE_AB {
         runtime: CvarDef::new("r_competitiveAB", "", "0..2147483663", "Experimental stripped competitive renderer: 0 original; 1 no main BSP world; 2 no dynamic models; 3 no client FX; 4 hide native HUD (console retained); 5 one stage + cheap baked lightmaps + fast sky; 6 additionally omit BSP model-path props; 7 additionally stop client FX; 8 additionally omit non-water transparent world surfaces; 9 omit HUD; 10 no world preparation/drawing; 11 one-texture world (no lightmaps or fused stages); 12 flat-color world; 13 flat world without extra transparent BSP; 14 flat world without models/FX/HUD; 15 acquire/submit-only render ceiling (normal client continues). 16+ = independent skip-bitmask: mask=value-16, bits documented in competitive_ab_probes.md; e.g. 17 PVS, 24 patch LOD, 4112 no world draw, 8208 no world prep and draw. Session only; 0 and 16 are baselines.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.competitive_ab.to_string()),
@@ -1415,6 +1447,66 @@ app_cvars! {
                         println!("[FX DIAG] {} via {} (session-only; latest.log next to executable)",
                             if enabled { "START" } else { "STOP" }, name);
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FXPROMOTEDLIGHTCAP {
+        runtime: CvarDef::new(
+                "r_fxPromotedLightCap",
+                "",
+                "0..64",
+                "Maximum inferred EFX lights in Aggressive mode (default 24), excluding direct weapon beam projectors. 0 disables EFX inference only; authored EFX, direct weapon beams and gameplay saber lights are unaffected. Session-only, live.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_fxpromotedlightcap(app)),
+                |app, value| App::cvar_set_r_fxpromotedlightcap(app, APP_R_FXPROMOTEDLIGHTCAP.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_fxpromotedlightcap, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_get_r_fxpromotedlightcap(&self) -> String {
+                    crate::fx::light_promotion::aggressive_light_cap().to_string()
+                }
+                fn cvar_set_r_fxpromotedlightcap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let cap = value.trim().parse::<usize>().ok()
+                        .filter(|cap| *cap <= 64)
+                        .ok_or_else(|| format!("{name}: expected an integer 0..64"))?;
+                    crate::fx::light_promotion::set_aggressive_light_cap(cap);
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FXPROMOTEDMINSIZE {
+        runtime: CvarDef::new(
+                "r_fxPromotedMinSize",
+                "",
+                "0..32",
+                "Minimum combined visual size of an inferred Aggressive EFX light (default 1.2 JKA units). Small nearby sparks merge before this is applied. 0 disables the threshold. Direct FX_AddLine weapon beams and authored Light{} are unchanged. Session-only, live.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_fxpromotedminsize(app)),
+                |app, value| App::cvar_set_r_fxpromotedminsize(app, APP_R_FXPROMOTEDMINSIZE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_fxpromotedminsize, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_get_r_fxpromotedminsize(&self) -> String {
+                    crate::fx::light_promotion::promoted_min_size().to_string()
+                }
+                fn cvar_set_r_fxpromotedminsize(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let minimum = value.trim().parse::<f32>().ok()
+                        .filter(|value| value.is_finite() && (0.0..=32.0).contains(value))
+                        .ok_or_else(|| format!("{name}: expected a finite number 0..32"))?;
+                    crate::fx::light_promotion::set_promoted_min_size(minimum);
                     Ok(())
                 }
             }
@@ -2333,6 +2425,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -2342,6 +2435,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -2351,6 +2445,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -4571,6 +4666,33 @@ app_cvars! {
         }]
     }
 
+    APP_R_SHAREDPRESENTPROBE {
+        runtime: CvarDef::new(
+            "r_sharedPresentProbe", "0", "0..1",
+            "One-shot Vulkan shared-present probe: 1 prints selected GPU extension support, actual window surface modes, required shared-image color usage, and current WGPU extension enablement. Does NOT change presentation. 0 does nothing. Session-only.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String("0".to_owned()),
+            |app, value| App::cvar_set_r_sharedpresentprobe(app, APP_R_SHAREDPRESENTPROBE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_sharedpresentprobe, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_sharedpresentprobe(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = match value.trim() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(format!("{name}: expected 0 or 1")),
+                };
+                if enabled {
+                    self.render_command(RenderCommand::ProbeSharedPresent);
+                    self.push_console_line(
+                        "^3[VULKAN SHARED PRESENT] Query queued; see [SHARED PRESENT] console lines".to_owned(),
+                    );
+                }
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_ACQUIREPROBE {
         runtime: CvarDef::new(
             "r_acquireProbe", "0", "0..10",
@@ -4700,42 +4822,54 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_mode",
                 "",
-                "-1",
-                "Custom resolution marker; dimensions are controlled by r_customwidth and r_customheight.",
-                CvarType::Enum(&["-1"]),
-                CvarFlags::ARCHIVE.union(CvarFlags::FIXED),
-                LatchScope::None,
+                "-2|-1",
+                "Resolution selection: -2 desktop (automatic), -1 custom r_customwidth/r_customheight. Apply required.",
+                CvarType::Enum(&["-2", "-1"]),
+                CvarFlags::ARCHIVE,
+                LatchScope::VidRestart,
                 |app| CvarValue::String(App::cvar_get_r_mode(app)),
                 |app, value| App::cvar_set_r_mode(app, APP_R_MODE.entry.name, &value.to_string()),
             )
-            .with_text_setter(App::cvar_set_r_mode, None),
+            .with_text_setter(
+                App::cvar_set_r_mode,
+                Some(|name, value| match value.trim() {
+                    "-2" | "-1" => Ok(value.trim().to_owned()),
+                    _ => Err(format!("{name}: expected -2 (desktop) or -1 (custom)")),
+                }),
+            ),
         config: CvarBinding {
-                archive: Some((0, |_state| "-1".to_owned())),
+                load_video: Some(|settings, _name, value, context| {
+                    if matches!(value.trim(), "-2" | "-1") {
+                        context.resolution_mode_seen = true;
+                        settings.resolution_desktop = value.trim() == "-2";
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    if matches!(value.trim(), "-2" | "-1") {
+                        settings.resolution_desktop = value.trim() == "-2";
+                    }
+                }),
+                archive: Some((0, |state| {
+                    if state.video.resolution_desktop { "-2".to_owned() } else { "-1".to_owned() }
+                })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_mode(&self) -> String {
-                    "-1".into()
+                    if self.video.resolution_desktop { "-2" } else { "-1" }.to_owned()
                 }
                 fn cvar_set_r_mode(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        let mode = value
-                            .trim()
-                            .parse::<i32>()
-                            .map_err(|_| format!("{name}: expected an integer"))?;
-                        if mode != -1 {
-                            return Err(format!(
-                                "{name}: only -1 (custom, r_customWidth/r_customHeight) is supported"
-                            ));
-                        }
+                    match value.trim() {
+                        "-2" => self.set_desktop_resolution(),
+                        "-1" => self.set_custom_resolution(self.video.resolution),
+                        _ => return Err(format!("{name}: expected -2 (desktop) or -1 (custom)")),
                     }
                     Ok(())
                 }
             }
         ]
     }
-
     APP_R_MODERNSABERS {
         runtime: CvarDef::new("r_modernSabers", "", "0..1", "Continuous view-facing saber glow ribbon; 0 keeps the OpenJK-compatible sprite-chain presentation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_modernsabers(app)), |app, value| App::cvar_set_r_modernsabers(app, APP_R_MODERNSABERS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_modernsabers, None),
         config: CvarBinding {
@@ -5290,6 +5424,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -5299,6 +5434,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -5308,6 +5444,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -5784,6 +5921,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -5793,6 +5931,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -5802,6 +5941,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;

@@ -607,6 +607,9 @@ impl Renderer {
             || (self.baked_indirect_power - 1.0).abs() > 0.0001
             || self.baked_sun_debug_mode != 0
             || self.sun_lighting
+            // Blue Water moonlight shares this existing Relighting shader path.
+            // Select the variant when Relighting is enabled, not every sunset.
+            || (self.sky_backend == 1 && self.sun_override)
             || (self.baked_sun_removal > 0.0
                 && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some()))
     }

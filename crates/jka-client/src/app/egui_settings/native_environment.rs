@@ -187,7 +187,24 @@ impl App {
             "MOON",
             "Blue Water sky only. Map illumination requires Relight map and Sky world illumination on Relighting. Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
         );
-        changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. While position is locked, phase also moves the moon along its automatic sky arc. With manual position unlocked, phase changes illumination only.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
+        changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. The automatic moon light follows phase, independently of its position lock.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
+        theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. Requires Relight map; separate from moon disc brightness.", theme::Reset::None, |ui| {
+            let locked = !s.moon_intensity_custom;
+            let mut shown = if locked { s.phase_moon_intensity() } else { s.moon_intensity };
+            let label = format!("{shown:.2}");
+            let moved = ui.add_enabled_ui(!locked, |ui| {
+                theme::slider_default(ui, &mut shown, 0.0..=16.0, &label, d.moon_intensity)
+            }).inner;
+            ui.add_space(8.0);
+            if let Some(now_locked) = theme::lock_toggle(ui, locked) {
+                s.moon_intensity_custom = !now_locked;
+                if !now_locked { s.moon_intensity = shown; }
+                changed = true;
+            } else if moved {
+                s.moon_intensity = shown;
+                changed = true;
+            }
+        });
         let mut unlocked = s.moon_custom;
         // The native model places an automatic moon on its celestial arc from
         // the active sun angle and phase. Show that derived position while the

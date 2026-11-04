@@ -57,6 +57,30 @@ pub fn wire_weapon(weapon: i32) -> Option<i32> {
     (0..16).find(|&value| presented_weapon(value) == Some(weapon))
 }
 
+fn unmapped(table: &[i32], value: i32) -> Option<i32> {
+    (value >= 0).then(|| table.iter().position(|&v| v == value)).flatten().map(|i| i as i32)
+}
+
+/// Presentation animation -> MVSDK cgame animNumber_t. MVSDK's cgame keeps
+/// 1.04 numbering for both versions (cg_snapshot.c MV_MapAnimation104).
+pub fn wire_animation(value: i32) -> Option<i32> {
+    unmapped(ids::ANIMATIONS_104, value)
+}
+
+/// Presentation saberMoveName_t -> JK2 saberMoveName_t.
+pub fn wire_saber_move(value: i32) -> Option<i32> {
+    if value < 0 { Some(value) } else { unmapped(ids::SABER_MOVES, value) }
+}
+
+/// Presentation eFlags -> JK2 eFlags (JKA-only bits are dropped).
+pub fn wire_entity_flags(value: i32) -> i32 {
+    ids::ENTITY_FLAGS
+        .iter()
+        .fold(0u32, |bits, &(source, dest)| {
+            bits | if value as u32 & dest != 0 { source } else { 0 }
+        }) as i32
+}
+
 /// JK2 holdable_t tag -> presentation tag (HI_DATAPAD has none).
 pub fn presented_holdable(tag: i32) -> Option<i32> {
     mapped(ids::HOLDABLES, tag).filter(|&value| value < 12)

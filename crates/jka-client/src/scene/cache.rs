@@ -1,7 +1,8 @@
 //! Cache.
 use crate::scene::{
-    active_game_directory, Arc, DrawBatch, GpuVertex, Path, PathBuf, Pod, STATIC_BSP_AO_CACHE_VERSION,
+    Arc, DrawBatch, GpuVertex, Path, PathBuf, Pod, STATIC_BSP_AO_CACHE_VERSION,
 };
+use jka_assets::pk3::dinurdojk_cache_directory;
 
 impl super::PreparedMap {
     pub(crate) fn intern_images(&mut self) {
@@ -175,14 +176,12 @@ impl std::fmt::Write for StageFingerprint {
 
 pub(in crate::scene) fn static_bsp_ao_cache_info(
     root: &Path,
-    game: Option<&Path>,
+    _game: Option<&Path>,
     name: &str,
     map_hash: u64,
 ) -> StaticBspAoCacheInfo {
     StaticBspAoCacheInfo {
-        directory: active_game_directory(root, game)
-            .join("cache")
-            .join("static-bsp-ao"),
+        directory: dinurdojk_cache_directory(root).join("static-bsp-ao"),
         map_name: name.to_string(),
         map_hash,
         version: STATIC_BSP_AO_CACHE_VERSION,

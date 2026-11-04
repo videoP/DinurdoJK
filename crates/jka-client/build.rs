@@ -14,6 +14,13 @@ fn main() {
     // executable. If nothing changed, Cargo does not relink the binary, so the
     // previous compile time remains the correct one.
     println!("cargo:rerun-if-changed=src");
+    // Optional local-only NWH module. Its absence must not break public builds.
+    let nwh_private = Path::new("src/net/nwh_private.rs");
+    println!("cargo:rerun-if-changed={}", nwh_private.display());
+    println!("cargo:rustc-check-cfg=cfg(djk_nwh_private)");
+    if nwh_private.is_file() {
+        println!("cargo:rustc-cfg=djk_nwh_private");
+    }
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../icon.png");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");

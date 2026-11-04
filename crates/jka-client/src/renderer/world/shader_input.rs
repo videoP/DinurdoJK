@@ -3,7 +3,7 @@
 //! Mode 0 uses the existing WGSL modules and pipeline overrides unchanged.
 //! Mode 1 resolves overrides per VS/FS entry point, compiles stage-specific
 //! SPIR-V, and caches it by source + entry + resolved settings under
-//! base/cache/world_spirv. Every emitted OR cached binary is round-trip
+//! DinurdoJK/cache/world_spirv. Every emitted OR cached binary is round-trip
 //! imported and validated via Naga BEFORE creating a wgpu module.
 //! Mode 2 (native passthrough) is intentionally disabled after an observed
 //! NVIDIA driver access violation triggered by unvalidated SPIR-V.
@@ -25,7 +25,7 @@ static WGSL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub(in crate::renderer) fn install_cache_root(base: &Path) {
-    let _ = CACHE_ROOT.set(base.join("cache").join("world_spirv"));
+    let _ = CACHE_ROOT.set(jka_assets::pk3::dinurdojk_cache_directory(base).join("world_spirv"));
 }
 
 fn source_for(variant: WorldShaderVariantKey, material: Option<MaterialFragmentKey>) -> String {

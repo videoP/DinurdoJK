@@ -13,6 +13,7 @@ impl Renderer {
     pub(in crate::renderer) fn rt_taa_active(&self) -> bool {
         self.rt_taa_mode != 0
             && !self.taa_enabled
+            && !self.dlss_requested
             && !self.asset_preview_mode
             && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
             && self.ray_tracing_supported
@@ -20,6 +21,36 @@ impl Renderer {
 
     pub(in crate::renderer) fn temporal_resolve_active(&self) -> bool {
         self.taa_enabled || self.rt_taa_active()
+    }
+
+    /// NVIDIA DLAA replaces the TAA resolve but consumes the same jittered
+    /// camera and motion-vector prepass. Previews, offscreen exports, thermal
+    /// vision and MSAA targets bypass it.
+    pub(in crate::renderer) fn dlss_active(&self) -> bool {
+        self.dlss_requested
+            && !self.dlss_failed
+            && !self.asset_preview_mode
+            && self.offscreen_output.is_none()
+            && self.thermal_vision == 0
+            && self.msaa_samples == 1
+    }
+
+    /// Size of the world and screen-space targets: the window, or DLSS's
+    /// lower internal resolution while it upscales (`targets.render_size`
+    /// follows this via `apply_pending_scene_rebuild`).
+    pub(in crate::renderer) fn render_extent(&self) -> (u32, u32) {
+        let output = (self.config.width.max(1), self.config.height.max(1));
+        let scale = self.dlss_mode.render_scale();
+        if !self.dlss_active() || scale >= 1.0 {
+            return output;
+        }
+        let scaled = |size: u32| ((size as f32 * scale).round() as u32).max(1);
+        (scaled(output.0), scaled(output.1))
+    }
+
+    /// Whether the prepass writes motion vectors and the camera is jittered.
+    pub(in crate::renderer) fn motion_vectors_wanted(&self) -> bool {
+        self.temporal_resolve_active() || self.dlss_active()
     }
 
     pub(in crate::renderer) fn ensure_rt_taa_pipeline(&mut self) {

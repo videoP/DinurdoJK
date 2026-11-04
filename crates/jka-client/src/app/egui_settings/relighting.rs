@@ -239,10 +239,10 @@ impl App {
                     self.touch_baked_sun_debug();
                 }
             });
-            theme::section(ui, "SKY ILLUMINATION", "Blue Water ambient and sun/moon illumination follows the positions and atmosphere configured on Sky.");
+            theme::section(ui, "SKY ILLUMINATION", "Blue Water sky ambient uses this optional blend; direct moonlight and its CSM shadows now use the normal Relighting path independently.");
             ui.add_enabled_ui(self.video.sky_backend == 1, |ui| {
                 let mut value = self.video.blue_water_environment.world_lighting;
-                theme::row(ui, "Sky world illumination", "Blend Blue Water sky ambient and sun/moon lighting over the baked map. 0 preserves the original contribution. This scales baked light and does not reconstruct indoor bounced light.", theme::Reset::None, |ui| {
+                theme::row(ui, "Sky world illumination", "Optional fullscreen sky ambient/direct blend over baked lighting, separate from the Relighting moon key light and its cascaded shadows. 0 disables this blend; it no longer disables moonlight.", theme::Reset::None, |ui| {
                     let default = defaults.blue_water_environment.world_lighting;
                     let readout = format!("{value:.2}");
                     if theme::slider_default(ui, &mut value, 0.0..=1.0, &readout, default) {

@@ -484,8 +484,7 @@ impl Renderer {
         camera_pos_time: [f32; 4],
         bevy_mode: bool,
     ) {
-        let sun = self.active_sun();
-        let light_direction = Vec3::from_array(sun.direction).normalize_or_zero();
+        let light_direction = self.shadow_celestial_direction();
         let receiver = ShadowReceiverUniform {
             dynamic_coverage: [[0;4]; SHADOW_CASCADES],
             view_proj: std::array::from_fn(|index| matrices[index].to_cols_array_2d()),

@@ -217,6 +217,8 @@ impl PlayerPresenter {
             load_shared,
             async_loading: true,
             fx_requests: Vec::new(),
+            grapple_owners: HashSet::new(),
+            grapple_hands: HashMap::new(),
             breath_puff_times: HashMap::new(),
             breath_talking: HashSet::new(),
             cold_breath_effects: false,

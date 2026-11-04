@@ -6,6 +6,44 @@ use crate::{
     },
 };
 pub(super) const CVARS: &[CvarDef<App>] = &[
+CvarDef::new("cg_remoteSmoothing", "0", "0..3", "Live remote player visual A/B: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded velocity extrapolation; 3 tangent-limited Hermite + extrapolation. No prediction or protocol changes; session only.", CvarType::Int { min: 0, max: 3 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
+    let CvarValue::Int(mode) = value else { unreachable!() };
+    crate::cgame::remote_smoothing::set_mode(mode as u8);
+    if let Some(session) = app.game_session.as_mut() { session.remote_smoothing.sync_from_cvar(); }
+    app.push_console_line(format!("^3cg_remoteSmoothing:^7 mode {mode} (0=original, 1=buffer+hold, 2=buffer+extrap, 3=buffer+Hermite+extrap). Live only; demo playback unchanged."));
+    Ok(())
+}),
+CvarDef::new("cg_remoteBufferMs", "50", "0..100", "Extra visual-only snapshot interpolation delay (ms), 0 for low latency; used when cg_remoteBufferAuto=0. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::buffer_ms() as i32), |_app, value| {
+    let CvarValue::Int(ms) = value else { unreachable!() };
+    crate::cgame::remote_smoothing::set_buffer_ms(ms as u32);
+    Ok(())
+}),
+CvarDef::new("cg_remoteBufferAuto", "0", "0|1", "0 fixed cg_remoteBufferMs; 1 adaptive visual buffer from server snapshot cadence and arrival jitter (up to 100 ms). Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::cgame::remote_smoothing::buffer_auto()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::cgame::remote_smoothing::set_buffer_auto(enabled);
+    Ok(())
+}),
+CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrapolation beyond the latest remote snapshot for smoothing modes 2/3. 0 disables extrapolation. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::extrap_max_ms() as i32), |_app, value| {
+    let CvarValue::Int(ms) = value else { unreachable!() };
+    crate::cgame::remote_smoothing::set_extrap_max_ms(ms as u32);
+    Ok(())
+}),
+CvarDef::new("cg_remoteSmoothDebug", "0", "0..2", "0 off; 1 one-second smoothing/underrun/correction summary; 2 also logs per remote player. No render overhead/readbacks. Session only.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::debug() as i32), |_app, value| {
+    let CvarValue::Int(level) = value else { unreachable!() };
+    crate::cgame::remote_smoothing::set_debug(level as u8);
+    Ok(())
+}),
+CvarDef::new("cg_remoteSmoothStats", "0", "0|1", "Write 1 to print an immediate remote visual history/jitter/underrun report to the in-game console. Read-back remains 0 (one-shot command cvar).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(false), |app, value| {
+    let CvarValue::Bool(print) = value else { unreachable!() };
+    if print {
+        if let Some(session) = app.game_session.as_ref() {
+            app.push_console_line(session.remote_smoothing.summary());
+        } else {
+            app.push_console_line("^3[REMOTE SMOOTH]^7 No current game session.");
+        }
+    }
+    Ok(())
+}),
 CvarDef::new("r_riverDebug", "0", "0|1|2", "Live riversource diagnostics: 0 off, 1 one-second solver/draw status, 2 detailed spawn geometry and CPU encoding timings. Session-only; no GPU readbacks or stalls.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::river_runtime::debug_mode() as i32), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::river_runtime::set_debug_mode(mode as u8);

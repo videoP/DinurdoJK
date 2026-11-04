@@ -44,3 +44,4 @@ wgpu-core = { path = "vendor/wgpu-core-30.0.1" }
 wgpu-hal = { path = "vendor/wgpu-hal-30.0.1" }
 wgpu-types = { path = "vendor/wgpu-types-30.0.1" }
 winit = { path = "vendor/winit-0.30.13" }
+dlss_wgpu = { path = "vendor/dlss_wgpu-6.0.0" }

@@ -1985,10 +1985,12 @@ impl EntityPresenter {
         asset: &Md3Asset, surface_asset: &Md3SurfaceAsset,
         entity_num: u16, frame: usize, axis: [[f32; 3]; 3],
         origin: [f32; 3], scale: f32, entity_color: [f32; 4], depth_hack: f32,
+        opacity: f32,
     ) {
         let camera = self.md3_lod_view.map(|view| view.camera_position());
         for stage in &surface_asset.extra_stages {
-            let stage_color = md3_stage_color(stage, entity_color);
+            let mut stage_color = md3_stage_color(stage, entity_color);
+            stage_color[3] *= opacity;
             let (vertices, indices) = self.md3_geometry(
                 asset, surface_asset, entity_num, stage.index + 1, frame,
                 axis, origin, scale, stage_color, depth_hack,
@@ -2023,10 +2025,27 @@ impl EntityPresenter {
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
                 texture: stage.texture.clone(),
-                alpha_mode: stage.alpha_mode,
+                alpha_mode: blend_for_alpha(stage.alpha_mode, opacity),
                 authored_glow: stage.authored_glow,
             });
         }
+    }
+
+    /// Render a predicted local projectile with the same MD3/material pipeline
+    /// as an authoritative ET_MISSILE, without injecting a fake network entity.
+    pub fn present_simulated_missile(
+        &mut self,
+        id: u16,
+        missile: &super::weapon_fx::MissileModel,
+    ) -> Vec<DynamicModelSurface> {
+        let draw = ItemDraw {
+            model: missile.qpath.clone(),
+            origin: missile.origin,
+            axis: missile.axis,
+            rgba: [1.0; 4],
+            custom_shader: None,
+        };
+        self.present_md3_ref_entity(id, &draw).unwrap_or_default()
     }
 
     /// An MD3 refEntity with an explicit transform (frame 0), shaderRGBA and
@@ -2128,7 +2147,7 @@ impl EntityPresenter {
             if submission.custom_shader.is_none() {
                 self.present_md3_extra_stages(
                     &mut draws, &asset, surface_asset, entity_num, 0, submission.axis,
-                    submission.origin, 1.0, submission.rgba, 0.0,
+                    submission.origin, 1.0, submission.rgba, 0.0, 1.0,
                 );
             }
             if let Some(layers) = layers.as_deref_mut() {
@@ -2235,7 +2254,7 @@ impl EntityPresenter {
             });
             self.present_md3_extra_stages(
                 &mut draws, &asset, surface_asset, entity.number, frame, axis,
-                entity.origin, scale, color, 0.0,
+                entity.origin, scale, color, 0.0, 1.0,
             );
         }
         if !raster_visible {
@@ -2253,6 +2272,7 @@ impl EntityPresenter {
         &mut self,
         entity_num: u16,
         weapon_num: i32,
+        charge_active: bool,
         mut view_origin: [f32; 3],
         mut view_angles: [f32; 3],
         velocity: [f32; 3],
@@ -2262,7 +2282,9 @@ impl EntityPresenter {
         hand_frame: usize,
         hand_oldframe: usize,
         hand_backlerp: f32,
-    ) -> Result<Vec<DynamicModelSurface>, String> {
+        settings: crate::camera::ViewWeaponSettings,
+        world_fov: f32,
+    ) -> Result<(Vec<DynamicModelSurface>, Option<[f32; 3]>), String> {
         const WP_NONE: i32 = 0;
         const WP_STUN_BATON: i32 = 1;
         const WP_DISRUPTOR: i32 = 6;
@@ -2275,8 +2297,8 @@ impl EntityPresenter {
         // EternalJK CG_AddViewWeapon forwards saber/melee through the same
         // first-person viewModel path as the other weapons.
         // CG_AddPlayerWeapon only special-cases the emplaced gun here.
-        if matches!(weapon_num, WP_NONE | WP_EMPLACED_GUN) {
-            return Ok(Vec::new());
+        if settings.draw_gun == 0 || matches!(weapon_num, WP_NONE | WP_EMPLACED_GUN) {
+            return Ok((Vec::new(), None));
         }
 
         // CG_RegisterWeapon walks bg_itemlist to find the IT_WEAPON entry with
@@ -2287,7 +2309,7 @@ impl EntityPresenter {
             .find(|item| item.item_type == IT_WEAPON && item.tag == weapon_num)
             .ok_or_else(|| format!("weapon {weapon_num} has no IT_WEAPON bg_itemlist entry"))?;
         if item.view_model.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let hand_qpath = replace_md3_suffix(&item.view_model, "_hand.md3");
@@ -2306,6 +2328,7 @@ impl EntityPresenter {
             return Err(format!("{resolved_hand_qpath}: view hand has no MD3 tags"));
         }
 
+        let camera_angles = view_angles;
         // CG_CalculateWeaponPosition. cg.bobcycle is just the high bit of
         // ps->bobCycle after CG_OffsetFirstPersonView; cg.bobfracsin comes from
         // the low 7 bits. TaystJK's cg_weaponBob/cg_fallingBob defaults retain
@@ -2316,22 +2339,60 @@ impl EntityPresenter {
         let bob_phase = (bob_cycle & 127) as f32 / 127.0 * std::f32::consts::PI;
         let bobfracsin = bob_phase.sin().abs();
         let scale = if ((bob_cycle & 128) >> 7) != 0 { -xyspeed } else { xyspeed };
-        view_angles[2] += scale * bobfracsin * 0.005;
-        view_angles[1] += scale * bobfracsin * 0.01;
-        view_angles[0] += xyspeed * bobfracsin * 0.005;
-        view_origin[2] += land_offset;
-        let idle_scale = xyspeed + 40.0;
-        let idle = (current_time as f32 * 0.001).sin();
-        view_angles[2] += idle_scale * idle * 0.01;
-        view_angles[1] += idle_scale * idle * 0.01;
-        view_angles[0] += idle_scale * idle * 0.01;
+        if settings.draw_gun < 2 {
+            view_angles[2] += scale * bobfracsin * 0.005;
+            view_angles[1] += scale * bobfracsin * 0.01;
+            view_angles[0] += xyspeed * bobfracsin * 0.005;
+        }
+        if settings.draw_gun < 3 {
+            view_origin[2] += land_offset;
+        }
+        if settings.draw_gun < 4 {
+            let idle_scale = xyspeed + 40.0;
+            let idle = (current_time as f32 * 0.001).sin();
+            view_angles[2] += idle_scale * idle * 0.01;
+            view_angles[1] += idle_scale * idle * 0.01;
+            view_angles[0] += idle_scale * idle * 0.01;
+        }
 
-        let hand_axis = angles_to_axis(view_angles);
+        // TaystJK CG_AddViewWeapon adds gunX/Y/Z along the CAMERA axes, not
+        // along the bobbing hand axes. angles_to_axis follows native JKA's
+        // forward / left / up convention (cg.refdef.viewaxis).
+        let view_axis = angles_to_axis(camera_angles);
+        let cg_fov = world_fov.clamp(1.0, 140.0);
+        let gun_fov = if settings.fov_viewmodel != 0.0 {
+            settings.fov_viewmodel.clamp(1.0, 140.0)
+        } else {
+            cg_fov
+        };
+        let high_fov_drop = if settings.fov_viewmodel_adjust && gun_fov > 90.0 {
+            -0.2 * (gun_fov - 90.0)
+        } else {
+            0.0
+        };
+        for axis in 0..3 {
+            view_origin[axis] += settings.gun_x * view_axis[0][axis]
+                + settings.gun_y * view_axis[1][axis]
+                + (settings.gun_z + high_fov_drop) * view_axis[2][axis];
+        }
+        let mut hand_axis = angles_to_axis(view_angles);
+        if settings.fov_viewmodel != 0.0 {
+            // The original renderer scales the FIRST ROW of the hand matrix;
+            // the tag_weapon/tag_barrel child models inherit this scale.
+            let scale = (gun_fov.to_radians() * 0.5).tan()
+                / (cg_fov.to_radians() * 0.5).tan();
+            for c in &mut hand_axis[0] { *c *= scale; }
+        }
         let tag_weapon = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, "tag_weapon")
             .ok_or_else(|| format!("{resolved_hand_qpath}: missing tag_weapon"))?;
         let (gun_origin, gun_axis) = position_on_md3_tag(view_origin, hand_axis, tag_weapon);
 
-        let mut draws = self.present_view_md3(entity_num, &item.view_model, gun_origin, gun_axis)?;
+        let gun_alpha = if settings.gun_alpha > 0.0 && settings.gun_alpha < 1.0 {
+            settings.gun_alpha
+        } else {
+            1.0 // TaystJK's cg_gunAlpha=0 keeps an opaque gun.
+        };
+        let mut draws = self.present_view_md3(entity_num, &item.view_model, gun_origin, gun_axis, gun_alpha)?;
 
         // CG_AddPlayerWeapon bolts these barrels directly to the hand model,
         // not to the gun model. Keep that slightly surprising original rule.
@@ -2344,7 +2405,7 @@ impl EntityPresenter {
             for (qpath, tag_name) in BATON_BARRELS {
                 if let Some(tag) = lerp_md3_tag(&hand.model, hand_oldframe, hand_frame, 1.0 - hand_backlerp, tag_name) {
                     let (origin, axis) = position_on_md3_tag(view_origin, hand_axis, tag);
-                    draws.extend(self.present_view_md3(entity_num, qpath, origin, axis)?);
+                    draws.extend(self.present_view_md3(entity_num, qpath, origin, axis, gun_alpha)?);
                 }
             }
         } else if matches!(
@@ -2356,13 +2417,24 @@ impl EntityPresenter {
                 let (origin, axis) = position_on_md3_tag(view_origin, hand_axis, tag);
                 // CG_RegisterWeapon treats a missing optional barrel as handle 0;
                 // do the same instead of making the whole view weapon disappear.
-                if let Ok(mut barrel) = self.present_view_md3(entity_num, &barrel_qpath, origin, axis) {
+                if let Ok(mut barrel) = self.present_view_md3(entity_num, &barrel_qpath, origin, axis, gun_alpha) {
                     draws.append(&mut barrel);
                 }
             }
         }
 
-        Ok(draws)
+        // `CG_PositionEntityOnTag(&flash, &gun, gun.hModel, "tag_flash")`
+        // uses the weapon itself, not the invisible hand MD3. Use the same
+        // transform as the rendered view gun so charging glow stays on muzzle.
+        let muzzle = if charge_active {
+            self.load_md3(&item.view_model).ok().and_then(|weapon| {
+                lerp_md3_tag(&weapon.model, 0, 0, 1.0, "tag_flash")
+                    .map(|tag| position_on_md3_tag(gun_origin, gun_axis, tag).0)
+            })
+        } else {
+            None
+        };
+        Ok((draws, muzzle))
     }
 
     /// Submit an MD3 with OpenJK `RF_DEPTHHACK | RF_FIRST_PERSON` geometry
@@ -2375,8 +2447,11 @@ impl EntityPresenter {
         qpath: &str,
         origin: [f32; 3],
         axis: [[f32; 3]; 3],
+        alpha: f32,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let asset = self.load_md3(qpath)?;
+        let flat_equipment = crate::renderer::collision_world_only();
+        let flat_texture = flat_equipment.then(super::player_presenter::collision_world_equipment_texture);
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
             if surface_asset.invisible_without_override {
@@ -2389,7 +2464,7 @@ impl EntityPresenter {
             }
             let (vertices, indices) = self.md3_geometry(
                 &asset, surface_asset, entity_num, 0, 0, axis, origin,
-                1.0, [1.0; 4], 1.0);
+                1.0, [1.0, 1.0, 1.0, alpha], 1.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 authored_lighting: surface_asset.authored_lighting,
@@ -2407,15 +2482,27 @@ impl EntityPresenter {
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
-                texture: surface_asset.texture.clone(),
-                alpha_mode: surface_asset.alpha_mode,
+                // Use one opaque material for first person gun and barrel
+                // surfaces in collision-world contrast mode.
+                texture: if flat_equipment { flat_texture.clone() } else { surface_asset.texture.clone() },
+                alpha_mode: if flat_equipment { DynamicModelAlphaMode::Opaque } else if alpha < 1.0 {
+                    match surface_asset.alpha_mode {
+                        DynamicModelAlphaMode::Opaque => DynamicModelAlphaMode::Blend,
+                        DynamicModelAlphaMode::Mask => DynamicModelAlphaMode::MaskBlend,
+                        mode => mode,
+                    }
+                } else {
+                    surface_asset.alpha_mode
+                },
 
-                authored_glow: surface_asset.authored_glow,
+                authored_glow: !flat_equipment && surface_asset.authored_glow,
             });
-            self.present_md3_extra_stages(
-                &mut draws, &asset, surface_asset, entity_num, 0, axis,
-                origin, 1.0, [1.0; 4], 1.0,
-            );
+            if !flat_equipment {
+                self.present_md3_extra_stages(
+                    &mut draws, &asset, surface_asset, entity_num, 0, axis,
+                    origin, 1.0, [1.0; 4], 1.0, alpha,
+                );
+            }
         }
         Ok(draws)
     }
@@ -2497,7 +2584,7 @@ impl EntityPresenter {
             });
             self.present_md3_extra_stages(
                 &mut draws, &asset, surface_asset, entity_num, frame, axis,
-                origin, 1.0, rgba, 0.0,
+                origin, 1.0, rgba, 0.0, 1.0,
             );
         }
         Ok(draws)
@@ -3015,6 +3102,19 @@ impl EntityPresenter {
         let key = scene::canonical_shader_name(shader_name);
         // Engine-built material: untextured vertex-colour additive (enhanced
         // saber melt glow). Not an authored shader, so it never hits the loaders.
+        // DestroHook-style rope: the core/glow use untextured vertex-colour
+        // alpha blending. No PK3 shader required (especially on vanilla maps).
+        if key == "$grapple_rope" {
+            return vec![FxMaterial {
+                animation: None, texture: None, blend: FxBlend::Alpha,
+                rgb_vertex: true, alpha_vertex: true,
+                rgb_const: [1.0; 3], alpha_const: 1.0,
+                rgb_wave: None, alpha_wave: None,
+                rgb_one_minus_vertex: false, alpha_one_minus_vertex: false,
+                tc_mods: Vec::new(), shader_time_offset: 0.0,
+                shader_clamp_time: None, authored_glow: false, alpha_test: 0.0,
+            }];
+        }
         if key == "$melt_glow" {
             return vec![FxMaterial {
                 animation: None,

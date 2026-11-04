@@ -19,6 +19,48 @@ fn studio_crosshair_is_opt_in_even_with_an_inherited_helper_crosshair() {
 }
 
 #[test]
+fn taystjk_zoom_crosshair_scope_applies_to_static_and_late_latched_paths() {
+    let mut ui = UiSnapshot::default();
+    ui.mode = OverlayMode::None;
+    ui.video.draw_2d = true;
+    ui.video.skip_ui = false;
+    ui.crosshair.style = 1;
+    let scope = UiZoomScope {
+        mode: 1,
+        fov: 30.0,
+        time: 1000,
+        yaw_deg: 0.0,
+        ammo: 150,
+        double_ammo: false,
+        charge_started: None,
+        binocular_art_hidden: false,
+    };
+    for (scope_mode, visible) in [(0, false), (1, true), (2, false)] {
+        ui.crosshair.scope_mode = scope_mode;
+        for zoom_mode in [1, 2] {
+            ui.zoom_scope = Some(UiZoomScope { mode: zoom_mode, ..scope });
+            for position in [None, Some([310.0, 250.0])] {
+                let mut out = Vec::new();
+                build_crosshair_vertices(&mut out, &ui, position, 1280, 720);
+                assert_eq!(!out.is_empty(), visible, "scope={scope_mode}, zoom={zoom_mode}, position={position:?}");
+            }
+        }
+    }
+    // The cvar has no effect outside zoom, including on both crosshair paths.
+    ui.crosshair.scope_mode = 0;
+    ui.zoom_scope = None;
+    let mut out = Vec::new();
+    build_crosshair_vertices(&mut out, &ui, None, 1280, 720);
+    assert!(!out.is_empty());
+    // jaPRO race mode suppresses binocular art but the scoped crosshair must
+    // remain hidden, just as in TaystJK's raw zoomMode check.
+    ui.zoom_scope = Some(UiZoomScope { mode: 2, binocular_art_hidden: true, ..scope });
+    out.clear();
+    build_crosshair_vertices(&mut out, &ui, None, 1280, 720);
+    assert!(out.is_empty());
+}
+
+#[test]
 fn dot_crosshair_is_circular_and_exactly_centered() {
     for (width, height) in [(1280_u32, 720_u32), (1279_u32, 799_u32)] {
         let mut vertices = Vec::new();

@@ -3,12 +3,12 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
-    cmd_jk2_demo_info ["jk2_demoInfo"] ("jk2_demoInfo <demoname or absolute path>", "Decode an entire JK2 demo and report its version, map, duration, and snapshot integrity. Names resolve under fs_jk2path/base/demos.", CommandScope::Always) |self, command| {
+    cmd_jk2_demo_info ["jk2_demoInfo"] ("jk2_demoInfo <demoname or absolute path>", "Decode an entire JK2 demo and report its version, map, duration, and snapshot integrity. Names resolve under fs_jk2basepath/demos, then fs_jk2cdpath/base/demos.", CommandScope::Always) |self, command| {
         let args = jka_protocol::commands::tokenize(command.as_bytes());
         let result = (|| {
             if args.len() != 2 { return Err("usage: jk2_demoInfo <demoname or absolute path>".to_owned()); }
             let name = std::str::from_utf8(&args[1]).map_err(|_| "Invalid demo path".to_owned())?;
-            let path = crate::jk2_diagnostics::resolve_demo(self.fs_roots.jk2path.as_deref(), name)?;
+            let path = crate::jk2_diagnostics::resolve_demo(&self.base, &self.fs_roots, name)?;
             let tx = self.background_result_tx.clone();
             self.background_jobs.io(move || {
                 let result = crate::jk2_diagnostics::inspect(&path);
@@ -287,6 +287,24 @@ commands! {
                 "^2SKY SWEEP ARMED^7 Six cases × {frames} frames. Hold camera still, close console. Automatically restores settings. Output: {}.csv/.json", stem.display()
             )),
             Err(error) => self.push_console_line(format!("^1sky_perf_sweep:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_shitter_sweep ["shitter_sweep", "shittersweep"] ("shitter_sweep", "Automatically compare full-resolution Shitter world and swapchain paths; save one TXT report in renderperf and restore all original modes.", CommandScope::Connected) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("^3usage:^7 shitter_sweep".to_owned());
+            return CommandResult::Handled;
+        }
+        let path = self.game_write_path(std::path::PathBuf::from("renderperf")
+            .join(format!("shitter-sweep-{}.txt", demo_recording_timestamp())));
+        let result = self.render.as_ref().ok_or("renderer is unavailable")
+            .and_then(|render| render.start_shitter_sweep(path.clone()));
+        match result {
+            Ok(()) => self.push_console_line(format!(
+                "^2SHITTER SWEEP ARMED^7 Close console, keep camera still. Automatic test and settings restoration. Send this one log: {}",
+                path.display())),
+            Err(error) => self.push_console_line(format!("^1shitter_sweep:^7 {error}")),
         }
         CommandResult::Handled
     }

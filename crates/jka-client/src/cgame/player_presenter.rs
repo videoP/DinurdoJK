@@ -2,7 +2,7 @@
 mod source_player;
 mod swim_tilt;
 mod swing_transition;
-pub(crate) use swing_transition::{animation_blend_enabled, set_animation_blend, saber_swing_fix, set_saber_swing_fix};
+pub(crate) use swing_transition::{animation_blend_enabled, set_animation_blend, saber_swing_fix, set_saber_swing_fix, jk2_angle_debug, set_jk2_angle_debug};
 mod move_lean;
 mod source_vtf;
 mod assets;
@@ -20,6 +20,7 @@ mod physics;
 mod pose;
 mod powerups;
 mod presentation;
+pub(crate) use presentation::collision_world_equipment_texture;
 mod previews;
 mod studio_camera;
 pub(crate) use studio_camera::ProfileAttachmentFrame;
@@ -152,7 +153,7 @@ use jka_assets::{
     vehicle::{load_vehicle_definitions, VehicleDefinition, VehicleDefinitions},
 };
 use jka_movement::{
-    bg_g2_player_angles, CollisionWorld, PlayerAngleEntity, PlayerAngleState, TraceQuery,
+    bg_g2_player_angles, jk2_g2_player_angles, CollisionWorld, PlayerAngleEntity, PlayerAngleState, TraceQuery,
     BONE_ANGLES_POSTMULT,
 };
 use jka_protocol::entity_event::EntityEvent;
@@ -209,6 +210,9 @@ pub struct StudioPoseBlend {
 pub struct PlayerPresenter {
     /// This frame's force-power FX requests (drained by the caller).
     fx_requests: Vec<PlayerFxRequest>,
+    /// Hook owners only; pose their right-hand bolt on demand (not all players).
+    grapple_owners: HashSet<u16>,
+    grapple_hands: HashMap<u16, [f32; 3]>,
     /// TaystJK cent->breathPuffTime, separate per client, in server milliseconds.
     breath_puff_times: HashMap<u16, i32>,
     /// Per-entity S_GetVoiceVolume > 0, sampled from the existing audio backend.

@@ -1,6 +1,6 @@
 struct GammaSettings {
     values: vec4<f32>, // gamma, LUT strength, vignette, manual exposure EV
-    flags: vec4<f32>, // x: HDR scene (skip legacy output dither), y: preserve HDR LUT headroom
+    flags: vec4<f32>, // x: HDR scene, y: HDR LUT headroom, z: r_overBrightBits emulation
 };
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -81,6 +81,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (settings.values.z > 0.5) {
         let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));
         corrected *= 1.0 - edge * 0.28;
+    }
+    // OpenJK PR #1349: multiply the final scene after gamma, independent of
+    // hardware gamma or fullscreen. 0 leaves the preexisting output unchanged.
+    if (settings.flags.z > 0.5) {
+        corrected *= 2.0;
     }
     if (settings.flags.x < 0.5) {
         corrected = output_dither_srgb8(corrected, input.position.xy);

@@ -47,7 +47,8 @@ impl App {
 
     /// egui owns every menu overlay, not just the Video page.
     pub(in crate::app) fn egui_menu_active(&self) -> bool {
-        let blocking_download_ui = self.connection_modal_active();
+        // Live connection controls are native Taffy/WGPU, not egui.
+        let blocking_download_ui = self.demo_missing_map_prompt.is_some();
         ((self.overlay == OverlayMode::Console && self.console_hl2)
             || blocking_download_ui
             || self.siege_dialog.is_some()
@@ -117,11 +118,21 @@ impl App {
     /// control rebinding needs the raw winit key/button rather than egui's
     /// logical key, so those events are handed back to the legacy handlers.
     pub(in crate::app) fn route_egui_window_event(&mut self, event: &WindowEvent) -> bool {
+        if self.native_connection_loading_event(event) { return true; }
         if self.native_demo_browser_event(event) { return true; }
         let confirmation = self.egui_confirmation_active();
+        // A missing-map/password decision suspends the join handshake. Even
+        // with the console open, its buttons must receive pointer/keyboard
+        // events or the user has no way to resume the connection.
+        let connection_choice = self.server_password_prompt.is_some()
+            || self.missing_map_prompt.is_some()
+            || self.demo_missing_map_prompt.is_some();
         // Asset Viewer remains rendered behind the legacy console, but the
-        // console must retain all keyboard/mouse input while it is open.
-        if !confirmation && self.overlay == OverlayMode::Console && !self.console_hl2 {
+        // console must retain all keyboard/mouse input while it is open,
+        // except while a blocking connection decision is awaiting input.
+        if !confirmation && self.overlay == OverlayMode::Console && !self.console_hl2
+            && !connection_choice
+        {
             // Only the chat translation popup, while open, takes pointer input.
             return self.route_console_chat_menu_event(event);
         }
@@ -129,7 +140,9 @@ impl App {
         // clipboard and bindings) authoritative. Only pointer events are sent
         // to egui's floating frame, and consumed there instead of selecting
         // text in the old dropdown geometry.
-        if !confirmation && self.overlay == OverlayMode::Console && self.console_hl2 {
+        if !confirmation && self.overlay == OverlayMode::Console && self.console_hl2
+            && !connection_choice
+        {
             if let WindowEvent::CursorMoved { position, .. } = event {
                 self.cursor_position = (position.x, position.y);
             }
@@ -486,6 +499,18 @@ impl App {
     // ------------------------------------------------------------- chrome --
 
     pub(in crate::app::egui_menu) fn build_egui_menu(&mut self, ui: &mut egui::Ui) {
+        // The joining panel and both live connection decisions are painted
+        // in the native WGPU pass using Taffy; never layer legacy egui on top.
+        // Demo missing-map prompts and the optional HL2 console remain egui.
+        let hl2_console = self.overlay == OverlayMode::Console && self.console_hl2
+            && self.server_password_prompt.is_none() && self.missing_map_prompt.is_none();
+        if !hl2_console && self.demo_missing_map_prompt.is_none()
+            && (self.server_password_prompt.is_some() || self.missing_map_prompt.is_some()
+                || self.live_join_ui.is_some() || self.live_download.is_some()
+                || self.unified_loading_ui().is_some_and(|loading| loading.joining_server))
+        {
+            return;
+        }
         if self.overlay == OverlayMode::Console && self.console_hl2 {
             // Keep the originating setup/profile/game menu behind the floating
             // console, just as the classic console does. It is safe to skip
@@ -496,6 +521,11 @@ impl App {
                 self.build_egui_menu_underlay(ui);
             }
             self.egui_hl2_console(ui.ctx());
+            // Demo missing-map decisions still use egui; server connection
+            // decisions use the separate native Taffy modal.
+            if self.demo_missing_map_prompt.is_some() {
+                self.egui_demo_missing_map_dialog(ui);
+            }
             return;
         }
         self.build_egui_menu_underlay(ui);
@@ -521,33 +551,12 @@ impl App {
         }
         self.egui_update_notice(ui);
         let painted_overlay = self.egui_display_overlay();
-        if self.server_password_prompt.is_some() {
-            self.egui_server_password_dialog(ui);
-            return;
-        }
         if self.siege_dialog.is_some() {
             self.egui_siege_dialog(ui);
             return;
         }
-        if self.missing_map_prompt.is_some() {
-            self.egui_missing_map_dialog(ui);
-            return;
-        }
         if self.demo_missing_map_prompt.is_some() {
             self.egui_demo_missing_map_dialog(ui);
-            return;
-        }
-        if self.live_join_ui.is_some() || self.net.as_ref().is_some_and(|net| {
-            net.state() != jka_protocol::session::ConnectionState::Active
-                || self.game_session.as_ref().is_none_or(|session| {
-                    session.phase != crate::app::SessionPhase::Playing
-                })
-        }) {
-            self.egui_live_join_pipeline(ui);
-            return;
-        }
-        if self.live_download.is_some() {
-            self.egui_download_dialog(ui);
             return;
         }
         if painted_overlay == OverlayMode::Vgs {

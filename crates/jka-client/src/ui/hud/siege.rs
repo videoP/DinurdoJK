@@ -1,7 +1,7 @@
 //! Siege-specific HUD overlays ported from TaystJK/OpenJK semantics.
 
 use crate::ui::{fixed_charset_text, proportional_text, rect, rect_outline, textured_rect_with_source, ProportionalFont, UiSiegeTimerMenu, UiSnapshot, UiVertex};
-use super::extensions::{image_cell_uv, EXT_IMAGE_TEXTURE_SOURCE};
+use super::extensions::{image_cell_uv_for_count, EXT_IMAGE_TEXTURE_SOURCE};
 
 
 /// Parse the same menu and item names consumed by TaystJK's
@@ -152,7 +152,7 @@ fn draw_mp_timer(out: &mut Vec<UiVertex>, text: &str, menu: &UiSiegeTimerMenu, i
     let x = |virtual_x: f32| w as f32 - (640.0 - virtual_x) * unit;
     if let Some(index) = images.iter().position(|p| p == &menu.frame_shader) {
         let [fx, fy, fw, fh] = menu.frame_rect;
-        let (uv0, uv1) = image_cell_uv(index);
+        let (uv0, uv1) = image_cell_uv_for_count(index, images.len());
         textured_rect_with_source(out, x(fx), fy * unit, fw * unit, fh * unit, uv0, uv1, menu.frame_color, EXT_IMAGE_TEXTURE_SOURCE, w, h);
     }
     if let Some(font) = font {

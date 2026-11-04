@@ -72,6 +72,14 @@ impl BrowserProtocol {
             ],
         }
     }
+    fn cache_filename(self) -> &'static str {
+        match self {
+            Self::Jka => "jka.json",
+            Self::Jk2_102 => "jk2-102.json",
+            Self::Jk2_104 => "jk2-104.json",
+        }
+    }
+
     fn settings_suffix(self) -> &'static str {
         match self {
             Self::Jka => "",
@@ -115,6 +123,8 @@ const MASTER_WAIT: Duration = Duration::from_millis(1200);
 const INFO_WAIT: Duration = Duration::from_millis(2200);
 const STATUS_WAIT: Duration = Duration::from_millis(900);
 const MAX_MASTER_SERVERS: usize = 4096;
+const INTERNET_CACHE_VERSION: u32 = 1;
+const MAX_INTERNET_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PACKET: usize = 64 * 1024;
 
 /// TaystJK/OpenJK-style master slots. TaystJK supports five `sv_masterN` cvars:
@@ -147,7 +157,7 @@ impl ServerSource {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerEntry {
     pub address: SocketAddr,
     pub hostname: String,
@@ -337,6 +347,8 @@ pub struct BrowserUiState {
     favorites_path: std::path::PathBuf,
     history_path: std::path::PathBuf,
     master_path: Option<std::path::PathBuf>,
+    /// Persisted Internet discovery is shared across mods, but isolated by protocol.
+    internet_cache_path: Option<std::path::PathBuf>,
 }
 
 impl BrowserUiState {
@@ -504,7 +516,35 @@ impl BrowserUiState {
             favorites_path,
             history_path,
             master_path,
+            internet_cache_path: None,
         }
+    }
+
+    /// Use <GameData>/DinurdoJK/cache/serverbrowser for all game tabs.
+    /// Cached rows are displayed immediately, but their old pings are not reused.
+    /// Discovery is still started only when the Join page opens for this protocol.
+    pub fn with_internet_cache(mut self, base_game_directory: &Path) -> Self {
+        let path = jka_assets::pk3::dinurdojk_cache_directory(base_game_directory).join("serverbrowser")
+            .join(self.protocol.cache_filename());
+        if let Some(servers) = load_internet_cache(&path, self.protocol) {
+            let count = servers.len();
+            let addresses = self.source_addresses.entry(ServerSource::Internet).or_default();
+            for server in servers {
+                addresses.insert(server.address);
+                self.servers.insert(server.address, server);
+            }
+            if count > 0 {
+                let text = format!("{count} cached servers (refresh pending)");
+                self.source_status.insert(ServerSource::Internet, text.clone());
+                self.status_text = text;
+            }
+        }
+        self.internet_cache_path = Some(path);
+        self
+    }
+
+    pub fn internet_cache_path(&self) -> Option<&Path> {
+        self.internet_cache_path.as_deref()
     }
 
     /// JK2 master configuration is independent of archived JKA sv_masterN cvars.
@@ -561,7 +601,10 @@ impl BrowserUiState {
                 // Internet/LAN are discovery sources, so a completed refresh is
                 // the authoritative new set. Favorites/history deliberately keep
                 // offline entries so the user can still retry them later.
-                if matches!(source, ServerSource::Internet | ServerSource::Lan) {
+                // A master outage / total query timeout must not erase the last
+                // known-good Internet list or its on-disk cache.
+                let preserve_internet = source == ServerSource::Internet && responded == 0;
+                if matches!(source, ServerSource::Internet | ServerSource::Lan) && !preserve_internet {
                     if let Some(seen) = self.refresh_seen.remove(&source) {
                         if let Some(addresses) = self.source_addresses.get_mut(&source) {
                             addresses.retain(|address| seen.contains(address));
@@ -570,7 +613,9 @@ impl BrowserUiState {
                 } else {
                     self.refresh_seen.remove(&source);
                 }
-                let text = if discovered == 0 {
+                let text = if preserve_internet && !self.addresses_for_source(source).is_empty() {
+                    format!("INTERNET: no servers responded; showing cached results")
+                } else if discovered == 0 {
                     format!("{}: no servers found", source.label())
                 } else {
                     format!("{}: {responded}/{discovered} servers responded", source.label())
@@ -717,7 +762,7 @@ pub struct TaggedBrowserEvent {
 
 #[derive(Debug)]
 pub enum BrowserCommand {
-    RefreshInternet { masters: Vec<String> },
+    RefreshInternet { masters: Vec<String>, cache_path: Option<std::path::PathBuf> },
     RefreshLan,
     RefreshAddresses {
         source: ServerSource,
@@ -778,7 +823,7 @@ fn worker(commands: Receiver<BrowserRequest>, event_tx: Sender<TaggedBrowserEven
     while let Ok(BrowserRequest { protocol, command }) = commands.recv() {
         let events = ScopedEventSender { sender: &event_tx, protocol };
         let result = match command {
-            BrowserCommand::RefreshInternet { masters } => refresh_internet(&events, masters),
+            BrowserCommand::RefreshInternet { masters, cache_path } => refresh_internet(&events, masters, cache_path.as_deref()),
             BrowserCommand::RefreshLan => refresh_lan(&events),
             BrowserCommand::RefreshAddresses { source, addresses } => {
                 refresh_addresses(&events, source, addresses)
@@ -819,13 +864,17 @@ impl ScopedEventSender<'_> {
 
 type WorkerResult = Result<(), (Option<ServerSource>, String)>;
 
-fn refresh_internet(events: &ScopedEventSender<'_>, masters: Vec<String>) -> WorkerResult {
+fn refresh_internet(
+    events: &ScopedEventSender<'_>,
+    masters: Vec<String>,
+    cache_path: Option<&Path>,
+) -> WorkerResult {
     let source = ServerSource::Internet;
     events
         .send(BrowserEvent::RefreshStarted(source))
         .map_err(|_| (Some(source), "browser UI disconnected".to_owned()))?;
     let addresses = discover_master_servers(&masters, events.protocol).map_err(|message| (Some(source), message))?;
-    query_info_batch(events, source, addresses)
+    query_info_batch(events, source, addresses, cache_path)
 }
 
 fn refresh_lan(events: &ScopedEventSender<'_>) -> WorkerResult {
@@ -904,7 +953,7 @@ fn refresh_addresses(
     events
         .send(BrowserEvent::RefreshStarted(source))
         .map_err(|_| (Some(source), "browser UI disconnected".to_owned()))?;
-    query_info_batch(events, source, addresses)
+    query_info_batch(events, source, addresses, None)
 }
 
 fn refresh_server(
@@ -1035,6 +1084,7 @@ fn query_info_batch(
     events: &ScopedEventSender<'_>,
     source: ServerSource,
     mut addresses: Vec<SocketAddr>,
+    cache_path: Option<&Path>,
 ) -> WorkerResult {
     addresses.retain(SocketAddr::is_ipv4);
     addresses.sort_unstable();
@@ -1073,6 +1123,7 @@ fn query_info_batch(
     let mut buf = vec![0u8; MAX_PACKET];
     let mut responded_addresses = HashSet::new();
     let mut responded = 0usize;
+    let mut cached_servers = Vec::new();
     while started.elapsed() < INFO_WAIT && responded_addresses.len() < sent_at.len() {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
@@ -1091,6 +1142,9 @@ fn query_info_batch(
                 responded_addresses.insert(from);
                 let server = server_from_info(from, &info, sent.elapsed());
                 responded += 1;
+                if cache_path.is_some() {
+                    cached_servers.push(server.clone());
+                }
                 if events.send(BrowserEvent::Server { source, server }).is_err() {
                     return Ok(());
                 }
@@ -1102,6 +1156,15 @@ fn query_info_batch(
         }
     }
 
+    // Disk I/O stays on the browser worker; the UI/render thread never writes
+    // server caches. Replace the file only after a completed, nonempty scan.
+    if responded > 0 {
+        if let Some(path) = cache_path {
+            if let Err(error) = save_internet_cache(path, events.protocol, &cached_servers) {
+                eprintln!("SERVER BROWSER: cache write failed: {error}");
+            }
+        }
+    }
     let _ = events.send(BrowserEvent::RefreshFinished {
         source,
         discovered,
@@ -1429,9 +1492,114 @@ pub fn save_address_list(path: &Path, addresses: &[SocketAddr]) -> Result<(), St
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A versioned snapshot of the last successfully answered Internet servers.
+/// Favorites/history, player status and LAN discoveries are deliberately excluded.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InternetServerCache {
+    version: u32,
+    protocol: u32,
+    servers: Vec<ServerEntry>,
+}
+
+fn load_internet_cache(path: &Path, protocol: BrowserProtocol) -> Option<Vec<ServerEntry>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > MAX_INTERNET_CACHE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let cached: InternetServerCache = serde_json::from_slice(&bytes).ok()?;
+    if cached.version != INTERNET_CACHE_VERSION || cached.protocol != protocol.protocol()
+        || cached.servers.len() > MAX_MASTER_SERVERS
+    {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    Some(cached.servers.into_iter().filter_map(|mut server| {
+        if !server.address.is_ipv4() || server.protocol != protocol.protocol()
+            || !seen.insert(server.address)
+        {
+            return None;
+        }
+        // Old network latency must never appear as a current ping.
+        server.ping_ms = 0;
+        Some(server)
+    }).collect())
+}
+
+fn save_internet_cache(
+    path: &Path,
+    protocol: BrowserProtocol,
+    servers: &[ServerEntry],
+) -> Result<(), String> {
+    let cached = InternetServerCache {
+        version: INTERNET_CACHE_VERSION,
+        protocol: protocol.protocol(),
+        servers: servers.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&cached)
+        .map_err(|error| format!("serialize Internet server cache: {error}"))?;
+    if bytes.len() as u64 > MAX_INTERNET_CACHE_BYTES {
+        return Err("Internet server cache exceeds size limit".to_owned());
+    }
+    let parent = path.parent().ok_or("Internet server cache path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("{}: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internet_cache_round_trips_per_protocol_without_reusing_ping() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        // The cache lives in <GameData>/DinurdoJK, a sibling of base/.
+        let root = std::env::temp_dir().join(format!("dinurdo-browser-cache-{}-{nonce}", std::process::id()));
+        let base = root.join("base");
+        for protocol in BrowserProtocol::ALL {
+            let address: SocketAddr = "127.0.0.1:29070".parse().unwrap();
+            let path = jka_assets::pk3::dinurdojk_cache_directory(&base).join("serverbrowser").join(protocol.cache_filename());
+            let mut entry = ServerEntry::placeholder(address);
+            entry.protocol = protocol.protocol();
+            entry.hostname = protocol.label().to_owned();
+            entry.ping_ms = 123;
+            save_internet_cache(&path, protocol, &[entry]).unwrap();
+            let restored = BrowserUiState::new_for_protocol(
+                &base, protocol.default_masters().map(str::to_owned), protocol,
+            ).with_internet_cache(&base);
+            assert_eq!(restored.servers_for_current_source().len(), 1);
+            assert_eq!(restored.servers[&address].hostname, protocol.label());
+            assert_eq!(restored.servers[&address].ping_ms, 0);
+            assert!(!restored.internet_requested_once);
+            assert_eq!(restored.internet_cache_path(), Some(path.as_path()));
+            // Another protocol can never mistake this snapshot for its own.
+            let other = if protocol == BrowserProtocol::Jka { BrowserProtocol::Jk2_102 } else { BrowserProtocol::Jka };
+            assert!(load_internet_cache(&path, other).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn internet_timeout_preserves_cached_rows() {
+        let path = Path::new("nonexistent-browser-cache-timeout-test-path");
+        let mut browser = BrowserUiState::new(path, DEFAULT_MASTER_CVARS.map(str::to_owned));
+        let address: SocketAddr = "127.0.0.1:29070".parse().unwrap();
+        browser.handle_event(BrowserEvent::Server {
+            source: ServerSource::Internet,
+            server: ServerEntry::placeholder(address),
+        });
+        browser.handle_event(BrowserEvent::RefreshStarted(ServerSource::Internet));
+        browser.handle_event(BrowserEvent::RefreshFinished {
+            source: ServerSource::Internet, discovered: 0, responded: 0,
+        });
+        assert_eq!(browser.addresses_for_source(ServerSource::Internet), vec![address]);
+        assert!(browser.status_text.contains("cached"));
+    }
 
     #[test]
     fn game_tabs_use_their_own_wire_protocols_and_ports() {

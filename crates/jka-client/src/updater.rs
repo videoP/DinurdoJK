@@ -1,4 +1,6 @@
 //! GitHub Releases updater. One check at launch, downloads only on a user click.
+//! The signed v2 manifest lists per-file release assets, so unchanged installed
+//! files are not downloaded again.
 //! Release AUTHORIZATION is independent of GitHub: fail closed without a
 //! compiled-in Ed25519 verifying key and a valid signature on exact manifest bytes.
 use std::{collections::BTreeMap, fs, fs::File, io::{Read, Write}, path::{Path, PathBuf}};
@@ -7,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const LATEST: &str = "https://api.github.com/repos/videop/DinurdoJK/releases/latest";
-const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
+const MAX_DOWNLOAD: u64 = 1024 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 16 * 1024;
 const MANIFEST_NAME: &str = "release-manifest.json";
@@ -21,9 +23,7 @@ pub struct Release {
     pub tag: String,
     pub notes: String,
     pub url: String,
-    pub archive_url: String,
-    pub archive_size: u64,
-    pub sha256: String,
+    pub total_size: u64,
     manifest_bytes: Vec<u8>,
     manifest_signature: Vec<u8>,
 }
@@ -120,8 +120,6 @@ struct FileInfo { size: u64, sha256: String }
 struct SignedManifest {
     format: u32,
     tag: String,
-    archive: FileInfo,
-    archive_name: String,
     files: BTreeMap<String, FileInfo>,
 }
 
@@ -133,27 +131,25 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     verify_signature_with_key(raw, signature, key)?;
     let manifest: SignedManifest = serde_json::from_slice(raw)
         .map_err(|_| "invalid signed release manifest JSON")?;
-    if manifest.format != 1 || stable_version(&manifest.tag).is_none() {
-        return Err("unsupported release manifest format or tag".into());
+    if manifest.format != 2 || stable_version(&manifest.tag).is_none() {
+        return Err("unsupported signed per-file release manifest format or tag".into());
     }
-    if manifest.archive_name != format!("DinurdoJK-{}-windows-x64.zip", manifest.tag) {
-        return Err("archive name is not bound to signed release tag".into());
-    }
-    check_digest(&manifest.archive.sha256)?;
-    if manifest.archive.size == 0 || manifest.archive.size > MAX_ARCHIVE {
-        return Err("signed archive exceeds size limit".into());
-    }
-    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > 9 {
+    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > 17 {
         return Err("signed file allowlist must contain DinurdoJK.exe".into());
     }
     let mut total = 0u64;
     for (name, info) in &manifest.files {
         if !matches!(name.as_str(), "DinurdoJK.exe" | "phonon.dll" | "OpenALSoft.x86_64.dll" | "OpenAL-Soft-LGPL-2.0.txt" | "EalMan-LGPL-2.1.txt"
-            | "msvcp140.dll" | "msvcp140_atomic_wait.dll" | "vcruntime140.dll" | "vcruntime140_1.dll") {
+            | "msvcp140.dll" | "msvcp140_atomic_wait.dll" | "vcruntime140.dll" | "vcruntime140_1.dll"
+            | "nvngx_dlss.dll" | "NVIDIA-DLSS-SDK-LICENSE.txt" | "Bevy-Solari-MIT.txt"
+            | "dxcompiler.dll" | "dxil.dll" | "DXC-LICENSE.txt" | "DXC-ThirdPartyNotices.txt"
+            | "base/dinurdo-assets.pk3") {
             return Err("signed manifest contains an unexpected file".into());
         }
         check_digest(&info.sha256)?;
-        if info.size == 0 { return Err("signed manifest has an empty file".into()); }
+        if info.size == 0 || info.size > MAX_DOWNLOAD {
+            return Err("signed manifest has an empty or oversized file".into());
+        }
         total = total.checked_add(info.size).ok_or("unpacked size overflow")?;
     }
     if total > MAX_UNPACKED { return Err("signed files exceed unpacked size limit".into()); }
@@ -164,6 +160,16 @@ fn check_digest(hash: &str) -> Result<(), String> {
     let _ = decode_hex::<32>(hash)?;
     if hash != hash.to_ascii_lowercase() { return Err("SHA-256 must be lowercase".into()); }
     Ok(())
+}
+
+// Each GitHub asset has a simple filename; the one nested installation path
+// is the project-owned PK3, published as the plain release asset filename.
+fn release_asset_name(installed_name: &str) -> &str {
+    if installed_name == "base/dinurdo-assets.pk3" {
+        "dinurdo-assets.pk3"
+    } else {
+        installed_name
+    }
 }
 
 fn asset_url(tag: &str, file: &str) -> String {
@@ -178,8 +184,10 @@ fn exact_asset_url(value: &serde_json::Value, tag: &str, name: &str) -> Result<S
     let found = assets.iter().find(|asset| asset["name"].as_str() == Some(name)).ok_or("missing release asset")?;
     let url = found["browser_download_url"].as_str().ok_or("missing asset URL")?;
     let expected = asset_url(tag, name);
-    if url != expected { return Err("release asset URL differs from expected trusted repository path".into()); }
-    Ok(expected)
+    if !url.eq_ignore_ascii_case(&expected) {
+        return Err("release asset URL differs from expected trusted repository path".into());
+    }
+    Ok(url.to_owned())
 }
 
 fn fetch_small(url: &str, max: u64) -> Result<Vec<u8>, String> {
@@ -197,36 +205,35 @@ fn parse_release_json(bytes: &[u8], installed: &str) -> Result<Option<Release>, 
     let local = stable_version(installed).ok_or("installed version must be MAJOR.MINOR.PATCH")?;
     if remote <= local { return Ok(None); }
 
-    let zip_name = format!("DinurdoJK-{tag}-windows-x64.zip");
-    let archive_url = exact_asset_url(&value, tag, &zip_name)?;
     let manifest_url = exact_asset_url(&value, tag, MANIFEST_NAME)?;
     let signature_url = exact_asset_url(&value, tag, SIGNATURE_NAME)?;
-    // No downloaded archive, no stage, and no installer until BOTH publisher
-    // signature and the signed release/asset binding have been checked.
+    // Verify the publisher signature before trusting any file, SHA-256 or
+    // destination path, and bind every asset to this exact GitHub release.
     let manifest_bytes = fetch_small(&manifest_url, MAX_MANIFEST)?;
     let manifest_signature = fetch_small(&signature_url, 64)?;
     let manifest = parse_signed_manifest(&manifest_bytes, &manifest_signature)?;
-    if manifest.tag != tag || manifest.archive_name != zip_name {
-        return Err("signed release identity does not match GitHub release".into());
+    if manifest.tag != tag {
+        return Err("signed release tag does not match GitHub release".into());
     }
-    let archive_asset = value["assets"].as_array().ok_or("no assets")?.iter()
-        .find(|asset| asset["name"].as_str() == Some(zip_name.as_str())).ok_or("no archive asset")?;
-    if archive_asset["size"].as_u64() != Some(manifest.archive.size) {
-        return Err("GitHub asset size disagrees with signed manifest".into());
-    }
-    // GitHub asset digest is a helpful second consistency check, not the trust anchor.
-    if let Some(digest) = archive_asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")) {
-        if !digest.eq_ignore_ascii_case(&manifest.archive.sha256) {
-            return Err("GitHub digest disagrees with signed manifest".into());
+    for (name, info) in &manifest.files {
+        let asset = release_asset_name(name);
+        exact_asset_url(&value, tag, asset)?;
+        let listed = value["assets"].as_array().ok_or("no GitHub release assets")?.iter()
+            .find(|item| item["name"].as_str() == Some(asset)).ok_or("missing signed release asset")?;
+        if listed["size"].as_u64() != Some(info.size) {
+            return Err(format!("GitHub asset {asset} size differs from signed manifest"));
+        }
+        if let Some(digest) = listed["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")) {
+            if !digest.eq_ignore_ascii_case(&info.sha256) {
+                return Err(format!("GitHub asset {asset} digest differs from signed manifest"));
+            }
         }
     }
     Ok(Some(Release {
         tag: tag.to_owned(),
         notes: value["body"].as_str().unwrap_or("").chars().take(12_000).collect(),
         url: value["html_url"].as_str().unwrap_or("").to_owned(),
-        archive_url,
-        archive_size: manifest.archive.size,
-        sha256: manifest.archive.sha256,
+        total_size: manifest.files.values().map(|info| info.size).sum(),
         manifest_bytes,
         manifest_signature,
     }))
@@ -302,8 +309,49 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn validate_stage(stage: &Path) -> Result<SignedManifest, String> {
+// Only one nested install path is authorized. Keep writable staging flat and
+// never allow arbitrary paths, traversal, symlinks or Windows junctions.
+fn stage_filename(signed_name: &str) -> &str {
+    if signed_name == "base/dinurdo-assets.pk3" {
+        "base__dinurdo-assets.pk3"
+    } else {
+        signed_name
+    }
+}
+
+fn signed_name_from_stage(staged_name: &str) -> &str {
+    if staged_name == "base__dinurdo-assets.pk3" {
+        "base/dinurdo-assets.pk3"
+    } else {
+        staged_name
+    }
+}
+
+fn ensure_install_parent(root: &Path, signed_name: &str) -> Result<(), String> {
+    if signed_name == "base/dinurdo-assets.pk3" {
+        let base = root.join("base");
+        assert_no_reparse(&base)?;
+        if !base.exists() { fs::create_dir(&base).map_err(|e| e.to_string())?; }
+        if !base.is_dir() { return Err("base asset directory is not a directory".into()); }
+        assert_no_reparse(&base)?;
+    }
+    Ok(())
+}
+
+fn installed_matches(root: &Path, name: &str, info: &FileInfo) -> Result<bool, String> {
+    let path = root.join(name);
+    assert_no_reparse(&path)?;
+    if !path.is_file() { return Ok(false); }
+    if fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size { return Ok(false); }
+    Ok(file_sha256(&path)? == info.sha256)
+}
+
+// Signed staged files MUST match the manifest. Files omitted from the staging
+// directory are permitted only if an identical installed copy already exists.
+// Re-run this check before launching and after the game exits to close TOCTOU.
+fn validate_stage(stage: &Path, install_root: &Path) -> Result<SignedManifest, String> {
     assert_no_reparse(stage)?;
+    assert_no_reparse(install_root)?;
     let raw = read_bounded(&stage.join(MANIFEST_NAME), MAX_MANIFEST)?;
     let sig = read_bounded(&stage.join(SIGNATURE_NAME), 64)?;
     let manifest = parse_signed_manifest(&raw, &sig)?;
@@ -311,90 +359,88 @@ fn validate_stage(stage: &Path) -> Result<SignedManifest, String> {
     if !stage.join("ready").is_file() { return Err("update stage is not marked ready".into()); }
     let dir = stage.join("files");
     assert_no_reparse(&dir)?;
-    let mut count = 0usize;
     for item in fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let path = item.map_err(|e| e.to_string())?.path();
         assert_no_reparse(&path)?;
         let name = path.file_name().and_then(|n| n.to_str()).ok_or("invalid staged name")?;
-        let info = manifest.files.get(name).ok_or("unexpected staged file")?;
-        if !path.is_file() || fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size || file_sha256(&path)? != info.sha256 {
+        let info = manifest.files.get(signed_name_from_stage(name)).ok_or("unexpected staged file")?;
+        if !path.is_file() || fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size
+            || file_sha256(&path)? != info.sha256 {
             return Err(format!("staged {name} does not match signed manifest"));
         }
-        count += 1;
     }
-    if count != manifest.files.len() { return Err("staged files are missing".into()); }
+    for (name, info) in &manifest.files {
+        let staged = dir.join(stage_filename(name));
+        if !staged.is_file() && !installed_matches(install_root, name, info)? {
+            return Err(format!("required update file {name} is neither verified on disk nor staged"));
+        }
+    }
     Ok(manifest)
 }
 
 pub fn stage<F>(release: &Release, mut report: F) -> Result<PathBuf, String>
 where F: FnMut(u64, u64) {
     let manifest = parse_signed_manifest(&release.manifest_bytes, &release.manifest_signature)?;
-    if manifest.tag != release.tag || manifest.archive.size != release.archive_size ||
-        manifest.archive.sha256 != release.sha256 || manifest.archive_name != format!("DinurdoJK-{}-windows-x64.zip", release.tag) ||
-        release.archive_url != asset_url(&release.tag, &manifest.archive_name) {
+    if manifest.tag != release.tag ||
+        release.total_size != manifest.files.values().map(|info| info.size).sum::<u64>() {
         return Err("release changed since signed metadata was verified".into());
     }
     if stable_version(&manifest.tag) <= stable_version(env!("CARGO_PKG_VERSION")) {
         return Err("refusing to install the same or an older release".into());
     }
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    if current.file_name().and_then(|n| n.to_str()) != Some("DinurdoJK.exe") {
+        return Err("unexpected game executable path".into());
+    }
+    let install_root = current.parent().ok_or("game directory is unavailable")?;
+    assert_no_reparse(install_root)?;
+    let mut needed = Vec::new();
+    let mut total = 0u64;
+    for (name, info) in &manifest.files {
+        if !installed_matches(install_root, name, info)? {
+            total = total.checked_add(info.size).ok_or("download size overflow")?;
+            needed.push((name, info));
+        }
+    }
+    report(0, total);
     let stage = stage_for(&release.tag)?;
     fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
     assert_no_reparse(&stage)?;
     if stage.join("installing").exists() { return Err("an installation is already in progress".into()); }
-    let archive_tmp = stage.join("package.zip.part");
-    let archive = stage.join("package.zip");
     let _ = fs::remove_file(stage.join("ready"));
-    let _ = fs::remove_file(&archive_tmp);
-    let _ = fs::remove_file(&archive);
     let result = (|| {
-        let mut output = File::create_new(&archive_tmp).map_err(|e| e.to_string())?;
-        let mut hasher = Sha256::new();
-        let mut count = 0u64;
-        let status = http_get(&release.archive_url, MAX_ARCHIVE, |part, _| {
-            output.write_all(part).map_err(|e| e.to_string())?;
-            hasher.update(part);
-            count += part.len() as u64;
-            report(count, release.archive_size);
-            Ok(())
-        })?;
-        output.sync_all().map_err(|e| e.to_string())?;
-        drop(output);
-        if status != 200 || count != manifest.archive.size || format!("{:x}", hasher.finalize()) != manifest.archive.sha256 {
-            return Err("download does not match signed release archive".into());
-        }
-        fs::rename(&archive_tmp, &archive).map_err(|e| e.to_string())?;
-        let file = File::open(&archive).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        if zip.len() != manifest.files.len() { return Err("ZIP entry count differs from signed manifest".into()); }
         let dir = stage.join("files");
         assert_no_reparse(&dir)?;
         if dir.exists() { fs::remove_dir_all(&dir).map_err(|e| e.to_string())?; }
         fs::create_dir(&dir).map_err(|e| e.to_string())?;
-        let mut total = 0u64;
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-            let name = entry.name().to_owned();
-            if entry.is_dir() || name.contains('/') || name.contains('\\') || name.contains(':') {
-                return Err("ZIP paths and directories are not permitted".into());
+        let mut completed = 0u64;
+        for (name, info) in needed {
+            let asset = release_asset_name(name);
+            let url = asset_url(&release.tag, asset);
+            let path = dir.join(stage_filename(name));
+            let partial = dir.join(format!("{}.part", stage_filename(name)));
+            let _ = fs::remove_file(&partial);
+            let mut output = File::create_new(&partial).map_err(|e| e.to_string())?;
+            let mut hasher = Sha256::new();
+            let mut count = 0u64;
+            let status = http_get(&url, info.size, |chunk, _| {
+                output.write_all(chunk).map_err(|e| e.to_string())?;
+                hasher.update(chunk);
+                count += chunk.len() as u64;
+                report(completed + count, total);
+                Ok(())
+            })?;
+            output.sync_all().map_err(|e| e.to_string())?;
+            drop(output);
+            if status != 200 || count != info.size || format!("{:x}", hasher.finalize()) != info.sha256 {
+                return Err(format!("downloaded {asset} does not match publisher-signed SHA-256"));
             }
-            if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
-                return Err("ZIP contains a symbolic link".into());
-            }
-            let info = manifest.files.get(&name).ok_or("ZIP contains an unauthorized file")?;
-            if entry.size() != info.size { return Err("ZIP file size differs from signed manifest".into()); }
-            total = total.checked_add(entry.size()).ok_or("ZIP size overflow")?;
-            if total > MAX_UNPACKED { return Err("ZIP exceeds unpacked size limit".into()); }
-            let path = dir.join(&name);
-            if path.exists() { return Err("duplicate ZIP entry".into()); }
-            let mut out = File::create_new(&path).map_err(|e| e.to_string())?;
-            let copied = std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-            if copied != info.size { return Err("short ZIP extraction".into()); }
-            out.sync_all().map_err(|e| e.to_string())?;
-            if file_sha256(&path)? != info.sha256 { return Err("extracted file hash does not match publisher signature".into()); }
+            fs::rename(&partial, &path).map_err(|e| e.to_string())?;
+            completed += count;
         }
         for name in [MANIFEST_NAME, SIGNATURE_NAME, "ready"] {
             let path = stage.join(name);
-            if path.exists() || fs::symlink_metadata(&path).is_ok() {
+            if fs::symlink_metadata(&path).is_ok() {
                 fs::remove_file(&path).map_err(|e| e.to_string())?;
             }
         }
@@ -404,21 +450,19 @@ where F: FnMut(u64, u64) {
         let mut sig = File::create_new(stage.join(SIGNATURE_NAME)).map_err(|e| e.to_string())?;
         sig.write_all(&release.manifest_signature).map_err(|e| e.to_string())?;
         sig.sync_all().map_err(|e| e.to_string())?;
-        // Re-read staged manifest and all files before committing readiness.
         let mut ready = File::create_new(stage.join("ready")).map_err(|e| e.to_string())?;
-        ready.write_all(b"ready-v2").map_err(|e| e.to_string())?;
+        ready.write_all(b"ready-v3-per-file").map_err(|e| e.to_string())?;
         ready.sync_all().map_err(|e| e.to_string())?;
-        validate_stage(&stage)?;
+        validate_stage(&stage, install_root)?;
         let pending = staging_root()?.join("pending.txt");
         assert_no_reparse(&pending)?;
-        // Discard previous pending marker without following a user-controlled link.
         if fs::symlink_metadata(&pending).is_ok() { fs::remove_file(&pending).map_err(|e| e.to_string())?; }
         let mut pending_file = File::create_new(pending).map_err(|e| e.to_string())?;
         pending_file.write_all(release.tag.as_bytes()).map_err(|e| e.to_string())?;
         pending_file.sync_all().map_err(|e| e.to_string())?;
         Ok(stage.clone())
     })();
-    if result.is_err() { let _ = fs::remove_file(&archive_tmp); let _ = fs::remove_file(stage.join("ready")); }
+    if result.is_err() { let _ = fs::remove_file(stage.join("ready")); }
     result
 }
 
@@ -429,11 +473,11 @@ fn launch_helper(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
         return Err("updater will only replace DinurdoJK.exe".into());
     }
     assert_no_reparse(exe)?;
-    validate_stage(stage)?;
+    let dir = exe.parent().ok_or("game directory not found")?;
+    validate_stage(stage, dir)?;
     // Keep the helper alongside the installed game, NOT inside the writable
     // downloaded stage: Windows searches the EXE directory for dependent DLLs
     // before our Rust signature validation runs.
-    let dir = exe.parent().ok_or("game directory not found")?;
     assert_no_reparse(dir)?;
     let helper = dir.join(format!("DinurdoJK-Updater-{pid}.exe"));
     assert_no_reparse(&helper)?;
@@ -451,22 +495,25 @@ fn launch_helper(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
 }
 
 pub fn restart_with_update(stage: &Path) -> Result<(), String> {
-    let manifest = validate_stage(stage)?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let root = exe.parent().ok_or("missing install directory")?;
+    let manifest = validate_stage(stage, root)?;
     if stable_version(&manifest.tag) <= stable_version(env!("CARGO_PKG_VERSION")) {
         return Err("not a newer signed release".into());
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     launch_helper(&exe, stage, std::process::id())
 }
 
 pub fn apply_pending_on_launch() -> Result<bool, String> {
-    let root = match staging_root() { Ok(root) => root, Err(_) => return Ok(false) };
-    let tag = match fs::read_to_string(root.join("pending.txt")) { Ok(tag) => tag, Err(_) => return Ok(false) };
+    let updater_root = match staging_root() { Ok(root) => root, Err(_) => return Ok(false) };
+    let tag = match fs::read_to_string(updater_root.join("pending.txt")) { Ok(tag) => tag, Err(_) => return Ok(false) };
     let stage = match stage_for(&tag) {
         Ok(stage) => stage,
-        Err(_) => { let _ = fs::remove_file(root.join("pending.txt")); return Ok(false); }
+        Err(_) => { let _ = fs::remove_file(updater_root.join("pending.txt")); return Ok(false); }
     };
-    let manifest = validate_stage(&stage)?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let install_root = exe.parent().ok_or("missing install directory")?;
+    let manifest = validate_stage(&stage, install_root)?;
     let local = stable_version(env!("CARGO_PKG_VERSION")).ok_or("invalid running version")?;
     let remote = stable_version(&manifest.tag).ok_or("invalid release version")?;
     if remote <= local {
@@ -476,11 +523,10 @@ pub fn apply_pending_on_launch() -> Result<bool, String> {
         if remote != local || !stage.join("installing").is_file() ||
             file_sha256(&std::env::current_exe().map_err(|e| e.to_string())?)? !=
                 manifest.files.get("DinurdoJK.exe").ok_or("signed EXE missing")?.sha256 {
-            let _ = fs::remove_file(root.join("pending.txt"));
+            let _ = fs::remove_file(updater_root.join("pending.txt"));
             return Ok(false);
         }
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     launch_helper(&exe, &stage, std::process::id())?;
     Ok(true)
 }
@@ -535,11 +581,14 @@ fn prepare_backups(stage: &Path, parent: &Path, manifest: &SignedManifest) -> Re
     fs::create_dir(&backup).map_err(|e| e.to_string())?;
     let mut snapshot = BTreeMap::new();
     for name in manifest.files.keys() {
+        // Only replaced files need backup copies. Most DLLs and the PK3
+        // remain unchanged across releases and are never written at all.
+        if !stage.join("files").join(stage_filename(name)).is_file() { continue; }
         let installed = parent.join(name);
         assert_no_reparse(&installed)?;
         if installed.exists() {
             if !installed.is_file() { return Err("installed target is not a normal file".into()); }
-            let copied = backup.join(name);
+            let copied = backup.join(stage_filename(name));
             fs::copy(installed, &copied).map_err(|e| e.to_string())?;
             File::open(&copied).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
             snapshot.insert(name.clone(), Some(file_sha256(&copied)?));
@@ -557,11 +606,12 @@ fn rollback(stage: &Path, parent: &Path, manifest: &SignedManifest,
             snapshot: &BTreeMap<String, Option<String>>) -> Result<(), String> {
     let backup = stage.join("backup");
     assert_no_reparse(&backup)?;
-    for name in manifest.files.keys() {
-        let old = backup.join(name);
+    for (name, original) in snapshot {
+        if !manifest.files.contains_key(name) { return Err("unauthorized backup target".into()); }
+        let old = backup.join(stage_filename(name));
         let target = parent.join(name);
         assert_no_reparse(&target)?;
-        match snapshot.get(name).ok_or("backup snapshot is incomplete")? {
+        match original {
             Some(expected) => {
                 assert_no_reparse(&old)?;
                 if file_sha256(&old)? != *expected {
@@ -582,7 +632,8 @@ fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
     if exe.file_name().and_then(|n| n.to_str()) != Some("DinurdoJK.exe") {
         return Err("unexpected installation target".into());
     }
-    let manifest = validate_stage(stage)?;
+    let root = exe.parent().ok_or("missing install directory")?;
+    let manifest = validate_stage(stage, root)?;
     // Do not accept the command-line target as authoritative: it must be the
     // exact currently-running game image that was copied into this helper.
     let helper_exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -604,7 +655,7 @@ fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
     wait_for_process(pid)?;
     // Recheck trust and file hashes after parent process exits, not only when
     // Download & Install was clicked.
-    validate_stage(stage)?;
+    validate_stage(stage, parent)?;
     // Never restore old code from a disk-only crash journal: another local
     // process could have tampered with the unsigned backup while we were gone.
     // Crash recovery is roll-forward using the publisher-signed new files.
@@ -618,7 +669,8 @@ fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
             let target = parent.join(name);
             assert_no_reparse(&target)?;
             if target.exists() && file_sha256(&target)? == info.sha256 { continue; }
-            replace_atomically(&stage.join("files").join(name), &target, &info.sha256)?;
+            ensure_install_parent(parent, name)?;
+            replace_atomically(&stage.join("files").join(stage_filename(name)), &target, &info.sha256)?;
         }
         for (name, info) in &manifest.files {
             if file_sha256(&parent.join(name))? != info.sha256 {
@@ -765,10 +817,8 @@ mod security_tests {
     fn signed_fixture() -> (Vec<u8>, Vec<u8>, VerifyingKey) {
         let key = SigningKey::from_bytes(&[41; 32]);
         let manifest = serde_json::json!({
-            "format": 1,
+            "format": 2,
             "tag": "v0.2.0",
-            "archive_name": "DinurdoJK-v0.2.0-windows-x64.zip",
-            "archive": {"size": 100, "sha256": "a".repeat(64)},
             "files": {"DinurdoJK.exe": {"size": 3, "sha256": "b".repeat(64)}}
         });
         let raw = serde_json::to_vec(&manifest).unwrap();
@@ -807,7 +857,9 @@ mod security_tests {
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         for name in ["phonon.dll", "OpenALSoft.x86_64.dll", "OpenAL-Soft-LGPL-2.0.txt", "EalMan-LGPL-2.1.txt",
-            "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll"] {
+            "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+            "nvngx_dlss.dll", "NVIDIA-DLSS-SDK-LICENSE.txt", "Bevy-Solari-MIT.txt",
+            "dxcompiler.dll", "dxil.dll", "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
             value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let raw = serde_json::to_vec(&value).unwrap();
@@ -816,6 +868,48 @@ mod security_tests {
         value["files"]["../OpenALSoft.x86_64.dll"] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         let raw = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_err());
+    }
+
+    #[test]
+    fn signed_dxc_files_are_allowed_only_at_install_root() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        for name in ["dxcompiler.dll", "dxil.dll", "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
+            value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        }
+        let valid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
+        value["files"]["bin/dxcompiler.dll"] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        let invalid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
+    }
+
+    #[test]
+    fn signed_project_asset_is_allowed_and_other_subdirectories_are_rejected() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["files"]["base/dinurdo-assets.pk3"] =
+            serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
+        let valid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
+        assert_eq!(stage_filename("base/dinurdo-assets.pk3"), "base__dinurdo-assets.pk3");
+        assert_eq!(release_asset_name("base/dinurdo-assets.pk3"), "dinurdo-assets.pk3");
+        value["files"]["base/../../evil.dll"] =
+            serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
+        let invalid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
+    }
+
+    #[test]
+    fn old_archive_manifest_format_is_not_accepted_as_per_file_release() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["format"] = serde_json::json!(1);
+        let invalid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
     }
 
     #[test]

@@ -407,7 +407,14 @@ impl Renderer {
         if !clean {
             self.submit_egui(&view);
             if self.egui_active {
-                self.submit_ui_overlay(&view, None);
+                // Studio editor UI follows the same authored/implicit JKA 2D
+                // policy as gameplay. The SDR target is reinterpreted, not copied.
+                let encoded_view = if self.hdr_output.is_none()
+                    && self.native_2d_encoded_surface_eligible()
+                    && self.ensure_encoded_2d_pipelines() {
+                    Some(self.surface_texture_unorm_view(&frame))
+                } else { None };
+                self.submit_ui_overlay(&view, encoded_view.as_ref());
             }
         }
         if let Some(output) = &self.hdr_output {

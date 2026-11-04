@@ -126,14 +126,7 @@ impl App {
                 let _ = self.set_console_cvar("r_lodScale", &defaults.lod_scale.to_string());
             }
             ui::VIDEO_ROW_FULLSCREEN => self.set_fullscreen_mode(defaults.fullscreen),
-            ui::VIDEO_ROW_RESOLUTION => {
-                self.video.resolution = defaults.resolution;
-                self.mark_config_dirty();
-                self.console_status = format!(
-                    "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
-                    self.video.resolution[0], self.video.resolution[1]
-                );
-            }
+            ui::VIDEO_ROW_RESOLUTION => self.set_desktop_resolution(),
             ui::VIDEO_ROW_VSYNC => {
                 self.video.vsync = defaults.vsync;
                 self.render_command(RenderCommand::SetVsync(self.video.vsync));
@@ -171,6 +164,7 @@ impl App {
                 self.video.fxaa = defaults.fxaa;
                 self.video.smaa = defaults.smaa;
                 self.video.taa = defaults.taa;
+                self.video.dlss = defaults.dlss;
                 self.render_command(RenderCommand::SetMsaa(self.video.msaa_samples));
                 self.sync_post_effects();
                 self.mark_config_dirty();

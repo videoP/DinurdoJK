@@ -24,6 +24,10 @@ pub struct Settings {
     pub high_amount: f32,
     pub high_altitude: f32,
     pub moon_phase: f32,
+    /// Moon world-light intensity in authored units, not the visible disc brightness.
+    /// With moon_intensity_custom false, the phase curve selects the effective value.
+    pub moon_intensity: f32,
+    pub moon_intensity_custom: bool,
     pub moon_custom: bool,
     pub moon_elevation: f32,
     pub moon_azimuth: f32,
@@ -73,6 +77,8 @@ impl Default for Settings {
             high_amount: 0.2,
             high_altitude: 8000.0,
             moon_phase: 0.5,
+            moon_intensity: Self::FULL_MOON_WORLD_INTENSITY,
+            moon_intensity_custom: false,
             moon_custom: false,
             moon_elevation: 35.0,
             moon_azimuth: 180.0,
@@ -95,6 +101,22 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// Full-moon key light in the Blue Water world-lighting gain (the moon
+    /// itself and the environment bake continue to use native phase lighting).
+    pub const FULL_MOON_WORLD_INTENSITY: f32 = 2.5;
+
+    pub fn phase_moon_intensity(self) -> f32 {
+        let phase = self.moon_phase.clamp(0.0, 1.0);
+        // Illuminated fraction squared: crescent < quarter < full moon.
+        let illuminated = 0.5 * (1.0 - (std::f32::consts::TAU * phase).cos());
+        Self::FULL_MOON_WORLD_INTENSITY * illuminated * illuminated
+    }
+
+    pub fn effective_moon_intensity(self) -> f32 {
+        if self.moon_intensity_custom { self.moon_intensity.clamp(0.0, 16.0) }
+        else { self.phase_moon_intensity() }
+    }
+
     pub fn sanitize(mut self) -> Self {
         let d = Self::default();
         macro_rules! limit {
@@ -124,6 +146,7 @@ impl Settings {
         limit!(high_amount, 0.0, 1.0);
         limit!(high_altitude, 2000.0, 20000.0);
         limit!(moon_phase, 0.0, 1.0);
+        limit!(moon_intensity, 0.0, 16.0);
         limit!(moon_elevation, -90.0, 90.0);
         limit!(moon_azimuth, 0.0, 360.0);
         limit!(rayleigh, 0.0, 1.5);
@@ -242,5 +265,27 @@ mod tests {
             assert_eq!(override_settings.quality(), tier);
         }
         assert_eq!(Settings { cloud_quality: 255, ..Default::default() }.sanitize().cloud_quality(), SkyQuality::High);
+    }
+}
+
+#[cfg(test)]
+mod moon_intensity_tests {
+    use super::Settings;
+
+    #[test]
+    fn automatic_moon_intensity_follows_phase() {
+        let mut settings = Settings::default();
+        settings.moon_phase = 0.0;
+        assert!(settings.effective_moon_intensity().abs() < 1e-6);
+        settings.moon_phase = 0.25;
+        let quarter = settings.effective_moon_intensity();
+        settings.moon_phase = 0.5;
+        let full = settings.effective_moon_intensity();
+        assert!(quarter > 0.0 && quarter < full);
+        assert!((full - Settings::FULL_MOON_WORLD_INTENSITY).abs() < 1e-6);
+        settings.moon_intensity_custom = true;
+        settings.moon_intensity = 4.0;
+        settings.moon_phase = 0.0;
+        assert_eq!(settings.effective_moon_intensity(), 4.0);
     }
 }

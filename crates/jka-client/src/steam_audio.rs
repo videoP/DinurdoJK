@@ -22,7 +22,8 @@ use std::{
 pub const JKA_UNITS_PER_METER: f32 = 32.0;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
-const BAKE_PROFILE_VERSION: u32 = 1;
+// Acoustic topology changed: never load the older serialized Steam Audio scene.
+const BAKE_PROFILE_VERSION: u32 = 2;
 const PROBE_SPACING_M: f32 = 3.0;
 const PROBE_HEIGHT_M: f32 = 1.5;
 const PROBE_BOUNDS_PADDING_M: f32 = 1.0;
@@ -111,15 +112,13 @@ impl SteamAudioBakeData {
 
 pub fn cache_info(
     root: &Path,
-    game: Option<&Path>,
+    _game: Option<&Path>,
     map_name: &str,
     map_hash: u64,
 ) -> SteamAudioBakeCacheInfo {
     let safe_name = sanitize_map_name(map_name);
     SteamAudioBakeCacheInfo {
-        directory: game
-            .unwrap_or(root)
-            .join("cache")
+        directory: jka_assets::pk3::dinurdojk_cache_directory(root)
             .join("steam-audio")
             .join(format!(
                 "{safe_name}-{map_hash:016x}-v{CACHE_SCHEMA_VERSION}-p{BAKE_PROFILE_VERSION}"

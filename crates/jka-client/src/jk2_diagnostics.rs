@@ -7,22 +7,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) fn resolve_demo(root: Option<&Path>, name: &str) -> Result<PathBuf, String> {
+/// Resolve JK2 recordings through its own base layers only. Local JK2
+/// recordings win over the optional retail installation, as local JKA
+/// recordings do over the JKA CD path.
+pub(crate) fn resolve_demo(
+    base: &Path, roots: &jka_assets::pk3::FilesystemRoots, name: &str,
+) -> Result<PathBuf, String> {
     let given = Path::new(name);
-    let candidates = if given.is_absolute() {
-        vec![given.to_path_buf()]
-    } else {
-        if given
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            return Err("Use a demo name under fs_jk2path/base/demos, or an absolute path".into());
-        }
-        let base = root
-            .ok_or("Set fs_jk2path to your JK2 GameData directory first")?
-            .join("base");
-        vec![base.join("demos").join(given)]
-    };
+    if !given.is_absolute() && given.components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("Use a demo name under fs_jk2basepath/demos or fs_jk2cdpath/base/demos, or an absolute path".into());
+    }
     if given.extension().is_some_and(|ext| {
         !ext.to_str().is_some_and(|ext| {
             ext.eq_ignore_ascii_case("dm_15") || ext.eq_ignore_ascii_case("dm_16")
@@ -30,21 +26,56 @@ pub(crate) fn resolve_demo(root: Option<&Path>, name: &str) -> Result<PathBuf, S
     }) {
         return Err("Expected a JK2 .dm_15 or .dm_16 demo".into());
     }
-    let mut matches = Vec::new();
-    for path in candidates {
-        let paths = if path.extension().is_none() {
+    let mut dirs = Vec::new();
+    if given.is_absolute() {
+        dirs.push(PathBuf::new());
+    } else {
+        if let Some(home) = &roots.homepath { dirs.push(home.join("jk2_base/demos")); }
+        dirs.push(jka_assets::pk3::jk2_base_directory(base, roots).join("demos"));
+        if let Some(cd) = &roots.jk2cdpath { dirs.push(cd.join("base/demos")); }
+    }
+    for dir in dirs {
+        let path = dir.join(given);
+        let candidates = if path.extension().is_none() {
             vec![path.with_extension("dm_15"), path.with_extension("dm_16")]
         } else {
             vec![path]
         };
-        matches.extend(paths.into_iter().filter(|p| p.is_file()));
+        let mut matches = candidates.into_iter().filter(|candidate| candidate.is_file()).collect::<Vec<_>>();
+        match matches.len() {
+            0 => continue,
+            1 => return Ok(matches.remove(0)),
+            _ => return Err("Multiple JK2 demos match; specify the extension or absolute path".into()),
+        }
     }
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(format!(
-            "No JK2 demo found for {name}; checked base/demos"
-        )),
-        _ => Err("Multiple JK2 demos match; specify the extension or absolute path".into()),
+    Err(format!("No JK2 demo found for {name}; checked fs_jk2basepath/demos and fs_jk2cdpath/base/demos"))
+}
+
+#[cfg(test)]
+mod jk2_demo_roots_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_local_first_then_retail_without_using_jka_demos() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let install = std::env::temp_dir().join(format!("jk2-demo-roots-{}-{nonce}", std::process::id()));
+        let local = install.join("jk2_base/demos");
+        let retail = install.join("retail/base/demos");
+        let jka = install.join("base/demos");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&retail).unwrap();
+        std::fs::create_dir_all(&jka).unwrap();
+        std::fs::write(jka.join("jkaonly.dm_15"), b"no").unwrap();
+        std::fs::write(retail.join("recording.dm_15"), b"retail").unwrap();
+        let base = install.join("base");
+        let roots = jka_assets::pk3::FilesystemRoots {
+            jk2cdpath: Some(install.join("retail")), ..Default::default()
+        };
+        assert_eq!(resolve_demo(&base, &roots, "recording").unwrap(), retail.join("recording.dm_15"));
+        assert!(resolve_demo(&base, &roots, "jkaonly").is_err());
+        std::fs::write(local.join("recording.dm_15"), b"local").unwrap();
+        assert_eq!(resolve_demo(&base, &roots, "recording").unwrap(), local.join("recording.dm_15"));
+        std::fs::remove_dir_all(install).unwrap();
     }
 }
 
@@ -81,11 +112,11 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
                 .ok_or("Cannot locate executable directory")?
                 .join("base");
             let mut roots = crate::filesystem_paths::load(&base);
-            if roots.jk2path.is_none() {
-                return Err("Set fs_jk2path to your JK2 GameData directory first".into());
+            if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&base, &roots, 2) {
+                return Err(format!("JK2 requires {missing} in fs_jk2basepath or fs_jk2cdpath/base"));
             }
             let demo = demo
-                .map(|name| resolve_demo(roots.jk2path.as_deref(), &name))
+                .map(|name| resolve_demo(&base, &roots, &name))
                 .transpose()?;
             roots.active_jk2 = Some(2);
             jka_assets::pk3::configure_filesystem_roots(&base, roots);
@@ -94,7 +125,7 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
             let asset = assets
                 .read("models/players/_humanoid/animation.cfg", 39998)
                 .map_err(|e| e.to_string())?
-                .ok_or("JK2 animation.cfg missing under fs_jk2path")?;
+                .ok_or("JK2 animation.cfg missing under fs_jk2basepath and fs_jk2cdpath/base")?;
             let mut report = jka_movement::jk2::diagnostics::run(&asset.bytes)?;
             if let Some(demo) = demo {
                 report.push_str(&format!(
@@ -120,7 +151,7 @@ pub(crate) fn cli_entry() -> Option<std::process::ExitCode> {
             .ok_or("Cannot locate executable directory")?
             .join("base");
         let roots = crate::filesystem_paths::load(&base);
-        let path = resolve_demo(roots.jk2path.as_deref(), &name)?;
+        let path = resolve_demo(&base, &roots, &name)?;
         if flag.as_deref() == Some("--jk2-presentation-info") {
             use std::io::Read;
             let mut bytes = Vec::new();

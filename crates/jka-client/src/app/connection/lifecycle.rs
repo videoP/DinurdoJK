@@ -84,6 +84,9 @@ impl App {
         }
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
+        self.render_command(RenderCommand::SetOverbrightBits(
+            self.video.effective_overbright_bits(false),
+        ));
         self.scoreboard = None;
         for guess in &mut self.spectator_ping_guesses {
             guess.reset();
@@ -177,6 +180,9 @@ impl App {
         }
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
+        self.render_command(RenderCommand::SetOverbrightBits(
+            self.video.effective_overbright_bits(false),
+        ));
         self.scoreboard = None;
         for guess in &mut self.spectator_ping_guesses {
             guess.reset();

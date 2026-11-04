@@ -532,14 +532,17 @@ impl App {
         {
             return;
         }
-        self.inventory_select_until = Some(Instant::now() + Duration::from_millis(1400));
+        self.inventory_select_until = Some(Instant::now() + Duration::from_millis(
+            if self.live_input.is_jk2() { 1530 } else { 1400 }
+        ));
         self.weapon_select_until = None;
         self.force_select_until = None;
         self.publish_transient_ui();
     }
 
     pub(in crate::app) fn inventory_select_ui(&self, now: Instant) -> Option<ui::UiInventorySelect> {
-        if now >= self.inventory_select_until? { return None; }
+        let until = self.inventory_select_until?;
+        if now >= until { return None; }
         let ps = self.live_player_state()?;
         let selected = self.live_input.inventory_select;
         if ps.stats[0] <= 0 || ps.stats[1] == 0 || ps.stats[2] == 0
@@ -552,6 +555,7 @@ impl App {
         Some(ui::UiInventorySelect {
             selected,
             owned_bits: ps.stats[2] as u32,
+            remaining_ms: until.saturating_duration_since(now).as_millis().min(u32::MAX as u128) as u32,
         })
     }
 
@@ -568,11 +572,16 @@ impl App {
         Some(ui::UiForceSelect {
             selected: self.live_input.force_select,
             known_bits,
+            remaining_ms: until.saturating_duration_since(now).as_millis().min(u32::MAX as u128) as u32,
         })
     }
 
     pub(in crate::app) fn weapon_select_ui(&self, now: Instant) -> Option<ui::UiWeaponSelect> {
-        if now >= self.weapon_select_until? { return None; }
+        // The owning HUD extension highlights the pending selection itself.
+        // Do not draw the vanilla transient weapon carousel over its fixed bar.
+        if !self.extensions.weapon_cycle.is_empty() && !self.live_input.is_jk2() { return None; }
+        let until = self.weapon_select_until?;
+        if now >= until { return None; }
         let ps = self.live_player_state()?;
         const PMF_FOLLOW: i32 = 4096;
         const PM_SPECTATOR: i32 = 4;
@@ -583,13 +592,20 @@ impl App {
         { return None; }
         let mut selectable_bits = 0_u32;
         let mut ammo_available_bits = 0_u32;
-        for weapon in 1..=16 {
-            let Some((ammo_index, primary_cost, alt_cost)) = jka_movement::weapon_info(weapon) else {
-                continue;
+        for weapon in 1..=(if self.live_input.is_jk2() { 13 } else { 16 }) {
+            let (ammo_index, primary_cost, alt_cost) = if self.live_input.is_jk2() {
+                let index = ui::jk2_ammo_index(weapon);
+                (index, 1, 1)
+            } else {
+                let Some((index, primary, alt)) = jka_movement::weapon_info(weapon) else {
+                    continue;
+                };
+                (index.max(0) as usize, primary, alt)
             };
-            let ammo = ps.ammo.get(ammo_index.max(0) as usize).copied().unwrap_or(0);
-            let has_ammo = ammo >= primary_cost || ammo >= alt_cost;
-            let detpack_valid = weapon != 14 || ammo > 0
+            let ammo = ps.ammo.get(ammo_index).copied().unwrap_or(0);
+            let has_ammo = ammo_index == 0 || ammo >= primary_cost || ammo >= alt_cost;
+            let detpack_id = if self.live_input.is_jk2() { 13 } else { 14 };
+            let detpack_valid = weapon != detpack_id || ammo > 0
                 || ps.field_i32("hasDetPackPlanted").unwrap_or(0) != 0;
             if has_ammo { ammo_available_bits |= 1 << weapon; }
             if ps.stats[4] & (1 << weapon) != 0 && has_ammo && detpack_valid {
@@ -602,6 +618,7 @@ impl App {
             selectable_bits,
             ammo_available_bits,
             saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
+            remaining_ms: until.saturating_duration_since(now).as_millis().min(u32::MAX as u128) as u32,
         })
     }
 

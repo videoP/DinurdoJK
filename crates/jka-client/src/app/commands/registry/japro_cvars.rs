@@ -2,6 +2,50 @@
 use super::cvar_prelude::*;
 
 settings_cvars! { JaproCgame;
+    APP_CG_LEADINDICATOR {
+        runtime: CvarDef::new(
+            "cg_leadIndicator", "0", "0 off | 1 ping | 2..2000 manual ms",
+            "TaystJK / jaPRO projectile lead markers. 0 off; 1 use snapshot ping; >=2 manual latency in milliseconds. Always disabled when the server advertises restricts bit 4 (RESTRICT_LEAD).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.japro_cg.lead_indicator.to_string()),
+            |app, value| App::cvar_set_cg_leadindicator(app, APP_CG_LEADINDICATOR.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_leadindicator, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, name, value| { let _ = settings.japro.set_cvar(name, value); }),
+            archive: Some((35920, |state| state.presentation.japro.lead_indicator.to_string())),
+            ..CvarBinding::NONE
+        },
+        settings: SETTINGS_CG_LEADINDICATOR = APP_CG_LEADINDICATOR
+            .bind(
+                |state: &JaproCgame| CvarValue::String(state.lead_indicator.to_string()),
+                |state, value| JaproCgame::cvar_set_cg_leadindicator(state, APP_CG_LEADINDICATOR.entry.name, &value.to_string()),
+            )
+            .with_text_setter(JaproCgame::cvar_set_cg_leadindicator, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_leadindicator(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let offset = value.trim().parse::<f32>()
+                        .map_err(|_| format!("{name}: expected 0, 1, or a manual millisecond offset"))?;
+                    if !offset.is_finite() || !(0.0..=2000.0).contains(&offset) || offset.fract() != 0.0 {
+                        return Err(format!("{name}: expected an integer from 0..2000"));
+                    }
+                    self.lead_indicator = offset;
+                    Ok(())
+                }
+            }
+            impl App {
+                fn cvar_set_cg_leadindicator(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_LEADINDICATOR.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    self.lead_indicator_visible = [false; 32];
+                    self.player_name_scan_at = Instant::now() - Duration::from_secs(1);
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_REMAPS {
         runtime: CvarDef::new(
                 "cg_remaps",

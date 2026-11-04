@@ -4843,7 +4843,7 @@ impl App {
                         ui.allocate_ui(egui::vec2(220.0,24.0),|ui| {
                             sui::combo(ui,"studio_video_section",&mut self.video_section,&sections);
                         });
-                        sui::hint(ui,"Edits apply to Studio preview and exports only. Files: render-studio/profiles/*.cfg; the project remembers its profile.");
+                        sui::hint(ui,"Edits apply to Studio preview and exports only. Files: DinurdoJK/render-studio/profiles/*.cfg; the project remembers its profile.");
                     });
                     sui::divider(ui);
                 });

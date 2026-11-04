@@ -10,6 +10,7 @@ pub(crate) struct ArchiveState<'a> {
 pub(crate) struct VideoLoadState {
     pub custom_width: Option<u32>,
     pub custom_height: Option<u32>,
+    pub resolution_mode_seen: bool,
     pub window_x: Option<i32>,
     pub window_y: Option<i32>,
     pub novis: Option<bool>,

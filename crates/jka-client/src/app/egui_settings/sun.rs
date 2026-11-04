@@ -24,6 +24,8 @@ impl App {
             v.sun_visibility != d.sun_visibility,
             s.moon_custom != e.moon_custom,
             differs(s.moon_phase, e.moon_phase),
+            s.moon_intensity_custom != e.moon_intensity_custom,
+            s.moon_intensity_custom && differs(s.moon_intensity, e.moon_intensity),
             differs(s.moon_elevation, e.moon_elevation),
             differs(s.moon_azimuth, e.moon_azimuth),
             differs(s.rayleigh, e.rayleigh),
@@ -59,6 +61,8 @@ impl App {
         v.sun_visibility = d.sun_visibility;
         let s = &mut v.blue_water_environment;
         s.moon_phase = e.moon_phase;
+        s.moon_intensity = e.moon_intensity;
+        s.moon_intensity_custom = e.moon_intensity_custom;
         s.moon_custom = e.moon_custom;
         s.moon_elevation = e.moon_elevation;
         s.moon_azimuth = e.moon_azimuth;

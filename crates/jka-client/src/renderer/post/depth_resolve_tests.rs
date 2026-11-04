@@ -226,7 +226,7 @@ fn ssao_history_tracks_selected_resolution() {
             let targets = create_targets(
                 &device, 64, 32, wgpu::TextureFormat::Rgba8Unorm, 1,
                 false, false, false, true, mode, false, false, false, false,
-                Default::default(),
+                Default::default(), (64, 32),
             );
             let history = targets.ssao_history.as_ref().unwrap();
             for texture in &history._textures {

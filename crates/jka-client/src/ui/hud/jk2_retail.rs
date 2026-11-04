@@ -1,0 +1,612 @@
+//! Native Jedi Outcast (JK2) multiplayer status HUD.
+//!
+//! Source authority: Raven's CODE-mp/cgame/cg_draw.c (`CG_DrawHUD`,
+//! `CG_DrawArmor`, `CG_DrawHealth`, `CG_DrawAmmo`, `CG_DrawForcePower`),
+//! cg_main.c (forceTicPos/ammoTicPos/media paths), and cg_drawtools.c
+//! (`CG_DrawNumField`). No JKA HUD art or scripted extensions are involved.
+//! Coordinates are 640x480 virtual units; the clusters are independently editable.
+use crate::ui::{
+    hud_element_rect, textured_rect_with_source, HudElementId, HudRectContext,
+    UiSnapshot, UiVertex,
+};
+use super::extensions::{
+    image_cell_uv_for_count, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE,
+};
+
+
+// JK2 source: code/cgame/cg_weapons.cpp CG_DrawIconBackground (single-player)
+// and CODE-mp/cgame/cg_main.c media registration. The JK2 MP renderer left
+// these actual draw calls commented, but the authored textures and the 130 ms
+// interpolation remain present in the original single-player renderer.
+const SELECT_BG_WEAPON: &str = "gfx/hud/background";
+const SELECT_BG_FORCE: &str = "gfx/hud/background_f";
+const SELECT_BG_ITEM: &str = "gfx/hud/background_i";
+const SELECT_PRONG_WEAPON: &str = "gfx/hud/prong_on_w";
+const SELECT_PRONG_FORCE: &str = "gfx/hud/prong_on_f";
+const SELECT_PRONG_ITEM: &str = "gfx/hud/prong_on_i";
+const SELECT_PRONG_OFF: &str = "gfx/hud/prong_off";
+const SELECT_ART: [&str; 7] = [
+    SELECT_BG_WEAPON, SELECT_BG_FORCE, SELECT_BG_ITEM,
+    SELECT_PRONG_WEAPON, SELECT_PRONG_FORCE, SELECT_PRONG_ITEM, SELECT_PRONG_OFF,
+];
+// Raven CODE-mp/cgame/cg_main.c weaponIcons / weaponIcons_NA (JK2 only).
+const JK2_WEAPON_ICONS: [&str; 14] = [
+    "", "gfx/hud/w_icon_stunbaton", "gfx/hud/w_icon_lightsaber",
+    "gfx/hud/w_icon_briar", "gfx/hud/w_icon_blaster", "gfx/hud/w_icon_disruptor",
+    "gfx/hud/w_icon_bowcaster", "gfx/hud/w_icon_repeater",
+    "gfx/hud/w_icon_demp2", "gfx/hud/w_icon_flechette",
+    "gfx/hud/w_icon_merrsonn", "gfx/hud/w_icon_thermal",
+    "gfx/hud/w_icon_tripmine", "gfx/hud/w_icon_detpack",
+];
+const JK2_WEAPON_ICONS_EMPTY: [&str; 14] = [
+    "", "gfx/hud/w_icon_stunbaton_na", "gfx/hud/w_icon_lightsaber_na",
+    "gfx/hud/w_icon_briar_na", "gfx/hud/w_icon_blaster_na",
+    "gfx/hud/w_icon_disruptor_na", "gfx/hud/w_icon_bowcaster_na",
+    "gfx/hud/w_icon_repeater_na", "gfx/hud/w_icon_demp2_na",
+    "gfx/hud/w_icon_flechette_na", "gfx/hud/w_icon_merrsonn_na",
+    "gfx/hud/w_icon_thermal_na", "gfx/hud/w_icon_tripmine_na",
+    "gfx/hud/w_icon_detpack_na",
+];
+const JK2_WEAPON_NAMES: [&str; 14] = [
+    "", "Stun Baton", "Lightsaber", "Bryar Pistol", "E-11 Blaster Rifle",
+    "Disruptor Rifle", "Bowcaster", "Heavy Repeater", "DEMP2",
+    "Flechette", "Rocket Launcher", "Thermal Detonator",
+    "Trip Mine", "Det Pack",
+];
+// CODE-mp/game/bg_misc.c bg_itemlist for the six JK2 holdable tags.
+const JK2_ITEM_ICONS: [&str; 7] = [
+    "", "gfx/hud/i_icon_seeker", "gfx/hud/i_icon_shieldwall",
+    "gfx/hud/i_icon_bacta", "", "gfx/hud/i_icon_zoom",
+    "gfx/hud/i_icon_sentrygun",
+];
+const JK2_ITEM_NAMES: [&str; 7] = [
+    "", "Seeker Drone", "Forcefield", "Bacta Canister", "Datapad",
+    "Binoculars", "Sentry Gun",
+];
+
+const WHITE: [f32; 4] = [1.0; 4];
+const GREEN: [f32; 4] = [0.0, 0.613, 0.097, 1.0];
+const RED: [f32; 4] = [0.835, 0.015, 0.015, 1.0];
+const ORANGE: [f32; 4] = [1.0, 0.658, 0.062, 1.0];
+const LEFT_INNER: &str = "gfx/hud/hudleft_innerframe";
+const LEFT_FRAME: &str = "gfx/hud/static_test";
+const RIGHT_INNER: &str = "gfx/hud/hudright_innerframe";
+const RIGHT_FRAME: &str = "gfx/hud/hudrightframe";
+const ARMOR_OUTER: &str = "gfx/hud/armor1";
+const ARMOR_INNER: &str = "gfx/hud/armor2";
+const ARMOR_TIC: &str = "gfx/hud/armor_tic";
+const HEALTH: &str = "gfx/hud/health";
+const HEALTH_TIC: &str = "gfx/hud/health_tic";
+const SABER_STYLES: [&str; 3] = [
+    "gfx/hud/saber_stylesFast", "gfx/hud/saber_stylesMed", "gfx/hud/saber_stylesStrong",
+];
+// CODE-mp/game/bg_weapons.h + bg_weapons.c. JK2 and JKA weapon IDs are
+// NOT interchangeable (JK2 WP_SABER is 2, not JKA's 3).
+pub(crate) fn jk2_ammo_index(weapon: i32) -> usize {
+    match weapon {
+        3 | 4 => 2,            // Bryar pistol, E-11: AMMO_BLASTER
+        5 | 6 | 8 => 3,        // Disruptor, bowcaster, DEMP2: AMMO_POWERCELL
+        7 | 9 => 4,            // Repeater, flechette: AMMO_METAL_BOLTS
+        10 => 5,               // Rocket launcher: AMMO_ROCKETS
+        11 => 7,               // Thermal detonator
+        12 => 8,               // Trip mine
+        13 => 9,               // Det pack
+        _ => 0,
+    }
+}
+// CODE-mp/game/bg_weapons.c ammoData[AMMO_MAX], not JKA's ammo table.
+const JK2_AMMO_MAX: [i32; 10] = [0, 100, 300, 300, 300, 25, 800, 10, 10, 10];
+
+const NUMBERS: [&str; 11] = [
+    "gfx/2d/numbers/t_zero", "gfx/2d/numbers/t_one",
+    "gfx/2d/numbers/t_two", "gfx/2d/numbers/t_three",
+    "gfx/2d/numbers/t_four", "gfx/2d/numbers/t_five",
+    "gfx/2d/numbers/t_six", "gfx/2d/numbers/t_seven",
+    "gfx/2d/numbers/t_eight", "gfx/2d/numbers/t_nine",
+    "gfx/2d/numbers/t_minus",
+];
+
+// JK2 CODE-mp/cgame/cg_main.c: forceTicPos and ammoTicPos, in source order.
+// A negative width is an intentionally mirrored (right-hand) tick.
+type Piece = (&'static str, f32, f32, f32, f32);
+const FORCE_TICS: [Piece; 14] = [
+    ("gfx/hud/force_tick1", 11.0, 41.0, 20.0, 10.0),
+    ("gfx/hud/force_tick2", 12.0, 45.0, 20.0, 10.0),
+    ("gfx/hud/force_tick3", 14.0, 49.0, 20.0, 10.0),
+    ("gfx/hud/force_tick4", 17.0, 52.0, 20.0, 10.0),
+    ("gfx/hud/force_tick5", 22.0, 55.0, 10.0, 10.0),
+    ("gfx/hud/force_tick6", 28.0, 57.0, 10.0, 20.0),
+    ("gfx/hud/force_tick7", 34.0, 59.0, 10.0, 10.0),
+    ("gfx/hud/force_tick7", 46.0, 59.0, -10.0, 10.0),
+    ("gfx/hud/force_tick6", 52.0, 57.0, -10.0, 20.0),
+    ("gfx/hud/force_tick5", 58.0, 55.0, -10.0, 10.0),
+    ("gfx/hud/force_tick4", 63.0, 52.0, -20.0, 10.0),
+    ("gfx/hud/force_tick3", 66.0, 49.0, -20.0, 10.0),
+    ("gfx/hud/force_tick2", 68.0, 45.0, -20.0, 10.0),
+    ("gfx/hud/force_tick1", 69.0, 41.0, -20.0, 10.0),
+];
+const AMMO_TICS: [Piece; 14] = [
+    ("gfx/hud/ammo_tick7", 12.0, 34.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick6", 13.0, 28.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick5", 15.0, 23.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick4", 19.0, 19.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick3", 23.0, 15.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick2", 29.0, 12.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick1", 34.0, 11.0, 10.0, 10.0),
+    ("gfx/hud/ammo_tick1", 47.0, 11.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick2", 52.0, 12.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick3", 58.0, 15.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick4", 62.0, 19.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick5", 66.0, 23.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick6", 68.0, 28.0, -10.0, 10.0),
+    ("gfx/hud/ammo_tick7", 69.0, 34.0, -10.0, 10.0),
+];
+
+/// Appends only the assets for the active game; extension image slots retain their order.
+/// As with the JKA native HUD, loading/decoding stays on the existing image worker.
+pub(crate) fn append_jk2_hud_images(images: &mut Vec<String>, style: u8) {
+    if style != 1 { return; }
+    let names = [
+        LEFT_INNER, LEFT_FRAME, RIGHT_INNER, RIGHT_FRAME,
+        ARMOR_OUTER, ARMOR_INNER, ARMOR_TIC, HEALTH, HEALTH_TIC,
+    ].into_iter()
+        .chain(SABER_STYLES)
+        .chain(FORCE_TICS.iter().map(|piece| piece.0))
+        .chain(AMMO_TICS.iter().map(|piece| piece.0))
+        .chain(NUMBERS)
+        .chain(SELECT_ART)
+        .chain(JK2_WEAPON_ICONS.iter().copied().filter(|name| !name.is_empty()))
+        .chain(JK2_WEAPON_ICONS_EMPTY.iter().copied().filter(|name| !name.is_empty()))
+        .chain(JK2_ITEM_ICONS.iter().copied().filter(|name| !name.is_empty()));
+    for name in names {
+        if !images.iter().any(|present| present == name) {
+            images.push(name.to_owned());
+        }
+    }
+}
+
+struct Painter<'a> {
+    out: &'a mut Vec<UiVertex>,
+    images: &'a [String],
+    shader_flags: &'a [bool],
+    screen: [u32; 2],
+    origin: [f32; 2],
+    /// Uniform 640x480-to-pixel factor. HUD artwork must never stretch on widescreen.
+    unit: f32,
+}
+
+impl Painter<'_> {
+    fn image(&mut self, name: &str, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
+        self.image_pixels(
+            name, self.origin[0] + x * self.unit, self.origin[1] + y * self.unit,
+            width * self.unit, height * self.unit, [0.0, 1.0], color,
+        );
+    }
+
+    /// Draw artwork in real pixels, optionally sampling a horizontal region.
+    /// The selector's long background can grow through its featureless centre,
+    /// without stretching the actual artwork (or any circular HUD component).
+    #[allow(clippy::too_many_arguments)]
+    fn image_pixels(
+        &mut self, name: &str, x: f32, y: f32, width: f32, height: f32,
+        u_range: [f32; 2], color: [f32; 4],
+    ) {
+        let Some(index) = self.images.iter().position(|image| image == name) else { return; };
+        let (mut uv0, mut uv1) = image_cell_uv_for_count(index, self.images.len());
+        let u_start = uv0[0];
+        let u_span = uv1[0] - uv0[0];
+        uv0[0] = u_start + u_span * u_range[0];
+        uv1[0] = u_start + u_span * u_range[1];
+        if width < 0.0 { std::mem::swap(&mut uv0[0], &mut uv1[0]); }
+        if height < 0.0 { std::mem::swap(&mut uv0[1], &mut uv1[1]); }
+        textured_rect_with_source(
+            self.out,
+            x.min(x + width), y.min(y + height), width.abs(), height.abs(),
+            uv0, uv1, color,
+            if self.shader_flags.get(index).copied().unwrap_or(false) {
+                EXT_IMAGE_SHADER_SOURCE_BASE + index as f32
+            } else { EXT_IMAGE_TEXTURE_SOURCE },
+            self.screen[0], self.screen[1],
+        );
+    }
+
+    fn frame(&mut self, name: &str, color: [f32; 4]) {
+        self.image(name, 0.0, 0.0, 80.0, 80.0, color);
+    }
+
+    /// Raven CG_DrawNumField(NUM_FONT_SMALL): x+2+charWidth*(3-digits),
+    /// with a one-virtual-pixel gap *after* each six-pixel digit.
+    fn number(&mut self, value: i32, x: f32, y: f32, color: [f32; 4]) {
+        let digits = value.clamp(-99, 999).to_string();
+        let mut x = x + 2.0 + 6.0 * (3 - digits.len()) as f32;
+        for ch in digits.chars() {
+            let index = if ch == '-' { 10 } else { ch.to_digit(10).unwrap_or(0) as usize };
+            self.image(NUMBERS[index], x, y, 6.0, 12.0, color);
+            x += 7.0;
+        }
+    }
+
+    /// CODE-mp draws all 14 segments, including solid-black empty ticks.
+    /// The reference reduces the remaining value for each tick in reverse order.
+    fn ring(&mut self, pieces: &[Piece; 14], value: i32, maximum: i32) {
+        let increment = maximum.max(1) as f32 / 14.0;
+        let mut remaining = value as f32;
+        for &(name, x, y, w, h) in pieces.iter().rev() {
+            let brightness = (remaining / increment).clamp(0.0, 1.0);
+            self.image(name, x, y, w, h, [brightness, brightness, brightness, 1.0]);
+            remaining -= increment;
+        }
+    }
+}
+
+fn dim(color: [f32; 4], level: f32) -> [f32; 4] {
+    let value = level.clamp(0.0, 1.0);
+    [color[0] * value, color[1] * value, color[2] * value, color[3]]
+}
+
+pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let Some(hud) = ui.hud else { return; };
+    if hud.spectating { return; }
+    let ctx = HudRectContext::from_snapshot(ui);
+    let tint = match hud.team {
+        1 => [1.0, 0.5, 0.5, 1.0],
+        2 => [0.5, 0.5, 1.0, 1.0],
+        _ => WHITE,
+    };
+    // Match the aspect-safe HUD convention used by lagometer, JA+ and JKA:
+    // cgs.widthRatioCoef cancels horizontal widescreen stretch. Keep the
+    // original 640x480 artwork proportions, but anchor panels to real edges.
+    let unit = super::layout::hud_art_scale(w, h);
+    let images = &ui.extension_images;
+    let shaders = &ui.extension_shader_flags;
+    if !ui.native_replaced(crate::extensions::NativeHud::Health) {
+        let left = hud_element_rect(HudElementId::Health, ui.hud_layout.health, &ctx, w, h);
+        let mut painter = Painter {
+            out, images, shader_flags: shaders, screen: [w, h],
+            origin: [left.x, left.y], unit: unit * ui.hud_layout.health.scale.clamp(0.5, 2.0),
+        };
+        // Original layering: inner frame, armor rings and tic, health ring
+        // and tic, small numbers, outer frame. No JKA stock HUD calls.
+        painter.frame(LEFT_INNER, tint);
+        let half_max = (hud.max_health.max(1) / 2).max(1) as f32;
+        let outer_armor = (hud.armor.min(hud.max_health) as f32 - half_max) / half_max;
+        let inner_armor = if outer_armor > 0.0 { 1.0 } else { hud.armor as f32 / half_max };
+        painter.frame(ARMOR_OUTER, dim(GREEN, outer_armor));
+        painter.frame(ARMOR_INNER, dim(GREEN, inner_armor));
+        // Raven toggles these indicators on a 100 ms shared timer below
+        // 25% armor / 20% health; the stateless UI uses game-time phase.
+        let flashing = (hud.time_ms / 100).rem_euclid(2) == 0;
+        if hud.armor != 0 && (inner_armor >= 0.5 || flashing) {
+            painter.frame(ARMOR_TIC, GREEN);
+        }
+        let health_fraction = hud.health.min(hud.max_health) as f32 / hud.max_health.max(1) as f32;
+        painter.frame(HEALTH, dim(RED, health_fraction));
+        if health_fraction > 0.2 || flashing {
+            painter.frame(HEALTH_TIC, RED);
+        }
+        painter.number(hud.armor, 32.0, 54.0, GREEN);
+        painter.number(hud.health, 16.0, 40.0, RED);
+        painter.frame(LEFT_FRAME, tint);
+    }
+    if !ui.native_replaced(crate::extensions::NativeHud::Ammo) {
+        let right = hud_element_rect(HudElementId::Ammo, ui.hud_layout.ammo, &ctx, w, h);
+        let mut painter = Painter {
+            out, images, shader_flags: shaders, screen: [w, h],
+            origin: [right.x, right.y], unit: unit * ui.hud_layout.ammo.scale.clamp(0.5, 2.0),
+        };
+        painter.frame(RIGHT_INNER, tint);
+        if let Some(force) = hud.force_power {
+            // JK2 CG_DrawForcePower uses a fixed 100 point capacity.
+            painter.ring(&FORCE_TICS, force, 100);
+        }
+        if hud.weapon == 2 {
+            // JK2 weapon WP_SABER: style is drawn across the *top* half
+            // of the right cluster, rather than using JKA's separate icons.
+            if (1..=3).contains(&hud.saber_style) {
+                painter.image(SABER_STYLES[(hud.saber_style - 1) as usize],
+                    0.0, 0.0, 80.0, 40.0, WHITE);
+            }
+        } else if hud.weapon > 0 {
+            if let Some(ammo) = hud.ammo.filter(|ammo| *ammo >= 0) {
+                painter.number(ammo, 30.0, 26.0, ORANGE);
+                let maximum = JK2_AMMO_MAX.get(hud.ammo_index).copied().unwrap_or(0);
+                painter.ring(&AMMO_TICS, ammo, maximum);
+            }
+        }
+        painter.frame(RIGHT_FRAME, tint);
+    }
+}
+
+
+/// Draw the original JK2 460x60 selection art with fixed-size endcaps.
+/// Only a narrow centre texel is extended across extra widescreen space;
+/// circular frames, icons, and animated prongs remain aspect-correct.
+fn select_background(
+    painter: &mut Painter<'_>, name: &str, y: f32, height: f32, screen_width: f32,
+) {
+    let unit = painter.unit;
+    let left = 90.0 * unit;
+    let half = 230.0 * unit;
+    let right = screen_width - (90.0 + 230.0) * unit;
+    let y = y * unit;
+    let height = height * unit;
+    if right <= left + half {
+        // 4:3 and narrower: the authored image already fits at uniform scale.
+        painter.image_pixels(name, left, y, 460.0 * unit, height, [0.0, 1.0], WHITE);
+    } else {
+        painter.image_pixels(name, left, y, half, height, [0.0, 0.5], WHITE);
+        painter.image_pixels(name, left + half, y, right - left - half, height,
+            [0.499, 0.501], WHITE);
+        painter.image_pixels(name, right, y, half, height, [0.5, 1.0], WHITE);
+    }
+}
+
+/// Replays JK2 single-player's expanding `CG_DrawIconBackground` artwork.
+/// Original 130 ms timing is unchanged; only widescreen placement differs.
+pub(in crate::ui) fn build_select_chrome(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32,
+) {
+    if !ui.jk2_mode || ui.video.hud_style != 1 || !ui.video.draw_hud || w == 0 || h == 0 {
+        return;
+    }
+    let selections = [
+        ui.weapon_select.map(|value| (value.remaining_ms, SELECT_BG_WEAPON, SELECT_PRONG_WEAPON)),
+        ui.force_select.map(|value| (value.remaining_ms, SELECT_BG_FORCE, SELECT_PRONG_FORCE)),
+        ui.inventory_select.map(|value| (value.remaining_ms, SELECT_BG_ITEM, SELECT_PRONG_ITEM)),
+    ];
+    // App clears older selection state whenever a new selector is activated.
+    let selected = selections.into_iter().flatten().find(|(ms, _, _)| *ms > 0);
+    let unit = super::layout::hud_art_scale(w, h);
+    let mut painter = Painter {
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        screen: [w, h], origin: [0.0, 0.0], unit,
+    };
+    // Prongs are tied to the left and right viewport edges, respectively.
+    // Neither X size nor Y size depends on screen aspect ratio.
+    let prongs = |painter: &mut Painter<'_>, name: &str, x_add: f32| {
+        painter.image_pixels(name, (67.0 + x_add) * unit, 400.0 * unit,
+            40.0 * unit, 80.0 * unit, [0.0, 1.0], WHITE);
+        painter.image_pixels(name, w as f32 - (66.0 + x_add) * unit, 400.0 * unit,
+            -40.0 * unit, 80.0 * unit, [0.0, 1.0], WHITE);
+    };
+    let Some((remaining, background, prong)) = selected else {
+        prongs(&mut painter, SELECT_PRONG_OFF, 0.0);
+        return;
+    };
+    let percent = if remaining > 1400 {
+        ((1530 - remaining.min(1530)) as f32 / 130.0).clamp(0.0, 1.0)
+    } else if remaining <= 130 {
+        (remaining as f32 / 130.0).clamp(0.0, 1.0)
+    } else { 1.0 };
+    let x_add = (8.0 * percent) as i32 as f32;
+    let span = (60.0 * percent) as i32 as f32;
+    if span > 0.0 {
+        select_background(&mut painter, background, 440.0, -span, w as f32);
+        select_background(&mut painter, background, 438.0, span, w as f32);
+    }
+    prongs(&mut painter, if remaining <= 130 { SELECT_PRONG_OFF } else { prong }, x_add);
+}
+
+fn select_label(
+    out: &mut Vec<UiVertex>, label: &str,
+    color: [f32; 4], font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
+) {
+    let scale = h as f32 / 480.0;
+    let x = w as f32 * 0.5;
+    if let Some(font) = font {
+        let size = 0.55;
+        let width = crate::ui::proportional_text_width(label, font, size) * scale;
+        crate::ui::proportional_text_uniform(out, label, font, x - width * 0.5,
+            455.0 * scale, size, color, true, w, h);
+    } else {
+        let width = 8.0 * scale;
+        crate::ui::fixed_charset_text(out, label, x - label.len() as f32 * width * 0.5,
+            455.0 * scale, width, 12.0 * scale, width, color, true, w, h);
+    }
+}
+
+/// Dedicated JK2 weapon carousel. JKA IDs (saber=3, concussion=15) and
+/// JKA's icon atlas are intentionally not used for this protocol.
+pub(in crate::ui) fn build_weapon_select(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot,
+    font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
+) {
+    let Some(selection) = ui.weapon_select else { return; };
+    if selection.remaining_ms <= 130 || !(1..=13).contains(&selection.selected) { return; }
+    // JK2 displays every owned weapon; weapons without ammo use their
+    // authored `_na` icon instead of disappearing from the carousel.
+    let visible: Vec<usize> = (1..=13)
+        .filter(|id| selection.owned_bits & (1_u32 << *id) != 0)
+        .collect();
+    let Some(center) = visible.iter().position(|id| *id == selection.selected as usize) else { return; };
+    let side = if visible.len() > 6 { (3, 3) } else {
+        ((visible.len()-1)/2, visible.len()/2)
+    };
+    let scale = h as f32 / 480.0;
+    let mut painter = Painter {
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        screen: [w, h], origin: [w as f32 * 0.5 - 320.0 * scale, 0.0],
+        unit: scale,
+    };
+    let mut draw = |weapon: usize, x: f32, y: f32, size: f32| {
+        let no_ammo = selection.ammo_available_bits & (1 << weapon) == 0;
+        painter.image(if no_ammo { JK2_WEAPON_ICONS_EMPTY[weapon] }
+            else { JK2_WEAPON_ICONS[weapon] }, x, y, size, size, WHITE);
+    };
+    for i in 1..=side.0 {
+        draw(visible[(center + visible.len() - i) % visible.len()],
+            228.0 - (i as f32 - 1.0) * 52.0, 420.0, 40.0);
+    }
+    draw(selection.selected as usize, 280.0, 400.0, 80.0);
+    for i in 1..=side.1 {
+        draw(visible[(center + i) % visible.len()],
+            372.0 + (i as f32 - 1.0) * 52.0, 420.0, 40.0);
+    }
+    select_label(out, JK2_WEAPON_NAMES[selection.selected as usize],
+        [0.875, 0.718, 0.121, 1.0], font, w, h);
+}
+
+/// Native JK2 `HI_*` inventory tags / icons (JKA's tags are different).
+pub(in crate::ui) fn build_inventory_select(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot,
+    font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
+) {
+    let Some(selection) = ui.inventory_select else { return; };
+    if selection.remaining_ms <= 130 || !(1..=6).contains(&selection.selected) { return; }
+    let visible: Vec<usize> = (1..=6).filter(|id| {
+        JK2_ITEM_ICONS[*id].len() > 0 && selection.owned_bits & (1_u32 << *id) != 0
+    }).collect();
+    let Some(center) = visible.iter().position(|id| *id == selection.selected as usize) else { return; };
+    let left = (visible.len()-1).min(6) / 2;
+    let right = (visible.len()-1).min(6) - left;
+    let scale = h as f32 / 480.0;
+    let mut painter = Painter {
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        screen: [w, h], origin: [w as f32 * 0.5 - 320.0 * scale, 0.0],
+        unit: scale,
+    };
+    for i in 1..=left {
+        painter.image(JK2_ITEM_ICONS[visible[(center + visible.len()-i) % visible.len()]],
+            224.0 - (i as f32 - 1.0)*56.0, 420.0, 40.0, 40.0, WHITE);
+    }
+    painter.image(JK2_ITEM_ICONS[selection.selected as usize], 280.0, 400.0, 80.0, 80.0, WHITE);
+    for i in 1..=right {
+        painter.image(JK2_ITEM_ICONS[visible[(center+i) % visible.len()]],
+            376.0 + (i as f32 - 1.0)*56.0, 420.0, 40.0, 40.0, WHITE);
+    }
+    select_label(out, JK2_ITEM_NAMES[selection.selected as usize],
+        [0.312, 0.75, 0.621, 1.0], font, w, h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jk2_native_assets_have_unique_source_paths() {
+        let mut images = vec!["my/custom/hud".to_owned()];
+        append_jk2_hud_images(&mut images, 0);
+        assert_eq!(images.len(), 1);
+        append_jk2_hud_images(&mut images, 1);
+        assert_eq!(images.len(), 76); // unique JK2 art, including carousel backgrounds and prongs
+        assert_eq!(images[0], "my/custom/hud");
+        append_jk2_hud_images(&mut images, 1);
+        assert_eq!(images.len(), 76);
+    }
+
+    #[test]
+    fn jk2_selector_chrome_uses_the_original_prongs_and_open_close_timing() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        ui.video.draw_hud = true;
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        let mut out = Vec::new();
+        ui.force_select = Some(crate::ui::UiForceSelect {
+            selected: 3, known_bits: 1 << 3, remaining_ms: 1530,
+        });
+        build_select_chrome(&mut out, &ui, 1280, 720);
+        assert_eq!(out.len(), 12); // two prongs, collapsed background
+        out.clear();
+        ui.force_select.as_mut().unwrap().remaining_ms = 1465;
+        build_select_chrome(&mut out, &ui, 1280, 720);
+        assert_eq!(out.len(), 48); // six background slices + two prongs
+        out.clear();
+        ui.force_select.as_mut().unwrap().remaining_ms = 65;
+        build_select_chrome(&mut out, &ui, 1280, 720);
+        assert_eq!(out.len(), 48); // six background slices + two off prongs
+    }
+
+    #[test]
+    fn jk2_hud_frames_and_selector_prongs_do_not_stretch_on_widescreen() {
+        // 4:3, 16:9, the reported 1649x928 screenshot, and ultrawide.
+        // Native HUD frames and selector prongs use the same height-based unit;
+        // only their positioning is anchored to opposite screen edges.
+        for (w, h) in [(640, 480), (1280, 720), (1649, 928), (3440, 1440)] {
+            let mut ui = UiSnapshot::default();
+            ui.jk2_mode = true;
+            ui.video.hud_style = 1;
+            ui.video.draw_hud = true;
+            append_jk2_hud_images(&mut ui.extension_images, 1);
+            let context = HudRectContext::from_snapshot(&ui);
+            let left = hud_element_rect(HudElementId::Health, ui.hud_layout.health, &context, w, h);
+            let right = hud_element_rect(HudElementId::Ammo, ui.hud_layout.ammo, &context, w, h);
+            let unit = super::super::layout::hud_art_scale(w, h);
+            let size = 80.0 * unit;
+            assert!((left.x).abs() < 0.01);
+            assert!((left.width - size).abs() < 0.01);
+            assert!((left.height - size).abs() < 0.01);
+            assert!((right.x - (w as f32 - size)).abs() < 0.01);
+            assert!((right.width - right.height).abs() < 0.01);
+
+            let px = |ndc: f32| (ndc + 1.0) * w as f32 * 0.5;
+            let py = |ndc: f32| (1.0 - ndc) * h as f32 * 0.5;
+            let mut out = Vec::new();
+            build_select_chrome(&mut out, &ui, w, h);
+            assert_eq!(out.len(), 12); // left and right prongs, six vertices each
+            assert!((px(out[0].position[0]) - 67.0 * unit).abs() < 0.01);
+            assert!((px(out[6].position[0]) - (w as f32 - 106.0 * unit)).abs() < 0.01);
+            assert!((px(out[2].position[0]) - px(out[0].position[0]) - 40.0 * unit).abs() < 0.01);
+            assert!((px(out[8].position[0]) - px(out[6].position[0]) - 40.0 * unit).abs() < 0.01);
+            assert!((py(out[0].position[1]) - (h as f32 - size)).abs() < 0.01);
+            assert!((py(out[2].position[1]) - py(out[0].position[1]) - size).abs() < 0.01);
+            assert!(px(out[0].position[0]) < left.x + left.width);
+            assert!(px(out[6].position[0]) < right.x);
+
+            ui.force_select = Some(crate::ui::UiForceSelect {
+                selected: 3, known_bits: 1 << 3, remaining_ms: 1400,
+            });
+            out.clear();
+            build_select_chrome(&mut out, &ui, w, h);
+            assert_eq!(out.len(), if w as f32 > 640.0 * unit { 48 } else { 24 });
+            assert!((px(out[0].position[0]) - 90.0 * unit).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn jk2_native_weapon_and_inventory_selectors_are_not_jka_ids() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        let mut out = Vec::new();
+        ui.weapon_select = Some(crate::ui::UiWeaponSelect {
+            selected: 2, owned_bits: 1 << 2, selectable_bits: 1 << 2,
+            ammo_available_bits: 1 << 2, saber_style: 0, remaining_ms: 1000,
+        });
+        build_weapon_select(&mut out, &ui, None, 1280, 720);
+        assert!(!out.is_empty());
+        out.clear();
+        ui.inventory_select = Some(crate::ui::UiInventorySelect {
+            selected: 3, owned_bits: 1 << 3, remaining_ms: 1000,
+        });
+        build_inventory_select(&mut out, &ui, None, 1280, 720);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn jk2_weapon_ids_do_not_use_jka_ammo_mapping() {
+        assert_eq!(jk2_ammo_index(2), 0); // JK2 saber
+        assert_eq!(jk2_ammo_index(3), 2); // JK2 Bryar
+        assert_eq!(jk2_ammo_index(5), 3); // Disruptor
+        assert_eq!(jk2_ammo_index(7), 4); // Repeater
+        assert_eq!(jk2_ammo_index(10), 5); // Rocket launcher
+        assert_eq!(jk2_ammo_index(13), 9); // Det pack
+    }
+
+    #[test]
+    fn jk2_hud_emits_native_geometry() {
+        let mut ui = UiSnapshot::default();
+        ui.video.hud_style = 1;
+        ui.jk2_mode = true;
+        ui.hud = Some(crate::ui::HudState {
+            health: 100, max_health: 100, armor: 50,
+            weapon: 2, saber_style: 2, force_power: Some(75),
+            ..Default::default()
+        });
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        let mut out = Vec::new();
+        build(&mut out, &ui, 1280, 720);
+        assert!(!out.is_empty());
+    }
+}

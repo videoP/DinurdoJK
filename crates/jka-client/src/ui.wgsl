@@ -61,7 +61,15 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         // Dynamic CG_DrawTeamOverlay model/weapon/powerup atlas.
         return textureSampleLevel(ui_team_icons, ui_font_sampler, input.uv, 0.0) * input.color;
     } else if input.textured < 7.5 {
-        // Game images requested by extension hud_image() calls.
+        // Original-pixel sprite crops use a native point-sampled read of the
+        // *same* extension atlas, without a custom WGSL extension pipeline.
+        if input.textured > 7.125 {
+            let dim = textureDimensions(ui_ext_images);
+            let texel = clamp(vec2<i32>(floor(input.uv * vec2<f32>(dim))),
+                              vec2<i32>(0), vec2<i32>(dim) - vec2<i32>(1));
+            return textureLoad(ui_ext_images, texel, 0) * input.color;
+        }
+        // Regular images retain their existing filtered atlas fast path.
         return textureSampleLevel(ui_ext_images, ui_font_sampler, input.uv, 0.0) * input.color;
     } else if input.textured < 8.5 {
         glyph = textureSampleGrad(ui_clean_font, ui_font_sampler, input.uv, uv_dx, uv_dy);

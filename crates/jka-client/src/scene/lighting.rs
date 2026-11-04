@@ -48,6 +48,8 @@ pub(in crate::scene) fn prepare_static_light_grid(
     assets: &mut AssetSearchPath,
     map_name: &str,
     warnings: &mut Vec<String>,
+    map_overbright_bits: u8,
+    output_overbright_bits: u8,
 ) -> Result<Option<StaticLightGrid>, String> {
     let Some(grid) = bsp.light_grid.as_ref() else {
         return Ok(None);
@@ -186,14 +188,30 @@ pub(in crate::scene) fn prepare_static_light_grid(
         } else {
             ([0.0; 3], [0.0; 3])
         };
+        let convert_classic = |rgb: [f32; 3]| {
+            if map_overbright_bits == output_overbright_bits { return rgb; }
+            let shifted = super::overbright_rgb(rgb.map(|x| x.clamp(0.0, 255.0) as u8),
+                map_overbright_bits, output_overbright_bits);
+            shifted.map(f32::from)
+        };
         classic_cells.push(ClassicLightGridCell {
-            ambient: classic_ambient,
-            directed: classic_directed,
+            ambient: convert_classic(classic_ambient),
+            directed: convert_classic(classic_directed),
             direction,
             sun_weight: 0.0,
             valid: classic_valid,
         });
 
+        let (ambient, directed) = if map_overbright_bits == output_overbright_bits {
+            (ambient, directed)
+        } else {
+            let shift = |rgb: [f32; 3]| {
+                let converted = super::overbright_rgb(rgb.map(|v| v.clamp(0.0, 255.0) as u8),
+                    map_overbright_bits, output_overbright_bits);
+                converted.map(f32::from)
+            };
+            (shift(ambient), shift(directed))
+        };
         let axes = [
             [1.0_f32, 0.0, 0.0],
             [-1.0, 0.0, 0.0],

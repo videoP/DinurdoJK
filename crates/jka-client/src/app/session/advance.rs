@@ -322,6 +322,19 @@ impl GameSession {
                 target_server_time,
             )?;
         }
+        // Prediction/pmove has already consumed the authoritative entity slice.
+        // Only now replace REMOTE visual poses, so collision traces, prediction,
+        // usercmds, and gameplay events never inherit an artificial buffer delay.
+        // Demos and the unmodified legacy mode 0 take no additional path.
+        if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+            let now = Instant::now();
+            self.remote_smoothing.prime(
+                self.current_snapshot.as_ref(), self.next_snapshot.as_ref(),
+                &self.live_snapshots,
+            );
+            self.remote_smoothing.apply(presentation_time_ms, now, &mut self.presented_entities);
+            self.remote_smoothing.report_if_enabled(now);
+        }
         let sample = self
             .update_presented_player_state(
                 presentation_time_ms,
@@ -756,6 +769,17 @@ impl GameSession {
                 &mut self.weapon_fx,
                 rt_rigid_casters_enabled,
             );
+        // Client-local jaPRO projectiles share CG_Missile's FX and MD3 path.
+        // Match against authoritative missiles first so there is no doubled
+        // rocket/model/trail at the hand-off. Disabled = no per-frame work.
+        if self.weapon_fx.simulated_projectiles_enabled() {
+            let local_missiles = self.weapon_fx.present_simulated_projectiles(
+                &self.presented_entities, target_server_time,
+            );
+            for (id, missile) in local_missiles {
+                dynamic_models.extend(self.entity_presenter.present_simulated_missile(id, &missile));
+            }
+        }
         self.client_perf.entity_present_ms =
             entity_present_started.elapsed().as_secs_f64() * 1000.0;
         self.inline_models = Arc::new(inline_models);
@@ -894,7 +918,7 @@ impl GameSession {
                         &entity,
                         &self.client_game,
                         target_server_time,
-                        render_followed_body,
+                        render_followed_body && !first_person_saber,
                     );
                     dynamic_models.extend(self.player_presenter.present_player_entity(
                         &entity,
@@ -938,6 +962,7 @@ impl GameSession {
                     // _hand.md3 tag parent with RF_DEPTHHACK semantics.
                     const TEAM_SPECTATOR: i32 = 3;
                     if sample_owns_camera
+                        && self.view_weapon.draw_gun != 0
                         && !sample_third_person
                         && sample.policy.team != TEAM_SPECTATOR
                         && !intermission
@@ -967,6 +992,12 @@ impl GameSession {
                         let view_weapon = self.entity_presenter.present_view_weapon(
                             entity.number,
                             sample.policy.weapon,
+                            crate::cgame::weapon_fx::weapon_charge(
+                                sample.policy.weapon,
+                                entity.state.field_i32("modelindex2").unwrap_or(0),
+                                entity.state.field_i32("constantLight").unwrap_or(0),
+                                target_server_time,
+                            ).is_some(),
                             weapon_view_origin,
                             sample.view_angles,
                             sample.velocity,
@@ -978,9 +1009,24 @@ impl GameSession {
                             hand_frame,
                             hand_oldframe,
                             hand_backlerp,
+                            self.view_weapon,
+                            self.view_weapon_world_fov,
                         );
                         match view_weapon {
-                            Ok(models) => dynamic_models.extend(models),
+                            Ok((models, muzzle)) => {
+                                dynamic_models.extend(models);
+                                if let Some(muzzle) = muzzle {
+                                    // TaystJK's view-model `tag_flash` charge effect.
+                                    // Source state is the predicted playerState projected
+                                    // into the synthesized followed entity.
+                                    self.weapon_fx.weapon_charge_sprite(
+                                        muzzle,
+                                        sample.policy.weapon,
+                                        entity.state.field_i32("modelindex2").unwrap_or(0),
+                                        entity.state.field_i32("constantLight").unwrap_or(0),
+                                    );
+                                }
+                            }
                             // CG_RegisterWeapon only warns about a missing weapon
                             // model; CG_AddViewWeapon then draws nothing. A missing
                             // asset must not end the session.
@@ -1056,6 +1102,32 @@ impl GameSession {
                 ghost_present_started.elapsed().as_secs_f64() * 1000.0;
         }
 
+        // Grapple lines need the completed Ghoul2 hand pose, including the
+        // synthesized local/followed entity. First-person world-body bolts are
+        // hidden and do not coincide with the view weapon: start that rope from
+        // the camera-side grip instead of making it emerge from behind us.
+        // All values stay in native JKA space; no movement state is modified.
+        let first_person_hook_source = if sample_owns_camera && !sample_third_person {
+            followed_entity_num.map(|owner| {
+                let yaw = sample.view_angles[1].to_radians();
+                let pitch = sample.view_angles[0].to_radians();
+                let forward = [pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), -pitch.sin()];
+                let right = [yaw.sin(), -yaw.cos(), 0.0];
+                let mut eye = scene::jka_position(sample.eye_position);
+                for i in 0..3 { eye[i] += forward[i] * 12.0 + right[i] * 7.0; }
+                eye[2] -= 8.0;
+                (owner, eye)
+            })
+        } else { None };
+        self.weapon_fx.render_grapples(
+            &self.presented_entities,
+            &self.client_game,
+            target_server_time,
+            |owner| first_person_hook_source
+                .filter(|(camera_owner, _)| *camera_owner == owner)
+                .map(|(_, hand)| hand)
+                .or_else(|| self.player_presenter.grapple_hand(owner)),
+        );
         let cosmetics = self.player_presenter.drain_cosmetic_draws();
         if !cosmetics.is_empty() {
             self.entity_presenter.set_material_eye(sphere_view_origin);
@@ -1138,6 +1210,20 @@ impl GameSession {
             crate::cgame::weapon_fx::WeaponFx::constant_entity_light,
         ));
         fx_frame.draws.extend(self.player_presenter.physics_glass_draws(target_server_time));
+        // TaystJK only shakes the camera belonging to the charging player.
+        // Charge glow is intentionally independent of cg_screenShake.
+        if sample_owns_camera && self.screen_shake_level >= 2 {
+            if let Some(ps) = self.presented_player_state() {
+                if let Some(intensity) = crate::cgame::weapon_fx::weapon_charge_shake(
+                    ps.field_i32("weapon").unwrap_or(0),
+                    ps.field_i32("weaponstate").unwrap_or(0),
+                    ps.field_i32("weaponChargeTime").unwrap_or(0),
+                    target_server_time,
+                ) {
+                    self.event_presenter.add_camera_shake(intensity, 100);
+                }
+            }
+        }
         if self.screen_shake_level >= 1 {
             let view = scene::jka_position(sample.eye_position);
             for shake in &fx_frame.shakes {
@@ -1187,6 +1273,9 @@ impl GameSession {
                 &fx_frame.auto_light_candidates, &mut resolve, target_server_time, self.promote_fx_lights,
             );
             fx_frame.lights.extend(promoted);
+            if fx_frame.lights.len() > 1 {
+                crate::fx::light_promotion::prioritize_runtime_lights(&mut fx_frame.lights);
+            }
         }
         if crate::fx::diagnostics::enabled() {
             use crate::fx::diagnostics as diag;
@@ -1194,7 +1283,7 @@ impl GameSession {
             diag::add(diag::FX_DRAW_TOTAL, (shared_fx_count + fx_frame.draws.len()) as u64);
             diag::add(diag::FX_DRAW_LINES, fx_frame.shared_draws.iter().flat_map(|draws| draws.iter())
                 .chain(fx_frame.draws.iter())
-                .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Line { .. })).count() as u64);
+                .filter(|draw| matches!(draw, crate::fx::system::FxDraw::Line { .. } | crate::fx::system::FxDraw::Rope { .. })).count() as u64);
             diag::report_if_due();
         }
         if !crate::fx::render_enabled() {

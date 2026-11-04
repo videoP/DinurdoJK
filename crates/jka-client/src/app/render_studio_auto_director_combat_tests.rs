@@ -833,7 +833,7 @@ fn saberexample_speed_and_camera_regression() {
             .collect::<Vec<_>>()
     );
     let ctx = DirectorWorkerContext {
-        project_dir: base.parent().unwrap_or(&base).join("render-studio/Test"),
+        project_dir: jka_assets::pk3::dinurdojk_directory(&base).join("render-studio/Test"),
         base,
         paths,
         collision: Default::default(),
@@ -895,7 +895,7 @@ fn saberexample2_final_edit_regression() {
     let paths = StudioPathCache::default();
     let path = load_path(&base, &paths, &clip.name, &clip.game).unwrap();
     let mut ctx = DirectorWorkerContext {
-        project_dir: base.parent().unwrap_or(&base).join("render-studio/Test"),
+        project_dir: jka_assets::pk3::dinurdojk_directory(&base).join("render-studio/Test"),
         base: base.clone(),
         paths,
         collision: Default::default(),
@@ -1020,7 +1020,7 @@ fn saberexample_camera_bound_speed_and_respawn_regression() {
             .collect::<Vec<_>>()
     );
     let mut ctx = DirectorWorkerContext {
-        project_dir: base.parent().unwrap_or(&base).join("render-studio/Test"),
+        project_dir: jka_assets::pk3::dinurdojk_directory(&base).join("render-studio/Test"),
         base,
         paths,
         collision: Default::default(),

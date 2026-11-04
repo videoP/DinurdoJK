@@ -543,6 +543,7 @@ impl StudioDemoSource {
         viewport: [u32; 2],
         guard_subject: bool,
         fpls: bool,
+        view_weapon: crate::camera::ViewWeaponSettings,
         now: Instant,
     ) -> Result<StudioSourceFrame, String> {
         let target = clip.source_time_ms(time);
@@ -699,6 +700,8 @@ impl StudioDemoSource {
                 viewport[0].max(1) as f32 / viewport[1].max(1) as f32, 0.0,
             )
         });
+        session.view_weapon = view_weapon;
+        session.view_weapon_world_fov = key.fov;
         let (_, sample) = session.advance(
             now,
             third_person,
@@ -880,12 +883,9 @@ impl App {
     fn open_studio_source(&mut self, index: usize) -> Result<(), String> {
         let clip = self.render_studio.timeline.demos[index].clone();
         if clip.demo_protocol == 15 || clip.demo_protocol == 16 {
-            let root=self.fs_roots.jk2path.as_ref()
-                .ok_or("Set fs_jk2path to your JK2 GameData directory before previewing JK2 demos")?;
-            let required=if clip.demo_protocol==15 { & ["assets0.pk3","assets1.pk3"][..] }
-                else { &["assets0.pk3","assets1.pk3","assets2.pk3","assets5.pk3"][..] };
-            if let Some(missing)=required.iter().find(|name|!root.join("base").join(name).is_file()) {
-                return Err(format!("JK2 requires {missing} in {}",root.join("base").display()));
+            let version = if clip.demo_protocol == 15 { 2 } else { 4 };
+            if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, version) {
+                return Err(format!("JK2 requires {missing} in fs_jk2basepath or fs_jk2cdpath/base"));
             }
         }
         let base = self.base.clone();
@@ -903,6 +903,8 @@ impl App {
         let name = clip.name.clone();
         let game = clip.game.clone();
         let demo_protocol=clip.demo_protocol;
+        let mut demo_roots = self.fs_roots.clone();
+        demo_roots.active_jk2 = match demo_protocol { 15 => Some(2), 16 => Some(4), _ => None };
         let progress = Arc::new(crate::runtime::LoadProgress::default());
         let worker_progress = Arc::clone(&progress);
         let worker = std::thread::Builder::new().name("studio-demo-load".into()).spawn(move || {
@@ -934,7 +936,7 @@ impl App {
                 .ok().map(|track| track.race_start_server_ms)
         } else { None };
         let probe = super::probe_demo_gamestate(&data)?;
-        let game_dir = jka_assets::pk3::resolve_fs_game_directory(&base, &probe.fs_game)?;
+        let game_dir = jka_assets::pk3::resolve_fs_game_directory_for_roots(&base, &probe.fs_game, &demo_roots)?;
         progress.set("Indexing recording", 0, 0);
         let bytes: Arc<[u8]> = Arc::from(data);
         let demo_index = super::build_demo_index(&bytes).map(Arc::new).map_err(|error| {
@@ -1845,6 +1847,7 @@ impl App {
                 viewport,
                 self.render_studio.timeline.director_at(time).is_some_and(|shot| shot.auto) && clip.comparison.is_none(),
                 self.first_person_lightsaber,
+                self.view_weapon,
                 now,
             ) {
                 Ok(mut frame) => {
@@ -2298,6 +2301,10 @@ fn studio_hud_for_source(
                 .filter(|(index,_,_)|*index>0)
                 .and_then(|(index,_,_)|ps.ammo.get(index as usize).copied());
             ui.hud=Some(HudState {
+                team:ps.persistant[3],
+                spectating:matches!(ps.field_i32("pm_type"), Some(4 | 7 | 8)),
+                ammo_index:jka_movement::weapon_info(weapon)
+                    .map_or(0, |(index,_,_)| index.max(0) as usize),
                 health:ps.stats[0],max_health:ps.stats[8].max(1),armor:ps.stats[5],
                 force_power:Some(ps.field_i32("fd.forcePower").unwrap_or(0)),
                 force_power_max:100,ammo,weapon,

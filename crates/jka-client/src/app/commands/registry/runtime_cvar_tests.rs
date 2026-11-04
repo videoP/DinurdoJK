@@ -3,6 +3,40 @@ use crate::cvar_compatibility::{assert_snapshot, digest, Fixture, INPUTS};
 use std::fs;
 
 #[test]
+fn setu_creates_userinfo_cvar_and_seta_archives_it() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "").unwrap();
+    let mut app = App::new(fixture.0.clone(), None,
+        crate::scene::MapSource::Bsp("mp/ffa3".into()), false,
+        event_loop.create_proxy()).unwrap();
+
+    assert_eq!(app.console_cvar_value("NWH").as_deref(), Some("1"));
+    app.execute_command_line("setu custom_nwh_test 7");
+    assert_eq!(app.console_cvar_value("custom_nwh_test").as_deref(), Some("7"));
+    assert!(app.network.user_cvar("custom_nwh_test").unwrap().flags.contains(crate::net::UserCvarFlags::USERINFO));
+    app.execute_command_line("setu nwh 1");
+    assert!(app.network.user_cvar("nwh").unwrap().flags.contains(crate::net::UserCvarFlags::USERINFO));
+    assert!(!app.network.user_cvar("nwh").unwrap().flags.contains(crate::net::UserCvarFlags::ARCHIVE));
+    assert_eq!(jka_protocol::commands::info_value(&app.network.jk2_userinfo_for_version("kyle/default", jka_protocol::jk2::Version::V102), b"nwh"), Some(b"1".as_slice()));
+    app.execute_command_line("NWH 0");
+    assert_eq!(app.console_cvar_value("nwh").as_deref(), Some("0"));
+    app.execute_command_line("toggle nwh");
+    assert_eq!(app.console_cvar_value("nwh").as_deref(), Some("1"));
+    app.execute_command_line("seta nwh 1");
+    assert!(app.network.user_cvar("nwh").unwrap().flags.contains(crate::net::UserCvarFlags::ARCHIVE));
+    app.flush_config();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("seta nwh \"1\""));
+    assert!(text.contains("setu nwh \"1\""));
+    let reloaded = crate::config::load_client_presentation_settings(&path);
+    assert!(reloaded.network.user_cvar("nwh").unwrap().flags.contains(crate::net::UserCvarFlags::USERINFO));
+}
+
+#[test]
 fn entity_fixture_ab_is_live_opt_in_and_never_archived() {
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()

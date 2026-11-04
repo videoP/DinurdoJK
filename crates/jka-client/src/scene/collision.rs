@@ -3,6 +3,38 @@ use crate::scene::{
     map_asset_name, AssetSearchPath, Bsp, HashMap, MapSource, Path, SurfaceKind, MAX_FILE_BYTES,
 };
 
+/// Re-read the BSP's optimized authored draw surfaces only for an explicit
+/// `r_collisionWorld 1` request. In particular, map preparation must never
+/// call this function, even when Steam Audio is disabled.
+///
+/// Player prediction retains its own OpenJK CM brush/patch traces, while
+/// Steam Audio retains its full independent acoustic scene.
+pub fn prepare_collision_render_mesh(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    allow_asset_overrides: bool,
+    expected_map_hash: u64,
+) -> Result<std::sync::Arc<jka_assets::bsp::CompetitiveMesh>, String> {
+    let MapSource::Bsp(name) = source else {
+        return Err("collision-world rendering requires a compiled BSP".into());
+    };
+    let asset_name = map_asset_name(name, "bsp")?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|e| e.to_string())?;
+    assets.set_allow_asset_overrides(allow_asset_overrides);
+    let asset = assets
+        .read(&asset_name, MAX_FILE_BYTES)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Map {asset_name} not found"))?;
+    if super::map_content_hash(&asset.bytes) != expected_map_hash {
+        return Err("collision-world BSP changed since the current map was loaded".into());
+    }
+    let bsp = Bsp::parse(&asset.bytes).map_err(|e| e.to_string())?;
+    bsp.world_competitive_mesh()
+        .map(std::sync::Arc::new)
+        .map_err(|e| e.to_string())
+}
+
 /// Build only the Rapier static-world mesh for an already-running BSP map.
 ///
 /// Client physics is enabled after load far more often than it changes the

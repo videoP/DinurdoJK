@@ -166,6 +166,59 @@ impl App {
                     }
                 });
 
+                theme::section(ui, "FIRST-PERSON WEAPON", "TaystJK viewmodel controls. Only your first-person weapon is affected.");
+                theme::row(ui, "Draw gun", "cg_drawGun: 0 hide, 1 normal, 2 no gun bob, 3 no landing dip, 4 no idle sway (cumulative).", theme::Reset::None, |ui| {
+                    let mut mode = self.view_weapon.draw_gun;
+                    egui::ComboBox::from_id_salt("cg_drawGun_mode")
+                        .selected_text(match mode {
+                            0 => "Off", 1 => "Normal", 2 => "No bob", 3 => "No bob / landing",
+                            _ => "No weapon movement",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut mode, 0, "Off");
+                            ui.selectable_value(&mut mode, 1, "Normal");
+                            ui.selectable_value(&mut mode, 2, "No bob");
+                            ui.selectable_value(&mut mode, 3, "No bob / landing");
+                            ui.selectable_value(&mut mode, 4, "No weapon movement");
+                        });
+                    if mode != self.view_weapon.draw_gun {
+                        let _ = self.set_console_cvar("cg_drawGun", &mode.to_string());
+                    }
+                });
+                macro_rules! gun_offset {
+                    ($label:literal, $description:literal, $field:ident, $cvar:literal) => {
+                        theme::row(ui, $label, $description, theme::Reset::None, |ui| {
+                            let mut value = self.view_weapon.$field;
+                            if ui.add(egui::DragValue::new(&mut value).speed(0.25)
+                                .max_decimals(2).update_while_editing(false)).changed() {
+                                let _ = self.set_console_cvar($cvar, &value.to_string());
+                            }
+                        });
+                    };
+                }
+                gun_offset!("Gun X", "cg_gunX: move gun forward/back along camera aim.", gun_x, "cg_gunX");
+                gun_offset!("Gun Y", "cg_gunY: move gun toward camera left/right.", gun_y, "cg_gunY");
+                gun_offset!("Gun Z", "cg_gunZ: raise/lower the gun.", gun_z, "cg_gunZ");
+                theme::row(ui, "Gun FOV", "cg_fovViewmodel: independent weapon FOV (0 follows cg_fov; default 80).", theme::Reset::None, |ui| {
+                    let mut value = self.view_weapon.fov_viewmodel;
+                    if ui.add(egui::DragValue::new(&mut value).range(0.0..=140.0)
+                        .speed(0.5).max_decimals(1).update_while_editing(false)).changed() {
+                        let _ = self.set_console_cvar("cg_fovViewmodel", &value.to_string());
+                    }
+                });
+                theme::row(ui, "Lower at high FOV", "cg_fovViewmodelAdjust: lower the view gun above 90 degrees as in TaystJK.", theme::Reset::None, |ui| {
+                    if let Some(value) = theme::switch(ui, self.view_weapon.fov_viewmodel_adjust) {
+                        let _ = self.set_console_cvar("cg_fovViewmodelAdjust", if value { "1" } else { "0" });
+                    }
+                });
+                theme::row(ui, "Gun alpha", "cg_gunAlpha: opacity; 0 and 1 are opaque in TaystJK, intermediate values are translucent.", theme::Reset::None, |ui| {
+                    let mut value = self.view_weapon.gun_alpha;
+                    if ui.add(egui::DragValue::new(&mut value).range(0.0..=1.0)
+                        .speed(0.01).max_decimals(2).update_while_editing(false)).changed() {
+                        let _ = self.set_console_cvar("cg_gunAlpha", &value.to_string());
+                    }
+                });
+
             });
     }
 

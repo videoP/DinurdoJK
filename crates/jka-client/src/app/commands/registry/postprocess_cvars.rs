@@ -28,6 +28,108 @@ mod strength_tests {
 }
 
 app_cvars! {
+    APP_R_DLSS {
+        runtime: CvarDef::new(
+            "r_dlss", "0", "0..1",
+            "NVIDIA DLSS anti-aliasing/upscaling (see r_dlssMode, r_dlssModel). Vulkan/DX12 nvidia-dlss builds only.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_dlaa(app)),
+            |app, value| App::cvar_set_r_dlaa(app, APP_R_DLSS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_dlaa, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.dlss = parse_bool(value).unwrap_or(settings.dlss);
+            }),
+            archive: Some((432, |state| u8::from(state.video.dlss).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dlaa(&self) -> String {
+                    bool_value(self.video.dlss)
+                }
+                fn cvar_set_r_dlaa(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if enabled && !cfg!(feature = "nvidia-dlss") {
+                        return Err("r_dlss requires the nvidia-dlss Cargo feature".into());
+                    }
+                    self.video.dlss = enabled;
+                    if enabled {
+                        self.video.taa = false;
+                        self.video.smaa = false;
+                        self.video.fxaa = false;
+                        if self.video.msaa_samples > 1 {
+                            self.video.msaa_samples = 1;
+                            self.render_command(RenderCommand::SetMsaa(1));
+                        }
+                    }
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+    APP_R_DLSSMODE {
+        runtime: CvarDef::new(
+            "r_dlssMode", "dlaa", "ultraperformance|performance|balanced|quality|dlaa",
+            "DLSS quality mode. dlaa renders at native resolution; the others render lower and upscale.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_dlssmode(app)),
+            |app, value| App::cvar_set_r_dlssmode(app, APP_R_DLSSMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_dlssmode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.dlss_mode = DlssMode::from_config(value).unwrap_or(settings.dlss_mode);
+            }),
+            archive: Some((433, |state| state.video.dlss_mode.config_value().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dlssmode(&self) -> String {
+                    self.video.dlss_mode.config_value().to_owned()
+                }
+                fn cvar_set_r_dlssmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = DlssMode::from_config(value).ok_or_else(|| {
+                        format!("{name} expects ultraperformance, performance, balanced, quality or dlaa")
+                    })?;
+                    self.set_dlss_mode(mode);
+                    Ok(())
+                }
+            }
+        ]
+    }
+    APP_R_DLSSMODEL {
+        runtime: CvarDef::new(
+            "r_dlssModel", "transformer", "cnn|transformer|transformer2",
+            "DLSS model: cnn (DLSS 2/3), transformer (DLSS 4) or transformer2 (DLSS 4.5).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_dlssmodel(app)),
+            |app, value| App::cvar_set_r_dlssmodel(app, APP_R_DLSSMODEL.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_dlssmodel, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.dlss_model = DlssModel::from_config(value).unwrap_or(settings.dlss_model);
+            }),
+            archive: Some((434, |state| state.video.dlss_model.config_value().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dlssmodel(&self) -> String {
+                    self.video.dlss_model.config_value().to_owned()
+                }
+                fn cvar_set_r_dlssmodel(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let model = DlssModel::from_config(value)
+                        .ok_or_else(|| format!("{name} expects cnn, transformer or transformer2"))?;
+                    self.set_dlss_model(model);
+                    Ok(())
+                }
+            }
+        ]
+    }
     APP_R_THERMALVISION {
         runtime: CvarDef::new(
             "r_thermalVision", "", "0..5",
@@ -293,6 +395,8 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                   self.video.dlss = false;
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -302,6 +406,8 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                   self.video.dlss = false;
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -311,6 +417,8 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                   self.video.dlss = false;
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -557,6 +665,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -566,6 +675,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -575,6 +685,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -835,6 +946,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -844,6 +956,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -853,6 +966,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -942,6 +1056,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -951,6 +1066,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -960,6 +1076,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1091,6 +1208,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1100,6 +1218,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1109,6 +1228,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1569,6 +1689,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1578,6 +1699,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1587,6 +1709,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;

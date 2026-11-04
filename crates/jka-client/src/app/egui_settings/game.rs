@@ -154,7 +154,32 @@ impl App {
                     }
                 }
 
-                theme::section(ui, "WEAPONS", "Weapon selection helpers.");
+                theme::section(ui, "WEAPONS", "Weapon selection and projectile presentation.");
+                theme::row(
+                    ui,
+                    "Simulate projectiles",
+                    "cg_simulatedProjectiles. Show your own projectile immediately after firing on jaPRO servers advertising unlagged projectiles. Pseudorandom spread uses the local firing command time when advertised by jcinfo; unsupported spread overrides remain server authoritative. Not used on vanilla JKA/JK2 or JA+.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.simulated_projectiles) {
+                            let _ = self.set_console_cvar("cg_simulatedProjectiles", if value { "1" } else { "0" });
+                        }
+                    },
+                );
+                theme::row(
+                    ui,
+                    "Predict rocket knockback",
+                    "cg_predictKnockback. In jaPRO race mode, anticipate your own primary rocket splash impulse using the shared simulated projectile trajectory and native Pmove. Requires Simulate projectiles and a server advertising UNLAGGEDPROJ. Default off; diagnostics: console values 2..5.",
+                    theme::Reset::None,
+                    |ui| {
+                        let enabled = self.network.predict_knockback != 0;
+                        ui.add_enabled_ui(self.simulated_projectiles, |ui| {
+                            if let Some(value) = theme::switch(ui, enabled) {
+                                let _ = self.set_console_cvar("cg_predictKnockback", if value { "1" } else { "0" });
+                            }
+                        });
+                    },
+                );
                 if let Some(value) = segmented_row(
                     ui,
                     "Auto switch",
@@ -263,7 +288,7 @@ impl App {
                 if let Some(value) = segmented_row(
                     ui,
                     "Screen shake",
-                    "cg_screenShake. Effects: shake from explosions and creature stomps. Effects + weapons: also the kick of firing rockets, alt repeater, flechette and charged bryar/demp2/bowcaster shots. Server-triggered shake events (rancors, scripted quakes) are unaffected, as in OpenJK.",
+                    "cg_screenShake. Effects: shake from explosions and creature stomps. Effects + weapons: also the kick of firing rockets, alt repeater, flechette and charged shots, plus shake while charging bryar/bowcaster/demp2. Server-triggered shake events (rancors, scripted quakes) are unaffected, as in OpenJK.",
                     theme::Reset::None,
                     self.screen_shake,
                     &[(0, "Off"), (1, "Effects"), (2, "Effects + weapons")],

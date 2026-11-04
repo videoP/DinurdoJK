@@ -27,13 +27,9 @@ impl App {
             "1.04" => jka_protocol::jk2::Version::V104,
             _ => { self.push_console_line("^1JK2 version must be 1.02 or 1.04; 1.03 is unsupported"); return; }
         };
-        let Some(root) = self.fs_roots.jk2path.as_ref() else {
-            self.push_console_line("^1Set fs_jk2path to the JK2 GameData directory first"); return;
-        };
-        let required = if version == jka_protocol::jk2::Version::V102 { &["assets0.pk3", "assets1.pk3"][..] }
-            else { &["assets0.pk3", "assets1.pk3", "assets2.pk3", "assets5.pk3"][..] };
-        if let Some(missing) = required.iter().find(|name| !root.join("base").join(name).is_file()) {
-            self.push_console_line(format!("^1JK2 {} requires base/{missing} under fs_jk2path", version.name())); return;
+        let minor = if version == jka_protocol::jk2::Version::V102 { 2 } else { 4 };
+        if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, minor) {
+            self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath or fs_jk2cdpath/base", version.name())); return;
         }
         self.connect_to_server_game(target, None, Some(version));
     }
@@ -77,8 +73,9 @@ impl App {
         if self.network.color2_packed.is_none() {
             if let Err(error) = self.sync_packed_body_cvar() { self.push_console_error(error); }
         }
-        let userinfo = if jk2.is_some() { self.network.jk2_userinfo(&self.solo_client_info.model_cvar()) }
-            else { self.network.userinfo(&self.solo_client_info.model_cvar()) };
+        let userinfo = if let Some(version) = jk2 {
+            self.network.jk2_userinfo_for_version(&self.solo_client_info.model_cvar(), version)
+        } else { self.network.userinfo(&self.solo_client_info.model_cvar()) };
         let connection = if let Some(version) = jk2 { crate::net::NetClient::connect_jk2_preflight(target, userinfo, self.network.net_port, version) }
             else { crate::net::NetClient::connect_preflight(target, userinfo, self.network.net_port) };
         match connection {
@@ -281,17 +278,12 @@ impl App {
             self.handle_jk2_force_rank();
             self.apply_out_of_ammo_changes();
             let empty = HashSet::new();
-            let buttons = crate::net::CommandButtons {
-                active: if playing { &self.live_buttons } else { &empty },
-                forced_moveup: playing && self.japro_flipkick_moveup,
-                idrive: self.network.idrive,
-                any_key: playing && (!self.keys.is_empty() || !self.mouse_buttons_down.is_empty()),
-                // jaPRO CL_CmdButtons: `Key_GetCatcher() || (unfocused &&
-                // cl_chatBubbleUnfocused)`, then `cl_chatBubbleSelf`.
-                talking: (!matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
-                    || (!self.window_focused && self.network.chat_bubble_unfocused))
-                    && self.network.chat_bubble_self,
-            };
+            let any_key = playing && (!self.keys.is_empty() || !self.mouse_buttons_down.is_empty());
+            // jaPRO CL_CmdButtons: `Key_GetCatcher() || (unfocused &&
+            // cl_chatBubbleUnfocused)`, then `cl_chatBubbleSelf`.
+            let talking = (!matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
+                || (!self.window_focused && self.network.chat_bubble_unfocused))
+                && self.network.chat_bubble_self;
             // CL_CreateNewCommands runs once per client frame; our tick rate
             // follows input events, so pace commands explicitly. Mouse keeps
             // accumulating in cl.viewangles between commands.
@@ -317,6 +309,15 @@ impl App {
                 // More than one command per tick only to catch up after a 2+ ms tick gap
                 // at 1-2 ms intervals.
                 for _ in 0..3 {
+                    self.resume_console_after_usercmd();
+                    // A script can disconnect, restart video or change maps.
+                    // Do not author more commands against an invalid session.
+                    if self.renderer_restart_suspended || self.quit_requested
+                        || self.net.as_ref().is_none_or(|net|
+                            net.state() < jka_protocol::session::ConnectionState::Primed)
+                    {
+                        return;
+                    }
                     let slot = match self.next_command_time {
                         // First command, time went backwards (map restart), or we fell behind:
                         // restart the cadence from now instead of bursting to catch up.
@@ -332,7 +333,7 @@ impl App {
                         Some(_) => None,
                     };
                     let Some((stamp, next)) = slot else { break };
-                    let net = self.net.as_mut().expect("checked above");
+                    let net = self.net.as_ref().expect("checked above");
                     let previous = net
                         .session()
                         .command(net.session().cmd_number())
@@ -343,11 +344,23 @@ impl App {
                         break;
                     }
                     self.next_command_time = Some(next);
+                    // TaystJK alternates +moveup/-moveup once per CGame frame.
+                    // At high render FPS those transitions would be lost between
+                    // paced usercmds; advance once for each *authored* command.
+                    self.tick_japro_flipkick();
+                    let buttons = crate::net::CommandButtons {
+                        active: if playing { &self.live_buttons } else { &empty },
+                        forced_moveup: playing && self.japro_flipkick_moveup,
+                        idrive: self.network.idrive,
+                        any_key,
+                        talking,
+                    };
                     let cmd = self.live_input.create_cmd(&buttons);
                     if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
                         self.live_input.queue_emote_stop();
                     }
-                    net.session_mut().create_command_at(cmd, stamp);
+                    self.net.as_mut().expect("checked above").session_mut().create_command_at(cmd, stamp);
+                    self.console_usercmd_authored();
                 }
             } else {
                 let interval = Duration::from_secs_f64(1.0 / rate);
@@ -362,12 +375,21 @@ impl App {
                         }
                         _ => now,
                     });
+                    self.tick_japro_flipkick();
+                    let buttons = crate::net::CommandButtons {
+                        active: if playing { &self.live_buttons } else { &empty },
+                        forced_moveup: playing && self.japro_flipkick_moveup,
+                        idrive: self.network.idrive,
+                        any_key,
+                        talking,
+                    };
                     let cmd = self.live_input.create_cmd(&buttons);
                     if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
                         self.live_input.queue_emote_stop();
                     }
                     let net = self.net.as_mut().expect("checked above");
                     net.session_mut().create_command(cmd);
+                    self.console_usercmd_authored();
                 }
             }
             let server_time = self
@@ -376,7 +398,15 @@ impl App {
                 .expect("checked above")
                 .session()
                 .server_time();
-            let mut provisional = self.live_input.preview_cmd(&buttons);
+            // A provisional prediction sample must not consume a flipkick tap.
+            let preview_buttons = crate::net::CommandButtons {
+                active: if playing { &self.live_buttons } else { &empty },
+                forced_moveup: playing && self.japro_flipkick_moveup,
+                idrive: self.network.idrive,
+                any_key,
+                talking,
+            };
+            let mut provisional = self.live_input.preview_cmd(&preview_buttons);
             provisional.server_time = server_time;
             self.live_provisional = Some(provisional);
         } else {
@@ -434,6 +464,7 @@ impl App {
                         }
                     }
                 }
+                self.publish_ui();
             }
             SessionEvent::ServerInfo(info) => self.handle_live_server_info(info),
             SessionEvent::Print(text) => {
@@ -466,8 +497,27 @@ impl App {
                     }
                 }
                 self.start_live_gamestate();
+                self.publish_ui();
             }
             SessionEvent::ServerCommand(command) => {
+                // NWH's JK2 game module issues clVerifyChallenge through the
+                // reliable server-command stream. Answer at the engine/network
+                // layer (CL_GetServerCommand), even if the native CGame or the
+                // gamestate preparation worker has not started yet. Live JK2
+                // 1.02 connections only; never reply during demo playback
+                // or send NWH-specific commands to JK2 1.04/JKA servers.
+                if self.net.as_ref().is_some_and(|net| net.session().jk2_version() == Some(jka_protocol::jk2::Version::V102)) {
+                    if let Some(reply) = crate::net::nwh_verify_reply(&command.text) {
+                        if let Some(net) = self.net.as_mut() {
+                            // A parsed challenge is the server-side NWH signal.
+                            // Do not infer NWH from our default userinfo cvar.
+                            net.note_nwh_challenge();
+                            if let Err(error) = net.session_mut().add_reliable_command(reply.as_bytes(), false) {
+                                self.push_console_line(format!("^1NWH verification reply could not be queued: {error}"));
+                            }
+                        }
+                    }
+                }
                 if command.text.starts_with(b"cs 1 ") && self.game_session.as_ref().is_some_and(|s| s.live)
                     && self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()
                         && net.state() == ConnectionState::Active)
@@ -545,6 +595,12 @@ impl App {
                 if let Some(session) = self.game_session.as_mut().filter(|session| session.live) {
                     if session.live_snapshots.len() >= 128 {
                         session.live_snapshots.pop_front();
+                    }
+                    // Record *arrival* time for the experimental remote visual
+                    // buffer, not the later CGame transition time. Mode 0 does no
+                    // snapshot copies, timing updates, or allocator work here.
+                    if crate::cgame::remote_smoothing::mode() != 0 {
+                        session.remote_smoothing.receive(&snapshot, Instant::now());
                     }
                     session.live_snapshots.push_back(snapshot);
                 }
@@ -862,6 +918,7 @@ impl App {
                 .set_saber_staff_multi_color(self.saber_staff_multi_color);
             session.weapon_fx.set_saber_trail(self.saber_trail);
             session.player_presenter.set_speed_trail(self.speed_trail);
+            session.weapon_fx.set_simulated_projectiles(self.simulated_projectiles);
             session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
             session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
             session.weapon_fx.set_fx_physics(self.video.fx_physics);

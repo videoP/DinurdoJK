@@ -339,24 +339,28 @@ impl Renderer {
                 } else {
                     1.0
                 };
-            gpu_lights.extend(
-                self.transient_lights
-                    .iter()
-                            .flat_map(|light| {
-                        transient_light_samples(
-                            light,
-                            self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
-                        )
-                    })
+            let rt = self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware;
+            // The cluster builder visits this nonpromoted range before static
+            // lamps, then promoted EFX last. Retain the original single-pass
+            // fast path when promotion is absent.
+            if self.transient_lights.iter().any(|light|
+                light.kind == crate::fx::system::FxLightKind::PromotedEffect)
+            {
+                let source_count = gpu_lights.len();
+                for promoted in [false, true] {
+                    let available = remaining.saturating_sub(gpu_lights.len() - source_count);
+                    gpu_lights.extend(self.transient_lights.iter()
+                        .filter(|light| (light.kind == crate::fx::system::FxLightKind::PromotedEffect) == promoted)
+                        .flat_map(|light| transient_light_samples(light, rt))
+                        .take(available)
+                        .map(|light| transient_light_gpu(&light, transient_intensity_scale, rt)));
+                }
+            } else {
+                gpu_lights.extend(self.transient_lights.iter()
+                    .flat_map(|light| transient_light_samples(light, rt))
                     .take(remaining)
-                    .map(|light| {
-                        transient_light_gpu(
-                            &light,
-                            transient_intensity_scale,
-                            self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
-                        )
-                    }),
-            );
+                    .map(|light| transient_light_gpu(&light, transient_intensity_scale, rt)));
+            }
         }
         if gpu_lights.is_empty() {
             gpu_lights.push(GpuPointLight::zeroed());
@@ -367,7 +371,18 @@ impl Renderer {
 
     pub(in crate::renderer) fn update_lighting_settings(&self) {
         let light_count = self.active_light_count();
-        let transient_start = u32::try_from(self.active_static_light_count()).unwrap_or(0);
+        let static_light_count = self.active_static_light_count();
+        let transient_start = u32::try_from(static_light_count).unwrap_or(0);
+        // Packed into feature_flags.z upper 16 bits (low bits retain every
+        // existing debug/lighting flag). Inferred FX are at the end of the
+        // GPU transient list; they must never crowd out map or authored FX.
+        let rt = self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware;
+        let priority_transient_count = self.transient_lights.iter()
+            .filter(|light| light.kind != crate::fx::system::FxLightKind::PromotedEffect)
+            .map(|light| if rt { light.blade_segments.as_ref().map_or(1, |v| v.len().max(1)) } else { 1 })
+            .sum::<usize>();
+        let promoted_start = static_light_count.saturating_add(priority_transient_count)
+            .min(MAX_DYNAMIC_LIGHTS) as u32;
         let shadowed_count = self
             .world
             .as_ref()
@@ -404,6 +419,11 @@ impl Renderer {
             let rgb = Vec3::from_array(sun.color) * (sun.intensity.max(0.0) / 255.0);
             [rgb.x, rgb.y, rgb.z, 0.0]
         };
+        let runtime_light = self.relit_celestial();
+        // Treat a moonless Blue Water night as an explicit zero direct light,
+        // not legacy baked-sun darkening from the hidden solar shadow map.
+        let runtime_celestial_enabled = self.sun_lighting
+            || (self.sun_override && self.blue_water_night());
         let old_map = self.shadow_resources.original_sun_cache.filter(|cache| {
             self.baked_sun_shadow_map && self.world.as_ref().is_some_and(|world| {
                 !world.source_map && world.remap_asset_hash == cache.map_identity
@@ -415,8 +435,8 @@ impl Renderer {
             values: [
                 u32::from(direct_local_lighting_enabled && light_count != 0),
                 light_count,
-                self.config.width.max(1),
-                self.config.height.max(1),
+                self.targets.render_size.0,
+                self.targets.render_size.1,
             ],
             local_shadows: [
                 u32::from(
@@ -448,7 +468,8 @@ impl Renderer {
                 }) | (if self.dynamic_light_debug { 0x100 } else { 0 })
                     | (if self.tinted_glass_enabled { 0x200 } else { 0 })
                     | (if self.tinted_glass_debug == 1 { 0x400 } else { 0 })
-                    | (if self.tinted_glass_debug == 2 { 0x800 } else { 0 }),
+                    | (if self.tinted_glass_debug == 2 { 0x800 } else { 0 })
+                    | (promoted_start << 16),
                 self.reflection_quality.shader_value(),
             ],
             map_ambient: [
@@ -484,12 +505,12 @@ impl Renderer {
             ],
             baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)],
             runtime_sun_direction: {
-                let toward = -Vec3::from_array(self.active_sun().direction);
+                let toward = -Vec3::from_array(runtime_light.direction);
                 [toward.x, toward.y, toward.z, 0.0]
             },
             runtime_sun_radiance: {
-                let rgb = radiance(self.active_sun());
-                [rgb[0], rgb[1], rgb[2], if self.sun_lighting && self.world.as_ref().is_some_and(|w| !w.source_map) { 1.0 } else { 0.0 }]
+                let rgb = radiance(runtime_light);
+                [rgb[0], rgb[1], rgb[2], if runtime_celestial_enabled && self.world.as_ref().is_some_and(|w| !w.source_map) { 1.0 } else { 0.0 }]
             },
             map_minlight: [
                 source_map_lighting.minlight[0],

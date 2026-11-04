@@ -4,7 +4,7 @@ use crate::app::{
     split_console_script, ui, ActiveEventLoop, App, ApplicationHandler, Arc, BindKey, Camera,
     ClientFramePerf, ConsoleSize, ControlFlow, DemoTimelineHit, DemoViewMode, DeviceEvent,
     Duration, ElementState, FrontendCinematic, FrontendPage, FullscreenMode, InputLatencySample,
-    Instant, KeyCode, LiveJoinTiming, LocalServer, MapEditor, ModifiersState, MouseButton,
+    Instant, JoinMode, KeyCode, LiveJoinTiming, LocalServer, MapEditor, ModifiersState, MouseButton,
     MouseScrollDelta, OverlayMode, PerfStats, PhysicalKey, PhysicalPosition, PhysicalSize,
     PreparedMapCache, StartCause, RenderCommand, RenderThread, RendererBackend, ScreenshotOutput,
     ThreadPerfStats, UserEvent, Window, WindowEvent, WindowId, FRONTEND_CAMERA_EYE_HEIGHT,
@@ -108,6 +108,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::WindowCreated);
+        // Capture the monitor's desktop size BEFORE entering exclusive mode.
+        // The mode switch can change monitor.size(), so this also makes a
+        // subsequent return to Desktop reliably use the original desktop size.
+        self.desktop_resolution = Self::monitor_desktop_resolution(&window);
+        if self.video.resolution_desktop {
+            if let Some(resolution) = self.desktop_resolution {
+                self.video.resolution = resolution;
+            }
+        }
         if !self.video.fullscreen.is_windowed() && !headless() {
             if let Err(error) = Self::apply_fullscreen_mode(
                 &window,
@@ -115,8 +124,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.video.resolution,
                 self.video.renderer_backend,
             ) {
-                eprintln!("Fullscreen setup failed: {error}; falling back to windowed mode");
-                self.video.fullscreen = FullscreenMode::Windowed;
+                eprintln!("Fullscreen setup failed: {error}; falling back to borderless mode");
+                self.video.fullscreen = FullscreenMode::Borderless;
+                if let Err(error) = Self::apply_fullscreen_mode(
+                    &window, self.video.fullscreen, self.video.resolution, self.video.renderer_backend,
+                ) {
+                    eprintln!("Borderless setup failed: {error}; falling back to windowed mode");
+                    self.video.fullscreen = FullscreenMode::Windowed;
+                }
             }
         }
         if self.video.fullscreen.is_windowed() && self.video.window_maximized {
@@ -128,6 +143,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.applied_renderer_backend = self.video.renderer_backend;
         self.applied_gpu_adapter = self.video.gpu_adapter;
         self.applied_resolution = self.video.resolution;
+        self.applied_resolution_desktop = self.video.resolution_desktop;
         self.applied_grass = self.video.grass;
         self.applied_ocean = self.video.ocean;
         self.reset_egui_for_window(&window);
@@ -151,7 +167,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.attach_companion_to_renderer(&render);
+        // The startup menu has no gameplay capture, but it should already
+        // confine its visible pointer if the new window actually has focus.
+        // Do not trust App's optimistic initial window_focused value here.
+        self.window_focused = window.has_focus();
         self.window = Some(window);
+        self.set_capture(false);
         self.render = Some(render);
         self.profile_background_requested=None;
         self.sync_classic_world_lighting();
@@ -1353,6 +1374,31 @@ impl ApplicationHandler<UserEvent> for App {
                                 .map(jka_assets::bsp::Visibility::area_locator),
                         ) {
                             Ok(mut server) => {
+                                // JK2 local maps use the existing decoded JKA
+                                // snapshot authority, not an emulated JK2 game
+                                // DLL. Join if the movement assets loaded; if
+                                // they did not, spectator is already a noclip
+                                // free camera and still allows visual inspection.
+                                if self.fs_roots.active_jk2.is_some() {
+                                    if server.can_join() {
+                                        match server.join(JoinMode::Player, spawn) {
+                                            Ok(()) => {
+                                                self.solo_initial_spawn_pending = false;
+                                                if spawn.fallback {
+                                                    if let Err(error) = server.set_noclip(true) {
+                                                        self.push_console_line(format!("^3JK2_DEVMAP: noclip unavailable: {error}"));
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => self.push_console_line(format!("^3JK2_DEVMAP: using free spectator camera: {error}")),
+                                        }
+                                    } else {
+                                        self.push_console_line("^3JK2_DEVMAP: no compatible local movement assets; using free spectator camera (fly-through).".to_owned());
+                                    }
+                                    if spawn.fallback {
+                                        self.push_console_line("^3JK2_DEVMAP: no deathmatch spawn; using world-center fallback with noclip/freefly.".to_owned());
+                                    }
+                                }
                                 server.set_char_color(self.network.char_color);
                                 server.set_mouse_input_settings(self.mouse_input);
                                 if let Err(error) =
@@ -1949,6 +1995,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.shader_remap_upload = false;
                 // Physics may have been enabled while this map was loading.
                 self.ensure_map_physics_mesh();
+                // Collision render mesh is genuinely lazy: only a map whose
+                // cvar is already ON schedules any extra preparation here.
+                if crate::renderer::collision_world_only() {
+                    self.ensure_collision_world_mesh();
+                }
 
                 if self.game_session.as_ref().is_some_and(|session| {
                     session.live
@@ -2126,6 +2177,17 @@ impl ApplicationHandler<UserEvent> for App {
                 )
             {
                 self.toggle_borderless_exclusive();
+                return;
+            }
+        }
+
+        // Keep Alt+Enter strictly one-shot: OS repeat must not fall through
+        // to a normal Enter bind while Alt is held.
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed && event.repeat
+                && self.modifiers.alt_key()
+                && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter))
+            {
                 return;
             }
         }
@@ -2338,6 +2400,17 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         self.mouse_buttons_down.remove(&button_number);
                     }
+                    if let Some(index) = (4..=5).contains(&button_number)
+                        .then_some((button_number - 4) as usize)
+                    {
+                        self.mouse_repeat_next[index] = if down {
+                            Some(Instant::now() + crate::app::Duration::from_millis(
+                                16 + u64::from(self.in_mouserepeat_delay),
+                            ))
+                        } else {
+                            None
+                        };
+                    }
                     if down {
                         self.execute_binding_press(BindKey::Mouse(button_number));
                     } else {
@@ -2363,6 +2436,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if !self.video.window_maximized {
                         self.video.resolution = [size.width, size.height];
                         self.applied_resolution = [size.width, size.height];
+                        self.video.resolution_desktop = false;
+                        self.applied_resolution_desktop = false;
                     }
                     self.mark_config_dirty();
                 }
@@ -2538,40 +2613,20 @@ impl ApplicationHandler<UserEvent> for App {
                         // as soon as the user returns to the game.
                         window.request_user_attention(None);
                     }
-                    // A Windows Locked grab pins the cursor at its *current screen
-                    // position*. In a windowed game that position may still be outside
-                    // the client area after Alt+Tab; a successful grab then traps the
-                    // cursor outside the game, and repeating the grab does not help.
-                    // Move it inside *before* restoring capture, only when the normal
-                    // gameplay/demo input rules actually want a captured cursor.
+                    // set_capture() recenters before grabbing on *every*
+                    // display mode, including borderless and Vulkan exclusive.
+                    // Its normal ownership rules still exclude visible UI.
                     if self.overlay == OverlayMode::None {
                         let demo_active = self.demo_playback_active();
-                        let wants_capture = !demo_active
-                            || (!self.live_buttons.contains("+speed")
-                                && !self.demo_scrub_dragging && !self.demo_speed_dragging);
-                        if wants_capture
-                            && !self.captured
-                            && !self.connection_modal_active()
-                            && self.applied_fullscreen.is_windowed()
-                        {
-                            if let Some(window) = self.window.as_ref() {
-                                let size = window.inner_size();
-                                if size.width > 0 && size.height > 0 {
-                                    let center = PhysicalPosition::new(
-                                        (size.width / 2) as i32,
-                                        (size.height / 2) as i32,
-                                    );
-                                    if let Err(error) = window.set_cursor_position(center) {
-                                        eprintln!("Windowed focus: cursor recenter failed: {error}");
-                                    }
-                                }
-                            }
-                        }
                         if demo_active {
                             self.sync_demo_camera_capture();
                         } else {
                             self.set_capture(true);
                         }
+                    } else {
+                        // Menus, console, Studio, and modal UI also need their
+                        // native clip restored after returning from Alt+Tab.
+                        self.set_capture(false);
                     }
                     return;
                 }
@@ -2594,6 +2649,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.keys.clear();
                 self.movement_keys.clear();
                 self.mouse_buttons_down.clear();
+                self.mouse_repeat_next = [None; 2];
                 self.noclip_primary_down = false;
                 self.noclip_alt_down = false;
                 self.modifiers = ModifiersState::empty();
@@ -3154,8 +3210,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 let bind_key = keybinds::bind_key_for_code(code);
-                if event.state == ElementState::Pressed && !event.repeat {
+                if event.state == ElementState::Pressed {
                     if code == KeyCode::Escape {
+                        if event.repeat { return; }
                         // Editing is persistent, but Escape must still open the
                         // ordinary JKA menu. Roll back only the current drag.
                         if self.model_placement.edit_mode && self.model_placement.editor_drag.is_some() {
@@ -3166,10 +3223,14 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if code == KeyCode::KeyN && self.modifiers.shift_key() {
-                        self.cycle_spawn();
+                        if !event.repeat { self.cycle_spawn(); }
                         return;
                     }
-                    self.execute_binding_press_from(bind_key, BindKey::Keyboard(code));
+                    if event.repeat {
+                        self.execute_binding_repeat_from(bind_key, BindKey::Keyboard(code));
+                    } else {
+                        self.execute_binding_press_from(bind_key, BindKey::Keyboard(code));
+                    }
                 } else if event.state == ElementState::Released {
                     // TaystJK CL_KeyUpEvent always emits the `-` half of every
                     // +command in the bind, so held actions cannot stick.

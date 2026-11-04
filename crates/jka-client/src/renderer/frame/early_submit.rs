@@ -13,6 +13,7 @@ pub(in crate::renderer) struct EarlyPresentTarget {
     /// Also the screenshot source on early-submit frames.
     pub(in crate::renderer) texture: wgpu::Texture,
     view: wgpu::TextureView,
+    pub(in crate::renderer) encoded_view: wgpu::TextureView,
 }
 
 impl Renderer {
@@ -108,6 +109,7 @@ impl Renderer {
             target.texture.size() != size || target.texture.format() != self.config.format
         });
         if stale {
+            let encoded_view_formats = [self.config.format.remove_srgb_suffix()];
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("JKA early-submit frame"),
                 size,
@@ -117,10 +119,18 @@ impl Renderer {
                 format: self.config.format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
+                view_formats: if self.config.format.is_srgb() {
+                    &encoded_view_formats
+                } else {
+                    &[]
+                },
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.early_present_target = Some(EarlyPresentTarget { texture, view });
+            let encoded_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.config.format.remove_srgb_suffix()),
+                ..Default::default()
+            });
+            self.early_present_target = Some(EarlyPresentTarget { texture, view, encoded_view });
         }
         self.early_present_target
             .as_ref()

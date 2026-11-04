@@ -4,7 +4,7 @@
 //! (CG_PredictPlayerState) over the pinned OpenJK Pmove.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::ErrorKind,
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -22,15 +22,58 @@ use jka_protocol::{
 };
 
 pub mod mod_support;
+// JK2 1.02 NWH implementation is local-only and intentionally Git-ignored.
+// build.rs enables this module only when its source exists.
+#[cfg(djk_nwh_private)]
+#[path = "net/nwh_private.rs"]
+mod nwh_private;
+
+/// Optional JK2 1.02 verification reply. Without the private file, the
+/// client builds normally and does not respond to NWH challenges.
+pub(crate) fn nwh_verify_reply(command: &[u8]) -> Option<String> {
+    #[cfg(djk_nwh_private)]
+    {
+        nwh_private::verify_reply(command)
+    }
+    #[cfg(not(djk_nwh_private))]
+    {
+        let _ = command;
+        None
+    }
+}
 pub(crate) mod jk2_prediction;
 pub(crate) mod jk2_input;
+mod predict_knockback;
 pub(crate) use jk2_input::Jk2Frame;
 
 // ---------------------------------------------------------------- cvars --
 
+/// Runtime flags for cvars created via the TaystJK/Quake `set` command family.
+/// `setu` is USERINFO, not ARCHIVE: persistence is opt-in with `seta`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserCvarFlags(u8);
+impl UserCvarFlags {
+    pub const NONE: Self = Self(0);
+    pub const ARCHIVE: Self = Self(1);
+    pub const USERINFO: Self = Self(2);
+    pub const SERVERINFO: Self = Self(4);
+    pub fn contains(self, other: Self) -> bool { self.0 & other.0 != 0 }
+    pub fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserCvar {
+    pub name: String,
+    pub value: String,
+    pub flags: UserCvarFlags,
+}
+
 /// Archived CVAR_USERINFO / network cvars. Defaults follow OpenJK.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkSettings {
+    /// Unknown console cvars, case-insensitive by key. Kept with the network
+    /// profile so both initial getchallenge/userinfo and later updates see them.
+    pub user_cvars: BTreeMap<String, UserCvar>,
     pub name: String,
     pub rate: u32,
     pub snaps: u32,
@@ -104,6 +147,8 @@ pub struct NetworkSettings {
     /// off and matches them; Quake 3 ran it. Off, a mispredicted event keeps
     /// whatever was played first. Never affects Pmove or the sent command.
     pub correct_predicted_events: bool,
+    /// TaystJK-style jaPRO race rocket-jump prediction: 0 off, 1 on, 2..5 diagnostics.
+    pub predict_knockback: u8,
     /// Flash a HUD warning when a prediction correction exceeds the threshold.
     pub prediction_miss_highlight: bool,
     /// Keep the rolling per-frame history that `hitchmark` writes out. Session-only.
@@ -142,7 +187,14 @@ pub struct NetworkSettings {
 
 impl Default for NetworkSettings {
     fn default() -> Self {
+        // `nwh 1` is a USERINFO cvar from first launch, just like `/setu nwh 1`.
+        // Transmission is separately limited to JK2 1.02 below.
+        let mut user_cvars = BTreeMap::new();
+        user_cvars.insert("nwh".to_owned(), UserCvar {
+            name: "nwh".to_owned(), value: "1".to_owned(), flags: UserCvarFlags::USERINFO,
+        });
         Self {
+            user_cvars,
             name: "Padawan".into(),
             rate: 50000,
             snaps: 100,
@@ -181,6 +233,7 @@ impl Default for NetworkSettings {
             show_miss: false,
             prediction_debug: false,
             correct_predicted_events: false,
+            predict_knockback: 0,
             prediction_miss_highlight: false,
             hitch_record: false,
             model_frame_debug: false,
@@ -201,12 +254,88 @@ impl Default for NetworkSettings {
 }
 
 impl NetworkSettings {
+    pub fn user_cvar(&self, name: &str) -> Option<&UserCvar> {
+        self.user_cvars.get(&name.to_ascii_lowercase())
+    }
+
+    /// Mirror Cvar_User_Set / Cvar_Set_f: an unknown name is created by any
+    /// `set*` form, and subsequent calls OR their flags without removing old
+    /// flags. Returns whether value or flags changed.
+    pub fn set_user_cvar(
+        &mut self, name: &str, value: &str, flags: UserCvarFlags,
+    ) -> Result<bool, String> {
+        if name.is_empty() || name.len() > 255 || !name.bytes().all(|b|
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        {
+            return Err(format!("{name}: invalid cvar name"));
+        }
+        // Serialized configs and Quake info strings do not escape these.
+        if value.len() > 1023 || value.bytes().any(|b|
+            b < 32 || b == 127 || matches!(b, b'\\' | b';' | b'"'))
+        {
+            return Err(format!("{name}: invalid cvar value"));
+        }
+        let key = name.to_ascii_lowercase();
+        if self.user_cvars.len() >= 8192 && !self.user_cvars.contains_key(&key) {
+            return Err("too many user-created cvars".into());
+        }
+        use std::collections::btree_map::Entry;
+        match self.user_cvars.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(UserCvar { name: name.to_owned(), value: value.to_owned(), flags });
+                Ok(true)
+            }
+            Entry::Occupied(mut entry) => {
+                let cvar = entry.get_mut();
+                let new_flags = cvar.flags.union(flags);
+                let changed = cvar.value != value || new_flags != cvar.flags;
+                if changed {
+                    cvar.value = value.to_owned();
+                    cvar.flags = new_flags;
+                }
+                Ok(changed)
+            }
+        }
+    }
+
+    fn append_user_cvars(&self, info: &mut Vec<u8>, nwh_102: bool) {
+        for cvar in self.user_cvars.values() {
+            // NWH is specific to JK2 1.02; never send it to JKA or 1.04,
+            // even if the user sets the variable globally in their config.
+            if cvar.name.eq_ignore_ascii_case("nwh") && !nwh_102 {
+                continue;
+            }
+            if cvar.flags.contains(UserCvarFlags::USERINFO) {
+                let value = crate::cgame::text_to_jka_bytes(&cvar.value);
+                // JK2/JKA connection info strings have a 1024-byte limit.
+                // Never let a custom entry make an otherwise valid connect fail.
+                let added = cvar.name.len() + value.len() + 2;
+                if info.len() + added >= 1024 { continue; }
+                set_info_value(info, cvar.name.as_bytes(), &value);
+            }
+        }
+    }
+
+    /// Version-neutral JK2 userinfo (does not expose NWH to other protocols).
+    /// Game connection paths should call `jk2_userinfo_for_version` instead.
+    pub fn jk2_userinfo(&self, model: &str) -> Vec<u8> {
+        self.build_jk2_userinfo(model, false)
+    }
+
+    pub fn jk2_userinfo_for_version(&self, model: &str, version: jka_protocol::jk2::Version) -> Vec<u8> {
+        self.build_jk2_userinfo(model, version == jka_protocol::jk2::Version::V102)
+    }
+
     /// Stock JK2 fields only; packed JKA body/cosmetic extensions are not part
     /// of JK2's color1/team protocol. Do not mutate the user's JKA settings.
-    pub fn jk2_userinfo(&self, model: &str) -> Vec<u8> {
+    fn build_jk2_userinfo(&self, model: &str, nwh_102: bool) -> Vec<u8> {
         let mut info = Vec::new();
         for (key, value) in [
             ("name", self.name.clone()), ("model", model.to_owned()),
+            // JK2 ClientUserinfoChanged reads `team_model` for GT_TEAM and up;
+            // without it team servers broadcast an empty model. The JK2 UI sets
+            // both cvars to the same character.
+            ("team_model", model.to_owned()),
             ("rate", self.rate.to_string()), ("snaps", self.snaps.to_string()),
             ("color1", self.color1.to_string()), ("forcepowers", self.forcepowers.clone()),
             ("sex", self.sex.clone()), ("handicap", self.handicap.to_string()),
@@ -216,6 +345,7 @@ impl NetworkSettings {
             ("cg_predictItems", u8::from(self.predict_items).to_string()),
             ("teamoverlay", u8::from(self.team_overlay).to_string()),
         ] { set_info_value(&mut info, key.as_bytes(), value.as_bytes()); }
+        self.append_user_cvars(&mut info, nwh_102);
         info
     }
 
@@ -277,6 +407,7 @@ impl NetworkSettings {
             let password = crate::cgame::text_to_jka_bytes(&self.password);
             set_info_value(&mut info, b"password", &password);
         }
+        self.append_user_cvars(&mut info, false);
         info
     }
 
@@ -498,6 +629,9 @@ pub struct NetClient {
     session: ClientSession,
     epoch: Instant,
     transport_debug: TransportDebug,
+    /// Set only after an actual JK2 1.02 NWH verification challenge, never
+    /// from our own default `nwh 1` userinfo or a server browser name.
+    nwh_server: bool,
     pub server_name: String,
 }
 
@@ -606,6 +740,7 @@ impl NetClient {
         let mut client = Self {
             socket, session, epoch, server_name: server_name.to_owned(),
             transport_debug: TransportDebug::default(),
+            nwh_server: false,
         };
         client.flush();
         Ok(client)
@@ -618,6 +753,15 @@ impl NetClient {
 
     pub fn session(&self) -> &ClientSession { &self.session }
     pub fn session_mut(&mut self) -> &mut ClientSession { &mut self.session }
+    /// NWH restrictions are connection-scoped and apply only to JK2 1.02.
+    pub(crate) fn is_nwh_server(&self) -> bool {
+        self.nwh_server && self.session.jk2_version() == Some(jka_protocol::jk2::Version::V102)
+    }
+    pub(crate) fn note_nwh_challenge(&mut self) {
+        if self.session.jk2_version() == Some(jka_protocol::jk2::Version::V102) {
+            self.nwh_server = true;
+        }
+    }
     pub(crate) fn transport_debug(&self) -> TransportDebug { self.transport_debug }
     pub fn local_port(&self) -> u16 { self.socket.local_addr().map_or(0, |addr| addr.port()) }
     pub(crate) fn connection_started(&self) -> Instant { self.epoch }
@@ -976,7 +1120,7 @@ impl LiveInput {
     }
 
     /// CG_WeaponSelectable against the predicted state.
-    fn selectable(ps: &PlayerState, weapon: i32) -> bool {
+    pub(crate) fn selectable(ps: &PlayerState, weapon: i32) -> bool {
         if weapon <= 0 {
             return false;
         }
@@ -998,6 +1142,32 @@ impl LiveInput {
         ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
             && ps.field_i32("pm_type").unwrap_or(0) != PM_SPECTATOR
             && ps.field_i32("emplacedIndex").unwrap_or(0) == 0
+    }
+
+    /// An extension-defined fixed-slot JKA order; selection remains native and
+    /// synchronous. The script never runs on mouse-wheel/input dispatch.
+    /// Existing /weapon, weaplast and non-HUD callers retain native behavior.
+    pub fn cycle_weapon_in_order(&mut self, ps: &PlayerState, forward: bool, order: &[u8]) {
+        if order.is_empty() {
+            self.cycle_weapon(ps, forward);
+            return;
+        }
+        if !Self::can_select(ps) { return; }
+        let len = order.len();
+        let current = order.iter().position(|&wp| wp == self.weapon_select);
+        for step in 1..=len {
+            let idx = match (current, forward) {
+                (Some(at), true) => (at + step) % len,
+                (Some(at), false) => (at + len - step) % len,
+                (None, true) => step - 1,
+                (None, false) => len - step,
+            };
+            let weapon = i32::from(order[idx]);
+            if Self::selectable(ps, weapon) {
+                self.set_selected_weapon(weapon as u8);
+                return;
+            }
+        }
     }
 
     /// CG_NextWeapon_f / CG_PrevWeapon_f.
@@ -1503,6 +1673,20 @@ fn prediction_trigger(entity_type: i32) -> bool {
     matches!(entity_type, 2 | 10 | 11) // ET_ITEM, ET_PUSH_TRIGGER, ET_TELEPORT_TRIGGER
 }
 
+// The pinned OpenJK/JAPRO (JKA) and MVSDK (JK2) entity enums agree on
+// ET_SPECIAL=4 and holdable HI_SHIELD=2. TaystJK's CG_ClipMoveToEntities
+// bypasses this exact entity because its deployed force-field collision is
+// not reliably predicted. It must still be kept for CG_PointContents.
+const ET_SPECIAL: i32 = 4;
+const HI_SHIELD: i32 = 2;
+
+fn skip_portable_shield_movement(
+    current_type: i32,
+    state: &jka_protocol::gamestate::EntityState,
+) -> bool {
+    current_type == ET_SPECIAL && state.field_i32("modelindex") == Some(HI_SHIELD)
+}
+
 /// CG_ClipMoveToEntities resolves shape and placement from currentState, not
 /// from the next snapshot's `solid` that admitted the entity to the list.
 /// Keeping these steps separate matters when projectiles spawn/despawn.
@@ -1596,7 +1780,12 @@ fn prediction_solid_entities(
             let angles = crate::cgame::evaluate_entity_trajectory(next, "apos", physics_time).unwrap_or([0.0; 3]);
             (next, origin, angles)
         };
-        solids.push(solid_entity_from_state(state, origin, angles, physics_time));
+        let mut solid = solid_entity_from_state(state, origin, angles, physics_time);
+        // Shared by JKA and JK2 1.02/1.04: skip portable shields only in
+        // predicted movement traces, not in point-contents or visual queries.
+        // Use currentState, just like TaystJK CG_ClipMoveToEntities.
+        solid.skip_movement = skip_portable_shield_movement(current_type, state);
+        solids.push(solid);
     }
     solids
 }
@@ -1797,6 +1986,7 @@ impl TraceWorld for PredictionTraceWorld<'_, '_> {
 pub struct Predictor {
     pub(crate) jk2: Option<Box<jk2_prediction::Predictor>>,
     native: Option<NativePlayerState>,
+    knockback: predict_knockback::KnockbackPrediction,
     failure_logged_at: Option<Instant>,
     /// cg.predictedPlayerState from committed usercmds only; the base for
     /// OpenJK's prediction-error detection.
@@ -1930,6 +2120,8 @@ pub struct PredictionInput<'a> {
     /// This frame's lerped packet entities (for CG_BuildSolidList).
     pub entities: &'a [crate::cgame::PresentedEntity],
     pub settings: &'a NetworkSettings,
+    /// TaystJK cg_predictKnockback requires simulated projectiles enabled.
+    pub simulated_projectiles: bool,
     /// Current input as a not-yet-sent usercmd stamped with cl.serverTime.
     /// OpenJK builds a real usercmd every client frame; we pace real ones
     /// (cl_commandRate) and predict this one only for display.
@@ -2085,7 +2277,7 @@ impl Predictor {
 
     /// CG_PredictPlayerState (vanilla, no vehicles).
     pub fn predict(&mut self, input: PredictionInput<'_>) -> Result<(), String> {
-        let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional, entity_graph, duel_states } = input;
+        let PredictionInput { session, snap, next, time, movement, world, entities, settings, simulated_projectiles, provisional, entity_graph, duel_states } = input;
         let client_num = snap.player_state.field_i32("clientNum").unwrap_or(0);
         // cg.thisFrameTeleport is raised by CG_TransitionSnapshot when the
         // playerstate teleport bit or client number changes.
@@ -2114,6 +2306,7 @@ impl Predictor {
         }
         const PMF_FOLLOW: i32 = 4096;
         if settings.no_predict || snap.player_state.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0 {
+            self.knockback.begin_frame(false, session.cmd_number(), false, 0);
             // CG_InterpolatePlayerState: callers use the interpolated snapshot.
             self.predicted = None;
             self.display = None;
@@ -2258,6 +2451,25 @@ impl Predictor {
             }
         }
         self.last_regime = Some(regime);
+        let rocket_prediction_active = settings.predict_knockback != 0
+            && simulated_projectiles
+            && prediction_settings.jcinfo & (1 << 13) != 0 // JAPRO_CINFO_UNLAGGEDPROJ
+            // WTTRIBES has 3040 u/s gravity rockets, not 900 u/s linear ones;
+            // never inject an incorrect impulse for that movement variant.
+            && prediction_settings.jcinfo2 & (1 << 4) == 0
+            && prediction_settings.server_mod == 1
+            && base_ps.stats[STAT_RACEMODE] != 0
+            && base_ps.field_i32("pm_type").unwrap_or(0) == 0;
+        self.knockback.begin_frame(
+            rocket_prediction_active, current,
+            self.this_frame_teleport || next_frame_teleport,
+            base_ps.field_i32("commandTime").unwrap_or(0),
+        );
+        if rocket_prediction_active {
+            self.misses.extend(self.knockback.observe_server_explosions(
+                base, client_num, settings.predict_knockback,
+            ));
+        }
         // cg.physicsTime: the snapshot time the replay starts from, which is
         // where movers are clipped and where the ground-mover adjustment starts.
         let mut physics_time = base.server_time;
@@ -2339,7 +2551,9 @@ impl Predictor {
                 skip[entity.number as usize] = !native.clips_prediction_entity(entity);
             }
             for solid in &mut solids {
-                solid.skip_movement = skip[solid.number as usize];
+                // Preserve the unconditional shield fix even with the stock
+                // JKA backend (where japro_clip_entity is not called).
+                solid.skip_movement |= skip[solid.number as usize];
             }
         }
         let debug_enabled = settings.prediction_debug
@@ -2385,7 +2599,50 @@ impl Predictor {
                 *world.ground_trace = None;
                 *world.ground_probe = None;
             }
+            let pre_event_sequence = if rocket_prediction_active { native.view().event_sequence } else { 0 };
             movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
+            if rocket_prediction_active {
+                let first_pass = self.knockback.note_command(number);
+                let after = native.view();
+                if first_pass && after.weapon == 11 {
+                    let fire_event = jka_protocol::entity_event::EntityEvent::EV_FIRE_WEAPON.as_i32();
+                    // eventSequence indexes the two-slot predictable event ring.
+                    // A Pmove may emit multiple events in one usercmd.
+                    for sequence in pre_event_sequence.max(after.event_sequence - 2)..after.event_sequence {
+                        if after.events[sequence.rem_euclid(2) as usize] == fire_event {
+                            if let Some((at, point)) = self.knockback.note_rocket_fire(number, cmd.server_time, client_num, after, &mut world) {
+                                if matches!(settings.predict_knockback, 2 | 3) {
+                                    self.misses.push(format!(
+                                        "^5PK-FIRE^7 cmd={number} fire={} impact={} at=({:.1},{:.1},{:.1})",
+                                        cmd.server_time, at, point[0], point[1], point[2],
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                for hit in self.knockback.inject_crossed(command_time, cmd.server_time, native)? {
+                    match settings.predict_knockback {
+                        2 | 3 => self.misses.push(format!(
+                            "^2PK-HIT^7 cmd={} impactT={} point=({:.1},{:.1},{:.1}) kb={} dv=({:.1},{:.1},{:.1})",
+                            hit.command_number, hit.impact_time,
+                            hit.impact[0], hit.impact[1], hit.impact[2], hit.knockback,
+                            hit.impulse[0], hit.impulse[1], hit.impulse[2],
+                        )),
+                        4 => self.misses.push(format!(
+                            "^6PK-DMG^7 cmd={} time={} kb={} radius={} impact={:?}",
+                            hit.command_number, hit.impact_time, hit.knockback, 160, hit.impact,
+                        )),
+                        5 => self.misses.push(format!(
+                            "^6PK-INJECT^7 cmd={} time={} before={:?} impulse={:?} after={:?}",
+                            hit.command_number, hit.impact_time,
+                            hit.pre_velocity, hit.impulse,
+                            std::array::from_fn::<_, 3, _>(|i| hit.pre_velocity[i] + hit.impulse[i]),
+                        )),
+                        _ => {},
+                    }
+                }
+            }
             let native_view = native.view();
             // Only the first prediction of a sent command is evidence. Replays and
             // the unsent render command must never replace this baseline.
@@ -2750,6 +3007,11 @@ impl Predictor {
                 // Native Pmove still advances the hypothetical presentation command,
                 // but only its continuous movement/camera state may be displayed.
                 movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
+                if rocket_prediction_active {
+                    // A provisional input is never a new rocket launch; only
+                    // already committed shots may affect the displayed state.
+                    self.knockback.inject_crossed(reached, cmd.server_time, native)?;
+                }
                 let native_view = native.view();
                 let mut tentative = from_native(native.network());
                 let carried = adjust_position_for_mover(entities, &tentative, origin(&tentative), physics_time, time);
@@ -2977,6 +3239,43 @@ mod tests {
     }
 
     #[test]
+    fn portable_shield_skips_only_predicted_movement_collision() {
+        use jka_protocol::gamestate::ENTITY_FIELDS;
+        let field = |name: &str| ENTITY_FIELDS.iter().position(|(n, _)| *n == name).unwrap();
+        let mut shield = mover_entity(80, ET_SPECIAL, [10.0, 20.0, 30.0], [0.0; 3]);
+        shield.state.fields[field("solid")] = 0x0048_180f;
+        shield.state.fields[field("modelindex")] = HI_SHIELD as u32;
+        let mut other = mover_entity(81, ET_SPECIAL, [40.0, 20.0, 30.0], [0.0; 3]);
+        other.state.fields[field("solid")] = 0x0048_180f;
+        other.state.fields[field("modelindex")] = 3;
+        let snapshot = Snapshot {
+            server_time: 500, message_num: 5, delta_num: 4, snap_flags: 0,
+            ping: 0, server_command_num: 0, area_mask: [0; 32],
+            player_state: PlayerState::default(), vehicle_player_state: None,
+            entities: vec![shield.state.clone(), other.state.clone()],
+        };
+        let displayed = [shield.clone(), other.clone()];
+        let prediction = prediction_solid_entities(&snapshot, &displayed, 500);
+        assert_eq!(prediction.len(), 2, "shield must remain in the list for point-contents");
+        assert!(prediction[0].skip_movement, "ET_SPECIAL / HI_SHIELD must not clip predicted player movement");
+        assert!(!prediction[1].skip_movement, "unrelated ET_SPECIALs must remain solid");
+        assert!(!solid_entities(&displayed, 500)[0].skip_movement,
+            "rendering, HUD and non-prediction queries must retain the shield");
+        // A just-spawned shield absent from presented currentState still gets
+        // the same prediction exception from the selected snapshot.
+        let fallback = prediction_solid_entities(&snapshot, &[], 500);
+        assert_eq!(fallback.len(), 2);
+        assert!(fallback[0].skip_movement);
+        assert!(!fallback[1].skip_movement);
+        // Once currentState exists, it takes precedence over nextState for
+        // clipping rules as well as collision shape (TaystJK behavior).
+        let mut changed = shield;
+        changed.state.fields[field("modelindex")] = 3;
+        let current = prediction_solid_entities(&snapshot, &[changed, other], 500);
+        assert!(!current[0].skip_movement);
+    }
+
+    #[test]
     fn mover_solids_are_placed_at_physics_time() {
         let mut entity = mover_entity(70, ET_MOVER, [0.0; 3], [0.0, 0.0, 100.0]);
         let index = jka_protocol::gamestate::ENTITY_FIELDS.iter().position(|(n, _)| *n == "solid").unwrap();
@@ -3131,6 +3430,7 @@ mod tests {
                         world,
                         entities: &[],
                         settings: &settings,
+                        simulated_projectiles: false,
                         provisional,
                         entity_graph: None,
                         duel_states: [crate::cgame::PrivateDuelState::default(); 2],
@@ -3322,6 +3622,42 @@ mod tests {
         let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
         assert_eq!(info_value(&info, b"cg_displayNetSettings"), None);
         assert!(settings.set_cvar("cg_displayNetSettings", "1 2 3").unwrap().is_err());
+    }
+
+    #[test]
+    fn nwh_defaults_to_userinfo_one_only_on_jk2_102() {
+        use jka_protocol::jk2::Version;
+        let settings = NetworkSettings::default();
+        let nwh = settings.user_cvar("NWH").unwrap();
+        assert_eq!(nwh.value, "1");
+        assert!(nwh.flags.contains(UserCvarFlags::USERINFO));
+        assert!(!nwh.flags.contains(UserCvarFlags::ARCHIVE));
+        assert_eq!(info_value(&settings.jk2_userinfo_for_version("kyle/default", Version::V102), b"nwh"), Some(&b"1"[..]));
+        assert_eq!(info_value(&settings.jk2_userinfo_for_version("kyle/default", Version::V104), b"nwh"), None);
+        assert_eq!(info_value(&settings.jk2_userinfo("kyle/default"), b"nwh"), None);
+        assert_eq!(info_value(&settings.userinfo("kyle/default"), b"nwh"), None);
+        assert_eq!(info_value(&settings.jk2_userinfo("kyle/default"), b"team_model"), Some(&b"kyle/default"[..]));
+    }
+
+    #[test]
+    fn user_created_cvars_are_case_insensitive_and_flags_accumulate() {
+        use jka_protocol::jk2::Version;
+        let mut settings = NetworkSettings::default();
+        settings.set_user_cvar("NWH", "1", UserCvarFlags::USERINFO).unwrap();
+        assert_eq!(settings.user_cvar("nwh").unwrap().value, "1");
+        settings.set_user_cvar("nwh", "2", UserCvarFlags::ARCHIVE).unwrap();
+        assert_eq!(settings.user_cvars.len(), 1);
+        assert!(settings.user_cvar("nWh").unwrap().flags.contains(UserCvarFlags::ARCHIVE));
+        assert!(settings.user_cvar("nWh").unwrap().flags.contains(UserCvarFlags::USERINFO));
+        assert_eq!(info_value(&settings.jk2_userinfo_for_version("kyle/default", Version::V102), b"nwh"), Some(&b"2"[..]));
+        assert_eq!(info_value(&settings.jk2_userinfo_for_version("kyle/default", Version::V104), b"nwh"), None);
+        assert_eq!(info_value(&settings.userinfo("kyle/default"), b"nwh"), None);
+        // The generic cvar creation pathway is still available for other keys.
+        settings.set_user_cvar("X_Custom", "7", UserCvarFlags::USERINFO).unwrap();
+        assert_eq!(info_value(&settings.userinfo("kyle/default"), b"X_Custom"), Some(&b"7"[..]));
+        assert_eq!(settings.user_cvars.len(), 2);
+        assert!(settings.set_user_cvar("oops\\hack", "x", UserCvarFlags::USERINFO).is_err());
+        assert!(settings.set_user_cvar("safe", "evil\\payload", UserCvarFlags::USERINFO).is_err());
     }
 
     #[test]
@@ -3790,6 +4126,39 @@ mod tests {
         assert!(!LiveInput::has_selectable_force(&ps));
         ps.set_field_bits("fd.forcePowersKnown", (1 << 1) | (1 << 0));
         assert!(LiveInput::has_selectable_force(&ps));
+    }
+
+    #[test]
+    fn extension_weapon_cycle_respects_fixed_order_and_native_gates() {
+        let mut ps = PlayerState::default();
+        ps.stats[4] = (1 << 3) | (1 << 5) | (1 << 15) | (1 << 16);
+        for ammo in &mut ps.ammo { *ammo = 999; }
+        let order: Vec<u8> = (3..=16).collect();
+        let mut input = LiveInput::default();
+        input.set_selected_weapon(3);
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 5, "unowned fixed slots are skipped");
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 15, "concussion has a stable dedicated slot");
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 16, "old Bryar has a stable dedicated slot");
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 3, "wraps in declared order");
+        input.cycle_weapon_in_order(&ps, false, &order);
+        assert_eq!(input.weapon_select, 16, "reverse wraps");
+        input.set_selected_weapon(1); // An equipped weapon not displayed in this HUD.
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 3, "entry from outside the bar starts at first slot");
+        input.set_selected_weapon(1);
+        input.cycle_weapon_in_order(&ps, false, &order);
+        assert_eq!(input.weapon_select, 16, "reverse entry starts at last slot");
+        input.set_selected_weapon(15);
+        ps.stats[4] &= !(1 << 16);
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 3, "skips unavailable old Bryar without moving other slots");
+        ps.set_field_bits("pm_type", 4); // spectator
+        input.cycle_weapon_in_order(&ps, true, &order);
+        assert_eq!(input.weapon_select, 3, "spectators cannot cycle weapons");
     }
 
     #[test]

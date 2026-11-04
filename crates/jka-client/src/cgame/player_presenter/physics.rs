@@ -734,7 +734,7 @@ impl PlayerPresenter {
             fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None,
                 instances: Arc::new(std::mem::take(&mut self.blob_shadow_instances)),
-                blob_shadow: true, lightning: false,
+                blob_shadow: true, lightning: false, rope: false,
             }),
             texture: Some(texture),
             // OpenJK registers `markShadow` as a shader and lets the renderer

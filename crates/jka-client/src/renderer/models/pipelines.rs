@@ -47,6 +47,8 @@ impl DynamicModelRenderer {
     ) {
         self.wireframe_pipeline = None;
         self.fx_sprite_wireframe_pipeline = None;
+        self.fx_rope_pipeline = None;
+        self.fx_rope_wireframe_pipeline = None;
         self.fx_sprite_surface_format = surface_format;
         self.fx_sprite_samples = samples;
         self.skin_wireframe_pipeline = None;
@@ -395,6 +397,48 @@ impl DynamicModelRenderer {
         }
     }
 
+    pub(in crate::renderer) fn ensure_fx_rope_pipeline(
+        &mut self, jobs: &mut PipelineJobManager, device: &wgpu::Device,
+    ) {
+        if self.fx_rope_pipeline.is_some() { return; }
+        if self.fx_rope_shader.is_none() {
+            let key = PipelineJobKey::new("fx-grapple-rope-shader", 0, 0);
+            if let Some(shader) = jobs.take_ready::<wgpu::ShaderModule>(key) {
+                self.fx_rope_shader = Some(shader);
+            } else {
+                let device = device.clone();
+                jobs.request(key, "grappling rope shader", move || {
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("JKA grappling rope procedural ribbon"),
+                        source: wgpu::ShaderSource::Wgsl(include_str!("../../fx_rope.wgsl").into()),
+                    })
+                });
+                return;
+            }
+        }
+        let config = pipeline_hash(&(
+            self.fx_sprite_surface_format, self.fx_sprite_samples,
+            self.legacy_fog_compiled, self.fx_zero_alpha_discard,
+        ));
+        let key = PipelineJobKey::new("fx-grapple-rope", 0, config);
+        if let Some(pipeline) = jobs.take_ready::<wgpu::RenderPipeline>(key) {
+            self.fx_rope_pipeline = Some(pipeline);
+            return;
+        }
+        let device = device.clone();
+        let layout = self.pipeline_layout.clone();
+        let shader = self.fx_rope_shader.as_ref().expect("rope module above").clone();
+        let format = self.fx_sprite_surface_format;
+        let samples = self.fx_sprite_samples;
+        let fog = self.legacy_fog_compiled;
+        let zero_alpha_discard = self.fx_zero_alpha_discard;
+        jobs.request(key, "grappling rope blend pipeline", move || {
+            create_fx_sprite_pipeline(&device, &layout, &shader, format,
+                samples, DynamicModelAlphaMode::BlendUnlit, fog,
+                zero_alpha_discard, false, false)
+        });
+    }
+
     pub(in crate::renderer) fn ensure_fx_sprite_pipeline(
         &mut self,
         jobs: &mut PipelineJobManager,
@@ -557,6 +601,25 @@ impl DynamicModelRenderer {
                             surface_format,
                             samples,
                         )
+                    });
+                }
+            }
+        }
+        // Rope wireframe remains lazy even when r_showtris is enabled.
+        if self.fx_sprite_draws.iter().any(|draw| draw.rope)
+            && self.fx_rope_wireframe_pipeline.is_none()
+        {
+            if let Some(shader) = self.fx_rope_shader.as_ref() {
+                let key = PipelineJobKey::new("dynamic-wireframe", 3, config);
+                if let Some(pipeline) = jobs.take_ready(key) {
+                    self.fx_rope_wireframe_pipeline = Some(pipeline);
+                } else {
+                    let device = device.clone();
+                    let layout = self.pipeline_layout.clone();
+                    let shader = shader.clone();
+                    jobs.request(key, "grapple rope wireframe", move || {
+                        create_fx_sprite_wireframe_pipeline(&device, &layout,
+                            &shader, surface_format, samples)
                     });
                 }
             }

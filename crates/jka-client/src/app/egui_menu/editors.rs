@@ -78,7 +78,7 @@ impl App {
             }
         }
 
-        let rect_ctx = ui::HudRectContext::new(
+        let mut rect_ctx = ui::HudRectContext::new(
             self.movement_keys_hud,
             &self.video,
             &self.perf,
@@ -89,6 +89,7 @@ impl App {
             [self.draw_score_x, self.draw_score_y],
             self.draw_scores,
         );
+        rect_ctx.jk2_mode = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
         let neighbors: Vec<_> = HudElementId::ALL.into_iter()
             .filter(|id| self.hud_edit_element_enabled(*id)
                 && !ui::hud_element_replaced(self.extensions.native_hidden, self.video.draw_hud, *id))
@@ -443,7 +444,11 @@ impl App {
             let label = if disabled {
                 format!("{} (off)", id.label())
             } else {
-                id.label().to_owned()
+                if self.video.hud_style == 1 && id == HudElementId::Health {
+                    "NATIVE HEALTH / ARMOR".to_owned()
+                } else if self.video.hud_style == 1 && id == HudElementId::Ammo {
+                    "NATIVE FORCE / AMMO".to_owned()
+                } else { id.label().to_owned() }
             };
             // Keep the tag on screen for elements hugging the top edge.
             let (label_pos, label_align) = if rect.top() < 24.0 {
@@ -1074,8 +1079,10 @@ impl App {
         if save_layout { self.extensions.save_widget_layouts(); }
         if visual_changed {
             self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
-                crate::ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
-                images }));
+                crate::ui::append_native_hud_images(&mut images, self.video.hud_style,
+                    self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
+                ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
+                images }, self.extensions.hud_shaders.clone()));
             self.egui_repaint_requested=true;
         }
     }

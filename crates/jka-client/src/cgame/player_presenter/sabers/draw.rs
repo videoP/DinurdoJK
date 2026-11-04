@@ -160,7 +160,11 @@ impl PlayerPresenter {
                 player_axis,
                 player_origin,
                 [1.0, 1.0, 1.0, entity_alpha],
-                None,
+                crate::renderer::collision_world_only().then(|| (
+                    Some(super::super::presentation::collision_world_equipment_texture()),
+                    crate::renderer::DynamicModelAlphaMode::Opaque,
+                    false,
+                )),
                 false,
             )?;
             if i32::from(entity.number) == self.viewer_client {
@@ -496,7 +500,11 @@ impl PlayerPresenter {
             saber_axis,
             saber_entity.origin,
             [1.0, 1.0, 1.0, entity_alpha],
-            None,
+            crate::renderer::collision_world_only().then(|| (
+                Some(super::super::presentation::collision_world_equipment_texture()),
+                crate::renderer::DynamicModelAlphaMode::Opaque,
+                false,
+            )),
             false,
         )?;
         if i32::from(owner.number) == self.viewer_client {

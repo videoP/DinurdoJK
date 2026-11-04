@@ -156,6 +156,18 @@ app_cvars! {
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_phase=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27307,|state|state.video.blue_water_environment.moon_phase.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_moon_phase(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_phase=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
+    APP_R_BLUESKYMOONINTENSITY {
+        runtime:CvarDef::new("r_blueSkyMoonIntensity","2.5","0..16","Authored Blue Water world moon intensity. Effective only when r_blueSkyMoonIntensityCustom is 1; otherwise the lunar phase controls illumination.",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_intensity.to_string()),|app,value|App::cvar_set_bluesky_moon_intensity(app,APP_R_BLUESKYMOONINTENSITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_intensity,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_intensity=v.clamp(0.0,16.0);}}}),archive:Some((27332,|state|state.video.blue_water_environment.moon_intensity.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_intensity(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_intensity=App::parse_cvar_finite(name,value)?.clamp(0.0,16.0); app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONINTENSITYCUSTOM {
+        runtime:CvarDef::new("r_blueSkyMoonIntensityCustom","0","0|1","0 automatic intensity from moon phase; 1 use r_blueSkyMoonIntensity (independent of moon position lock).",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_intensity_custom.to_string()),|app,value|App::cvar_set_bluesky_moon_intensity_custom(app,APP_R_BLUESKYMOONINTENSITYCUSTOM.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_intensity_custom,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.moon_intensity_custom=parse_bool(value).unwrap_or(settings.blue_water_environment.moon_intensity_custom);}),archive:Some((27333,|state|state.video.blue_water_environment.moon_intensity_custom.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_intensity_custom(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_intensity_custom=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
     APP_R_BLUESKYMOONELEVATION {
         runtime:CvarDef::new("r_blueSkyMoonElevation","","-90.0..90.0","Moon elevation",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.moon_elevation.to_string()),|app,value|App::cvar_set_bluesky_moon_elevation(app,APP_R_BLUESKYMOONELEVATION.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_elevation,None),
@@ -558,6 +570,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -567,6 +580,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -576,6 +590,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1051,6 +1066,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1060,6 +1076,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1069,6 +1086,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1171,6 +1189,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1180,6 +1199,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1189,6 +1209,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1459,6 +1480,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1468,6 +1490,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1477,6 +1500,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1579,6 +1603,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1588,6 +1613,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1597,6 +1623,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;
@@ -1699,6 +1726,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1708,6 +1736,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -1717,6 +1746,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;

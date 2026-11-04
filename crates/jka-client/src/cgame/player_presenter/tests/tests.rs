@@ -1619,6 +1619,7 @@ fn demo_force_powers_produce_fx() {
                             PlayerFxRequest::EffectDir { name, .. } => name.clone(),
                             PlayerFxRequest::AuthoredBladeEffect { name, .. } => name.clone(),
                             PlayerFxRequest::SaberBlade { .. } => "saber blade".into(),
+                            PlayerFxRequest::WeaponCharge { .. } => "weapon charge".into(),
                             PlayerFxRequest::PushPuffs { .. } => "push puffs".into(),
                             PlayerFxRequest::GripPuffs { .. } => "grip puffs".into(),
                             PlayerFxRequest::HeadSprite { shader, .. } => {

@@ -339,7 +339,7 @@ impl App {
         source: &str,
         preserve_rendered_world: bool,
     ) -> Result<bool, String> {
-        let game = jka_assets::pk3::resolve_fs_game_directory(&self.base, value)?;
+        let game = jka_assets::pk3::resolve_fs_game_directory_for_roots(&self.base, value, &self.fs_roots)?;
         if self.game == game {
             return Ok(false);
         }
@@ -347,17 +347,8 @@ impl App {
             .as_ref()
             .filter(|path| !path.is_dir())
             .map(|path| path.display().to_string());
-        let previous = self
-            .game
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "base".to_owned());
-        let next = game
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "base".to_owned());
+        let previous = jka_assets::pk3::fs_game_name(self.game.as_deref());
+        let next = jka_assets::pk3::fs_game_name(game.as_deref());
         // A vote proposal in the old fs_game cannot be promoted across VFS
         // changes, even if its BSP qpath is identical.
         self.cancel_vote_map_prewarm();

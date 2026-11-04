@@ -630,6 +630,21 @@ impl GameSession {
         self.note_out_of_ammo(&event);
         self.note_view_kick(&event);
         self.note_weapon_shake(&event);
+        if self.live && !self.seeking_demo
+            && matches!(event.event, EntityEvent::EV_FIRE_WEAPON | EntityEvent::EV_ALT_FIRE)
+        {
+            let player = self.presented_player_state().cloned();
+            if let Some(ps) = player.as_ref() {
+                let local = ps.field_i32("clientNum").unwrap_or(-1);
+                let spectator = ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0;
+                if !spectator && i32::from(event.entity_num) == local {
+                    let ping = self.current_snapshot.as_ref().map_or(0, |snap| snap.ping);
+                    self.weapon_fx.note_simulated_projectile(
+                        &event, ps, &self.client_game, target_server_time, ping,
+                    );
+                }
+            }
+        }
         self.note_item_pickup(&event);
         self.note_hud_events(&event);
         self.note_siege_events(&event);

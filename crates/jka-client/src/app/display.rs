@@ -13,6 +13,7 @@ pub(in crate::app) struct AppliedVideoMode {
     pub(in crate::app) gpu_adapter: u8,
     pub(in crate::app) hdr_output: u32,
     pub(in crate::app) resolution: [u32; 2],
+    pub(in crate::app) resolution_desktop: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,12 +109,22 @@ pub(crate) enum AntiAliasingChoice {
     Fxaa,
     Smaa,
     Taa,
+    /// NVIDIA DLSS (DLAA or upscaling); Vulkan and DX12 (nvidia-dlss builds).
+    Dlss,
     Msaa(u32),
 }
 
 pub(in crate::app) fn normalize_anti_aliasing(video: &mut VideoSettings) -> bool {
-    let before = (video.msaa_samples, video.fxaa, video.smaa, video.taa);
-    if video.taa {
+    let before = (video.msaa_samples, video.fxaa, video.smaa, video.taa, video.dlss);
+    if !cfg!(feature = "nvidia-dlss") {
+        video.dlss = false;
+    }
+    if video.dlss {
+        video.taa = false;
+        video.fxaa = false;
+        video.smaa = false;
+        video.msaa_samples = 1;
+    } else if video.taa {
         video.fxaa = false;
         video.smaa = false;
         video.msaa_samples = 1;
@@ -123,10 +134,65 @@ pub(in crate::app) fn normalize_anti_aliasing(video: &mut VideoSettings) -> bool
     } else if video.fxaa {
         video.msaa_samples = 1;
     }
-    before != (video.msaa_samples, video.fxaa, video.smaa, video.taa)
+    before != (video.msaa_samples, video.fxaa, video.smaa, video.taa, video.dlss)
 }
 
 impl App {
+    /// The desktop pixel dimensions must be captured *before* switching the
+    /// monitor to an exclusive video mode. monitor.size() may otherwise report
+    /// the lower exclusive mode rather than the user's actual desktop setting.
+    pub(in crate::app) fn monitor_desktop_resolution(window: &Window) -> Option<[u32; 2]> {
+        let monitor = window.current_monitor().or_else(|| window.primary_monitor())?;
+        let size = monitor.size();
+        (size.width > 0 && size.height > 0).then_some([size.width, size.height])
+    }
+
+    pub(in crate::app) fn selected_desktop_resolution(&self) -> [u32; 2] {
+        if Self::native_fullscreen_mode(self.applied_fullscreen, self.applied_renderer_backend)
+            != FullscreenMode::Exclusive
+        {
+            if let Some(resolution) = self.window.as_deref()
+                .and_then(Self::monitor_desktop_resolution)
+            {
+                return resolution;
+            }
+        }
+        self.desktop_resolution.unwrap_or(self.video.resolution)
+    }
+
+    pub(in crate::app) fn refresh_desktop_resolution(&mut self) {
+        if !self.video.resolution_desktop { return; }
+        let resolution = self.selected_desktop_resolution();
+        self.video.resolution = resolution;
+        self.desktop_resolution = Some(resolution);
+    }
+
+    pub(in crate::app) fn set_desktop_resolution(&mut self) {
+        let resolution = self.selected_desktop_resolution();
+        if self.video.resolution_desktop && self.video.resolution == resolution { return; }
+        self.video.resolution_desktop = true;
+        self.video.resolution = resolution;
+        self.desktop_resolution = Some(resolution);
+        self.mark_config_dirty();
+        self.console_status = format!(
+            "RESOLUTION: DESKTOP {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
+            resolution[0], resolution[1]
+        );
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_custom_resolution(&mut self, resolution: [u32; 2]) {
+        if !self.video.resolution_desktop && self.video.resolution == resolution { return; }
+        self.video.resolution_desktop = false;
+        self.video.resolution = resolution;
+        self.mark_config_dirty();
+        self.console_status = format!(
+            "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
+            resolution[0], resolution[1]
+        );
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn exclusive_video_mode(
         window: &Window,
         resolution: [u32; 2],
@@ -252,6 +318,7 @@ impl App {
         self.video.renderer_backend = self.applied_renderer_backend;
         self.video.hdr_output = self.applied_hdr_output;
         self.video.resolution = self.applied_resolution;
+        self.video.resolution_desktop = self.applied_resolution_desktop;
 
         if target == FullscreenMode::Exclusive
             && self.applied_renderer_backend != RendererBackend::Dx12
@@ -345,17 +412,20 @@ impl App {
     pub(in crate::app) fn cycle_resolution(&mut self, direction: i32) {
         let resolutions =
             Self::available_resolutions(self.window.as_deref(), self.video.resolution);
-        let current = resolutions
-            .iter()
-            .position(|value| *value == self.video.resolution)
-            .unwrap_or(0) as i32;
-        let next = (current + direction).rem_euclid(resolutions.len() as i32) as usize;
-        self.video.resolution = resolutions[next];
-        self.mark_config_dirty();
-        self.console_status = format!(
-            "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
-            self.video.resolution[0], self.video.resolution[1]
-        );
+        // The first step represents Desktop; every remaining step is an
+        // explicit dimension, including a custom size equal to the desktop.
+        let current = if self.video.resolution_desktop {
+            0
+        } else {
+            1 + resolutions.iter()
+                .position(|value| *value == self.video.resolution).unwrap_or(0)
+        } as i32;
+        let next = (current + direction).rem_euclid((resolutions.len() + 1) as i32);
+        if next == 0 {
+            self.set_desktop_resolution();
+        } else {
+            self.set_custom_resolution(resolutions[next as usize - 1]);
+        }
     }
 
     /// The anti-aliasing ladder, ordered by the menu's intended quality scale:
@@ -382,11 +452,16 @@ impl App {
         );
         choices.push((AntiAliasingChoice::Smaa, "SMAA".to_owned()));
         choices.push((AntiAliasingChoice::Taa, "TAA".to_owned()));
+        if cfg!(feature = "nvidia-dlss") {
+            choices.push((AntiAliasingChoice::Dlss, "NVIDIA DLSS".to_owned()));
+        }
         choices
     }
 
     pub(crate) fn current_anti_aliasing(&self) -> AntiAliasingChoice {
-        if self.video.taa {
+        if self.video.dlss {
+            AntiAliasingChoice::Dlss
+        } else if self.video.taa {
             AntiAliasingChoice::Taa
         } else if self.video.smaa {
             AntiAliasingChoice::Smaa
@@ -418,11 +493,13 @@ impl App {
         self.video.fxaa = false;
         self.video.smaa = false;
         self.video.taa = false;
+        self.video.dlss = false;
         match next {
             AntiAliasingChoice::Off => {}
             AntiAliasingChoice::Fxaa => self.video.fxaa = true,
             AntiAliasingChoice::Smaa => self.video.smaa = true,
             AntiAliasingChoice::Taa => self.video.taa = true,
+            AntiAliasingChoice::Dlss => self.video.dlss = true,
             AntiAliasingChoice::Msaa(samples) => self.video.msaa_samples = samples,
         }
 
@@ -475,6 +552,7 @@ impl App {
             gpu_adapter: self.applied_gpu_adapter,
             hdr_output: self.applied_hdr_output,
             resolution: self.applied_resolution,
+            resolution_desktop: self.applied_resolution_desktop,
         }
     }
 
@@ -602,6 +680,7 @@ impl App {
             || self.video.gpu_adapter != self.applied_gpu_adapter
             || self.video.hdr_output != self.applied_hdr_output
             || self.video.resolution != self.applied_resolution
+            || self.video.resolution_desktop != self.applied_resolution_desktop
     }
 
     /// The two framebuffer-format A/Bs require a new renderer (surface and/or
@@ -682,16 +761,20 @@ impl App {
                 ),
             );
         }
-        if self.video.resolution != self.applied_resolution {
+        if self.video.resolution != self.applied_resolution
+            || self.video.resolution_desktop != self.applied_resolution_desktop
+        {
+            let label = |desktop: bool, resolution: [u32; 2]| {
+                if desktop { format!("Desktop ({} x {})", resolution[0], resolution[1]) }
+                else { format!("{} x {}", resolution[0], resolution[1]) }
+            };
             add(
                 "resolution",
                 "Resolution",
                 format!(
-                    "{} x {} -> {} x {}",
-                    self.applied_resolution[0],
-                    self.applied_resolution[1],
-                    self.video.resolution[0],
-                    self.video.resolution[1]
+                    "{} -> {}",
+                    label(self.applied_resolution_desktop, self.applied_resolution),
+                    label(self.video.resolution_desktop, self.video.resolution),
                 ),
             );
         }
@@ -951,6 +1034,7 @@ impl App {
         self.video.gpu_adapter = previous.gpu_adapter;
         self.video.hdr_output = previous.hdr_output;
         self.video.resolution = previous.resolution;
+        self.video.resolution_desktop = previous.resolution_desktop;
         self.normalize_video_selection();
         self.console_status = format!("VIDEO SETTINGS {reason}; REVERTING...");
         self.push_console_line(format!("^3{}", self.console_status));
@@ -992,6 +1076,7 @@ impl App {
 
         self.applied_fullscreen = mode;
         self.applied_resolution = self.video.resolution;
+        self.applied_resolution_desktop = self.video.resolution_desktop;
         Ok(())
     }
 
@@ -1020,6 +1105,7 @@ impl App {
         // and depth pipeline must be rebuilt once to use the new formats.
         let framebuffer_restart = self.framebuffer_format_restart_pending();
         self.apply_latched_console_cvars(ApplyLatchedScope::VidRestart);
+        self.refresh_desktop_resolution();
         Some(if framebuffer_restart {
             ApplyVideoPath::RestartRenderer
         } else if !self.display_restart_required() {
@@ -1141,6 +1227,8 @@ impl App {
                 if actual != self.applied_resolution && self.video_confirmation.is_none() {
                     self.video.resolution = actual;
                     self.applied_resolution = actual;
+                    self.video.resolution_desktop = false;
+                    self.applied_resolution_desktop = false;
                     self.mark_config_dirty();
                 }
             }
@@ -1158,6 +1246,10 @@ impl App {
             // invalidate; the next map load prepares with them.
             self.applied_grass = self.video.grass;
             self.applied_ocean = self.video.ocean;
+            // A menu with no loaded BSP still needs the output-gain setting.
+            self.render_command(RenderCommand::SetOverbrightBits(
+                self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+            ));
             self.publish_ui();
             return;
         }
@@ -1209,6 +1301,7 @@ impl App {
         self.video.gpu_adapter = target.gpu_adapter;
         self.video.hdr_output = target.hdr_output;
         self.video.resolution = target.resolution;
+        self.video.resolution_desktop = target.resolution_desktop;
     }
 
     pub(in crate::app) fn restart_display_apply_failed(
@@ -1260,6 +1353,11 @@ impl App {
             Ok(render) => {
                 self.attach_companion_to_renderer(&render);
                 self.render = Some(render);
+                // A restarted renderer begins with overbright disabled. Restore
+                // the resolved protocol default before cached BSP reupload.
+                self.render_command(RenderCommand::SetOverbrightBits(
+                    self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+                ));
                 self.profile_background_requested=None;
                 // Renderer restarts recreate these lightweight runtime flags;
                 // immediately restore the classic world-lighting controls from
@@ -1396,6 +1494,7 @@ impl App {
         }
         self.applied_fullscreen = target.fullscreen;
         self.applied_resolution = target.resolution;
+        self.applied_resolution_desktop = target.resolution_desktop;
         self.window_hidden_for_restart = true;
         self.window = Some(Arc::clone(&window));
         self.reset_egui_for_window(&window);
@@ -1584,6 +1683,7 @@ impl App {
     }
 
     pub(in crate::app) fn restart_renderer_internal(&mut self, confirm_on_change: bool) {
+        self.refresh_desktop_resolution();
         self.restore_gamma_before_restart();
         let previous = self.applied_video_mode();
         let Some(window) = self.window.clone() else {
@@ -1623,6 +1723,7 @@ impl App {
             gpu_adapter: self.video.gpu_adapter,
             hdr_output: self.video.hdr_output,
             resolution: self.video.resolution,
+            resolution_desktop: self.video.resolution_desktop,
         };
 
         // Preserve the current window placement before leaving windowed mode,
@@ -1758,6 +1859,7 @@ impl App {
         // so its WGPU surface/device are gone before the replacement is created.
         self.applied_fullscreen = target.fullscreen;
         self.applied_resolution = target.resolution;
+        self.applied_resolution_desktop = target.resolution_desktop;
         rverbose!(
             1,
             "[VID_RESTART] display mode unchanged; skipped Win32 mode transition"

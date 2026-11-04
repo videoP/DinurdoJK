@@ -68,7 +68,8 @@ impl QualityPreset {
                     "r_igpuAB" => *value = "19", // A/B 3 + cached main-view frustum planes
                     "r_igpuMemoryAB" => *value = "1", // Depth16Unorm (latched)
                     "r_rgb565" => *value = "1", // native RGB565 swapchain when supported (latched)
-                    "r_competitiveAB" => *value = "5", // one BSP material stage + cheap baked lightmap (mode 11 stays unlit)
+                    "r_competitiveAB" => *value = "5", // retained for ordinary renderer A/B; the flat-world path bypasses authored stages
+                    "r_collisionWorld" => *value = "1", // position-only compiled solid surfaces, independent of audio
                     "r_fragmentShaderMode" => *value = "5", // current measured compact-world family
                     "r_drawfog" => *value = "0", // avoid Legacy 2 FP16/post on fog maps
                     "r_fullbright" => *value = "0", // BSP baked global lightmaps, not forced unlit
@@ -145,6 +146,9 @@ impl QualityPreset {
 
         let table: &'static [(&'static str, &'static str)] = match self {
             Self::Minimal => &[
+                // DLSS/DLAA overrides conventional AA in the renderer. Turn it
+                // off *before* applying this preset's authored AA settings.
+                ("r_dlss", "0"),
                 // The cvar's canonical "off" value is 0; the setter maps both
                 // 0 and 1 to the renderer's single-sample state. Using 0 here
                 // lets active_quality_preset() compare against the getter.
@@ -201,6 +205,7 @@ impl QualityPreset {
                 ("r_glassPromotion", "0"),
             ],
             Self::Low => &[
+                ("r_dlss", "0"),
                 ("r_ext_multisample", "2"),
                 ("r_maxFrameLatency", "2"),
                 ("r_picmip", "0"),
@@ -284,6 +289,7 @@ impl QualityPreset {
             ("r_igpuAB", "0"),
             ("r_fragmentShaderMode", "5"),
             ("r_competitiveAB", "0"),
+            ("r_collisionWorld", "0"), // all non-Shitter presets restore authored geometry
             ("r_fullbright", "0"),
             ("r_vertexLight", "0"),
             ("r_lightmap", "0"),
@@ -467,11 +473,69 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_disables_dlss_before_restoring_its_authored_aa() {
+        // DLAA is a mode of r_dlss; r_dlssMode itself is an independent
+        // user preference and does not need to be rewritten.
+        for (preset, expected_msaa) in [
+            (QualityPreset::Shitter, "0"),
+            (QualityPreset::Minimal, "0"),
+            (QualityPreset::Low, "2"),
+            (QualityPreset::Medium, "2"),
+            (QualityPreset::High, "4"),
+            (QualityPreset::Ultra, "4"),
+        ] {
+            let settings = preset.settings();
+            assert_eq!(settings.first(), Some(&("r_dlss", "0")),
+                "{} must disable DLSS/DLAA before configuring AA", preset.label());
+            assert_eq!(settings.iter().find(|(name, _)| *name == "r_ext_multisample")
+                .map(|(_, value)| *value), Some(expected_msaa),
+                "{} must retain its authored AA", preset.label());
+            for (name, expected) in [("r_fxaa", "0"), ("r_smaa", "0"), ("r_taa", "0")] {
+                assert_eq!(settings.iter().find(|(cvar, _)| *cvar == name)
+                    .map(|(_, value)| *value), Some(expected),
+                    "{} changed its authored {name} value", preset.label());
+            }
+            assert_eq!(settings.iter().filter(|(name, _)| *name == "r_dlss").count(), 1);
+        }
+    }
+
+    #[test]
     fn presets_never_touch_model_lod_generation() {
         for preset in QualityPreset::ALL {
             let names = preset.settings();
             assert!(!names.iter().any(|(name, _)| name.eq_ignore_ascii_case("r_md3AutoLod") || name.eq_ignore_ascii_case("r_bspModelLod")),
                 "{} changed the independently controlled LOD-generation switch", preset.label());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn applying_any_preset_replaces_active_dlss_with_its_aa() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+            .with_any_thread(true).build().unwrap();
+        let fixture = crate::cvar_compatibility::Fixture::new();
+        let mut app = crate::app::App::new(fixture.0.clone(), None,
+            crate::scene::MapSource::Bsp("mp/ffa3".into()), false, event_loop.create_proxy()).unwrap();
+        app.supported_msaa = vec![1, 2, 4, 8];
+        for (preset, expected_msaa) in [
+            (QualityPreset::Shitter, 1),
+            (QualityPreset::Minimal, 1),
+            (QualityPreset::Low, 2),
+            (QualityPreset::Medium, 2),
+            (QualityPreset::High, 4),
+            (QualityPreset::Ultra, 4),
+        ] {
+            // Bypass the feature/platform gate to simulate a DLSS-enabled
+            // previous selection, even in a non-NGX test build.
+            app.video.dlss = true;
+            app.apply_quality_preset(preset);
+            assert!(!app.video.dlss, "{} left DLSS active", preset.label());
+            assert_eq!(app.video.msaa_samples, expected_msaa,
+                "{} failed to restore MSAA", preset.label());
+            assert!(!app.video.fxaa && !app.video.smaa && !app.video.taa);
+            assert_eq!(app.console_cvar_value("r_dlss").as_deref(), Some("0"));
+            assert_eq!(app.active_quality_preset(), Some(preset));
         }
     }
 
@@ -560,6 +624,7 @@ mod tests {
             ("r_rgb565", "1", "0"),
             ("r_fragmentShaderMode", "5", "5"),
             ("r_competitiveAB", "5", "0"),
+            ("r_collisionWorld", "1", "0"),
             ("r_fullbright", "0", "0"),
             ("r_vertexLight", "0", "0"),
             ("r_lightmap", "0", "0"),

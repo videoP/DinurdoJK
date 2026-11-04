@@ -604,9 +604,9 @@ pub(in crate::ui) fn build_scoreboard(
     }
     let hint = match cursor {
         Some(cursor) if cursor.menu.is_some() => "CLICK OUTSIDE TO CLOSE",
-        Some(_) => "CLICK A PLAYER FOR OPTIONS   ·   M3 / ESC  RELEASE",
-        None if layout.max_scroll > 0 => "WHEEL  SCROLL   ·   M3  MOUSE",
-        None => "M3  MOUSE",
+        Some(_) => "CLICK A PLAYER FOR OPTIONS   ·   ALT ATTACK / ESC  RELEASE",
+        None if layout.max_scroll > 0 => "WHEEL  SCROLL   ·   ALT ATTACK  MOUSE",
+        None => "ALT ATTACK  MOUSE",
     };
     txt.draw_right(out, hint, layout.footer_right[0] + layout.footer_right[2], footer_baseline, meta, pal::TEXT_FAINT());
     if board.chrome.stats.is_some() {

@@ -5,7 +5,13 @@ param(
     [switch]$Fetch,
     [switch]$Fast,
     [switch]$Faster,
-    [switch]$CacheAudit
+    [switch]$Dlss,
+    [switch]$CacheAudit,
+    # Copy ONLY DinurdoJK.exe (plus DinurdoJK.pdb when the build produced one) to
+    # this folder instead of staging the game in target\release (no DLLs,
+    # licenses, base\ or .mode file). Created if missing; relative paths resolve
+    # against the current directory.
+    [Alias('OutDir')][string]$Output
 )
 $ErrorActionPreference = 'Stop'
 # Measure the whole command, not just the Cargo subprocess.
@@ -77,6 +83,12 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 # -Faster    Visual-only iteration: opt-level=0, LTO off, incremental OFF, PDB enabled.
 # Each profile has its own cache (target\fast, target\faster).
 # Both stage their executable into target\release; neither builds jka-probe.
+# -Output <folder>  Copy only DinurdoJK.exe (+ .pdb if built) there instead of staging into
+#            target\release (any mode). Cargo's cache stays in target\<mode>.
+# -Dlss      Adds Cargo feature nvidia-dlss (NVIDIA DLAA, Vulkan only). Needs
+#            DLSS_SDK (NVIDIA DLSS SDK 310.9.1), VULKAN_SDK and libclang, and
+#            stages nvngx_dlss.dll beside the exe. Toggling it rebuilds only the
+#            game crate, but Cargo keeps a second copy of that crate's cache.
 if ($Fast -and $Faster) { throw 'Choose -Fast or -Faster, not both.' }
 if (($Fast -or $Faster) -and $Configuration -eq 'Debug') {
     throw 'For -Fast or -Faster, omit -Configuration Debug.'
@@ -94,8 +106,24 @@ if ($Fast) {
     $buildMode = 'debug'
     $profileArguments = @()
 }
+$featureArguments = @()
+if ($Dlss) {
+    foreach ($name in 'DLSS_SDK', 'VULKAN_SDK') {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not $value -or -not (Test-Path -LiteralPath $value)) {
+            throw "-Dlss needs $name set to an existing directory (see crates\jka-client\DLAA_VULKAN.md)."
+        }
+    }
+    $featureArguments = @('--features', 'nvidia-dlss')
+}
 $buildDirectory = Join-Path $PSScriptRoot "target\$buildMode"
 $runtimeDirectory = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInvariant())"
+if ($Output) {
+    $runtimeDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output).TrimEnd('\', '/')
+    if ($runtimeDirectory -like '*.exe') {
+        throw "-Output takes a folder, not an exe path (the exe is staged with its DLLs and base\): $Output"
+    }
+}
 $executable = Join-Path $runtimeDirectory 'DinurdoJK.exe'
 $previousExecutable = "$executable.prev"
 
@@ -212,33 +240,37 @@ try {
     }
     Ensure-PatchedSmaaVendor -WorkspaceRoot $PSScriptRoot
     $openalRuntime = Ensure-OpenALRuntime -WorkspaceRoot $PSScriptRoot
-    New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
-    Sync-RuntimeFile $openalRuntime
-    foreach ($name in @('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
-        Sync-RuntimeFile (Join-Path $PSScriptRoot "target\fast\$name")
+    # -Output copies only the exe: the DLLs, licenses and base\ are the caller's.
+    if (-not $Output) {
+        New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+        Sync-RuntimeFile $openalRuntime
+        foreach ($name in @('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            Sync-RuntimeFile (Join-Path $PSScriptRoot "target\fast\$name")
+        }
+        $runtimeLicenses = Join-Path $runtimeDirectory 'licenses'
+        New-Item -ItemType Directory -Force -Path $runtimeLicenses | Out-Null
+        # These licenses do not change between normal builds. Avoid rewriting them.
+        Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination (Join-Path $runtimeLicenses 'OpenAL-Soft-LGPL-2.0.txt')
+        Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt')
+        Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\bevy-solari-ris\LICENSE-MIT') -Destination (Join-Path $runtimeLicenses 'Bevy-Solari-MIT.txt')
     }
-    $runtimeLicenses = Join-Path $runtimeDirectory 'licenses'
-    New-Item -ItemType Directory -Force -Path $runtimeLicenses | Out-Null
-    # These licenses do not change between normal builds. Avoid rewriting them.
-    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'target\fast\licenses\OpenAL-Soft-LGPL-2.0.txt') -Destination (Join-Path $runtimeLicenses 'OpenAL-Soft-LGPL-2.0.txt')
-    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\ealman\LICENSE') -Destination (Join-Path $runtimeLicenses 'EalMan-LGPL-2.1.txt')
-    Sync-IfDifferent -Source (Join-Path $PSScriptRoot 'vendor\bevy-solari-ris\LICENSE-MIT') -Destination (Join-Path $runtimeLicenses 'Bevy-Solari-MIT.txt')
     # Refresh the dependency graph once when upgrading an older checkout.
     $lockfile = Join-Path $PSScriptRoot 'Cargo.lock'
     $lockText = if (Test-Path -LiteralPath $lockfile) { [System.IO.File]::ReadAllText($lockfile) } else { '' }
     $staleGraphicsLock = (-not $lockText) -or
         ($lockText -match '(?m)^name = "wgpu"\r?\nversion = "29\.') -or
         ($lockText -match '(?m)^name = "smaa"\r?\nversion = "0\.20\.0"')
-    if ($Fetch -or $staleGraphicsLock) {
+    # -Dlss needs dlss_wgpu/bindgen, which ordinary offline builds never download.
+    if ($Fetch -or $staleGraphicsLock -or $Dlss) {
         & $cargoPath fetch
         if ($LASTEXITCODE -ne 0) { throw 'Dependency download failed.' }
     }
     if ($Check) {
         & $cargoPath fmt --all -- --check
         if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed.' }
-        & $cargoPath test --workspace --offline --locked @profileArguments
+        & $cargoPath test --workspace --offline --locked @profileArguments @featureArguments
         if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
-        & $cargoPath clippy --workspace --all-targets --offline --locked @profileArguments -- -D warnings
+        & $cargoPath clippy --workspace --all-targets --offline --locked @profileArguments @featureArguments -- -D warnings
         if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
     }
     # Release/Debug link straight into the runtime folder, so make room first.
@@ -248,7 +280,7 @@ try {
     # Keep JSON artifact accounting, but let Cargo render rustc diagnostics to its
     # own stderr. The previous plain-JSON rendering lost the normal error/warning
     # colors when PowerShell reprinted it. stderr is not part of this pipeline.
-    $cargoArguments = @('build', '--package', 'DinurdoJK', '--offline', '--locked') + $profileArguments + @('--message-format=json,json-render-diagnostics')
+    $cargoArguments = @('build', '--package', 'DinurdoJK', '--offline', '--locked') + $profileArguments + $featureArguments + @('--message-format=json,json-render-diagnostics')
     $beforeCargoSeconds = $buildWallClock.Elapsed.TotalSeconds
     $cargoBuildTimer = [System.Diagnostics.Stopwatch]::StartNew()
     & $cargoPath @cargoArguments | ForEach-Object {
@@ -292,6 +324,22 @@ try {
         # An unchanged rebuild must not overwrite .prev with a copy of the same exe.
         $unchanged = (Test-Path -LiteralPath $executable) -and
             (Get-FileHash -LiteralPath $builtExecutable).Hash -eq (Get-FileHash -LiteralPath $executable).Hash
+        if ($Output) {
+            # Exe only. Overwrite in place; set the old one aside (.prev) only if
+            # a running game holds it open.
+            if (-not $unchanged) {
+                try {
+                    Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force -ErrorAction Stop
+                } catch {
+                    Preserve-RunningExecutable
+                    Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force
+                }
+            }
+            # The pdb only exists for profiles that emit one.
+            Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb')
+            Write-Host "`nBuilt ($buildMode): $executable"
+            return
+        }
         if (-not $unchanged) {
             Preserve-RunningExecutable
             Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force
@@ -299,7 +347,12 @@ try {
         Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb')
         Get-ChildItem -LiteralPath $buildDirectory -Filter '*.dll' | ForEach-Object { Sync-RuntimeFile $_.FullName }
     }
-    Set-Content -LiteralPath "$executable.mode" -Value "$buildMode $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
+    if ($Dlss) {
+        # NGX loads the DLAA runtime from the executable's folder.
+        Sync-IfDifferent -Source (Join-Path $env:DLSS_SDK 'lib\Windows_x86_64\rel\nvngx_dlss.dll') -Destination (Join-Path $runtimeDirectory 'nvngx_dlss.dll')
+    }
+    $modeLabel = if ($Dlss) { "$buildMode+dlss" } else { $buildMode }
+    Set-Content -LiteralPath "$executable.mode" -Value "$modeLabel $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
     $runtimeBase = Join-Path $runtimeDirectory 'base'
     New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
     $assetPackage = Join-Path $PSScriptRoot 'assets\dinurdo-assets.pk3'

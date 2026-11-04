@@ -681,6 +681,88 @@ impl Bsp {
         Ok((mesh, batch_models))
     }
 
+    /// Competitive flat world: only authored, actually drawable BSP faces.
+    ///
+    /// This is deliberately NOT the Steam Audio collision soup. Quake 3/JKA's
+    /// compiler already removed hidden structural brush faces when emitting
+    /// draw surfaces. Reconstructing all the brush planes brings those hidden
+    /// triangles back and is expensive even with a trivial fragment shader.
+    /// Physical brush contents are *not* a visibility test: ordinary JK maps
+    /// use non-solid BSP draw surfaces for architectural skins and floor trim.
+    /// The native world renderer displays those surfaces, so rejecting all
+    /// non-solids leaves large holes. Keep opaque compiled faces regardless of
+    /// collision contents; omit only classes that cannot safely be rendered as
+    /// fully opaque (sky/fog and explicitly translucent/glass surfaces).
+    ///
+    /// Built only on demand, using coarser curved-patch tessellation than the
+    /// ordinary renderer. No lightmap/material/UV attributes are uploaded.
+    pub fn world_competitive_mesh(&self) -> Result<CompetitiveMesh> {
+        use std::collections::HashMap;
+
+        // This is an OpenJK patch *error in map units*, not the fixed 2x2
+        // grid used by the separate acoustic mesher. Larger is cheaper.
+        let source = self.world_visual_mesh(12.0, true)?;
+        let mut result = CompetitiveMesh::default();
+        // Vertices from separate draw surfaces often duplicate positions with
+        // different lightmap UVs; a position-only renderer needn't retain them.
+        let mut vertex_map = HashMap::<[u32; 3], u32>::new();
+        let mut source_indices = HashMap::<u32, u32>::new();
+        let mut skipped_translucent = 0usize;
+        let mut kept_non_solid = 0usize;
+        for batch in &source.batches {
+            let Some(shader) = self.shaders.get(batch.shader) else { continue; };
+            if shader.surface_flags & (SURF_NODRAW | SURF_SKY) != 0
+                || shader.contents & CONTENTS_FOG != 0
+            {
+                continue;
+            }
+            // Physical collision contents are NOT a test for renderability:
+            // non-solid brush skins and floor/ceiling detail still belong in
+            // the compiled BSP image. Preserve every previously selected solid
+            // surface; only screen *new* non-solid geometry for transparency.
+            if shader.contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) == 0 {
+                // No blending/alpha test in this one-material renderer. Do not
+                // introduce transparent glass, liquid or FX as opaque occluders.
+                const CONTENTS_TRANSLUCENT: u32 = 0x8000_0000;
+                const CONTENTS_LIQUIDS: u32 = 0x0002_0006; // lava, water, slime
+                if shader.contents & (CONTENTS_TRANSLUCENT | CONTENTS_LIQUIDS) != 0
+                    || shader.surface_flags & MATERIAL_MASK == MATERIAL_GLASS
+                {
+                    skipped_translucent += 1;
+                    continue;
+                }
+                kept_non_solid += 1;
+            }
+            for triangle in source.indices[batch.indices.clone()].chunks_exact(3) {
+                let mut remapped = [0_u32; 3];
+                for (slot, &old) in triangle.iter().enumerate() {
+                    let new = if let Some(&new) = source_indices.get(&old) {
+                        new
+                    } else {
+                        let point = source.vertices[old as usize].position;
+                        let key = point.map(f32::to_bits);
+                        let new = *vertex_map.entry(key).or_insert_with(|| {
+                            let next = result.vertices.len() as u32;
+                            result.vertices.push(point);
+                            next
+                        });
+                        source_indices.insert(old, new);
+                        new
+                    };
+                    remapped[slot] = new;
+                }
+                if remapped[0] != remapped[1]
+                    && remapped[1] != remapped[2]
+                    && remapped[2] != remapped[0]
+                {
+                    result.triangles.push(remapped);
+                }
+            }
+        }
+        println!("[COLLISION WORLD] compiled visible BSP: {} triangles; {} non-solid visual surfaces preserved, {} translucent/glass/liquid surfaces omitted", result.triangles.len(), kept_non_solid, skipped_translucent);
+        Ok(result)
+    }
+
     /// Static world geometry for acoustic ray tracing.
     ///
     /// This is intentionally independent of [`Self::world_mesh`]. The render
@@ -709,6 +791,13 @@ impl Bsp {
             .max(1024.0)
             * 2.0;
 
+        // BSP solids may overlap or touch: the raw brush-plane soup contains
+        // faces *inside* those solids. Unlike the renderer we retain exposed
+        // nodraw/caulk walls for acoustic occlusion. Only faces provably fully
+        // contained by another world solid are removed (never centroid-only
+        // decisions, which can punch large holes in partial intersections).
+        let mut faces = Vec::<AcousticBrushFace>::new();
+        let mut bounds = vec![None; self.brushes.len()];
         for brush_index in world.brushes.clone() {
             let brush = &self.brushes[brush_index];
             let brush_shader = self
@@ -718,34 +807,138 @@ impl Bsp {
             if brush_shader.contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) == 0 {
                 continue;
             }
+            let mut brush_bounds = AcousticBrushBounds::empty();
             for side_index in brush.sides.clone() {
                 let side = self
                     .brush_sides
                     .get(side_index)
                     .ok_or_else(|| invalid("brush side index out of range"))?;
                 let polygon = brush_side_polygon(self, brush, side_index, extent)?;
-                if polygon.len() < 3 {
-                    continue;
-                }
-                mesh.reserve(polygon.len(), polygon.len().saturating_sub(2))?;
-                let base = u32::try_from(mesh.vertices.len())
-                    .map_err(|_| invalid("acoustic mesh vertex index overflow"))?;
-                mesh.vertices.extend_from_slice(&polygon);
+                if polygon.len() < 3 { continue; }
+                for &point in &polygon { brush_bounds.extend(point); }
                 let material = self
                     .shaders
                     .get(side.shader)
                     .ok_or_else(|| invalid("brush-side shader index out of range"))?
-                    .surface_flags
-                    & MATERIAL_MASK;
-                for index in 1..polygon.len() - 1 {
-                    mesh.triangles.push([
-                        base,
-                        base + index as u32,
-                        base + index as u32 + 1,
-                    ]);
-                    mesh.materials.push(material as u8);
+                    .surface_flags & MATERIAL_MASK;
+                faces.push(AcousticBrushFace {
+                    brush_index,
+                    normal: self.planes[side.plane].normal,
+                    polygon,
+                    material: material as u8,
+                });
+            }
+            if brush_bounds.is_valid() {
+                bounds[brush_index] = Some(brush_bounds);
+            }
+        }
+
+        // Spatial index only for the offline acoustic builder. Large brushes
+        // are handled separately to avoid allocating millions of empty cells
+        // on enormous community maps. Nothing is queried or uploaded per frame.
+        use std::collections::HashMap;
+        const CELL: f32 = 512.0;
+        let coord = |v: f32| (v / CELL).floor() as i32;
+        let mut occupied = HashMap::<(i32, i32, i32), Vec<usize>>::new();
+        let mut large = Vec::<usize>::new();
+        for brush_index in world.brushes.clone() {
+            let Some(bb) = bounds[brush_index] else { continue; };
+            let lo = bb.min.map(coord);
+            let hi = bb.max.map(coord);
+            let span = (0..3).try_fold(1_u64, |prod, axis| {
+                let width = i64::from(hi[axis]) - i64::from(lo[axis]) + 1;
+                prod.checked_mul(u64::try_from(width).ok()?)
+            });
+            if !span.is_some_and(|n| n <= 64) {
+                large.push(brush_index);
+                continue;
+            }
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        occupied.entry((x, y, z)).or_default().push(brush_index);
+                    }
                 }
             }
+        }
+        let mut hidden = 0_usize;
+        let mut duplicates = 0_usize;
+        let mut kept = Vec::<Option<AcousticBrushFace>>::new();
+        let mut identical = HashMap::<Vec<[i64; 3]>, usize>::new();
+        for face in faces {
+            let center = face.polygon.iter().fold([0.0_f32; 3], |mut sum, point| {
+                for axis in 0..3 { sum[axis] += point[axis]; }
+                sum
+            }).map(|v| v / face.polygon.len() as f32);
+            // Probe just beyond the face into the adjacent solid. All corners
+            // must be inside that *same* convex brush; a center-only test
+            // would incorrectly cull partially exposed acoustic surfaces.
+            let probe: [f32; 3] = std::array::from_fn(|axis| center[axis] + face.normal[axis] * 0.125);
+            let key = (coord(probe[0]), coord(probe[1]), coord(probe[2]));
+            let is_hidden = occupied.get(&key).into_iter().flatten()
+                .chain(large.iter())
+                .copied()
+                .any(|candidate| {
+                    if candidate == face.brush_index { return false; }
+                    let Some(bb) = bounds[candidate] else { return false; };
+                    if !(0..3).all(|axis| probe[axis] >= bb.min[axis] - 0.1
+                        && probe[axis] <= bb.max[axis] + 0.1) {
+                        return false;
+                    }
+                    let brush = &self.brushes[candidate];
+                    face.polygon.iter().all(|point| {
+                        let shifted = std::array::from_fn(|axis| {
+                            point[axis] + face.normal[axis] * 0.125
+                        });
+                        brush.sides.clone().all(|side_index| {
+                            let plane = self.planes[self.brush_sides[side_index].plane];
+                            dot3(plane.normal, shifted) <= plane.distance + 0.05
+                        })
+                    })
+                });
+            if is_hidden {
+                hidden += 1;
+                continue;
+            }
+            // Exact coincident (often duplicated) brush faces can still exist
+            // on a BSP boundary. Collapse them by quantized polygon position;
+            // opposite-facing identical pairs are fully interior and cancel.
+            let mut polygon_key: Vec<[i64; 3]> = face.polygon.iter().map(|p| {
+                p.map(|v| (f64::from(v) * 1024.0).round() as i64)
+            }).collect();
+            polygon_key.sort_unstable();
+            polygon_key.dedup();
+            if let Some(&previous_index) = identical.get(&polygon_key) {
+                if let Some(previous) = &kept[previous_index] {
+                    let dot = dot3(previous.normal, face.normal);
+                    if dot < -0.99 {
+                        kept[previous_index] = None;
+                        identical.remove(&polygon_key);
+                        duplicates += 2;
+                        continue;
+                    }
+                    if dot > 0.99 && previous.material == face.material {
+                        duplicates += 1;
+                        continue;
+                    }
+                }
+            }
+            identical.insert(polygon_key, kept.len());
+            kept.push(Some(face));
+        }
+        for face in kept.into_iter().flatten() {
+            let polygon = face.polygon;
+            mesh.reserve(polygon.len(), polygon.len().saturating_sub(2))?;
+            let base = u32::try_from(mesh.vertices.len())
+                .map_err(|_| invalid("acoustic mesh vertex index overflow"))?;
+            mesh.vertices.extend_from_slice(&polygon);
+            for index in 1..polygon.len() - 1 {
+                mesh.triangles.push([base, base + index as u32, base + index as u32 + 1]);
+                mesh.materials.push(face.material);
+            }
+        }
+        if hidden > 0 || duplicates > 0 {
+            println!("[STEAM AUDIO MESH] removed {hidden} buried brush faces, {duplicates} coincident faces");
         }
 
         // Patches and triangle soups are not necessarily backed by convex BSP
@@ -1206,6 +1399,44 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     pub batches: Vec<DrawBatch>,
     pub patches: Vec<patch::MeshPatch>,
+}
+
+/// A polygon reconstructed from one convex world brush side, before acoustic
+/// internal-face elimination. This never changes gameplay collision or BSP PVS.
+struct AcousticBrushFace {
+    brush_index: usize,
+    normal: [f32; 3],
+    polygon: Vec<[f32; 3]>,
+    material: u8,
+}
+
+#[derive(Clone, Copy)]
+struct AcousticBrushBounds {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+impl AcousticBrushBounds {
+    fn empty() -> Self {
+        Self { min: [f32::INFINITY; 3], max: [f32::NEG_INFINITY; 3] }
+    }
+    fn extend(&mut self, point: [f32; 3]) {
+        for axis in 0..3 {
+            self.min[axis] = self.min[axis].min(point[axis]);
+            self.max[axis] = self.max[axis].max(point[axis]);
+        }
+    }
+    fn is_valid(self) -> bool {
+        (0..3).all(|axis| self.min[axis] <= self.max[axis])
+    }
+}
+
+/// One-material, position-only compiled visible world for the competitive
+/// renderer. Does not contain invisible acoustic/physics brush faces.
+#[derive(Debug, Default)]
+pub struct CompetitiveMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub triangles: Vec<[u32; 3]>,
 }
 
 /// Static acoustic triangle soup in native JKA coordinates. `materials` is
@@ -1866,6 +2097,83 @@ mod acoustic_tests {
         let volumes = bsp.debug_volumes().expect("trigger cube");
         assert_eq!(volumes.triggers.triangle_indices.len(), 12 * 3);
         assert_eq!(volumes.triggers.colors[0], [64, 255, 96, 255]);
+    }
+
+    #[test]
+    fn acoustic_mesh_removes_shared_face_between_touching_solids() {
+        let mut bsp = cube_bsp(SURF_NODRAW | 7, CONTENTS_SOLID);
+        // Second identical cube adjacent along X. Their coincident X=1
+        // surface is internal to the union: neither side can affect sound.
+        let new_plane_start = bsp.planes.len();
+        let planes = bsp.planes.clone();
+        bsp.planes.extend(planes.into_iter().map(|mut plane| {
+            plane.distance += 2.0 * plane.normal[0];
+            plane
+        }));
+        let new_side_start = bsp.brush_sides.len();
+        for offset in 0..6 {
+            bsp.brush_sides.push(BrushSide {
+                plane: new_plane_start + offset,
+                shader: 0,
+            });
+        }
+        bsp.brushes.push(Brush { sides: new_side_start..new_side_start + 6, shader: 0 });
+        bsp.models[0].brushes = 0..2;
+        bsp.models[0].maxs[0] = 3.0;
+
+        let mesh = bsp.world_acoustic_mesh(4).expect("touching acoustic cubes");
+        // Two cubes have 24 triangles before removing the two interior quads.
+        assert_eq!(mesh.triangles.len(), 20);
+        assert_eq!(mesh.materials, vec![7; 20]);
+    }
+
+    #[test]
+    fn competitive_mesh_uses_draw_surfaces_not_invisible_brush_planes() {
+        let mut bsp = cube_bsp(SURF_NODRAW | 7, CONTENTS_SOLID);
+        // The brush is solid but all of its faces are invisible caulk. Its
+        // acoustic scene must keep walls; the visual renderer must not draw it.
+        assert!(bsp.world_competitive_mesh().unwrap().triangles.is_empty());
+        assert_eq!(bsp.world_acoustic_mesh(4).unwrap().triangles.len(), 12);
+
+        let v = Vertex {
+            position: [0.0, 0.0, 0.0],
+            texcoord: [0.0; 2],
+            lightmap_uv: [[0.0; 2]; 4],
+            normal: [0.0, 0.0, 1.0],
+            color: [[255; 4]; 4],
+        };
+        bsp.vertices = vec![v, Vertex { position: [4.0, 0.0, 0.0], ..v },
+            Vertex { position: [0.0, 4.0, 0.0], ..v }];
+        bsp.indices = vec![0, 1, 2];
+        bsp.surfaces = vec![Surface {
+            shader: 1, fog_num: -1, kind: SurfaceKind::Planar, flare: None,
+            vertices: 0..3, indices: 0..3,
+            lightmaps: [-1; 4], lightmap_styles: [255; 4],
+            vertex_styles: [255; 4], patch_size: [0; 2],
+            patch_lod_bounds: [[0.0; 3]; 2],
+        }];
+        bsp.models[0].surfaces = 0..1;
+        bsp.shaders.push(Shader {
+            name: b"textures/test/solid".to_vec(),
+            surface_flags: 0, contents: CONTENTS_SOLID,
+        });
+        let mesh = bsp.world_competitive_mesh().unwrap();
+        assert_eq!(mesh.triangles.len(), 1);
+        assert_eq!(mesh.vertices.len(), 3);
+        bsp.shaders[1].surface_flags = SURF_SKY;
+        assert!(bsp.world_competitive_mesh().unwrap().triangles.is_empty());
+        bsp.shaders[1].surface_flags = 0;
+        bsp.shaders[1].contents = 0; // a non-solid visible BSP floor must remain
+        assert_eq!(bsp.world_competitive_mesh().unwrap().triangles.len(), 1);
+        bsp.shaders[1].contents = 0x8000_0000; // explicit translucent surface
+        assert!(bsp.world_competitive_mesh().unwrap().triangles.is_empty());
+        bsp.shaders[1].contents = 0;
+        bsp.shaders[1].surface_flags = MATERIAL_GLASS;
+        assert!(bsp.world_competitive_mesh().unwrap().triangles.is_empty());
+        // Previously selected structural glass remains selected; classify it
+        // properly when the flat path gains an optional transparent pass.
+        bsp.shaders[1].contents = CONTENTS_SOLID;
+        assert_eq!(bsp.world_competitive_mesh().unwrap().triangles.len(), 1);
     }
 
     #[test]

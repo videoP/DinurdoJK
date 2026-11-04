@@ -29,7 +29,7 @@ impl crate::renderer::Renderer {
         }
         let settings = self.blue_water_environment.sanitize();
         let config = AtmosphereConfig {
-            target: (self.config.width, self.config.height, self.msaa_samples, self.scene_format()),
+            target: (self.targets.render_size.0, self.targets.render_size.1, self.msaa_samples, self.scene_format()),
             quality: settings.quality,
             cloud_quality: settings.cloud_quality,
             clouds: self.cloud_backend == 1 && self.clouds_enabled,
@@ -691,6 +691,8 @@ impl AtmosphereRenderer {
         // the copy the cloud march reads, after lighting so portal terrain is not
         // lit as if it were world geometry.
         portal: Option<(&wgpu::TextureView, f32)>,
+        moon_light: Option<([f32; 3], f32)>,
+        moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
     ) {
         self.scene.copy.capture(device, encoder, color, depth);
         if let Some(camera) = &self.frame_camera {
@@ -712,6 +714,8 @@ impl AtmosphereRenderer {
                     self.settings.world_lighting,
                     shadows && self.clouds_active,
                     flash,
+                    moon_light,
+                    moon_csm,
                 );
             }
         }
@@ -1069,6 +1073,7 @@ mod native_tests {
                         &depth,
                         true,
                         None,
+                        None,
                     );
                     atmosphere.apply_opaque_air(
                         &device,
@@ -1108,7 +1113,7 @@ mod native_tests {
                         assert_eq!(atmosphere.clouds.layers().0[0].altitude, 0.0);
                         assert_eq!(Some(atmosphere.last_time), atmosphere.frozen_time);
                         atmosphere.render_image(&device, &mut encoder, None);
-                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None);
+                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None, None);
                         queue.submit(Some(encoder.finish()));
                         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                     }

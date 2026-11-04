@@ -795,6 +795,126 @@ impl DofMode {
     }
 }
 
+/// NVIDIA DLSS quality mode. Everything but DLAA renders the world at a
+/// lower internal resolution and lets DLSS upscale it to the window size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DlssMode {
+    UltraPerformance,
+    Performance,
+    Balanced,
+    Quality,
+    #[default]
+    Dlaa,
+}
+
+impl DlssMode {
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::UltraPerformance => "ultraperformance",
+            Self::Performance => "performance",
+            Self::Balanced => "balanced",
+            Self::Quality => "quality",
+            Self::Dlaa => "dlaa",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
+            "0" | "ultraperformance" => Some(Self::UltraPerformance),
+            "1" | "performance" => Some(Self::Performance),
+            "2" | "balanced" => Some(Self::Balanced),
+            "3" | "quality" => Some(Self::Quality),
+            "4" | "dlaa" | "native" => Some(Self::Dlaa),
+            _ => None,
+        }
+    }
+
+    /// Internal render size per axis, NVIDIA's standard ratios
+    /// (33%, 50%, 58%, 67%, 100%).
+    pub fn render_scale(self) -> f32 {
+        match self {
+            Self::UltraPerformance => 1.0 / 3.0,
+            Self::Performance => 0.5,
+            Self::Balanced => 0.58,
+            Self::Quality => 2.0 / 3.0,
+            Self::Dlaa => 1.0,
+        }
+    }
+}
+
+/// NVIDIA DLSS model family. Each resolves to an NGX render preset per mode
+/// (`DlssModel::preset`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DlssModel {
+    /// DLSS 2/3 CNN.
+    Cnn,
+    /// DLSS 4 transformer.
+    #[default]
+    Transformer,
+    /// DLSS 4.5 second-generation transformer.
+    Transformer2,
+}
+
+impl DlssModel {
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Cnn => "cnn",
+            Self::Transformer => "transformer",
+            Self::Transformer2 => "transformer2",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
+            "0" | "cnn" | "cns" | "2" | "2.0" => Some(Self::Cnn),
+            "1" | "transformer" | "4" | "4.0" => Some(Self::Transformer),
+            "transformer2" | "4.5" => Some(Self::Transformer2),
+            _ => None,
+        }
+    }
+
+    /// NGX render preset letter for this model in `mode`.
+    /// CNN follows NVIDIA's last CNN defaults (F for DLAA/Ultra Performance,
+    /// E otherwise); the transformer mappings are the project's choice.
+    pub fn preset(self, mode: DlssMode) -> char {
+        match (self, mode) {
+            (Self::Cnn, DlssMode::Dlaa | DlssMode::UltraPerformance) => 'F',
+            (Self::Cnn, _) => 'E',
+            (Self::Transformer, DlssMode::Performance | DlssMode::UltraPerformance) => 'J',
+            (Self::Transformer, _) => 'K',
+            (Self::Transformer2, DlssMode::Dlaa | DlssMode::UltraPerformance) => 'L',
+            (Self::Transformer2, _) => 'M',
+        }
+    }
+}
+
+#[cfg(test)]
+mod dlss_setting_tests {
+    use super::{DlssMode, DlssModel};
+
+    #[test]
+    fn preset_table_matches_menu_spec() {
+        use DlssMode::*;
+        let row = |model: DlssModel| {
+            [UltraPerformance, Performance, Balanced, Quality, Dlaa].map(|mode| model.preset(mode))
+        };
+        assert_eq!(row(DlssModel::Cnn), ['F', 'E', 'E', 'E', 'F']);
+        assert_eq!(row(DlssModel::Transformer), ['J', 'J', 'K', 'K', 'K']);
+        assert_eq!(row(DlssModel::Transformer2), ['L', 'M', 'M', 'M', 'L']);
+    }
+
+    #[test]
+    fn cvar_values_round_trip() {
+        for mode in [DlssMode::UltraPerformance, DlssMode::Performance, DlssMode::Balanced, DlssMode::Quality, DlssMode::Dlaa] {
+            assert_eq!(DlssMode::from_config(mode.config_value()), Some(mode));
+        }
+        for model in [DlssModel::Cnn, DlssModel::Transformer, DlssModel::Transformer2] {
+            assert_eq!(DlssModel::from_config(model.config_value()), Some(model));
+        }
+        assert_eq!(DlssMode::from_config("Ultra Performance"), Some(DlssMode::UltraPerformance));
+    }
+}
+
 #[cfg(test)]
 mod dof_mode_tests {
     use super::DofMode;

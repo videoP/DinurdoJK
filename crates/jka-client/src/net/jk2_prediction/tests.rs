@@ -371,11 +371,11 @@ thread_local! {
 /// ffa_bespin collision, comparing each provisional (display) preview with the
 /// next committed command. Reports only; the server path is the same SDK.
 #[test]
-#[ignore = "requires fs_jk2path with JK2 1.04 assets"]
+#[ignore = "requires fs_jk2cdpath with JK2 1.04 assets"]
 fn wall_jump_preview_probe() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/base");
     let mut roots = crate::filesystem_paths::load(&base);
-    assert!(roots.jk2path.is_some(), "configure fs_jk2path first");
+    assert!(jka_assets::pk3::missing_jk2_stock_archive(&base, &roots, 4).is_none(), "configure fs_jk2basepath or fs_jk2cdpath first");
     roots.active_jk2 = Some(4);
     jka_assets::pk3::configure_filesystem_roots(&base, roots);
     let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&base, None).unwrap();
@@ -484,7 +484,7 @@ fn loopback(version: Version, play: bool) {
     use std::time::{Duration, Instant};
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/base");
     let mut roots = crate::filesystem_paths::load(&base);
-    assert!(roots.jk2path.is_some(), "configure fs_jk2path first");
+    assert!(jka_assets::pk3::missing_jk2_stock_archive(&base, &roots, 4).is_none(), "configure fs_jk2basepath or fs_jk2cdpath first");
     roots.active_jk2 = Some(match version {
         Version::V102 => 2,
         Version::V104 => 4,

@@ -4,7 +4,7 @@ use crate::ui::{
     build_console, build_console_notify, build_crosshair_name, build_crosshair_vertices,
     build_demo_timeline,
     build_follow_indicator, build_force_select, build_weapon_select, build_inventory_select, build_fps_simple, build_game_timer, build_hud,
-    build_enemy_info, build_hud_score, build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
+    build_enemy_info, build_hud_score, build_lagometer, build_loading_modal, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
     build_siege_hud,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
     build_speedometer, build_splash_background, build_strafe_helper, build_team_overlay,
@@ -31,7 +31,7 @@ pub fn build_vertices(
         return out;
     }
     if let Some(loading) = &ui.loading {
-        build_loading_screen(&mut out, loading, width, height, splash_size);
+        build_loading_screen(&mut out, ui, loading, small_font, width, height, splash_size);
         if let Some(progress) = &ui.shader_compile_progress {
             build_shader_compile_progress(&mut out, progress, ui.shader_compile_stage.as_deref(), width, height);
         }
@@ -41,6 +41,9 @@ pub fn build_vertices(
         if ui.mode == OverlayMode::Console && !ui.console_hl2 {
             build_console(&mut out, ui, width, height);
         }
+        // A blocking connection decision must be above the classic console,
+        // not hidden underneath it as it would be in the regular loading pass.
+        build_loading_modal(&mut out, ui, loading, small_font, width, height);
         return out;
     }
     if ui.video.draw_2d && matches!(
@@ -127,7 +130,7 @@ pub fn build_dynamic_static_vertices(
     if ui.video.draw_hud {
         build_hud(out, ui, width, height);
         build_extension_hud(out, &ui.extension_hud, &ui.extension_images,
-            &ui.extension_shader_flags, width, height);
+            &ui.extension_shader_flags, &ui.extension_image_dimensions, width, height);
     }
 }
 
@@ -185,9 +188,17 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::CrosshairName, width, height, |out| {
             build_crosshair_name(out, ui, small_font, width, height);
         });
-        build_force_select(out, ui, small_font, width, height);
-        build_weapon_select(out, ui, small_font, width, height);
-        build_inventory_select(out, ui, small_font, width, height);
+        if ui.jk2_mode && ui.video.hud_style == 1 {
+            // JK2 native selectors use their own background, prongs and source icons.
+            crate::ui::hud::jk2_retail::build_select_chrome(out, ui, width, height);
+            build_force_select(out, ui, small_font, width, height);
+            crate::ui::hud::jk2_retail::build_weapon_select(out, ui, small_font, width, height);
+            crate::ui::hud::jk2_retail::build_inventory_select(out, ui, small_font, width, height);
+        } else {
+            build_force_select(out, ui, small_font, width, height);
+            build_weapon_select(out, ui, small_font, width, height);
+            build_inventory_select(out, ui, small_font, width, height);
+        }
     }
     if gameplay_overlay {
         // Follows the snapshot's client every frame (CG_DrawFollow), so it lives

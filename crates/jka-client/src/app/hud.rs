@@ -2,7 +2,7 @@
 use crate::app::{
     playerstate_vec3, scene, ui, App, Arc, ConsolePathLinkUi, ConsolePoint, ConsoleSearchMatch,
     ConsoleSelection, DemoViewMode, Duration, HashMap, HudState, Instant, JoinMode, MapLoadingBar,
-    MapLoadingState, OverlayMode, PredictionDebugUi, SurfaceInspectorInfo, UiScoreboard,
+    OverlayMode, PredictionDebugUi, SurfaceInspectorInfo, UiScoreboard,
     UiSnapshot, ET_PLAYER,
 };
 
@@ -12,11 +12,12 @@ impl App {
     pub(in crate::app) fn align_hud_defaults_for_editor(&mut self) {
         let Some(window) = self.window.as_ref() else { return; };
         let size = window.inner_size();
-        let context = ui::HudRectContext::new(
+        let mut context = ui::HudRectContext::new(
             self.movement_keys_hud, &self.video, &self.perf, self.threads.len(),
             &self.japro_cg, self.strafe_helper, self.video.draw_timer,
             [self.draw_score_x, self.draw_score_y], self.draw_scores,
         );
+        context.jk2_mode = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
         if self.hud_layout.align_default_elements_to_grid(&context, size.width, size.height) {
             self.mark_config_dirty();
             self.publish_ui();
@@ -33,7 +34,8 @@ impl App {
             return choice != 0 && !(id == StrafeGuide && choice == ui::SHELPER_CINEMATIC);
         }
         match id {
-            Health | Shield | Ammo | Force => self.video.draw_hud,
+            Health | Ammo => self.video.draw_hud,
+            Shield | Force => self.video.draw_hud && self.video.hud_style == 0,
             Score => self.video.draw_hud && self.draw_score != 0,
             MiniScores => self.draw_scores != 0,
             EnemyInfo => self.draw_enemy_info,
@@ -208,6 +210,7 @@ impl App {
         let (zoom_scope, rocket_lock) = self.combat_overlay_state();
 
         let mut snapshot = UiSnapshot {
+            jk2_mode: self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2(),
             studio_race: None,
             frontend_main_scene: self.front_end && matches!(self.frontend_page,
                 crate::app::FrontendPage::Main | crate::app::FrontendPage::Play
@@ -273,9 +276,12 @@ impl App {
             native_hidden: self.extensions.native_hidden,
             extension_images: {
                 let mut images = self.extensions.hud_images.clone();
+                ui::append_native_hud_images(&mut images, self.video.hud_style,
+                    self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images
             },
+            extension_image_dimensions: Vec::new(), // renderer-owned, preserved in set_ui()
             crosshair: if in_studio || (self.model_placement.active && self.overlay == OverlayMode::None) {
                 crate::ui::CrosshairSettings { style: 0, ..self.crosshair }
             } else { self.crosshair },
@@ -309,7 +315,7 @@ impl App {
             startup_splash_art: !self.front_end,
             // Studio draws its own progress modal; the native fullscreen
             // loading HUD must never replace the editing canvas.
-            loading: self.loading.as_ref().map(MapLoadingState::ui),
+            loading: self.unified_loading_ui(),
             shader_compile_progress: None, // Render thread owns worker progress.
             shader_compile_stage: None,
             static_ao_progress: self
@@ -319,6 +325,7 @@ impl App {
                     completed,
                     total,
                     skipped: false,
+                    no_work: false,
                 }),
         };
         if self.streamer_preview_local {
@@ -655,12 +662,7 @@ impl App {
     }
 
     pub(in crate::app) fn active_fs_game_name(&self) -> String {
-        self.game
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "base".to_owned())
+        jka_assets::pk3::fs_game_name(self.game.as_deref())
     }
 
     /// Start a lazy live-server chat-log session. No file is created until the
@@ -1176,10 +1178,19 @@ impl App {
         ps: &jka_protocol::server::PlayerState,
     ) -> HudState {
         let weapon = ps.field_i32("weapon").unwrap_or(0);
-        let ammo = jka_movement::weapon_info(weapon)
-            .filter(|(ammo_index, _, _)| *ammo_index > 0)
-            .and_then(|(ammo_index, _, _)| ps.ammo.get(ammo_index as usize).copied());
+        let ammo_index = if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+            ui::jk2_ammo_index(weapon)
+        } else {
+            jka_movement::weapon_info(weapon)
+                .map_or(0, |(index, _, _)| index.max(0) as usize)
+        };
+        let ammo = (ammo_index > 0)
+            .then(|| ps.ammo.get(ammo_index).copied())
+            .flatten();
         HudState {
+            team: ps.persistant[3],
+            spectating: matches!(ps.field_i32("pm_type"), Some(4 | 7 | 8)),
+            ammo_index,
             health: ps.stats[0],
             max_health: ps.stats[8].max(1),
             armor: ps.stats[5],
@@ -1242,6 +1253,7 @@ impl App {
             None
         };
         Some(HudState {
+            team: recorder_team,
             health,
             max_health: health.max(100).max(1),
             armor,
@@ -1269,7 +1281,9 @@ impl App {
         let binoculars_allowed = !(zoom_mode == 2
             && session.client_game.is_japro()
             && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0);
-        let zoom_scope = (zoom_mode == 1 || (zoom_mode == 2 && binoculars_allowed)).then(|| ui::UiZoomScope {
+        // Preserve zoomMode 2 even when jaPRO race mode hides binocular art:
+        // CG_DrawCrosshair still suppresses its crosshair for zoomMode != 0.
+        let zoom_scope = (zoom_mode == 1 || zoom_mode == 2).then(|| ui::UiZoomScope {
             mode: zoom_mode,
             // TaystJK's rotating insert uses cg_view.c's local zoomFov,
             // NOT the networked Pmove progress field named zoomFov.
@@ -1281,6 +1295,7 @@ impl App {
             double_ammo: ps.field_i32("eFlags").unwrap_or(0) & (1<<20) != 0,
             charge_started: (ps.field_i32("weaponstate").unwrap_or(0) == 5)
                 .then(|| ps.field_i32("weaponChargeTime").unwrap_or(time)),
+            binocular_art_hidden: !binoculars_allowed,
         });
         // Render the wheel only when the real server/predicted playerState
         // reports a valid target and an active lock timer.
@@ -1333,6 +1348,8 @@ impl App {
             (player.mode == JoinMode::Player).then(|| {
                 let view = player.view();
                 HudState {
+                    ammo_index: jka_movement::weapon_info(view.weapon)
+                        .map_or(0, |(index, _, _)| index.max(0) as usize),
                     health: view.health,
                     max_health: view.max_health.max(1),
                     armor: view.armor,
@@ -1619,7 +1636,6 @@ impl App {
         const MAX_CLIENTS: usize = 32;
         const TEAM_SPECTATOR: i32 = 3;
         const EF_DEAD: i32 = 1 << 1;
-        const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4;
         const MAX_LABEL_DISTANCE_SQ: f32 = 3000.0 * 3000.0;
 
         let overlay_allows_labels = matches!(
@@ -1631,7 +1647,29 @@ impl App {
             && self.game_session.is_some()
             && !self.player_names_restricted()
             && self.game_session.as_ref().map_or(true, |session| {
-                session.client_game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES == 0
+                !session.client_game.japro_weapon_features().tribes_weapons
+            });
+        // Independently enabled: labels can be off while projectile lead is on.
+        // The server restricts mask is read live; never mutate the archived cvar.
+        let lead_active = self.japro_cg.lead_indicator >= 1.0
+            && overlay_allows_labels
+            && !self.server_restrictions().contains(super::restrictions::LEAD_INDICATOR)
+            && self.fs_roots.active_jk2.is_none()
+            && self.game_session.as_ref().is_some_and(|session| {
+                let Some(snap) = session.client_game.current_snapshot() else { return false; };
+                let ps = session.presented_player_state().unwrap_or(&snap.player_state);
+                if ps.stats[0] <= 0 || ps.persistant[3] == 3
+                    || ps.field_i32("pm_type").unwrap_or(0) == 4
+                { return false; }
+                // Avoid trace scans on saber, hitscan and other weapons that
+                // have no TaystJK projectile lead profile.
+                let weapon = ps.field_i32("weapon").unwrap_or(0);
+                let alt = self.current_movement_hud_state().buttons & jka_movement::BUTTON_ALT_ATTACK != 0;
+                let tribes = session.client_game.japro_cinfo2() & (1 << 4) != 0;
+                let serverinfo = session.client_game.configstring(crate::cgame::CS_SERVERINFO).unwrap_or_default();
+                let jcinfo = jka_protocol::commands::info_value(serverinfo, b"jcinfo")
+                    .map_or(0, jka_protocol::commands::atoi);
+                super::lead_indicator::bullet_profile(weapon, alt, tribes, jcinfo).0 > 0.0
             });
         let ghost_active = overlay_allows_labels
             && (self.race_ghost_name
@@ -1641,8 +1679,9 @@ impl App {
                 .game_session
                 .as_ref()
                 .is_some_and(|session| !session.race_ghosts.is_empty());
-        if !normal_active && !ghost_active {
+        if !normal_active && !ghost_active && !lead_active {
             self.player_name_visible = [false; MAX_CLIENTS];
+            self.lead_indicator_visible = [false; MAX_CLIENTS];
             self.race_ghost_label_visible = [false; 128];
             return;
         }
@@ -1672,7 +1711,7 @@ impl App {
             .find(|entity| i32::from(entity.number) == viewer)
             .map(|entity| &entity.state);
         let solids = crate::net::solid_entities(&session.presented_entities, snapshot.server_time);
-        let candidates = if normal_active {
+        let candidates = if normal_active || lead_active {
             session
                 .presented_entities
                 .iter()
@@ -1703,7 +1742,9 @@ impl App {
                         entity.origin[2] - start[2],
                     ];
                     let distance2 = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-                    (distance2 < MAX_LABEL_DISTANCE_SQ).then_some((client, entity.origin))
+                    let wants_label = normal_active && distance2 < MAX_LABEL_DISTANCE_SQ;
+                    let wants_lead = lead_active;
+                    (wants_label || wants_lead).then_some((client, entity.origin, wants_label, wants_lead))
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -1733,9 +1774,11 @@ impl App {
         };
 
         let mut visible = [false; MAX_CLIENTS];
+        let mut lead_visible = [false; MAX_CLIENTS];
         let mut ghost_visible = [false; 128];
         let Some(world) = self.map_collision.as_mut() else {
             self.player_name_visible = visible;
+            self.lead_indicator_visible = lead_visible;
             self.race_ghost_label_visible = ghost_visible;
             return;
         };
@@ -1744,7 +1787,7 @@ impl App {
             solids: &solids,
             client_num: own,
         };
-        for (client, end) in candidates {
+        for (client, end, wants_label, wants_lead) in candidates {
             let trace = prediction_world.trace(jka_movement::TraceQuery {
                 start,
                 mins: [0.0; 3],
@@ -1755,7 +1798,14 @@ impl App {
             });
             // TaystJK rejects only a world hit here; another body between the
             // viewer and target does not suppress the target's label.
-            visible[client] = trace.entity != ENTITYNUM_WORLD;
+            if wants_label {
+                visible[client] = trace.entity != ENTITYNUM_WORLD;
+            }
+            // TaystJK CG_LeadIndicator: only a line trace that hits a player
+            // may reveal the marker (not a wall, mover, or empty trace).
+            if wants_lead {
+                lead_visible[client] = (0..MAX_CLIENTS as i32).contains(&trace.entity);
+            }
         }
         for (slot, end) in ghost_candidates {
             let trace = prediction_world.trace(jka_movement::TraceQuery {
@@ -1769,6 +1819,7 @@ impl App {
             ghost_visible[slot] = trace.entity != ENTITYNUM_WORLD;
         }
         self.player_name_visible = visible;
+        self.lead_indicator_visible = lead_visible;
         self.race_ghost_label_visible = ghost_visible;
     }
 
@@ -1787,16 +1838,19 @@ impl App {
         let session = self.game_session.as_ref()?;
         let normal_active = self.player_names.mode != 0
             && !self.player_names_restricted()
-            && session.client_game.japro_cinfo2() & (1 << 4) == 0;
+            && !session.client_game.japro_weapon_features().tribes_weapons;
         let ghost_active = self.race_ghost_name
             || self.race_ghost_velocity_delta
             || self.race_ghost_distance_delta;
-        if !normal_active && !ghost_active {
+        let lead_active = self.japro_cg.lead_indicator >= 1.0
+            && !self.server_restrictions().contains(super::restrictions::LEAD_INDICATOR)
+            && self.fs_roots.active_jk2.is_none();
+        if !normal_active && !ghost_active && !lead_active {
             return None;
         }
 
         let mut labels = Vec::new();
-        let leaders = self.score_leaders();
+        let leaders = if normal_active { self.score_leaders() } else { Vec::new() };
         if normal_active {
             let snapshot = session.client_game.current_snapshot()?;
             let viewer_team = snapshot.player_state.persistant[3];
@@ -1907,9 +1961,58 @@ impl App {
             }
         }
 
-        (!labels.is_empty()).then(|| ui::UiWorldPlayerNames {
+        // This runs on the existing render-snapshot path; nothing is traced,
+        // allocated, or projected when the feature is off or restricted.
+        let mut leads = Vec::new();
+        if lead_active {
+            let snapshot = session.client_game.current_snapshot()?;
+            let ps = session.presented_player_state().unwrap_or(&snapshot.player_state);
+            if ps.stats[0] > 0 && ps.persistant[3] != TEAM_SPECTATOR
+                && ps.field_i32("pm_type").unwrap_or(0) != 4
+                && ps.field_i32("eFlags").unwrap_or(0) & EF_DEAD == 0
+            {
+                let weapon = ps.field_i32("weapon").unwrap_or(0);
+                let alt_fire = self.current_movement_hud_state().buttons & jka_movement::BUTTON_ALT_ATTACK != 0;
+                let tribes = session.client_game.japro_cinfo2() & (1 << 4) != 0;
+                let serverinfo = session.client_game.configstring(crate::cgame::CS_SERVERINFO).unwrap_or_default();
+                let jcinfo = jka_protocol::commands::info_value(serverinfo, b"jcinfo")
+                    .map_or(0, jka_protocol::commands::atoi);
+                let (speed, gravity) = super::lead_indicator::bullet_profile(weapon, alt_fire, tribes, jcinfo);
+                if speed > 0.0 {
+                    let shooter = playerstate_vec3(ps, "origin").unwrap_or_default();
+                    let viewer = ps.field_i32("clientNum").unwrap_or(-1);
+                    let own = self.net.as_ref().map_or(viewer, |net| net.session().client_num());
+                    let ping_ms = if self.japro_cg.lead_indicator < 2.0 {
+                        snapshot.ping.max(0) as f32
+                    } else {
+                        self.japro_cg.lead_indicator
+                    };
+                    for entity in &session.presented_entities {
+                        let client = usize::from(entity.number);
+                        if client >= 32 || !self.lead_indicator_visible[client]
+                            || entity.entity_type != ET_PLAYER || client as i32 == viewer
+                            || client as i32 == own
+                            || entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
+                        { continue; }
+                        let velocity = [0, 1, 2].map(|axis| entity.state
+                            .field_f32(match axis { 0 => "pos.trDelta[0]", 1 => "pos.trDelta[1]", _ => "pos.trDelta[2]" })
+                            .unwrap_or(0.0));
+                        if let Some(lead) = super::lead_indicator::predict_taystjk(
+                            shooter, entity.origin, velocity, speed, gravity, ping_ms,
+                        ) {
+                            leads.push(ui::UiLeadIndicator {
+                                current: scene::render_position(entity.origin),
+                                predicted: scene::render_position(lead),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        (!labels.is_empty() || !leads.is_empty()).then(|| ui::UiWorldPlayerNames {
             scale: self.player_names.scale,
             labels: Arc::new(labels),
+            leads: Arc::new(leads),
         })
     }
 }

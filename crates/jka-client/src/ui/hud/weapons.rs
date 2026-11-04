@@ -63,6 +63,7 @@ pub(in crate::ui) fn build_weapon_select(
     // spectator/follow, and emplaced-gun gates. The selection UI is independent
     // of cg_drawHud, just as the already-ported force selector is.
     let Some(selector) = ui.weapon_select else { return; };
+    if ui.jk2_mode && ui.video.hud_style == 1 && selector.remaining_ms <= 130 { return; }
     if !(1..=16).contains(&selector.selected) { return; }
     let weapons = visible_weapons(selector);
     let Some(center) = weapons.iter().position(|&weapon| weapon == selector.selected) else {
@@ -137,7 +138,7 @@ mod tests {
     fn selector(owned: &[u8], selected: u8) -> UiWeaponSelect {
         let bits = owned.iter().fold(0_u32, |bits, weapon| bits | (1_u32 << *weapon));
         UiWeaponSelect { selected, owned_bits: bits, selectable_bits: bits,
-            ammo_available_bits: bits, saber_style: 1 }
+            ammo_available_bits: bits, saber_style: 1, remaining_ms: 1400 }
     }
     #[test]
     fn concussion_is_between_flechette_and_rocket() {

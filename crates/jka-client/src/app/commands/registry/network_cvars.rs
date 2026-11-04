@@ -510,6 +510,49 @@ settings_cvars! { NetworkSettings;
         ]
     }
 
+    APP_CG_PREDICTKNOCKBACK {
+        runtime: CvarDef::new(
+            "cg_predictKnockback", "0", "0..5",
+            "TaystJK jaPRO race rocket-jump knockback. Requires cg_simulatedProjectiles 1 and jcinfo UNLAGGEDPROJ: 0 off, 1 on, 2..5 diagnostics. Uses shared missile trajectory plus server-event reconciliation.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_cg_predictknockback(app)),
+            |app, value| App::cvar_set_cg_predictknockback(app, APP_CG_PREDICTKNOCKBACK.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_predictknockback, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, name, value| {
+                let _ = settings.network.set_cvar(name, value);
+            }),
+            archive: Some((29560, |state| format!("{}", state.presentation.network.predict_knockback))),
+            ..CvarBinding::NONE
+        },
+        settings: SETTINGS_CG_PREDICTKNOCKBACK = APP_CG_PREDICTKNOCKBACK
+            .bind(
+                |state: &NetworkSettings| CvarValue::String(state.predict_knockback.to_string()),
+                |state, value| NetworkSettings::cvar_set_cg_predictknockback(
+                    state, APP_CG_PREDICTKNOCKBACK.entry.name, &value.to_string(),
+                ),
+            )
+            .with_text_setter(NetworkSettings::cvar_set_cg_predictknockback, None),
+        implementations: [
+            impl NetworkSettings {
+                fn cvar_set_cg_predictknockback(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    self.predict_knockback = atoi(value.as_bytes()).clamp(0, 5) as u8;
+                    Ok(())
+                }
+            }
+            impl App {
+                fn cvar_get_cg_predictknockback(&self) -> String {
+                    (SETTINGS_CG_PREDICTKNOCKBACK.get)(&self.network).to_string()
+                }
+                fn cvar_set_cg_predictknockback(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_PREDICTKNOCKBACK.set_text.unwrap())(&mut self.network, name, value)?;
+                    self.mark_config_dirty();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_PREDICTIONDEBUG {
         runtime: CvarDef::new(
                 "cg_predictionDebug",

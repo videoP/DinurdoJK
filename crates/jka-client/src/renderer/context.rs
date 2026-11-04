@@ -27,6 +27,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn make_offscreen_output(&self) -> wgpu::Texture {
+        // The descriptor borrows this slice until create_texture returns.
+        let encoded_view_formats = [self.config.format.remove_srgb_suffix()];
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Independent Studio scene output"),
             size: wgpu::Extent3d { width: self.config.width.max(1), height: self.config.height.max(1), depth_or_array_layers: 1 },
@@ -34,7 +36,11 @@ impl Renderer {
             format: self.config.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            view_formats: if self.config.format.is_srgb() {
+                &encoded_view_formats
+            } else {
+                &[]
+            },
         })
     }
 }
@@ -146,10 +152,12 @@ impl Renderer {
         self.configure_surface();
         self.note_surface_configured("resize");
         self.resize_hdr_output();
+        self.dlss.release();
+        let (render_width, render_height) = self.render_extent();
         self.targets = create_targets(
             &self.device,
-            size.width,
-            size.height,
+            render_width,
+            render_height,
             self.scene_format(),
             self.msaa_samples,
             self.glow_mode.enabled() || self.halation_enabled,
@@ -162,6 +170,7 @@ impl Renderer {
             self.taa_enabled || self.rt_taa_mode > 0,
             self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
+            (self.config.width, self.config.height),
         );
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
@@ -206,10 +215,12 @@ impl Renderer {
         self.configure_surface();
         self.note_surface_configured(reason);
         self.resize_hdr_output();
+        self.dlss.release();
+        let (render_width, render_height) = self.render_extent();
         self.targets = create_targets(
             &self.device,
-            self.config.width,
-            self.config.height,
+            render_width,
+            render_height,
             self.scene_format(),
             self.msaa_samples,
             self.glow_mode.enabled() || self.halation_enabled,
@@ -222,6 +233,7 @@ impl Renderer {
             self.taa_enabled || self.rt_taa_mode > 0,
             self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
+            (self.config.width, self.config.height),
         );
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
@@ -373,6 +385,25 @@ impl Renderer {
             }
         }
     }
+}
+
+/// DLSS camera jitter in render pixels: Halton(2,3) - 0.5 over NVIDIA's
+/// recommended 8 * (output / render)^2 phases (8 for DLAA, 72 for Ultra
+/// Performance).
+pub(in crate::renderer) fn dlss_jitter(frame_index: u32, render_width: u32, output_width: u32) -> [f32; 2] {
+    fn halton(mut index: u32, base: u32) -> f32 {
+        let (mut fraction, mut result) = (1.0, 0.0);
+        while index > 0 {
+            fraction /= base as f32;
+            result += fraction * (index % base) as f32;
+            index /= base;
+        }
+        result
+    }
+    let ratio = output_width.max(1) as f32 / render_width.max(1) as f32;
+    let phases = ((8.0 * ratio * ratio).round() as u32).max(8);
+    let index = frame_index % phases + 1;
+    [halton(index, 2) - 0.5, halton(index, 3) - 0.5]
 }
 
 pub(in crate::renderer) fn temporal_jitter(frame_index: u32) -> [f32; 2] {

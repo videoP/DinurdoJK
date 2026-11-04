@@ -85,7 +85,7 @@ JKA's `fs_cdpath`:
 set fs_jk2path "C:\Games\JK21.02\GameData"
 ```
 
-The setting persists in `DinurdoJK-paths.ini` and takes effect after restarting.
+The setting persists in `DinurdoJK/DinurdoJK-paths.ini` (next to `base/`) and takes effect after restarting.
 It records the JK2 root for upcoming JK2 support; it does not add those packages
 to the JKA search path. Inspect a JK2 1.02/1.04 demo without starting the renderer:
 

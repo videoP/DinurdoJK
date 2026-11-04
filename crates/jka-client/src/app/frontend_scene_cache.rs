@@ -167,7 +167,7 @@ pub(super) fn shader_gamma_reusable(video: &crate::ui::VideoSettings) -> bool {
 
 pub(super) fn path(base: &Path, game: Option<&Path>, scene: &str, video: &crate::ui::VideoSettings) -> PathBuf {
     let mod_name = game.map_or("base", |path| path.to_str().unwrap_or("mod"));
-    jka_assets::pk3::game_write_directory(base, None).join("cache").join("frontend_scenes").join(format!(
+    jka_assets::pk3::dinurdojk_cache_directory(base).join("menu").join(format!(
         "v7_{:016x}.png", scene_hash(scene, mod_name, video),
     ))
 }

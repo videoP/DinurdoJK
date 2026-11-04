@@ -1,7 +1,7 @@
 //! Api.
 use crate::renderer::{
     scene, ui, Arc, Camera, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
-    DofMode, DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
+    DlssMode, DlssModel, DofMode, DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode,
     Ghoul2SkinningMode, Hash, InputLatencySample, Instant, JumpShadeState, PathBuf, PhysicalSize,
     PlanarReflectionDebugMode, Pod, PreparedMap, PuddleQuality, PvsMode, RainIntensity,
@@ -391,6 +391,9 @@ pub struct FxGpuSprites {
     pub blob_shadow: bool,
     /// Segmented 24-step bolt; vs_main expands each instance into a ribbon.
     pub lightning: bool,
+    /// Joined grappling rope expanded by a separate lazily-created vertex shader.
+    /// Deliberately does not use the Force Lightning compute path.
+    pub rope: bool,
 }
 
 /// One material-stage draw against stable resident slot IDs. Each surface
@@ -850,6 +853,10 @@ pub struct PostEffects {
     pub fxaa: bool,
     pub smaa: bool,
     pub taa: bool,
+    /// NVIDIA DLAA/DLSS, Vulkan or DX12 (cargo feature nvidia-dlss).
+    pub dlss: bool,
+    pub dlss_mode: DlssMode,
+    pub dlss_model: DlssModel,
     pub rt_taa: u32,
     pub contact_shadows: bool,
     pub fog_mode: FogMode,
@@ -1107,6 +1114,10 @@ pub enum RenderCommand {
     SetPresentCopy(bool),
     /// Run a bounded, clear-only surface acquisition/presentation diagnostic.
     RunAcquireProbe(u32),
+    /// One-command, auto-restored Shitter rendering/presentation path comparison.
+    StartShitterSweep { path: PathBuf },
+    /// One-shot read-only Vulkan shared-present capability query on the current window.
+    ProbeSharedPresent,
     SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
@@ -1122,6 +1133,15 @@ pub enum RenderCommand {
     SetDetailTextureFade {
         enabled: bool,
         distance: f32,
+    },
+    /// Optional collision render BSP triangulation: never launched at map load
+    /// while r_collisionWorld is off. Workers are map-hash scoped.
+    BuildCollisionWorld {
+        map_hash: u64,
+        root: PathBuf,
+        game: Option<PathBuf>,
+        source: scene::MapSource,
+        allow_asset_overrides: bool,
     },
     SetWireframeMask(u32),
     SetShaderComplexity(bool),
@@ -1163,6 +1183,7 @@ pub enum RenderCommand {
     SetCompetitiveAb(u32),
     SetFpsCap(u32),
     SetGamma(f32),
+    SetOverbrightBits(u8),
     SetGammaMethod(crate::gamma::GammaMethod),
     SetHardwareGammaActive(bool),
     PrepareGammaMethod(u64),
@@ -1307,7 +1328,8 @@ pub enum RenderCommand {
     /// Decoded scene still; uploaded on render thread and composited beneath neon.
     SetNeonMenuCache(Option<egui::ColorImage>),
     /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
-    SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>, crate::extensions::NativeHudMask, Vec<String>),
+    SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>, crate::extensions::NativeHudMask,
+        Vec<String>, Vec<(String, String)>),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
         console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
@@ -1531,6 +1553,8 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) late_latch_after_acquire: bool,
     /// r_earlySubmit applied: recorded offscreen, submitted before acquire.
     pub(in crate::renderer) early_submit: bool,
+    /// True only when the offscreen copy-to-swapchain path was actually used.
+    pub(in crate::renderer) present_copy: bool,
     pub(in crate::renderer) dynamic_model_prepare_ms: f64,
     pub(in crate::renderer) dynamic_model_surfaces: u32,
     pub(in crate::renderer) dynamic_model_vertices: u64,

@@ -107,6 +107,41 @@ app_cvars! {
         ]
     }
 
+    APP_CG_CROSSHAIRSCOPE {
+        runtime: CvarDef::new(
+            "cg_crossHairScope", "0", "0|1|2",
+            "TaystJK Disruptor scope: 0 classic 4:3 scope and rotating insert (no crosshair), 1 normal crosshair without the scope mask, 2 full-screen scope mask (no crosshair). Ammo ticks and charge meter remain in all modes.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::Int(App::cvar_get_cg_crosshairscope(app)),
+            |app, value| App::cvar_set_cg_crosshairscope(app, APP_CG_CROSSHAIRSCOPE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_crosshairscope, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.crosshair.scope_mode = mode.min(crate::ui::CROSSHAIR_SCOPE_MAX);
+                }
+            }),
+            archive: Some((2291, |state| state.presentation.crosshair.scope_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_cg_crosshairscope(&self) -> i32 {
+                    i32::from(self.crosshair.scope_mode)
+                }
+                fn cvar_set_cg_crosshairscope(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let error = || format!("cg_crossHairScope: expected 0, 1 or {}", ui::CROSSHAIR_SCOPE_MAX);
+                    let mode = value.trim().parse::<u8>().map_err(|_| error())?;
+                    if mode > ui::CROSSHAIR_SCOPE_MAX { return Err(error()); }
+                    self.crosshair.scope_mode = mode;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_CROSSHAIRIMAGE {
         runtime: CvarDef::new("cg_crosshairImage", "", "0..10", "Image crosshair: 0 draws the cg_drawCrosshair shape; 1..10 draws gfx/2d/crosshaira..crosshairj (j needs japro-assets.pk3). cg_drawCrosshair 0 still hides it.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_crosshairimage(app)), |app, value| App::cvar_set_cg_crosshairimage(app, APP_CG_CROSSHAIRIMAGE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_crosshairimage, None),
         config: CvarBinding {

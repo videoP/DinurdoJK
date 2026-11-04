@@ -120,17 +120,22 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let z_max = z_boundary(slice + 1u);
     let light_count = min(settings.values.y, arrayLength(&lights));
 
-    // Runtime transient lights (sabers, blasters) live after the static map
-    // lights. Visit them first so maps with many authored lights cannot fill
-    // the per-cluster cap before a saber light is considered.
+    // Source ordering: gameplay/authored FX -> static map lights -> inferred
+    // promoted FX. A 32-light cluster must never lose an existing light just
+    // because many tiny particles requested promotion.
     let transient_start = min(settings.local_shadows.w, light_count);
+    let promoted_start = clamp(settings.feature_flags.z >> 16u, transient_start, light_count);
+    let priority_count = promoted_start - transient_start;
     var count = 0u;
     for (var iteration = 0u; iteration < light_count; iteration += 1u) {
-        let light_index = select(
-            transient_start + iteration,
-            iteration - (light_count - transient_start),
-            iteration >= light_count - transient_start
-        );
+        var light_index: u32;
+        if (iteration < priority_count) {
+            light_index = transient_start + iteration;
+        } else if (iteration < promoted_start) {
+            light_index = iteration - priority_count;
+        } else {
+            light_index = iteration;
+        }
         let light = lights[light_index];
         if light.shape.w < -0.5 {continue;}
         let is_area = light.emitter.w > 0.5 && light.emitter.w < 2.5;

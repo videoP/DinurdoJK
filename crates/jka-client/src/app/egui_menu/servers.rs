@@ -284,6 +284,7 @@ impl App {
                 self.server_browser.internet_requested_once = true;
                 BrowserCommand::RefreshInternet {
                     masters: self.server_browser.master_servers.to_vec(),
+                    cache_path: self.server_browser.internet_cache_path().map(std::path::Path::to_path_buf),
                 }
             }
             ServerSource::Lan => BrowserCommand::RefreshLan,

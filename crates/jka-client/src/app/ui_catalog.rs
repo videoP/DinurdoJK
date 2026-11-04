@@ -34,14 +34,15 @@ pub(super) enum CatalogRequest {
     ModelThumbnail { qpath: String },
     ConsoleFiles,
     DemoGames { token: u64 },
-    Jk2DemoFolders { token: u64, root: Option<PathBuf> },
+    Jk2DemoFolders { token: u64, local_base: PathBuf, home_base: Option<PathBuf>, root: Option<PathBuf> },
     Jk2DemoRecordings { token: u64, folder: PathBuf },
     Jk2DemoDetails { token: u64, path: PathBuf },
     Demos { token: u64 },
     ChatLogs,
     ChatLogDetail { path: PathBuf },
     Profile,
-    SoloMaps,
+    /// Tagged with the asset game it was listed for (`None` = JKA).
+    SoloMaps { jk2: Option<u8> },
     SourceMaps,
     Levelshot { source: bool, map_name: String },
     ProfileBackground { map_name: String },
@@ -71,7 +72,7 @@ pub(super) enum CatalogPayload {
     ChatLogs(Result<Vec<ChatLogIndexEntry>, String>),
     ChatLogDetail { path: PathBuf, detail: Result<ChatLogDetail, String> },
     Profile(Result<ProfileCatalog, String>),
-    SoloMaps(Result<Vec<SoloMapEntry>, String>),
+    SoloMaps { jk2: Option<u8>, maps: Result<Vec<SoloMapEntry>, String> },
     SourceMaps(Result<Vec<SoloMapEntry>, String>),
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
     ProfileBackground { map_name: String, image: Option<DecodedImage> },
@@ -95,6 +96,8 @@ struct Job {
     generation: u64,
     base: PathBuf,
     game: Option<PathBuf>,
+    /// `Some(jk2)` reads that asset game instead of the installed filesystem.
+    asset_game: Option<Option<u8>>,
     request: CatalogRequest,
 }
 
@@ -152,10 +155,21 @@ impl UiCatalog {
     }
 
     pub fn request(&mut self, base: &std::path::Path, game: Option<&std::path::Path>, request: CatalogRequest) {
+        self.send(base, game, None, request);
+    }
+
+    /// [`Self::request`] against a specific asset game (`None` = JKA, `Some(2|4)`
+    /// = JK2 1.02/1.04) without switching the process-wide filesystem.
+    pub fn request_as(&mut self, base: &std::path::Path, game: Option<&std::path::Path>, jk2: Option<u8>, request: CatalogRequest) {
+        self.send(base, game, Some(jk2), request);
+    }
+
+    fn send(&mut self, base: &std::path::Path, game: Option<&std::path::Path>, asset_game: Option<Option<u8>>, request: CatalogRequest) {
         let job = Job {
             generation: self.generation,
             base: base.to_path_buf(),
             game: game.map(std::path::Path::to_path_buf),
+            asset_game,
             request,
         };
         if self.tx.send(job).is_err() {
@@ -195,6 +209,7 @@ struct OpenVfs {
     generation: u64,
     base: PathBuf,
     game: Option<PathBuf>,
+    asset_game: Option<Option<u8>>,
     assets: AssetSearchPath,
 }
 
@@ -208,10 +223,10 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         // potentially large recursive scan/parsing on this worker, but do not
         // pay for opening/reopening the game PK3 search path.
         match &job.request {
-            CatalogRequest::Jk2DemoFolders { token, root } => {
+            CatalogRequest::Jk2DemoFolders { token, local_base, home_base, root } => {
                 let payload = CatalogPayload::Jk2DemoFolders {
                     token: *token,
-                    folders: jk2_demo_browser::scan_folders(root.as_deref()),
+                    folders: jk2_demo_browser::scan_folders(local_base, home_base.as_deref(), root.as_deref()),
                 };
                 let _ = results.send(CatalogResult { generation: job.generation, payload });
                 continue;
@@ -293,11 +308,17 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
 
         let reusable = vfs.as_ref().is_some_and(|open| {
             open.generation == job.generation && open.base == job.base && open.game == job.game
+                && open.asset_game == job.asset_game
         });
         if !reusable {
-            vfs = match AssetSearchPath::open_game(&job.base, job.game.as_deref()) {
+            let opened = match job.asset_game {
+                Some(jk2) => AssetSearchPath::open_game_as(&job.base, job.game.as_deref(), jk2),
+                None => AssetSearchPath::open_game(&job.base, job.game.as_deref()),
+            };
+            vfs = match opened {
                 Ok(assets) => Some(OpenVfs {
                     generation: job.generation,
+                    asset_game: job.asset_game,
                     base: job.base.clone(),
                     game: job.game.clone(),
                     assets,
@@ -312,7 +333,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         // Handled before VFS open above.
                         CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => None,
                         CatalogRequest::Profile => Some(CatalogPayload::Profile(Err(error))),
-                        CatalogRequest::SoloMaps => Some(CatalogPayload::SoloMaps(Err(error))),
+                        CatalogRequest::SoloMaps { jk2 } => Some(CatalogPayload::SoloMaps { jk2, maps: Err(error) }),
                         CatalogRequest::SourceMaps => Some(CatalogPayload::SourceMaps(Err(error))),
                         CatalogRequest::Levelshot { source, map_name } => {
                             Some(CatalogPayload::Levelshot { source, map_name, image: None })
@@ -396,9 +417,9 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 let mut reader=assets.fork();reader.set_allow_asset_overrides(allow_overrides);
                 ("studio cinematics",CatalogPayload::StudioCinematics {token,catalog:super::render_studio_cinematics::scan(&mut reader)})
             }
-            CatalogRequest::SoloMaps => (
+            CatalogRequest::SoloMaps { jk2 } => (
                 "solo maps",
-                CatalogPayload::SoloMaps(Ok(frontend::scan_solo_maps(assets))),
+                CatalogPayload::SoloMaps { jk2, maps: Ok(frontend::scan_solo_maps(assets)) },
             ),
             CatalogRequest::SourceMaps => (
                 "source maps",

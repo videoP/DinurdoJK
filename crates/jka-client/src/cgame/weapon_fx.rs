@@ -59,6 +59,46 @@ const FP_SEE: i32 = 14;
 const WP_DET_PACK: i32 = 14;
 const WP_CONCUSSION: i32 = 15;
 const WP_BRYAR_OLD: i32 = 16;
+// TaystJK bg_public.h weaponstate_t (0 = WEAPON_READY).
+const WEAPON_CHARGING: i32 = 4;
+const WEAPON_CHARGING_ALT: i32 = 5;
+
+/// cg_weapons.c CG_AddPlayerWeapon: charge effect shader and scale. The
+/// client/server clock is milliseconds; full charge visuals take one second.
+/// These states come from playerState.weaponstate or entityState.modelindex2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WeaponCharge {
+    shader: &'static str,
+    progress: f32,
+    scale: f32,
+}
+
+pub(crate) fn weapon_charge(
+    weapon: i32, weapon_state: i32, charge_start_ms: i32, now_ms: i32,
+) -> Option<WeaponCharge> {
+    let (shader, scale) = match (weapon, weapon_state) {
+        (WP_BRYAR_PISTOL | WP_BRYAR_OLD, WEAPON_CHARGING_ALT) =>
+            ("gfx/effects/bryarFrontFlash", 1.0),
+        (WP_BOWCASTER, WEAPON_CHARGING) => ("gfx/effects/greenFrontFlash", 1.0),
+        (WP_DEMP2, WEAPON_CHARGING_ALT) => ("gfx/misc/lightningFlash", 1.75),
+        _ => return None,
+    };
+    Some(WeaponCharge {
+        shader,
+        progress: ((now_ms as i64 - charge_start_ms as i64) as f32 * 0.001).clamp(0.0, 1.0),
+        scale,
+    })
+}
+
+/// TaystJK's `CGCam_Shake` during charging, only at cg_screenShake >= 2.
+/// Never call for another player's weapon (the caller owns the viewer gate).
+pub(crate) fn weapon_charge_shake(
+    weapon: i32, weapon_state: i32, charge_start_ms: i32, now_ms: i32,
+) -> Option<f32> {
+    weapon_charge(weapon, weapon_state, charge_start_ms, now_ms).map(|charge| {
+        if charge.progress >= 1.0 { 0.2 } else { charge.progress * charge.progress * 0.6 }
+    })
+}
 const WP_EMPLACED_GUN: i32 = 17;
 const WP_TURRET: i32 = 18;
 const G2_MODEL_PART: i32 = 50;
@@ -66,6 +106,147 @@ const G2_MODEL_PART: i32 = 50;
 const EF_ALT_FIRING: i32 = 1 << 10;
 const EF_JETPACK_ACTIVE: i32 = 1 << 11;
 const EF_MISSILE_STICK: i32 = 1 << 22;
+
+
+/// A single local missile-flight model shared by jaPRO cosmetic rockets and
+/// speculative self-knockback. Collision is only requested by knockback;
+/// normal projectile presentation stays collision-free.
+pub(crate) const RACE_ROCKET_SPEED: f32 = 900.0;
+pub(crate) const RACE_ROCKET_PRESTEP_MS: i32 = 50;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalMissileFlight {
+    pub origin: [f32; 3],
+    pub velocity: [f32; 3],
+    pub start_time: i32,
+    pub gravity: bool,
+}
+
+impl LocalMissileFlight {
+    pub fn new(origin: [f32; 3], direction: [f32; 3], speed: f32, start_time: i32, gravity: bool) -> Self {
+        Self { origin, velocity: direction.map(|axis| axis * speed), start_time, gravity }
+    }
+
+    /// Quake3 SnapVector truncates to integers when serializing the missile
+    /// trajectory. Preserve parity for the specific race rocket that uses it.
+    pub fn snapped_to_network(mut self) -> Self {
+        for coordinate in &mut self.origin { *coordinate = coordinate.trunc(); }
+        for component in &mut self.velocity { *component = component.trunc(); }
+        self
+    }
+
+    pub fn position(self, now: i32) -> [f32; 3] {
+        let dt = now.saturating_sub(self.start_time).max(0) as f32 * 0.001;
+        let mut point = self.origin;
+        for (coordinate, speed) in point.iter_mut().zip(self.velocity) {
+            *coordinate += speed * dt;
+        }
+        if self.gravity { point[2] -= 400.0 * dt * dt; }
+        point
+    }
+
+    pub fn direction(self, now: i32) -> [f32; 3] {
+        let mut velocity = self.velocity;
+        if self.gravity {
+            velocity[2] -= 800.0 * now.saturating_sub(self.start_time).max(0) as f32 * 0.001;
+        }
+        normalize_or_up(velocity)
+    }
+}
+
+/// TaystJK CG_GetMuzzlePoint. Race rockets use a centered muzzle; the
+/// ordinary local missile presentation keeps its existing per-weapon offsets.
+pub(crate) fn local_projectile_muzzle(
+    origin: [f32; 3], angles: [f32; 3], view_height: f32,
+    weapon: i32, center_muzzle: bool,
+) -> ([f32; 3], [f32; 3]) {
+    let axis = angles_to_axis(angles);
+    let mut muzzle = origin;
+    for i in 0..3 { muzzle[i] += 12.0 * axis[0][i]; }
+    muzzle[2] += view_height;
+    if !center_muzzle {
+        // AngleVectors' `right` corresponds to -axis[1].
+        let (right, up): (f32, f32) = match weapon {
+            WP_BRYAR_PISTOL | WP_BLASTER | WP_DEMP2 | WP_FLECHETTE
+            | WP_CONCUSSION | WP_BRYAR_OLD => (6.0, -6.0),
+            WP_BOWCASTER => (2.0, -6.0),
+            WP_REPEATER => (4.0, -6.0),
+            WP_ROCKET_LAUNCHER => (8.0, -4.0),
+            WP_THERMAL => (0.0, -4.0),
+            WP_TRIP_MINE => (0.0, -10.0),
+            _ => (0.0, 0.0),
+        };
+        for i in 0..3 {
+            muzzle[i] -= right * axis[1][i];
+            muzzle[i] += up * axis[2][i];
+        }
+    }
+    (muzzle, axis[0])
+}
+
+/// Purely cosmetic. No collision, damage, or server entity is created.
+#[derive(Clone, Copy, Debug)]
+struct SimulatedProjectile {
+    id: u16,
+    weapon: i32,
+    alt: bool,
+    owner: i32,
+    start_time: i32,
+    end_time: i32,
+    origin: [f32; 3],
+    velocity: [f32; 3],
+    gravity: bool,
+    match_radius: f32,
+    last_fx_time: i32,
+}
+
+impl SimulatedProjectile {
+    fn flight(self) -> LocalMissileFlight {
+        LocalMissileFlight {
+            origin: self.origin, velocity: self.velocity,
+            start_time: self.start_time, gravity: self.gravity,
+        }
+    }
+    fn position(self, now: i32) -> [f32; 3] { self.flight().position(now) }
+    fn direction(self, now: i32) -> [f32; 3] { self.flight().direction(now) }
+}
+
+/// TaystJK `CG_GetBulletSpeed` plus Tribes substitutions.
+fn simulated_projectile_speed(weapon: i32, alt: bool, tribes: bool, sniper: bool) -> Option<f32> {
+    Some(match (weapon, alt) {
+        (WP_BRYAR_PISTOL, _) if !tribes => 1600.0, // WT_TRIBES Colt is hitscan
+        (WP_BRYAR_OLD, _) => if tribes { 10440.0 } else { 1600.0 }, // server WP_FireBryarPistol
+        (WP_BLASTER, _) => if tribes { 10440.0 } else { 2300.0 },
+        (WP_DISRUPTOR, _) if sniper => if tribes { 32000.0 } else { 9000.0 },
+        (WP_BOWCASTER, _) => if tribes { 3040.0 } else { 1300.0 },
+        (WP_REPEATER, false) => if tribes { 10440.0 } else { 1600.0 },
+        (WP_REPEATER, true) => if tribes { 2000.0 } else { 1100.0 },
+        (WP_DEMP2, false) => 1800.0,
+        (WP_FLECHETTE, false) => 3500.0,
+        (WP_FLECHETTE, true) => if tribes { 2000.0 } else { 1050.0 },
+        (WP_ROCKET_LAUNCHER, _) if tribes => 3040.0,
+        (WP_ROCKET_LAUNCHER, false) => RACE_ROCKET_SPEED,
+        (WP_ROCKET_LAUNCHER, true) => 450.0,
+        (WP_THERMAL, _) => if tribes { 1800.0 } else { 550.0 },
+        (WP_TRIP_MINE, _) => 550.0,
+        (WP_CONCUSSION, false) => if tribes { 3040.0 } else { 3000.0 },
+        (WP_CONCUSSION, true) if tribes => 1000.0, // spinfusor alt; normal alt is hitscan
+        _ => return None, // beam / hitscan / stun / saber / unsupported alt modes
+    })
+}
+
+fn simulated_projectile_gravity(weapon: i32, alt: bool, tribes: bool, sniper: bool) -> bool {
+    matches!((weapon, alt), (WP_REPEATER, true) | (WP_FLECHETTE, true) | (WP_TRIP_MINE, _))
+        || (weapon == WP_DISRUPTOR && sniper)
+        || (weapon == WP_BOWCASTER && tribes)
+        || (weapon == WP_ROCKET_LAUNCHER && tribes)
+}
+
+/// Quake Q_random / Q_crandom, bit-exact 69069 LCG from q_shared.c.
+fn simulated_random(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(69069).wrapping_add(1);
+    (*seed & 0xffff) as f32 / 65536.0
+}
 
 const TR_STATIONARY: i32 = 0;
 const TR_INTERPOLATE: i32 = 1;
@@ -1254,6 +1435,11 @@ pub struct WeaponFx {
     fx_was_disabled: bool,
     entity_fx: HashMap<u16, EntityFxState>,
     missile_fx: HashMap<u16, MissileFxState>,
+    simulated_projectiles_enabled: bool,
+    simulated_projectiles: Vec<SimulatedProjectile>,
+    next_simulated_projectile_id: u16,
+    /// Presentation-only DestroHook-inspired rope shape per networked grapple.
+    grapple_ropes: HashMap<u16, super::grapple::GrappleRopeState>,
     tripmine_fx: HashMap<u16, TripmineLaserCadence>,
     force_fx_cadence: HashMap<u16, ForceFxCadence>,
     /// `0` is stock JKA: invoke continuous projectile FX every presentation
@@ -1383,6 +1569,10 @@ impl WeaponFx {
             fx_was_disabled: false,
             entity_fx: HashMap::new(),
             missile_fx: HashMap::new(),
+            simulated_projectiles_enabled: false,
+            simulated_projectiles: Vec::new(),
+            next_simulated_projectile_id: 50_000,
+            grapple_ropes: HashMap::new(),
             tripmine_fx: HashMap::new(),
             force_fx_cadence: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
@@ -1615,6 +1805,7 @@ impl WeaponFx {
             // Start the new cadence from the next presented sample instead of
             // inheriting phase from the previous rate/mode.
             self.missile_fx.clear();
+            self.grapple_ropes.clear();
             self.tripmine_fx.clear();
             self.force_fx_cadence.clear();
             self.saber_contact_history.clear();
@@ -1667,6 +1858,8 @@ impl WeaponFx {
         let _ = self.worker_tx.send(FxWorkerCommand::ResetTime(time));
         self.entity_fx.clear();
         self.missile_fx.clear();
+        self.simulated_projectiles.clear();
+        self.grapple_ropes.clear();
         self.tripmine_fx.clear();
         self.force_fx_cadence.clear();
         self.vehicle_weapon_names.clear();
@@ -1736,6 +1929,8 @@ impl WeaponFx {
             self.pending_glass.clear();
             self.entity_fx.clear();
             self.missile_fx.clear();
+            self.simulated_projectiles.clear();
+            self.grapple_ropes.clear();
             self.tripmine_fx.clear();
             self.saber_trail_history.clear();
             self.saber_trail_segments.clear();
@@ -2341,7 +2536,7 @@ impl WeaponFx {
                 if length2.is_finite() && length2 > 1.0e-8 {
                     let effect = spec.shader.bytes().fold(2166136261_u32, |h, b| h.wrapping_mul(16777619) ^ u32::from(b));
                     frame.auto_light_candidates.push(FxAutoLightCandidate {
-                        effect, score: 3, kind: PrimType::Line,
+                        effect, class: FxClass::DirectBeam, score: 3, kind: PrimType::Line,
                         origin: spec.start,
                         radius: spec.size1 + (spec.size2 - spec.size1) * t,
                         rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 255],
@@ -2710,6 +2905,29 @@ impl WeaponFx {
         }
     }
 
+    /// TaystJK CG_AddPlayerWeapon charge sprite: exact authored shader, one-second
+    /// ramp, 0..0.5 radius jitter, 0..360 rotation, and constant 0.7 alpha.
+    /// Called only when the weapon is charging, with its actual muzzle tag/bolt.
+    /// An immediate FX draw avoids a worker round trip on every render frame.
+    pub(crate) fn weapon_charge_sprite(
+        &mut self, origin: [f32; 3], weapon: i32, state: i32, start_ms: i32,
+    ) {
+        let Some(charge) = weapon_charge(weapon, state, start_ms, self.time) else {
+            return;
+        };
+        let size = 3.0 * (charge.progress + self.runner_rng.flrand(0.0, 1.0) * 0.5)
+            * charge.scale;
+        let rotation = self.runner_rng.flrand(0.0, 1.0) * 360.0;
+        self.immediate_draws.push(FxDraw::Sprite {
+            shader_time: 0.0,
+            origin,
+            radius: size,
+            rotation,
+            rgba: [255, 255, 255, 179],
+            shader: charge.shader.to_owned(),
+        });
+    }
+
     /// Force-power visuals requested by CG_Player.
     pub fn player_fx(&mut self, request: &PlayerFxRequest) {
         match request {
@@ -2778,39 +2996,67 @@ impl WeaponFx {
                     *length,
                     *no_wall_marks,
                 );
-                self.saber_dynamic_light(
-                    key,
-                    *origin,
-                    *direction,
-                    clipped_length,
-                    *length,
-                    *color,
-                    *num_blades,
-                    *no_dlight || (*no_blade && *num_blades >= 3),
-                );
-                self.saber_trail(
-                    key,
-                    *origin,
-                    *direction,
-                    clipped_length,
-                    *color,
-                    *entity_alpha,
-                    *saber_move,
-                    *torso_anim,
-                    *saber_in_flight,
-                    *trail_style,
-                );
-                if !*no_blade {
-                    self.saber_blade(
+                if crate::renderer::collision_world_only() {
+                    // Collision mode: one untextured, player-color-readable
+                    // blade. $melt_glow is an existing engine-native vertex-
+                    // color material (one additive stage, no image sampling).
+                    // Do not generate the legacy glow/core layers or trails.
+                    self.saber_trail_history.remove(&key);
+                    if !*no_blade && clipped_length >= 0.5 && *radius > 0.0 {
+                        let color = saber_trail_rgb(*color);
+                        let opacity = (*entity_alpha).clamp(0.0, 1.0);
+                        let rgba = [
+                            (f32::from(color[0]) * opacity) as u8,
+                            (f32::from(color[1]) * opacity) as u8,
+                            (f32::from(color[2]) * opacity) as u8,
+                            255,
+                        ];
+                        self.immediate_draws.push(FxDraw::Line {
+                            start: *origin,
+                            end: madd3(*origin, normalize3(*direction), clipped_length),
+                            width: (*radius * 0.85).max(0.75),
+                            rgba,
+                            shader: "$melt_glow".into(),
+                        });
+                    }
+                } else {
+                    self.saber_dynamic_light(
+                        key,
                         *origin,
                         *direction,
                         clipped_length,
-                        *length_max,
-                        *radius,
+                        *length,
+                        *color,
+                        *num_blades,
+                        *no_dlight || (*no_blade && *num_blades >= 3),
+                    );
+                    self.saber_trail(
+                        key,
+                        *origin,
+                        *direction,
+                        clipped_length,
                         *color,
                         *entity_alpha,
+                        *saber_move,
+                        *torso_anim,
+                        *saber_in_flight,
+                        *trail_style,
                     );
+                    if !*no_blade {
+                        self.saber_blade(
+                            *origin,
+                            *direction,
+                            clipped_length,
+                            *length_max,
+                            *radius,
+                            *color,
+                            *entity_alpha,
+                        );
+                    }
                 }
+            }
+            PlayerFxRequest::WeaponCharge { origin, weapon, state, start_ms } => {
+                self.weapon_charge_sprite(*origin, *weapon, *state, *start_ms);
             }
             PlayerFxRequest::PushPuffs { origin } => {
                 // CG_ForcePushBlur (LE_PUFF path).
@@ -3657,10 +3903,269 @@ impl WeaponFx {
         (slot < self.vehicle_weapon_names.len()).then_some(slot)
     }
 
+    /// Live toggle, with no prediction work or allocations when disabled.
+    pub fn set_simulated_projectiles(&mut self, enabled: bool) {
+        if self.simulated_projectiles_enabled != enabled {
+            self.simulated_projectiles.clear();
+            self.simulated_projectiles_enabled = enabled;
+        }
+    }
+
+    pub fn simulated_projectiles_enabled(&self) -> bool {
+        self.simulated_projectiles_enabled
+    }
+
+    /// TaystJK CG_LocalMissile at the accepted local EV_FIRE_WEAPON seam.
+    /// This is strictly client presentation and never creates gameplay missiles.
+    pub fn note_simulated_projectile(
+        &mut self,
+        event: &PresentationEvent,
+        ps: &jka_protocol::server::PlayerState,
+        game: &ClientGameState,
+        time: i32,
+        ping: i32,
+    ) {
+        // Only a predicted weapon fire event has the exact firing command clock.
+        // Never spawn a late local copy from a packet/snapshot event.
+        let Some(command_time) = event.predicted_fire_command_time else { return; };
+        if !self.simulated_projectiles_enabled || !game.is_japro() { return; }
+        let features = game.japro_weapon_features();
+        if !features.unlagged_projectiles { return; }
+        let weapon = event.state.field_i32("weapon")
+            .filter(|w| *w > 0)
+            .unwrap_or_else(|| ps.field_i32("weapon").unwrap_or(0));
+        let alt = event.event == EntityEvent::EV_ALT_FIRE;
+        let tribes = features.tribes_weapons;
+        let sniper = features.projectile_sniper;
+        let Some(speed) = simulated_projectile_speed(weapon, alt, tribes, sniper) else { return; };
+        // player_state_to_entity_state is built from the committed usercmd's
+        // PlayerState at event creation, not the potentially newer render PS.
+        let Some(origin) = super::entity_vec3(&event.state, "pos.trBase") else { return; };
+        let Some(angles) = super::entity_vec3(&event.state, "apos.trBase") else { return; };
+        let race = ps.stats.get(11).is_some_and(|stat| *stat != 0);
+        if race && weapon == WP_DISRUPTOR { return; } // server forces hitscan in race
+        let center_muzzle = race
+            || game.plugin_disable() & crate::japro_cg::plugin_disable::CENTER_MUZZLE != 0;
+        let (muzzle, mut direction) = local_projectile_muzzle(
+            origin, angles, ps.field_i32("viewheight").unwrap_or(26) as f32,
+            weapon, center_muzzle,
+        );
+        // jaPRO FireWeapon: seed = pers.cmd.serverTime % 10000.
+        // Only reproducible if jcinfo advertises WT_PSEUDORANDOM_FIRE.
+        // Without it, the server uses Q_flrand (not networked); leave the
+        // direction centered rather than invent a deterministic 'exact' spread.
+        let mut seed = command_time.rem_euclid(10000) as u32;
+        let spread = if features.pseudorandom_fire {
+            match (weapon, alt) {
+                (WP_BLASTER, _) if tribes => if alt { 1.6 } else { 1.6 * 0.15 },
+                (WP_BLASTER, true) => 1.6,
+                (WP_REPEATER, false) => if tribes { 1.4 * 0.15 } else { 1.4 },
+                _ => 0.0,
+            }
+        } else { 0.0 };
+        if spread > 0.0 {
+            let theta = std::f32::consts::PI * (2.0 * simulated_random(&mut seed) - 1.0);
+            let radius = spread * simulated_random(&mut seed);
+            let mut shot_angles = angles;
+            shot_angles[0] += radius * theta.sin();
+            shot_angles[1] += radius * theta.cos();
+            direction = angles_to_axis(shot_angles)[0];
+        }
+        // jaPRO race Flechette uses stake gun rather than 5 ordinary bolts;
+        // WT_STAKE_GUN is not advertised. Don't invent 5 race projectiles.
+        if weapon == WP_FLECHETTE && race { return; }
+        if weapon == WP_FLECHETTE && alt && !tribes && features.pseudorandom_fire {
+            let mut a = angles;
+            a[0] -= simulated_random(&mut seed) * 4.0 + 8.0;
+            a[1] += (2.0 * simulated_random(&mut seed) - 1.0) * 2.0;
+            direction = angles_to_axis(a)[0];
+        }
+        // CG_LocalMissile / jaPRO CreateMissileNew prestep. `start_time`
+        // is the trajectory epoch; the visual is not emitted before the shot.
+        let prestep = if race { RACE_ROCKET_PRESTEP_MS } else { ((ping.max(0) as f32 * 0.9) as i32).clamp(0, 135) };
+        let expiry = (ping.max(0) + 1000 / game.server_fps().max(1) + 100).clamp(120, 450);
+        let mut flight = LocalMissileFlight::new(
+            muzzle, direction, speed, time.saturating_sub(prestep),
+            simulated_projectile_gravity(weapon, alt, tribes, sniper),
+        );
+        if race && weapon == WP_ROCKET_LAUNCHER && !alt {
+            flight = flight.snapped_to_network();
+        }
+        let shot = SimulatedProjectile {
+            id: self.next_simulated_projectile_id,
+            weapon, alt,
+            owner: ps.field_i32("clientNum").unwrap_or(-1),
+            start_time: flight.start_time,
+            end_time: time.saturating_add(expiry),
+            origin: flight.origin,
+            velocity: flight.velocity,
+            gravity: flight.gravity,
+            // Covers server/client time skew for very fast Tribes shots without
+            // an unbounded search that could consume unrelated missiles.
+            match_radius: (speed * (prestep as f32 * 0.001 + 0.04)).clamp(64.0, 1500.0),
+            last_fx_time: i32::MIN,
+        };
+        self.next_simulated_projectile_id = if self.next_simulated_projectile_id >= 60_000 {
+            50_000
+        } else { self.next_simulated_projectile_id + 1 };
+        if self.simulated_projectiles.len() >= 48 { self.simulated_projectiles.remove(0); }
+        self.simulated_projectiles.push(shot);
+
+        // jaPRO Golan Arms primary: five bolts; the first has no spread,
+        // following four use sequential Q_crandom calls under WT_PSEUDORANDOM_FIRE.
+        // The independent WT_FLECHETTE_SPRD bit is not in jcinfo; this models
+        // the standard pattern and leaves authoritative server missiles final.
+        if weapon == WP_FLECHETTE && features.pseudorandom_fire && (!alt || !tribes) {
+            let count = if alt { 2 } else { 5 };
+            for _ in 1..count {
+                let mut a = angles;
+                if alt {
+                    a[0] -= simulated_random(&mut seed) * 4.0 + 8.0;
+                    a[1] += (2.0 * simulated_random(&mut seed) - 1.0) * 2.0;
+                } else {
+                    a[0] += (2.0 * simulated_random(&mut seed) - 1.0) * 4.0;
+                    a[1] += (2.0 * simulated_random(&mut seed) - 1.0) * 4.0;
+                }
+                let mut pellet = shot;
+                pellet.id = self.next_simulated_projectile_id;
+                pellet.velocity = angles_to_axis(a)[0].map(|v| v * speed);
+                self.next_simulated_projectile_id = if self.next_simulated_projectile_id >= 60_000 {
+                    50_000
+                } else { self.next_simulated_projectile_id + 1 };
+                if self.simulated_projectiles.len() >= 48 { self.simulated_projectiles.remove(0); }
+                self.simulated_projectiles.push(pellet);
+            }
+        }
+    }
+
+    /// Run once after the authoritative CG_Missile presenter, before end_frame.
+    /// A conservative best-position match retires the temporary visual rather
+    /// than rendering two missiles. It never changes the authoritative entity.
+    pub fn present_simulated_projectiles(
+        &mut self, authoritative: &[PresentedEntity], time: i32,
+    ) -> Vec<(u16, MissileModel)> {
+        if !self.simulated_projectiles_enabled || self.simulated_projectiles.is_empty() {
+            return Vec::new();
+        }
+        // At most 48 local shots: fixed stack storage avoids an allocation
+        // on every 2000+ FPS presentation frame while a shot is in flight.
+        let mut used_real = [u16::MAX; 48];
+        let mut used_real_count = 0;
+        self.simulated_projectiles.retain(|shot| {
+            if time >= shot.end_time || time < shot.start_time { return false; }
+            let predicted = shot.position(time);
+            let max_delta = shot.match_radius;
+            let candidate = authoritative.iter().filter(|real| {
+                if real.presentation_kind() != super::EntityPresentationKind::Missile
+                    || real.state.field_i32("weapon") != Some(shot.weapon)
+                    || (real.state.field_i32("eFlags").unwrap_or(0) & EF_ALT_FIRING != 0) != shot.alt
+                    || used_real[..used_real_count].contains(&real.number)
+                { return false; }
+                // `otherEntityNum` may be ENTITYNUM_NONE (1023); only trust
+                // an explicit shooter when the server provides one.
+                if let Some(owner) = real.state.field_i32("otherEntityNum") {
+                    if owner >= 0 && owner < 1023 && owner != shot.owner { return false; }
+                }
+                let distance2 = (0..3).map(|i| (real.origin[i] - predicted[i]).powi(2)).sum::<f32>();
+                // Same weapon and origin are not enough in a firefight: avoid
+                // handing off to a projectile traveling the opposite way.
+                let moving_together = super::entity_vec3(&real.state, "pos.trDelta")
+                    .filter(|v| v.iter().any(|component| component.abs() > 0.01))
+                    .is_none_or(|v| {
+                        let rv = normalize_or_up(v);
+                        let lv = normalize_or_up(shot.velocity);
+                        (0..3).map(|i| rv[i] * lv[i]).sum::<f32>() > 0.65
+                    });
+                moving_together && distance2 <= max_delta * max_delta
+            }).min_by(|a,b| {
+                let distance2 = |real: &&PresentedEntity| (0..3)
+                    .map(|i| (real.origin[i] - predicted[i]).powi(2)).sum::<f32>();
+                distance2(a).total_cmp(&distance2(b))
+            });
+            if let Some(real) = candidate {
+                used_real[used_real_count] = real.number;
+                used_real_count += 1;
+                return false;
+            }
+            true
+        });
+        let mut draws = Vec::new();
+        for index in 0..self.simulated_projectiles.len() {
+            let shot = self.simulated_projectiles[index];
+            let origin = shot.position(time);
+            let forward = shot.direction(time);
+            // Reuse stock CG_Missile trails, and sample at a modest cadence
+            // to avoid one FX worker command for every 2500-FPS render frame.
+            if time.saturating_sub(shot.last_fx_time) >= 16 || shot.last_fx_time == i32::MIN {
+                if let Some(name) = trail_effect(shot.weapon, shot.alt) {
+                    self.projectile_light_requests.push((name.to_owned(), origin, forward));
+                    self.play(name, origin, forward);
+                }
+                self.simulated_projectiles[index].last_fx_time = time;
+            }
+            if shot.weapon == WP_ROCKET_LAUNCHER {
+                self.immediate_lights.push(FxLight {
+                    kind: FxLightKind::Missile, origin, radius: 125.0, source_radius: 0.0,
+                    rgb: [1.0, 1.0, 0.5], spot: None, segment: None, blade_segments: None,
+                });
+            }
+            if let Some(qpath) = missile_model(shot.weapon, shot.alt) {
+                // Same CG_Missile non-interpolated spinning axis as the
+                // authoritative ET_MISSILE, including flechette models.
+                let axis = jka_movement::rotate_around_direction(forward, time as f32 * 0.25);
+                draws.push((shot.id, MissileModel { qpath: qpath.to_owned(), origin, axis }));
+            }
+        }
+        draws
+    }
+
+
+    /// Build rope ribbons from the interpolated snapshot *after* player posing.
+    /// This only feeds FxDraw; movement, traces, and grapple commands are untouched.
+    pub fn render_grapples(
+        &mut self,
+        entities: &[PresentedEntity],
+        game: &ClientGameState,
+        time: i32,
+        mut owner_hand: impl FnMut(u16) -> Option<[f32; 3]>,
+    ) {
+        // Nothing to do on base or JK2 servers: no allocation and no rope FX.
+        if !game.is_japro() && !game.is_japlus() {
+            self.grapple_ropes.clear();
+            return;
+        }
+        for hook in entities.iter().filter(|ent| ent.entity_type == super::ET_MISSILE) {
+            let Some(owner) = super::grapple::grapple_owner(hook, game) else { continue };
+            let start = owner_hand(owner).or_else(|| {
+                entities.iter().find(|ent| ent.number == owner && ent.entity_type == super::ET_PLAYER)
+                    .map(|player| [player.origin[0], player.origin[1], player.origin[2] + 24.0])
+            });
+            let Some(start) = start else { continue };
+            if !start.iter().chain(hook.origin.iter()).all(|v| v.is_finite()) { continue }
+            let rope = self.grapple_ropes.entry(hook.number).or_default();
+            let delta = super::entity_vec3(&hook.state, "pos.trDelta").unwrap_or([0.0; 3]);
+            let flying = hook.state.field_i32("pos.trType").unwrap_or(0) != 0;
+            let generation = hook.state.field_i32("pos.trTime").unwrap_or(0);
+            super::grapple::append_grapple_rope(
+                &mut self.immediate_draws, rope, owner, generation, time,
+                start, hook.origin, if flying { delta } else { [0.0; 3] },
+            );
+        }
+        // The snapshot no longer contains a hook: remove its rope immediately.
+        // Seeking and entity-number reuse reset state separately as well.
+        self.grapple_ropes.retain(|_, rope| rope.last_time == time);
+    }
+
     /// CG_Missile: play the weapon's trail effect for this frame and return
     /// the missile model refEntity, if the weapon has one.
     pub fn missile(&mut self, entity: &PresentedEntity, game: &ClientGameState, time: i32) -> Option<MissileModel> {
         let state = &entity.state;
+        // TaystJK CG_GrappleTrail/CG_GrappleEndpoint: grapple missiles
+        // display their dedicated MD3 head, not ordinary weapon shot FX.
+        // The deforming rope is submitted separately after player posing.
+        if super::grapple::grapple_owner(entity, game).is_some() {
+            return Some(super::grapple::grapple_endpoint_model(entity, time));
+        }
         let weapon = state.field_i32("weapon").unwrap_or(0);
         if weapon == WP_SABER || weapon == G2_MODEL_PART {
             return None; // thrown sabers / G2 parts: owned by the player presenter
@@ -4668,7 +5173,7 @@ pub(crate) fn rapier_debris_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
     angles_to_axis(angles)
 }
 
-fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
+pub(crate) fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
     let (sr, cr) = angles[2].to_radians().sin_cos();
@@ -4682,6 +5187,51 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taystjk_charge_states_shaders_and_camera_shake() {
+        for (weapon, state, shader, scale) in [
+            (WP_BRYAR_PISTOL, WEAPON_CHARGING_ALT, "gfx/effects/bryarFrontFlash", 1.0),
+            (WP_BRYAR_OLD, WEAPON_CHARGING_ALT, "gfx/effects/bryarFrontFlash", 1.0),
+            (WP_BOWCASTER, WEAPON_CHARGING, "gfx/effects/greenFrontFlash", 1.0),
+            (WP_DEMP2, WEAPON_CHARGING_ALT, "gfx/misc/lightningFlash", 1.75),
+        ] {
+            let effect = weapon_charge(weapon, state, 5_000, 5_500).unwrap();
+            assert_eq!(effect.shader, shader);
+            assert_eq!(effect.scale, scale);
+            assert!((effect.progress - 0.5).abs() < 1.0e-6);
+            assert_eq!(weapon_charge_shake(weapon, state, 5_000, 5_500), Some(0.15));
+            assert_eq!(weapon_charge_shake(weapon, state, 5_000, 6_500), Some(0.2));
+            assert_eq!(weapon_charge(weapon, state, 5_000, 4_900).unwrap().progress, 0.0);
+        }
+        assert!(weapon_charge(WP_BLASTER, WEAPON_CHARGING, 0, 2_000).is_none());
+        assert!(weapon_charge(WP_BOWCASTER, WEAPON_CHARGING_ALT, 0, 2_000).is_none());
+        assert!(weapon_charge(WP_BRYAR_PISTOL, WEAPON_CHARGING, 0, 2_000).is_none());
+        assert!(weapon_charge(WP_DEMP2, WEAPON_CHARGING, 0, 2_000).is_none());
+        assert!(weapon_charge(WP_BRYAR_PISTOL, 0, 0, 2_000).is_none());
+    }
+
+    #[test]
+    fn taystjk_charge_sprite_is_immediate_muzzle_attached_and_not_emitted_idle() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(5_500);
+        let muzzle = [12.0, -5.0, 24.0];
+        fx.weapon_charge_sprite(muzzle, WP_BOWCASTER, WEAPON_CHARGING, 5_000);
+        assert_eq!(fx.immediate_draws.len(), 1);
+        match &fx.immediate_draws[0] {
+            FxDraw::Sprite { origin, radius, rotation, rgba, shader, .. } => {
+                assert_eq!(*origin, muzzle);
+                assert_eq!(shader, "gfx/effects/greenFrontFlash");
+                assert!((1.5..3.0).contains(radius));
+                assert!((0.0..360.0).contains(rotation));
+                assert_eq!(*rgba, [255, 255, 255, 179]);
+            }
+            other => panic!("expected sprite, got {other:?}"),
+        }
+        fx.weapon_charge_sprite(muzzle, WP_BOWCASTER, 0, 5_000);
+        assert_eq!(fx.immediate_draws.len(), 1, "idle must not spawn a charge glow");
+    }
 
     #[test]
     fn zero_delay_map_runner_uses_worker_cadence_without_throttling_authored_delay() {
@@ -5515,6 +6065,7 @@ mod event_beam_tests {
         }
         PresentationEvent {
             receive_sequence: 7,
+            predicted_fire_command_time: None,
             source_entity_num: 40,
             entity_num: 40,
             event: kind,

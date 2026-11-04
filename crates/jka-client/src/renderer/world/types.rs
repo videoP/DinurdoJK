@@ -492,6 +492,7 @@ impl WorldGpu {
 }
 
 pub(in crate::renderer) struct WorldGpu {
+    pub(in crate::renderer) collision_mesh: Option<crate::renderer::collision_world::CollisionGpuMesh>,
     /// Immutable index source retained for material-only AUTO4 recipe rebinding.
     pub(in crate::renderer) remap_index_source: Arc<Vec<u32>>,
     /// Remap-only reuse key; never consulted by frame/draw code.

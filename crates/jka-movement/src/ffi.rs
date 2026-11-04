@@ -54,6 +54,19 @@ unsafe extern "C" {
         state: *mut PlayerAngleState,
         result: *mut PlayerAngleResult,
     ) -> i32;
+    pub fn jk2_cg_g2_player_angles(
+        version: i32,
+        input: *const PlayerAngleEntity,
+        time: i32,
+        lerp_origin: *const f32,
+        lerp_angles: *const f32,
+        frametime: i32,
+        ci_legs: i32,
+        ci_torso: i32,
+        motion_matrix: *const f32,
+        state: *mut PlayerAngleState,
+        result: *mut PlayerAngleResult,
+    ) -> i32;
     pub fn jka_player_jump_level(player: *mut c_void, level: i32);
     pub fn jka_player_knockback(player: *mut c_void, velocity: *const f32, duration: i32);
     pub fn jka_player_set_noclip(player: *mut c_void, enabled: i32);

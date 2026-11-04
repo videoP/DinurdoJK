@@ -383,7 +383,7 @@ impl App {
     pub(in crate::app) fn choose_missing_map_autodownload(&mut self) {
         if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
             self.console_status = "JK2 AUTODOWNLOAD IS NOT IMPLEMENTED YET".into();
-            self.push_console_line("^3Install the JK2 map PK3 under <client>/jk2/base, then retry. JK2 downloads require their own package rules.");
+            self.push_console_line("^3Install the JK2 map PK3 under fs_jk2basepath (or fs_jk2basepath/<modname> for a JK2 mod), then retry. JK2 downloads require their own package rules.");
             self.egui_repaint_requested = true;
             return;
         }
@@ -410,6 +410,7 @@ impl App {
         self.live_missing_map_authorized = false;
         self.live_auto_download_requested = true;
         self.console_status = "CONNECTING TO GET SERVER DOWNLOAD LIST...".into();
+        self.publish_ui();
         self.continue_live_after_missing_map_choice();
     }
 

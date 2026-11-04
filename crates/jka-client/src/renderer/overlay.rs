@@ -19,12 +19,94 @@ fn ui_shader_icon_index(source: f32) -> Option<usize> {
 }
 
 /// Unified shader cache key: native icon indices first, then extension slots.
+const MAX_UI_HUD_ATLAS_IMAGE_SLOTS: usize = 128; // script APIs remain capped at 32
+const USER_SHADER_INDEX_BASE: usize = ui::ICON_NAMES.len() + MAX_UI_HUD_ATLAS_IMAGE_SLOTS;
+
+fn ui_user_shader_draw_index(source: f32) -> Option<usize> {
+    let index = source - ui::EXT_USER_SHADER_SOURCE_BASE;
+    if index >= 0.0 && index < (64 * crate::extensions::MAX_HUD_COMMANDS) as f32
+        && index.fract() == 0.0 { Some(index as usize) } else { None }
+}
+
 fn ui_shader_material_index(source: f32) -> Option<usize> {
+    if let Some(index) = ui_user_shader_draw_index(source) {
+        return Some(USER_SHADER_INDEX_BASE + index);
+    }
     if let Some(index) = ui_shader_icon_index(source) { return Some(index); }
     let index = source - ui::EXT_IMAGE_SHADER_SOURCE_BASE;
-    if index >= 0.0 && index < crate::extensions::MAX_HUD_IMAGES as f32
+    if index >= 0.0 && index < MAX_UI_HUD_ATLAS_IMAGE_SLOTS as f32
         && index.fract() == 0.0
     { Some(ui::ICON_NAMES.len() + index as usize) } else { None }
+}
+
+const MAX_HUD_SHADED_DRAWS: usize = 128;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(in crate::renderer) struct HudShaderUniform {
+    atlas_rect: [f32; 4],
+    values: [f32; 4],
+    clock: [f32; 4],
+}
+
+pub(in crate::renderer) struct HudShaderGpu {
+    layout: wgpu::PipelineLayout,
+    uniforms: wgpu::Buffer,
+    group: wgpu::BindGroup,
+    stride: usize,
+    pending: Vec<u8>,
+    // A shader can draw into either the native sRGB UI view or its encoded
+    // UNORM alias (RGBA UNORM for the HDR UI canvas). Pipeline targets must
+    // exactly match the active render-pass attachment's format.
+    pipelines: HashMap<String, HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
+    requested: HashMap<String, HashMap<wgpu::TextureFormat, u64>>,
+}
+
+impl HudShaderGpu {
+    fn new(device: &wgpu::Device, atlas_layout: &wgpu::BindGroupLayout) -> Self {
+        let stride = device.limits().min_uniform_buffer_offset_alignment.max(256) as usize;
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Extension HUD WGSL uniforms"),
+            size: (stride * MAX_HUD_SHADED_DRAWS) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Extension HUD WGSL params layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<HudShaderUniform>() as u64),
+                },
+                count: None,
+            }],
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Extension HUD WGSL params"), layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniforms, offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<HudShaderUniform>() as u64),
+                }),
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Extension HUD WGSL pipeline layout"),
+            bind_group_layouts: &[Some(atlas_layout), Some(&uniform_layout)],
+            immediate_size: 0,
+        });
+        Self { layout, uniforms, group, stride, pending: Vec::new(), pipelines: HashMap::new(), requested: HashMap::new() }
+    }
+
+    fn append(&mut self, uniform: HudShaderUniform) -> Option<u32> {
+        let slot = self.pending.len() / self.stride;
+        if slot >= MAX_HUD_SHADED_DRAWS { return None; }
+        self.pending.extend_from_slice(bytemuck::bytes_of(&uniform));
+        self.pending.resize((slot + 1) * self.stride, 0);
+        Some((slot * self.stride) as u32)
+    }
 }
 
 pub(in crate::renderer) struct PendingUiLevelshot {
@@ -104,6 +186,7 @@ struct UiExtImageResult {
     wanted: Vec<String>,
     first_new: usize,
     pixels: Vec<Option<Vec<u8>>>,
+    source_dimensions: Vec<Option<[u32; 2]>>,
     shader_flags: Vec<bool>,
     shader_stages: Vec<(usize, Vec<crate::fx::draw::FxMaterial>)>,
 }
@@ -139,6 +222,7 @@ impl UiExtImageLoader {
                     let _ = complete.send(UiExtImageResult {
                         wanted, first_new,
                         pixels: vec![None; count],
+                        source_dimensions: vec![None; count],
                         shader_flags: vec![false; count],
                         shader_stages: Vec::new(),
                     });
@@ -162,7 +246,7 @@ impl UiExtImageLoader {
                     rverbose!(2, "Extension HUD shader library: {warning}");
                 }
             }
-            let (pixels, shader_flags) = decode_ui_extension_image_cells(
+            let (pixels, shader_flags, source_dimensions) = decode_ui_extension_image_cells(
                 &mut assets, cache.shaders.as_ref(), &wanted[first_new..],
             );
             let mut shader_stages = Vec::new();
@@ -188,7 +272,7 @@ impl UiExtImageLoader {
             }
             drop(cache);
             let _ = complete.send(UiExtImageResult {
-                wanted, first_new, pixels, shader_flags, shader_stages,
+                wanted, first_new, pixels, source_dimensions, shader_flags, shader_stages,
             });
         });
         if queued { self.pending = true; }
@@ -206,6 +290,7 @@ impl Renderer {
         ui_state.icon_atlas_uvs.clone_from(&self.ui_state.icon_atlas_uvs);
         ui_state.icon_shader_flags.clone_from(&self.ui_state.icon_shader_flags);
         ui_state.extension_shader_flags.clone_from(&self.ui_state.extension_shader_flags);
+        ui_state.extension_image_dimensions.clone_from(&self.ui_state.extension_image_dimensions);
         // Likewise the clean font: loaded once by the renderer, never by the app.
         ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
         ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
@@ -230,9 +315,18 @@ impl Renderer {
         zoom_scope: Option<ui::UiZoomScope>,
         rocket_lock: Option<ui::UiRocketLock>,
     ) {
+        // The static crosshair is cached in the transient HUD buffer, whereas
+        // zoomMode changes arrive through this lightweight per-tick command.
+        // Rebuild that buffer on scope entry/exit only, not on every zoom frame.
+        let zoom_was_active = self.ui_state.zoom_scope.is_some();
         self.ui_state.zoom_scope = zoom_scope;
         self.ui_state.rocket_lock = rocket_lock;
         self.load_ui_icons_if_needed();
+        if zoom_was_active != self.ui_state.zoom_scope.is_some()
+            && self.ui_state.crosshair.scope_mode != 1
+        {
+            self.rebuild_transient_ui();
+        }
     }
 
     pub(in crate::renderer) fn set_extension_hud(
@@ -240,7 +334,22 @@ impl Renderer {
         widgets: Vec<crate::extensions::PlacedHudWidget>,
         hidden: crate::extensions::NativeHudMask,
         images: Vec<String>,
+        shaders: Vec<(String, String)>,
     ) {
+        if self.hud_shader_sources != shaders {
+            self.hud_shader_sources = shaders;
+            if self.hud_shader_sources.is_empty() {
+                // Disabling extensions releases their shader GPU state.
+                self.hud_shader_gpu = None;
+            } else {
+                let device = &self.device;
+                let atlas_layout = &self.ui_texture_layout;
+                let gpu = self.hud_shader_gpu.get_or_insert_with(||
+                    HudShaderGpu::new(device, atlas_layout));
+                gpu.pipelines.clear();
+                gpu.requested.clear();
+            }
+        }
         if self.ui_state.extension_hud == widgets
             && self.ui_state.native_hidden == hidden
             && self.ui_state.extension_images == images
@@ -255,6 +364,51 @@ impl Renderer {
         self.rebuild_dynamic_ui();
     }
 
+    /// Lazily build only active shader variants on the existing background PSO
+    /// worker. No shader-module compilation occurs in normal render frames.
+    fn ensure_hud_shader_pipeline(&mut self, name: &str, format: wgpu::TextureFormat) {
+        if self.hud_shader_gpu.as_ref().is_none_or(|gpu|
+            gpu.pipelines.get(name).is_some_and(|variants| variants.contains_key(&format))) {
+            return;
+        }
+        let Some((_, source)) = self.hud_shader_sources.iter().find(|(key, _)| key == name) else { return };
+        let id = crate::renderer::pipeline_hash(&(name, source, format));
+        // Each (shader, attachment format) pair needs its own job slot. The
+        // worker replaces pending jobs sharing a slot, even if their hashes
+        // differ, so the UNORM variant must not evict its sRGB counterpart.
+        let slot = crate::renderer::pipeline_hash(&(name, format)) as u32;
+        let key = crate::renderer::PipelineJobKey::new("hud-user-wgsl", slot, id);
+        if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+            if let Some(gpu) = self.hud_shader_gpu.as_mut() {
+                gpu.pipelines.entry(name.to_string()).or_default().insert(format, pipeline);
+            }
+            return;
+        }
+        // Poll only the job state after the initial request. Avoid WGSL or
+        // WGPU handle cloning on the render thread while it compiles.
+        let Some(gpu) = self.hud_shader_gpu.as_ref() else { return };
+        if gpu.requested.get(name).and_then(|variants| variants.get(&format)) == Some(&id) {
+            return;
+        }
+        let device = self.device.clone();
+        let layout = gpu.layout.clone();
+        let shader_body = source.clone();
+        if self.pipeline_jobs.request(key, "Rhai extension HUD WGSL", move || {
+            let combined = format!("{}\n{}\n{}",
+                include_str!("../hud_extension_shader_header.wgsl"), shader_body,
+                include_str!("../hud_extension_shader_footer.wgsl"));
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Rhai extension HUD WGSL"),
+                source: wgpu::ShaderSource::Wgsl(combined.into()),
+            });
+            crate::renderer::create_ui_pipeline(&device, &layout, &shader, format)
+        }) {
+            if let Some(gpu) = self.hud_shader_gpu.as_mut() {
+                gpu.requested.entry(name.to_string()).or_default().insert(format, id);
+            }
+        }
+    }
+
     /// Poll background shader jobs at UI cadence, not at render frame rate.
     /// Upload only the small retained HUD batch when the integer count changes.
     pub(in crate::renderer) fn refresh_shader_compile_progress(&mut self) {
@@ -263,6 +417,7 @@ impl Renderer {
             completed: progress.finished,
             total: progress.total,
             skipped: false,
+            no_work: false,
         });
         let stage = if status.is_some() {
             crate::pipeline_jobs::world_pipeline_stage().map(|stage| format!(
@@ -425,7 +580,7 @@ impl Renderer {
                 if gametype >= crate::cgame::GT_TEAM
                     && gametype != crate::cgame::GT_SIEGE && jedi_v_merc != "1"
                 {
-                    if let Ok(mut assets) = AssetSearchPath::open_game(
+                    if let Ok(assets) = AssetSearchPath::open_game(
                         &self.base, self.detail_texture_game.as_deref(),
                     ) {
                         let _ = crate::cgame::validate_skin_for_team(
@@ -569,6 +724,7 @@ impl Renderer {
                 );
                 self.ui_ext_image_key.clear();
                 self.ui_state.extension_shader_flags.clear();
+                self.ui_state.extension_image_dimensions.clear();
                 self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
                 self.rebuild_ui_bind_group();
             }
@@ -577,12 +733,20 @@ impl Renderer {
 
         // A non-prefix update is a full HUD reload, not a request to reassign
         // existing cell indices. Results from the old request are discarded.
-        if !wanted.starts_with(&self.ui_ext_image_key) {
+        let atlas_rows = ui_extension_atlas_rows(wanted.len());
+        let atlas_height = atlas_rows * ui::EXT_IMAGE_CELL;
+        // Native JK2 can need more artwork than the 32 script-controlled slots.
+        // Grow the GPU atlas *only when needed*, never on the competitive HUD path.
+        if !wanted.starts_with(&self.ui_ext_image_key)
+            || self._ui_ext_images._texture.size().height != atlas_height
+        {
             self._ui_ext_images = upload_texture(
-                &self.device, &self.queue, &blank_ui_extension_atlas(),
+                &self.device, &self.queue, &blank_ui_extension_atlas_for_count(wanted.len()),
             );
             self.ui_ext_image_key.clear();
+            self.ui_ext_image_loader = None;
             self.ui_state.extension_shader_flags.clear();
+            self.ui_state.extension_image_dimensions.clear();
             self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
             self.rebuild_ui_bind_group();
         }
@@ -627,6 +791,7 @@ impl Renderer {
                     );
                 }
                 self.ui_state.extension_shader_flags.extend(batch.shader_flags);
+                self.ui_state.extension_image_dimensions.extend(batch.source_dimensions);
                 for (index, stages) in batch.shader_stages {
                     self.ui_icon_shader_materials.insert(index, stages);
                 }
@@ -642,14 +807,7 @@ impl Renderer {
 
         if wanted == self.ui_ext_image_key { return; }
         if self.ui_ext_image_loader.is_none() {
-            // Until the worker finishes, new HUD image slots must sample a
-            // correctly sized transparent atlas, not the startup 1x1 dummy.
-            if self.ui_ext_image_key.is_empty() {
-                self._ui_ext_images = upload_texture(
-                    &self.device, &self.queue, &blank_ui_extension_atlas(),
-                );
-                self.rebuild_ui_bind_group();
-            }
+            // Atlas allocation already matches wanted.len() above.
             self.ui_ext_image_loader = Some(UiExtImageLoader::start(
                 self.base.clone(), self.detail_texture_game.clone(),
             ));
@@ -736,17 +894,20 @@ impl Renderer {
             return;
         }
 
+        // TaystJK supports dedicated 16:9 levelshots. Prefer them when the
+        // viewport is wide, then fall back to the stock 4:3 qpath. Neither
+        // image is ever cover-cropped by the native loading renderer.
         let path = format!("levelshots/{}", pending.map_name);
-        let Some(data) = try_load_texture_asset(
-            &self.base,
-            pending.game.as_deref(),
-            &path,
-            true,
-            false,
-            true,
-            "UI levelshot",
-        ) else {
-            eprintln!("UI levelshot: no image resolved for {path}; keeping menu/art/unknownmap_mp");
+        let wide = format!("levelshots_16_9/{}", pending.map_name);
+        let prefer_wide = self.config.width as f32 / self.config.height.max(1) as f32 >= 1.5;
+        let data = (if prefer_wide {
+            try_load_texture_asset(&self.base,pending.game.as_deref(),&wide,
+                true,false,true,"UI widescreen levelshot")
+        } else {None}).or_else(||try_load_texture_asset(
+            &self.base,pending.game.as_deref(),&path,
+            true,false,true,"UI levelshot"));
+        let Some(data) = data else {
+            eprintln!("UI levelshot: no image resolved for {path}; keeping unknown-map art");
             return;
         };
 
@@ -756,25 +917,40 @@ impl Renderer {
         self._ui_splash = image;
         self.ui_binding_is_unknown_map = false;
         self.rebuild_ui_bind_group();
-        // Cover-mode geometry depends on the source dimensions.
+        // Rebuild the retained UI after changing the bound artwork.
         self.rebuild_retained_ui();
     }
 
-    /// Encoded JKA 2D is enabled only when the destination is the *actual*
-    /// compatible SDR swapchain image. Never alias HDR, CRT, SMAA, Studio or
-    /// early-submit intermediates, and never introduce a framebuffer transfer.
+    /// The legacy 2D material uses the encoded component values of an SDR
+    /// target. Swapchain aliases need surface support; owned offscreen textures
+    /// explicitly advertise the matching UNORM view without allocating pixels.
+    /// Native HDR's existing Rgba8Unorm UI canvas is also an encoded target;
+    /// its established compositor decodes the complete premultiplied UI layer.
     pub(in crate::renderer) fn native_2d_encoded_surface_eligible(&self) -> bool {
-        self.hdr_output.is_none()
-            && self.offscreen_output.is_none()
-            && self.config.format.is_srgb()
-            && self.surface_unorm_alias_supported
+        self.hdr_output.is_some() || (self.config.format.is_srgb()
+            && (self.surface_unorm_alias_supported || self.offscreen_output.is_some()))
     }
 
     /// Prepare both ordinary and authored shader stages together. Until all
     /// required lazy PSOs are ready, draw the *whole* overlay with the normal
     /// sRGB pipeline so no mixed-space stages or pipeline validation errors occur.
     pub(in crate::renderer) fn ensure_encoded_2d_pipelines(&mut self) -> bool {
-        let format = self.config.format.remove_srgb_suffix();
+        let format = if self.hdr_output.is_some() {
+            wgpu::TextureFormat::Rgba8Unorm
+        } else {
+            self.config.format.remove_srgb_suffix()
+        };
+        if self.ui_encoded_format != Some(format) {
+            // HDR switching changes the output format (BGRA to RGBA).
+            // Keep no stale PSOs around; each async job is keyed by its format.
+            self.ui_encoded_pipeline = None;
+            self.screen_fx_encoded_pipelines.clear();
+            if let Some(gamma) = self.ui_gamma_native.as_mut() {
+                gamma.encoded_pipeline = None;
+                gamma.encoded_fx_pipelines.clear();
+            }
+            self.ui_encoded_format = Some(format);
+        }
         // HardwareSceneOnly must not disable the encoded 2D target. Prepare a
         // gamma-aware variant of BOTH the implicit HUD material and authored
         // screen-FX stages, all targeting the same UNORM view without a copy.
@@ -1139,6 +1315,22 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn submit_egui(&mut self, frame_view: &wgpu::TextureView) {
+        self.submit_egui_impl(frame_view, false, false);
+    }
+
+    pub(in crate::renderer) fn submit_egui_deferred_hdr(&mut self, frame_view: &wgpu::TextureView) {
+        self.submit_egui_impl(frame_view, true, false);
+    }
+
+    /// Loading dialogs are painted over the native loading screen. In encoded
+    /// HDR mode that screen and egui share the same UI texture: don't clear
+    /// the native bars before painting the dialog over them.
+    pub(in crate::renderer) fn submit_egui_deferred_hdr_over_native(&mut self, frame_view: &wgpu::TextureView) {
+        self.submit_egui_impl(frame_view, true, true);
+    }
+
+    fn submit_egui_impl(&mut self, frame_view: &wgpu::TextureView, defer_hdr_composite: bool,
+        preserve_native_hdr_ui: bool) {
         if !self.egui_active || (self.egui_paint_jobs.is_empty() && !self.neon_chrome_wanted()) {
             return;
         }
@@ -1188,7 +1380,12 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if (self.hdr_output.is_some() || compensate_ui) && !chrome_drawn { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load },
+                        load: if (self.hdr_output.is_some() || compensate_ui)
+                            && !chrome_drawn && !preserve_native_hdr_ui {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1218,8 +1415,10 @@ impl Renderer {
             pass.set_bind_group(0, &resources.group, &[]);
             pass.draw(0..3, 0..1);
         }
-        if let Some(output) = &self.hdr_output {
-            output.composite_ui(&mut encoder, frame_view);
+        if !defer_hdr_composite {
+            if let Some(output) = &self.hdr_output {
+                output.composite_ui(&mut encoder, frame_view);
+            }
         }
         let egui_command_buffer = encoder.finish();
         self.queue.submit(
@@ -1325,9 +1524,11 @@ impl Renderer {
     pub(in crate::renderer) fn prepare_ui_icon_shaders(&mut self) {
         self.ui_icon_shader_batches.clear();
         self.ui_icon_shader_vertices.clear();
+        if let Some(gpu) = self.hud_shader_gpu.as_mut() { gpu.pending.clear(); }
         if self.ui_state.video.skip_ui ||
             !(self.ui_icons_loaded && self.ui_state.icon_shader_flags.iter().any(|&flag| flag)
-              || self.ui_state.extension_shader_flags.iter().any(|&flag| flag))
+              || self.ui_state.extension_shader_flags.iter().any(|&flag| flag)
+              || !self.hud_shader_sources.is_empty())
         { return; }
         // Collect only the tagged triangles. In practice this is the small
         // handful of scope/Force icons on screen, not the whole HUD.
@@ -1356,8 +1557,57 @@ impl Renderer {
         // Reuse resolved frame textures/PSOs. The resolver is never used in
         // the no-shader path, nor on subsequent frames for the same icon.
         let seconds = self.frame_time();
+        let gamma_active = self.ui_gamma_active();
+        let srgb_output = self.config.format.is_srgb();
         for (layer, original_start, index, quad) in segments {
             let original_end = original_start + quad.len() as u32;
+            if index >= USER_SHADER_INDEX_BASE {
+                let command_index = index - USER_SHADER_INDEX_BASE;
+                let widget_index = command_index / crate::extensions::MAX_HUD_COMMANDS;
+                let command_index = command_index % crate::extensions::MAX_HUD_COMMANDS;
+                let command = self.ui_state.extension_hud.get(widget_index)
+                    .and_then(|w| w.widget.commands.get(command_index));
+                if let Some(crate::extensions::HudCommand::ShaderImage {
+                    name, shader, params, ..
+                }) = command {
+                    let found = self.hud_shader_sources.iter().any(|(key, _)| key == shader);
+                    let source_index = self.ui_state.extension_images.iter().position(|v| v == name);
+                    if found {
+                        if let (Some(source_index), Some(gpu)) = (source_index, self.hud_shader_gpu.as_mut()) {
+                            let (uv0, uv1) = ui::extension_image_cell_uv_for_count(source_index, self.ui_state.extension_images.len());
+                            let uniform = HudShaderUniform {
+                                atlas_rect: [uv0[0], uv0[1], uv1[0]-uv0[0], uv1[1]-uv0[1]],
+                                values: *params,
+                                clock: [seconds, self.gamma,
+                                    if gamma_active { 1.0 } else { 0.0 },
+                                    if srgb_output { 1.0 } else { 0.0 }],
+                            };
+                            if let Some(offset) = gpu.append(uniform) {
+                                if self.ui_icon_shader_vertices.len() + quad.len() <= 16_384 {
+                                    let start = self.ui_icon_shader_vertices.len() as u32;
+                                    self.ui_icon_shader_vertices.extend(quad.iter().map(|v| {
+                                        let mut v = *v;
+                                        v.textured = ui::EXT_IMAGE_TEXTURE_SOURCE;
+                                        v
+                                    }));
+                                    self.ui_icon_shader_batches.push(UiIconShaderBatch {
+                                        layer, original_start, original_end,
+                                        stage: ScreenFxBatch {
+                                            range: start..self.ui_icon_shader_vertices.len() as u32,
+                                            blend: FxBlend::Alpha, texture_key: None,
+                                        },
+                                        user: Some((shader.clone(), offset)),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Missing shader, image, or budget: suppress the custom tag.
+                // The shader is optional and cannot corrupt the stock pipeline.
+                continue;
+            }
             // Every shader-tagged span must be excluded from the native UI
             // pipeline even if its authored material is missing/unrenderable.
             self.ui_icon_shader_batches.push(UiIconShaderBatch {
@@ -1365,6 +1615,7 @@ impl Renderer {
                 stage: ScreenFxBatch {
                     range: 0..0, blend: FxBlend::Alpha, texture_key: None,
                 },
+                user: None,
             });
             if !self.ui_icon_shader_materials.contains_key(&index) {
                 if self.ui_icon_shader_resolver.is_none() {
@@ -1422,7 +1673,7 @@ impl Renderer {
                     // Remap them into the original image's 0..1 UV domain
                     // before applying authored tcMods and sampling stage maps.
                     if index >= ui::ICON_NAMES.len() {
-                        let (uv0, uv1) = ui::extension_image_cell_uv(index - ui::ICON_NAMES.len());
+                        let (uv0, uv1) = ui::extension_image_cell_uv_for_count(index - ui::ICON_NAMES.len(), self.ui_state.extension_images.len());
                         v.uv = [
                             (v.uv[0] - uv0[0]) / (uv1[0] - uv0[0]),
                             (v.uv[1] - uv0[1]) / (uv1[1] - uv0[1]),
@@ -1445,12 +1696,40 @@ impl Renderer {
                         blend: stage.blend,
                         texture_key,
                     },
+                    user: None,
                 });
             }
             if shader_start == self.ui_icon_shader_vertices.len() {
                 rverbose!(1, "HUD shader icon {index}: no renderable stages");
             }
             self.ui_icon_shader_materials.insert(index, stages);
+        }
+        if let Some(gpu) = self.hud_shader_gpu.as_ref() {
+            if !gpu.pending.is_empty() {
+                self.queue.write_buffer(&gpu.uniforms, 0, &gpu.pending);
+            }
+        }
+        // Render with the already compiled pipeline, or display the original
+        // image while a first-use shader PSO is being prepared asynchronously.
+        let names: Vec<_> = self.ui_icon_shader_batches.iter()
+            .filter_map(|batch| batch.user.as_ref().map(|(name, _)| name.clone()))
+            .collect();
+        // Prepare the native and encoded attachment variants independently.
+        // Both remain cold until this extension actually draws an image shader.
+        // The encoded target can be BGRA UNORM or HDR's RGBA UNORM UI canvas.
+        let native_format = self.config.format;
+        let encoded_format = self.native_2d_encoded_surface_eligible().then(|| {
+            if self.hdr_output.is_some() {
+                wgpu::TextureFormat::Rgba8Unorm
+            } else {
+                native_format.remove_srgb_suffix()
+            }
+        }).filter(|&format| format != native_format);
+        for name in names {
+            self.ensure_hud_shader_pipeline(&name, native_format);
+            if let Some(format) = encoded_format {
+                self.ensure_hud_shader_pipeline(&name, format);
+            }
         }
         if !self.ui_icon_shader_vertices.is_empty() {
             self.queue.write_buffer(
@@ -1510,6 +1789,8 @@ impl Renderer {
         textures: &'a HashMap<String, ScreenFxTexture>,
         white: &'a wgpu::BindGroup,
         encoded: bool,
+        shader_target_format: wgpu::TextureFormat,
+        user_gpu: Option<&'a HudShaderGpu>,
     ) {
         if shader_batches.is_empty() {
             Self::draw_ui_batches(pass, ui_pipeline, ui_group,
@@ -1547,7 +1828,21 @@ impl Renderer {
                 {
                     let batch = &shader_batches[index].stage;
                     if !batch.range.is_empty() {
-                        if let Some(pipeline) = shaders.get(&batch.blend) {
+                        if let Some((name, offset)) = &shader_batches[index].user {
+                            // Do not draw the shader's source noise atlas
+                            // image as a rectangular placeholder before its
+                            // first-use PSO is ready. The extension's ordinary
+                            // images, frame and text remain visible meanwhile.
+                            if let Some(gpu) = user_gpu {
+                                if let Some(pipeline) = gpu.pipelines.get(name)
+                                    .and_then(|variants| variants.get(&shader_target_format)) {
+                                    pass.set_pipeline(pipeline);
+                                    pass.set_bind_group(0, ui_group, &[]);
+                                    pass.set_bind_group(1, &gpu.group, &[*offset]);
+                                    pass.draw(batch.range.clone(), 0..1);
+                                }
+                            }
+                        } else if let Some(pipeline) = shaders.get(&batch.blend) {
                             let group = batch.texture_key.as_ref()
                                 .and_then(|key| textures.get(key))
                                 .map_or(white, |texture| if encoded { &texture.encoded_bind_group } else { &texture.bind_group });
@@ -1641,7 +1936,12 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: if encoded && self.hdr_output.is_some()
+                            && (!self.egui_active || (self.egui_paint_jobs.is_empty() && !self.neon_chrome_wanted())) {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1690,6 +1990,12 @@ impl Renderer {
                 ui_pipelines,
                 &self.screen_fx_textures,
                 &self.screen_fx_white_bind_group, encoded,
+                if encoded {
+                    self.ui_encoded_format.expect("encoded 2D UI pipeline initialized")
+                } else {
+                    self.config.format
+                },
+                self.hud_shader_gpu.as_ref(),
             );
             // The single enemy-info icon is a standalone authored multi-stage
             // shader. It never samples the 64x64 UI icon atlas.
@@ -1956,6 +2262,25 @@ impl Renderer {
             }
 
             if let Some(player_names) = self.player_names.as_ref() {
+                // Unlike the legacy 640x480 projection, these markers follow
+                // the same late-latched, aspect-correct view used by the models.
+                // Off/restricted: leads is empty; no extra per-frame work.
+                for lead in player_names.leads.iter() {
+                    let project = |position: [f32; 3]| {
+                        let clip = view_proj * Vec3::from_array(position).extend(1.0);
+                        if clip.w <= 0.001 { return None; }
+                        let ndc = clip.truncate() / clip.w;
+                        if !(0.0..=1.0).contains(&ndc.z) { return None; }
+                        Some([(ndc.x * 0.5 + 0.5) * self.config.width.max(1) as f32,
+                              (0.5 - ndc.y * 0.5) * self.config.height.max(1) as f32])
+                    };
+                    let Some(current) = project(lead.current) else { continue; };
+                    if current[0] < 0.0 || current[0] >= self.config.width as f32
+                        || current[1] < 0.0 || current[1] >= self.config.height as f32 { continue; }
+                    let Some(predicted) = project(lead.predicted) else { continue; };
+                    ui::build_lead_indicator_vertices(&mut self.ui_transient_vertices,
+                        current, predicted, self.config.width, self.config.height);
+                }
                 for label in player_names.labels.iter() {
                     let clip = view_proj * Vec3::from_array(label.anchor).extend(1.0);
                     if clip.w <= 0.001 {
@@ -2300,12 +2625,20 @@ mod native_icon_atlas_tests {
     }
 }
 
-/// Full-size, fully transparent extension image atlas: `MAX_HUD_IMAGES` cells of
-/// `ui::EXT_IMAGE_CELL` squares, `ui::EXT_IMAGE_COLUMNS` per row. Allocated once;
-/// images are written into their cells as they are first needed.
+/// Atlas capacity in rows, with the 32-image Rhai budget unchanged.
+/// Native artwork uses additional rows only while a native HUD requests it.
+fn ui_extension_atlas_rows(wanted_count: usize) -> u32 {
+    (wanted_count.max(crate::extensions::MAX_HUD_IMAGES + 1) as u32)
+        .div_ceil(ui::EXT_IMAGE_COLUMNS)
+}
+
 pub(in crate::renderer) fn blank_ui_extension_atlas() -> TextureData {
+    blank_ui_extension_atlas_for_count(crate::extensions::MAX_HUD_IMAGES)
+}
+
+pub(in crate::renderer) fn blank_ui_extension_atlas_for_count(wanted_count: usize) -> TextureData {
     let cell = ui::EXT_IMAGE_CELL;
-    let rows = (crate::extensions::MAX_HUD_IMAGES as u32 + 1).div_ceil(ui::EXT_IMAGE_COLUMNS);
+    let rows = ui_extension_atlas_rows(wanted_count);
     let (width, height) = (ui::EXT_IMAGE_COLUMNS * cell, rows * cell);
     TextureData {
         label: "JKA UI extension image atlas".into(),
@@ -2352,7 +2685,8 @@ pub(in crate::renderer) fn load_ui_extension_images_with_shaders(
         Err(err) => { eprintln!("Extension HUD shader library: {err}"); None }
     };
     for warning in warnings { rverbose!(2, "Extension HUD shader library: {warning}"); }
-    decode_ui_extension_image_cells(&mut assets, library.as_ref(), names)
+    let (pixels, flags, _) = decode_ui_extension_image_cells(&mut assets, library.as_ref(), names);
+    (pixels, flags)
 }
 
 /// Shared pure CPU decoding path, for the async loader and unit tests. The
@@ -2361,34 +2695,36 @@ fn decode_ui_extension_image_cells(
     assets: &mut AssetSearchPath,
     library: Option<&std::collections::BTreeMap<String, jka_assets::shader::Shader>>,
     names: &[String],
-) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
+) -> (Vec<Option<Vec<u8>>>, Vec<bool>, Vec<Option<[u32; 2]>>) {
     let cell = ui::EXT_IMAGE_CELL;
     let flags: Vec<bool> = names.iter().map(|name| library.is_some_and(|library|
         ui_icon_has_authored_shader(library, name))).collect();
-    let pixels = names
+    let decoded: Vec<_> = names
         .iter().zip(flags.iter())
         .map(|(name, &authored)| {
-            if authored { return None; } // Authored materials use standalone stages.
+            if authored { return (None, None); } // Authored materials use standalone stages.
             let Some(image) = try_load_texture_asset_from_search_path(
                 assets, name, true, false, true, "extension HUD image",
             ) else {
                 eprintln!("Extension HUD image {name}: not found");
-                return None;
+                return (None, None);
             };
             let (source_w, source_h) = (image.width, image.height);
             let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba.into_vec()) else {
                 eprintln!("Extension HUD image {name}: unexpected pixel format");
-                return None;
+                return (None, None);
             };
-            Some(if source_w == cell && source_h == cell {
+            let pixels = if source_w == cell && source_h == cell {
                 source.into_raw()
             } else {
                 image::imageops::resize(&source, cell, cell, image::imageops::FilterType::Triangle)
                     .into_raw()
-            })
+            };
+            (Some(pixels), Some([source_w, source_h]))
         })
         .collect();
-    (pixels, flags)
+    let (pixels, dimensions): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
+    (pixels, flags, dimensions)
 }
 
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
@@ -2649,27 +2985,31 @@ pub(in crate::renderer) fn load_ui_loading_texture(
     base: &Path,
     game: Option<&Path>,
     levelshot_map_name: Option<&str>,
+    prefer_wide: bool,
 ) -> (TextureData, Option<[u32; 2]>) {
     if let Some(map_name) = levelshot_map_name {
         // Use the renderer's normal VFS/image resolver. Passing an extensionless
         // qpath intentionally gives levelshots the same format fallback rules as
         // every other generic texture load instead of maintaining a private list.
         let path = format!("levelshots/{map_name}");
-        if let Some(data) =
-            try_load_texture_asset(base, game, &path, true, false, true, "UI levelshot")
-        {
+        let wide = format!("levelshots_16_9/{map_name}");
+        let data = (if prefer_wide {
+            try_load_texture_asset(base, game, &wide, true, false, true, "UI widescreen levelshot")
+        } else {None}).or_else(||try_load_texture_asset(base, game, &path, true, false, true, "UI levelshot"));
+        if let Some(data) = data {
             let size = [data.width, data.height];
             return (data, Some(size));
         }
         eprintln!(
             "UI levelshot: no image resolved for {path}; falling back to menu/art/unknownmap_mp"
         );
-        return load_ui_unknown_map_texture(base, game);
+        return load_ui_unknown_map_texture(base, game, prefer_wide);
     }
 
-    if let Some(data) =
-        try_load_texture_asset(base, game, "menu/splash", true, false, true, "UI splash")
-    {
+    let splash = (if prefer_wide {
+        try_load_texture_asset(base, game, "menu/splash_16_9", true, false, true, "UI widescreen splash")
+    } else { None }).or_else(||try_load_texture_asset(base, game, "menu/splash", true, false, true, "UI splash"));
+    if let Some(data) = splash {
         let size = [data.width, data.height];
         return (data, Some(size));
     }
@@ -2693,7 +3033,16 @@ pub(in crate::renderer) fn load_ui_loading_texture(
 pub(in crate::renderer) fn load_ui_unknown_map_texture(
     base: &Path,
     game: Option<&Path>,
+    prefer_wide: bool,
 ) -> (TextureData, Option<[u32; 2]>) {
+    // Prefer the author-provided widescreen variant, as TaystJK does.
+    if prefer_wide {
+        if let Some(data) = try_load_texture_asset(base,game,"menu/art/unknownmap_mp_16_9",
+            true,false,true,"UI widescreen unknown map") {
+            let size=[data.width,data.height];
+            return (data,Some(size));
+        }
+    }
     if let Some(data) = try_load_texture_asset(
         base,
         game,
@@ -2902,6 +3251,8 @@ pub(in crate::renderer) struct UiIconShaderBatch {
     pub(in crate::renderer) original_start: u32,
     pub(in crate::renderer) original_end: u32,
     pub(in crate::renderer) stage: ScreenFxBatch,
+    /// Script-owned shader key and dynamic uniform byte offset, or stock FX.
+    pub(in crate::renderer) user: Option<(String, u32)>,
 }
 
 #[derive(Clone)]
@@ -2913,6 +3264,16 @@ pub(in crate::renderer) struct ScreenFxBatch {
 
 #[cfg(test)]
 mod extension_image_atlas_tests {
+    #[test]
+    fn native_jk2_can_grow_atlas_without_changing_the_extension_limit() {
+        assert_eq!(crate::extensions::MAX_HUD_IMAGES, 32);
+        let small = super::blank_ui_extension_atlas();
+        let jk2 = super::blank_ui_extension_atlas_for_count(76);
+        assert_eq!(small.width, jk2.width);
+        assert!(jk2.height > small.height);
+        assert!(jk2.width as usize * jk2.height as usize / (256 * 256) >= 76);
+    }
+
     use super::*;
 
     #[test]

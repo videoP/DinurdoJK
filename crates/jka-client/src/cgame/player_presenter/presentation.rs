@@ -1,6 +1,6 @@
 //! Presentation.
 use crate::cgame::player_presenter::{
-    angles_to_axis, bg_g2_player_angles, dismember_source_entity, dismember_source_ready,
+    angles_to_axis, bg_g2_player_angles, jk2_g2_player_angles, dismember_source_entity, dismember_source_ready,
     find_siege_class_visual, flatten_matrix3x4, foot_bolts_timed, footsteps,
     fpls_mode3_surface_hidden, ghoul2_entity_radius, ghoul2_lod_for_view, ghoul2_model_scale,
     ghoul2_render_origin, ghoul2_render_transform, model_bolt_matrix_timed,
@@ -19,6 +19,57 @@ use crate::cgame::player_presenter::{
     entity_is_mind_tricked,
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER, FP_SEE, PW_CLOAKED,
 };
+
+/// One 1x1 material per team for the collision-world experiment. These are
+/// created on first use, not during map load, and the dynamic model renderer
+/// uploads each material at most once via its existing texture cache.
+/// This replaces player-body textures, not player geometry or attached weapons.
+fn collision_world_player_texture(team: i32) -> Arc<crate::materials::TextureData> {
+    use std::sync::OnceLock;
+    fn solid(label: &str, rgb: [u8; 3]) -> Arc<crate::materials::TextureData> {
+        Arc::new(crate::materials::TextureData {
+            label: label.to_owned(),
+            source: None,
+            width: 1,
+            height: 1,
+            rgba: vec![rgb[0], rgb[1], rgb[2], 255].into(),
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: true,
+            srgb: true,
+        })
+    }
+    static BEIGE: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
+    static RED: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
+    static BLUE: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
+    match team {
+        crate::cgame::TEAM_RED => Arc::clone(RED.get_or_init(||
+            solid("collision-world-player-red", [158, 43, 39]))),
+        crate::cgame::TEAM_BLUE => Arc::clone(BLUE.get_or_init(||
+            solid("collision-world-player-blue", [43, 83, 158]))),
+        _ => Arc::clone(BEIGE.get_or_init(||
+            solid("collision-world-player-beige", [146, 105, 64]))),
+    }
+}
+
+/// All equipped Ghoul2 weapons and saber hilts reuse one opaque gunmetal
+/// texel in collision-world mode.  It is created only on first use, and the
+/// ordinary renderer's material cache shares it across players/models.
+pub(crate) fn collision_world_equipment_texture() -> Arc<crate::materials::TextureData> {
+    use std::sync::OnceLock;
+    static GUNMETAL: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
+    Arc::clone(GUNMETAL.get_or_init(|| Arc::new(crate::materials::TextureData {
+        label: "collision-world-equipment-gunmetal".to_owned(),
+        source: None,
+        width: 1,
+        height: 1,
+        rgba: vec![53, 61, 71, 255].into(),
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    })))
+}
 
 /// TaystJK `CG_Player` (`cg_players.c`): `EF_NODRAW` and
 /// `EF2_SHIP_DEATH` suppress *all* Ghoul2 presentation, not just shadows.
@@ -70,6 +121,11 @@ impl PlayerPresenter {
         }
     }
 
+    /// Right-hand attachment evaluated from the current player animation pose.
+    pub fn grapple_hand(&self, owner: u16) -> Option<[f32; 3]> {
+        self.grapple_hands.get(&owner).copied()
+    }
+
     pub fn present_snapshot_players(
         &mut self,
         entities: &[PresentedEntity],
@@ -82,6 +138,18 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        self.grapple_owners.clear();
+        self.grapple_hands.clear();
+        // Network missiles identify grapple owners in jaPRO / JA+. Reusing
+        // this set later in present_player keeps Ghoul2 bolt work strictly
+        // limited to actively grappling characters.
+        if game.is_japro() || game.is_japlus() {
+            for ent in entities.iter().filter(|ent| ent.entity_type == crate::cgame::ET_MISSILE) {
+                if let Some(owner) = crate::cgame::grapple::grapple_owner(ent, game) {
+                    self.grapple_owners.insert(owner);
+                }
+            }
+        }
         self.studio_bones.clear();
         self.studio_saber_tips.clear();
         crate::emotes::network::set_render_time(current_time);
@@ -1150,9 +1218,10 @@ impl PlayerPresenter {
         // Force-grip handoff must instead sample the exact normal player pose on
         // its first frame, then Rapier freezes that skinning pose internally.
         let rapier_corpse = corpse_ragdoll_requested && self.ragdolls.active();
+        let jk2_version = self.assets.jk2_version();
         let anim_blend = super::animation_blend_enabled();
         let swing_fix = if anim_blend { super::saber_swing_fix() } else { 0 };
-        let swing_eligible = model.humanoid && entity.entity_type == ET_PLAYER
+        let swing_eligible = jk2_version.is_none() && model.humanoid && entity.entity_type == ET_PLAYER
             && entity.state.field_i32("weapon") == Some(WP_SABER)
             && entity.state.field_i32("forceFrame").unwrap_or(0) == 0
             && entity.state.field_i32("m_iVehicleNum").unwrap_or(0) == 0
@@ -1258,19 +1327,51 @@ impl PlayerPresenter {
             };
             let angle_entity = player_angle_entity(entity);
             let angle_render_origin = ghoul2_render_origin(entity);
-            let mut angle_result = bg_g2_player_angles(
-                &angle_entity,
-                current_time,
-                angle_render_origin,
-                entity.angles,
-                frametime,
-                model_scale,
-                ci_legs,
-                ci_torso,
-                look_angles,
-                Some(&motion_matrix),
-                &mut runtime.player_angles,
-            )?;
+            // JK2 1.02 and 1.04 have different CG_G2PlayerAngles math;
+            // JKA alone uses OpenJK's BG_G2PlayerAngles. Both produce the
+            // same bone-command ABI consumed by our Ghoul2 animator.
+            let mut angle_result = if let Some(jk2) = jk2_version {
+                // The presented state carries JKA-renumbered IDs; the MVSDK
+                // cgame code tests JK2 anim/weapon/saberMove/eFlags values.
+                use jka_protocol::jk2::presentation as jk2_ids;
+                let anim = |value: i32| jk2_ids::wire_animation(value).unwrap_or(-1);
+                let mut jk2_entity = angle_entity;
+                jk2_entity.legs_anim = anim(angle_entity.legs_anim);
+                jk2_entity.torso_anim = anim(angle_entity.torso_anim);
+                jk2_entity.weapon = jk2_ids::wire_weapon(angle_entity.weapon).unwrap_or(0);
+                jk2_entity.saber_move = jk2_ids::wire_saber_move(angle_entity.saber_move).unwrap_or(0);
+                jk2_entity.e_flags = jk2_ids::wire_entity_flags(angle_entity.e_flags);
+                let result = jk2_g2_player_angles(
+                    jk2, &jk2_entity, current_time, angle_render_origin,
+                    entity.angles, frametime, anim(ci_legs), anim(ci_torso),
+                    Some(&motion_matrix), &mut runtime.player_angles,
+                )?;
+                if super::jk2_angle_debug() {
+                    let m = &motion_matrix;
+                    let spine = result.commands().iter()
+                        .map(|c| format!("{}=({:.1},{:.1},{:.1})", c.bone_name(), c.angles[0], c.angles[1], c.angles[2]))
+                        .collect::<Vec<_>>().join(" ");
+                    log::info!(
+                        "[JK2 ANGLES] v{jk2} ent={} t={current_time} ft={frametime} legs={} torso={} ci=({},{}) dir={} gnd={} \
+                         vel=({:.0},{:.0},{:.0}) look=({:.1},{:.1}) motionNegY=({:.2},{:.2},{:.2}) motionNegX=({:.2},{:.2},{:.2}) \
+                         root=({:.1},{:.1},{:.1}) torsoYaw={:.1} legsYaw={:.1} {spine}",
+                        entity.number, jk2_entity.legs_anim, jk2_entity.torso_anim, anim(ci_legs), anim(ci_torso),
+                        jk2_entity.movement_dir, jk2_entity.ground_entity_num,
+                        jk2_entity.velocity[0], jk2_entity.velocity[1], jk2_entity.velocity[2],
+                        entity.angles[0], entity.angles[1],
+                        -m[1], -m[5], -m[9], -m[0], -m[4], -m[8],
+                        result.legs_angles[0], result.legs_angles[1], result.legs_angles[2],
+                        runtime.player_angles.torso_yaw_angle, runtime.player_angles.legs_yaw_angle,
+                    );
+                }
+                result
+            } else {
+                bg_g2_player_angles(
+                    &angle_entity, current_time, angle_render_origin,
+                    entity.angles, frametime, model_scale, ci_legs, ci_torso,
+                    look_angles, Some(&motion_matrix), &mut runtime.player_angles,
+                )?
+            };
             runtime.spine_transition.apply(&mut angle_result, current_time, swing_fix,
                 swing_eligible, swing_boundary, swing_blend_ms);
             runtime.last_angle_time = current_time;
@@ -1283,7 +1384,7 @@ impl PlayerPresenter {
             for command in angle_result.commands() {
                 if command.flags & BONE_ANGLES_POSTMULT == 0 {
                     return Err(format!(
-                        "OpenJK BG_G2PlayerAngles emitted unsupported bone-angle flags {:#x} for {}",
+                        "G2PlayerAngles emitted unsupported bone-angle flags {:#x} for {}",
                         command.flags,
                         command.bone_name()
                     ));
@@ -1552,6 +1653,15 @@ impl PlayerPresenter {
         record_pose_eval(&mut self.perf, pose_started);
 
         let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);
+        if self.grapple_owners.contains(&entity.number) {
+            // TaystJK uses the Ghoul2 right-hand bolt, not the entity origin.
+            // Pose is already evaluated here, so no second skeleton pass.
+            if let Ok(Some(hand)) = model_bolt_origin_timed(
+                &mut self.perf, &model, &pose, render_axis, render_origin, "*r_hand",
+            ) {
+                self.grapple_hands.insert(entity.number, hand);
+            }
+        }
         if !ragdoll_requested {
             if let Some((active,_))=local_emote.as_ref(){
                 self.cosmetic_draws.extend(Self::emote_prop_draws(active,&model,&pose,render_axis,render_origin,entity.number));
@@ -1764,6 +1874,10 @@ impl PlayerPresenter {
             current_time,
         )?;
 
+        // FPLS keeps the posed local player and attached saber alive, but
+        // first-person must not submit body-mounted props (flags, hats/capes,
+        // jetpack). The carrier lights/other gameplay effects still run.
+        let show_body_attachments = submit_geometry && !first_person_saber;
         self.queue_player_powerups(
             entity,
             info.gametype,
@@ -1771,7 +1885,7 @@ impl PlayerPresenter {
             &pose,
             render_axis,
             render_origin,
-            submit_geometry,
+            show_body_attachments,
         )?;
 
         let cloak = self.cloak_visual(entity, current_time);
@@ -1853,6 +1967,30 @@ impl PlayerPresenter {
             fpls_surfaces.as_slice()
         } else {
             model.surfaces.as_slice()
+        };
+        // Flat one-texel player bodies in collision-world mode. Feeding this
+        // through the existing custom-material path also suppresses additional
+        // authored player material stages and tint overlays, so it removes
+        // texture bindings/draws instead of layering a colored pass on top.
+        // The override is limited to the body: sabers, held weapons, force FX,
+        // cloaking and server-enforced visibility still use their normal paths.
+        let flat_body = npc_model_request.is_none()
+            && crate::renderer::collision_world_only()
+            && look.ghost == crate::japro_cg::Ghost::None;
+        let body_custom = if flat_body {
+            Some((Some(collision_world_player_texture(info.team)),
+                DynamicModelAlphaMode::Opaque, false))
+        } else {
+            body_custom
+        };
+        let body_rgba = if flat_body {
+            // Preserve JKA's private-duel/bystander dimming even while the
+            // original material and rgbGen stages have been bypassed.
+            let shade = if look.duel_bubble { 50.0 / 255.0 }
+                else if look.dim { 0.2 } else { 1.0 };
+            [shade, shade, shade, body_rgba[3]]
+        } else {
+            body_rgba
         };
         let mut draws = self.render_glm_surfaces_tinted_selected(
             entity.number,
@@ -1958,6 +2096,7 @@ impl PlayerPresenter {
                 render_origin,
                 current_time,
                 entity_alpha,
+                !first_person_saber,
             ) {
                 self.report_saber_warning_once(entity.number, &format!("jetpack: {error}"));
             }
@@ -1991,6 +2130,7 @@ impl PlayerPresenter {
                 render_origin,
                 current_time,
                 entity_alpha,
+                submit_geometry,
             ) {
                 self.report_saber_warning_once(
                     entity.number,
@@ -2230,7 +2370,7 @@ impl PlayerPresenter {
                 }
             }
         }
-        if submit_geometry {
+        if show_body_attachments {
             self.queue_cosmetics(
                 entity,
                 info,

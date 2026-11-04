@@ -58,6 +58,8 @@ pub(in crate::scene) fn load_external_lightmap(
     map_name: &str,
     page: usize,
     prefer_hdr: bool,
+    map_overbright_bits: u8,
+    output_overbright_bits: u8,
 ) -> Result<Option<TextureData>, String> {
     if prefer_hdr {
         if let Some(image) = try_load_hdr_lightmap(assets, map_name, page)? {
@@ -78,6 +80,7 @@ pub(in crate::scene) fn load_external_lightmap(
         {
             let mut image = materials::decode_texture_data(path, &asset.bytes, true, false)?;
             image.source = Some(asset.source);
+            shift_lightmap_rgba(&mut image, map_overbright_bits, output_overbright_bits);
             if prefer_hdr {
                 materials::promote_lightmap_to_float(&mut image);
             }
@@ -199,5 +202,41 @@ pub(in crate::scene) fn embedded_deluxemap_texture(index: usize, page: &[u8]) ->
         mip_level_count: 1,
         clamp: true,
         srgb: false,
+    }
+}
+
+/// OpenJK R_ColorShiftLightingBytes. With matching map/output bits it is
+/// deliberately a no-op (the ordinary JKA and JK2 automatic configurations).
+/// Negative shifts use the inverse, rather than undefined signed C shifts.
+pub(in crate::scene) fn overbright_rgb(rgb: [u8; 3], map_bits: u8, output_bits: u8) -> [u8; 3] {
+    let difference = i32::from(map_bits) - i32::from(output_bits);
+    if difference == 0 { return rgb; }
+    let shift = difference.unsigned_abs().min(2);
+    let mut channels = rgb.map(|value| {
+        if difference > 0 { u32::from(value) << shift } else { u32::from(value) >> shift }
+    });
+    let peak = *channels.iter().max().unwrap_or(&0);
+    if peak > 255 {
+        for channel in &mut channels { *channel = *channel * 255 / peak; }
+    }
+    channels.map(|value| value as u8)
+}
+
+pub(in crate::scene) fn shift_lightmap_rgba(image: &mut TextureData, map_bits: u8, output_bits: u8) {
+    if map_bits == output_bits || image.rgba16f.is_some() { return; }
+    for pixel in image.rgba.chunks_exact_mut(4) {
+        let shifted = overbright_rgb([pixel[0], pixel[1], pixel[2]], map_bits, output_bits);
+        pixel[0..3].copy_from_slice(&shifted);
+    }
+}
+
+#[cfg(test)]
+mod overbright_tests {
+    use super::overbright_rgb;
+    #[test]
+    fn normalizes_without_destroying_chroma() {
+        assert_eq!(overbright_rgb([200, 100, 50], 1, 0), [255, 127, 63]);
+        assert_eq!(overbright_rgb([32, 64, 128], 0, 1), [16, 32, 64]);
+        assert_eq!(overbright_rgb([200, 100, 50], 1, 1), [200, 100, 50]);
     }
 }

@@ -10,6 +10,10 @@ pub(crate) fn saber_swing_fix() -> u8 { MODE.load(Ordering::Relaxed) }
 pub(crate) fn set_saber_swing_fix(mode: u8) { MODE.store(mode.min(2), Ordering::Relaxed); }
 pub(crate) fn animation_blend_enabled() -> bool { ANIM_BLEND.load(Ordering::Relaxed) }
 pub(crate) fn set_animation_blend(enabled: bool) { ANIM_BLEND.store(enabled, Ordering::Relaxed); }
+// Diagnostic: log JK2 CG_G2PlayerAngles inputs/outputs every frame.
+static JK2_ANGLE_DEBUG: AtomicBool = AtomicBool::new(false);
+pub(crate) fn jk2_angle_debug() -> bool { JK2_ANGLE_DEBUG.load(Ordering::Relaxed) }
+pub(crate) fn set_jk2_angle_debug(enabled: bool) { JK2_ANGLE_DEBUG.store(enabled, Ordering::Relaxed); }
 
 pub(super) fn split_boundary(previous: (i32, i32), next: (i32, i32)) -> bool {
     previous.0 >= 0 && previous.1 >= 0

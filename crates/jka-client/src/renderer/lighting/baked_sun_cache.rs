@@ -414,7 +414,7 @@ impl Renderer {
     /// All callers meet here: sun changes, removal controls, AO uploads and
     /// worker completion only invalidate inputs; warm frames allocate nothing.
     pub(in crate::renderer) fn sync_baked_sun_lightmap_cache(&mut self) {
-        let sun = self.active_sun();
+        let sun = self.relit_celestial();
         let Some(world) = self.world.as_ref() else {
             return;
         };
@@ -442,7 +442,7 @@ impl Renderer {
                 moving_strength: self.sun_shadow_strength,
                 mode: if !sun_ready {
                     0.0
-                } else if self.sun_lighting {
+                } else if self.sun_lighting || (self.sun_override && self.blue_water_night()) {
                     1.0
                 } else {
                     2.0

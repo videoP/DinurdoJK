@@ -354,38 +354,45 @@ impl App {
 
         let resolutions =
             Self::available_resolutions(self.window.as_deref(), self.video.resolution);
+        let desktop = self.selected_desktop_resolution();
         theme::row(
             ui,
             "Resolution",
-            "Backbuffer size the world is rendered at. Lower resolutions cost \
-             less on the GPU at the price of sharpness. Needs Apply.",
+            "Desktop uses the current monitor's desktop pixel resolution, even after restarting the game. \
+             Fixed sizes override it. Lower resolutions cost less on the GPU at the price of sharpness. Needs Apply.",
             theme::Reset::Video(ui::VIDEO_ROW_RESOLUTION),
             |ui| {
+                let current = if self.video.resolution_desktop {
+                    format!("Desktop ({} × {})", desktop[0], desktop[1])
+                } else {
+                    format!("{} × {}", self.video.resolution[0], self.video.resolution[1])
+                };
                 egui::ComboBox::from_id_salt("video_resolution")
-                    .selected_text(format!(
-                        "{} × {}",
-                        self.video.resolution[0], self.video.resolution[1]
-                    ))
+                    .selected_text(current)
                     .width(190.0)
                     .show_ui(ui, |ui| {
+                        if ui.selectable_label(
+                            self.video.resolution_desktop,
+                            format!("Desktop ({} × {})", desktop[0], desktop[1]),
+                        ).clicked() {
+                            self.set_desktop_resolution();
+                        }
+                        ui.separator();
                         for resolution in resolutions {
                             if ui
                                 .selectable_label(
-                                    self.video.resolution == resolution,
+                                    !self.video.resolution_desktop && self.video.resolution == resolution,
                                     format!("{} × {}", resolution[0], resolution[1]),
                                 )
                                 .clicked()
                             {
-                                self.video.resolution = resolution;
-                                self.mark_config_dirty();
-                                self.console_status = format!(
-                                    "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
-                                    resolution[0], resolution[1]
-                                );
+                                self.set_custom_resolution(resolution);
                             }
                         }
                     });
-                if self.video.resolution != self.applied_resolution {
+                if self.video.resolution != self.applied_resolution
+                    || self.video.resolution_desktop != self.applied_resolution_desktop
+                {
                     theme::hint(ui, "needs apply", theme::WARNING());
                 }
             },

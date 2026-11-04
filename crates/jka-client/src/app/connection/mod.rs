@@ -7,5 +7,6 @@ pub(in crate::app) mod jk2_pure;
 pub(in crate::app) mod jk2_selection;
 pub(in crate::app) mod mod_preferences;
 pub(in crate::app) mod password;
+pub(in crate::app) mod native_ui;
 pub(in crate::app) mod prepare;
 pub(in crate::app) mod types;

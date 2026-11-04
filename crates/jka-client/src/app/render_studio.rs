@@ -540,7 +540,7 @@ pub(in crate::app) enum StudioMediaTab { #[default] Jka, Fortnite, Cutscenes, De
 pub(in crate::app) struct StudioMediaDrag {pub name: String, pub emote_id: Option<String>,
     pub cinematic:Option<super::render_studio_cinematics::StudioCinematicSource>,
     pub demo_game:Option<String>,
-    /// Loose JK2 recording selected from fs_jk2path; copied to project on drop.
+    /// Loose JK2 recording selected from fs_jk2cdpath; copied to project on drop.
     pub demo_path:Option<std::path::PathBuf>}
 
 pub(in crate::app) struct StudioJk2ImportJob {

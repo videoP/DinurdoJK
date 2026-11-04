@@ -711,7 +711,7 @@ impl ApplicationHandler<UserEvent> for StudioRun {
             5 => {
                 if self.app.render_studio.export.is_some() { return; }
                 assert!(self.app.render_studio.status.starts_with("Wrote "), "{}", self.app.render_studio.status);
-                let folder = self.app.game_write_path("render-studio");
+                let folder = self.app.studio_media_root();
                 let output = std::fs::read_dir(&folder).unwrap().filter_map(Result::ok)
                     .map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "mp4")).expect("encoded movie");
                 let ffmpeg = std::env::var_os("DJK_STUDIO_TEST_FFMPEG").unwrap();
@@ -743,7 +743,7 @@ fn ventara_ghost_comparison_gpu_all_runners_and_clock_phases() {
     use super::super::render_studio_director as director;
     let base=PathBuf::from(std::env::var_os("DJK_STUDIO_TEST_BASE").unwrap());
     let (inputs,prior)=director::route_test_inputs(&base);
-    let runs=director::load_route_runs(base.clone(),base.parent().unwrap_or(&base).join("render-studio/Test"),Default::default(),inputs).unwrap();
+    let runs=director::load_route_runs(base.clone(),jka_assets::pk3::dinurdojk_directory(&base).join("render-studio/Test"),Default::default(),inputs).unwrap();
     let mut plan=director::build_route_comparison_plan(&runs,160.0,None).unwrap();
     director::inherit_route_presentation(&mut plan,&prior,&Default::default());
     director::direct_route_plan(&mut plan,90.0,1);

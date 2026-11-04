@@ -67,6 +67,25 @@ impl DynamicModelRenderer {
                 storage_buffer_entry(1, true, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
+        // DLSS motion prepass only: last frame's bones and transforms. Layouts
+        // cost nothing; the pipelines compile on the first DLSS frame.
+        let motion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA DLSS Ghoul2 motion layout"),
+            entries: &[
+                storage_buffer_entry(super::motion::PREVIOUS_BONES_BINDING, true, wgpu::ShaderStages::VERTEX),
+                storage_buffer_entry(super::motion::SKIN_MOTION_BINDING, true, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let skin_motion_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Ghoul2 DLSS motion prepass layout"),
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&texture_layout),
+                Some(&skin_layout),
+                Some(&motion_layout),
+            ],
+            immediate_size: 0,
+        });
         let skin_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("JKA Ghoul2 GPU skinning pipeline layout"),
             bind_group_layouts: &[
@@ -226,6 +245,7 @@ impl DynamicModelRenderer {
             &shader,
             md3_vertex_layout.clone(),
             false,
+            None,
             "JKA dynamic model depth prepass pipeline",
         );
         let prepass_mask_pipeline = create_entity_prepass_pipeline(
@@ -234,6 +254,7 @@ impl DynamicModelRenderer {
             &shader,
             md3_vertex_layout.clone(),
             true,
+            None,
             "JKA dynamic model alpha-test depth prepass pipeline",
         );
         let skin_prepass_pipeline = create_entity_prepass_pipeline(
@@ -242,6 +263,7 @@ impl DynamicModelRenderer {
             &skin_shader,
             skin_vertex_layout.clone(),
             false,
+            None,
             "JKA Ghoul2 GPU skin depth prepass pipeline",
         );
         let skin_prepass_mask_pipeline = create_entity_prepass_pipeline(
@@ -250,6 +272,7 @@ impl DynamicModelRenderer {
             &skin_shader,
             skin_vertex_layout.clone(),
             true,
+            None,
             "JKA Ghoul2 GPU skin alpha-test depth prepass pipeline",
         );
         let rain_prepass_pipeline = create_entity_rain_prepass_pipeline(
@@ -318,6 +341,9 @@ impl DynamicModelRenderer {
             model_glow_pipelines: Default::default(),
             model_alpha_mask: 0,
             fx_sprite_shader: None,
+            fx_rope_shader: None,
+            fx_rope_pipeline: None,
+            fx_rope_wireframe_pipeline: None,
             fx_sprite_surface_format: surface_format,
             fx_sprite_samples: samples,
             fx_sprite_wireframe_pipeline: None,
@@ -365,6 +391,7 @@ impl DynamicModelRenderer {
             fx_sprite_instance_buffer,
             fx_sprite_instance_capacity,
             fx_sprite_draws: Vec::new(),
+            fx_rope_present: false,
             lightning_gpu: None,
             lightning_gpu_attempted: false,
             resident_fx: None,
@@ -384,6 +411,10 @@ impl DynamicModelRenderer {
             glass_bind_group: None,
             skin_draws: Vec::new(),
             skin_instance_entities: Vec::new(),
+            object_motion: false,
+            motion: Default::default(),
+            motion_layout,
+            skin_motion_pipeline_layout,
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             model_state_cache: false,
             dynamic_batch_draws: true,

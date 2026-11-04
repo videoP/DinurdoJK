@@ -139,16 +139,16 @@ impl App {
         }
         self.render_studio.navigation.looking = active;
         self.render_studio.navigation.raw_delta = [0.0; 2];
-        if let Some(window) = &self.window {
-            if active {
+        if active {
+            if let Some(window) = &self.window {
                 let _ = window
                     .set_cursor_grab(winit::window::CursorGrabMode::Locked)
                     .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
                 window.set_cursor_visible(false);
-            } else if !self.captured {
-                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                window.set_cursor_visible(true);
             }
+        } else if !self.captured {
+            // Hand cursor ownership back to the focused 2D UI, not the desktop.
+            self.sync_visible_cursor_grab();
         }
     }
 

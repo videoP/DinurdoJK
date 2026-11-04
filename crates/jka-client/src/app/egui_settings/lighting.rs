@@ -159,12 +159,12 @@ impl App {
         const FX_OPTIONS: [(u8, &str, &str); 3] = [
             (0, "Off", "Authored FX lights and faithful missile/entity lights still work."),
             (1, "Conservative", "Existing EFX semantic/material classifier; no additional live projectile lights."),
-            (2, "Aggressive", "Broader EFX promotion, live luminous projectile lights, and short-lived light retention."),
+            (2, "Aggressive", "Broader EFX promotion with merged/budgeted inferred lights, including saber sparks and impacts; live projectiles remain lit."),
         ];
         if let Some(target) = mode_row(
             ui,
             "Promote emissive FX to lights",
-            "0 off / 1 conservative / 2 aggressive. Preserves authored Light{} stages and uses existing point, spot and segment lights.",
+            "0 off / 1 conservative / 2 aggressive. Authored Light{} and gameplay saber lights are preserved; Aggressive merges nearby EFX and budgets dense effects (r_fxPromotedLightCap, default 24; direct weapon beams excluded).",
             theme::Reset::Video(ui::VIDEO_ROW_PROMOTE_FX_LIGHTS),
             self.video.promote_fx_lights,
             &FX_OPTIONS,

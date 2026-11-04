@@ -102,17 +102,20 @@ impl App {
             launch_map.then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
         let front_end = !launch_map;
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
+        // Favorites, history and JK2 master lists: per user, not per fs_game.
+        let servers_dir = jka_assets::pk3::dinurdojk_directory(&base).join("servers");
         let mut server_browser =
-            BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
+            BrowserUiState::new(&servers_dir, presentation.master_servers.clone())
+                .with_internet_cache(&base);
         server_browser.apply_filters_string(&presentation.server_filters);
         let other_server_browsers = [
             server_browser::BrowserProtocol::Jk2_102,
             server_browser::BrowserProtocol::Jk2_104,
         ].map(|protocol| BrowserUiState::new_for_protocol(
-            &settings_dir,
+            &servers_dir,
             protocol.default_masters().map(str::to_owned),
             protocol,
-        ));
+        ).with_internet_cache(&base));
         let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
         let (race_ghost_tx, race_ghost_rx) = mpsc::channel();
         let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();
@@ -208,6 +211,8 @@ impl App {
             solo_map_selected: 0,
             solo_catalog_loaded: false,
             solo_catalog_error: None,
+            solo_asset_game: None,
+            solo_catalog_for: None,
             solo_levelshot_texture: None,
             solo_levelshot_texture_map: None,
             source_maps: Vec::new(),
@@ -531,6 +536,7 @@ impl App {
             inventory_select_until: None,
             player_names: presentation.player_names,
             player_name_visible: [false; 32],
+            lead_indicator_visible: [false; 32],
             race_ghost_label_visible: [false; 128],
             player_name_scan_at: Instant::now(),
             follow_name_shown: None,
@@ -564,6 +570,9 @@ impl App {
             controls_waiting_for_key: false,
             controls_section: 0,
             mouse_buttons_down: HashSet::new(),
+            mouse_repeat_next: [None; 2],
+            in_mouserepeat: presentation.mouse_repeat_mode,
+            in_mouserepeat_delay: presentation.mouse_repeat_delay,
             modifiers: ModifiersState::empty(),
             captured: false,
             mouse_grab_mode: "none",
@@ -636,6 +645,7 @@ impl App {
             ui_vgs: presentation.ui_vgs,
             jump_height_shade: presentation.jump_height_shade,
             screen_shake: presentation.screen_shake,
+            simulated_projectiles: presentation.simulated_projectiles,
             head_look: presentation.head_look,
             swim_tilt: presentation.swim_tilt,
             swim_turn_bank: presentation.swim_turn_bank,
@@ -644,6 +654,7 @@ impl App {
             forced_player_models,
             japro_zoom_fov: presentation.zoom_fov,
             view_bob: presentation.view_bob,
+            view_weapon: presentation.view_weapon,
             japro_zoom_transition_at: None,
             japro_fk_duration: presentation.fk_duration,
             japro_fk_first_jump_duration: presentation.fk_first_jump_duration,
@@ -665,7 +676,7 @@ impl App {
             console_history: Vec::with_capacity(128),
             console_history_index: None,
             console_command_buffer: VecDeque::new(),
-            console_wait_until: None,
+            console_wait: None,
             console_map_barrier: false,
             perf_sample: None,
             latched_console_cvars: BTreeMap::new(),
@@ -739,6 +750,8 @@ impl App {
             hdr_available_modes: 1,
             hdr_modes_known: false,
             applied_resolution: video.resolution,
+            applied_resolution_desktop: video.resolution_desktop,
+            desktop_resolution: None,
             applied_grass: video.grass,
             applied_ocean: video.ocean,
             video_confirmation: None,
@@ -777,6 +790,8 @@ impl App {
                 client_physics: video.client_physics,
                 gen_normal_maps: video.gen_normal_maps,
                 float_lightmap: video.float_lightmap && (video.hdr || video.hdr_output != 0),
+                overbright_bits: video.effective_overbright_bits(false),
+                map_overbright_bits: video.effective_map_overbright_bits(false),
                 planar_reflections: video.reflection_quality.planar_slot_budget() > 0,
                 planar_environment: video.reflection_quality.promotes_environment_planars(),
                 omit_environment_stages: video.reflection_quality.omits_environment_stages(),
@@ -839,6 +854,15 @@ impl App {
         // modest hardware instead of at the engine's uncurated field defaults.
         if fresh_install {
             app.apply_quality_preset(quality::QualityPreset::Low);
+        }
+        // A direct launch can display the loading HUD before request_map runs.
+        // Freeze its row set using the final active settings (including a
+        // first-run quality preset), just as later map requests do.
+        if app.loading.is_some() {
+            let options = app.current_map_prepare_options();
+            if let Some(loading) = &mut app.loading {
+                loading.apply_prepare_options(&options);
+            }
         }
         if app.front_end {
             app.open_ui_page(&[app.game_launch_screen.page_name()]);

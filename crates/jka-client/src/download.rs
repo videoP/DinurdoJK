@@ -65,10 +65,9 @@ pub fn referenced_downloads(
     // game directory (NOT fs_forcegame). No download ever lands in fs_cdpath.
     let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
     let download_root = roots.homepath.as_deref().unwrap_or(game_data);
-    let active_name = active_game_dir
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| base_dir.file_name().and_then(|name| name.to_str()).unwrap_or("base"));
+    // The server's mod name (a reserved name is stored in an escaped folder).
+    let active_name = jka_assets::pk3::fs_game_name(active_game_dir);
+    let active_name = active_name.as_str();
 
     let local_checksums = local_pk3_checksums(base_dir, active_game_dir)?;
 
@@ -96,7 +95,7 @@ pub fn referenced_downloads(
             continue;
         }
 
-        let game_dir = download_root.join(game);
+        let game_dir = download_root.join(jka_assets::pk3::jka_game_folder(game));
         let downloaded = game_dir.join(format!("dl_{pak}.pk3"));
         let local_path = if downloaded.exists() {
             game_dir.join(format!("dl_{pak}.{:08x}.pk3", checksum as u32))

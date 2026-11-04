@@ -549,6 +549,45 @@ pub fn bg_g2_player_angles(
     }
 }
 
+/// JK2 cgame player angles. Version is the active JK2 wire/game version
+/// (`2` = 1.02, `4` = 1.04), never the JKA protocol number.
+///
+/// This uses Raven's `CG_G2PlayerAngles`/`CG_G2ClientSpineAngles` math via
+/// the isolated MVSDK/JK2 native library. It deliberately does not call
+/// either the MVSDK shared `BG_G2PlayerAngles` or the OpenJK/JKA path above.
+#[allow(clippy::too_many_arguments)]
+pub fn jk2_g2_player_angles(
+    version: u8,
+    input: &PlayerAngleEntity,
+    time: i32,
+    lerp_origin: [f32; 3],
+    lerp_angles: [f32; 3],
+    frametime: i32,
+    ci_legs: i32,
+    ci_torso: i32,
+    motion_matrix: Option<&[f32; 12]>,
+    state: &mut PlayerAngleState,
+) -> Result<PlayerAngleResult, String> {
+    if version != 2 && version != 4 {
+        return Err(format!("Unsupported JK2 G2PlayerAngles version {version}"));
+    }
+    let _guard = ffi::NativeGuard::new();
+    let mut result = PlayerAngleResult::default();
+    let ok = unsafe {
+        ffi::jk2_cg_g2_player_angles(
+            i32::from(version), input, time, lerp_origin.as_ptr(),
+            lerp_angles.as_ptr(), frametime, ci_legs, ci_torso,
+            motion_matrix.map_or(std::ptr::null(), |matrix| matrix.as_ptr()),
+            state, &mut result,
+        )
+    };
+    if ok == 0 {
+        Err(format!("JK2 {version} CG_G2PlayerAngles rejected player-angle state"))
+    } else {
+        Ok(result)
+    }
+}
+
 /// Read-only result of OpenJK `BG_PlayerStateToEntityState`, plus the
 /// playerState fields consumed by OpenJK's third-person view decision.
 #[repr(C)]

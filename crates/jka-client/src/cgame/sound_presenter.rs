@@ -29,7 +29,6 @@ const EF_JETPACK: i32 = 1 << 29;
 const EF_JETPACK_FLAMING: i32 = 1 << 30;
 const CLASS_VEHICLE: i32 = 53;
 const GT_CTY: i32 = 9;
-const JAPRO_CINFO2_WTTRIBES: i32 = 1 << 4;
 /// jaPRO `RS_TIMER_START` (`eFlags2`, `cg_raceSounds`): the race start-trigger sound.
 const RS_TIMER_START: i32 = 1 << 0;
 const DUEL_MUSIC: &str = "music/mp/duel.mp3";
@@ -810,9 +809,15 @@ impl SoundPresenter {
         }
     }
 
-    /// Upstream weather supplies the delay and loudness; use installed JKA thunder samples.
+    /// Upstream weather supplies the delay and loudness. The five `sound/japro/thunder_0N.mp3`
+    /// samples in dinurdo-assets.pk3 are tried first, starting at a random one so strikes vary;
+    /// installed JKA thunder samples are the fallback.
     pub fn play_weather_thunder(&mut self,volume:f32) {
-        for qpath in ["sound/ambience/thunder2.wav","sound/ambience/thunder1.mp3","sound/ambient/1shot_thunder_02.wav"] {
+        const BUNDLED: [&str;5] = ["sound/japro/thunder_00.mp3","sound/japro/thunder_01.mp3","sound/japro/thunder_02.mp3","sound/japro/thunder_03.mp3","sound/japro/thunder_04.mp3"];
+        const STOCK: [&str;3] = ["sound/ambience/thunder2.wav","sound/ambience/thunder1.mp3","sound/ambient/1shot_thunder_02.wav"];
+        let start=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.subsec_nanos() as usize).unwrap_or(0)%BUNDLED.len();
+        let bundled=(0..BUNDLED.len()).map(|i|BUNDLED[(start+i)%BUNDLED.len()]);
+        for qpath in bundled.chain(STOCK) {
             if let Ok(sound)=self.assets.register(qpath) {
                 if let Some(backend)=&mut self.backend {backend.play_ambient(SoundRequest {qpath:qpath.to_owned(),entity:1022,channel:0,origin:SoundOrigin::Local},sound,volume);}
                 break;
@@ -1565,7 +1570,7 @@ impl SoundPresenter {
         let mut candidates = Vec::with_capacity(2);
         if !profile.sound_dir.is_empty() {
             candidates.push(format!("sound/chars/{}/misc/{stem}", profile.sound_dir));
-        } else {
+        } else if !info.model_name.is_empty() {
             candidates.push(format!("sound/chars/{}/misc/{stem}", info.model_name));
         }
         // TaystJK CG_LoadCISounds falls back to a generic male/female voice
@@ -1627,7 +1632,9 @@ impl SoundPresenter {
             female: info.female,
         };
         for config in config_paths {
-            if let Some(text) = self.assets.read_text(&config, MAX_SOUND_CONFIG_BYTES)? {
+            // An empty model (JK2 team server without `team_model`) makes an
+            // unopenable path; trap_FS_FOpenFile just finds no file there.
+            if let Ok(Some(text)) = self.assets.read_text(&config, MAX_SOUND_CONFIG_BYTES) {
                 let mut lines = text.lines();
                 if let Some(first) = lines.next() {
                     let first = first.trim();
@@ -2222,7 +2229,7 @@ fn complex_sound_event(
             let mut pain_time = false;
             if event.event == E::EV_FALL || event.parm != 0 {
                 // A fall-roll-in-one EV_ROLL also runs DoFall.
-                let ski = game.is_japro() && game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES != 0;
+                let ski = game.japro_weapon_features().tribes_weapons;
                 let (fall, stamps_pain) = fall_sounds(event, ski);
                 plays = fall;
                 pain_time = stamps_pain;
@@ -2724,7 +2731,7 @@ fn jetpack_loops(
     } else {
         SoundOrigin::Fixed(entity.origin)
     };
-    if game.japro_cinfo2() & JAPRO_CINFO2_WTTRIBES != 0 {
+    if game.japro_weapon_features().tribes_weapons {
         out.push(LoopRequest { emitter: (u64::from(entity.number) << 8) | 4,
             qpath: "sound/effects/thrust.wav".to_owned(),
             origin,
@@ -2809,6 +2816,7 @@ mod tests {
         }
         PresentationEvent {
             receive_sequence: 0,
+            predicted_fire_command_time: None,
             source_entity_num: 3,
             entity_num: 3,
             event,

@@ -2,6 +2,240 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    // TaystJK cg_weapons.c / cg_xcvar.h: archived client-only first-person gun controls.
+    APP_CG_DRAWGUN {
+        runtime: CvarDef::new(
+            "cg_drawGun", "1", "0..4",
+            "TaystJK: 0 hide view gun; 1 stock; 2 no weapon bob; 3 no landing dip; 4 no idle drift (cumulative).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.draw_gun.to_string()),
+            |app, value| {
+                let mode = value.to_string().parse::<u8>()
+                    .map_err(|_| "cg_drawGun expects 0..4".to_owned())?;
+                if mode > 4 { return Err("cg_drawGun expects 0..4".to_owned()); }
+                app.view_weapon.draw_gun = mode;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(mode @ 0..=4) = value.parse::<u8>() {
+                    settings.view_weapon.draw_gun = mode;
+                }
+            }),
+            archive: Some((36360, |state| state.presentation.view_weapon.draw_gun.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_GUNX {
+        runtime: CvarDef::new(
+            "cg_gunX", "0", "number",
+            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera forward axis.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.gun_x.to_string()),
+            |app, value| {
+                app.view_weapon.gun_x = App::parse_cvar_finite("cg_gunX", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(number) = value.parse::<f32>() {
+                    if number.is_finite() { settings.view_weapon.gun_x = number; }
+                }
+            }),
+            archive: Some((36361, |state| state.presentation.view_weapon.gun_x.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_GUNY {
+        runtime: CvarDef::new(
+            "cg_gunY", "0", "number",
+            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera left axis.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.gun_y.to_string()),
+            |app, value| {
+                app.view_weapon.gun_y = App::parse_cvar_finite("cg_gunY", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(number) = value.parse::<f32>() {
+                    if number.is_finite() { settings.view_weapon.gun_y = number; }
+                }
+            }),
+            archive: Some((36362, |state| state.presentation.view_weapon.gun_y.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_GUNZ {
+        runtime: CvarDef::new(
+            "cg_gunZ", "0", "number",
+            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera up axis.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.gun_z.to_string()),
+            |app, value| {
+                app.view_weapon.gun_z = App::parse_cvar_finite("cg_gunZ", &value.to_string())?;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(number) = value.parse::<f32>() {
+                    if number.is_finite() { settings.view_weapon.gun_z = number; }
+                }
+            }),
+            archive: Some((36363, |state| state.presentation.view_weapon.gun_z.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_FOVVIEWMODEL {
+        runtime: CvarDef::new(
+            "cg_fovViewmodel", "80", "0 or 1..140",
+            "TaystJK: independent horizontal viewmodel FOV; 0 inherits cg_fov. Scales hand forward axis and MD3 tags.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.fov_viewmodel.to_string()),
+            |app, value| {
+                let fov = App::parse_cvar_finite("cg_fovViewmodel", &value.to_string())?;
+                if fov != 0.0 && !(1.0..=140.0).contains(&fov) {
+                    return Err("cg_fovViewmodel expects 0 or 1..140".to_owned());
+                }
+                app.view_weapon.fov_viewmodel = fov;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(fov) = value.parse::<f32>() {
+                    if fov.is_finite() && (fov == 0.0 || (1.0..=140.0).contains(&fov)) {
+                        settings.view_weapon.fov_viewmodel = fov;
+                    }
+                }
+            }),
+            archive: Some((36364, |state| state.presentation.view_weapon.fov_viewmodel.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_FOVVIEWMODELADJUST {
+        runtime: CvarDef::new(
+            "cg_fovViewmodelAdjust", "1", "0|1",
+            "TaystJK: lower the first-person hand origin by 0.2 units for every viewmodel FOV degree above 90.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(u8::from(app.view_weapon.fov_viewmodel_adjust).to_string()),
+            |app, value| {
+                let value = value.to_string().parse::<u8>()
+                    .map_err(|_| "cg_fovViewmodelAdjust expects 0 or 1".to_owned())?;
+                if value > 1 { return Err("cg_fovViewmodelAdjust expects 0 or 1".to_owned()); }
+                app.view_weapon.fov_viewmodel_adjust = value != 0;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                match value { "0" => settings.view_weapon.fov_viewmodel_adjust = false,
+                              "1" => settings.view_weapon.fov_viewmodel_adjust = true,
+                              _ => () }
+            }),
+            archive: Some((36365, |state| u8::from(state.presentation.view_weapon.fov_viewmodel_adjust).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_CG_GUNALPHA {
+        runtime: CvarDef::new(
+            "cg_gunAlpha", "1", "0..1",
+            "jaPRO/TaystJK: first-person gun translucency (0 and 1 are opaque in upstream).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.view_weapon.gun_alpha.to_string()),
+            |app, value| {
+                let alpha = App::parse_cvar_finite("cg_gunAlpha", &value.to_string())?;
+                if !(0.0..=1.0).contains(&alpha) {
+                    return Err("cg_gunAlpha expects 0..1".to_owned());
+                }
+                app.view_weapon.gun_alpha = alpha;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(alpha) = value.parse::<f32>() {
+                    if (0.0..=1.0).contains(&alpha) {
+                        settings.view_weapon.gun_alpha = alpha;
+                    }
+                }
+            }),
+            archive: Some((36366, |state| state.presentation.view_weapon.gun_alpha.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_IN_MOUSEREPEAT {
+        runtime: CvarDef::new(
+            "in_mouserepeat", "0", "0|1|2",
+            "TaystJK: 0 off, 1 repeat held MOUSE4 and MOUSE5, 2 repeat MOUSE4 only. Real-time cadence is decoupled from render FPS.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.in_mouserepeat.to_string()),
+            |app, value| {
+                let value = value.to_string().parse::<u8>()
+                    .map_err(|_| "in_mouserepeat expects 0, 1 or 2".to_owned())?;
+                if value > 2 { return Err("in_mouserepeat expects 0, 1 or 2".to_owned()); }
+                app.in_mouserepeat = value;
+                app.mouse_repeat_next = [None; 2];
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(mode @ 0..=2) = value.parse::<u8>() {
+                    settings.mouse_repeat_mode = mode;
+                }
+            }),
+            archive: Some((36350, |state| state.presentation.mouse_repeat_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_IN_MOUSEREPEATDELAY {
+        runtime: CvarDef::new(
+            "in_mouserepeatDelay", "0", "0..2000 (ms)",
+            "Optional delay before MOUSE4/MOUSE5 begin repeating; default 0 matches TaystJK's lack of a deliberate repeat delay. Subsequent repeats are approximately every 16ms.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.in_mouserepeat_delay.to_string()),
+            |app, value| {
+                let value = value.to_string().parse::<u32>()
+                    .map_err(|_| "in_mouserepeatDelay expects an integer 0..2000".to_owned())?;
+                if value > 2000 { return Err("in_mouserepeatDelay expects 0..2000 ms".to_owned()); }
+                app.in_mouserepeat_delay = value;
+                app.mouse_repeat_next = [None; 2];
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(delay @ 0..=2000) = value.parse::<u32>() {
+                    settings.mouse_repeat_delay = delay;
+                }
+            }),
+            archive: Some((36351, |state| state.presentation.mouse_repeat_delay.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_CG_ANIMBLEND {
         runtime: CvarDef::new(
             "cg_animBlend", "1", "0|1",
@@ -13,6 +247,23 @@ app_cvars! {
                     .map_err(|_| "cg_animBlend expects 0 or 1".to_owned())?;
                 if enabled > 1 { return Err("cg_animBlend expects 0 or 1".to_owned()); }
                 crate::cgame::player_presenter::set_animation_blend(enabled != 0);
+                Ok(())
+            },
+        ),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_CG_DEBUGJK2ANGLES {
+        runtime: CvarDef::new(
+            "cg_debugJK2Angles", "0", "0|1",
+            "Diagnostic: log JK2 CG_G2PlayerAngles inputs and outputs for every player each frame to the console log. Session-only.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(u8::from(crate::cgame::player_presenter::jk2_angle_debug()).to_string()),
+            |_app, value| {
+                let enabled = value.to_string().trim().parse::<u8>()
+                    .map_err(|_| "cg_debugJK2Angles expects 0 or 1".to_owned())?;
+                if enabled > 1 { return Err("cg_debugJK2Angles expects 0 or 1".to_owned()); }
+                crate::cgame::player_presenter::set_jk2_angle_debug(enabled != 0);
                 Ok(())
             },
         ),
@@ -943,8 +1194,36 @@ app_cvars! {
         ]
     }
 
+    APP_CG_SIMULATEDPROJECTILES {
+        runtime: CvarDef::new(
+            "cg_simulatedProjectiles", "0", "0|1",
+            "TaystJK: immediately simulate your own projectile visuals on jaPRO servers with jcinfo UNLAGGEDPROJ. When jcinfo advertises pseudorandom fire, use the exact predicted firing usercmd seed. Cosmetic only; off by default.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(u8::from(app.simulated_projectiles).to_string()),
+            |app, value| {
+                let enabled = App::parse_cvar_bool("cg_simulatedProjectiles", &value.to_string())?;
+                app.simulated_projectiles = enabled;
+                if let Some(session) = app.game_session.as_mut() {
+                    session.weapon_fx.set_simulated_projectiles(enabled);
+                }
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(n) = value.parse::<u8>() {
+                    if n <= 1 { settings.simulated_projectiles = n != 0; }
+                }
+            }),
+            archive: Some((36360, |state| u8::from(state.presentation.simulated_projectiles).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_CG_SCREENSHAKE {
-        runtime: CvarDef::new("cg_screenShake", "", "0..2", "Camera shake: 1 effect-driven (explosions, creature efx), 2 also the kick of firing rockets, repeater alt, flechette, bryar/demp2 alt and bowcaster. Server-triggered shake events are not affected, as in OpenJK.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_screenshake(app)), |app, value| App::cvar_set_cg_screenshake(app, APP_CG_SCREENSHAKE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_screenshake, None),
+        runtime: CvarDef::new("cg_screenShake", "", "0..2", "Camera shake: 1 effect-driven (explosions, creature efx), 2 also the kick of firing rockets, repeater alt, flechette and charged shots, plus continuous shake while charging bryar/bowcaster/demp2. Server-triggered shake events are not affected, as in OpenJK.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_screenshake(app)), |app, value| App::cvar_set_cg_screenshake(app, APP_CG_SCREENSHAKE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_screenshake, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {

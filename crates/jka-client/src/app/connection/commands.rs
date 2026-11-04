@@ -97,8 +97,8 @@ impl App {
                     .to_vec()
             })
             .unwrap_or_default();
-        let info = if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
-            let mut info = self.network.jk2_userinfo(&self.solo_client_info.model_cvar());
+        let info = if let Some(version) = self.net.as_ref().and_then(|net| net.session().jk2_version()) {
+            let mut info = self.network.jk2_userinfo_for_version(&self.solo_client_info.model_cvar(), version);
             let powers = self.jk2_effective_forcepowers();
             jka_protocol::session::set_info_value(&mut info, b"forcepowers", powers.as_bytes());
             info
@@ -324,8 +324,8 @@ impl App {
                 GameCommand::ForceNext | GameCommand::ForcePrev | GameCommand::Weapon)) => {
                 if let Some(ps) = self.live_player_state().cloned() {
                     match action {
-                        GameCommand::WeaponNext => self.live_input.cycle_weapon(&ps, true),
-                        GameCommand::WeaponPrev => self.live_input.cycle_weapon(&ps, false),
+                        GameCommand::WeaponNext => self.live_input.cycle_weapon_in_order(&ps, true, &self.extensions.weapon_cycle),
+                        GameCommand::WeaponPrev => self.live_input.cycle_weapon_in_order(&ps, false, &self.extensions.weapon_cycle),
                         GameCommand::WeaponLast => self.live_input.select_last_weapon(&ps),
                         GameCommand::ToggleFireMode => {
                             self.live_input.toggle_single_fire(&ps);

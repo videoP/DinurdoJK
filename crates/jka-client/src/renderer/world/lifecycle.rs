@@ -80,6 +80,9 @@ impl Renderer {
 
     fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>, resident: Option<StudioCachedWorld>, shared: Option<&crate::renderer::WorldGpu>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
+        // Invalidate any on-demand collision render build for the previous BSP.
+        // Never queue or construct a collision render mesh during map load.
+        self.collision_world_job = None;
         self.dynamic_model_renderer.fixture_lighting = None;
         self.dynamic_model_renderer.lightning_gpu = None;
         self.dynamic_model_renderer.lightning_gpu_attempted = false;
@@ -541,6 +544,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn unload_map(&mut self) {
+        self.collision_world_job = None;
         self.clear_live_rivers();
         self.studio_active_world = None;
         self.studio_cached_worlds.clear();

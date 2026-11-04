@@ -26,6 +26,7 @@ mod geometry;
 mod lighting;
 mod memory;
 mod lightmaps;
+use lightmaps::{overbright_rgb, shift_lightmap_rgba};
 mod material_batches;
 mod prepare;
 mod reflections;
@@ -45,7 +46,7 @@ pub(crate) use shader_remap::{
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
 use collision::bsp_physics_collision_mesh;
-pub use collision::{prepare_physics_collision, river_collision_triangles};
+pub use collision::{prepare_collision_render_mesh, prepare_physics_collision, river_collision_triangles};
 pub use coordinates::{jka_position, render_position};
 pub use entities::SkyPortal;
 pub(crate) use entities::{append_authored_ocean_planes, bsp_brush_entities};
@@ -153,7 +154,7 @@ use jka_assets::{
     map::{
         MapBrush, MapDocument, MapFace, Plane as MapPlane, TextureProjection, MAX_MAP_FILE_BYTES,
     },
-    pk3::{active_game_directory, AssetSearchPath},
+    pk3::AssetSearchPath,
     shader::{AlphaGen, RgbGen, Shader, Sun as ShaderSun, TcGen, TcMod},
 };
 use std::{
@@ -533,6 +534,9 @@ pub struct SpawnPoint {
     pub initial: bool,
     /// `nohumans 1`: bot-only spot.
     pub no_humans: bool,
+    /// Synthetic world-bounds spawn when the map has no deathmatch spawn.
+    /// Offline JK2 exploration starts in noclip at this potentially solid point.
+    pub fallback: bool,
 }
 
 /// OpenJK's FFA spawn choice for a human player (`SelectInitialSpawnPoint` /
@@ -914,6 +918,11 @@ pub struct MapPrepareOptions {
     pub client_physics: bool,
     pub gen_normal_maps: bool,
     pub float_lightmap: bool,
+    /// Resolved OpenJK r_overBrightBits / r_mapOverBrightBits at map load.
+    /// This is part of the prep options so a JK2/JKA transition cannot reuse
+    /// vertex colors or lightmaps prepared for the other lighting range.
+    pub overbright_bits: u8,
+    pub map_overbright_bits: u8,
     /// Preserve reflection-plane topology for authored mirrors and tcGen
     /// environment surfaces. When false, those surfaces are free to batch like
     /// ordinary opaque geometry; enabling the planar reflection path therefore
@@ -968,6 +977,8 @@ impl Default for MapPrepareOptions {
             client_physics: false,
             gen_normal_maps: false,
             float_lightmap: false,
+            overbright_bits: 0,
+            map_overbright_bits: 0,
             planar_reflections: true,
             planar_environment: true,
             omit_environment_stages: false,

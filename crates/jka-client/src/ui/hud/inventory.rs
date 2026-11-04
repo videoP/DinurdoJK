@@ -37,6 +37,7 @@ pub(in crate::ui) fn build_inventory_select(
     h: u32,
 ) {
     let Some(selector) = ui.inventory_select else { return; };
+    if ui.jk2_mode && ui.video.hud_style == 1 && selector.remaining_ms <= 130 { return; }
     let selected = usize::from(selector.selected);
     if !selectable(selected) { return; }
     let items = visible_items(selector);
@@ -98,6 +99,7 @@ mod tests {
         let items = visible_items(UiInventorySelect {
             selected: 4,
             owned_bits: (1 << 1) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 11),
+            remaining_ms: 1400,
         });
         assert_eq!(items, [1, 4, 11]);
     }
@@ -110,6 +112,7 @@ mod tests {
         ui.inventory_select = Some(UiInventorySelect {
             selected: 4,
             owned_bits: (1 << 1) | (1 << 4) | (1 << 11),
+            remaining_ms: 1400,
         });
         build_inventory_select(&mut verts, &ui, None, 1280, 720);
         assert_eq!(verts.iter().filter(|v| v.textured == ICON_TEXTURE_SOURCE).count(), 18);
@@ -117,7 +120,7 @@ mod tests {
     #[test]
     fn unowned_selection_does_not_draw_anything() {
         let mut ui = UiSnapshot::default();
-        ui.inventory_select = Some(UiInventorySelect { selected: 4, owned_bits: 1 << 1 });
+        ui.inventory_select = Some(UiInventorySelect { selected: 4, owned_bits: 1 << 1, remaining_ms: 1400 });
         let mut verts = Vec::new();
         build_inventory_select(&mut verts, &ui, None, 1280, 720);
         assert!(verts.is_empty());

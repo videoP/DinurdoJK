@@ -312,8 +312,13 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn apply_pending_scene_rebuild(&mut self) {
-        if std::mem::take(&mut self.scene_rebuild_pending) {
+        // DLSS upscaling (mode, failure, toggles) changes the render size.
+        let render_size_changed = self.targets.render_size != self.render_extent();
+        if std::mem::take(&mut self.scene_rebuild_pending) || render_size_changed {
             self.rebuild_scene_targets_and_pipelines();
+            if render_size_changed {
+                self.rebuild_frame_plan();
+            }
         }
     }
 
@@ -344,10 +349,12 @@ impl Renderer {
         // MSAA count. Recreate them lazily after this rebuild; the presentation
         // worker keeps showing its last safe texture until the new ring arrives.
         self.companion_scene_targets.clear();
+        self.dlss.release();
+        let (render_width, render_height) = self.render_extent();
         self.targets = create_targets(
             &self.device,
-            self.config.width,
-            self.config.height,
+            render_width,
+            render_height,
             scene_format,
             samples,
             self.glow_mode.enabled() || self.halation_enabled,
@@ -360,6 +367,7 @@ impl Renderer {
             self.taa_enabled || self.rt_taa_mode > 0,
             self.clouds_enabled && self.cloud_backend == 0,
             self.cloud_render_resolution,
+            (self.config.width, self.config.height),
         );
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
@@ -2307,6 +2315,8 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
     shader: &wgpu::ShaderModule,
     vertex_layout: wgpu::VertexBufferLayout<'_>,
     alpha_test: bool,
+    // Some(vertex entry): DLSS variant that writes object motion vectors.
+    motion: Option<&'static str>,
     label: &'static str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2314,7 +2324,7 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_prepass"),
+            entry_point: Some(motion.unwrap_or("vs_prepass")),
             compilation_options: Default::default(),
             buffers: &[Some(vertex_layout)],
         },
@@ -2335,10 +2345,11 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if alpha_test {
-                "fs_prepass_mask"
-            } else {
-                "fs_prepass"
+            entry_point: Some(match (alpha_test, motion.is_some()) {
+                (false, false) => "fs_prepass",
+                (true, false) => "fs_prepass_mask",
+                (false, true) => "fs_prepass_motion",
+                (true, true) => "fs_prepass_mask_motion",
             }),
             compilation_options: Default::default(),
             targets: &[
@@ -2347,12 +2358,17 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
-                // Entities have no per-bone history; keep TAA's existing
-                // motion for these pixels rather than inventing camera-only motion.
+                // TAA keeps its existing entity behavior: no entity motion,
+                // the pixels retain what the world prepass wrote. The DLSS
+                // variants write object motion (models/motion.rs).
                 Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rg16Float,
                     blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
+                    write_mask: if motion.is_some() {
+                        wgpu::ColorWrites::ALL
+                    } else {
+                        wgpu::ColorWrites::empty()
+                    },
                 }),
                 Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,

@@ -3239,6 +3239,8 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
         color *= 1.0 - edge * 0.28;
     }
     color = film_grain(color, input.uv);
+    // Final framebuffer overbright after all color transforms, as in #1349.
+    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
     if (settings.taa_params.x < 0.5) {
         color = output_dither_srgb8(color, input.position.xy);
     }
@@ -3255,7 +3257,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 // and skipping it keeps the textures and lighting from leaking through.
 @fragment
 fn fs_main_thermal(input: VertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(thermal_post_color(input.uv, input.position.xy), 1.0);
+    let color = thermal_post_color(input.uv, input.position.xy);
+    return vec4<f32>(select(color, color * 2.0, settings.snow_haze.w > 0.5), 1.0);
 }
 
 // Specialized A/B path for frames where rain is the only spatial post effect.
@@ -3299,6 +3302,7 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
         let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));
         color *= 1.0 - edge * 0.28;
     }
+    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
     if (settings.taa_params.x < 0.5) {
         color = output_dither_srgb8(color, input.position.xy);
     }
@@ -3404,6 +3408,7 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
         color *= 1.0 - edge * 0.28;
     }
     color = film_grain(color, input.uv);
+    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
     var out: TaaFragmentOut;
     // Dither LDR presentation only. HDR already preserved the fog gradient,
     // while temporal history must always stay free of the ordered pattern.
@@ -3431,7 +3436,8 @@ fn fs_main_taa_thermal(input: VertexOut) -> TaaFragmentOut {
         current = taa_tonemap(current);
     }
     var out: TaaFragmentOut;
-    out.display = vec4<f32>(thermal_post_color(input.uv, input.position.xy), 1.0);
+    let thermal = thermal_post_color(input.uv, input.position.xy);
+    out.display = vec4<f32>(select(thermal, thermal * 2.0, settings.snow_haze.w > 0.5), 1.0);
     out.history = vec4<f32>(current, 1.0);
     return out;
 }

@@ -163,9 +163,24 @@ pub fn renderer_verbose_enabled(required: u8) -> bool {
     developer_level() >= required || renderer_verbose_level() >= required
 }
 
-pub fn init() -> Result<PathBuf, String> {
+/// `<GameData>/DinurdoJK/logs`: latest.log, previous.log and the crash/hang
+/// `.dmp` files (the crash reporter writes beside the log). Runs before the
+/// command line is parsed, so it follows the saved `fs_homepath` in
+/// DinurdoJK-paths.ini but not a `+set fs_homepath` given on this launch.
+/// Falls back to the exe folder if the directory cannot be created.
+fn log_directory() -> Result<PathBuf, String> {
+    let base = crate::filesystem_paths::default_base_directory()?;
+    let roots = crate::filesystem_paths::load(&base);
+    let directory = jka_assets::pk3::dinurdojk_directory_for(&base, &roots).join("logs");
+    if std::fs::create_dir_all(&directory).is_ok() {
+        return Ok(directory);
+    }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let directory = executable.parent().ok_or("Cannot locate executable")?;
+    executable.parent().map(std::path::Path::to_path_buf).ok_or_else(|| "Cannot locate executable".to_owned())
+}
+
+pub fn init() -> Result<PathBuf, String> {
+    let directory = log_directory()?;
     let path = directory.join("latest.log");
     // Keep the previous run's log. A crash is usually reported after the game has
     // been started again, which used to truncate the only copy of the evidence.

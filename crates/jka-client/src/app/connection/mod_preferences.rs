@@ -576,7 +576,10 @@ impl App {
     }
 
     pub(in crate::app) fn server_restrictions(&self) -> crate::app::restrictions::ServerRestrictions {
+        let nwh_live_102 = self.game_session.as_ref().is_some_and(|session| session.live)
+            && self.net.as_ref().is_some_and(crate::net::NetClient::is_nwh_server);
         crate::app::restrictions::ServerRestrictions::from_server_info(self.cgame_server_info())
+            .with_nwh_102(nwh_live_102)
     }
 
     pub(in crate::app) fn japro_do_restricted(&self) -> bool {
@@ -675,9 +678,10 @@ impl App {
         self.japro_flipkick_frames = 1;
     }
 
-    /// Port of TaystJK CG_DoAsync's flipkick block.  This deliberately counts
-    /// client frames rather than milliseconds because that is what the source
-    /// implementation and its cg_fk* cvars do.
+    /// Port of TaystJK CG_DoAsync's flipkick sequence. TaystJK counts CGame
+    /// frames, which ordinarily produce movement commands. Our render rate is
+    /// uncapped and usercmds are paced separately, so callers advance this once
+    /// per authored usercmd to preserve every jump press/release at the server.
     pub(in crate::app) fn tick_japro_flipkick(&mut self) {
         if self.japro_flipkick_restricted() {
             return;

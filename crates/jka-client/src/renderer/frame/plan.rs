@@ -190,9 +190,11 @@ impl Renderer {
         // intermediate: with gamma/effects off the world can render directly
         // into the SMAA color target before SMAA resolves to the surface.
         let compact_post_reason = hdr_resolve
+            || self.dlss_active()
             || gamma_enabled
             || lut_enabled
             || manual_exposure
+            || self.overbright_bits != 0
             || legacy2_precision_post
             || rain_lens_copy;
         let use_post = compact_post_reason || full_post_effects;
@@ -206,7 +208,7 @@ impl Renderer {
         let other_linear_depth = self.thermal_vision != 0
             || self.ssao_enabled
             || self.rt_local_cache_wanted()
-            || self.temporal_resolve_active()
+            || self.motion_vectors_wanted()
             || self.contact_shadows_enabled
             || fog_enabled
             || legacy1_global_post
@@ -223,7 +225,7 @@ impl Renderer {
         let linear_depth_reasons = [
             self.ssao_enabled,
             self.rt_local_cache_wanted(),
-            self.temporal_resolve_active(),
+            self.motion_vectors_wanted(),
             self.contact_shadows_enabled,
             fog_enabled,
             legacy1_global_post,

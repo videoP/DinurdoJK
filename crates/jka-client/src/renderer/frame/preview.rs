@@ -215,7 +215,14 @@ impl Renderer {
         if !clean_video_frame {
             self.submit_egui(&frame_view);
             if self.egui_active {
-                self.submit_ui_overlay(&frame_view, None);
+                // The in-editor HUD uses the shared encoded blending policy,
+                // while clean video capture remains completely HUD-free.
+                let encoded_view = if self.hdr_output.is_none()
+                    && self.native_2d_encoded_surface_eligible()
+                    && self.ensure_encoded_2d_pipelines() {
+                    Some(self.surface_texture_unorm_view(&frame))
+                } else { None };
+                self.submit_ui_overlay(&frame_view, encoded_view.as_ref());
             }
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;

@@ -831,7 +831,7 @@ pub(in crate::app) struct StudioProject {
     /// Per-character `char_color_*` RGB; None inherits the current Profile tint.
     #[serde(default)] pub lane_char_colors: Vec<Option<[u8; 3]>>,
     #[serde(default)] pub lane_visible: Vec<bool>,
-    /// Studio graphics profile (base/render-studio/profiles/*.cfg).
+    /// Studio graphics profile (DinurdoJK/render-studio/profiles/*.cfg).
     #[serde(default)] pub render_cfg: String,
     /// Demo layers hidden with their eye toggle.
     #[serde(default)] pub demo_layer_hidden: Vec<bool>,

@@ -9,6 +9,8 @@ pub(super) struct Scene {
     pub depth_key: u64,
     image_layout: wgpu::BindGroupLayout,
     light_layout: wgpu::BindGroupLayout,
+    csm_layout: wgpu::BindGroupLayout,
+    csm_fallback: wgpu::BindGroup,
     uniform: wgpu::Buffer,
     replace: wgpu::RenderPipeline,
     over: wgpu::RenderPipeline,
@@ -123,9 +125,74 @@ impl Scene {
                 tex(2, false),
             ],
         });
+        let csm_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("native world lighting CSM"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        // Cloud-only and standalone atmosphere draws have no JKA shadow map.
+        // Keep the uniform group valid without allocating any cascades.
+        let fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native world lighting CSM fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::renderer::depth_format(),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let fallback_view = fallback_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let fallback_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            compare: Some(wgpu::CompareFunction::GreaterEqual),
+            ..Default::default()
+        });
+        let fallback_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("native world lighting CSM empty uniform"),
+            size: std::mem::size_of::<crate::renderer::ShadowReceiverUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let csm_fallback = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native world lighting CSM fallback group"),
+            layout: &csm_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fallback_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&fallback_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: fallback_uniform.as_entire_binding() },
+            ],
+        });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("native scene light camera"),
-            size: 112,
+            size: 144,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -192,6 +259,7 @@ impl Scene {
                 &light_layout,
                 &clouds.shadow().bind_group_layout,
                 &sky.environment().bind_group_layout,
+                &csm_layout,
             ],
             None,
         );
@@ -262,6 +330,8 @@ impl Scene {
             depth_key,
             image_layout,
             light_layout,
+            csm_layout,
+            csm_fallback,
             uniform,
             replace,
             over,
@@ -369,14 +439,22 @@ impl Scene {
         world: f32,
         shadows: bool,
         flash: f32,
+        moon_light: Option<([f32; 3], f32)>,
+        moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
     ) {
-        let mut values = [0f32; 28];
+        let mut values = [0f32; 36];
         values[..16].copy_from_slice(&camera.inverse_view_projection);
         values[16..19].copy_from_slice(&camera.position);
         values[20..24].copy_from_slice(&camera.viewport);
         values[24] = world.clamp(0.0, 1.0);
         values[25] = u8::from(shadows) as f32;
         values[26] = flash;
+        values[27] = u8::from(moon_csm.is_some()) as f32;
+        if let Some((direction, intensity)) = moon_light {
+            values[28..31].copy_from_slice(&direction);
+            values[31] = intensity;
+            values[32] = 1.0; // explicit moon-light mode; even intensity 0 hides the sun
+        }
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&values));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("native lighting inputs"),
@@ -396,6 +474,17 @@ impl Scene {
                 },
             ],
         });
+        let csm_group = moon_csm.map(|(texture, sampler, uniform)| device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("native world lighting moon CSM"),
+                layout: &self.csm_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(texture) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+                ],
+            }
+        ));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("native world lighting and cloud shadows"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -414,6 +503,7 @@ impl Scene {
         pass.set_bind_group(0, &group, &[]);
         pass.set_bind_group(1, &clouds.shadow().bind_group, &[]);
         pass.set_bind_group(2, &sky.environment().bind_group, &[]);
+        pass.set_bind_group(3, csm_group.as_ref().unwrap_or(&self.csm_fallback), &[]);
         pass.draw(0..3, 0..1);
     }
 }

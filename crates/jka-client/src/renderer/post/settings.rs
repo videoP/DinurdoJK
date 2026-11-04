@@ -22,10 +22,25 @@ impl Renderer {
         let old_reflection_debug = self.reflection_debug_enabled;
         let old_dof_enabled = self.depth_of_field_strength > 0.001;
         let old_motion_blur = self.motion_blur_strength;
-        let desired_taa = effects.taa;
-        let desired_smaa = effects.smaa && !desired_taa;
-        let desired_fxaa = effects.fxaa && !desired_taa && !desired_smaa;
-        let taa_changed = self.taa_enabled != desired_taa;
+        // DLAA and the conventional AA resolves are mutually exclusive. The
+        // device check is false on non-NGX devices and non-nvidia-dlss builds.
+        let old_dlss_requested = self.dlss_requested;
+        self.dlss_requested = effects.dlss && super::super::dlss::device_supported();
+        if old_dlss_requested != self.dlss_requested
+            || self.dlss_mode != effects.dlss_mode
+            || self.dlss_model != effects.dlss_model
+        {
+            // Releases the NGX history and the DLSS targets. NGX reads the
+            // quality mode and model preset only when the feature is created.
+            self.dlss_mode = effects.dlss_mode;
+            self.dlss_model = effects.dlss_model;
+            self.dlss.release();
+            self.dlss_failed = false;
+        }
+        let desired_taa = effects.taa && !self.dlss_requested;
+        let desired_smaa = effects.smaa && !desired_taa && !self.dlss_requested;
+        let desired_fxaa = effects.fxaa && !desired_taa && !desired_smaa && !self.dlss_requested;
+        let taa_changed = self.taa_enabled != desired_taa || old_dlss_requested != self.dlss_requested;
         let rt_taa_changed = self.rt_taa_mode != effects.rt_taa.min(2);
         let smaa_changed = self.smaa_enabled != desired_smaa;
         let color_grade = effects.color_grade.sanitize();
@@ -122,6 +137,15 @@ impl Renderer {
         self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
         let previous_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
                             self.sun_intensity, self.sun_color);
+        let previous_sky_backend = self.sky_backend;
+        let previous_moon = (
+            self.blue_water_environment.moon_phase,
+            self.blue_water_environment.moon_custom,
+            self.blue_water_environment.moon_elevation,
+            self.blue_water_environment.moon_azimuth,
+            self.blue_water_environment.moon_intensity,
+            self.blue_water_environment.moon_intensity_custom,
+        );
         self.sun_override = effects.sun_override;
         if previous_sun.0 != self.sun_override && self.entity_fixture_lighting_ab {
             if let Some(world) = &mut self.world { world.local_shadows.selection_position = None; }
@@ -152,16 +176,16 @@ impl Renderer {
         self.baked_sun_direct_limit = effects.baked_sun_direct_limit.clamp(0.0, 0.9);
         let current_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
                            self.sun_intensity, self.sun_color);
-        if old_baked_sun_removal != self.baked_sun_removal
+        let solar_uniforms_changed = old_baked_sun_removal != self.baked_sun_removal
             || old_baked_sun_shadow_map != self.baked_sun_shadow_map
             || old_indirect != (self.baked_indirect_scale, self.baked_indirect_saturation,
                 self.baked_indirect_power, self.baked_indirect_highlight_preserve,
                 self.baked_sun_edge_softness, self.baked_sun_direct_limit)
             || previous_sun != current_sun
-            || old_sun_lighting != self.sun_lighting
-        {
-            self.update_lighting_settings();
-        }
+            || old_sun_lighting != self.sun_lighting;
+        // Defer the lighting uniform upload until AFTER the new sky and moon
+        // settings are installed. Otherwise the first slider change writes the
+        // previous moon intensity, and moon-only changes may never upload it.
         self.sky_fractal_override = effects.sky_fractal_override;
         if self.sky_backend != effects.sky_backend.min(1) || self.cloud_backend != effects.cloud_backend.min(1) {
             self.cloud_history_valid = false;
@@ -172,6 +196,19 @@ impl Renderer {
         // skybox on screen it would light the map from a sky nobody sees.
         if self.sky_backend != 1 {
             self.blue_water_environment.world_lighting = 0.0;
+        }
+        let current_moon = (
+            self.blue_water_environment.moon_phase,
+            self.blue_water_environment.moon_custom,
+            self.blue_water_environment.moon_elevation,
+            self.blue_water_environment.moon_azimuth,
+            self.blue_water_environment.moon_intensity,
+            self.blue_water_environment.moon_intensity_custom,
+        );
+        if solar_uniforms_changed || previous_sky_backend != self.sky_backend
+            || previous_moon != current_moon
+        {
+            self.update_lighting_settings();
         }
         self.cloud_backend = effects.cloud_backend.min(1);
         let cloud_portal_depth = effects.cloud_portal_depth.min(2);

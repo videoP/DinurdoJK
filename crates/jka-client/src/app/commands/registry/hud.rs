@@ -43,6 +43,11 @@ video_cvars! {
     CvarType::Bool, Bool, draw_hud, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
+    HUD_STYLE, APP_HUD_STYLE, "cg_hudStyle", "0", "0|1",
+    "Native Rust HUD style: 0 DinurdoJK panels, 1 Native (JK2 or JKA retail HUD based on active game).",
+    CvarType::Int { min: 0, max: 1 }, Int, hud_style, |value: i32| value as u8,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
     DRAW_FPS, APP_DRAW_FPS, "cg_drawFPS", "1", "0|1|2",
     "FPS overlay: 0 off, 1 simple FPS, 2 detailed diagnostics.",
     CvarType::Int { min: 0, max: 2 }, Int, draw_fps, |value: i32| value as u8,

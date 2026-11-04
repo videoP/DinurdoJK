@@ -282,23 +282,32 @@ impl Renderer {
             wgpu::MemoryHints::Performance
         };
         println!("GPU memory allocator policy: {memory_hints:?}");
-        let (device, queue) = if let Some((_,device,queue,_)) = &shared { (device.clone(), queue.clone()) } else { adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("DinurdoJK renderer"),
-                required_features,
-                required_limits: adapter.limits(),
-                experimental_features: if ray_tracing_supported {
-                    // wgpu 29 gates the native ray-query API behind its explicit
-                    // experimental-feature token as well as EXPERIMENTAL_RAY_QUERY.
-                    unsafe { wgpu::ExperimentalFeatures::enabled() }
-                } else {
-                    wgpu::ExperimentalFeatures::disabled()
-                },
-                memory_hints,
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .map_err(|e| format!("GPU device creation failed: {e}"))? };
+        let device_descriptor = wgpu::DeviceDescriptor {
+            label: Some("DinurdoJK renderer"),
+            required_features,
+            required_limits: adapter.limits(),
+            experimental_features: if ray_tracing_supported {
+                // wgpu 29 gates the native ray-query API behind its explicit
+                // experimental-feature token as well as EXPERIMENTAL_RAY_QUERY.
+                unsafe { wgpu::ExperimentalFeatures::enabled() }
+            } else {
+                wgpu::ExperimentalFeatures::disabled()
+            },
+            memory_hints,
+            trace: wgpu::Trace::Off,
+        };
+        let (device, queue) = if let Some((_, device, queue, _)) = &shared {
+            (device.clone(), queue.clone())
+        } else if let Some(pair) = super::dlss::try_request_device(&adapter, &device_descriptor) {
+            // NGX-capable NVIDIA Vulkan device (DX12 uses ordinary device creation).
+            pair
+        } else {
+            adapter
+                .request_device(&device_descriptor)
+                .await
+                .map_err(|e| format!("GPU device creation failed: {e}"))?
+        };
+        super::dlss::detect_dx12_support(&adapter, &device);
         rverbose!(
             1,
             "[RENDER INIT] device request {:.1} ms",
@@ -530,6 +539,7 @@ impl Renderer {
             false,
             false,
             CloudRenderResolution::Half,
+            (config.width, config.height),
         );
 
         init_mark!("surface config+caps");
@@ -1285,7 +1295,7 @@ impl Renderer {
         let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
         // Filled in the background the first time a scoreboard is shown.
         let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
-        let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None);
+        let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None, size.width as f32 / size.height.max(1) as f32 >= 1.5);
         let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
         // on; set_ui loads it the first time that happens.
@@ -1313,7 +1323,7 @@ impl Renderer {
         // Keep the MP unknown-map art resident from renderer startup. Map-load UI
         // can bind this immediately, present it once, and only then resolve the
         // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
-        let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game);
+        let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game, size.width as f32 / size.height.max(1) as f32 >= 1.5);
         let ui_unknown_map = upload_cached_texture(&device, &queue, &ui_unknown_map_data);
         init_mark!("UI textures");
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2390,7 +2400,7 @@ impl Renderer {
         );
         let mut renderer = Self {
             model_frame_log: crate::model_frame_log::ModelFrameLog::new(
-                jka_assets::pk3::active_game_directory(base, game).join("hitch"),
+                jka_assets::pk3::game_write_directory(base, game).join("hitch"),
             ),
             base: base.to_path_buf(),
             adapter,
@@ -2518,6 +2528,7 @@ impl Renderer {
             blob_mark_buffer: jka_assets::bsp::MarkBuffer::default(),
             ui_pipeline,
             ui_encoded_pipeline: None,
+            ui_encoded_format: None,
             ui_shader,
             ui_pipeline_layout,
             screen_fx_shader,
@@ -2544,6 +2555,8 @@ impl Renderer {
             ui_icon_shader_buffer,
             ui_icon_shader_vertices: Vec::new(),
             ui_icon_shader_batches: Vec::new(),
+            hud_shader_sources: Vec::new(),
+            hud_shader_gpu: None,
             ui_texture_layout,
             ui_bind_group,
             ui_encoded_bind_group,
@@ -2617,6 +2630,8 @@ impl Renderer {
             menu_backdrop: None,
             neon_menu: Default::default(),
             world: None,
+            collision_world_pipeline: None,
+            collision_world_job: None,
             studio_active_world: None,
             studio_cached_worlds: Vec::new(),
             world_videos: Vec::new(),
@@ -2645,6 +2660,7 @@ impl Renderer {
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
             gamma,
+            overbright_bits: 0,
             baked_brightness: crate::renderer::brightness::BakedBrightness::default(),
             gamma_method: crate::gamma::GammaMethod::Shader,
             hardware_gamma_active: false,
@@ -2671,6 +2687,11 @@ impl Renderer {
             fxaa_enabled: false,
             smaa_enabled: false,
             taa_enabled: false,
+            dlss_requested: false,
+            dlss_failed: false,
+            dlss_mode: Default::default(),
+            dlss_model: Default::default(),
+            dlss: Default::default(),
             rt_taa_mode: 1,
             contact_shadows_enabled: false,
             sun_override: false,

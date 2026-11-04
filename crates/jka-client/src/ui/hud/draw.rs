@@ -33,6 +33,14 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
         return;
     };
 
+    if ui.video.hud_style == 1 {
+        if ui.jk2_mode {
+            super::jk2_retail::build(out, ui, w, h);
+        } else {
+            super::retail::build(out, ui, w, h);
+        }
+        return;
+    }
     let ctx = HudRectContext::from_snapshot(ui);
     if !ui.native_replaced(NativeHud::Health) {
         let health_layout = ui.hud_layout.health;

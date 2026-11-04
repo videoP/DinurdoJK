@@ -16,6 +16,17 @@ mod compose;
 mod studio_race;
 pub use studio_race::{StudioRaceUi,StudioRaceRunnerUi};
 pub(crate) use hud::siege::{append_mp_timer_image, load_mp_timer};
+/// Register only the stock artwork matching the active game protocol.
+/// Never mount both JK2 and JKA HUD names in a single native image atlas.
+pub(crate) use hud::jk2_retail::jk2_ammo_index;
+
+pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_mode: bool) {
+    if jk2_mode {
+        hud::jk2_retail::append_jk2_hud_images(images, style);
+    } else {
+        hud::retail::append_retail_hud_images(images, style);
+    }
+}
 pub(crate) use studio_race::leaderboard_bounds;
 mod ttf_font;
 pub(crate) use ttf_font::{
@@ -35,11 +46,12 @@ pub(crate) use tile_cost::{build_tile_cost_vertices, TileCostView};
 mod diagnostics;
 mod geometry;
 mod combat_effects;
-pub(crate) use combat_effects::{build_combat_hud_vertices, UiZoomScope, UiRocketLock};
+pub(crate) use combat_effects::{build_combat_hud_vertices, build_lead_indicator_vertices, UiZoomScope, UiRocketLock};
 mod hud;
 pub(crate) mod movement_components;
 mod inspector;
 mod loading;
+pub(crate) mod loading_layout;
 mod scoreboard;
 pub(crate) mod flex;
 mod glyphs;
@@ -78,7 +90,8 @@ use hud::layout::draw_placed;
 use hud::extensions::build_extension_hud;
 pub(crate) use hud::extensions::hud_element_replaced;
 pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
-pub(crate) use hud::extensions::{EXT_IMAGE_SHADER_SOURCE_BASE, image_cell_uv as extension_image_cell_uv};
+pub(crate) use hud::extensions::{EXT_IMAGE_TEXTURE_SOURCE, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_USER_SHADER_SOURCE_BASE,
+    image_cell_uv as extension_image_cell_uv, image_cell_uv_for_count as extension_image_cell_uv_for_count};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
@@ -97,7 +110,7 @@ use hud::scores::{build_enemy_info, build_game_timer, build_hud_score, build_min
 use hud::siege::build_siege_hud;
 use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_cell};
 use inspector::surface_inspector_frame;
-use loading::{build_background_progress, build_loading_screen, build_shader_compile_progress, build_splash_background};
+use loading::{build_background_progress, build_loading_modal, build_loading_screen, build_shader_compile_progress, build_splash_background};
 use scoreboard::build_scoreboard;
 pub(crate) use scoreboard::{hit_test as scoreboard_hit_test, max_scroll as scoreboard_max_scroll};
 pub use settings::environment::{
@@ -123,7 +136,7 @@ pub use settings::rendering::{
     VIDEO_ROW_PATCH_SUBDIVISIONS, VIDEO_ROW_PATCH_LOD_ERROR, VIDEO_ROW_PATCH_STITCHING,
     VIDEO_ROW_DRAW_CURVES, VIDEO_ROW_PATCH_STATS, VIDEO_ROW_MODEL_LOD_SCALE,
     ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
-    DofMode, DofQuality, DynamicLightsMode, GlowMode,
+    DlssMode, DlssModel, DofMode, DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
     FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, InlineTransformMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
@@ -380,7 +393,7 @@ pub struct ScoreboardChrome {
     pub playtime: Option<String>,
     /// The open vote's summary; shows YES/NO buttons in the footer.
     pub vote: Option<String>,
-    /// Present while the scoreboard owns a mouse cursor (M2/M3 on the board).
+    /// Present while the scoreboard owns a mouse cursor (+altattack on the board).
     pub cursor: Option<ScoreboardCursorUi>,
     /// jaPRO servers also accept `callvote forcespec`.
     pub japro: bool,
@@ -862,6 +875,12 @@ pub struct HudState {
     pub health: i32,
     pub max_health: i32,
     pub armor: i32,
+    /// `PERS_TEAM` for the retail HUD's red/blue backing tint.
+    pub team: i32,
+    /// Current weapon ammo slot, for the stock four-tic ammo meter.
+    pub ammo_index: usize,
+    /// Retail status HUD is hidden for spectator/intermission cameras.
+    pub spectating: bool,
     /// None when a reconstructed demo POV has no recorded force value.
     pub force_power: Option<i32>,
     pub force_power_max: i32,
@@ -894,6 +913,10 @@ pub struct CrosshairSettings {
     /// 0 draws the `style` shape; 1..=`CROSSHAIR_IMAGE_COUNT` draws the stock
     /// `gfx/2d/crosshair{a..j}` image instead (while `style` is not 0).
     pub image: u8,
+    /// TaystJK `cg_crossHairScope`: 0 classic Disruptor mask + insert,
+    /// 1 no mask (show the normal crosshair), 2 full-screen mask without insert.
+    /// The scope's ammo ticks and charge bar remain visible in all three modes.
+    pub scope_mode: u8,
     /// JKA-compatible cg_crosshairSize value. 24 preserves the stock default.
     pub size: f32,
     /// RGBA, matching TaystJK's cg_crosshairColor 0..255 convention.
@@ -924,6 +947,8 @@ pub const CROSSHAIR_STYLE_MAX: u8 = CROSSHAIR_STYLE_LINE;
 pub const CROSSHAIR_STRENGTH_MAX: f32 = 2.0;
 /// Stock image crosshairs, `gfx/2d/crosshaira` .. `crosshairj` (jaPRO adds `j`).
 pub const CROSSHAIR_IMAGE_COUNT: u8 = 10;
+/// Largest TaystJK `cg_crossHairScope` value (full-screen mask).
+pub const CROSSHAIR_SCOPE_MAX: u8 = 2;
 /// `gfx/2d` names of the image crosshairs, `cg_crosshairImage` 1.. in order.
 pub const CROSSHAIR_IMAGE_NAMES: [&str; CROSSHAIR_IMAGE_COUNT as usize] = [
     "gfx/2d/crosshaira",
@@ -961,6 +986,7 @@ impl Default for CrosshairSettings {
         Self {
             style: 1,
             image: 0,
+            scope_mode: 0,
             size: 24.0,
             // Keep DinurdoJK's existing white crosshair by default while using
             // TaystJK's four-component cg_crosshairColor storage convention.
@@ -1022,6 +1048,15 @@ pub struct UiStudioLabel {
 pub struct UiWorldPlayerNames {
     pub scale: f32,
     pub labels: std::sync::Arc<Vec<UiWorldPlayerLabel>>,
+    /// Render-thread projected red dotted projectile lead lines, independent of player labels.
+    pub leads: std::sync::Arc<Vec<UiLeadIndicator>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiLeadIndicator {
+    /// Both points are in render-world coordinates; never screen coordinates.
+    pub current: [f32; 3],
+    pub predicted: [f32; 3],
 }
 
 /// TaystJK-compatible movement-key HUD controls. `mode` matches cg_movementKeys:
@@ -1356,6 +1391,8 @@ pub struct MapLoadingBar {
     pub completed: u32,
     pub total: u32,
     pub skipped: bool,
+    /// This row is enabled by settings, but the current map has no such work.
+    pub no_work: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1367,6 +1404,20 @@ pub struct MapLoadingUi {
     pub active_game_dir: Option<String>,
     pub preparation_finished: bool,
     pub bars: Vec<MapLoadingBar>,
+    /// Multiplayer join progress uses the same native panel as map loading.
+    pub joining_server: bool,
+    /// Actual current operation, never a made-up overall phase percentage.
+    pub status_line: Option<String>,
+    /// During autodownload, the SERVER CONTENT row shows this file rather than
+    /// the queue label; the row stays in place when the next PK3 begins.
+    pub download_file_name: Option<String>,
+    /// Preserve queue-wide progress for the header while the file row starts
+    /// again at zero for every new PK3.
+    pub download_overall_fraction: Option<f32>,
+    /// A native Taffy modal shown over the loading image; egui does not paint it.
+    pub connection_prompt: Option<loading_layout::ConnectionPromptUi>,
+    /// Mouse position for native/Taffy hover feedback; egui does not draw or hit-test it.
+    pub(crate) pointer: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1385,6 +1436,8 @@ pub struct PredictionDebugUi {
 pub struct UiForceSelect {
     pub selected: u8,
     pub known_bits: u32,
+    /// Milliseconds to the end of the JK2 130 ms closing animation.
+    pub remaining_ms: u32,
 }
 
 /// Temporary TaystJK `CG_DrawWeaponSelect` HUD. This is client-local input
@@ -1395,6 +1448,7 @@ pub struct UiInventorySelect {
     pub selected: u8,
     /// STAT_HOLDABLE_ITEMS bitmask indexed by HI_* tags.
     pub owned_bits: u32,
+    pub remaining_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1407,6 +1461,7 @@ pub struct UiWeaponSelect {
     pub ammo_available_bits: u32,
     /// `fd.saberDrawAnimLevel`: 6 = dual, 7 = staff.
     pub saber_style: i32,
+    pub remaining_ms: u32,
 }
 
 /// TaystJK `cg_drawScore` content, independent of `cg_drawScores`.
@@ -1483,6 +1538,8 @@ pub struct UiSiegeHud {
 
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
+    /// Active multiplayer protocol controls which game the Native HUD recreates.
+    pub jk2_mode: bool,
     pub studio_race: Option<studio_race::StudioRaceUi>,
     /// The live frontend Main page: render it at its original color and contrast.
     pub frontend_main_scene: bool,
@@ -1571,6 +1628,9 @@ pub struct UiSnapshot {
     /// Renderer-owned: which extension images have authored .shader/.oshader
     /// materials. Such images bypass the atlas and execute their shader stages.
     pub(crate) extension_shader_flags: Vec<bool>,
+    /// Renderer-owned original pixel dimensions for the atlas slots above.
+    /// Never supplied by Rhai or the app, only by the async decoder.
+    pub(crate) extension_image_dimensions: Vec<Option<[u32; 2]>>,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
@@ -1623,6 +1683,7 @@ pub struct UiSnapshot {
 impl Default for UiSnapshot {
     fn default() -> Self {
         Self {
+            jk2_mode: false,
             frontend_main_scene: false,
             setup_selected: 1,
             mode: OverlayMode::None,
@@ -1685,6 +1746,7 @@ impl Default for UiSnapshot {
             native_hidden: crate::extensions::NativeHudMask::default(),
             extension_images: Vec::new(),
             extension_shader_flags: Vec::new(),
+            extension_image_dimensions: Vec::new(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,

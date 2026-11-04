@@ -1,9 +1,11 @@
-//! jaPRO server-authored `restricts` bits (CS_SERVERINFO).
+//! Server-authored `restricts` bits (CS_SERVERINFO) and NWH compatibility.
 //!
 //! The server advertises the mask; client-side rendering/commands must obey it.
-//! Keep the parsing in one place so live configstring changes are picked up by
+//! NWH JK2 1.02 additionally blocks player labels after verification.
+//! Keep the policy in one place so live configstring changes are picked up by
 //! the HUD, command handlers, camera and strafe-trail presenter alike.
 
+pub(in crate::app) const LEAD_INDICATOR: i32 = 1 << 2; // 4: TaystJK RESTRICT_LEAD
 pub(in crate::app) const PLAYER_LABELS: i32 = 1 << 6; // 64
 pub(in crate::app) const FLIPKICK: i32 = 1 << 7; // 128
 pub(in crate::app) const STRAFE_TRAILS: i32 = 1 << 8; // 256
@@ -28,6 +30,13 @@ impl ServerRestrictions {
 
     pub(in crate::app) fn contains(self, bit: i32) -> bool {
         self.0 & bit != 0
+    }
+
+    /// NWH uses the same effective restriction as `restricts & PLAYER_LABELS`.
+    /// This masks the feature without modifying the saved cg_drawPlayerNames cvar,
+    /// so the user's preference resumes after leaving the NWH server.
+    pub(in crate::app) fn with_nwh_102(self, nwh_102: bool) -> Self {
+        if nwh_102 { Self(self.0 | PLAYER_LABELS) } else { self }
     }
 
     /// jaPRO restricts: do not submit through-wall spectator silhouettes for
@@ -71,6 +80,7 @@ mod tests {
     #[test]
     fn serverinfo_mask_and_combined_bits() {
         let flags = ServerRestrictions::from_server_info(br"\gamename\jaPRO\restricts\1344");
+        assert!(!flags.contains(LEAD_INDICATOR));
         assert!(flags.contains(PLAYER_LABELS));
         assert!(flags.contains(STRAFE_TRAILS));
         assert!(flags.contains(THIRD_PERSON_ANGLE));
@@ -78,6 +88,29 @@ mod tests {
         assert!(!flags.contains(FLIPKICK));
         assert_eq!(ServerRestrictions::from_server_info(br"\restricts\0"), ServerRestrictions::default());
         assert_eq!(ServerRestrictions::from_server_info(br"\restricts\invalid"), ServerRestrictions::default());
+    }
+
+    #[test]
+    fn lead_indicator_restriction_is_bit_two_and_independent() {
+        let restrict = ServerRestrictions::from_server_info(br"\restricts\4");
+        assert!(restrict.contains(LEAD_INDICATOR));
+        assert!(!restrict.contains(PLAYER_LABELS));
+        assert!(!ServerRestrictions::from_server_info(br"\restricts\64").contains(LEAD_INDICATOR));
+        assert!(ServerRestrictions::from_server_info(br"\restricts\68").contains(LEAD_INDICATOR));
+    }
+
+    #[test]
+    fn nwh_102_blocks_player_labels_without_changing_other_restrictions() {
+        let vanilla = ServerRestrictions::default();
+        assert_eq!(vanilla.with_nwh_102(false), vanilla);
+        assert_eq!(vanilla.with_nwh_102(true), ServerRestrictions(PLAYER_LABELS));
+        let existing = ServerRestrictions(STRAFE_TRAILS | DO);
+        assert_eq!(existing.with_nwh_102(false), existing);
+        let restricted = existing.with_nwh_102(true);
+        assert!(restricted.contains(PLAYER_LABELS));
+        assert!(restricted.contains(STRAFE_TRAILS));
+        assert!(restricted.contains(DO));
+        assert!(!restricted.contains(FLIPKICK));
     }
 
     #[test]

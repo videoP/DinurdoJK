@@ -383,14 +383,35 @@ impl HdrOutput {
         &self, device: &wgpu::Device, queue: &wgpu::Queue,
         surface: &wgpu::TextureView, capture: bool,
     ) {
-        self.submit_with_alpha(device, queue, surface, capture, false);
+        self.submit_with_alpha_and_ui(device, queue, surface, capture, false, false);
+    }
+
+    /// Compose JKA authored/implicit 2D material output from the existing
+    /// encoded HDR UI canvas just before presentation. The extra color pass
+    /// shares the ordinary HDR output submission (no additional queue submit).
+    pub fn submit_with_encoded_ui(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        surface: &wgpu::TextureView, capture: bool, composite_ui: bool,
+    ) {
+        self.submit_with_alpha_and_ui(device, queue, surface, capture, false, composite_ui);
     }
 
     pub fn submit_with_alpha(
         &self, device: &wgpu::Device, queue: &wgpu::Queue,
         surface: &wgpu::TextureView, capture: bool, transparent: bool,
     ) {
+        self.submit_with_alpha_and_ui(device, queue, surface, capture, transparent, false);
+    }
+
+    fn submit_with_alpha_and_ui(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        surface: &wgpu::TextureView, capture: bool, transparent: bool,
+        composite_ui: bool,
+    ) {
         let mut encoder = device.create_command_encoder(&Default::default());
+        if composite_ui {
+            self.composite_ui(&mut encoder, &self.view);
+        }
         Self::pass(
             &mut encoder,
             surface,

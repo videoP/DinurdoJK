@@ -143,7 +143,7 @@ impl Renderer {
         let resized = enabled
             && h.resize(
                 &self.device,
-                [self.config.width.max(1), self.config.height.max(1)],
+                [self.targets.render_size.0, self.targets.render_size.1],
                 self.rt_samples,
             );
         if !enabled

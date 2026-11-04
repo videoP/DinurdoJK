@@ -27,6 +27,14 @@ impl App {
                 });
                 theme::label(ui, theme::plain(crate::palette::active().description(), 12.5, theme::TEXT_FAINT()));
                 theme::section(ui, "HUD", "Heads-up display controls.");
+                theme::row(ui, "HUD style", "cg_hudStyle. Native uses Jedi Outcast artwork in JK2 mode or Jedi Academy artwork in JKA mode. Both render in Rust without extensions.", theme::Reset::None, |ui| {
+                    for (style, name) in [(0, "DinurdoJK"), (1, "Native")] {
+                        if theme::chip(ui, name, self.video.hud_style == style).clicked() && self.video.hud_style != style {
+                            let _ = self.set_console_cvar("cg_hudStyle", &style.to_string());
+                        }
+                        ui.add_space(3.0);
+                    }
+                });
                 theme::row(
                     ui,
                     "HUD layout",
@@ -323,6 +331,32 @@ impl App {
                     let _ = self.set_console_cvar("cg_dynamicCrosshair", &mode.to_string());
                 }
 
+                theme::section(ui, "PROJECTILE LEAD", "TaystJK / jaPRO projectile prediction. The server's RESTRICT_LEAD (restricts bit 4) always takes precedence.");
+                let lead_restricted = self.server_restrictions().contains(crate::app::restrictions::LEAD_INDICATOR);
+                let lead_value = self.japro_cg.lead_indicator;
+                theme::row(ui, "Lead indicator", "cg_leadIndicator: Off, 1 uses snapshot ping, >=2 uses the given millisecond offset. Visibility and server restrictions apply in all modes.", theme::Reset::None, |ui| {
+                    ui.add_enabled_ui(!lead_restricted && self.fs_roots.active_jk2.is_none(), |ui| {
+                        let selected = if lead_value < 1.0 { 0 } else if lead_value < 2.0 { 1 } else { 2 };
+                        for (mode, title, value) in [(0, "Off", 0.0), (1, "Ping", 1.0), (2, "Manual", 100.0)] {
+                            if theme::chip(ui, title, selected == mode).clicked() && selected != mode {
+                                let _ = self.set_console_cvar("cg_leadIndicator", &value.to_string());
+                            }
+                            ui.add_space(3.0);
+                        }
+                    });
+                });
+                if lead_restricted {
+                    theme::label(ui, theme::plain("Disabled by this server (restricts & 4). Your saved preference is unchanged.", 12.5, theme::WARNING()));
+                }
+                if lead_value >= 2.0 {
+                    theme::row(ui, "Manual lead offset", "cg_leadIndicator (milliseconds). Ping mode is automatic; manual uses this value directly as in TaystJK.", theme::Reset::None, |ui| {
+                        let mut ms = lead_value;
+                        let text = format!("{ms:.0} ms");
+                        if theme::slider(ui, &mut ms, 2.0..=500.0, &text) {
+                            let _ = self.set_console_cvar("cg_leadIndicator", &ms.round().to_string());
+                        }
+                    });
+                }
                 theme::row(
                     ui,
                     "Color by target",
@@ -751,7 +785,7 @@ impl App {
         theme::section(
             ui,
             "SCOREBOARD",
-            "Hold your scores key, then press Mouse 3 (middle click) to free the cursor. Click a player to mute them or call a kick vote.",
+            "Hold your scores key, then press your Alt Attack bind to toggle the scoreboard mouse cursor. Click a player to mute them or call a kick vote.",
         );
         let board = self.scoreboard_settings;
         theme::row(ui, "Avatars", "cg_scoreboardAvatars. Player portraits next to player names.", theme::Reset::None, |ui| {

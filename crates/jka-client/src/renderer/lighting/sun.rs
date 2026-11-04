@@ -58,6 +58,75 @@ impl Renderer {
             })
     }
 
+    /// Keep the editor's authored sun for the atmosphere and GUI, but stop
+    /// injecting real-time sunlight into the BSP after it sets. This does not
+    /// alter the map's baked lightmap (which requires baked-sun removal).
+    pub(in crate::renderer) fn relit_sun(&self) -> DirectionalSun {
+        let mut sun = self.active_sun();
+        if self.sky_backend == 1 {
+            // `direction` is light travel, so positive Y is below the horizon.
+            // Fade across the horizon instead of instantaneously popping.
+            sun.intensity *= (-sun.direction[1] / 0.035).clamp(0.0, 1.0);
+        }
+        sun
+    }
+
+    pub(in crate::renderer) fn blue_water_night(&self) -> bool {
+        self.sky_backend == 1 && self.active_sun().direction[1] >= 0.0
+    }
+
+    /// The direct light used by BSP Relighting, static-sun composition, and
+    /// entity-sun replacement. One celestial key light at a time. Moon intensity
+    /// uses the same 0.2 direct-light gain as Blue Water's world-lighting pass,
+    /// converted to the renderer's /255 radiance convention.
+    pub(in crate::renderer) fn relit_celestial(&self) -> DirectionalSun {
+        let mut light = self.relit_sun();
+        if self.sun_override && self.blue_water_night() {
+            light.intensity = 0.0; // No lingering direct sunlight after sunset.
+            if let Some(toward_moon) = self.blue_water_moon_toward() {
+                light.direction = (-toward_moon).to_array();
+                light.color = [0.70, 0.82, 1.0];
+                light.intensity = self.blue_water_environment.effective_moon_intensity() * (255.0 * 0.2);
+            }
+        }
+        light
+    }
+
+    /// Moon direction is derived from the SAME position model the Moon editor
+    /// displays. `Sky::light()` is not an authoritative moon source: it can
+    /// report the selected solar light even after sunset.
+    pub(in crate::renderer) fn blue_water_moon_toward(&self) -> Option<Vec3> {
+        if !self.blue_water_night() { return None; }
+        let s = self.blue_water_environment.sanitize();
+        let (elevation, azimuth) = if s.moon_custom {
+            (f64::from(s.moon_elevation), f64::from(s.moon_azimuth))
+        } else {
+            let [yaw, pitch] = self.active_sun().q3_angles();
+            let mut celestial = ::blue_water_sky::state::CelestialModel::default();
+            celestial.set(f64::from(pitch), f64::from((yaw + 90.0).rem_euclid(360.0)), f64::from(s.moon_phase));
+            ::blue_water_sky::state::angles_of(celestial.moon)
+        };
+        if elevation <= 0.0 { return None; }
+        let (e, a) = ((elevation as f32).to_radians(), (azimuth as f32).to_radians());
+        Some(Vec3::new(e.cos() * a.sin(), e.sin(), e.cos() * a.cos()))
+    }
+
+    /// One existing cascade set: at night it follows the moon if moonlight is
+    /// enabled and the moon is up, otherwise it keeps the sun. No extra pass.
+    pub(in crate::renderer) fn blue_water_moon_shadow_direction(&self) -> Option<Vec3> {
+        if !(self.sun_override || self.blue_water_environment.world_lighting > 0.0)
+            || !self.cascaded_shadows_enabled
+            || self.blue_water_environment.effective_moon_intensity() <= 0.0
+        { return None; }
+        self.blue_water_moon_toward().map(|toward| -toward)
+    }
+
+    pub(in crate::renderer) fn shadow_celestial_direction(&self) -> Vec3 {
+        self.blue_water_moon_shadow_direction().unwrap_or_else(|| {
+            Vec3::from_array(self.active_sun().direction).normalize_or_zero()
+        })
+    }
+
     /// The sun the native river's Single Layer Water follows: Blue Water's
     /// celestial light while that sky is on (as the Blue Water sea receives
     /// it), otherwise the classic `active_sun()` the world is lit with.
@@ -90,7 +159,7 @@ impl Renderer {
         let world = self.world.as_ref()?;
         let map_sun = world.sun?;
         let map_toward_sun = world.entity_light_grid.as_ref()?.map_toward_sun()?;
-        let sun = self.active_sun();
+        let sun = self.relit_celestial();
         let toward_sun = Vec3::from_array(sun.direction).normalize_or_zero() * -1.0;
         if toward_sun == Vec3::ZERO {
             return None;

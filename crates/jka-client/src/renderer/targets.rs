@@ -117,8 +117,16 @@ pub(in crate::renderer) struct RenderTargets {
     pub(in crate::renderer) depth_view: wgpu::TextureView,
     pub(in crate::renderer) _msaa_texture: Option<wgpu::Texture>,
     pub(in crate::renderer) msaa_view: Option<wgpu::TextureView>,
+    /// Size of every world/screen-space target below except `scene_view`.
+    /// Equals the window unless DLSS upscales from a lower resolution.
+    pub(in crate::renderer) render_size: (u32, u32),
+    /// Window-size scene color read by post, bloom, DOF, SSR and friends.
     pub(in crate::renderer) _scene_texture: wgpu::Texture,
     pub(in crate::renderer) scene_view: wgpu::TextureView,
+    /// Render-size color the world draws into while DLSS upscales; DLSS
+    /// writes its upscaled result into `scene_view`. None otherwise.
+    pub(in crate::renderer) _world_color_texture: Option<wgpu::Texture>,
+    pub(in crate::renderer) world_color_view: Option<wgpu::TextureView>,
     pub(in crate::renderer) authored_glow: Option<AuthoredGlowTarget>,
     pub(in crate::renderer) bloom: Option<BloomPyramid>,
     pub(in crate::renderer) dof: Option<DofTarget>,
@@ -286,7 +294,10 @@ pub(in crate::renderer) fn create_targets(
     enable_temporal: bool,
     enable_clouds: bool,
     cloud_render_resolution: CloudRenderResolution,
+    output_size: (u32, u32),
 ) -> RenderTargets {
+    let output_size = (output_size.0.max(1), output_size.1.max(1));
+    let render_size = (width.max(1), height.max(1));
     let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA depth"),
         size: wgpu::Extent3d {
@@ -321,21 +332,29 @@ pub(in crate::renderer) fn create_targets(
     let msaa_view = msaa_texture
         .as_ref()
         .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
-    let scene_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("JKA post-process scene color"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: color_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
+    let scene_color = |label, (width, height): (u32, u32)| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let scene_texture = scene_color("JKA post-process scene color", output_size);
     let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let world_color_texture = (render_size != output_size)
+        .then(|| scene_color("JKA DLSS render-resolution world color", render_size));
+    let world_color_view = world_color_texture
+        .as_ref()
+        .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
     let authored_glow = enable_authored_glow.then(|| {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA authored glow source"),
@@ -601,8 +620,11 @@ pub(in crate::renderer) fn create_targets(
         depth_view,
         _msaa_texture: msaa_texture,
         msaa_view,
+        render_size,
         _scene_texture: scene_texture,
         scene_view,
+        _world_color_texture: world_color_texture,
+        world_color_view,
         authored_glow,
         bloom,
         dof,

@@ -339,6 +339,32 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     return prepass_output(input.world_position, input.normal, input.heat_alpha);
 }
 
+// DLSS motion prepass (models/motion.rs). MD3 vertices arrive already in
+// world space with no previous pose, so this is camera-only motion: exact for
+// static props, the Bevy convention (current - previous, UV units).
+fn camera_motion(world_position: vec3<f32>) -> vec2<f32> {
+    let current = camera.unjittered_view_proj * vec4<f32>(world_position, 1.0);
+    let previous = camera.previous_unjittered_view_proj * vec4<f32>(world_position, 1.0);
+    return (current.xy / current.w - previous.xy / previous.w) * vec2<f32>(0.5, -0.5);
+}
+
+@fragment
+fn fs_prepass_motion(input: PrepassVertexOut) -> PrepassOut {
+    var out = prepass_output(input.world_position, input.normal, input.heat_alpha);
+    out.motion_vector = camera_motion(input.world_position);
+    return out;
+}
+
+@fragment
+fn fs_prepass_mask_motion(input: PrepassVertexOut) -> PrepassOut {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
+    var out = prepass_output(input.world_position, input.normal, input.heat_alpha);
+    out.motion_vector = camera_motion(input.world_position);
+    return out;
+}
+
 @fragment
 fn fs_rain_prepass(input: PrepassVertexOut) -> @location(0) f32 {
     return distance(input.world_position, camera.camera_pos_time.xyz);

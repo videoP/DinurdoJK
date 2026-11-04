@@ -415,7 +415,14 @@ impl Renderer {
     /// Common frame-boundary entry: commands only change inputs. Old results
     /// cannot be used after a sun/material change, even while a worker finishes.
     pub(in crate::renderer) fn sync_static_sun_lightmaps(&mut self) {
-        let sun = self.active_sun();
+        // The cached static illumination needs flux/occlusion from the same
+        // direction as the runtime CSM. Only its DIRECTION is part of the key;
+        // moving the intensity slider must not re-raytrace static geometry.
+        let sun = if self.sun_override && self.blue_water_night() {
+            self.relit_celestial()
+        } else {
+            self.active_sun()
+        };
         let bake_sun = self.baked_sun_cache
             && self.baked_sun_debug_mode == 0
             && self.cascaded_shadow_mode.is_csm();

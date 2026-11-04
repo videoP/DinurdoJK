@@ -27,6 +27,7 @@ struct FrameResources {
     view_format: wgpu::TextureFormat,
     color: wgpu::Texture,
     view: wgpu::TextureView,
+    encoded_view: wgpu::TextureView,
     ui_buffer: wgpu::Buffer,
 }
 
@@ -189,6 +190,15 @@ impl StreamOutput {
             self.vulkan_sender = None;
         } // wrapper outlives neither resource nor dimensions
         self.resources = None;
+        // Offer both the regular sampled view and its encoded-color alias.
+        // This is metadata on ONE stream texture, not a new composition image.
+        let encoded_format = view_format.remove_srgb_suffix();
+        let mut view_formats = Vec::with_capacity(2);
+        for variant in [view_format, encoded_format] {
+            if variant != format && !view_formats.contains(&variant) {
+                view_formats.push(variant);
+            }
+        }
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA streamer private composition"),
             size: wgpu::Extent3d {
@@ -203,14 +213,14 @@ impl StreamOutput {
             usage: wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: if format == view_format {
-                &[]
-            } else {
-                std::slice::from_ref(&view_format)
-            },
+            view_formats: &view_formats,
         });
         let view = color.create_view(&wgpu::TextureViewDescriptor {
             format: Some(view_format),
+            ..Default::default()
+        });
+        let encoded_view = color.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(encoded_format),
             ..Default::default()
         });
         let ui_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -226,6 +236,7 @@ impl StreamOutput {
             view_format,
             color,
             view,
+            encoded_view,
             ui_buffer,
         });
     }
@@ -234,7 +245,7 @@ impl StreamOutput {
     /// Source is the SDR backbuffer or early-present target, not a second world pass.
     pub(in crate::renderer) fn submit_scene(
         &mut self,
-        renderer: &Renderer,
+        renderer: &mut Renderer,
         source: &wgpu::Texture,
     ) {
         if !self.settings.enabled || self.warned_unsupported {
@@ -348,6 +359,8 @@ impl StreamOutput {
             self.pause_unsupported("Spout2 GPU transport is Windows only");
             return;
         }
+        let encoded = renderer.hdr_output.is_none() && renderer.config.format.is_srgb()
+            && renderer.ensure_encoded_2d_pipelines();
         let Some(resources) = &self.resources else {
             return;
         };
@@ -414,7 +427,7 @@ impl StreamOutput {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA streamer filtered 2D only"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &resources.view,
+                    view: if encoded { &resources.encoded_view } else { &resources.view },
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -427,32 +440,47 @@ impl StreamOutput {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let ui_gamma = if renderer.ui_gamma_active() {
+                renderer.ui_gamma_native.as_ref()
+            } else { None };
+            let encoded_gamma = if encoded { ui_gamma } else { None };
+            let encoded_gamma_group = encoded_gamma.map(|gamma| &gamma.encoded_group);
+            let screen_fx_pipelines = if let Some(gamma) = encoded_gamma {
+                &gamma.encoded_fx_pipelines
+            } else if encoded {
+                &renderer.screen_fx_encoded_pipelines
+            } else {
+                &renderer.screen_fx_pipelines
+            };
             Renderer::draw_screen_fx_batches(
                 &mut pass,
                 &renderer.screen_fx_vertex_buffer,
                 renderer.screen_fx_vertex_count,
                 &renderer.screen_fx_batches,
-                &renderer.screen_fx_pipelines,
+                screen_fx_pipelines,
                 &renderer.screen_fx_textures,
-                &renderer.screen_fx_white_bind_group, false, None,
+                &renderer.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
             Renderer::draw_screen_fx_batches(
                 &mut pass, &renderer.enemy_icon_vertex_buffer,
                 renderer.enemy_icon_vertex_count, &renderer.enemy_icon_batches,
-                &renderer.screen_fx_pipelines, &renderer.screen_fx_textures,
-                &renderer.screen_fx_white_bind_group, false, None,
+                screen_fx_pipelines, &renderer.screen_fx_textures,
+                &renderer.screen_fx_white_bind_group, encoded, encoded_gamma_group,
             );
             if !vertices.is_empty() {
-                // Match the local presentation's native HUD gamma adjustment.
-                let ui_gamma = if renderer.ui_gamma_active() {
-                    renderer.ui_gamma_native.as_ref()
+                // Match local HUD encoded blending and hardware-scene gamma.
+                let pipeline = if let Some(gamma) = encoded_gamma {
+                    gamma.encoded_pipeline.as_ref().expect("ready streamer gamma 2D pipeline")
+                } else if encoded {
+                    renderer.ui_encoded_pipeline.as_ref().expect("ready streamer legacy 2D pipeline")
                 } else {
-                    None
+                    ui_gamma.map_or(&renderer.ui_pipeline, |gamma| &gamma.pipeline)
                 };
-                pass.set_pipeline(ui_gamma.map_or(&renderer.ui_pipeline, |r| &r.pipeline));
-                pass.set_bind_group(0, &renderer.ui_bind_group, &[]);
-                if let Some(gamma) = ui_gamma {
-                    pass.set_bind_group(1, &gamma.group, &[]);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, if encoded { &renderer.ui_encoded_bind_group }
+                    else { &renderer.ui_bind_group }, &[]);
+                if let Some(group) = encoded_gamma_group.or_else(|| ui_gamma.map(|gamma| &gamma.group)) {
+                    pass.set_bind_group(1, group, &[]);
                 }
                 pass.set_vertex_buffer(0, resources.ui_buffer.slice(..));
                 pass.draw(0..vertices.len() as u32, 0..1);

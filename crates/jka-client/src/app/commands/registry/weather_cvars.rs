@@ -858,6 +858,7 @@ app_cvars! {
                             "r_fxaa" => {
                                 self.video.fxaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.smaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -867,6 +868,7 @@ app_cvars! {
                             "r_smaa" => {
                                 self.video.smaa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.taa = false;
                                     self.video.msaa_samples = 1;
@@ -876,6 +878,7 @@ app_cvars! {
                             "r_taa" => {
                                 self.video.taa = enabled;
                                 if enabled {
+                                    self.video.dlss = false;
                                     self.video.fxaa = false;
                                     self.video.smaa = false;
                                     self.video.msaa_samples = 1;

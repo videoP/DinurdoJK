@@ -138,11 +138,9 @@ impl GameSession {
         if let Some(snapshot) = &snapshot {
             // Demos carry no ping: cgame derives one from the serverinfo's sv_fps.
             let demo = !self.live;
-            let svfps = if demo {
-                self.client_game.server_fps()
-            } else {
-                20
-            };
+            // Use the actual serverinfo cadence rather than assuming every
+            // live server runs at 20 Hz. A wrong cadence masks snapshot jitter.
+            let svfps = self.client_game.server_fps().clamp(1, 125);
             self.lagometer.add_snapshot_info(
                 &crate::lagometer::SnapshotInfo {
                     message_num: snapshot.message_num,

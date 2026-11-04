@@ -114,9 +114,17 @@ pub(in crate::ui) fn build_force_select(
         "Saber Defense",
         "Saber Throw",
     ];
+    // JK2 source: CODE-mp/cgame/cg_draw.c showPowersName[] / CT_ICON_BLUE.
+    const JK2_NAMES: [&str; 18] = [
+        "Heal", "Jump", "Speed", "Push", "Pull", "Mind Trick", "Grip",
+        "Lightning", "Dark Rage", "Protect", "Absorb", "Team Heal",
+        "Team Replenish", "Drain", "Seeing", "Saber Attack",
+        "Saber Defend", "Saber Throw",
+    ];
     let Some(selector) = ui.force_select else {
         return;
     };
+    if ui.jk2_mode && ui.video.hud_style == 1 && selector.remaining_ms <= 130 { return; }
     let valid = |power: u8| {
         power < 18
             && selector.known_bits & (1_u32 << power) != 0
@@ -223,18 +231,21 @@ pub(in crate::ui) fn build_force_select(
         }
     }
 
-    let name = NAMES[usize::from(selector.selected)];
+    let is_jk2_native = ui.jk2_mode && ui.video.hud_style == 1;
+    let name = if is_jk2_native { JK2_NAMES[usize::from(selector.selected)] }
+        else { NAMES[usize::from(selector.selected)] };
+    let tint = if is_jk2_native { [0.567, 0.685, 1.0, 0.75] } else { [1.0; 4] };
     let text_y = 455.0 * sy;
     if let Some(font) = small_font {
         let scale = 0.55;
         let x = (w as f32 - proportional_text_width(name, font, scale) * sy) * 0.5;
-        proportional_text_uniform(out, name, font, x, text_y, scale, [1.0; 4], true, w, h);
+        proportional_text_uniform(out, name, font, x, text_y, scale, tint, true, w, h);
     } else {
         let glyph_w = 8.0 * sy;
         let glyph_h = 12.0 * sy;
         let x = (w as f32 - name.len() as f32 * glyph_w) * 0.5;
         fixed_charset_text(
-            out, name, x, text_y, glyph_w, glyph_h, glyph_w, [1.0; 4], true, w, h,
+            out, name, x, text_y, glyph_w, glyph_h, glyph_w, tint, true, w, h,
         );
     }
 }
@@ -249,6 +260,12 @@ pub fn build_crosshair_vertices(
     h: u32,
 ) {
     if !gameplay_hud_visible(ui, w, h) {
+        return;
+    }
+    // TaystJK CG_DrawCrosshair: no ordinary crosshair over zoomMode 1 or 2,
+    // except cg_crossHairScope 1. This shared entry point covers both the
+    // cached screen-centred and the late-latched dynamic-crosshair paths.
+    if ui.zoom_scope.is_some() && ui.crosshair.scope_mode != 1 {
         return;
     }
     if ui.studio_hud_virtual_layout && ui.crosshair.style == 0 { return; }
@@ -387,8 +404,8 @@ fn build_crosshair_impl(
         // A vertical line 1.25x the length of the plus (`size` px, resolution
         // independent like the other shapes), cg_strafeHelperLineWidth units thick in
         // a 640x480 space like the strafehelper's lines.
-        let sx = w as f32 / 640.0;
-        let line_w = line_width.clamp(0.25, 5.0) * sx;
+        let line_w = line_width.clamp(0.25, 5.0)
+            * super::layout::hud_art_scale(w, h);
         let line_h = size * 1.25;
         rect(
             out,
@@ -453,10 +470,24 @@ mod icon_aspect_tests {
     use super::*;
 
     #[test]
+    fn procedural_line_width_uses_height_not_widescreen_width() {
+        let settings = CrosshairSettings { style: CROSSHAIR_STYLE_LINE, ..Default::default() };
+        for (w, h) in [(1280, 720), (2560, 720), (3440, 1440)] {
+            let mut vertices = Vec::new();
+            build_crosshair(&mut vertices, settings, None, None, 2.0, w, h);
+            let x = vertices.iter().map(|v| (v.position[0] + 1.0) * w as f32 / 2.0);
+            let width = x.clone().fold(f32::NEG_INFINITY, f32::max)
+                - x.fold(f32::INFINITY, f32::min);
+            assert!((width - 2.0 * h as f32 / 480.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
     fn force_selector_artwork_remains_square_on_widescreen() {
         let mut ui = UiSnapshot::default();
         ui.force_select = Some(crate::ui::UiForceSelect {
             selected: 5, known_bits: (1 << 5) | (1 << 2),
+            remaining_ms: 1400,
         });
         let (w, h) = (1920_u32, 1080_u32);
         let mut vertices = Vec::new();

@@ -512,6 +512,9 @@ pub struct HudRect {
 pub struct HudRectContext {
     pub movement_keys: MovementKeysSettings,
     pub draw_fps: u8,
+    pub hud_style: u8,
+    /// Whether Native HUD uses the 80x80 JK2 panels (versus JKA 128x124).
+    pub jk2_mode: bool,
     pub draw_timer: bool,
     /// The independently placed cg_drawScores display (Tayst mode 1/2 vs 3).
     pub mini_scores_mode: i32,
@@ -547,6 +550,8 @@ impl HudRectContext {
         Self {
             movement_keys,
             draw_fps: video.draw_fps,
+            hud_style: video.hud_style,
+            jk2_mode: false,
             draw_timer,
             mini_scores_mode,
             score_offset,
@@ -589,6 +594,7 @@ impl HudRectContext {
                 None => 1,
             },
         );
+        context.jk2_mode = ui.jk2_mode;
         context.enemy_info = ui.enemy_info.is_some();
         context.corner_rows = crate::ui::killfeed::corner_rows(ui);
         context
@@ -726,9 +732,11 @@ pub(crate) fn hud_stock_rect(
             let speed = ctx.speedometer;
             HudRect {
                 x: speed.x * sx,
-                y: (speed.y - 24.0) * sy,
+                // The numeric speed line uses the same 20-unit, centred
+                // text row as pre-speed, vertical speed, yaw and jump history.
+                y: (speed.y - 14.0) * sy,
                 width: 124.0 * sy,
-                height: 24.0 * sy,
+                height: 20.0 * sy,
             }
         }
         HudElementId::SpeedometerJumps => {
@@ -1039,6 +1047,14 @@ pub(in crate::ui) fn draw_placed(
     }
 }
 
+/// Convert a 640x480 HUD artwork unit to physical pixels without aspect stretch.
+/// Reuses the width-ratio correction already applied by other HUD components.
+/// Screen positions can still be anchored independently to the left or right.
+pub(in crate::ui) fn hud_art_scale(w: u32, h: u32) -> f32 {
+    if w == 0 || h == 0 { return 0.0; }
+    (w as f32 / 640.0) * crate::lagometer::width_ratio_coef(w, h)
+}
+
 pub fn hud_element_rect(
     id: HudElementId,
     layout: HudElementLayout,
@@ -1071,6 +1087,31 @@ pub fn hud_element_rect(
             y: stock.y + stock.height * 0.5 + layout.offset[1] - height * 0.5,
             width,
             height,
+        };
+    }
+    // In classic mode Health and Ammo are *clusters*, not four separate bars.
+    // Place the default clusters exactly at the retail bottom corners; any
+    // customised anchor/offset moves them relative to that stable baseline.
+    if ctx.hud_style == 1 && matches!(id, HudElementId::Health | HudElementId::Ammo) {
+        let unit = hud_art_scale(w, h);
+        // Uniform size for both native games; anchoring, not artwork, takes
+        // care of widescreen extra width. HUD Edit must match drawn bounds.
+        let width = (if ctx.jk2_mode { 80.0 } else { 128.0 }) * unit * scale;
+        let height = if ctx.jk2_mode { 80.0 } else { 124.0 } * unit * scale;
+        let reference = HudLayout::default().element(id);
+        let place = |entry: HudElementLayout| {
+            let screen = entry.anchor.screen_fraction();
+            let align = entry.anchor.element_fraction();
+            [screen[0] * w as f32 + entry.offset[0] - align[0] * width,
+             screen[1] * h as f32 + entry.offset[1] - align[1] * height]
+        };
+        let actual = place(layout);
+        let original = place(reference);
+        return HudRect {
+            x: if id == HudElementId::Health { 0.0 } else { w as f32 - width }
+                + actual[0] - original[0],
+            y: h as f32 - height + actual[1] - original[1],
+            width, height,
         };
     }
     let base_panel_w = 216.0_f32.min((w as f32 * 0.30).max(160.0));

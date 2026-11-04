@@ -671,12 +671,8 @@ impl App {
                 Err(error) => { self.push_console_line(format!("^1JK2 demo presentation: {error}")); return false; }
             };
             let minor = match conversion.version { jka_protocol::jk2::Version::V102 => 2, jka_protocol::jk2::Version::V104 => 4 };
-            let Some(root) = self.fs_roots.jk2path.as_ref() else {
-                self.push_console_line("^1Set fs_jk2path to the JK2 GameData directory first"); return false;
-            };
-            let required = if minor == 2 { &["assets0.pk3", "assets1.pk3"][..] } else { &["assets0.pk3", "assets1.pk3", "assets2.pk3", "assets5.pk3"][..] };
-            if let Some(missing) = required.iter().find(|name| !root.join("base").join(name).is_file()) {
-                self.push_console_line(format!("^1JK2 {} requires base/{missing} under fs_jk2path", conversion.version.name())); return false;
+            if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, minor) {
+                self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath or fs_jk2cdpath/base", conversion.version.name())); return false;
             }
             println!("JK2 {} presentation: {} snapshots, {} unmapped events omitted; source demo remains unchanged", conversion.version.name(), conversion.snapshots, conversion.omitted_events);
             asset.bytes = conversion.bytes;
@@ -722,8 +718,10 @@ impl App {
         // Establish CA_LOADING-equivalent presentation before the expensive CGame
         // asset build. `unknownmap_mp` is resident on the renderer, so the next
         // present is intentional even if presenter/VFS setup takes a while.
-        self.loading = Some(MapLoadingState::new(self.latest_request_id.wrapping_add(1),
-            probe.map_name.clone(),self.game.as_deref()));
+        let mut loading = MapLoadingState::new(self.latest_request_id.wrapping_add(1),
+            probe.map_name.clone(), self.game.as_deref());
+        loading.apply_prepare_options(&self.current_map_prepare_options());
+        self.loading = Some(loading);
         self.console_status = format!("LOADING DEMO MAP {}...",probe.map_name);
         self.publish_ui();
 
@@ -1707,6 +1705,10 @@ impl App {
             playback.player_presenter.set_local_global_cosmetics(
                 &self.network.global_hat, &self.network.global_cape);
             playback.race_ghost_alpha = self.race_ghost_alpha;
+            // Capture the same runtime cg_fov used to present the current scene;
+            // cg_fovViewmodel is a separate authored horizontal 4:3 FOV.
+            playback.view_weapon = self.view_weapon;
+            playback.view_weapon_world_fov = self.camera.cg_fov();
             playback.weapon_fx.set_gpu_staging(
                 self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu
             );
@@ -1755,6 +1757,7 @@ impl App {
                 let movement = self.map_movement.as_ref();
                 let world = &mut self.map_collision;
                 let settings = &self.network;
+                let simulated_projectiles = self.simulated_projectiles;
                 let session = net.session();
                 let jk2 = session.jk2_version().is_some();
                 let base_path = &self.base;
@@ -1816,6 +1819,7 @@ impl App {
                         world,
                         entities,
                         settings,
+                        simulated_projectiles,
                         provisional,
                         entity_graph,
                         duel_states,
@@ -2109,7 +2113,8 @@ impl App {
                         playback.client_perf.fx_oriented_quads += 1
                     }
                     crate::fx::system::FxDraw::Line { .. }
-                    | crate::fx::system::FxDraw::Lightning { .. } => playback.client_perf.fx_lines += 1,
+                    | crate::fx::system::FxDraw::Lightning { .. }
+                    | crate::fx::system::FxDraw::Rope { .. } => playback.client_perf.fx_lines += 1,
                     crate::fx::system::FxDraw::Quad { .. } => playback.client_perf.fx_quads += 1,
                     crate::fx::system::FxDraw::Mesh { .. }
                     | crate::fx::system::FxDraw::LitMesh { .. } => {

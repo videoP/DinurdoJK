@@ -76,20 +76,57 @@ fn has_demos(folder: &Path) -> bool {
     }))
 }
 
-pub(super) fn scan_folders(root: Option<&Path>) -> Result<Vec<Folder>, String> {
-    let root = root.ok_or("Set fs_jk2path to your JK2 GameData directory to browse recordings")?;
-    if !root.is_dir() { return Err(format!("JK2 GameData directory does not exist: {}", root.display())); }
+/// Browse local JK2 base demos (`jk2_base/`) and mod demos (`jk2_<mod>/`, beside
+/// the base folder). Homepath is a separate writable overlay; retail demos
+/// remain under cdpath/<game>/.
+pub(super) fn scan_folders(
+    local_base: &Path, home_base: Option<&Path>, retail_root: Option<&Path>,
+) -> Result<Vec<Folder>, String> {
     let mut folders = Vec::new();
-    let dirs = fs::read_dir(root).map_err(|err| format!("JK2 demo folder scan: {err}"))?;
-    for game_dir in dirs.flatten() {
-        if !game_dir.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
-        let name = game_dir.file_name().to_string_lossy().into_owned();
-        let path = game_dir.path().join("demos");
-        if has_demos(&path) {
-            folders.push(Folder { label: format!("{name}/demos"), path });
+    for (root, suffix) in [(Some(local_base), ""), (home_base, " (home)")] {
+        let Some(root) = root else { continue };
+        if folders.iter().any(|f: &Folder| f.path == root.join("demos")) { continue; }
+        let base_name = root.file_name().map_or_else(|| "jk2_base".to_owned(), |n| n.to_string_lossy().into_owned());
+        let local_demos = root.join("demos");
+        if has_demos(&local_demos) {
+            folders.push(Folder { label: format!("{base_name}/demos{suffix}"), path: local_demos });
+        }
+        if let Some(parent) = root.parent() {
+            for mod_dir in fs::read_dir(parent).into_iter().flatten().flatten() {
+                if !mod_dir.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
+                let name = mod_dir.file_name().to_string_lossy().into_owned();
+                let is_mod_folder = name.get(..jka_assets::pk3::JK2_FOLDER_PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(jka_assets::pk3::JK2_FOLDER_PREFIX));
+                if !is_mod_folder || mod_dir.path() == root { continue; }
+                let path = mod_dir.path().join("demos");
+                if has_demos(&path) && !folders.iter().any(|item| item.path == path) {
+                    folders.push(Folder { label: format!("{name}/demos{suffix}"), path });
+                }
+            }
         }
     }
-    folders.sort_by_key(|f| (!f.label.to_ascii_lowercase().starts_with("base/"), f.label.to_ascii_lowercase()));
+    // Optional read-only JK2 retail GameData remains a separate source.
+    if let Some(root) = retail_root {
+        if !root.is_dir() && !local_base.is_dir() && !home_base.is_some_and(Path::is_dir) {
+            return Err(format!("JK2 GameData directory does not exist: {}", root.display()));
+        }
+        if let Ok(dirs) = fs::read_dir(root) {
+            for game_dir in dirs.flatten() {
+                if !game_dir.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
+                let name = game_dir.file_name().to_string_lossy().into_owned();
+                let path = game_dir.path().join("demos");
+                if has_demos(&path) && !folders.iter().any(|item| item.path == path) {
+                    folders.push(Folder { label: format!("{name}/demos"), path });
+                }
+            }
+        }
+    }
+    folders.sort_by_key(|f| (
+        !f.label.eq_ignore_ascii_case("jk2_base/demos"),
+        !f.label.eq_ignore_ascii_case("jk2_base/demos (home)"),
+        !f.label.eq_ignore_ascii_case("base/demos"),
+        f.label.to_ascii_lowercase(),
+    ));
     Ok(folders)
 }
 
@@ -147,7 +184,7 @@ mod tests {
         fs::write(base.join("demos").join("official.dm_15"), b"demo").unwrap();
         fs::write(base.join("jk2demos").join("nonstandard.dm_16"), b"demo").unwrap();
         fs::write(modded.join("demos").join("modded.dm_16"), b"demo").unwrap();
-        let result = scan_folders(Some(&root)).unwrap();
+        let result = scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap();
         assert_eq!(result.iter().map(|folder| folder.label.as_str()).collect::<Vec<_>>(),
             vec!["base/demos", "custommod/demos"]);
         assert!(result.iter().all(|folder| folder.path.file_name().and_then(|name| name.to_str()) == Some("demos")));
@@ -158,7 +195,24 @@ mod tests {
         assert_eq!(scan_recordings(&base.join("demos")).unwrap().len(), 2);
         fs::create_dir_all(root.join("newmod").join("demos")).unwrap();
         fs::write(root.join("newmod").join("demos").join("newmod.dm_15"), b"demo").unwrap();
-        assert_eq!(scan_folders(Some(&root)).unwrap().len(), 3);
+        assert_eq!(scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap().len(), 3);
+        fs::create_dir_all(root.join("jk2_base/demos")).unwrap();
+        fs::write(root.join("jk2_base/demos/local.dm_15"), b"demo").unwrap();
+        fs::create_dir_all(root.join("jk2_newjk2mod/demos")).unwrap();
+        fs::write(root.join("jk2_newjk2mod/demos/mod.dm_16"), b"demo").unwrap();
+        // JK2 mod demos live in jk2_<modname> beside jk2_base, never under GameData/jk2/.
+        fs::create_dir_all(root.join("jk2/oldmod/demos")).unwrap();
+        fs::write(root.join("jk2/oldmod/demos/old.dm_15"), b"demo").unwrap();
+        let folders = scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap();
+        assert_eq!(folders.len(), 5);
+        assert_eq!(folders[0].label, "jk2_base/demos");
+        assert!(folders.iter().any(|f| f.label == "jk2_newjk2mod/demos"));
+        assert!(!folders.iter().any(|f| f.label.contains("oldmod")));
+        let home = root.join("home/jk2_modx/demos");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("home.dm_16"), b"demo").unwrap();
+        let folders = scan_folders(&root.join("jk2_base"), Some(&root.join("home/jk2_base")), Some(&root)).unwrap();
+        assert!(folders.iter().any(|f| f.label == "jk2_modx/demos (home)"));
         fs::remove_dir_all(&root).unwrap();
     }
     #[test]

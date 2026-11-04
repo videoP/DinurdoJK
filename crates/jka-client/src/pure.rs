@@ -36,7 +36,15 @@ pub fn build_pure_command(
     checksum_feed: u32,
     map_name: &str,
 ) -> Result<PureReply, String> {
-    let order = pk3_search_order(base_dir);
+    // The base layer in search order: homepath/base, base, then the retail
+    // fs_cdpath/base, where a split install keeps the stock assets*.pk3.
+    let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
+    let mut order = Vec::new();
+    if let Some(home) = &roots.homepath {
+        if let Some(name) = base_dir.file_name() { order.extend(pk3_search_order(&home.join(name))); }
+    }
+    order.extend(pk3_search_order(base_dir));
+    if let Some(cd) = &roots.cdpath { order.extend(pk3_search_order(&cd.join("base"))); }
     let file_name = |path: &Path| path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
     let assets3_index = order

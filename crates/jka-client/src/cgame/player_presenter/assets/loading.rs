@@ -55,7 +55,7 @@ fn jk2_skin_worker_keeps_nonpure_game_context_across_session_changes() {
     std::fs::write(base.join("jedi.skin"), b"head,head01\nhead_off,head02\nhead_face_off,face02\nhead_face,face01\n").unwrap();
     for version in [None, Some(2), Some(4)] {
         configure_filesystem_roots(&base, FilesystemRoots {
-            active_jk2: version, jk2path: Some(root.clone()), ..Default::default()
+            active_jk2: version, jk2cdpath: Some(root.clone()), ..Default::default()
         });
         let mut assets = AssetSearchPath::open_game(&base, None).unwrap();
         assert!(assets.jk2_pure_policy().is_none());

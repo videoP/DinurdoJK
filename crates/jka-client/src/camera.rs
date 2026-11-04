@@ -661,6 +661,36 @@ pub struct ViewBobSettings {
     pub run_roll: f32,
 }
 
+/// TaystJK cg_weapons.c first-person gun/viewmodel cvars. Client-only; the
+/// authoritative server still owns the weapon and its gameplay effects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewWeaponSettings {
+    /// cg_drawGun: 0 hide; 1 normal; 2 no weapon bob; 3 no landing;
+    /// 4 no idle sway. The levels are cumulative (CG_CalculateWeaponPosition).
+    pub draw_gun: u8,
+    pub gun_x: f32,
+    pub gun_y: f32,
+    pub gun_z: f32,
+    /// cg_fovViewmodel: 0 = follow cg_fov; otherwise a separate viewmodel FOV.
+    pub fov_viewmodel: f32,
+    pub fov_viewmodel_adjust: bool,
+    pub gun_alpha: f32,
+}
+
+impl Default for ViewWeaponSettings {
+    fn default() -> Self {
+        Self {
+            draw_gun: 1,
+            gun_x: 0.0,
+            gun_y: 0.0,
+            gun_z: 0.0,
+            fov_viewmodel: 80.0,
+            fov_viewmodel_adjust: true,
+            gun_alpha: 1.0,
+        }
+    }
+}
+
 /// The predicted playerState inputs consumed by TaystJK's
 /// CG_CalcViewValues / CG_OffsetFirstPersonView. Angles and velocity are in
 /// native JKA units. This state is presentation-only.

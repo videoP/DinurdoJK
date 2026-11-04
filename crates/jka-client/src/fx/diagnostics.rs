@@ -36,7 +36,9 @@ pub const SCHEDULED_FX_MAX: usize = 29;
 pub const PROMOTION_LEVEL: usize = 30;
 pub const FX_PLAY_US: usize = 31;
 pub const FX_PLAY_CALLS: usize = 32;
-const METRICS: usize = 33;
+pub const PROMOTION_MERGED: usize = 33;
+pub const PROMOTION_CAPPED: usize = 34;
+const METRICS: usize = 35;
 static VALUES: [AtomicU64; METRICS] = [const { AtomicU64::new(0) }; METRICS];
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -95,9 +97,9 @@ pub fn report_if_due() {
         n[WORKER_CALLS], avg(WORKER_WAIT_US, FX_END_FRAMES), avg(WORKER_US, WORKER_CALLS),
         n[FX_TRACES], n[FX_TRACE_US] as f64 / 1000.0,
         n[FX_PLAY_CALLS], avg(FX_PLAY_US, FX_PLAY_CALLS));
-    println!("[FX DIAG] fx_frames={} draws={} lines={} candidates={} line_candidates={} max_candidates/frame={} promoted={} spots={} max_promoted/frame={} promotion_ms/frm={:.3} max_spot_radius={:.1} max_beam_len={:.1}",
+    println!("[FX DIAG] fx_frames={} draws={} lines={} candidates={} line_candidates={} max_candidates/frame={} promoted={} merged={} capped={} spots={} max_promoted/frame={} promotion_ms/frm={:.3} max_spot_radius={:.1} max_beam_len={:.1}",
         n[FX_END_FRAMES], n[FX_DRAW_TOTAL], n[FX_DRAW_LINES], n[CANDIDATES], n[CANDIDATE_LINES], n[MAX_CANDIDATES_FRAME],
-        n[PROMOTED], n[SPOTS], n[MAX_PROMOTED_FRAME], avg(PROMOTION_US,PROMOTION_CALLS),
+        n[PROMOTED], n[PROMOTION_MERGED], n[PROMOTION_CAPPED], n[SPOTS], n[MAX_PROMOTED_FRAME], avg(PROMOTION_US,PROMOTION_CALLS),
         n[MAX_SPOT_RADIUS_10] as f64 / 10.0, n[MAX_BEAM_LENGTH_10] as f64 / 10.0);
     println!("[FX DIAG] legacy_mask rebuilds={} hits={} mask_ms_total={:.3} bvh_tests={} accepted={} uploads_kib={:.1} dlight_draw_ms_total={:.3} indices={} groups={} fx_active_max={} scheduled_max={}",
         n[LEGACY_MASK_REBUILDS], n[LEGACY_MASK_HITS], n[LEGACY_MASK_US] as f64/1000.0,

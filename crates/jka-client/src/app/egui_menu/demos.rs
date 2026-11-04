@@ -37,7 +37,9 @@ impl App {
         self.ui_catalog.request(&self.base, None,
             ui_catalog::CatalogRequest::Jk2DemoFolders {
                 token: self.jk2_demo_browser.generation,
-                root: self.fs_roots.jk2path.clone(),
+                local_base: jka_assets::pk3::jk2_base_directory(&self.base, &self.fs_roots),
+                home_base: self.fs_roots.homepath.as_ref().map(|p| p.join("jk2_base")),
+                root: self.fs_roots.jk2cdpath.clone(),
             });
     }
 
@@ -66,7 +68,7 @@ impl App {
         let Some(entry) = self.jk2_demo_browser.entries.get(self.jk2_demo_browser.selected) else { return; };
         let path = entry.path.clone();
         // This is the existing JK2 conversion/asset path, including the
-        // fs_jk2path package validation. Never invoke /demo (.dm_26 VFS).
+        // JK2 base/CD stock package validation. Never invoke /demo (.dm_26 VFS).
         self.play_demo_file(&path);
     }
 
@@ -89,7 +91,7 @@ impl App {
             title: current.map(|r| r.filename.clone()).unwrap_or_else(|| "NO DEMO SELECTED".to_owned()),
             status: b.error.clone().unwrap_or_else(|| {
                 if b.pending { "Scanning JK2 recordings...".to_owned() }
-                else if b.folders.is_empty() { "No .dm_15 / .dm_16 files found under fs_jk2path".to_owned() }
+                else if b.folders.is_empty() { "No JK2 recordings in fs_jk2basepath or fs_jk2cdpath".to_owned() }
                 else if b.entries.is_empty() { "No JK2 recordings in this folder".to_owned() }
                 else { "Reading selected JK2 recording...".to_owned() }
             }),
@@ -122,7 +124,7 @@ impl App {
             1 => vec![heading("JK2 / PLAYERS"), note("Detailed player roster is not indexed for JK2 recordings yet.")],
             2 => vec![heading("JK2 / MATCH"), note("Round and duel indexing is currently JKA-only.")],
             3 => vec![heading("JK2 / CONSOLE"), note("Console timeline extraction is currently JKA-only.")],
-            _ => vec![heading("JK2 / REFERENCED ASSETS"), note("JK2 assets are loaded from fs_jk2path during playback.")],
+            _ => vec![heading("JK2 / REFERENCED ASSETS"), note("JK2 assets use fs_jk2basepath, then fs_jk2cdpath/base.")],
         };
         ui
     }

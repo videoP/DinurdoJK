@@ -14,6 +14,9 @@ pub(crate) struct UiZoomScope {
     pub ammo: i32,
     pub double_ammo: bool,
     pub charge_started: Option<i32>,
+    /// TaystJK hides binocular art in jaPRO race mode, even though zoomMode
+    /// remains 2 (and the ordinary crosshair must still be suppressed).
+    pub binocular_art_hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,18 +113,27 @@ pub(crate) fn build_combat_hud_vertices(
             // columns are solid black; scope mode 2 is the binocular overlay.
             let aspect = (h * (4.0/3.0)).min(w);
             let offset = (w-aspect)*0.5;
-            if offset > 0.0 {
-                rect(out, 0.0, 0.0, offset, h, [0.0,0.0,0.0,1.0], width, height);
-                rect(out, offset+aspect, 0.0, offset, h, [0.0,0.0,0.0,1.0], width, height);
+            // TaystJK CG_DrawZoomMask uses the scope cvar only for the mask
+            // and rotating insert. Its ammo/charging widgets draw in every mode.
+            match ui.crosshair.scope_mode {
+                0 => {
+                    if offset > 0.0 {
+                        rect(out, 0.0, 0.0, offset, h, [0.0,0.0,0.0,1.0], width, height);
+                        rect(out, offset+aspect, 0.0, offset, h, [0.0,0.0,0.0,1.0], width, height);
+                    }
+                    icon(out, ui, ICON_COMBAT_BASE, offset, 0.0, aspect, h,
+                        [1.0;4], width, height);
+                    let level = ((50.0-zoom.fov)/50.0).clamp(0.0,1.0)*103.0;
+                    let alpha = if level >= 99.0 {
+                        (0.7 + (zoom.time as f32*0.01).sin()*0.3).clamp(0.0,1.0)
+                    } else { 1.0 };
+                    rotated_icon(out, ui, ICON_COMBAT_BASE+1, w*0.5, h*0.5,
+                        aspect, h, -level, [1.0,1.0,1.0,alpha], width, height);
+                }
+                2 => icon(out, ui, ICON_COMBAT_BASE, 0.0, 0.0, w, h,
+                    [1.0;4], width, height),
+                _ => {} // 1: minimalist scope using the normal crosshair
             }
-            icon(out, ui, ICON_COMBAT_BASE, offset, 0.0, aspect, h,
-                [1.0;4], width, height);
-            let level = ((50.0-zoom.fov)/50.0).clamp(0.0,1.0)*103.0;
-            let alpha = if level >= 99.0 {
-                (0.7 + (zoom.time as f32*0.01).sin()*0.3).clamp(0.0,1.0)
-            } else { 1.0 };
-            rotated_icon(out, ui, ICON_COMBAT_BASE+1, w*0.5, h*0.5,
-                aspect, h, -level, [1.0,1.0,1.0,alpha], width, height);
             // TaystJK CG_DrawZoomMask: energy ticks travel around the right
             // edge of the ring; depleted powercells shift from green to red.
             let ammo = (zoom.ammo as f32 / if zoom.double_ammo { 600.0 } else { 300.0 }).clamp(0.0,1.0);
@@ -152,7 +164,7 @@ pub(crate) fn build_combat_hud_vertices(
                     }
                 }
             }
-        } else if zoom.mode == 2 {
+        } else if zoom.mode == 2 && !zoom.binocular_art_hidden {
             // TaystJK CG_DrawZoomMask binocular branch: six authored images,
             // yaw-number tape, blue mask, pulsing indicator and zoom slider.
             let sx = w / 640.0;
@@ -241,6 +253,7 @@ mod tests {
             ammo: 150,
             double_ammo: false,
             charge_started: None,
+            binocular_art_hidden: false,
         });
         ui.icon_atlas_uvs = vec![([0.0,0.0],[0.8,0.8]); ICON_COMBAT_BASE+12];
         ui
@@ -254,6 +267,43 @@ mod tests {
         assert!(out.len() >= 24);
         assert!(out.iter().any(|v| v.textured == ICON_TEXTURE_SOURCE));
         assert!(out.iter().any(|v| v.textured == 0.0));
+    }
+
+    #[test]
+    fn taystjk_scope_modes_keep_ammo_and_charge_but_switch_masks() {
+        let mut ui = zoom_test_ui(1);
+        ui.zoom_scope.as_mut().unwrap().charge_started = Some(100);
+        // Use unique UV regions so the mask, insert, tick and charge are
+        // independently observable rather than all looking like one atlas.
+        for (i, uv) in ui.icon_atlas_uvs.iter_mut().enumerate() {
+            let x = i as f32 * 0.001;
+            *uv = ([x, 0.1], [x + 0.0005, 0.9]);
+        }
+        let contains_icon = |out: &[UiVertex], index: usize| {
+            let uv = ui.icon_uv(index).0;
+            out.iter().any(|v| v.uv == uv)
+        };
+        for (mode, mask, insert) in [(0, true, true), (1, false, false), (2, true, false)] {
+            ui.crosshair.scope_mode = mode;
+            let mut out = Vec::new();
+            build_combat_hud_vertices(&mut out, &ui, None, 1920, 1080);
+            assert_eq!(contains_icon(&out, ICON_COMBAT_BASE), mask, "mask for scope={mode}");
+            assert_eq!(contains_icon(&out, ICON_COMBAT_BASE+1), insert, "insert for scope={mode}");
+            assert!(contains_icon(&out, ICON_COMBAT_BASE+2), "ammo ticks for scope={mode}");
+            assert!(contains_icon(&out, ICON_COMBAT_BASE+3), "charge bar for scope={mode}");
+            let black_quads = out.iter().filter(|v| v.textured == 0.0 && v.color == [0.0,0.0,0.0,1.0]).count();
+            assert_eq!(black_quads, if mode == 0 { 12 } else { 0 }, "side bars for scope={mode}");
+        }
+    }
+
+    #[test]
+    fn binoculars_hidden_in_japro_race_still_have_no_art() {
+        let mut ui = zoom_test_ui(2);
+        ui.zoom_scope.as_mut().unwrap().binocular_art_hidden = true;
+        let mut out = Vec::new();
+        build_combat_hud_vertices(&mut out, &ui, None, 1920, 1080);
+        assert!(out.is_empty());
+        assert!(ui.zoom_scope.is_some(), "zoomMode is still active for crosshair suppression");
     }
 
     #[test]
@@ -317,5 +367,35 @@ mod tests {
         let mut out = Vec::new();
         build_combat_hud_vertices(&mut out, &ui, None, 1920, 1080);
         assert!(out.is_empty());
+    }
+}
+
+/// TaystJK CG_DottedLine and the red 4x4 lead marker, expressed as native UI
+/// quads. The upstream uses ten 1x1 dots at 50% alpha and an unscaled end pic.
+pub(crate) fn build_lead_indicator_vertices(
+    out: &mut Vec<UiVertex>, current: [f32; 2], predicted: [f32; 2],
+    width: u32, height: u32,
+) {
+    if !current.iter().chain(predicted.iter()).all(|v| v.is_finite()) { return; }
+    let [x, y] = current;
+    let [to_x, to_y] = predicted;
+    // Stock CG_DrawPic is authored in 640x480 HUD units. Scale uniformly by
+    // screen height so dots and marker keep their apparent size in widescreen.
+    let pixel_scale = (height.max(1) as f32 / 480.0).clamp(0.5, 8.0);
+    // Clip generated dots to the viewport before vertex creation. This also
+    // protects the existing transient buffer from pathological predictions.
+    for i in 0..10 {
+        let t = (i as f32 + 0.5) / 10.0;
+        let px = x + (to_x - x) * t;
+        let py = y + (to_y - y) * t;
+        if px >= 0.0 && px < width as f32 && py >= 0.0 && py < height as f32 {
+            crate::ui::rect(out, px, py, pixel_scale, pixel_scale,
+                [1.0, 0.0, 0.0, 0.5], width, height);
+        }
+    }
+    if to_x >= 0.0 && to_x < width as f32 && to_y >= 0.0 && to_y < height as f32 {
+        crate::ui::rect(out, to_x - 8.0 * pixel_scale, to_y - 8.0 * pixel_scale,
+            4.0 * pixel_scale, 4.0 * pixel_scale,
+            [1.0, 0.0, 0.0, 1.0], width, height);
     }
 }

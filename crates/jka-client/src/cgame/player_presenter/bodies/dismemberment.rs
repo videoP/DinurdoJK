@@ -812,6 +812,7 @@ impl PlayerPresenter {
                 origin,
                 current_time,
                 visual.body_rgba[3],
+                false, // Detached limbs must not emit weapon charge FX.
             ) {
                 self.report_saber_warning_once(
                     entity.number,

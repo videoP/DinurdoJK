@@ -1528,7 +1528,7 @@ mod route_tests {
             ghost.studio_audio_events(0,false);
             runtime.push(StudioRaceRuntime{key:(name.clone(),game.clone()),ghost:Some(ghost),worker:None,pending_track:None,error:None});
         }
-        let runs=load_route_runs(base.clone(),base.parent().unwrap_or(&base).join("render-studio/Test"),Default::default(),inputs).unwrap();
+        let runs=load_route_runs(base.clone(),jka_assets::pk3::dinurdojk_directory(&base).join("render-studio/Test"),Default::default(),inputs).unwrap();
         let mut plan=build_route_comparison_plan(&runs,160.0,None).unwrap();
         inherit_route_presentation(&mut plan,&prior,&Default::default());direct_route_plan(&mut plan,90.0,7);
         eprintln!("{}",plan.summary);

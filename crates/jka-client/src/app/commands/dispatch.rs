@@ -33,6 +33,9 @@ impl App {
                     self.push_console_line(line);
                     return;
                 }
+            } else if let Some(cvar) = self.network.user_cvar(name) {
+                self.push_console_line(format!("^3{}^7 = \"{}\" (user-created)", cvar.name, cvar.value));
+                return;
             }
         }
         if words.len() >= 2 && words[1] == "!" {
@@ -54,6 +57,13 @@ impl App {
                     }
                     return;
                 }
+            } else if let Some(current) = self.network.user_cvar(name).map(|cv| cv.value.clone()) {
+                let numeric = current.parse::<f32>().unwrap_or(0.0);
+                let target = if numeric == 0.0 { "1" } else { "0" };
+                if let Err(error) = self.set_console_cvar(name, target) {
+                    self.push_console_error(format!("^1{error}"));
+                }
+                return;
             }
         }
         // Cvar_Command semantics: if the first token is a cvar, the entire
@@ -74,6 +84,14 @@ impl App {
                     }
                     return;
                 }
+            } else if self.network.user_cvar(name).is_some() {
+                let raw_value = raw_value.trim();
+                let value = raw_value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(raw_value);
+                if let Err(error) = self.set_console_cvar(name, value) {
+                    self.push_console_error(format!("^1{error}"));
+                }
+                return;
             }
         }
 

@@ -73,6 +73,13 @@ shader register pressure is measured without Nsight (NVIDIA reports registers;
 it offers no internal representations). Without the variable nothing changes.
 Example: `blue-water-gpu` test `surface_register_stats`.
 
+Fourth change, in `src/dx12/mod.rs` (`CommandEncoder::raw_command_list`,
+marked "DinurdoJK patch"): a borrow-only accessor for the recording
+`ID3D12GraphicsCommandList`, used by the vendored `dlss_wgpu` DX12 path to
+record NGX DLSS. wgpu 30 exposes no public way to reach it. Descriptor heaps
+are set per pass in wgpu-hal DX12, so NGX changing them in a pass-free encoder
+is harmless.
+
 # winit vendor
 
 `winit-0.30.13` is the crates.io release with one change in
@@ -109,3 +116,31 @@ wgpu-core also has a second DinurdoJK patch in `src/instance.rs`:
 `Instance::new` logs "failed to create <backend> backend" at `warn` instead of
 `debug`, so the reason a backend is unavailable reaches latest.log (otherwise
 `create_surface` only reports "any enabled backend: {}").
+
+# dlss_wgpu vendor
+
+`dlss_wgpu-6.0.0` is the crates.io release (archive SHA-256
+`c6d49749f048ae6512153417e1ca603417620f6024132a4bb6d7a52f138a8bea`, matching
+`Cargo.lock`) without its `Dockerfile` and `Cargo.lock`. Only used by the
+optional `nvidia-dlss` feature (`build.ps1 -Fast -Dlss`). Wired in through
+`[patch.crates-io]`.
+
+One change, marked "DinurdoJK patch": `DlssRenderPreset` (`src/nvsdk_ngx.rs`)
+and `DlssSdk::set_render_preset` (`src/sdk.rs`) set NGX's
+`DLSS.Hint.Render.Preset.*` parameter so the menu can pick the DLSS model
+(E/F CNN, J/K transformer, L/M second-generation transformer). Upstream has no
+preset API.
+
+Second change (Patch20 `0001-dinurdojk-dlss-dx12.patch`, 2026-11-03): a D3D12
+backend for Super Resolution/DLAA, chosen at runtime in `DlssSdk::new`
+(`NgxBackend` in `src/sdk.rs`, NGX D3D12 calls in `src/dx12.rs`). Needs the
+wgpu-hal `raw_command_list` accessor above and the `windows` 0.62 crate (same
+version wgpu-hal uses). NGX records into its own fresh wgpu encoder; resource
+states come from the existing `barrier_list` transitions (wgpu's `RESOURCE`
+maps to D3D12 `NON_PIXEL_SHADER_RESOURCE`, `STORAGE_READ_WRITE` to UAV). Ray
+Reconstruction stays Vulkan-only. Drops now wait via `Device::poll` instead
+of `vkDeviceWaitIdle`. See `DX12_INTEGRATION.md`.
+
+`Cargo.lock` pins `bindgen 0.73.2` to `prettyplease 0.3.0`: Cargo otherwise
+pairs it with `prettyplease 0.2.37` (syn 2) while bindgen itself resolves to
+syn 3, which fails to compile.

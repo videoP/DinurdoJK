@@ -14,6 +14,7 @@ impl App {
             self.disconnect_to_main_menu();
         }
         self.server_password_prompt = Some(ServerPasswordPrompt { target, message });
+        self.set_capture(false);
         self.console_status = "SERVER PASSWORD REQUIRED".into();
         self.egui_repaint_requested = true;
         self.publish_ui();
@@ -28,6 +29,7 @@ impl App {
                 prompt.message = Some("Enter the server password to continue.".to_owned());
             }
             self.egui_repaint_requested = true;
+            self.publish_ui();
             return;
         }
         self.server_password_prompt = None;

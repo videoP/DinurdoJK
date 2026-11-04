@@ -44,6 +44,54 @@ fn position_q3df_speedometer_batch(batch: &mut [UiVertex], ui: &UiSnapshot, w: u
     }
 }
 
+/// Numeric jaPRO movement readouts all use the same typography contract:
+/// left inset inside their HUD Edit rectangle, vertically centred on the
+/// *digit* line. This is independent of the values (and their color codes),
+/// which otherwise cause speed, pre-speed, and yaw to drift when rearranged.
+/// The jump history uses one such line per 20-unit row.
+fn numeric_readout_position(
+    id: HudElementId,
+    item: &crate::speedometer::Text,
+    settings: &crate::speedometer::Settings,
+    stock: crate::ui::HudRect,
+    font: Option<&ProportionalFont>,
+    pixel_height: f32,
+) -> (f32, f32) {
+    const LEFT_INSET: f32 = 2.0; // in height-scaled 640x480 units
+    const JUMP_ROW_HEIGHT: f32 = 20.0;
+    let sy = pixel_height / 480.0;
+    let source_x = if id == HudElementId::SpeedometerJumps {
+        settings.jumps_x
+    } else {
+        crate::speedometer::component_origin(id, settings)[0]
+    };
+    let x = stock.x + LEFT_INSET * sy + (item.x - source_x) * sy;
+    let row_offset = if id == HudElementId::SpeedometerJumps {
+        (item.y - (settings.jumps_y + 110.0)) * sy
+    } else {
+        0.0
+    };
+    let center_y = stock.y + JUMP_ROW_HEIGHT * 0.5 * sy + row_offset;
+    let y = if let Some(font) = font {
+        // CG_Text_Paint takes a *baseline*, not the top of the glyph. Anchor
+        // using an actual digit's metrics so 612, 704, and 999 share one line.
+        let digit = font.glyphs[b'0' as usize];
+        let scale = settings.size * 0.78;
+        center_y + (digit.baseline as f32 - digit.height as f32 * 0.5) * scale * sy
+    } else {
+        // charsgrid_med's glyph_quad is top-anchored and 8 * scale high.
+        center_y - 4.0 * settings.size * 1.4
+    };
+    (x, y)
+}
+
+fn is_numeric_readout(id: HudElementId) -> bool {
+    matches!(id, HudElementId::Speedometer | HudElementId::GroundSpeed
+        | HudElementId::JumpHeight | HudElementId::JumpDistance
+        | HudElementId::VerticalSpeed | HudElementId::YawSpeed
+        | HudElementId::SpeedometerJumps)
+}
+
 pub(in crate::ui) fn build_speedometer(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
@@ -62,8 +110,14 @@ pub(in crate::ui) fn build_speedometer(
     // spacing of its contents uniformly with the screen's height. Otherwise
     // jumps columns, acceleration bars and the speed graph spread out on 21:9.
     let panel_x = |x: f32, anchor: f32| anchor * sx + (x - anchor) * sy;
-    let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text, anchor: f32| {
-        let (px, py) = (panel_x(item.x, anchor), item.y * sy);
+    let ctx = crate::ui::HudRectContext::from_snapshot(ui);
+    let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text, id: HudElementId, anchor: f32| {
+        let (px, py) = if is_numeric_readout(id) {
+            let stock = crate::ui::hud_stock_rect(id, &ctx, w, h);
+            numeric_readout_position(id, item, &speedo.settings, stock, small_font, h as f32)
+        } else {
+            (panel_x(item.x, anchor), item.y * sy)
+        };
         let color = speedometer_color(item.color);
         if let Some(font) = small_font {
             // The acceleration label uses the legacy font's 0xB5 glyph.
@@ -111,13 +165,13 @@ pub(in crate::ui) fn build_speedometer(
             // Native jaPRO text retains the authored left anchor. No bounds-
             // dependent recentering or anisotropic glyph/rectangle scaling.
             for item in &speedo.rects[rects.clone()] { fill(out, item, anchor, false); }
-            for item in &speedo.texts[texts.clone()] { paint(out, item, anchor); }
+            for item in &speedo.texts[texts.clone()] { paint(out, item, *id, anchor); }
         });
     }
     if crate::ui::movement_components::selected(HudElementId::SpeedometerJumps, ui.strafe_helper.flags, ui.speedometer_settings.flags) != 0 {
     draw_placed(out, ui, HudElementId::SpeedometerJumps, w, h, |out| {
         for item in &speedo.jump_texts {
-            paint(out, item, speedo.settings.jumps_x);
+            paint(out, item, HudElementId::SpeedometerJumps, speedo.settings.jumps_x);
         }
     });
     }
@@ -918,6 +972,54 @@ mod strafehelper_review {
             vertices.iter().map(|v| (v.position[0] + 1.0) * scale).fold(f32::INFINITY, f32::min),
             vertices.iter().map(|v| (v.position[0] + 1.0) * scale).fold(f32::NEG_INFINITY, f32::max),
         )
+    }
+
+    /// Every numeric panel's first row has the same left inset and the same
+    /// vertically centred digit line, including after the editor scales/moves
+    /// a panel. The chargrid fallback has uniform eight-pixel glyphs so we
+    /// can compare the actual triangles to the editor rectangles exactly.
+    #[test]
+    fn numeric_speed_panels_share_left_alignment_and_vertical_center() {
+        use crate::ui::{hud_element_rect, HudRectContext};
+        for (w, h) in [(1280, 960), (1920, 1080), (3440, 1440)] {
+            for scale in [1.0, 1.5] {
+                for id in [
+                    HudElementId::Speedometer, HudElementId::GroundSpeed,
+                    HudElementId::SpeedometerJumps, HudElementId::JumpHeight,
+                    HudElementId::JumpDistance, HudElementId::VerticalSpeed,
+                    HudElementId::YawSpeed,
+                ] {
+                    let mut ui = UiSnapshot::default();
+                    ui.mode = crate::ui::OverlayMode::HudEdit;
+                    ui.speedometer_settings.flags = crate::ui::movement_components::native_bit(id);
+                    ui.speedometer = Some(crate::speedometer::preview(&ui.speedometer_settings));
+                    ui.hud_layout.element_mut(id).scale = scale;
+                    ui.hud_layout.element_mut(id).offset = [27.0, -13.0];
+
+                    let mut vertices = Vec::new();
+                    build_speedometer(&mut vertices, &ui, None, w, h);
+                    assert!(!vertices.is_empty(), "{id:?}: missing sample text");
+                    let ctx = HudRectContext::from_snapshot(&ui);
+                    let panel = hud_element_rect(id, ui.hud_layout.element(id), &ctx, w, h);
+                    let left = vertices.iter()
+                        .map(|v| (v.position[0] + 1.0) * w as f32 * 0.5)
+                        .fold(f32::INFINITY, f32::min);
+                    let top = vertices.iter()
+                        .map(|v| (1.0 - v.position[1]) * h as f32 * 0.5)
+                        .fold(f32::INFINITY, f32::min);
+                    let bottom = vertices.iter()
+                        .map(|v| (1.0 - v.position[1]) * h as f32 * 0.5)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let expected_left = panel.x + 2.0 * (h as f32 / 480.0) * scale;
+                    let expected_center = panel.y + 10.0 * (h as f32 / 480.0) * scale;
+                    assert!((left - expected_left).abs() < 0.1,
+                        "{id:?} {w}x{h} scale={scale}: left {left} != {expected_left}");
+                    assert!(((top + bottom) * 0.5 - expected_center).abs() < 0.1,
+                        "{id:?} {w}x{h} scale={scale}: center {} != {expected_center}",
+                        (top + bottom) * 0.5);
+                }
+            }
+        }
     }
 
     #[test]

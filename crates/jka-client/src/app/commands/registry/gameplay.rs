@@ -13,6 +13,67 @@ fn show_player_id_line(slot: usize, team: i32, name: &str, bot: bool) -> String 
     format!("{slot:2} {team_label}   ^7{name}^7{}", if bot { " (bot)" } else { "" })
 }
 
+/// Parse an explicitly versioned JK2 *BSP* launch; never let a typo in the
+/// version silently select a JKA map or the wrong JK2 asset set.
+fn parse_jk2_devmap(words: &[&str]) -> Result<(u8, scene::MapSource), String> {
+    let [_verb, version, name] = words else {
+        return Err("USAGE: JK2_DEVMAP <1.02|1.04> <MAP>".into());
+    };
+    let version = match *version {
+        "1.02" => 2,
+        "1.04" => 4,
+        _ => return Err("JK2_DEVMAP VERSION MUST BE 1.02 OR 1.04 (1.03 UNSUPPORTED)".into()),
+    };
+    match scene::MapSource::from_map_argument(name)? {
+        source @ scene::MapSource::Bsp(_) => Ok((version, source)),
+        _ => Err("JK2_DEVMAP LOADS COMPILED .BSP MAPS ONLY".into()),
+    }
+}
+
+impl App {
+    /// Load a JK2 1.02/1.04 BSP into the local snapshot shim (`jk2_devmap`,
+    /// Solo Game page). False when nothing was launched; the reason is printed.
+    pub(in crate::app) fn launch_jk2_local_map(&mut self, version: u8, source: scene::MapSource) -> bool {
+        // Do not tear down the active game for missing retail assets. As with
+        // JK2 network joins, never silently fall back to JKA's base PK3s.
+        if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, version) {
+            self.console_status = format!("JK2 1.0{version} NEEDS {missing} IN FS_JK2BASEPATH OR FS_JK2CDPATH/BASE");
+            self.push_console_line(format!("^1{}", self.console_status));
+            return false;
+        }
+
+        self.leave_render_studio_for_launch();
+        // The local server always produces JKA-style decoded snapshots; do not
+        // enable JK2 wire prediction/usercmd mode, which is only for live JK2.
+        // Invalidate any old CGame before changing the asset namespace.
+        if self.net.is_some() || self.game_session.is_some() || self.local_server.is_some() || !self.front_end {
+            self.disconnect_to_main_menu();
+        }
+        self.select_demo_asset_game(Some(version));
+        let wanted_game = self.network.fs_game.clone();
+        if let Err(error) = self.set_session_fs_game(wanted_game.as_bytes(), "JK2 local map") {
+            self.disconnect_to_main_menu();
+            self.console_status = format!("JK2_DEVMAP FS_GAME: {error}");
+            self.push_console_line(format!("^1{}", self.console_status));
+            self.publish_ui();
+            return false;
+        }
+        if let Err(error) = scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
+            // A missing BSP must not leave the main menu using JK2 assets.
+            self.disconnect_to_main_menu();
+            self.console_status = format!("JK2_DEVMAP: {error}");
+            self.push_console_line(format!("^1{}", self.console_status));
+            self.publish_ui();
+            return false;
+        }
+        self.menu_look_oneshot = false;
+        self.menu_look_play = false;
+        self.push_console_line(format!("^2JK2 1.0{version} local map:^7 {} (JKA local snapshot shim; not JK2 single-player)", source.label()));
+        self.request_map(source);
+        true
+    }
+}
+
 commands! {
     // TaystJK cg_consolecmds.c: showPlayerId and clientlist share CG_ClientList_f.
     cmd_show_player_id ["showPlayerId", "clientlist"] ("showPlayerId", "List active client slots with team, name and bot marker (TaystJK).", CommandScope::Always) |self, _command| {
@@ -139,6 +200,11 @@ commands! {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb, name] => {
+                // /map and /devmap are JKA commands. An earlier JK2 demo,
+                // connection or /jk2_devmap must not leak its asset namespace.
+                if self.fs_roots.active_jk2.is_some() {
+                    self.disconnect_to_main_menu();
+                }
                 match scene::MapSource::from_map_argument(name) {
                     Ok(source) => match scene::verify_map_source_exists(
                         &self.base,
@@ -184,6 +250,22 @@ commands! {
             }
             _ => return CommandResult::Unhandled,
         }
+    }
+
+    cmd_jk2_devmap ["jk2_devmap", ] ("jk2_devmap <1.02|1.04> <map>", "Explore a JK2 1.02/1.04 BSP offline using the local snapshot shim (no dedicated server).", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let (version, source) = match parse_jk2_devmap(&words) {
+            Ok(request) => request,
+            Err(error) => {
+                self.console_status = error;
+                self.push_console_line(format!("^1{}", self.console_status));
+                return CommandResult::Status;
+            }
+        };
+        if self.launch_jk2_local_map(version, source) {
+            self.console_map_barrier = !self.console_command_buffer.is_empty();
+        }
+        CommandResult::Status
     }
 
     cmd_force_speed ["force_speed", ] ("force_speed", "Use Force speed.", CommandScope::Always, game = GameCommand::Generic(4)) |self, command| {
@@ -707,5 +789,26 @@ mod player_id_tests {
         assert_eq!(show.name, "showPlayerId");
         assert_eq!(show.scope, CommandScope::Always);
         assert_eq!(registry.find("clientlist").unwrap().name, show.name);
+    }
+}
+
+#[cfg(test)]
+mod jk2_devmap_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_explicit_jk2_versions_and_bsp_paths() {
+        for (version, expected) in [("1.02", 2), ("1.04", 4)] {
+            let (selected, source) = parse_jk2_devmap(&["jk2_devmap", version, "maps/ffa_bespin.bsp"]).unwrap();
+            assert_eq!(selected, expected);
+            assert!(matches!(source, scene::MapSource::Bsp(name) if name == "ffa_bespin"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_version_and_source_map() {
+        assert!(parse_jk2_devmap(&["jk2_devmap", "1.03", "ffa_bespin"]).is_err());
+        assert!(parse_jk2_devmap(&["jk2_devmap", "1.04", "ffa_bespin.map"]).is_err());
+        assert!(parse_jk2_devmap(&["jk2_devmap", "1.02"]).is_err());
     }
 }

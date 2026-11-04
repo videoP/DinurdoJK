@@ -1,7 +1,8 @@
 //! Map loading.
 use crate::app::{
     mpsc, scene, thread, App, ApplyLatchedScope, Arc, Duration, EventLoopProxy, ExternalMapChange,
-    Instant, MapLoadPurpose, MapLoadingBar, MapLoadingUi, Path, PathBuf, PhysicsMapMesh,
+    Instant, LiveDownloadState, MapLoadPurpose, MapLoadingBar, MapLoadingUi, Path, PathBuf,
+    PhysicsMapMesh,
     RenderCommand, Sender, UserEvent, FRONTEND_BACKGROUND_MAP,
 };
 
@@ -41,6 +42,8 @@ pub(in crate::app) struct MapLoadingBarState {
     pub(in crate::app) completed: u32,
     pub(in crate::app) total: u32,
     pub(in crate::app) skipped: bool,
+    /// Enabled in the chosen preset, but the map contains nothing to prepare.
+    pub(in crate::app) no_work: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapCollision,
@@ -94,6 +98,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapShaderParse,
@@ -101,6 +106,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapTextureDecode,
@@ -108,6 +114,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapMaterials,
@@ -115,6 +122,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapFxLightProfiles,
@@ -122,6 +130,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapGeometry,
@@ -129,6 +138,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapGi,
@@ -136,6 +146,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapPortalPlans,
@@ -143,6 +154,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapGrass,
@@ -150,6 +162,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapOcean,
@@ -157,6 +170,7 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
                 MapLoadingBarState {
                     task: Task::MapAcoustics,
@@ -164,12 +178,15 @@ impl MapLoadingState {
                     completed: 0,
                     total: 0,
                     skipped: false,
+                    no_work: false,
                 },
             ],
         }
     }
 
     /// Fix the row set from the settings this load was requested with.
+    /// This is called before the loading screen is published. Work discovery
+    /// may update values/statuses but must never alter row visibility.
     pub(in crate::app) fn apply_prepare_options(&mut self, options: &scene::MapPrepareOptions) {
         use crate::thread_activity::Task;
         for (enabled, task) in [
@@ -203,9 +220,12 @@ impl MapLoadingState {
             return;
         }
         if let Some(bar) = self.bars.iter_mut().find(|bar| bar.task == task) {
+            // A worker reporting a disabled stage does not re-enable that row.
+            if bar.skipped || bar.no_work {
+                return;
+            }
             bar.completed = completed.min(total);
             bar.total = total;
-            bar.skipped = false;
         }
     }
 
@@ -216,11 +236,11 @@ impl MapLoadingState {
         // and build_loading_screen used to hide them as soon as upload began.
         // MapPrepared guarantees that CPU preparation has finished, regardless
         // of whether the stages ran now or during the vote delay. Preserve the
-        // rows as completed while the separate, indeterminate RENDERER SETUP
-        // row tracks the remaining GPU/upload/first-frame work.
+        // rows as completed while the permanent RENDERER SETUP row remains
+        // pending until the first successful world frame.
         for bar in &mut self.bars {
             if bar.skipped {
-                continue; // Disabled or absent optional stages stay hidden.
+                continue; // Settings-disabled stages stay hidden.
             }
             if bar.total == 0 {
                 bar.total = 1;
@@ -232,9 +252,12 @@ impl MapLoadingState {
     /// Show a stage as finished when its result came from the prepared-map cache.
     pub(in crate::app) fn mark_cached(&mut self, task: crate::thread_activity::Task) {
         if let Some(bar) = self.bars.iter_mut().find(|bar| bar.task == task) {
+            if bar.skipped {
+                return;
+            }
             bar.total = 1;
             bar.completed = 1;
-            bar.skipped = false;
+            bar.no_work = false;
         }
     }
 
@@ -247,13 +270,17 @@ impl MapLoadingState {
         let Some(bar) = self.bars.iter_mut().find(|bar| bar.task == task) else {
             return;
         };
-        if !present {
-            bar.completed = 0;
-            bar.total = 0;
-            bar.skipped = true;
+        // The row is chosen by settings, not by late BSP/content discovery.
+        if bar.skipped {
             return;
         }
-        bar.skipped = false;
+        if !present {
+            bar.completed = 1;
+            bar.total = 1;
+            bar.no_work = true;
+            return;
+        }
+        bar.no_work = false;
         if bar.total == 0 {
             bar.total = 1;
             bar.completed = if completed { 1 } else { 0 };
@@ -261,67 +288,57 @@ impl MapLoadingState {
     }
 
     pub(in crate::app) fn progress_fraction(&self) -> f32 {
+        // Match the fullscreen HUD: all settings-enabled rows contribute from
+        // their first frame, including work whose total is not known yet.
+        // Renderer setup is one permanent final unit, still pending during
+        // preparation/upload. Never report 100% before WorldUploaded.
         let mut sum = 0.0f32;
-        let mut count = 0u32;
+        let mut count = 1u32; // RENDERER SETUP (0 until first-frame completion)
         for bar in &self.bars {
             if bar.skipped {
                 continue;
             }
-            if bar.total == 0 {
-                // The always-run stages that start late (materials, geometry,
-                // PVS plans) hold the fraction back rather than letting it
-                // jump backwards when the stage finally starts.
-                if matches!(
-                    bar.task,
-                    crate::thread_activity::Task::MapPortalPlans
-                        | crate::thread_activity::Task::MapMaterials
-                        | crate::thread_activity::Task::MapGeometry
-                        | crate::thread_activity::Task::MapFxLightProfiles
-                ) {
-                    count += 1;
-                }
-                continue;
+            if bar.total > 0 {
+                sum += (bar.completed as f32 / bar.total as f32).clamp(0.0, 1.0);
             }
-            sum += (bar.completed as f32 / bar.total as f32).clamp(0.0, 1.0);
             count += 1;
         }
-        let prep = if count == 0 { 0.0 } else { sum / count as f32 };
-        if self.preparation_finished {
-            prep.max(0.92).min(0.98)
-        } else {
-            (prep * 0.9).clamp(0.0, 0.9)
-        }
+        (sum / count as f32).min(0.99)
     }
 
     pub(in crate::app) fn ui(&self) -> MapLoadingUi {
-        use crate::thread_activity::Task;
+        let mut bars: Vec<MapLoadingBar> = self
+            .bars
+            .iter()
+            .map(|bar| MapLoadingBar {
+                label: bar.label,
+                completed: bar.completed,
+                total: bar.total,
+                skipped: bar.skipped,
+                no_work: bar.no_work,
+            })
+            .collect();
+        // Set up at the beginning, not at the MapPrepared transition. The
+        // render thread blocks while uploading, so 0/1 is the honest progress
+        // until it finishes the upload AND presents the first world frame.
+        bars.push(MapLoadingBar {
+            label: "RENDERER SETUP",
+            completed: 0,
+            total: u32::from(self.preparation_finished),
+            skipped: false,
+            no_work: false,
+        });
         MapLoadingUi {
             map_name: self.name.clone(),
             active_game_dir: self.active_game_dir.clone(),
             preparation_finished: self.preparation_finished,
-            bars: self
-                .bars
-                .iter()
-                .map(|bar| MapLoadingBar {
-                    label: bar.label,
-                    completed: bar.completed,
-                    total: bar.total,
-                    // Grass/ocean/acoustics depend on map content that is unknown
-                    // until the BSP is parsed, so they have no row until they
-                    // receive work. They sit last in `bars`, so when they appear
-                    // they are added at the bottom and nothing above shifts.
-                    // PVS draw plans always run for vis-bearing maps, starting
-                    // once the geometry batches are final, so it stays listed as
-                    // "WAIT" from the start (the panel drops it if it never
-                    // receives work).
-                    skipped: bar.skipped
-                        || (bar.total == 0
-                            && matches!(
-                                bar.task,
-                                Task::MapGrass | Task::MapOcean | Task::MapAcoustics
-                            )),
-                })
-                .collect(),
+            bars,
+            joining_server: false,
+            status_line: None,
+            download_file_name: None,
+            download_overall_fraction: None,
+            connection_prompt: None,
+            pointer: None,
         }
     }
 }
@@ -350,7 +367,209 @@ pub(in crate::app) fn prepared_map_has_ocean_surface(map: &scene::PreparedMap) -
     })
 }
 
+/// Fixed row set for the full server join. The rows precede/follow the map
+/// stages even before the server tells us which BSP to load, and survive the
+/// interval between `WorldUploaded` and `CL_FirstSnapshot`.
+fn join_bar(label: &'static str, completed: u32, total: u32) -> MapLoadingBar {
+    MapLoadingBar { label, completed, total, skipped: false, no_work: false }
+}
+
+/// The network content slot displays one file at a time; the header must
+/// continue measuring the whole queue so its percentage never moves backward
+/// when the next file starts. Unknown sizes remain WORKING rather than faking
+/// byte progress, but already completed files still count toward the header.
+fn download_content_progress(download: &LiveDownloadState) -> (MapLoadingBar, f32) {
+    let fraction = download.total.filter(|&total| total > 0)
+        .map(|total| download.received.min(total) as f64 / total as f64)
+        .unwrap_or(0.0);
+    let count = download.files.len().max(1);
+    let overall = ((download.index.min(count) as f64 + fraction) / count as f64)
+        .clamp(0.0, 1.0) as f32;
+    let bar = if download.total.is_some_and(|total| total > 0) {
+        join_bar("SERVER CONTENT", (fraction * 1000.0) as u32, 1000)
+    } else {
+        join_bar("SERVER CONTENT", 0, 1)
+    };
+    (bar, overall)
+}
+
+fn with_join_rows(mut ui: MapLoadingUi, connection: MapLoadingBar,
+    content: MapLoadingBar, snapshot: MapLoadingBar) -> MapLoadingUi
+{
+    ui.joining_server = true;
+    ui.bars.insert(0, connection);
+    ui.bars.insert(1, content);
+    ui.bars.push(snapshot);
+    ui
+}
+
 impl App {
+    /// One native loading screen, from connect through the first active
+    /// snapshot. The SERVER CONTENT row becomes the current per-file download
+    /// bar without introducing a new row partway through the join.
+    pub(in crate::app) fn unified_loading_ui(&self) -> Option<MapLoadingUi> {
+        use jka_protocol::session::ConnectionState;
+        let joining = self.server_password_prompt.is_some()
+            || self.missing_map_prompt.is_some()
+            || self.live_join_ui.is_some()
+            || self.live_download.is_some()
+            // A new server map may start preparing before CGame leaves Playing.
+            // Keep the same network rows from that very first map-load frame.
+            || (self.net.is_some() && self.loading.is_some()
+                && self.renderer_restart_started.is_none() && !self.shader_remap_upload)
+            || self.net.as_ref().is_some_and(|net| {
+                net.state() != ConnectionState::Active
+                    || self.game_session.as_ref().is_none_or(|session| {
+                        session.phase != crate::app::SessionPhase::Playing
+                    })
+            });
+        if !joining {
+            return self.loading.as_ref().map(MapLoadingState::ui);
+        }
+
+        let net = self.net.as_ref();
+        let has_gamestate = net.is_some_and(|net| net.session().has_gamestate());
+        let map_name = net.and_then(|net| net.session().decoder().map_name())
+            .or_else(|| self.loading.as_ref().map(|loading| loading.name.clone()))
+            .or_else(|| self.live_join_timing.as_ref().and_then(|timing| timing.prefetched_map.clone()))
+            .or_else(|| self.live_download.as_ref().map(|download| download.map_name.clone()))
+            .or_else(|| self.live_join_ui.as_ref().map(|join| join.map_name.clone()))
+            .or_else(|| self.missing_map_prompt.as_ref().map(|prompt| prompt.map_name.clone()))
+            .or_else(|| self.server_password_prompt.as_ref().map(|prompt| prompt.target.clone()))
+            .or_else(|| net.map(|net| net.server_name.clone()))
+            .unwrap_or_else(|| "SERVER".to_owned());
+
+        // Map preparation can finish before the server admits the client.
+        // Recreate the completed rows, not fresh WAIT rows, after WorldUploaded.
+        let ready_map = self.loading.is_none() && !self.live_without_world
+            && Self::normalized_bsp_name(&self.map_name) == Self::normalized_bsp_name(&map_name)
+            && (self.prepared_map_cache.as_ref().is_some_and(|cache| {
+                Self::normalized_bsp_name(&cache.label) == Self::normalized_bsp_name(&map_name)
+            }) || self.game_session.as_ref().is_some_and(|session| {
+                session.live && !session.local
+                    && session.phase == crate::app::SessionPhase::WaitingForSnapshot
+            }) || self.live_join_timing.as_ref().is_some_and(|timing| {
+                timing.first_world_frame_ms.is_some()
+                    && timing.prefetched_map.as_ref().is_some_and(|name| {
+                        Self::normalized_bsp_name(name) == Self::normalized_bsp_name(&map_name)
+                    })
+            }));
+        let mut ui = if let Some(loading) = self.loading.as_ref() {
+            loading.ui()
+        } else {
+            let mut pending = MapLoadingState::new(0, map_name.clone(), self.game.as_deref());
+            pending.apply_prepare_options(&self.current_map_prepare_options());
+            if ready_map || self.live_without_world {
+                pending.begin_upload();
+            }
+            let mut ui = pending.ui();
+            if ready_map || self.live_without_world {
+                if let Some(renderer) = ui.bars.last_mut() {
+                    renderer.total = 1;
+                    renderer.completed = 1;
+                }
+            }
+            if self.live_without_world {
+                // Explicitly authorized missing-map joins have no BSP to load.
+                for bar in &mut ui.bars {
+                    if !bar.skipped {
+                        bar.no_work = true;
+                    }
+                }
+            }
+            ui
+        };
+        ui.map_name = map_name;
+
+        // Connection progress denotes protocol transitions, never an elapsed
+        // time estimate. Connected+gamestate is the end of the handshake.
+        let connected = net.map(|net| match net.state() {
+            ConnectionState::Connecting => 0,
+            ConnectionState::Challenging => 1,
+            ConnectionState::Connected => if has_gamestate { 3 } else { 2 },
+            ConnectionState::Primed | ConnectionState::Active => 3,
+            ConnectionState::Disconnected => 0,
+        }).unwrap_or(0);
+        let connection = join_bar("SERVER CONNECTION", connected, 3);
+
+        let content = if let Some(download) = self.live_download.as_ref() {
+            let (bar, overall) = download_content_progress(download);
+            ui.download_overall_fraction = Some(overall);
+            ui.download_file_name = download.current().map(|file| file.remote_name.clone());
+            bar
+        } else {
+            let checked = (has_gamestate && !self.live_auto_download_requested
+                && self.missing_map_prompt.is_none())
+                || self.live_join_ui.as_ref().is_some_and(|join| {
+                    join.phase == crate::app::LiveJoinUiPhase::Synchronizing
+                });
+            join_bar("SERVER CONTENT", u32::from(checked), u32::from(checked))
+        };
+
+        // The first *active* snapshot enters CGame. WorldUploaded is not that
+        // boundary, and it must not remove the loading screen prematurely.
+        let primed = self.game_session.as_ref().is_some_and(|session| {
+            session.live && session.phase == crate::app::SessionPhase::WaitingForSnapshot
+        });
+        let snapshot = join_bar("SERVER SNAPSHOT", 0, u32::from(primed));
+        ui = with_join_rows(ui, connection, content, snapshot);
+        ui.connection_prompt = if let Some(prompt) = self.missing_map_prompt.as_ref() {
+            Some(crate::ui::loading_layout::ConnectionPromptUi::MissingMap {
+                map_name: prompt.map_name.clone(), reason: prompt.reason.clone(),
+                can_download: self.network.allow_http_downloads || self.network.allow_legacy_downloads,
+            })
+        } else {
+            self.server_password_prompt.as_ref().map(|prompt| {
+                crate::ui::loading_layout::ConnectionPromptUi::Password {
+                    target: prompt.target.clone(), message: prompt.message.clone(),
+                    masked_len: self.network.password.chars().count(),
+                }
+            })
+        };
+        ui.status_line = Some(if let Some(download) = self.live_download.as_ref() {
+            let name = download.current().map(|file| file.remote_name.as_str()).unwrap_or("PK3");
+            let transferred = if let Some(total) = download.total {
+                format!("{:.1}/{:.1} MiB", download.received as f64 / 1_048_576.0,
+                    total as f64 / 1_048_576.0)
+            } else {
+                format!("{:.1} MiB", download.received as f64 / 1_048_576.0)
+            };
+            format!("Downloading {} ({}/{}) - {}", name,
+                (download.index + 1).min(download.files.len()), download.files.len(), transferred)
+        } else if self.game_session.is_none() && self.live_join_ui.as_ref().is_some_and(|join| {
+            join.phase == crate::app::LiveJoinUiPhase::Synchronizing
+        }) {
+            "Refreshing downloaded assets and requesting a new gamestate...".to_owned()
+        } else if let Some(prompt) = self.missing_map_prompt.as_ref() {
+            format!("Map {} is not installed - choose auto-download, connect anyway, or abort.",
+                prompt.map_name)
+        } else if self.server_password_prompt.is_some() {
+            "Server password required - enter it to continue connecting.".to_owned()
+        } else if !has_gamestate {
+            net.map(|net| match net.state() {
+                ConnectionState::Connecting => "Waiting for server challenge...",
+                ConnectionState::Challenging => "Waiting for connection acknowledgement...",
+                _ => "Waiting for server gamestate...",
+            }).unwrap_or("Connecting to server...").to_owned()
+        } else if let Some(loading) = self.loading.as_ref() {
+            if loading.preparation_finished {
+                "Preparing the renderer and first world frame...".to_owned()
+            } else {
+                "Preparing map and client assets...".to_owned()
+            }
+        } else if self.pending_live_gamestate || self.game_session.is_none() {
+            "Initializing the game client and verifying server assets...".to_owned()
+        } else if ready_map || self.live_without_world {
+            "Awaiting first active server snapshot...".to_owned()
+        } else {
+            "Waiting for map preparation to begin...".to_owned()
+        });
+        // Native loading hover is evaluated against the same Taffy tree used
+        // for painting. The pointer is a physical-pixel coordinate.
+        ui.pointer = Some([self.cursor_position.0 as f32, self.cursor_position.1 as f32]);
+        Some(ui)
+    }
+
     pub(in crate::app) fn current_map_prepare_options(&self) -> scene::MapPrepareOptions {
         scene::MapPrepareOptions {
             visual_only: false,
@@ -363,6 +582,8 @@ impl App {
             client_physics: self.video.client_physics,
             gen_normal_maps: self.video.gen_normal_maps,
             float_lightmap: self.video.float_lightmap && (self.video.hdr || self.video.hdr_output != 0),
+            overbright_bits: self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+            map_overbright_bits: self.video.effective_map_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
             planar_reflections: self.video.reflection_quality.planar_slot_budget() > 0,
             planar_environment: self.video.reflection_quality.promotes_environment_planars(),
             omit_environment_stages: self.video.reflection_quality.omits_environment_stages(),
@@ -383,6 +604,29 @@ impl App {
 
     pub(in crate::app) fn request_studio_demo_map(&mut self, source: scene::MapSource) {
         self.request_map_internal(source, MapLoadPurpose::StudioDemo);
+    }
+
+    /// Explicitly request the optional collision render world. This is never
+    /// called on the off path and performs no BSP IO or polygon work itself.
+    /// The renderer reuses the active Steam Audio mesh, or starts a worker to
+    /// read the BSP and reconstruct brush sides only after this request.
+    pub(in crate::app) fn ensure_collision_world_mesh(&self) {
+        if !crate::renderer::collision_world_only()
+            || self.loading.is_some()
+            || self.render.is_none()
+        {
+            return;
+        }
+        let scene::MapSource::Bsp(_) = &self.initial_source else { return; };
+        let Some(cache) = self.prepared_map_cache.as_ref().filter(|cache|
+            cache.label == self.initial_source.label()) else { return; };
+        self.render_command(RenderCommand::BuildCollisionWorld {
+            map_hash: cache.map.map_hash,
+            root: self.base.clone(),
+            game: self.game.clone(),
+            source: self.initial_source.clone(),
+            allow_asset_overrides: self.video.allow_asset_overrides,
+        });
     }
 
     /// Client physics only needs the BSP's static triangle mesh, so turning it
@@ -747,6 +991,11 @@ impl App {
             self.clear_asset_preview_runtime();
         }
         self.apply_latched_console_cvars(ApplyLatchedScope::MapLoad);
+        // Match OpenJK's renderer defaults per connected protocol. This command
+        // precedes the BSP upload and also resets the menu when JK2 disconnects.
+        self.render_command(RenderCommand::SetOverbrightBits(
+            self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+        ));
         // PBR material selection is map-load scoped; synchronize the renderer at
         // the same boundary rather than when a latched cvar is typed. Rebuild the
         // local presentation asset cache so its VFS/material policy matches too.
@@ -1768,8 +2017,77 @@ impl App {
 
 #[cfg(test)]
 mod loading_row_tests {
-    use super::MapLoadingState;
+    use super::{download_content_progress, join_bar, with_join_rows, MapLoadingState};
+    use crate::app::{LiveDownloadState, LiveDownloadTransfer, PathBuf};
+    use crate::download::DownloadSpec;
     use crate::thread_activity::Task;
+
+    #[test]
+    fn download_row_tracks_current_file_while_queue_progress_advances() {
+        let file = |name: &str| DownloadSpec {
+            referenced_name: name.to_owned(),
+            remote_name: format!("japro/{name}.pk3"),
+            local_path: PathBuf::from(format!("dl_{name}.pk3")),
+            checksum: 0,
+        };
+        let mut download = LiveDownloadState {
+            map_name: "mp/example".into(),
+            files: vec![file("first"), file("second")],
+            index: 0,
+            http_base: None,
+            server_allows_legacy: true,
+            transfer: LiveDownloadTransfer::Idle,
+            received: 50,
+            total: Some(100),
+            status: String::new(),
+        };
+        let (first, overall_first) = download_content_progress(&download);
+        assert_eq!(first.label, "SERVER CONTENT");
+        assert_eq!((first.completed, first.total), (500, 1000));
+        assert!((overall_first - 0.25).abs() < f32::EPSILON);
+        assert_eq!(download.current().unwrap().remote_name, "japro/first.pk3");
+
+        download.index = 1;
+        download.received = 0;
+        download.total = None;
+        let (second, overall_second) = download_content_progress(&download);
+        assert_eq!((second.completed, second.total), (0, 1));
+        assert!((overall_second - 0.5).abs() < f32::EPSILON);
+        assert_eq!(download.current().unwrap().remote_name, "japro/second.pk3");
+
+        download.received = 75;
+        download.total = Some(100);
+        let (second_progress, overall_last) = download_content_progress(&download);
+        assert_eq!((second_progress.completed, second_progress.total), (750, 1000));
+        assert!((overall_last - 0.875).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn join_rows_keep_positions_from_handshake_to_snapshot() {
+        let mut loading = MapLoadingState::new(10, "mp/ffa3".into(), None);
+        loading.skip_task(Task::MapOcean);
+        let build = |ui, connected, content, snapshot| {
+            with_join_rows(ui, join_bar("SERVER CONNECTION", connected, 3),
+                join_bar("SERVER CONTENT", content, 1),
+                join_bar("SERVER SNAPSHOT", 0, snapshot))
+        };
+        let before = build(loading.ui(), 0, 0, 0);
+        loading.begin_upload();
+        let after_upload = build(loading.ui(), 3, 1, 0);
+        let mut uploaded = loading.ui();
+        uploaded.bars.last_mut().unwrap().completed = 1;
+        let awaiting_snapshot = build(uploaded, 3, 1, 1);
+        let labels = |ui: &crate::ui::MapLoadingUi| ui.bars.iter()
+            .filter(|bar| !bar.skipped).map(|bar| bar.label).collect::<Vec<_>>();
+        assert_eq!(labels(&before), labels(&after_upload));
+        assert_eq!(labels(&before), labels(&awaiting_snapshot));
+        assert_eq!(before.bars[0].completed, 0);
+        assert_eq!(awaiting_snapshot.bars[0].completed, 3);
+        assert_eq!(before.bars.last().unwrap().total, 0);
+        assert_eq!(awaiting_snapshot.bars.last().unwrap().total, 1);
+        assert_eq!(labels(&before).last(), Some(&"SERVER SNAPSHOT"));
+        assert!(before.bars.iter().find(|bar| bar.label == "OCEAN MESH").unwrap().skipped);
+    }
 
     #[test]
     fn upload_keeps_prepared_rows_complete_after_a_vote_cache_hit() {
@@ -1791,6 +2109,47 @@ mod loading_row_tests {
         assert!(loading.ui().bars.iter()
             .find(|bar| bar.label == "BSP PARSE")
             .is_some_and(|bar| bar.completed == 1 && bar.total == 1 && !bar.skipped));
+    }
+
+    #[test]
+    fn renderer_row_exists_before_cpu_preparation_and_stays_in_place() {
+        let mut loading = MapLoadingState::new(10, "mp/ffa3".into(), None);
+        let initial = loading.ui();
+        assert_eq!(initial.bars.last().unwrap().label, "RENDERER SETUP");
+        assert_eq!(initial.bars.last().unwrap().total, 0);
+        let labels = initial.bars.iter().filter(|row| !row.skipped)
+            .map(|row| row.label).collect::<Vec<_>>();
+        loading.begin_upload();
+        let upload = loading.ui();
+        assert_eq!(upload.bars.last().unwrap().label, "RENDERER SETUP");
+        assert_eq!(upload.bars.last().unwrap().total, 1);
+        assert_eq!(labels, upload.bars.iter().filter(|row| !row.skipped)
+            .map(|row| row.label).collect::<Vec<_>>());
+        assert!(loading.progress_fraction() < 1.0);
+    }
+
+    #[test]
+    fn enabled_optional_row_stays_visible_if_map_has_no_work() {
+        let mut loading = MapLoadingState::new(11, "mp/duel2".into(), None);
+        let before = loading.ui();
+        assert!(!before.bars.iter().find(|bar| bar.label == "OCEAN MESH").unwrap().skipped);
+        loading.set_optional_task_presence(Task::MapOcean, false, false);
+        let after = loading.ui();
+        let ocean = after.bars.iter().find(|bar| bar.label == "OCEAN MESH").unwrap();
+        assert!(!ocean.skipped);
+        assert!(ocean.no_work);
+        assert_eq!((ocean.completed, ocean.total), (1, 1));
+    }
+
+    #[test]
+    fn disabled_optional_row_stays_hidden_on_worker_or_presence_update() {
+        let mut loading = MapLoadingState::new(12, "mp/duel2".into(), None);
+        loading.skip_task(Task::MapGrass);
+        loading.update_worker(Task::MapGrass, 1, 2);
+        loading.set_optional_task_presence(Task::MapGrass, true, true);
+        loading.begin_upload();
+        let grass = loading.ui().bars.into_iter().find(|bar| bar.label == "GRASS").unwrap();
+        assert!(grass.skipped);
     }
 
     #[test]

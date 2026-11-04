@@ -324,7 +324,7 @@ impl RaceGhost {
                 let Ok(event)=EntityEvent::try_from(raw & !EV_EVENT_BITS) else{return};
                 if event==EntityEvent::EV_NONE {return;}
                 let Some(state)=crate::cgame::player_state_to_entity_state(ps) else{return};
-                events.push(crate::cgame::PresentationEvent {receive_sequence:0,source_entity_num:state.number,
+                events.push(crate::cgame::PresentationEvent {receive_sequence:0,predicted_fire_command_time:None,source_entity_num:state.number,
                     entity_num:state.number,event,raw_event:raw,parm,position:playerstate_vec3(ps,"origin").unwrap_or([0.0;3]),
                     event_only_entity:false,server_time:self.track.race_start_server_ms+frame.elapsed_ms,state});
             };

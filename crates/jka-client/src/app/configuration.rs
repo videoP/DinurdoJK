@@ -49,6 +49,7 @@ impl App {
         settings.renderer_backend = stable.renderer_backend;
         settings.gpu_adapter = stable.gpu_adapter;
         settings.resolution = stable.resolution;
+        settings.resolution_desktop = stable.resolution_desktop;
         // Grass can be disabled live. Preserve a pending enable as latched
         // until the renderer has actually been restarted with the required map
         // resources, but persist live disables immediately.
@@ -82,6 +83,8 @@ impl App {
             draw_score_y: self.draw_score_y,
             draw_enemy_info: self.draw_enemy_info,
             mouse: self.mouse_input,
+            mouse_repeat_mode: self.in_mouserepeat,
+            mouse_repeat_delay: self.in_mouserepeat_delay,
             fov: self.camera.cg_fov(),
             model: self.solo_client_info.model_cvar(),
             force_model: self.force_model.clone(),
@@ -114,12 +117,14 @@ impl App {
             ui_vgs: self.ui_vgs,
             jump_height_shade: self.jump_height_shade,
             screen_shake: self.screen_shake,
+            simulated_projectiles: self.simulated_projectiles,
             head_look: self.head_look,
             swim_tilt: self.swim_tilt,
             swim_turn_bank: self.swim_turn_bank,
             move_lean: self.move_lean,
             zoom_fov: self.japro_zoom_fov,
             view_bob: self.view_bob,
+            view_weapon: self.view_weapon,
             fk_duration: self.japro_fk_duration,
             fk_first_jump_duration: self.japro_fk_first_jump_duration,
             fk_second_jump_delay: self.japro_fk_second_jump_delay,
@@ -133,7 +138,6 @@ impl App {
             server_filters: self.server_browser_for(crate::server_browser::BrowserProtocol::Jka).filters_string(),
         };
         let path = self.config_path.clone();
-        let fs_roots = self.fs_roots.clone();
         let bindings = self.bindings.clone();
         let audio = self.audio.clone();
         let generation = self.config_save_generation.wrapping_add(1);
@@ -143,23 +147,8 @@ impl App {
             // the shared queue swallow the panic and silently lose settings.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 config::save_video_settings(&path, settings, &bindings, &presentation, &audio)?;
-                // Keep writeconfig faithful to the cvar console even though
-                // path discovery at startup uses the exe-local bootstrap file.
-                use std::io::Write as _;
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true).open(&path).map_err(|e| e.to_string())?;
-                let value = |path: &Option<std::path::PathBuf>|
-                    path.as_ref().map_or(String::new(), |p| p.display().to_string());
-                writeln!(file, "\n// Filesystem paths (restart required; mirrored in DinurdoJK-paths.ini)")
-                    .map_err(|e| e.to_string())?;
-                for (name, value) in [
-                    ("fs_homepath", value(&fs_roots.homepath)),
-                    ("fs_cdpath", value(&fs_roots.cdpath)),
-                    ("fs_jk2path", value(&fs_roots.jk2path)),
-                    ("fs_forcegame", fs_roots.forcegame.unwrap_or_default()),
-                ] {
-                    writeln!(file, "seta {name} \"{value}\"").map_err(|e| e.to_string())?;
-                }
+                // fs_* roots are not written here: DinurdoJK/DinurdoJK-paths.ini is
+                // their only store, and startup reads them from there.
                 Ok(())
             }))
             .unwrap_or_else(|_| Err("config serialization panicked".to_owned()));

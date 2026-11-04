@@ -66,6 +66,7 @@ pub(in crate::scene) fn map_spawn_points_of(
                 yaw: yaw.to_radians(),
                 initial: integer("spawnflags") & 1 != 0,
                 no_humans: integer("nohumans") != 0,
+                fallback: false,
             })
         })
         .collect()

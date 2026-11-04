@@ -2,22 +2,50 @@
 use crate::app::egui_menu::{filesystem_refresh_icon, rail_item, scene, theme, ui_catalog, App};
 
 impl App {
+    /// The menu lists the picked game; in a session, console map completion
+    /// and callvote need the maps of the game actually mounted.
+    fn solo_listing_game(&self) -> Option<u8> {
+        if self.front_end { self.solo_asset_game } else { self.fs_roots.active_jk2 }
+    }
+
     pub(in crate::app) fn ensure_solo_map_catalog(&mut self) {
-        if self.solo_catalog_loaded {
+        let jk2 = self.solo_listing_game();
+        if self.solo_catalog_loaded && self.solo_catalog_for == jk2 {
             return;
         }
 
         self.solo_catalog_loaded = true;
+        self.solo_catalog_for = jk2;
         self.solo_maps.clear();
         self.solo_catalog_error = None;
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = None;
+        // A JK2 install without its retail PK3s has no JK2 namespace to list.
+        if let Some(version) = jk2 {
+            if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, version) {
+                self.solo_catalog_error = Some(format!(
+                    "JK2 1.0{version} needs {missing} in fs_jk2basepath or fs_jk2cdpath/base."
+                ));
+                return;
+            }
+        }
         self.ui_catalog.pending.solo_maps = true;
-        self.ui_catalog.request(
+        self.ui_catalog.request_as(
             &self.base,
             self.game.as_deref(),
-            ui_catalog::CatalogRequest::SoloMaps,
+            jk2,
+            ui_catalog::CatalogRequest::SoloMaps { jk2 },
         );
+    }
+
+    /// Switch the page's asset game; the list and levelshot rescan lazily.
+    fn select_solo_asset_game(&mut self, jk2: Option<u8>) {
+        if self.solo_asset_game == jk2 {
+            return;
+        }
+        self.solo_asset_game = jk2;
+        self.solo_map_selected = 0;
+        self.egui_repaint_requested = true;
     }
 
     pub(in crate::app::egui_menu) fn ensure_solo_levelshot_texture(&mut self) {
@@ -33,9 +61,10 @@ impl App {
 
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = Some(map_name.clone());
-        self.ui_catalog.request(
+        self.ui_catalog.request_as(
             &self.base,
             self.game.as_deref(),
+            self.solo_catalog_for,
             ui_catalog::CatalogRequest::Levelshot {
                 source: false,
                 map_name,
@@ -47,7 +76,7 @@ impl App {
         theme::page_title(
             ui,
             "SOLO GAME",
-            "Compiled BSPs discovered from loose base/maps files and mounted PK3s.",
+            "Compiled BSPs discovered from loose maps/ files and mounted PK3s of the selected game.",
         );
         // Fixed-height row: a bare `with_layout` would hand the icon the whole
         // remaining page height and center it vertically, collapsing the list.
@@ -59,6 +88,15 @@ impl App {
                     self.restart_filesystem();
                     self.egui_repaint_requested = true;
                 }
+                // Right-to-left: listed in reverse so they read JKA, 1.02, 1.04.
+                ui.add_space(12.0);
+                let mut picked = self.solo_asset_game;
+                for (jk2, label) in [(Some(4), "JK2 1.04"), (Some(2), "JK2 1.02"), (None, "JKA")] {
+                    if theme::chip(ui, label, picked == jk2).clicked() {
+                        picked = jk2;
+                    }
+                }
+                self.select_solo_asset_game(picked);
             },
         );
 
@@ -149,8 +187,15 @@ impl App {
                     }
                     ui.add_space(14.0);
                     if theme::primary_button(ui, "LOAD MAP").clicked() {
-                        self.enter_local_game_dir();
-                        self.request_map(scene::MapSource::Bsp(selected_name.clone()));
+                        let source = scene::MapSource::Bsp(selected_name.clone());
+                        if let Some(version) = self.solo_asset_game {
+                            self.launch_jk2_local_map(version, source);
+                        } else {
+                            // Leave a JK2 asset namespace before a JKA map.
+                            self.select_demo_asset_game(None);
+                            self.enter_local_game_dir();
+                            self.request_map(source);
+                        }
                     }
                 },
             );

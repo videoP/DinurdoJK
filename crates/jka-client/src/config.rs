@@ -1,5 +1,5 @@
 pub(crate) mod cvars;
-use crate::camera::{SpectatorCameraSettings, ThirdPersonSettings, ViewBobSettings, DEFAULT_CG_FOV};
+use crate::camera::{SpectatorCameraSettings, ThirdPersonSettings, ViewBobSettings, ViewWeaponSettings, DEFAULT_CG_FOV};
 use crate::fx::{FX_FPS_LEGACY_JKA, FX_FPS_MAX, FX_FPS_MIN};
 use crate::player::MouseInputSettings;
 use crate::ui::{CrosshairSettings, HudLayout, MovementKeysSettings, PlayerNameSettings, StrafeHelperSettings, PvsMode, TextureFilter, DynamicShadowsMode, VideoSettings};
@@ -95,12 +95,18 @@ pub struct ClientPresentationSettings {
     /// TaystJK cg_drawEnemyInfo: top-right opponent / leader panel.
     pub draw_enemy_info: bool,
     pub mouse: MouseInputSettings,
+    /// TaystJK in_mouserepeat: 0 off, 1 mouse4+mouse5, 2 mouse4 only.
+    pub mouse_repeat_mode: u8,
+    /// Optional DinurdoJK first-repeat delay in milliseconds (TaystJK has none).
+    pub mouse_repeat_delay: u32,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
     pub fov: f32,
     /// TaystJK cg_zoomFov: target FOV for the held +zoom bind.
     pub zoom_fov: f32,
     /// TaystJK cg_bobUp/Pitch/Roll + cg_runPitch/Roll (all default 0).
     pub view_bob: ViewBobSettings,
+    /// TaystJK cg_drawGun/cg_gunX/Y/Z/cg_fovViewmodel/cg_gunAlpha.
+    pub view_weapon: ViewWeaponSettings,
     /// TaystJK flipkick bind timing, counted in CGame frames.
     pub fk_duration: i32,
     pub fk_first_jump_duration: i32,
@@ -165,8 +171,10 @@ pub struct ClientPresentationSettings {
     pub ui_vgs: i32,
     /// r_jumpHeightShade: tint landing surfaces by jump height in jaPRO SP physics.
     pub jump_height_shade: bool,
-    /// cg_screenShake: 0 off, 1 effect-driven shake (explosions, stomps), 2 also weapon-fire shake.
+    /// cg_screenShake: 0 off, 1 effect-driven shake (explosions, stomps), 2 also weapon-fire and charging shake.
     pub screen_shake: u8,
+    /// cg_simulatedProjectiles: local jaPRO unlagged missile visuals.
+    pub simulated_projectiles: bool,
     /// cg_headLook: 0 no automatic head tracking, 1 OpenJK, 2 gradual tracking.
     pub head_look: u8,
     /// cg_swimTilt: 0 = original swim presentation, 1 = full directional body tilt.
@@ -388,9 +396,12 @@ impl Default for ClientPresentationSettings {
             draw_score_y: 0.0,
             draw_enemy_info: true,
             mouse: MouseInputSettings::default(),
+            mouse_repeat_mode: 0,
+            mouse_repeat_delay: 0,
             fov: DEFAULT_CG_FOV,
             zoom_fov: 30.0,
             view_bob: ViewBobSettings::default(),
+            view_weapon: ViewWeaponSettings::default(),
             fk_duration: 50,
             fk_first_jump_duration: 0,
             fk_second_jump_delay: 0,
@@ -429,6 +440,7 @@ impl Default for ClientPresentationSettings {
             ui_vgs: 1,
             jump_height_shade: true,
             screen_shake: 1,
+            simulated_projectiles: false,
             head_look: 1,
             swim_tilt: 0.9,
             swim_turn_bank: 1.0,
@@ -475,7 +487,23 @@ pub fn load_client_presentation_settings(
             (words[0].as_str(), words[1].as_str())
         };
 
-        if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_presentation) { load(&mut settings, name, value); }
+        if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_presentation) {
+            load(&mut settings, name, value);
+        } else if crate::console::find(name).is_none() {
+            // Only an explicit set* line creates unknown cvars. These are
+            // restored before the first connect, including USERINFO flags.
+            let flags = match words[0].to_ascii_lowercase().as_str() {
+                "set" => Some(crate::net::UserCvarFlags::NONE),
+                "seta" => Some(crate::net::UserCvarFlags::ARCHIVE),
+                "setu" => Some(crate::net::UserCvarFlags::USERINFO),
+                "sets" => Some(crate::net::UserCvarFlags::SERVERINFO),
+                _ => None,
+            };
+            if let Some(flags) = flags {
+                let value = words[2..].join(" ");
+                let _ = settings.network.set_user_cvar(name, &value, flags);
+            }
+        }
     }
     crate::ui::movement_components::normalize(&mut settings.strafe_helper.flags,
         &mut settings.japro.speedometer.flags);
@@ -551,6 +579,10 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     settings.ocean_settings.wind = settings.weather_wind;
     if let (Some(width), Some(height)) = (context.custom_width, context.custom_height) {
         settings.resolution = [width, height];
+        // Pre-desktop-choice configurations only saved explicit pixel dimensions.
+        if !context.resolution_mode_seen {
+            settings.resolution_desktop = false;
+        }
     }
     if let (Some(x), Some(y)) = (context.window_x, context.window_y) {
         settings.window_position = Some([x, y]);
@@ -690,6 +722,22 @@ fn format_archived_config(
         let _ = writeln!(text, "\n// ===== {} =====", CONFIG_SECTIONS[index]);
         for (name, value) in entries {
             let _ = writeln!(text, "seta {name} \"{value}\"");
+        }
+    }
+    let archived: Vec<_> = presentation.network.user_cvars.values()
+        .filter(|cvar| cvar.flags.contains(crate::net::UserCvarFlags::ARCHIVE)).collect();
+    if !archived.is_empty() {
+        let _ = writeln!(text, "\n// ===== User-defined cvars =====");
+        for cvar in archived {
+            let _ = writeln!(text, "seta {} \"{}\"", cvar.name, cvar.value);
+            // Unlike stock Cvar_WriteVariables, preserve all custom flags
+            // across launch, so `seta` + `setu` does not lose USERINFO.
+            if cvar.flags.contains(crate::net::UserCvarFlags::USERINFO) {
+                let _ = writeln!(text, "setu {} \"{}\"", cvar.name, cvar.value);
+            }
+            if cvar.flags.contains(crate::net::UserCvarFlags::SERVERINFO) {
+                let _ = writeln!(text, "sets {} \"{}\"", cvar.name, cvar.value);
+            }
         }
     }
     text
@@ -980,6 +1028,76 @@ fn split_cfg_words(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_resolution_mode_defaults_and_round_trips_without_overwriting_legacy_custom() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-desktop-mode-{}-{:?}.cfg",
+            std::process::id(), std::thread::current().id()
+        ));
+        let defaults = VideoSettings::default();
+        assert_eq!(defaults.fullscreen, FullscreenMode::Exclusive);
+        assert!(defaults.resolution_desktop);
+        save_video_settings(
+            &path, defaults, &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(), &AudioSettings::default(),
+        ).unwrap();
+        let config = fs::read_to_string(&path).unwrap();
+        assert!(config.contains("seta r_mode \"-2\""));
+        assert!(config.contains("seta r_fullscreen \"2\""));
+        let loaded = load_video_settings(&path);
+        assert!(loaded.resolution_desktop);
+        assert_eq!(loaded.fullscreen, FullscreenMode::Exclusive);
+
+        // A configuration produced before r_mode -2 existed should keep its
+        // explicitly selected custom resolution, not silently switch modes.
+        fs::write(&path, "seta r_customwidth \"1024\"\nseta r_customheight \"768\"\n").unwrap();
+        let legacy = load_video_settings(&path);
+        assert!(!legacy.resolution_desktop);
+        assert_eq!(legacy.resolution, [1024, 768]);
+
+        // The mode flag, not equality with a monitor pixel size, decides
+        // whether the dimensions will be resolved from the monitor on startup.
+        fs::write(&path, "seta r_mode \"-2\"\nseta r_customwidth \"1024\"\nseta r_customheight \"768\"\n").unwrap();
+        let desktop = load_video_settings(&path);
+        assert!(desktop.resolution_desktop);
+        assert_eq!(desktop.resolution, [1024, 768]);
+        fs::write(&path, "seta r_mode \"-1\"\nseta r_customwidth \"1024\"\nseta r_customheight \"768\"\n").unwrap();
+        assert!(!load_video_settings(&path).resolution_desktop);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_created_setu_loads_as_userinfo_and_seta_round_trips_flags() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-setu-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        fs::write(&path, "setu NWH 1\nseta nwh \"1\"\n").unwrap();
+        let presentation = load_client_presentation_settings(&path);
+        let cvar = presentation.network.user_cvar("nwh").unwrap();
+        assert_eq!(cvar.value, "1");
+        assert!(cvar.flags.contains(crate::net::UserCvarFlags::USERINFO));
+        assert!(cvar.flags.contains(crate::net::UserCvarFlags::ARCHIVE));
+        assert_eq!(jka_protocol::commands::info_value(&presentation.network.jk2_userinfo_for_version("kyle/default", jka_protocol::jk2::Version::V102), b"nwh"), Some(b"1".as_slice()));
+        let text = format_archived_config(VideoSettings::default(), &crate::keybinds::Bindings::default(),
+            &presentation, &AudioSettings::default());
+        assert!(text.contains("seta nwh \"1\""));
+        assert!(text.contains("setu nwh \"1\""));
+        fs::write(&path, text).unwrap();
+        let reloaded = load_client_presentation_settings(&path);
+        assert_eq!(reloaded.network.user_cvar("nWh"), presentation.network.user_cvar("NWH"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn userinfo_only_custom_cvars_are_not_archived_by_default() {
+        let mut presentation = ClientPresentationSettings::default();
+        presentation.network.set_user_cvar("nwh", "1", crate::net::UserCvarFlags::USERINFO).unwrap();
+        let text = format_archived_config(VideoSettings::default(), &crate::keybinds::Bindings::default(),
+            &presentation, &AudioSettings::default());
+        assert!(!text.contains("setu nwh"));
+        assert!(!text.contains("seta nwh"));
+    }
 
     #[test]
     fn game_launch_screen_round_trips_and_invalid_config_keeps_main_menu() {

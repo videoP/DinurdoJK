@@ -49,6 +49,8 @@ pub enum FxClass {
     #[default]
     General,
     SaberImpact,
+    /// Direct FX_AddLine weapon beams (not .efx particle trees).
+    DirectBeam,
     /// Authored Force Lightning tree; never applied to drain or arbitrary EFX.
     ForceLightning,
     /// Stable ET_FX source. Descendant/death/emitter effects inherit this class.
@@ -186,6 +188,13 @@ pub enum FxDraw {
     Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: String },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
     Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: std::sync::Arc<str> },
+    /// Gameplay-independent grappling rope. Only two endpoints, a visual spring
+    /// displacement and its oscillator phase are sent to the renderer; the GPU
+    /// vertex shader generates the continuous, joined camera-facing ribbon.
+    Rope {
+        start: [f32; 3], end: [f32; 3], spring: [f32; 3],
+        phase: f32, speed: f32, shader: std::sync::Arc<str>,
+    },
     /// GPU-procedural, view-facing electricity ribbon. Its endpoint and authored
     /// material come from the EFX/trace; only cosmetic intermediate vertices
     /// are generated in the shader (24 steps, branching, core + corona).
@@ -448,6 +457,9 @@ impl FxDrawSource for FxDrawStream {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxAutoLightCandidate {
     pub effect: EffectId,
+    /// Inherited from the source FX tree; used for generic budgeting and
+    /// direct-beam exemptions, not for suppressing saber or impact lighting.
+    pub class: FxClass,
     pub score: i16,
     pub kind: PrimType,
     pub origin: [f32; 3],
@@ -1543,6 +1555,7 @@ fn update_primitive(
                     let light_origin = if spot.is_some() { prim.old_origin } else { prim.origin };
                     out.auto_light_candidates.push(FxAutoLightCandidate {
                         effect: auto.effect,
+                        class: prim.class,
                         score: auto.score,
                         kind: prim.kind,
                         origin: light_origin,

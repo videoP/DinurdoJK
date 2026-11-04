@@ -274,6 +274,7 @@ impl DynamicModelRenderer {
         raw_colors.clear();
         self.draws.clear();
         self.fx_sprite_draws.clear();
+        self.fx_rope_present = false;
         self.resident_fx_draws.clear();
         self.resident_fx_slots.clear();
         self.resident_fx_frame = None;
@@ -671,6 +672,8 @@ impl DynamicModelRenderer {
             vertex_bytes.len() as u64,
             index_bytes.len() as u64,
         );
+        // RT-skinned instances have no entity list: camera-only motion.
+        self.update_object_motion(device, queue, &gpu_draw_data, &bones);
         let rt = self.rt_skinning.as_mut().expect("created above");
         if !vertex_bytes.is_empty() {
             queue.write_buffer(&rt.vertex_buffer, 0, vertex_bytes);
