@@ -18,6 +18,12 @@ const MAX_MANIFEST: u64 = 16 * 1024;
 const DEPENDENCY_RELEASE_FILES: &[&str] = &[
     "phonon.dll", "OpenALSoft.x86_64.dll", "nvngx_dlss.dll",
     "dxcompiler.dll", "dxil.dll", "ffmpeg.exe",
+    "msvcp140.dll", "msvcp140_atomic_wait.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll",
+];
+// The packager installs attribution/license files at the EXE root,
+// not under DinurdoJK/dependencies. These must be accepted at that exact path.
+const ROOT_NOTICE_FILES: &[&str] = &[
     "OpenAL-Soft-LGPL-2.0.txt", "EalMan-LGPL-2.1.txt",
     "NVIDIA-DLSS-SDK-LICENSE.txt", "Bevy-Solari-MIT.txt",
     "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt",
@@ -25,6 +31,17 @@ const DEPENDENCY_RELEASE_FILES: &[&str] = &[
 
 const MANIFEST_NAME: &str = "release-manifest.json";
 const SIGNATURE_NAME: &str = "release-manifest.sig";
+const LAST_ERROR_NAME: &str = "last-error.txt";
+// New files are written beside their targets while the game is still running;
+// the displaced originals are renamed (not copied) to OLD_SUFFIX during the swap.
+const TMP_SUFFIX: &str = ".djk-update-tmp";
+const OLD_SUFFIX: &str = ".djk-old";
+// Set by a failed helper on the game it relaunches, so that one launch cannot
+// re-enter the updater. The game must always start after a failed update.
+const SKIP_PENDING_ENV: &str = "DINURDOJK_SKIP_PENDING_UPDATE";
+// A journalled (partially applied) install is rolled forward on later launches,
+// but only this many times before the stage is abandoned.
+const MAX_RESUME_ATTEMPTS: u32 = 2;
 // The build must supply only the PUBLIC key. Never ship or embed the private key.
 // No key => update checks fail closed if/when a new release is published.
 const PUBLIC_KEY_HEX: Option<&str> = option_env!("DINURDOJK_UPDATE_PUBLIC_KEY_HEX");
@@ -44,6 +61,8 @@ pub enum Event {
     Checked(Result<Option<Release>, String>),
     Progress { received: u64, total: u64 },
     Staged(Result<PathBuf, String>),
+    /// The restart helper was started (Ok) and the game may quit.
+    Applied(Result<(), String>),
 }
 
 #[derive(Default)]
@@ -54,6 +73,7 @@ pub struct State {
     pub release: Option<Release>,
     pub notice: bool,
     pub downloading: bool,
+    pub applying: bool,
     pub downloaded: u64,
     pub total: u64,
     pub staged: Option<PathBuf>,
@@ -71,7 +91,10 @@ impl State {
         let auto_check = fs::read(&settings_path).ok()
             .and_then(|bytes| serde_json::from_slice::<Preferences>(&bytes).ok())
             .map_or(true, |preferences| preferences.auto_check);
-        Self { auto_check, settings_path, ..Self::default() }
+        // Surface what the previous update helper reported, exactly once.
+        let error = staging_root().ok().and_then(|root| take_last_error(&root))
+            .map(|text| format!("The last update did not install: {text}"));
+        Self { auto_check, settings_path, error, ..Self::default() }
     }
     pub fn set_auto_check(&mut self, enabled: bool) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(&Preferences { auto_check: enabled })
@@ -151,9 +174,8 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     let mut total = 0u64;
     for (name, info) in &manifest.files {
         let allowed_root = matches!(name.as_str(), "DinurdoJK.exe"
-            | "msvcp140.dll" | "msvcp140_atomic_wait.dll"
-            | "vcruntime140.dll" | "vcruntime140_1.dll"
-            | "DinurdoJK/shared/dinurdo-assets.pk4");
+            | "DinurdoJK/shared/dinurdo-assets.pk4")
+            || ROOT_NOTICE_FILES.contains(&name.as_str());
         let allowed_dependency = name.strip_prefix("DinurdoJK/dependencies/")
             .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file));
         if !allowed_root && !allowed_dependency {
@@ -292,11 +314,28 @@ fn assert_no_reparse(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Update state is per installation directory: two installs must not share
+// pending.txt or last-error.txt. The helper is a copy of the EXE in the same
+// directory, so it derives the same key.
 fn staging_root() -> Result<PathBuf, String> {
     let home = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
-    let root = PathBuf::from(home).join("DinurdoJK").join("updates");
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("game directory is unavailable")?;
+    let root = PathBuf::from(home).join("DinurdoJK").join("updates").join(install_key(dir));
     assert_no_reparse(&root)?;
     Ok(root)
+}
+
+fn install_key(dir: &Path) -> String {
+    let digest = Sha256::digest(dir.to_string_lossy().to_lowercase().as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn take_last_error(root: &Path) -> Option<String> {
+    let path = root.join(LAST_ERROR_NAME);
+    let text = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    Some(text.chars().take(2000).collect())
 }
 
 fn stage_for(tag: &str) -> Result<PathBuf, String> {
@@ -375,9 +414,23 @@ fn installed_matches(root: &Path, name: &str, info: &FileInfo) -> Result<bool, S
     Ok(file_sha256(&path)? == info.sha256)
 }
 
-// Signed staged files MUST match the manifest. Files omitted from the staging
-// directory are permitted only if an identical installed copy already exists.
-// Re-run this check before launching and after the game exits to close TOCTOU.
+fn sibling(target: &Path, suffix: &str) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    target.with_file_name(name)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a.parent().zip(b.parent()).is_some_and(|(x, y)|
+        x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy()))
+}
+
+// Authorization and structure of a stage: publisher signature, tag, ready
+// marker, and that every staged file is a signed name with its signed size.
+// File CONTENTS are hashed where they are consumed (download, the verified
+// copy into the install directory, and just before the swap) instead of being
+// re-read on every call. Files absent from the stage must already be installed
+// with the signed size; their hashes were checked when the stage was created.
 fn validate_stage(stage: &Path, install_root: &Path) -> Result<SignedManifest, String> {
     assert_no_reparse(stage)?;
     assert_no_reparse(install_root)?;
@@ -388,23 +441,73 @@ fn validate_stage(stage: &Path, install_root: &Path) -> Result<SignedManifest, S
     if !stage.join("ready").is_file() { return Err("update stage is not marked ready".into()); }
     let dir = stage.join("files");
     assert_no_reparse(&dir)?;
-    for item in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+    for item in fs::read_dir(&dir).map_err(|e| io_error("read", &dir, e))? {
         let path = item.map_err(|e| e.to_string())?.path();
         assert_no_reparse(&path)?;
         let name = path.file_name().and_then(|n| n.to_str()).ok_or("invalid staged name")?;
         let info = manifest.files.get(&signed_name_from_stage(name)).ok_or("unexpected staged file")?;
-        if !path.is_file() || fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size
-            || file_sha256(&path)? != info.sha256 {
+        if !fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == info.size) {
             return Err(format!("staged {name} does not match signed manifest"));
         }
     }
     for (name, info) in &manifest.files {
-        let staged = dir.join(stage_filename(name));
-        if !staged.is_file() && !installed_matches(install_root, name, info)? {
-            return Err(format!("required update file {name} is neither verified on disk nor staged"));
+        if dir.join(stage_filename(name)).is_file() { continue; }
+        let installed = install_root.join(name);
+        assert_no_reparse(&installed)?;
+        if !fs::metadata(&installed).is_ok_and(|m| m.is_file() && m.len() == info.size) {
+            return Err(format!("required update file {name} is neither installed nor staged"));
         }
     }
     Ok(manifest)
+}
+
+/// Copy `source` to `target` while hashing the bytes actually written, and
+/// refuse the result unless it equals the signed SHA-256.
+fn copy_verified(source: &Path, target: &Path, expected: &str) -> Result<(), String> {
+    assert_no_reparse(source)?;
+    assert_no_reparse(target)?;
+    if target.exists() { fs::remove_file(target).map_err(|e| io_error("remove", target, e))?; }
+    let result = (|| -> Result<(), String> {
+        let mut input = File::open(source).map_err(|e| io_error("open", source, e))?;
+        let mut output = File::create_new(target).map_err(|e| io_error("create", target, e))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 256 * 1024];
+        loop {
+            let n = input.read(&mut buffer).map_err(|e| io_error("read", source, e))?;
+            if n == 0 { break; }
+            hasher.update(&buffer[..n]);
+            output.write_all(&buffer[..n]).map_err(|e| io_error("write", target, e))?;
+        }
+        // Flush through the handle that has write access. A read-only
+        // File::open(..).sync_all() fails with "Access is denied" (os error 5).
+        output.sync_all().map_err(|e| io_error("flush", target, e))?;
+        if format!("{:x}", hasher.finalize()) != expected {
+            return Err(format!("{} does not match the publisher-signed SHA-256", source.display()));
+        }
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(target); }
+    result
+}
+
+fn remove_preinstalled(root: &Path, manifest: &SignedManifest) {
+    for name in manifest.files.keys() {
+        let _ = fs::remove_file(sibling(&root.join(name), TMP_SUFFIX));
+    }
+}
+
+/// Runs on the download worker while the game is still running: put every
+/// changed file next to its target as a verified temporary copy, so that the
+/// restart only has to rename.
+fn preinstall(stage: &Path, root: &Path, manifest: &SignedManifest) -> Result<(), String> {
+    remove_preinstalled(root, manifest);
+    for (name, info) in &manifest.files {
+        let staged = stage.join("files").join(stage_filename(name));
+        if !staged.is_file() { continue; }
+        ensure_install_parent(root, name)?;
+        copy_verified(&staged, &sibling(&root.join(name), TMP_SUFFIX), &info.sha256)?;
+    }
+    Ok(())
 }
 
 pub fn stage<F>(release: &Release, mut report: F) -> Result<PathBuf, String>
@@ -437,6 +540,7 @@ where F: FnMut(u64, u64) {
     assert_no_reparse(&stage)?;
     if stage.join("installing").exists() { return Err("an installation is already in progress".into()); }
     let _ = fs::remove_file(stage.join("ready"));
+    let _ = fs::remove_file(stage.join("attempts"));
     let result = (|| {
         let dir = stage.join("files");
         assert_no_reparse(&dir)?;
@@ -482,7 +586,8 @@ where F: FnMut(u64, u64) {
         let mut ready = File::create_new(stage.join("ready")).map_err(|e| e.to_string())?;
         ready.write_all(b"ready-v3-per-file").map_err(|e| e.to_string())?;
         ready.sync_all().map_err(|e| e.to_string())?;
-        validate_stage(&stage, install_root)?;
+        let signed = validate_stage(&stage, install_root)?;
+        preinstall(&stage, install_root, &signed)?;
         let pending = staging_root()?.join("pending.txt");
         assert_no_reparse(&pending)?;
         if fs::symlink_metadata(&pending).is_ok() { fs::remove_file(&pending).map_err(|e| e.to_string())?; }
@@ -491,7 +596,10 @@ where F: FnMut(u64, u64) {
         pending_file.sync_all().map_err(|e| e.to_string())?;
         Ok(stage.clone())
     })();
-    if result.is_err() { let _ = fs::remove_file(stage.join("ready")); }
+    if result.is_err() {
+        let _ = fs::remove_file(stage.join("ready"));
+        remove_preinstalled(install_root, &manifest);
+    }
     result
 }
 
@@ -513,14 +621,56 @@ fn launch_helper(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
     if fs::symlink_metadata(&helper).is_ok() {
         fs::remove_file(&helper).map_err(|e| format!("remove stale updater helper: {e}"))?;
     }
-    fs::copy(exe, &helper).map_err(|e| format!("copy updater helper: {e}"))?;
-    std::process::Command::new(&helper)
-        .arg("--djk-apply-update")
-        .arg(pid.to_string())
-        .arg(exe)
-        .arg(stage)
-        .spawn().map_err(|e| format!("launch updater helper: {e}"))?;
+    // A hard link is instant and is not new data for the antivirus to scan;
+    // fall back to a copy where links are unavailable.
+    if fs::hard_link(exe, &helper).is_err() {
+        fs::copy(exe, &helper).map_err(|e| format!("copy updater helper {}: {e}", helper.display()))?;
+    }
+    let mut command = std::process::Command::new(&helper);
+    command.arg("--djk-apply-update").arg(pid.to_string()).arg(exe).arg(stage);
+    #[cfg(windows)] {
+        // The helper is a console-subsystem copy of the game: without this it
+        // shares (and keeps open) the game's black console window.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Err(e) = command.spawn() {
+        let _ = fs::remove_file(&helper);
+        return Err(format!("launch updater helper {}: {e}", helper.display()));
+    }
     Ok(())
+}
+
+/// Helper copies are deleted by the next game start (a running image cannot
+/// delete itself). A copy that is still running simply fails to delete.
+fn remove_stale_helpers() {
+    let Ok(current) = std::env::current_exe() else { return };
+    let Some(dir) = current.parent() else { return };
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if path != current && name.starts_with("dinurdojk-updater-") && name.ends_with(".exe")
+            && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Start the game for the user. A fresh console is requested because the
+/// helper's own (hidden) console would otherwise be shared, and the game only
+/// shows its console when it is alone in it.
+fn relaunch_game(exe: &Path, skip_pending: bool) -> Result<(), String> {
+    let mut command = std::process::Command::new(exe);
+    if let Some(dir) = exe.parent() { command.current_dir(dir); }
+    if skip_pending { command.env(SKIP_PENDING_ENV, "1"); }
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        command.creation_flags(CREATE_NEW_CONSOLE);
+    }
+    command.spawn().map(|_| ()).map_err(|e| format!("relaunch {}: {e}", exe.display()))
 }
 
 pub fn restart_with_update(stage: &Path) -> Result<(), String> {
@@ -534,7 +684,49 @@ pub fn restart_with_update(stage: &Path) -> Result<(), String> {
 }
 
 pub fn apply_pending_on_launch() -> Result<bool, String> {
+    remove_stale_helpers();
+    if std::env::var_os(SKIP_PENDING_ENV).is_some() { return Ok(false); }
     let updater_root = match staging_root() { Ok(root) => root, Err(_) => return Ok(false) };
+    if let Some(dir) = std::env::current_exe().ok().as_deref().and_then(Path::parent) {
+        cleanup_leftovers(&updater_root, dir);
+    }
+    let result = launch_pending(&updater_root);
+    if let Err(error) = &result {
+        // An unusable pending marker must never be retried by every launch.
+        record_failure(&updater_root, None, error);
+    }
+    result
+}
+
+/// Remove what a finished update leaves behind: renamed originals, unused
+/// temporary copies and stage folders that are not newer than this build.
+/// Nothing is touched while an update is still pending.
+fn cleanup_leftovers(updater_root: &Path, install_dir: &Path) {
+    if updater_root.join("pending.txt").exists() { return; }
+    for dir in [install_dir.to_path_buf(), install_dir.join("DinurdoJK").join("dependencies"),
+                install_dir.join("DinurdoJK").join("shared")] {
+        if assert_no_reparse(&dir).is_err() { continue; }
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if (name.ends_with(OLD_SUFFIX) || name.ends_with(TMP_SUFFIX))
+                && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let Some(running) = stable_version(env!("CARGO_PKG_VERSION")) else { return };
+    let Ok(entries) = fs::read_dir(updater_root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = entry.file_name().to_str().and_then(stable_version).is_some_and(|tag| tag <= running);
+        if old && entry.file_type().is_ok_and(|kind| kind.is_dir()) && assert_no_reparse(&path).is_ok() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn launch_pending(updater_root: &Path) -> Result<bool, String> {
     let tag = match fs::read_to_string(updater_root.join("pending.txt")) { Ok(tag) => tag, Err(_) => return Ok(false) };
     let stage = match stage_for(&tag) {
         Ok(stage) => stage,
@@ -560,101 +752,101 @@ pub fn apply_pending_on_launch() -> Result<bool, String> {
     Ok(true)
 }
 
+fn io_error(action: &str, path: &Path, error: std::io::Error) -> String {
+    format!("{action} {}: {error}", path.display())
+}
+
 fn write_sync(path: &Path, contents: &[u8]) -> Result<(), String> {
     assert_no_reparse(path)?;
-    let mut file = File::create(path).map_err(|e| e.to_string())?;
-    file.write_all(contents).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())
+    let mut file = File::create(path).map_err(|e| io_error("create", path, e))?;
+    file.write_all(contents).map_err(|e| io_error("write", path, e))?;
+    file.sync_all().map_err(|e| io_error("flush", path, e))
 }
 
-/// Copy to a temporary *in the installation directory*, fsync it, then
-/// replace via Windows' same-volume MoveFileExW rather than truncating a live
-/// file. Each file is atomic; transaction journal handles multiple files.
-fn replace_atomically(source: &Path, target: &Path, expected: &str) -> Result<(), String> {
-    assert_no_reparse(source)?;
-    assert_no_reparse(target)?;
-    if file_sha256(source)? != expected { return Err("replacement file hash mismatch".into()); }
-    let mut target_tmp = target.to_path_buf();
-    target_tmp.set_extension("djk-update-tmp");
-    assert_no_reparse(&target_tmp)?;
-    if target_tmp.exists() { fs::remove_file(&target_tmp).map_err(|e| e.to_string())?; }
-    fs::copy(source, &target_tmp).map_err(|e| e.to_string())?;
-    File::open(&target_tmp).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
-    if file_sha256(&target_tmp)? != expected { return Err("copied replacement hash mismatch".into()); }
-    #[cfg(windows)] {
-        use std::os::windows::ffi::OsStrExt;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-        }
-        let from: Vec<u16> = target_tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
-            return Err(format!("atomic replacement failed: {}", std::io::Error::last_os_error()));
-        }
+/// Rename `from` over `to` (MoveFileExW on Windows: write-through, replacing).
+/// A RUNNING executable or loaded DLL cannot be overwritten or deleted, but it
+/// can be renamed, which is what lets the swap work without a copy.
+#[cfg(windows)]
+fn move_replace(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    #[cfg(not(windows))] {
-        fs::rename(&target_tmp, target).map_err(|e| e.to_string())?;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (a, b) = (wide(from), wide(to));
+    if unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(format!("move {} to {}: {}", from.display(), to.display(), std::io::Error::last_os_error()));
     }
     Ok(())
 }
-
-/// Backup the installed files *before* creating the durable `installing`
-/// marker. An incomplete backup preparation cannot lead to a partial update.
-fn prepare_backups(stage: &Path, parent: &Path, manifest: &SignedManifest) -> Result<BTreeMap<String, Option<String>>, String> {
-    let backup = stage.join("backup");
-    assert_no_reparse(&backup)?;
-    if backup.exists() { fs::remove_dir_all(&backup).map_err(|e| e.to_string())?; }
-    fs::create_dir(&backup).map_err(|e| e.to_string())?;
-    let mut snapshot = BTreeMap::new();
-    for name in manifest.files.keys() {
-        // Only replaced files need backup copies. Most DLLs and the PK3
-        // remain unchanged across releases and are never written at all.
-        if !stage.join("files").join(stage_filename(name)).is_file() { continue; }
-        let installed = parent.join(name);
-        assert_no_reparse(&installed)?;
-        if installed.exists() {
-            if !installed.is_file() { return Err("installed target is not a normal file".into()); }
-            let copied = backup.join(stage_filename(name));
-            fs::copy(installed, &copied).map_err(|e| e.to_string())?;
-            File::open(&copied).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
-            snapshot.insert(name.clone(), Some(file_sha256(&copied)?));
-        } else {
-            snapshot.insert(name.clone(), None);
-        }
-    }
-    write_sync(&stage.join("installing"), b"signed-update-transaction-v1")?;
-    Ok(snapshot)
+#[cfg(not(windows))]
+fn move_replace(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|e| format!("move {} to {}: {e}", from.display(), to.display()))
 }
 
-/// Best-effort rollback if an install fails in-process. Power loss recovery is
-/// forward completion using the signed staged files on the next game launch.
-fn rollback(stage: &Path, parent: &Path, manifest: &SignedManifest,
-            snapshot: &BTreeMap<String, Option<String>>) -> Result<(), String> {
-    let backup = stage.join("backup");
-    assert_no_reparse(&backup)?;
-    for (name, original) in snapshot {
-        if !manifest.files.contains_key(name) { return Err("unauthorized backup target".into()); }
-        let old = backup.join(stage_filename(name));
-        let target = parent.join(name);
+/// (target, displaced original) for each file swapped in by this run.
+type Swapped = Vec<(PathBuf, Option<PathBuf>)>;
+
+/// Put every changed file in place: dependencies first, DinurdoJK.exe last, so
+/// the EXE (which decides whether a retry is still needed) is the commit point.
+/// Each file is hashed once more here, right before it becomes live, closing the
+/// window since it was written. Unchanged installed files are never read.
+fn install_files(stage: &Path, root: &Path, manifest: &SignedManifest, swapped: &mut Swapped) -> Result<(), String> {
+    let mut order: Vec<_> = manifest.files.iter().collect();
+    order.sort_by_key(|(name, _)| name.as_str() == "DinurdoJK.exe");
+    for (name, info) in order {
+        let staged = stage.join("files").join(stage_filename(name));
+        if !staged.is_file() { continue; }
+        let target = root.join(name);
+        let tmp = sibling(&target, TMP_SUFFIX);
         assert_no_reparse(&target)?;
-        match original {
-            Some(expected) => {
-                assert_no_reparse(&old)?;
-                if file_sha256(&old)? != *expected {
-                    return Err("original backup changed after it was prepared".into());
-                }
-                replace_atomically(&old, &target, expected)?;
+        assert_no_reparse(&tmp)?;
+        if !(tmp.is_file() && file_sha256(&tmp)? == info.sha256) {
+            // No usable pre-installed copy: either an interrupted earlier run
+            // already finished this file, or it must be rebuilt from the stage.
+            if fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == info.size)
+                && file_sha256(&target)? == info.sha256 {
+                let _ = fs::remove_file(&tmp);
+                continue;
             }
-            None if name != "DinurdoJK.exe" => {
-                if target.exists() { fs::remove_file(&target).map_err(|e| e.to_string())?; }
-            }
-            None => return Err("original executable backup missing".into()),
+            ensure_install_parent(root, name)?;
+            copy_verified(&staged, &tmp, &info.sha256)?;
+        }
+        let old = if target.exists() {
+            let old = sibling(&target, OLD_SUFFIX);
+            if old.exists() { fs::remove_file(&old).map_err(|e| io_error("remove", &old, e))?; }
+            move_replace(&target, &old)?;
+            Some(old)
+        } else { None };
+        if let Err(error) = move_replace(&tmp, &target) {
+            if let Some(old) = &old { let _ = move_replace(old, &target); }
+            return Err(error);
+        }
+        swapped.push((target, old));
+    }
+    for (name, info) in &manifest.files {
+        if !stage.join("files").join(stage_filename(name)).is_file() { continue; }
+        if !fs::metadata(root.join(name)).is_ok_and(|m| m.len() == info.size) {
+            return Err(format!("installed {name} has the wrong size"));
         }
     }
     Ok(())
+}
+
+/// Undo this run's swaps, newest first, by renaming the originals back.
+fn undo_swaps(swapped: &Swapped) -> Result<(), String> {
+    let mut failure = None;
+    for (target, old) in swapped.iter().rev() {
+        let result = match old {
+            Some(old) => move_replace(old, target),
+            None => fs::remove_file(target).map_err(|e| io_error("remove", target, e)),
+        };
+        if let Err(error) = result { failure = Some(error); }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
@@ -662,14 +854,14 @@ fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
         return Err("unexpected installation target".into());
     }
     let root = exe.parent().ok_or("missing install directory")?;
-    let manifest = validate_stage(stage, root)?;
-    // Do not accept the command-line target as authoritative: it must be the
-    // exact currently-running game image that was copied into this helper.
+    // The helper is a link/copy of the game image placed beside it. It acts
+    // only on the installation it lives in, whatever the command line says.
     let helper_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if !same_dir(&helper_exe, exe) { return Err("updater helper is not in the game directory".into()); }
     assert_no_reparse(&helper_exe)?;
-    if file_sha256(&helper_exe)? != file_sha256(exe)? {
-        return Err("installer target does not match the invoking game executable".into());
-    }
+    assert_no_reparse(exe)?;
+    assert_no_reparse(root)?;
+    let manifest = validate_stage(stage, root)?;
     let installed = stable_version(env!("CARGO_PKG_VERSION")).ok_or("invalid helper version")?;
     if stable_version(&manifest.tag) <= Some(installed) {
         // Existing helper is a copy of the pre-update EXE; a retry can carry
@@ -678,73 +870,87 @@ fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
             return Err("refusing same-version or downgrade installation".into());
         }
     }
-    assert_no_reparse(exe)?;
-    let parent = exe.parent().ok_or("missing target directory")?;
-    assert_no_reparse(parent)?;
     wait_for_process(pid)?;
-    // Recheck trust and file hashes after parent process exits, not only when
-    // Download & Install was clicked.
-    validate_stage(stage, parent)?;
-    // Never restore old code from a disk-only crash journal: another local
-    // process could have tampered with the unsigned backup while we were gone.
-    // Crash recovery is roll-forward using the publisher-signed new files.
-    let snapshot = if stage.join("installing").is_file() {
-        None
-    } else {
-        Some(prepare_backups(stage, parent, &manifest)?)
-    };
-    let operation = (|| -> Result<(), String> {
-        for (name, info) in &manifest.files {
-            let target = parent.join(name);
-            assert_no_reparse(&target)?;
-            if target.exists() && file_sha256(&target)? == info.sha256 { continue; }
-            ensure_install_parent(parent, name)?;
-            replace_atomically(&stage.join("files").join(stage_filename(name)), &target, &info.sha256)?;
-        }
-        for (name, info) in &manifest.files {
-            if file_sha256(&parent.join(name))? != info.sha256 {
-                return Err("installed files failed final verification".into());
+    // Recheck trust after the game exits, not only when Restart was clicked.
+    let manifest = validate_stage(stage, root)?;
+    // Crash recovery is roll-forward with the publisher-signed files; nothing
+    // is ever restored from a disk-only journal.
+    let resumed = stage.join("installing").is_file();
+    write_sync(&stage.join("installing"), b"signed-update-transaction-v2")?;
+    let mut swapped = Swapped::new();
+    if let Err(error) = install_files(stage, root, &manifest, &mut swapped) {
+        return Err(match undo_swaps(&swapped) {
+            Ok(()) => {
+                if !resumed {
+                    let _ = fs::remove_file(stage.join("installing"));
+                    if let Ok(updates) = staging_root() { let _ = fs::remove_file(updates.join("pending.txt")); }
+                }
+                error
             }
-        }
-        Ok(())
-    })();
-    if let Err(error) = operation {
-        if let Some(snapshot) = &snapshot {
-            if let Err(recovery_error) = rollback(stage, parent, &manifest, snapshot) {
-                // Leave pending + journal to permit recovery on subsequent launch.
-                return Err(format!("{error}; rollback also failed: {recovery_error}"));
-            }
-            let _ = fs::remove_file(stage.join("installing"));
-            let _ = fs::remove_file(staging_root()?.join("pending.txt"));
-        }
-        // If resuming an interrupted install, do NOT trust/reinstall the
-        // unsigned original backup; leave the journal for a signed retry.
-        return Err(error);
+            // Leave pending + journal so a later launch can roll forward.
+            Err(undo) => format!("{error}; rollback also failed: {undo}"),
+        });
     }
     // Commit before starting the new process. Otherwise its startup could
     // race pending.txt and launch a second installer for the same release.
-    let _ = fs::remove_file(staging_root()?.join("pending.txt"));
+    if let Ok(updates) = staging_root() { let _ = fs::remove_file(updates.join("pending.txt")); }
     let _ = fs::remove_file(stage.join("installing"));
     let _ = fs::remove_file(stage.join("ready"));
-    std::process::Command::new(exe).spawn()
-        .map_err(|e| format!("update installed; relaunch DinurdoJK manually: {e}"))?;
-    Ok(())
+    relaunch_game(exe, false)
+        .map_err(|e| format!("update installed; start DinurdoJK manually: {e}"))
+}
+
+/// Called by the helper after a failed install. Records the error for the game
+/// to show and makes sure the failure cannot repeat on every launch:
+/// - nothing was modified (no journal): the pending marker is dropped;
+/// - a journalled install is rolled forward on a later launch, at most
+///   MAX_RESUME_ATTEMPTS times, then the stage is abandoned for a fresh download.
+fn record_failure(root: &Path, stage: Option<&Path>, error: &str) {
+    let _ = fs::create_dir_all(root);
+    let _ = fs::write(root.join(LAST_ERROR_NAME), error);
+    let pending = root.join("pending.txt");
+    let stage = stage.filter(|stage| stage.parent() == Some(root));
+    let Some(stage) = stage.filter(|stage| stage.join("installing").is_file()) else {
+        let _ = fs::remove_file(&pending);
+        return;
+    };
+    let attempts_path = stage.join("attempts");
+    let attempts = fs::read_to_string(&attempts_path).ok()
+        .and_then(|text| text.trim().parse::<u32>().ok()).unwrap_or(0) + 1;
+    let _ = fs::write(&attempts_path, attempts.to_string());
+    if attempts >= MAX_RESUME_ATTEMPTS {
+        let _ = fs::remove_file(&pending);
+        for name in ["installing", "ready", "attempts"] {
+            let _ = fs::remove_file(stage.join(name));
+        }
+    }
 }
 
 pub fn helper_entry() -> Option<i32> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--djk-apply-update")) { return None; }
-    let result = (|| -> Result<(), String> {
+    let parsed = (|| -> Result<(u32, PathBuf, PathBuf), String> {
         let pid = args.next().and_then(|p| p.to_string_lossy().parse::<u32>().ok()).ok_or("missing process ID")?;
         let exe = PathBuf::from(args.next().ok_or("missing game path")?);
         let stage = PathBuf::from(args.next().ok_or("missing stage path")?);
         if args.next().is_some() { return Err("unexpected helper arguments".into()); }
-        apply_update(&exe, &stage, pid)
+        Ok((pid, exe, stage))
     })();
-    if let Err(err) = &result {
+    let result = match &parsed {
+        Ok((pid, exe, stage)) => apply_update(exe, stage, *pid),
+        Err(error) => Err(error.clone()),
+    };
+    if let Err(error) = &result {
         if let Ok(root) = staging_root() {
-            let _ = fs::create_dir_all(&root);
-            let _ = fs::write(root.join("last-error.txt"), err);
+            record_failure(&root, parsed.as_ref().ok().map(|(_, _, stage)| stage.as_path()), error);
+        }
+        // Never leave the user without a game. Only the sibling DinurdoJK.exe
+        // of this helper copy is started, and it must skip the updater once.
+        if let (Ok((pid, exe, _)), Ok(helper)) = (&parsed, std::env::current_exe()) {
+            if process_exited(*pid) && exe.file_name().and_then(|n| n.to_str()) == Some("DinurdoJK.exe")
+                && exe.parent() == helper.parent() && exe.is_file() {
+                let _ = relaunch_game(exe, true);
+            }
         }
     }
     Some(if result.is_ok() { 0 } else { 1 })
@@ -764,6 +970,20 @@ fn wait_for_process(pid: u32) -> Result<(), String> {
     if status != WAIT_OBJECT_0 { return Err("game did not exit within 60 seconds".into()); }
     Ok(())
 }
+/// True when the process is gone (or cannot be opened): a hung game must not
+/// get a second instance started next to it.
+#[cfg(windows)]
+fn process_exited(pid: u32) -> bool {
+    use windows_sys::Win32::{Foundation::{CloseHandle, WAIT_OBJECT_0}, System::Threading::{OpenProcess, WaitForSingleObject}};
+    let handle = unsafe { OpenProcess(0x0010_0000, 0, pid) };
+    if handle.is_null() { return true; }
+    let status = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    status == WAIT_OBJECT_0
+}
+#[cfg(not(windows))]
+fn process_exited(_pid: u32) -> bool { true }
+
 #[cfg(not(windows))]
 fn wait_for_process(_pid: u32) -> Result<(), String> { Err("Updater currently supports Windows only".into()) }
 
@@ -889,8 +1109,8 @@ mod security_tests {
             value["files"][format!("DinurdoJK/dependencies/{name}")] =
                 serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
-        for name in ["msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll"] {
-            value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        for name in ROOT_NOTICE_FILES {
+            value["files"][*name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let raw = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_ok());
@@ -905,8 +1125,11 @@ mod security_tests {
         let signing = SigningKey::from_bytes(&[41; 32]);
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        for name in ["dxcompiler.dll", "dxil.dll", "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
+        for name in ["dxcompiler.dll", "dxil.dll"] {
             value["files"][format!("DinurdoJK/dependencies/{name}")] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        }
+        for name in ["DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
+            value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let valid = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
@@ -921,6 +1144,32 @@ mod security_tests {
         }
     }
 
+    #[test]
+    fn packager_file_layout_is_accepted_without_allowing_arbitrary_paths() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        for name in DEPENDENCY_RELEASE_FILES {
+            manifest["files"][format!("DinurdoJK/dependencies/{name}")] =
+                serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        }
+        for name in ROOT_NOTICE_FILES {
+            manifest["files"][*name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        }
+        manifest["files"]["DinurdoJK/shared/dinurdo-assets.pk4"] =
+            serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        assert!(parse_signed_manifest_with_key(&encoded, &signing.sign(&encoded).to_bytes(), &key).is_ok());
+        for bad in ["DXC-LICENSE.txt/evil", "DinurdoJK/dependencies/DXC-LICENSE.txt",
+            "dxcompiler.dll", "vcruntime140.dll", "DinurdoJK/shared/../evil.pk4"] {
+            let mut invalid = manifest.clone();
+            // Keep the same file count so rejection checks the path, not the limit.
+            invalid["files"].as_object_mut().unwrap().remove("DXC-LICENSE.txt");
+            invalid["files"][bad] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+            let data = serde_json::to_vec(&invalid).unwrap();
+            assert!(parse_signed_manifest_with_key(&data, &signing.sign(&data).to_bytes(), &key).is_err());
+        }
+    }
     #[test]
     fn dependencies_require_new_install_directory() {
         let signing = SigningKey::from_bytes(&[41; 32]);
@@ -986,5 +1235,172 @@ mod security_tests {
         assert!(interpret_check_response(403, b"", "0.1.0").is_err());
         let release = br#"{"tag_name":"v0.2.0","assets":[]}"#;
         assert!(parse_release_json(release, "0.1.0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "djk-updater-test-{}-{}-{name}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sha(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+
+    fn info(bytes: &[u8]) -> FileInfo { FileInfo { size: bytes.len() as u64, sha256: sha(bytes) } }
+
+    // An install root with an old EXE and dependency, plus a stage holding the new ones.
+    fn fixture(name: &str) -> (PathBuf, PathBuf, SignedManifest) {
+        let root = scratch(name);
+        let install = root.join("game");
+        let stage = root.join("updates").join("v0.2.0");
+        fs::create_dir_all(install.join("DinurdoJK").join("dependencies")).unwrap();
+        fs::create_dir_all(stage.join("files")).unwrap();
+        fs::write(install.join("DinurdoJK.exe"), b"old exe").unwrap();
+        fs::write(install.join("DinurdoJK/dependencies/phonon.dll"), b"old dll").unwrap();
+        fs::write(stage.join("files").join("DinurdoJK.exe"), b"new exe").unwrap();
+        fs::write(stage.join("files").join("deps__phonon.dll"), b"new dll").unwrap();
+        let manifest = SignedManifest {
+            format: 2,
+            tag: "v0.2.0".into(),
+            files: BTreeMap::from([
+                ("DinurdoJK.exe".to_owned(), info(b"new exe")),
+                ("DinurdoJK/dependencies/phonon.dll".to_owned(), info(b"new dll")),
+            ]),
+        };
+        (install, stage, manifest)
+    }
+
+    #[test]
+    fn verified_copy_flushes_and_rejects_a_wrong_hash() {
+        let dir = scratch("copy");
+        let (source, target) = (dir.join("new.bin"), dir.join("new.bin.djk-update-tmp"));
+        fs::write(&source, b"new").unwrap();
+        copy_verified(&source, &target, &sha(b"new")).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(copy_verified(&source, &target, &sha(b"other")).is_err());
+        assert!(!target.exists(), "a rejected copy must not be left behind");
+    }
+
+    #[test]
+    fn preinstalled_files_are_swapped_in_with_the_exe_last_and_originals_renamed() {
+        let (install, stage, manifest) = fixture("swap");
+        preinstall(&stage, &install, &manifest).unwrap();
+        assert!(install.join("DinurdoJK.exe.djk-update-tmp").is_file());
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"old exe", "nothing is live yet");
+        let mut swapped = Swapped::new();
+        install_files(&stage, &install, &manifest, &mut swapped).unwrap();
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"new exe");
+        assert_eq!(fs::read(install.join("DinurdoJK/dependencies/phonon.dll")).unwrap(), b"new dll");
+        assert_eq!(fs::read(install.join("DinurdoJK.exe.djk-old")).unwrap(), b"old exe");
+        assert_eq!(swapped.len(), 2);
+        assert_eq!(swapped.last().unwrap().0, install.join("DinurdoJK.exe"));
+        assert!(!install.join("DinurdoJK.exe.djk-update-tmp").exists());
+        undo_swaps(&swapped).unwrap();
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"old exe");
+        assert_eq!(fs::read(install.join("DinurdoJK/dependencies/phonon.dll")).unwrap(), b"old dll");
+    }
+
+    #[test]
+    fn missing_or_tampered_preinstalled_copy_is_rebuilt_from_the_stage() {
+        let (install, stage, manifest) = fixture("rebuild");
+        // The EXE copy was never written; the dependency copy was tampered with.
+        fs::write(install.join("DinurdoJK/dependencies/phonon.dll.djk-update-tmp"), b"evil").unwrap();
+        let mut swapped = Swapped::new();
+        install_files(&stage, &install, &manifest, &mut swapped).unwrap();
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"new exe");
+        assert_eq!(fs::read(install.join("DinurdoJK/dependencies/phonon.dll")).unwrap(), b"new dll");
+    }
+
+    #[test]
+    fn a_failed_install_leaves_the_old_executable_untouched() {
+        let (install, stage, manifest) = fixture("failed");
+        // Corrupt the staged dependency: it is installed before the EXE, so the
+        // EXE must not have been swapped when this fails.
+        fs::write(stage.join("files").join("deps__phonon.dll"), b"bad dll").unwrap();
+        let mut swapped = Swapped::new();
+        assert!(install_files(&stage, &install, &manifest, &mut swapped).is_err());
+        assert!(swapped.is_empty());
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"old exe");
+        assert_eq!(fs::read(install.join("DinurdoJK/dependencies/phonon.dll")).unwrap(), b"old dll");
+    }
+
+    #[test]
+    fn a_file_finished_by_an_interrupted_run_is_not_installed_twice() {
+        let (install, stage, manifest) = fixture("resume");
+        fs::write(install.join("DinurdoJK/dependencies/phonon.dll"), b"new dll").unwrap();
+        let mut swapped = Swapped::new();
+        install_files(&stage, &install, &manifest, &mut swapped).unwrap();
+        assert_eq!(swapped.len(), 1, "only the EXE still needed swapping");
+        assert_eq!(fs::read(install.join("DinurdoJK.exe")).unwrap(), b"new exe");
+    }
+
+    #[test]
+    fn cleanup_removes_leftovers_only_when_no_update_is_pending() {
+        let (install, stage, _) = fixture("cleanup");
+        let updates = stage.parent().unwrap().to_path_buf();
+        fs::create_dir_all(updates.join("v0.0.1")).unwrap();
+        fs::create_dir_all(updates.join("v99.0.0")).unwrap();
+        fs::write(install.join("DinurdoJK.exe.djk-old"), b"x").unwrap();
+        fs::write(install.join("DinurdoJK/dependencies/phonon.dll.djk-update-tmp"), b"x").unwrap();
+        fs::write(updates.join("pending.txt"), "v99.0.0").unwrap();
+        cleanup_leftovers(&updates, &install);
+        assert!(install.join("DinurdoJK.exe.djk-old").exists(), "pending update keeps its files");
+        fs::remove_file(updates.join("pending.txt")).unwrap();
+        cleanup_leftovers(&updates, &install);
+        assert!(!install.join("DinurdoJK.exe.djk-old").exists());
+        assert!(!install.join("DinurdoJK/dependencies/phonon.dll.djk-update-tmp").exists());
+        assert!(install.join("DinurdoJK.exe").exists() && install.join("DinurdoJK/dependencies/phonon.dll").exists());
+        assert!(!updates.join("v0.0.1").exists(), "a stage older than this build is removed");
+        assert!(updates.join("v99.0.0").exists(), "a newer stage is kept");
+    }
+
+    #[test]
+    fn failure_before_any_change_drops_the_pending_marker() {
+        let (_, stage, _) = fixture("nojournal");
+        let root = stage.parent().unwrap().to_path_buf();
+        fs::write(root.join("pending.txt"), "v0.2.0").unwrap();
+        record_failure(&root, Some(&stage), "Access is denied. (os error 5)");
+        assert!(!root.join("pending.txt").exists());
+        assert_eq!(take_last_error(&root).unwrap(), "Access is denied. (os error 5)");
+        assert!(take_last_error(&root).is_none(), "the error is shown once");
+    }
+
+    #[test]
+    fn interrupted_install_is_resumed_a_bounded_number_of_times() {
+        let (_, stage, _) = fixture("journal");
+        let root = stage.parent().unwrap().to_path_buf();
+        fs::write(root.join("pending.txt"), "v0.2.0").unwrap();
+        fs::write(stage.join("installing"), b"journal").unwrap();
+        fs::write(stage.join("ready"), b"ready").unwrap();
+        record_failure(&root, Some(&stage), "first");
+        assert!(root.join("pending.txt").exists(), "first failure keeps the roll-forward marker");
+        record_failure(&root, Some(&stage), "second");
+        assert!(!root.join("pending.txt").exists());
+        assert!(!stage.join("installing").exists() && !stage.join("ready").exists());
+    }
+
+    #[test]
+    fn a_stage_outside_the_updater_root_is_never_touched() {
+        let (_, stage, _) = fixture("outside");
+        let root = scratch("other-root");
+        fs::write(root.join("pending.txt"), "v0.2.0").unwrap();
+        fs::write(stage.join("installing"), b"journal").unwrap();
+        record_failure(&root, Some(&stage), "boom");
+        assert!(stage.join("installing").exists());
+        assert!(!root.join("pending.txt").exists());
+    }
+
+    #[test]
+    fn state_is_separate_per_installation_directory() {
+        assert_ne!(install_key(Path::new(r"C:\Games\JK")), install_key(Path::new(r"D:\Games\JK")));
+        assert_eq!(install_key(Path::new(r"C:\Games\JK")), install_key(Path::new(r"c:\games\jk")));
     }
 }

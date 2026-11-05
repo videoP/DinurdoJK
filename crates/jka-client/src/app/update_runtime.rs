@@ -38,7 +38,23 @@ impl App {
         if let Err(e) = spawned { self.updater.downloading = false; self.updater.error = Some(e.to_string()); }
     }
 
+    /// Validating the stage and starting the restart helper touches the disk,
+    /// so it runs on a worker; the game quits only after the helper is running.
+    pub(in crate::app) fn apply_update_now(&mut self) {
+        if self.updater.applying { return; }
+        let Some(stage) = self.updater.staged.clone() else { return; };
+        self.updater.error = None;
+        self.updater.applying = true;
+        let proxy = self.proxy.clone();
+        let spawned = std::thread::Builder::new().name("github-update-apply".into()).spawn(move || {
+            let result = crate::updater::restart_with_update(&stage);
+            let _ = proxy.send_event(UserEvent::Update(Event::Applied(result)));
+        });
+        if let Err(e) = spawned { self.updater.applying = false; self.updater.error = Some(e.to_string()); }
+    }
+
     pub(in crate::app) fn handle_update_event(&mut self, event: Event) {
+        let mut quit = false;
         match event {
             Event::Checked(Ok(Some(release))) => {
                 self.updater.checking = false;
@@ -62,6 +78,13 @@ impl App {
                 self.updater.downloaded = received;
                 self.updater.total = total;
             }
+            Event::Applied(result) => {
+                self.updater.applying = false;
+                match result {
+                    Ok(()) => quit = true,
+                    Err(e) => self.updater.error = Some(e),
+                }
+            }
             Event::Staged(result) => {
                 self.updater.downloading = false;
                 match result {
@@ -72,6 +95,7 @@ impl App {
         }
         self.egui_repaint_requested = true;
         self.publish_ui();
+        if quit { self.request_quit(); }
     }
 
     pub(in crate::app) fn egui_update_notice(&mut self, root: &mut egui::Ui) {
@@ -100,13 +124,12 @@ impl App {
                                 self.updater.downloaded as f32 / self.updater.total as f32
                             };
                             ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
-                        } else if let Some(stage) = self.updater.staged.clone() {
+                        } else if self.updater.staged.is_some() {
                             ui.label("Verified and ready to install when the game restarts.");
-                            if ui.button("Restart & Apply Update").clicked() {
-                                match crate::updater::restart_with_update(&stage) {
-                                    Ok(()) => self.request_quit(),
-                                    Err(e) => self.updater.error = Some(e),
-                                }
+                            if self.updater.applying {
+                                ui.label("Starting the installer...");
+                            } else if ui.button("Restart & Apply Update").clicked() {
+                                self.apply_update_now();
                             }
                         } else if ui.button("Download & Install").clicked() {
                             self.download_update();

@@ -141,13 +141,12 @@ impl App {
                     if self.updater.downloading {
                         let ratio = if self.updater.total == 0 { 0.0 } else { self.updater.downloaded as f32 / self.updater.total as f32 };
                         ui.add(egui::ProgressBar::new(ratio.clamp(0.0, 1.0)).show_percentage());
-                    } else if let Some(stage) = self.updater.staged.clone() {
+                    } else if self.updater.staged.is_some() {
                         ui.label("Verified. It will apply when you next start the game.");
-                        if ui.button("Restart & Apply Update").clicked() {
-                            match crate::updater::restart_with_update(&stage) {
-                                Ok(()) => self.request_quit(),
-                                Err(e) => self.updater.error = Some(e),
-                            }
+                        if self.updater.applying {
+                            ui.label("Starting the installer...");
+                        } else if ui.button("Restart & Apply Update").clicked() {
+                            self.apply_update_now();
                         }
                     } else if ui.button("Download & Install").clicked() {
                         self.download_update();
