@@ -99,9 +99,10 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
     let (w,h)=(width.max(1) as f32,height.max(1) as f32);
     // Scale the *content* as well as the geometry on high-DPI displays.  The
     // original 1.17 cap left 1440p/4K text physically tiny on screen.
-    // Slightly more compact than the initial legibility pass, without
-    // reverting to the original undersized typography.
-    let s=(w/1500.0).min(h/850.0).clamp(0.80,1.72)*0.95;
+    // Compact 16% further than the previous 0.95 scale at desktop sizes.
+    // Keep a readable minimum on small windows instead of shrinking text into
+    // illegibility; the existing Taffy scroller handles constrained heights.
+    let s=((w/1500.0).min(h/850.0).clamp(0.80,1.72)*0.80).clamp(0.78,1.38);
     let mw=(w-26.0*s).max(1.0).min(1200.0*s);
     let gap=16.0*s;
     let wide = (mw-gap)*0.5 >= 470.0*s;
@@ -388,27 +389,42 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
             status_line(out,&font,row.status,status,color,w,h,s);
         }
     }
+    // Both games get the same two-line presentation: one colored readiness
+    // summary and one diagnostic line.  Individual PK3 names appear only if
+    // missing, rather than listing every healthy JKA archive but not JK2's.
     if visible(l.retail,l.viewport) {
-        let found=state.retail.iter().filter(|x|**x).count();
-        // Same filled, color-coded status treatment as the JK2 retail checks.
+        let found=state.retail.iter().filter(|present|**present).count();
+        let ready=found==state.retail.len();
         status_line(out,&font,[l.retail[0],l.retail[1],l.retail[2],27.0*s],
-            &format!("JKA RETAIL  /  {found} OF 4 ARCHIVES FOUND"),
-            if found==4 {GREEN}else{RED},w,h,s);
-        let gap=5.0*s;
-        let per=((l.retail[2]-3.0*gap)/4.0).max(1.0);
-        for i in 0..4 {
-            let b=[l.retail[0]+i as f32*(per+gap),l.retail[1]+31.0*s,per,27.0*s];
-            status_line(out,&font,b,&format!("assets{i}: {}",if state.retail[i]{"OK"}else{"MISSING"}),
-                if state.retail[i]{GREEN}else{RED},w,h,s);
-        }
+            if ready {"JKA RETAIL  /  READY"} else {"JKA RETAIL  /  MISSING ASSETS"},
+            if ready {GREEN}else{RED},w,h,s);
+        let detail=if ready {
+            "All four required retail archives detected".to_owned()
+        } else {
+            let missing=(0..state.retail.len()).filter(|&i|!state.retail[i])
+                .map(|i|format!("assets{i}.pk3")).collect::<Vec<_>>().join(", ");
+            format!("Missing: {missing}")
+        };
+        line(out,&font,[l.retail[0]+12.0*s,l.retail[1]+31.0*s,
+            l.retail[2]-20.0*s,26.0*s],&detail,15.0*s,if ready {DIM}else{RED});
     }
     if visible(l.jk2_status,l.viewport) {
-        for i in 0..2 {
-            let ready=state.jk2_status[i]=="READY";
-            let b=[l.jk2_status[0],l.jk2_status[1]+i as f32*30.0*s,l.jk2_status[2],27.0*s];
-            status_line(out,&font,b,&format!("JK2 1.0{}  /  {}",if i==0 {"2"}else{"4"},state.jk2_status[i]),
-                if ready{GREEN}else{RED},w,h,s);
-        }
+        let v102=state.jk2_status[0]=="READY";
+        let v104=state.jk2_status[1]=="READY";
+        let ready=v102&&v104;
+        status_line(out,&font,[l.jk2_status[0],l.jk2_status[1],l.jk2_status[2],27.0*s],
+            if ready {"JK2 RETAIL  /  READY"} else if v102||v104 {
+                "JK2 RETAIL  /  PARTIAL"
+            } else {"JK2 RETAIL  /  MISSING ASSETS"},
+            if ready {GREEN} else if v102||v104 {AMBER} else {RED},w,h,s);
+        let detail=if ready {
+            "Both JK2 1.02 and 1.04 asset sets detected".to_owned()
+        } else {
+            format!("1.02: {}   /   1.04: {}",state.jk2_status[0],state.jk2_status[1])
+        };
+        line(out,&font,[l.jk2_status[0]+12.0*s,l.jk2_status[1]+31.0*s,
+            l.jk2_status[2]-20.0*s,26.0*s],&detail,15.0*s,
+            if ready {DIM}else if v102||v104 {AMBER}else{RED});
     }
     if visible(l.feedback,l.viewport) {
         if let Some(message)=&state.feedback {line(out,&font,l.feedback,message,17.0*s,AMBER);}

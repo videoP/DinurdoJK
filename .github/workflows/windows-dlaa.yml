@@ -168,6 +168,32 @@ jobs:
           if (-not (Test-Path $license) -or (Get-Item $license).Length -eq 0) {
             throw 'OpenAL-Soft license download failed.'
           }
+          # Stage OpenAL from the same pinned/runtime helper used by build.ps1.
+          # Do this BEFORE the expensive Rust build so missing DLLs fail early.
+          $workspace = (Get-Location).Path
+          . (Join-Path $workspace 'scripts/ensure-openal-runtime.ps1')
+          $openal = Ensure-OpenALRuntime -WorkspaceRoot $workspace
+          if (-not $openal -or -not (Test-Path -LiteralPath $openal -PathType Leaf)) {
+            throw 'Ensure-OpenALRuntime did not return an existing OpenAL DLL.'
+          }
+          $openal = (Resolve-Path -LiteralPath $openal).Path
+          $dllStream = [IO.File]::OpenRead($openal)
+          try { $isPE = ($dllStream.ReadByte() -eq 0x4d -and $dllStream.ReadByte() -eq 0x5a) }
+          finally { $dllStream.Dispose() }
+          if (-not $isPE -or (Get-Item -LiteralPath $openal).Length -lt 32768) {
+            throw "OpenAL runtime is not a valid-looking Windows DLL: $openal"
+          }
+          $dependencyDir = 'target/release/DinurdoJK/dependencies'
+          New-Item -ItemType Directory -Force $dependencyDir | Out-Null
+          $openalStaged = Join-Path $dependencyDir 'OpenALSoft.x86_64.dll'
+          if ([IO.Path]::GetFullPath($openal) -ine [IO.Path]::GetFullPath($openalStaged)) {
+            Copy-Item -LiteralPath $openal -Destination $openalStaged -Force -ErrorAction Stop
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $openal).Hash -ne
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $openalStaged).Hash) {
+            throw 'Staged OpenAL DLL hash differs from helper output.'
+          }
+          Write-Host "Pre-staged OpenALSoft.x86_64.dll in $dependencyDir"
 
       - name: Build optimized Release with DLAA
         if: steps.version.outputs.publish == 'true'
