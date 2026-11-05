@@ -17,6 +17,7 @@ mod console_completion;
 mod console_state;
 mod constants;
 mod demos;
+pub(crate) mod asset_mapping;
 mod display;
 mod gamma;
 mod filesystem;
@@ -44,17 +45,16 @@ mod render_studio_cfg;
 mod render_studio_director;
 mod render_studio_race;
 mod render_studio_race_map;
-mod render_studio_auto_director;
+use jka_studio::render_studio_auto_director;
 mod render_studio_camera;
 mod render_studio_navigation;
 mod render_studio_cinematics;
 mod render_studio_spatial;
-mod render_studio_timeline;
-mod render_studio_profile;
+use jka_studio::render_studio_timeline;
+use jka_studio::render_studio_profile;
 mod render_studio_lights;
 mod render_studio_audio;
 mod restrictions;
-mod render_studio_transitions;
 mod render_studio_demo;
 mod render_studio_dm26;
 mod session;
@@ -266,6 +266,8 @@ pub struct App {
     base: PathBuf,
     /// Requested roots. Filesystem changes are persistent, applied on restart.
     fs_roots: jka_assets::pk3::FilesystemRoots,
+    /// Pending filesystem mapping UI. Never changes the active VFS until restart.
+    asset_mapping: Option<asset_mapping::AssetMappingState>,
     /// Command-line/local game directory. Session fs_game is restored to this on disconnect.
     startup_game: Option<PathBuf>,
     /// Active asset game directory. Remote/demo fs_game may replace this for the session.

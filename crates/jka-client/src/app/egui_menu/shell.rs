@@ -47,6 +47,12 @@ impl App {
 
     /// egui owns every menu overlay, not just the Video page.
     pub(in crate::app) fn egui_menu_active(&self) -> bool {
+        if self.asset_mapping.is_some() {
+            // Asset Mapping is native, but the optional floating HL2 console
+            // still needs its normal egui frame above the WGPU underlay.
+            return self.overlay == OverlayMode::Console && self.console_hl2
+                && self.window.is_some() && self.render.is_some();
+        }
         // Live connection controls are native Taffy/WGPU, not egui.
         let blocking_download_ui = self.demo_missing_map_prompt.is_some();
         ((self.overlay == OverlayMode::Console && self.console_hl2)
@@ -85,6 +91,13 @@ impl App {
     /// painter, which must coexist with live gameplay (no menu, no stolen
     /// input) rather than opening anything.
     pub(in crate::app) fn egui_paint_needed(&self) -> bool {
+        if self.asset_mapping.is_some() {
+            // The page is native; only the shared console and its optional
+            // chat context popup need egui.
+            return self.egui_menu_active()
+                || (self.classic_console_chat_menu_open()
+                    && self.window.is_some() && self.render.is_some());
+        }
         self.egui_menu_active()
             || (self.classic_console_chat_menu_open()
                 && self.video_confirmation.is_none()
@@ -118,6 +131,26 @@ impl App {
     /// control rebinding needs the raw winit key/button rather than egui's
     /// logical key, so those events are handed back to the legacy handlers.
     pub(in crate::app) fn route_egui_window_event(&mut self, event: &WindowEvent) -> bool {
+        if self.asset_mapping.is_some() {
+            if self.overlay == OverlayMode::Console && !self.console_hl2 {
+                // Classic console takes keyboard input and pointer selection
+                // exactly as on any other page. Do not pass it to path fields.
+                return self.route_console_chat_menu_event(event);
+            }
+            if self.overlay != OverlayMode::Console {
+                // Backquote is a global app shortcut, even while a path field
+                // has focus. The raw input handler toggles the console.
+                if matches!(event, WindowEvent::KeyboardInput {
+                    event: KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Backquote), ..
+                    }, ..
+                }) {
+                    return false;
+                }
+                return self.native_asset_mapping_event(event);
+            }
+            // HL2 console is handled below by the normal egui console route.
+        }
         if self.native_connection_loading_event(event) { return true; }
         if self.native_demo_browser_event(event) { return true; }
         let confirmation = self.egui_confirmation_active();
@@ -515,7 +548,7 @@ impl App {
             // Keep the originating setup/profile/game menu behind the floating
             // console, just as the classic console does. It is safe to skip
             // this background on the gameplay and loading screens.
-            if self.loading.is_none() && !matches!(self.overlay_before_console,
+            if self.asset_mapping.is_none() && self.loading.is_none() && !matches!(self.overlay_before_console,
                 OverlayMode::None | OverlayMode::Chat | OverlayMode::Console)
             {
                 self.build_egui_menu_underlay(ui);
@@ -779,6 +812,14 @@ impl App {
         }
         self.controls_waiting_for_key = false;
         if self.front_end {
+            if matches!(name.as_deref(), Some("assetmapping" | "asset-mapping")) {
+                self.release_neon_main_menu();
+                self.release_neon_chrome();
+                self.asset_mapping = Some(crate::app::asset_mapping::AssetMappingState::from_main_menu(&self.fs_roots, &self.base));
+                self.publish_ui();
+                self.egui_repaint_requested = true;
+                return;
+            }
             let page = match name.as_deref() {
                 Some("main") => FrontendPage::Main,
                 Some("play") => FrontendPage::Play,
@@ -873,7 +914,8 @@ impl App {
             return SETUP_TAB_MOD;
         }
         if tab.eq_ignore_ascii_case("streamer") { return SETUP_TAB_STREAMER; }
-        if tab.eq_ignore_ascii_case("pk3") || tab.eq_ignore_ascii_case("assets") { return SETUP_TAB_PK3; }
+        if tab.eq_ignore_ascii_case("pk3") || tab.eq_ignore_ascii_case("pk4")
+            || tab.eq_ignore_ascii_case("pk3 manager") || tab.eq_ignore_ascii_case("assets") { return SETUP_TAB_PK3; }
         SETUP_TABS
             .iter()
             .position(|name| name.eq_ignore_ascii_case(tab))
@@ -1037,7 +1079,7 @@ impl App {
                 let content_w = if server_page {
                     ui.available_width().min(1480.0)
                 } else if profile_page || (self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_PK3) {
-                    // The three-pane PK3 Manager needs the full canvas, but
+                    // The three-pane Package Manager needs the full canvas, but
                     // other Setup pages keep their familiar left column.
                     ui.available_width()
                 } else {
@@ -1097,7 +1139,7 @@ impl App {
             // Video keeps search alongside its pinned quality-preset toolbar.
             // Other Setup pages render the same field above their page title.
             if self.setup_selected != SETUP_TAB_VIDEO && self.setup_selected != SETUP_TAB_PK3 {
-                // PK3 Manager has a dedicated package search spanning both panes.
+                // Package Manager has a dedicated package search spanning both panes.
                 let searching = super::settings_search::search_bar(ui);
                 ui.add_space(10.0);
                 if searching {

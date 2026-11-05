@@ -5,6 +5,7 @@ use super::render_studio_timeline::{
     studio_follow_move_position, StudioCameraKey, StudioCameraSource, StudioDemoClip,
     StudioDemoPov, StudioDemoAnchor, StudioFollowFallback, StudioFollowMoveAim, StudioFollowPerspective,
 };
+use super::render_studio_lights::StudioTimelineLights;
 use super::{race_ghost, scene, App, FrontendPage, GameSession, Instant, RenderCommand};
 use crate::renderer::{StudioSceneFrame, StudioSourceFrame};
 use std::{path::PathBuf, sync::Arc};
@@ -885,7 +886,7 @@ impl App {
         if clip.demo_protocol == 15 || clip.demo_protocol == 16 {
             let version = if clip.demo_protocol == 15 { 2 } else { 4 };
             if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, version) {
-                return Err(format!("JK2 requires {missing} in fs_jk2basepath or fs_jk2cdpath/base"));
+                return Err(format!("JK2 requires {missing} in fs_jk2basepath/base or fs_jk2cdpath/base"));
             }
         }
         let base = self.base.clone();

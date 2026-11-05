@@ -24,7 +24,7 @@ impl App {
         if let Some(version) = jk2 {
             if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, version) {
                 self.solo_catalog_error = Some(format!(
-                    "JK2 1.0{version} needs {missing} in fs_jk2basepath or fs_jk2cdpath/base."
+                    "JK2 1.0{version} needs {missing} in fs_jk2basepath/base or fs_jk2cdpath/base."
                 ));
                 return;
             }

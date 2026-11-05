@@ -165,6 +165,13 @@ impl App {
                 self.frontend_page = FrontendPage::DeveloperTools;
                 self.egui_repaint_requested = true;
             }
+            Item::AssetMapping => {
+                self.release_neon_main_menu();
+                self.release_neon_chrome();
+                self.asset_mapping = Some(crate::app::asset_mapping::AssetMappingState::from_main_menu(&self.fs_roots, &self.base));
+                self.publish_ui();
+                self.egui_repaint_requested = true;
+            }
         }
     }
 }

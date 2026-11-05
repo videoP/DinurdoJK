@@ -38,7 +38,7 @@ impl App {
             ui_catalog::CatalogRequest::Jk2DemoFolders {
                 token: self.jk2_demo_browser.generation,
                 local_base: jka_assets::pk3::jk2_base_directory(&self.base, &self.fs_roots),
-                home_base: self.fs_roots.homepath.as_ref().map(|p| p.join("jk2_base")),
+                home_base: jka_assets::pk3::game_home_root(&self.fs_roots, true).map(|p| p.join("base")),
                 root: self.fs_roots.jk2cdpath.clone(),
             });
     }

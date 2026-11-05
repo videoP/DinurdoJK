@@ -2,20 +2,12 @@
 //! Project JSON contains only relative managed-media paths. Linked audio is absolute.
 use super::{render_studio::RenderStudio, App};
 use sha2::{Digest, Sha256};
-use std::{fs, io::{Read, Write}, path::{Component, Path, PathBuf}};
+use std::{fs, io::{Read, Write}, path::{Path, PathBuf}};
 
 const MAX_DEMO_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Untrusted JSON cannot escape the selected project folder.
-pub(super) fn media_path(project: &Path, relative: &str) -> Result<PathBuf, String> {
-    let path = Path::new(relative);
-    if !relative.starts_with("media/") || relative.contains('\\') ||
-        !path.components().all(|c| matches!(c, Component::Normal(_))) {
-        return Err(format!("Unsafe Render Studio media path: {relative}"));
-    }
-    Ok(project.join(path))
-}
+pub(super) use jka_studio::render_studio_media::media_path;
 
 fn safe_stem(path: &Path) -> String {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();

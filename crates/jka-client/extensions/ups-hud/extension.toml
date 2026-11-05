@@ -1,6 +1,0 @@
-api_version = 1
-name = "UPS speedometer"
-entry = "main.rhai"
-# Replaces the native speedometer (readout, jump counter and speed graph) while
-# this extension is enabled and running. Disable it and the native one returns.
-hides_native_hud = ["speedometer"]

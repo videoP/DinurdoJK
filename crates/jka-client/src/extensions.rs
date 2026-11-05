@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jka_assets::pk3::AssetSearchPath;
+use jka_assets::pk3::{dinurdojk_directory, AssetSearchPath};
 use rhai::{CallFnOptions, Dynamic, Engine, Map, Scope, AST};
 use jka_protocol::{server::PlayerState, PLAYER_FIELDS, VEHICLE_ONLY_FIELDS};
 use crate::cgame::{ClientGameState, PresentationEvent};
@@ -807,8 +807,50 @@ struct Slot {
     source_path: Option<PathBuf>,
 }
 
+/// A client preference, not a loose game asset. Unlisted extensions are enabled.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ExtensionPreferences {
+    disabled: BTreeSet<String>,
+}
+
+/// Write the complete preference set before changing the in-memory state.
+/// Keep the previous JSON intact if the replacement fails, including on Windows
+/// (where rename cannot replace an existing destination).
+fn save_extension_preferences(path: &Path, disabled: &BTreeSet<String>) -> Result<(), String> {
+    let mut json = serde_json::to_vec_pretty(&ExtensionPreferences { disabled: disabled.clone() })
+        .map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    let parent = path.parent().ok_or("Missing extension preferences parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let suffix = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos());
+    let temporary = parent.join(format!(".extensions-{suffix}.tmp"));
+    let backup = parent.join(format!(".extensions-{suffix}.bak"));
+    fs::write(&temporary, json).map_err(|e| e.to_string())?;
+    let result = if path.exists() {
+        fs::rename(path, &backup).and_then(|()| {
+            if let Err(error) = fs::rename(&temporary, path) {
+                let _ = fs::rename(&backup, path);
+                Err(error)
+            } else {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+        })
+    } else {
+        fs::rename(&temporary, path)
+    };
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result.map_err(|e| e.to_string())
+}
+
 struct Worker {
     root: PathBuf,
+    preferences_path: PathBuf,
+    disabled: BTreeSet<String>,
+    preferences_error: bool,
     base: PathBuf,
     game: Option<PathBuf>,
     response: Sender<Response>,
@@ -824,10 +866,84 @@ struct Worker {
 
 impl Worker {
     fn new(base: PathBuf, game: Option<PathBuf>, response: Sender<Response>) -> Self {
-        Self {
-            root: base.join("extensions"), base, game, response, slots: BTreeMap::new(), revision: 0, force_reload: BTreeSet::new(),
+        let preferences_path = dinurdojk_directory(&base).join("extensions.json");
+        let mut worker = Self {
+            root: base.join("extensions"), preferences_path, disabled: BTreeSet::new(),
+            preferences_error: false, base, game, response,
+            slots: BTreeMap::new(), revision: 0, force_reload: BTreeSet::new(),
             last_hud: Vec::new(), last_hidden: NativeHudMask::default(), last_preload: Vec::new(), last_cycle: Vec::new(), last_shaders: Vec::new(),
+        };
+        worker.load_extension_preferences();
+        worker
+    }
+
+    fn legacy_disabled_markers(&self) -> Vec<(String, PathBuf)> {
+        let Ok(entries) = fs::read_dir(&self.root) else { return Vec::new(); };
+        entries.flatten().filter_map(|entry| {
+            if !entry.file_type().ok()?.is_dir() { return None; }
+            let id = entry.file_name().into_string().ok()?;
+            if !valid_id(&id) { return None; }
+            let marker = entry.path().join(".disabled");
+            // Never follow symlinks while migrating or cleaning user files.
+            marker.symlink_metadata().ok()?.file_type().is_file().then_some((id, marker))
+        }).collect()
+    }
+
+    fn remove_legacy_markers(&self, markers: &[(String, PathBuf)]) {
+        for (id, marker) in markers {
+            match fs::remove_file(marker) {
+                Ok(()) => {
+                    // Only remove directories that are actually empty: loose
+                    // extension scripts, manifests, and layouts are preserved.
+                    if let Some(dir) = marker.parent() { let _ = fs::remove_dir(dir); }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => self.log(format!("{id}: cannot remove old .disabled marker: {e}")),
+            }
         }
+        let _ = fs::remove_dir(&self.root);
+    }
+
+    fn load_extension_preferences(&mut self) {
+        let have_json = match fs::read_to_string(&self.preferences_path) {
+            Ok(text) => {
+                match serde_json::from_str::<ExtensionPreferences>(&text) {
+                    Ok(prefs) if prefs.disabled.iter().all(|id| valid_id(id)) => {
+                        self.disabled = prefs.disabled;
+                        true
+                    }
+                    Ok(_) => {
+                        self.log("extensions.json has invalid extension IDs; fix it before changing extension settings");
+                        self.preferences_error = true;
+                        return;
+                    }
+                    Err(e) => {
+                        self.log(format!("Cannot parse extensions.json: {e}; fix it before changing extension settings"));
+                        self.preferences_error = true;
+                        return;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                self.log(format!("Cannot read extensions.json: {e}; extension settings are read-only"));
+                self.preferences_error = true;
+                return;
+            }
+        };
+        let markers = self.legacy_disabled_markers();
+        if !have_json && !markers.is_empty() {
+            // Import existing base/extensions/*/.disabled states once. Do not
+            // delete their only copy until the new JSON was persisted.
+            self.disabled.extend(markers.iter().map(|(id, _)| id.clone()));
+            if let Err(e) = save_extension_preferences(&self.preferences_path, &self.disabled) {
+                self.log(format!("Cannot migrate extension preferences: {e}; old markers were retained"));
+                return;
+            }
+        }
+        // Once the JSON exists it is authoritative; stale markers must not
+        // unexpectedly re-disable a user-enabled extension on the next launch.
+        if have_json || !markers.is_empty() { self.remove_legacy_markers(&markers); }
     }
 
     fn native_hidden(&self) -> NativeHudMask {
@@ -894,20 +1010,18 @@ impl Worker {
             }
             Command::SetEnabled(id, enabled) => {
                 if !valid_id(&id) || !self.slots.contains_key(&id) { return; }
-                if let Err(err) = fs::create_dir_all(self.root.join(&id)) {
-                    self.log(format!("{id}: cannot update enabled state: {err}")); return;
+                if self.preferences_error {
+                    self.log("extensions.json could not be loaded; fix it before changing extension settings");
+                    return;
                 }
-                let marker = self.root.join(&id).join(".disabled");
-                let result = if enabled {
-                    match fs::remove_file(&marker) {
-                        Ok(()) => Ok(()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e),
+                let mut disabled = self.disabled.clone();
+                let changed = if enabled { disabled.remove(&id) } else { disabled.insert(id.clone()) };
+                if changed {
+                    match save_extension_preferences(&self.preferences_path, &disabled) {
+                        Ok(()) => self.disabled = disabled,
+                        Err(err) => self.log(format!("{id}: cannot save extensions.json: {err}")),
                     }
-                } else {
-                    fs::write(marker, b"Disabled by DinurdoJK\n")
-                };
-                if let Err(err) = result { self.log(format!("{id}: cannot update enabled state: {err}")); }
+                }
             }
             Command::SaveSource(id, source) => {
                 if !valid_id(&id) || source.len() > MAX_SOURCE_BYTES { return; }
@@ -981,7 +1095,7 @@ impl Worker {
                 });
             let source = script_result.as_ref().cloned().unwrap_or_default();
             // Enable state is a local preference, including for packaged extensions.
-            let disabled = self.root.join(&id).join(".disabled").exists();
+            let disabled = self.disabled.contains(&id);
             let source_path = parsed.as_ref().ok().filter(|m| valid_entry(&m.entry))
                 .and_then(|m| assets.loose_file_path(&format!("{qroot}/{}", m.entry)));
             let fingerprint_source = script_result.as_ref().map_or_else(
@@ -1409,9 +1523,17 @@ mod tests {
         worker.scan(false);
         assert!(!worker.slots["test"].info.enabled);
         assert!(!worker.slots["test"].info.running);
+        let preferences_path = fixture.0.join("DinurdoJK/extensions.json");
+        let preferences: ExtensionPreferences = serde_json::from_str(
+            &fs::read_to_string(&preferences_path).unwrap()).unwrap();
+        assert!(preferences.disabled.contains("test"));
+        assert!(!base.join("extensions/test/.disabled").exists());
         worker.handle(Command::SetEnabled("test".into(), true));
         worker.scan(false);
         assert!(worker.slots["test"].info.running);
+        let preferences: ExtensionPreferences = serde_json::from_str(
+            &fs::read_to_string(preferences_path).unwrap()).unwrap();
+        assert!(preferences.disabled.is_empty());
 
         ExtensionFixture::loose(&game, "Mod loose", "let mod_loose = 1;");
         worker.handle(Command::SetGame(Some(game.clone())));
@@ -1435,18 +1557,95 @@ mod tests {
     #[test]
     fn packaged_extensions_work_without_a_loose_extensions_directory() {
         let fixture = ExtensionFixture::new();
-        ExtensionFixture::package(&fixture.0, "Packaged", "let value = 1;");
+        let base = fixture.0.join("base");
+        ExtensionFixture::package(&base, "Packaged", "let value = 1;");
         let (tx, _rx) = mpsc::channel();
-        let mut worker = Worker::new(fixture.0.clone(), None, tx);
+        let mut worker = Worker::new(base.clone(), None, tx);
         worker.scan(false);
         assert!(worker.slots["test"].info.running);
-        assert!(!fixture.0.join("extensions").exists());
+        assert!(!base.join("extensions").exists());
         worker.handle(Command::SetEnabled("test".into(), false));
         worker.scan(false);
         assert!(!worker.slots["test"].info.running);
-        fs::remove_file(fixture.0.join("extensions.pk3")).unwrap();
+        // Packaging alone never requires creating any loose extensions dir.
+        assert!(!base.join("extensions").exists());
+        assert!(fixture.0.join("DinurdoJK/extensions.json").exists());
+        fs::remove_file(base.join("extensions.pk3")).unwrap();
         worker.scan(false);
         assert!(worker.slots.is_empty());
+    }
+
+    #[test]
+    fn migration_preserves_disabled_choices_and_cleans_only_legacy_markers() {
+        let fixture = ExtensionFixture::new();
+        let base = fixture.0.join("base");
+        ExtensionFixture::package(&base, "Packaged", "let value = 1;");
+        let markers = base.join("extensions/test");
+        fs::create_dir_all(&markers).unwrap();
+        fs::write(markers.join(".disabled"), "Disabled by DinurdoJK\n").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(base.clone(), None, tx);
+        worker.scan(false);
+        assert!(!worker.slots["test"].info.enabled);
+        assert!(!markers.exists());
+        assert!(!base.join("extensions").exists());
+        let preferences_path = fixture.0.join("DinurdoJK/extensions.json");
+        let saved: ExtensionPreferences = serde_json::from_str(
+            &fs::read_to_string(&preferences_path).unwrap()).unwrap();
+        assert!(saved.disabled.contains("test"));
+        // The migrated preference also applies on restart without marker files.
+        let (tx, _rx) = mpsc::channel();
+        let mut restarted = Worker::new(base, None, tx);
+        restarted.scan(false);
+        assert!(!restarted.slots["test"].info.enabled);
+    }
+
+    #[test]
+    fn migration_keeps_real_loose_extension_files() {
+        let fixture = ExtensionFixture::new();
+        let base = fixture.0.join("base");
+        ExtensionFixture::loose(&base, "Loose", "let value = 1;");
+        let root = base.join("extensions/test");
+        fs::write(root.join(".disabled"), "old state").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(base, None, tx);
+        worker.scan(false);
+        assert!(!worker.slots["test"].info.running);
+        assert!(!root.join(".disabled").exists());
+        assert!(root.join("extension.toml").exists());
+        assert!(root.join("main.rhai").exists());
+    }
+
+    #[test]
+    fn json_is_authoritative_over_stale_legacy_markers() {
+        let fixture = ExtensionFixture::new();
+        let base = fixture.0.join("base");
+        ExtensionFixture::package(&base, "Packaged", "let value = 1;");
+        let preferences_path = fixture.0.join("DinurdoJK/extensions.json");
+        save_extension_preferences(&preferences_path, &BTreeSet::new()).unwrap();
+        let legacy = base.join("extensions/test/.disabled");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "stale marker").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(base, None, tx);
+        worker.scan(false);
+        assert!(worker.slots["test"].info.enabled);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn invalid_json_is_never_overwritten_by_toggle() {
+        let fixture = ExtensionFixture::new();
+        let base = fixture.0.join("base");
+        ExtensionFixture::package(&base, "Packaged", "let value = 1;");
+        let path = fixture.0.join("DinurdoJK/extensions.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{broken json").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut worker = Worker::new(base, None, tx);
+        worker.scan(false);
+        worker.handle(Command::SetEnabled("test".into(), false));
+        assert_eq!(fs::read_to_string(path).unwrap(), "{broken json");
     }
 
     #[test]

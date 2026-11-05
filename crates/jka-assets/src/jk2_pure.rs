@@ -248,7 +248,7 @@ pub struct PureReply {
 fn in_base(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
-        .is_some_and(|n| n.eq_ignore_ascii_case("base") || n.eq_ignore_ascii_case(pk3::JK2_BASE_FOLDER))
+        .is_some_and(|n| n.eq_ignore_ascii_case("base"))
 }
 fn retail(path: &Path) -> bool {
     in_base(path)

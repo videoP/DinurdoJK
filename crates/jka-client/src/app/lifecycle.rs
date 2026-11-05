@@ -183,7 +183,7 @@ impl ApplicationHandler<UserEvent> for App {
         // Start *CPU-only* map preparation while WGPU initializes. A worker
         // result arriving before the first egui-presented frame is held below;
         // it cannot preempt the first clickable menu with GPU uploads.
-        if self.front_end && !self.startup_first_frame_seen {
+        if self.front_end && !self.startup_first_frame_seen && self.asset_mapping.is_none() {
             self.request_frontend_background();
         }
     }
@@ -479,13 +479,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_map(initial_source);
                     self.console_map_barrier = !self.startup_commands.is_empty();
                 }
-                for command in std::mem::take(&mut self.startup_commands) {
-                    println!("STARTUP COMMAND: {command}");
-                    self.push_console_command_echo(format!("^7] {command}"));
-                    self.append_console_commands(split_console_script(&command));
-                }
-                if let Some(path) = self.startup_demo_file.take() {
-                    self.play_demo_file(&path);
+                // While the mandatory recovery UI is open, do not run launch
+                // commands that could start a map or connect with missing assets.
+                // Save & Restart replays unrelated launch arguments afterward.
+                if self.asset_mapping.is_none() {
+                    for command in std::mem::take(&mut self.startup_commands) {
+                        println!("STARTUP COMMAND: {command}");
+                        self.push_console_command_echo(format!("^7] {command}"));
+                        self.append_console_commands(split_console_script(&command));
+                    }
+                    if let Some(path) = self.startup_demo_file.take() {
+                        self.play_demo_file(&path);
+                    }
                 }
             }
             UserEvent::RendererFirstMenuFrame => {

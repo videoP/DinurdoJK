@@ -38,6 +38,12 @@ pub(super) fn detect_dx12_support(adapter: &wgpu::Adapter, _device: &wgpu::Devic
 pub(super) fn create_instance(desc: wgpu::InstanceDescriptor) -> wgpu::Instance {
     INSTANCE_SUPPORTS_NGX.store(false, Ordering::Relaxed);
     DEVICE_SUPPORTS_NGX.store(false, Ordering::Relaxed);
+    // Prefer the packaged feature DLL to an incidental copy beside the EXE.
+    // This feature is optional; missing runtime must not prevent normal Vulkan.
+    #[cfg(windows)]
+    if let Err(error) = crate::dependency_dll::preload("nvngx_dlss.dll") {
+        eprintln!("[DLSS] {error}");
+    }
     let mut support = FeatureSupport::default();
     match dlss_wgpu::create_instance(project_id(), &desc, &mut support) {
         Ok(instance) => {
@@ -156,6 +162,9 @@ impl DlssState {
                     if !device_supported() {
                         return Err("NGX Super Resolution is unavailable on this device".into());
                     }
+                    // DX12 has no Vulkan create_instance preloader.
+                    #[cfg(windows)]
+                    crate::dependency_dll::preload("nvngx_dlss.dll")?;
                     let sdk = DlssSdk::new(project_id(), device.clone())
                         .map_err(|e| format!("NGX init failed: {e}"))?;
                     self.sdk = Some(Arc::clone(&sdk));

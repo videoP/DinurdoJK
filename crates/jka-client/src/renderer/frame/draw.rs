@@ -165,15 +165,10 @@ impl Renderer {
         // Modes 0..15 retain their existing meanings. Modes 16+ use
         // independent system-skip bits for diagnosis.
         let competitive_mask = competitive_probe_mask(self.competitive_ab);
-        if crate::renderer::collision_world_only() {
-            // A worker is only started by a user enable (or a loaded map while
-            // already enabled). No file IO, geometry build or GPU allocation
-            // occurs on the ordinary frame path while the cvar is disabled.
-            self.poll_collision_world_job();
-        }
-        let collision_world_only = crate::renderer::collision_world_only()
-            && self.world.as_ref().is_some_and(|world| world.collision_mesh.is_some());
-        let competitive_no_world = collision_world_only || self.competitive_ab == 10
+        // Legacy console name retained for A/B configs; the path now draws
+        // the original BSP world mesh, never the collision/acoustic mesh.
+        let collision_world_only = crate::renderer::collision_world_only() && self.world.is_some();
+        let competitive_no_world = self.competitive_ab == 10
             || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0;
         // A/B bit 0 disables optional split encoder finishing while preserving
         // the configured r_encoderFinishThreads mode when the bit is clear.
@@ -439,7 +434,7 @@ impl Renderer {
             advance_world_animations(world, self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32()));
         }
         self.ensure_lazy_scene_pipelines();
-        // No pipeline compilation or extra shader on the normal rendering path.
+        // Compile only on demand; the normal world rendering path is untouched.
         if collision_world_only {
             self.ensure_collision_world_pipeline();
         }
@@ -1129,24 +1124,9 @@ impl Renderer {
         // grass/sprite preparation, not just raster draws. All world draw
         // sites are suppressed independently below; switching back repairs
         // stale visibility on the first normal frame.
-        if collision_world_only {
-            // The normal world preparation is skipped in collision mode, but
-            // collision geometry MUST still use the same view-cluster and
-            // server areaportal visibility as ordinary BSP drawing. Cache the
-            // expensive BSP box/leaf tests until the PVS cluster or area mask
-            // changes; the frustum remains the only per-frame chunk test.
-            if let Some(world) = &mut self.world {
-                update_visibility(world, camera);
-                let mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
-                let cluster = world.last_cluster.flatten();
-                let visibility = world.visibility.as_ref();
-                if let Some(mesh) = world.collision_mesh.as_mut() {
-                    mesh.refresh_pvs(visibility, self.pvs_mode, cluster, mask.as_ref());
-                    info.cull_pvs_rejected = mesh.pvs_rejected_chunks;
-                }
-            }
-        }
-        if !collision_world_only && self.competitive_ab != 10 && competitive_mask & probe::WORLD_PREP_AND_DRAW == 0 {
+        // Flat BSP rendering needs the normal PVS, inline-model visibility,
+        // map patch LOD and AUTO-4 index selection prepared below.
+        if self.competitive_ab != 10 && competitive_mask & probe::WORLD_PREP_AND_DRAW == 0 {
         if let Some(world) = &mut self.world {
             // Shell fragments are discarded unless footprints are in 3D mode, so
             // outside it there is nothing to build, hold or draw.
@@ -1213,6 +1193,49 @@ impl Renderer {
                     area_mask,
                     self.cull_debug_mode != CullDebugMode::Off,
                 );
+            }
+            if collision_world_only && !competitive_no_world {
+                // This list is drawn as ONE native indexed multi-draw. Its
+                // ranges are the original world.index_buffer offsets, and it
+                // inherits exactly the normal cluster/AUTO PVS and areaportals.
+                // Build it only in Shitter; normal presets have zero work here.
+                // Reuse the existing CPU compaction scratch allocation: Shitter
+                // never executes the normal material-group compaction below.
+                // No heap allocation is needed on steady-state frames.
+                let mut draws = std::mem::take(&mut self.cpu_compact_indirect_scratch);
+                draws.clear();
+                {
+                    let active = active_batch_selection(world, self.pvs_mode);
+                    let mask = effective_area_mask;
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if !batch.source.competitive_primary_stage
+                            || batch.patch_suppressed
+                            || batch.indexed_range.is_empty()
+                            || batch.source.pipeline.class == DrawClass::Sky
+                            || (batch.source.force_sight_only && !force_sight_on)
+                            || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
+                            || (!self.draw_inline_models && batch.is_inline_entity)
+                            || hidden_inline_batch(batch, &world.inline_models)
+                            || !batch_area_visible(batch, mask)
+                            || !main_view_aabb_visible(batch.bounds_min, batch.bounds_max)
+                            || ocean_suppresses_batch(render_ocean, batch)
+                        {
+                            continue;
+                        }
+                        draws.push(DrawIndexedIndirectArgs {
+                            index_count: batch.indexed_range.end - batch.indexed_range.start,
+                            instance_count: 1,
+                            first_index: batch.indexed_range.start,
+                            base_vertex: 0,
+                            first_instance: 0,
+                        });
+                    }
+                }
+                crate::renderer::collision_world::update_native_flat_draw(
+                    &self.device, &self.queue, &mut world.native_flat_draw, &draws,
+                );
+                self.cpu_compact_indirect_scratch = draws;
             }
             if self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                 && competitive_mask & probe::GRASS == 0 {
@@ -3599,7 +3622,7 @@ impl Renderer {
             // stage opaque/masked survivors into indirect multi-draws. Authored
             // multi-stage and transparent ordering remains on the conservative
             // per-draw path.
-            let use_cpu_compaction = !competitive_no_world
+            let use_cpu_compaction = !collision_world_only && !competitive_no_world
                 && competitive_mask & probe::CPU_COMPACTION == 0
                 && !self.gpu_driven_enabled
                 && !render_ocean
@@ -4078,24 +4101,24 @@ impl Renderer {
             pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
             if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            if collision_world_only {
-                if let (Some(mesh), Some(pipeline)) =
-                    (world.collision_mesh.as_ref(), self.collision_world_pipeline.as_ref())
+            if collision_world_only && !competitive_no_world {
+                if let (Some(draw), Some(pipeline)) =
+                    (world.native_flat_draw.as_ref(), self.collision_world_pipeline.as_ref())
                 {
-                    pass.set_pipeline(&pipeline.pipeline);
-                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    // Use native BSP PVS + server area-portal admission cached
-                    // on cluster/mask changes, then the view frustum. Consecutive
-                    // ranges are merged into a single indexed draw; no per-frame
-                    // geometry upload or fullscreen pass is added.
-                    let frustum = ClipFrustum::from_view_proj(view_proj);
-                    mesh.draw_visible(&mut pass, &frustum);
-                    // Other passes use the normal world buffers explicitly; restore
-                    // for the rest of the current world pass as a safety boundary.
-                    pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
-                    pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    if draw.count != 0 {
+                        pass.set_pipeline(&pipeline.pipeline);
+                        // Vertex 0 and the index buffer are ALREADY the regular
+                        // BSP world buffers. Only group 0 (camera) is used.
+                        pass.multi_draw_indexed_indirect(&draw.buffer, 0, draw.count);
+                        info.world_encoded_batches = draw.count;
+                        info.world_multidraw_groups = info.world_multidraw_groups.saturating_add(1);
+                        info.world_multidraw_batches = info.world_multidraw_batches.saturating_add(draw.count);
+                        if capture_api_calls {
+                            info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1);
+                            info.perf_encode_calls.multi_draw_indexed_indirect_count =
+                                info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1);
+                        }
+                    }
                 }
             }
             let mut current_pipeline = None;
@@ -4119,7 +4142,7 @@ impl Renderer {
                 }),
                 _ => false,
             };
-            let use_compaction = self.gpu_driven_enabled
+            let use_compaction = !collision_world_only && self.gpu_driven_enabled
                 && !render_ocean
                 // Compact groups share one representative material bind group.
                 // Legacy carries a per-draw source-triangle base in that bind

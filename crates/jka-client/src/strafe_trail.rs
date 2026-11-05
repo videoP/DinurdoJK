@@ -173,22 +173,7 @@ impl TrailView {
 
 /// Labels on race-clock ticks in Studio. Independent of the gameplay cvar
 /// controlling legacy loaded-trail plums.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StudioTickLabels {
-    #[default] Off,
-    Seconds,
-    MinutesSeconds,
-}
-impl StudioTickLabels {
-    fn text(self, seconds: u32) -> Option<String> {
-        match self {
-            Self::Off => None,
-            Self::Seconds => Some(seconds.to_string()),
-            Self::MinutesSeconds => Some(format!("{}:{:02}", seconds / 60, seconds % 60)),
-        }
-    }
-}
+pub(crate) use jka_studio::trail::StudioTickLabels;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TimeMarker {

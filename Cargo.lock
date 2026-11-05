@@ -7,7 +7,6 @@ name = "DinurdoJK"
 version = "0.1.0"
 dependencies = [
  "ash",
- "audionimbus",
  "blue-water-clouds",
  "blue-water-core",
  "blue-water-fx",
@@ -15,7 +14,6 @@ dependencies = [
  "blue-water-render",
  "blue-water-sky",
  "bytemuck",
- "cc",
  "dlss_wgpu",
  "ed25519-dalek",
  "egui",
@@ -28,9 +26,14 @@ dependencies = [
  "image",
  "image_dds",
  "jka-assets",
+ "jka-audio",
+ "jka-client-services",
  "jka-emotes",
  "jka-movement",
  "jka-protocol",
+ "jka-render-core",
+ "jka-river",
+ "jka-studio",
  "jka-ue-assets",
  "jka-ue-runtime",
  "jka-water",
@@ -55,7 +58,6 @@ dependencies = [
  "ttf-parser",
  "uuid",
  "wgpu",
- "whatlang",
  "windows",
  "windows-sys 0.61.2",
  "winit 0.30.13",
@@ -1971,6 +1973,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "jka-audio"
+version = "0.1.0"
+dependencies = [
+ "audionimbus",
+ "cc",
+ "jka-assets",
+ "jka-emotes",
+ "rodio",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "jka-client-services"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "image",
+ "jka-assets",
+ "jka-movement",
+ "jka-protocol",
+ "jka-render-core",
+ "serde",
+ "serde_json",
+ "taffy",
+ "ttf-parser",
+ "whatlang",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "jka-emotes"
 version = "0.1.0"
 dependencies = [
@@ -2007,6 +2040,49 @@ dependencies = [
 [[package]]
 name = "jka-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "jka-render-core"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "glam 0.33.9",
+ "jka-movement",
+]
+
+[[package]]
+name = "jka-river"
+version = "0.1.0"
+dependencies = [
+ "blue-water-clouds",
+ "blue-water-gpu",
+ "blue-water-sky",
+ "bytemuck",
+ "glam 0.33.9",
+ "jka-assets",
+ "jka-render-core",
+ "jka-water",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wgpu",
+ "zip 8.6.0",
+]
+
+[[package]]
+name = "jka-studio"
+version = "0.1.0"
+dependencies = [
+ "glam 0.33.9",
+ "jka-assets",
+ "jka-client-services",
+ "jka-emotes",
+ "jka-movement",
+ "jka-protocol",
+ "jka-render-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "jka-ue-assets"

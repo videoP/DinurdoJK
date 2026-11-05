@@ -672,7 +672,7 @@ impl App {
             };
             let minor = match conversion.version { jka_protocol::jk2::Version::V102 => 2, jka_protocol::jk2::Version::V104 => 4 };
             if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, minor) {
-                self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath or fs_jk2cdpath/base", conversion.version.name())); return false;
+                self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath/base or fs_jk2cdpath/base", conversion.version.name())); return false;
             }
             println!("JK2 {} presentation: {} snapshots, {} unmapped events omitted; source demo remains unchanged", conversion.version.name(), conversion.snapshots, conversion.omitted_events);
             asset.bytes = conversion.bytes;

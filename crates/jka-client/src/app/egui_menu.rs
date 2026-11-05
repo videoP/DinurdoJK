@@ -59,7 +59,7 @@ pub(in crate::app) use neon_main::NeonMenuState;
 
 const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
 const SETUP_TABS: [&str; 10] = [
-    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE", "PK3 MANAGER",
+    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE", "PACKAGE MANAGER",
 ];
 
 const TOP_RESUME: usize = 0;

@@ -1,4 +1,5 @@
 //! Frame.
+use super::render_studio_lights::{StudioEnvironmentRender, StudioTimelineLights};
 use crate::app::{
     rendering_third_person, ui, App, Arc, ClientFramePerf, FrontendPage, InputLatencySample,
     DemoViewMode, Duration, Instant, LocalServer, MapEditor, OverlayMode, PlayerViewPolicyState, RenderCommand,

@@ -158,8 +158,8 @@ jobs:
           foreach ($helper in @('scripts/build-cache-report.ps1', 'scripts/ensure-smaa-vendor.ps1', 'scripts/ensure-openal-runtime.ps1')) {
             if (-not (Test-Path $helper)) { throw "Missing $helper. Commit your local build helpers first." }
           }
-          if (-not (Test-Path 'assets/dinurdo-assets.pk3')) {
-            throw 'Missing committed assets/dinurdo-assets.pk3 for the signed ZIP.'
+          if (-not (Test-Path 'assets/dinurdo-assets.pk4')) {
+            throw 'Missing committed assets/dinurdo-assets.pk4 for the signed ZIP.'
           }
           # Current build.ps1 expects a target/fast license even in Release mode.
           $license = 'target/fast/licenses/OpenAL-Soft-LGPL-2.0.txt'
@@ -175,8 +175,16 @@ jobs:
         run: |
           .\build.ps1 -Fetch -Dlss
           if ($LASTEXITCODE -ne 0) { throw 'DinurdoJK Release build failed.' }
-          foreach ($file in @('target/release/DinurdoJK.exe', 'target/release/nvngx_dlss.dll', 'target/release/OpenALSoft.x86_64.dll')) {
-            if (-not (Test-Path $file)) { throw "Missing runtime: $file" }
+          if (-not (Test-Path 'target/release/DinurdoJK.exe' -PathType Leaf)) {
+            throw 'Missing release executable.'
+          }
+          # The packager understands either staging layout, but always publishes
+          # the updated DinurdoJK/dependencies layout in its signed manifest.
+          foreach ($dll in @('nvngx_dlss.dll', 'OpenALSoft.x86_64.dll')) {
+            if (-not (Test-Path "target/release/DinurdoJK/dependencies/$dll" -PathType Leaf) -and
+                -not (Test-Path "target/release/$dll" -PathType Leaf)) {
+              throw "Missing required runtime $dll (checked dependencies and legacy staging)."
+            }
           }
 
       # Pin the exact official Microsoft Windows DXC archive and verify its
@@ -207,7 +215,9 @@ jobs:
             try { $isPe = ($stream.ReadByte() -eq 0x4d -and $stream.ReadByte() -eq 0x5a) }
             finally { $stream.Dispose() }
             if (-not $isPe) { throw "Not a Windows PE file: $name" }
-            Copy-Item -LiteralPath $source -Destination (Join-Path 'target/release' $name) -Force
+            $deps = 'target/release/DinurdoJK/dependencies'
+            New-Item -ItemType Directory -Force $deps | Out-Null
+            Copy-Item -LiteralPath $source -Destination (Join-Path $deps $name) -Force
           }
           # Ship Microsoft's license and third-party notices alongside the
           # signed DLLs. Like all other update assets these are hash-verified.
@@ -242,7 +252,7 @@ jobs:
           New-Item -ItemType Directory -Force $licenseDir | Out-Null
           Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
           foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
-            if (-not (Test-Path -LiteralPath (Join-Path 'target/release' $name) -PathType Leaf)) {
+            if (-not (Test-Path -LiteralPath (Join-Path 'target/release/DinurdoJK/dependencies' $name) -PathType Leaf)) {
               throw "Missing Microsoft DXC runtime before signing: $name"
             }
           }
@@ -254,7 +264,7 @@ jobs:
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
           $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
-          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); assert m["format"]==2; assert set(z.namelist())==set(m["files"]); assert "DinurdoJK/dinurdo-assets.pk3" in z.namelist(); assert "DinurdoJK.exe" in z.namelist(); assert "dxcompiler.dll" in z.namelist() and "dxil.dll" in z.namelist(); assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified full ZIP and signed per-file hashes")' $archive
+          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); assert m["format"]==2; assert set(z.namelist())==set(m["files"]); assert "DinurdoJK/shared/dinurdo-assets.pk4" in z.namelist(); assert "DinurdoJK.exe" in z.namelist(); assert "DinurdoJK/dependencies/dxcompiler.dll" in z.namelist() and "DinurdoJK/dependencies/dxil.dll" in z.namelist(); assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified full ZIP and signed per-file hashes")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout and hashes failed verification.' }
 
       - name: Upload signed updater artifact

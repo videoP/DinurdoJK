@@ -163,10 +163,8 @@ pub fn renderer_verbose_enabled(required: u8) -> bool {
     developer_level() >= required || renderer_verbose_level() >= required
 }
 
-/// `<GameData>/DinurdoJK/logs`: latest.log, previous.log and the crash/hang
-/// `.dmp` files (the crash reporter writes beside the log). Runs before the
-/// command line is parsed, so it follows the saved `fs_homepath` in
-/// DinurdoJK-paths.ini but not a `+set fs_homepath` given on this launch.
+/// `<install>/DinurdoJK/logs`: latest.log, previous.log and crash dumps.
+/// Independent of both game roots and fs_homepath.
 /// Falls back to the exe folder if the directory cannot be created.
 fn log_directory() -> Result<PathBuf, String> {
     let base = crate::filesystem_paths::default_base_directory()?;

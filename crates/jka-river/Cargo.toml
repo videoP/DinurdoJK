@@ -1,0 +1,24 @@
+[package]
+name = "jka-river"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+blue-water-gpu = { path = "../blue-water-gpu" }
+blue-water-clouds = { path = "../blue-water-clouds" }
+blue-water-sky = { path = "../blue-water-sky" }
+bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
+glam.workspace = true
+jka-assets = { path = "../jka-assets" }
+jka-render-core = { path = "../jka-render-core" }
+jka-water = { path = "../jka-water" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "spirv", "dx12", "vulkan"] }
+
+[features]
+# Test-only hooks for the client's GPU integration tests; never enabled by a game build.
+test-support = []

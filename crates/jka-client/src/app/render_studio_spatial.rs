@@ -492,21 +492,7 @@ impl Default for StudioSpatialEditor {
         signature:String::new(),pose_signature:String::new(),camera_offsets:Default::default(),retry:false}}
 }
 
-pub(in crate::app) fn camera_from_key(key:StudioCameraKey)->Camera {
-    let mut camera=Camera::new_with_fov(crate::scene::render_position(key.position),key.yaw.to_radians(),key.fov);
-    camera.pitch=-key.pitch.to_radians();key.lens_for_camera(&mut camera);camera
-}
-pub(in crate::app) fn key_from_camera(camera:Camera)->StudioCameraKey {
-    StudioCameraKey {position:crate::scene::jka_position(camera.position.to_array()),yaw:camera.yaw.to_degrees(),
-        pitch:-camera.pitch.to_degrees(),fov:camera.cg_fov(),..Default::default()}
-}
-/// Stage placement in native JKA coordinates, shared by actors and authoring tools.
-pub(in crate::app) fn motion_origin(position:[f32;3],lane:usize,zoom:f32)->[f32;3] {
-    [88.*zoom.clamp(0.45,2.5)+position[0],lane as f32*26.+position[1],-22.+position[2]]
-}
-pub(in crate::app) fn motion_world(position:[f32;3],lane:usize,zoom:f32)->[f32;3] {
-    crate::scene::render_position(motion_origin(position,lane,zoom))
-}
+pub(in crate::app) use jka_studio::render_studio_spatial::{camera_from_key, key_from_camera, motion_world};
 pub(in crate::app) fn stored_position(timeline:&StudioTimeline,item:StudioItem)->Option<[f32;3]> {
     match item {StudioItem::Camera(i)=>timeline.camera.get(i).map(|k|k.position),
         StudioItem::Motion(i,k)=>timeline.clips.get(i)?.motion.get(k).map(|k|k.position),_=>None}

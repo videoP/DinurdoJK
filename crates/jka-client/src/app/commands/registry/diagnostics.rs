@@ -3,7 +3,7 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
-    cmd_jk2_demo_info ["jk2_demoInfo"] ("jk2_demoInfo <demoname or absolute path>", "Decode an entire JK2 demo and report its version, map, duration, and snapshot integrity. Names resolve under fs_jk2basepath/demos, then fs_jk2cdpath/base/demos.", CommandScope::Always) |self, command| {
+    cmd_jk2_demo_info ["jk2_demoInfo"] ("jk2_demoInfo <demoname or absolute path>", "Decode an entire JK2 demo and report its version, map, duration, and snapshot integrity. Names resolve under fs_jk2basepath/base/demos, then fs_jk2cdpath/base/demos.", CommandScope::Always) |self, command| {
         let args = jka_protocol::commands::tokenize(command.as_bytes());
         let result = (|| {
             if args.len() != 2 { return Err("usage: jk2_demoInfo <demoname or absolute path>".to_owned()); }

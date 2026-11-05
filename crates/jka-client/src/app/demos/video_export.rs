@@ -1,4 +1,4 @@
-//! Deterministic demo -> editor/video export through an adjacent ffmpeg.exe.
+//! Deterministic demo -> editor/video export using DinurdoJK/dependencies/ffmpeg.exe.
 use crate::app::{App, DemoAdvance, Duration, GameSession, Instant, RenderCommand, SessionPhase};
 use std::{
     fs::File,
@@ -131,13 +131,13 @@ impl Drop for DemoVideoExport {
     }
 }
 
-pub(in crate::app) fn adjacent_ffmpeg_path() -> Option<PathBuf> {
+pub(in crate::app) fn dependency_ffmpeg_path() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(path) = std::env::var_os("DJK_STUDIO_TEST_FFMPEG").map(PathBuf::from) {
         return path.is_file().then_some(path);
     }
     let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.join("ffmpeg.exe");
+    let path = exe.parent()?.join("DinurdoJK").join("dependencies").join("ffmpeg.exe");
     path.is_file().then_some(path)
 }
 
@@ -155,7 +155,7 @@ fn safe_stem(source: &str) -> String {
 
 impl App {
     pub(in crate::app) fn demo_export_available(&self) -> bool {
-        adjacent_ffmpeg_path().is_some()
+        dependency_ffmpeg_path().is_some()
     }
 
     pub(in crate::app) fn cycle_demo_export_preset(&mut self) {
@@ -215,8 +215,8 @@ impl App {
         if self.demo_video_export.is_some() {
             return;
         }
-        let Some(ffmpeg) = adjacent_ffmpeg_path() else {
-            self.console_status = "DEMO EXPORT DISABLED: ffmpeg.exe must be next to DinurdoJK.exe".into();
+        let Some(ffmpeg) = dependency_ffmpeg_path() else {
+            self.console_status = "DEMO EXPORT DISABLED: ffmpeg.exe must be in DinurdoJK/dependencies/".into();
             self.push_console_line(format!("^3{}", self.console_status));
             return;
         };

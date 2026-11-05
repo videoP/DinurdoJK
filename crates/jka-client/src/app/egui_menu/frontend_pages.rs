@@ -243,7 +243,7 @@ impl App {
                             FrontendPage::ChatLogs => "CHAT LOGS",
                             FrontendPage::DeveloperTools => "DEVELOPER TOOLS",
                             FrontendPage::AssetViewer => "ASSET VIEWER",
-                            FrontendPage::Pk3Manager => "PK3 MANAGER",
+                            FrontendPage::Pk3Manager => "PACKAGE MANAGER",
                             FrontendPage::Screenshots => "SCREENSHOTS",
                             FrontendPage::MapViewer => "MAP VIEWER",
                             FrontendPage::RenderStudio => "RENDER STUDIO",

@@ -3,9 +3,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-pub fn linear_color(rgb: [f32; 3]) -> [f32; 3] {
-    rgb.map(|c| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) })
-}
+pub use jka_render_core::color::linear_color;
 
 mod cull;
 mod procedural;
@@ -51,7 +49,7 @@ pub struct Settings {
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], transparency: 2304.0,
+        Self { fog_color: jka_render_core::color::UNDERWATER_FOG_COLOR, transparency: 2304.0,
             depth_darkening: 1.0, refraction: 0.1, caustics: 1.0, caustic_max_distance_m: 80.0, underwater_cull: 3.0,
             // The scissor is off by default: measured on a real map, a promoted
             // surface's bounds surround the camera, so there is no tight screen

@@ -212,7 +212,7 @@ impl App {
         let mut snapshot = UiSnapshot {
             jk2_mode: self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2(),
             studio_race: None,
-            frontend_main_scene: self.front_end && matches!(self.frontend_page,
+            frontend_main_scene: self.asset_mapping.is_none() && self.front_end && matches!(self.frontend_page,
                 crate::app::FrontendPage::Main | crate::app::FrontendPage::Play
                 | crate::app::FrontendPage::DeveloperTools),
             mode: self.overlay,
@@ -263,6 +263,7 @@ impl App {
             killfeed: self.killfeed_ui(),
             scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
+            asset_mapping: self.asset_mapping_ui(),
             demo_browser: if self.front_end && self.frontend_page == crate::app::FrontendPage::PlayDemo
                 && self.overlay == OverlayMode::Game { Some(self.native_demo_browser_ui()) } else { None },
             prediction_debug,

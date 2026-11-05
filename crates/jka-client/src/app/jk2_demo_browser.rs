@@ -76,9 +76,8 @@ fn has_demos(folder: &Path) -> bool {
     }))
 }
 
-/// Browse local JK2 base demos (`jk2_base/`) and mod demos (`jk2_<mod>/`, beside
-/// the base folder). Homepath is a separate writable overlay; retail demos
-/// remain under cdpath/<game>/.
+/// Browse JK2 base/ and its unprefixed sibling mod folders.
+/// CD fallback is read-only stock assets; demos there are still discoverable.
 pub(super) fn scan_folders(
     local_base: &Path, home_base: Option<&Path>, retail_root: Option<&Path>,
 ) -> Result<Vec<Folder>, String> {
@@ -86,7 +85,7 @@ pub(super) fn scan_folders(
     for (root, suffix) in [(Some(local_base), ""), (home_base, " (home)")] {
         let Some(root) = root else { continue };
         if folders.iter().any(|f: &Folder| f.path == root.join("demos")) { continue; }
-        let base_name = root.file_name().map_or_else(|| "jk2_base".to_owned(), |n| n.to_string_lossy().into_owned());
+        let base_name = root.file_name().map_or_else(|| "base".to_owned(), |n| n.to_string_lossy().into_owned());
         let local_demos = root.join("demos");
         if has_demos(&local_demos) {
             folders.push(Folder { label: format!("{base_name}/demos{suffix}"), path: local_demos });
@@ -95,9 +94,7 @@ pub(super) fn scan_folders(
             for mod_dir in fs::read_dir(parent).into_iter().flatten().flatten() {
                 if !mod_dir.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
                 let name = mod_dir.file_name().to_string_lossy().into_owned();
-                let is_mod_folder = name.get(..jka_assets::pk3::JK2_FOLDER_PREFIX.len())
-                    .is_some_and(|head| head.eq_ignore_ascii_case(jka_assets::pk3::JK2_FOLDER_PREFIX));
-                if !is_mod_folder || mod_dir.path() == root { continue; }
+                if name.eq_ignore_ascii_case("base") || mod_dir.path() == root { continue; }
                 let path = mod_dir.path().join("demos");
                 if has_demos(&path) && !folders.iter().any(|item| item.path == path) {
                     folders.push(Folder { label: format!("{name}/demos{suffix}"), path });
@@ -122,8 +119,8 @@ pub(super) fn scan_folders(
         }
     }
     folders.sort_by_key(|f| (
-        !f.label.eq_ignore_ascii_case("jk2_base/demos"),
-        !f.label.eq_ignore_ascii_case("jk2_base/demos (home)"),
+        !f.label.eq_ignore_ascii_case("base/demos"),
+        !f.label.eq_ignore_ascii_case("base/demos (home)"),
         !f.label.eq_ignore_ascii_case("base/demos"),
         f.label.to_ascii_lowercase(),
     ));
@@ -172,48 +169,26 @@ mod tests {
         assert!(!is_jk2_demo(Path::new("three.dm_26")));
     }
     #[test]
-    fn scanner_only_uses_standard_demos_folders() {
+    fn scanner_uses_unprefixed_mod_names_and_distinct_roots() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("dinurdo-jk2-demos-{}-{nonce}", std::process::id()));
-        let base = root.join("base");
-        let modded = root.join("custommod");
-        fs::create_dir_all(base.join("demos")).unwrap();
-        fs::create_dir_all(base.join("jk2demos")).unwrap();
-        fs::create_dir_all(modded.join("demos")).unwrap();
-        fs::write(base.join("demos").join("official.dm_15"), b"demo").unwrap();
-        fs::write(base.join("jk2demos").join("nonstandard.dm_16"), b"demo").unwrap();
-        fs::write(modded.join("demos").join("modded.dm_16"), b"demo").unwrap();
-        let result = scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap();
-        assert_eq!(result.iter().map(|folder| folder.label.as_str()).collect::<Vec<_>>(),
-            vec!["base/demos", "custommod/demos"]);
-        assert!(result.iter().all(|folder| folder.path.file_name().and_then(|name| name.to_str()) == Some("demos")));
-        assert_eq!(scan_recordings(&base.join("demos")).unwrap().len(), 1);
-        // No process restart is necessary: the next scan reads the current
-        // directory contents rather than reusing the previous list.
-        fs::write(base.join("demos").join("new.dm_16"), b"demo").unwrap();
-        assert_eq!(scan_recordings(&base.join("demos")).unwrap().len(), 2);
-        fs::create_dir_all(root.join("newmod").join("demos")).unwrap();
-        fs::write(root.join("newmod").join("demos").join("newmod.dm_15"), b"demo").unwrap();
-        assert_eq!(scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap().len(), 3);
-        fs::create_dir_all(root.join("jk2_base/demos")).unwrap();
-        fs::write(root.join("jk2_base/demos/local.dm_15"), b"demo").unwrap();
-        fs::create_dir_all(root.join("jk2_newjk2mod/demos")).unwrap();
-        fs::write(root.join("jk2_newjk2mod/demos/mod.dm_16"), b"demo").unwrap();
-        // JK2 mod demos live in jk2_<modname> beside jk2_base, never under GameData/jk2/.
-        fs::create_dir_all(root.join("jk2/oldmod/demos")).unwrap();
-        fs::write(root.join("jk2/oldmod/demos/old.dm_15"), b"demo").unwrap();
-        let folders = scan_folders(&root.join("jk2_base"), None, Some(&root)).unwrap();
-        assert_eq!(folders.len(), 5);
-        assert_eq!(folders[0].label, "jk2_base/demos");
-        assert!(folders.iter().any(|f| f.label == "jk2_newjk2mod/demos"));
-        assert!(!folders.iter().any(|f| f.label.contains("oldmod")));
-        let home = root.join("home/jk2_modx/demos");
-        fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("home.dm_16"), b"demo").unwrap();
-        let folders = scan_folders(&root.join("jk2_base"), Some(&root.join("home/jk2_base")), Some(&root)).unwrap();
-        assert!(folders.iter().any(|f| f.label == "jk2_modx/demos (home)"));
-        fs::remove_dir_all(&root).unwrap();
+        let install = std::env::temp_dir().join(format!("dinurdo-jk2-demos-{}-{nonce}", std::process::id()));
+        let local = install.join("JK2 GameData");
+        let cd = install.join("retail-jk2");
+        let home = install.join("home/JK2 GameData");
+        for folder in [local.join("base/demos"), local.join("jk2/demos"),
+            home.join("base/demos"), home.join("jka_mod/demos"), cd.join("base/demos"),
+            install.join("JKA GameData/jk2/demos")] {
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(folder.join("recording.dm_15"), b"demo").unwrap();
+        }
+        let folders = scan_folders(&local.join("base"), Some(&home.join("base")), Some(&cd)).unwrap();
+        assert!(folders.iter().any(|folder| folder.label == "base/demos"));
+        assert!(folders.iter().any(|folder| folder.label == "jk2/demos"));
+        assert!(folders.iter().any(|folder| folder.label == "jka_mod/demos (home)"));
+        assert!(folders.iter().all(|folder| !folder.path.starts_with(install.join("JKA GameData"))));
+        assert_eq!(scan_recordings(&local.join("base/demos")).unwrap().len(), 1);
+        fs::remove_dir_all(install).unwrap();
     }
     #[test]
     fn reset_invalidates_pending_results() {

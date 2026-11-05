@@ -9,7 +9,8 @@ impl App {
             "EXTENSIONS / RHAI",
             "Edit scripts directly in-game. Save & Reload recompiles on the extension worker; external file edits are detected automatically.",
         );
-        ui.label(format!("Local extensions and preferences: {}", self.extensions.root().display()));
+        ui.label(format!("Loose extension scripts: {}", self.extensions.root().display()));
+        ui.label(format!("Enabled/disabled preferences: {}", jka_assets::pk3::dinurdojk_directory(&self.base).join("extensions.json").display()));
         ui.label("Loads extensions/ from the active game and base, including PK3s, using normal asset precedence.");
         ui.add_space(8.0);
         ui.horizontal(|ui| {

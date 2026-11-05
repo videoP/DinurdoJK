@@ -1195,7 +1195,7 @@ app_cvars! {
     }
 
     APP_R_COLLISION_WORLD {
-        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 flat shaded compiled visible BSP surfaces (not the Steam Audio collision mesh), flat team-colored player bodies and gunmetal weapons/hilts, simplified untextured saber blades. No world lightmaps or authored material passes; normal HUD unchanged. Source-.map preview maps have no compiled competitive mesh. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with flat shading, original PVS/area/frustum culling and one indexed multidraw. No collision/acoustic mesh, texture/lightmap samples, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::collision_world_only()).to_string()),
             |app, value| App::cvar_set_collision_world(app, APP_R_COLLISION_WORLD.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_collision_world, Some(|name, value| {
@@ -1211,12 +1211,8 @@ app_cvars! {
                     _ => return Err(format!("{name}: expected 0 or 1")),
                 };
                 crate::renderer::set_collision_world_only(enabled);
-                if enabled {
-                    // No map-load work is scheduled while the cvar is off.
-                    self.ensure_collision_world_mesh();
-                }
-                self.console_status = format!("COLLISION WORLD: {}", if enabled { "ON" } else { "OFF" });
-                self.push_console_line(format!("[COLLISION WORLD] {} (full player rendering retained)", if enabled { "ON" } else { "OFF" }));
+                self.console_status = format!("NATIVE FLAT WORLD: {}", if enabled { "ON" } else { "OFF" });
+                self.push_console_line(format!("[NATIVE FLAT WORLD] {} (original BSP geometry/PVS/multidraw, no collision mesh)", if enabled { "ON" } else { "OFF" }));
                 Ok(())
             }
         }]

@@ -2352,6 +2352,7 @@ pub(in crate::renderer) fn build_world(
     (
         WorldGpu {
             collision_mesh: None,
+            native_flat_draw: None,
             remap_index_source: Arc::clone(&auto4_source_indices),
             remap_asset_source,
             remap_asset_hash,

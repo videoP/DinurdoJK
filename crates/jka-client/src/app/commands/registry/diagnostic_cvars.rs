@@ -6,11 +6,11 @@ use crate::{
     },
 };
 pub(super) const CVARS: &[CvarDef<App>] = &[
-CvarDef::new("cg_remoteSmoothing", "0", "0..3", "Live remote player visual A/B: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded velocity extrapolation; 3 tangent-limited Hermite + extrapolation. No prediction or protocol changes; session only.", CvarType::Int { min: 0, max: 3 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
+CvarDef::new("cg_remoteSmoothing", "0", "0..4", "Live remote players AND spectator-follow POV: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded extrapolation; 3 Hermite + extrapolation; 4 jaMME-inspired commandTime-aware Hermite (fallback linear). Visual-only, session-only.", CvarType::Int { min: 0, max: 4 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_mode(mode as u8);
     if let Some(session) = app.game_session.as_mut() { session.remote_smoothing.sync_from_cvar(); }
-    app.push_console_line(format!("^3cg_remoteSmoothing:^7 mode {mode} (0=original, 1=buffer+hold, 2=buffer+extrap, 3=buffer+Hermite+extrap). Live only; demo playback unchanged."));
+    app.push_console_line(format!("^3cg_remoteSmoothing:^7 mode {mode} (0=original, 1=buffer+hold, 2=buffer+extrap, 3=buffer+Hermite+extrap, 4=jaMME-inspired commandTime tangents). Includes live spectator follow; recorded demos unchanged."));
     Ok(())
 }),
 CvarDef::new("cg_remoteBufferMs", "50", "0..100", "Extra visual-only snapshot interpolation delay (ms), 0 for low latency; used when cg_remoteBufferAuto=0. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::buffer_ms() as i32), |_app, value| {
@@ -23,7 +23,7 @@ CvarDef::new("cg_remoteBufferAuto", "0", "0|1", "0 fixed cg_remoteBufferMs; 1 ad
     crate::cgame::remote_smoothing::set_buffer_auto(enabled);
     Ok(())
 }),
-CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrapolation beyond the latest remote snapshot for smoothing modes 2/3. 0 disables extrapolation. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::extrap_max_ms() as i32), |_app, value| {
+CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrapolation beyond the latest remote snapshot for smoothing modes 2/3/4. 0 disables extrapolation. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::extrap_max_ms() as i32), |_app, value| {
     let CvarValue::Int(ms) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_extrap_max_ms(ms as u32);
     Ok(())

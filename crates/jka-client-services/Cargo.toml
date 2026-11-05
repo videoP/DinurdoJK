@@ -1,0 +1,21 @@
+[package]
+name = "jka-client-services"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "tga", "hdr"] }
+encoding_rs = "=0.8.41"
+jka-assets = { path = "../jka-assets" }
+jka-movement = { path = "../jka-movement" }
+jka-protocol = { path = "../jka-protocol" }
+jka-render-core = { path = "../jka-render-core" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+taffy = { version = "=0.15.0", default-features = false, features = ["std", "flexbox", "taffy_tree"] }
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
+whatlang = "=0.18.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_UI_ColorSystem", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_WindowsProgramming", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_Security"] }

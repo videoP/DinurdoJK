@@ -10,12 +10,12 @@ type CvarDef = crate::console::cvars::CvarDef<App>;
 app_cvars! {
     APP_FS_BASEPATH {
         runtime: CvarDef::new(
-            "fs_basepath", "", "read-only installation root",
-            "Resolved directory containing the executable-relative base/ folder. --base overrides detection; not a writable cvar.",
-            CvarType::String, CvarFlags::FIXED, LatchScope::None,
-            |app| CvarValue::String(app.base.parent().unwrap_or(&app.base).display().to_string()),
-            |_, _| Err("fs_basepath is read-only; use --base to override base/ detection".into())
-        ).with_text_setter(|_, _, _| Err("fs_basepath is read-only; use --base to override base/ detection".into()), None),
+            "fs_basepath", "", "JKA GameData root",
+            "JKA installation root containing base/ and mod folders. Defaults to JKA GameData/. Restart required; --base can override at launch.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.fs_roots.basepath.as_ref().map_or_else(|| app.base.parent().unwrap_or(&app.base).display().to_string(), |p| p.display().to_string())),
+            |app, value| App::set_fs_basepath(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_basepath(app, value), None),
         config: CvarBinding::NONE,
         implementations: []
     }
@@ -32,10 +32,10 @@ app_cvars! {
     }
     APP_FS_JK2BASEPATH {
         runtime: CvarDef::new(
-            "fs_jk2basepath", "", "local JK2 base directory",
-            "JK2's independent base directory, default GameData/jk2_base (JK2 mods are jk2_<mod> folders beside it). Overrides fs_jk2cdpath/base; never mounted in JKA. Restart required. Empty restores default.",
+            "fs_jk2basepath", "", "JK2 GameData root",
+            "JK2 installation root containing base/ and unprefixed mod folders; defaults to JK2 GameData/. Never mounted in JKA. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |app| CvarValue::String(jka_assets::pk3::jk2_base_directory(&app.base, &app.fs_roots).display().to_string()),
+            |app| CvarValue::String(jka_assets::pk3::jk2_root_directory(&app.base, &app.fs_roots).display().to_string()),
             |app, value| App::set_fs_jk2basepath(app, &value.to_string())
         ).with_text_setter(|app, _, value| App::set_fs_jk2basepath(app, value), None),
         config: CvarBinding::NONE,
@@ -55,7 +55,7 @@ app_cvars! {
     APP_FS_HOMEPATH {
         runtime: CvarDef::new(
             "fs_homepath", "", "writable/readable GameData root",
-            "Optional high-priority writable/readable root, empty uses the executable's installation root. Restart required.",
+            "Optional writable overlay parent. Separate JKA GameData/ and JK2 GameData/ directories are appended. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_homepath(app, &value.to_string())
@@ -65,8 +65,8 @@ app_cvars! {
     }
     APP_FS_FORCEGAME {
         runtime: CvarDef::new(
-            "fs_forcegame", "", "game folder name",
-            "Always-on highest-priority asset layer, overriding server fs_game. Also determines config/demo/screenshot output subdirectory. Restart required.",
+            "fs_forcegame", "", "client-owned override folder",
+            "Optional highest-priority asset layer DinurdoJK/<name>/, above DinurdoJK/shared. Does not change game directories or write paths. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.forcegame.clone().unwrap_or_default()),
             |app, value| App::set_fs_forcegame(app, &value.to_string())
@@ -77,6 +77,12 @@ app_cvars! {
 }
 
 impl App {
+    fn set_fs_basepath(&mut self, value: &str) -> Result<(), String> {
+        let mut proposed = self.fs_roots.clone();
+        proposed.basepath = crate::filesystem_paths::parse_root(&self.base, value)?;
+        self.store_fs_roots(proposed)
+    }
+
     fn store_fs_roots(&mut self, proposed: jka_assets::pk3::FilesystemRoots) -> Result<(), String> {
         // Persist first. If the write fails, do not claim the setting changed.
         crate::filesystem_paths::save(&self.base, &proposed)?;

@@ -91,6 +91,15 @@ impl PlayerState {
     pub fn field_f32(&self, name: &str) -> Option<f32> {
         self.field_bits(name).map(f32::from_bits)
     }
+
+    /// `base[0..3]` as one vector, e.g. `origin` or `velocity`.
+    pub fn field_vec3(&self, base: &str) -> Option<[f32; 3]> {
+        Some([
+            self.field_f32(&format!("{base}[0]"))?,
+            self.field_f32(&format!("{base}[1]"))?,
+            self.field_f32(&format!("{base}[2]"))?,
+        ])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

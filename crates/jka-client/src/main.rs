@@ -30,33 +30,28 @@ macro_rules! rverbose {
 
 mod app;
 mod asset_jobs;
-mod audio;
+use jka_audio::{audio, eal, steam_audio};
 mod emotes;
-mod eal;
-mod eal_native;
-#[cfg(test)]
-mod eal_openal;
-mod eal_worker;
-mod camera;
+use jka_render_core::camera;
+use jka_client_services::{
+    chat_translation, clipboard, credential_store, display_gamma, filesystem_paths, frontend_cache_color,
+    jk2_diagnostics, neon_menu, protocol_link, pure, screenshot, server_browser, startup_timeline, vgs, vote,
+};
 mod cgame;
 mod global_cosmetics;
 mod profile_wire;
 mod chat_log;
-mod chat_translation;
-mod clipboard;
 mod cloud_noise;
 mod cloud_wind;
 mod color_grading;
 mod gamma;
-mod frontend_cache_color;
-mod display_gamma;
 mod color_lut;
 mod config;
 #[cfg(test)]
 mod cvar_compatibility;
 mod console;
 mod crash;
-mod credential_store;
+mod dependency_dll;
 mod download;
 mod updater;
 mod entity_graph;
@@ -77,54 +72,34 @@ mod materials;
 mod media_mp4;
 mod model_frame_log;
 mod net;
-mod neon_menu;
 mod palette;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;
-mod river_capture;
-mod river_foam;
-mod river_gpu;
-mod river_grid_mesh;
-mod river_material;
-mod river_runtime;
-mod river_authoring;
-mod river_discharge;
-mod river_settings;
-mod river_composite;
-mod river_surface;
-mod river_slw;
-mod river_ocean;
-mod river_map;
-mod river_water_info;
-mod river_water_info_capture;
+use jka_river::{river_authoring, river_runtime, river_settings, river_slw, river_surface};
+// The remaining river modules are reached directly only by the GPU port tests.
+#[cfg(test)]
+use jka_river::{
+    river_capture, river_composite, river_discharge, river_foam, river_gpu, river_grid_mesh, river_map,
+    river_material, river_ocean, river_water_info, river_water_info_capture,
+};
 #[cfg(test)]
 mod river_port_tests;
 mod blue_water_environment;
 mod player;
-mod protocol_link;
 mod pipeline_cache;
 mod pipeline_jobs;
-mod pure;
 mod renderer;
 mod runtime;
 mod scene;
-mod screenshot;
-mod filesystem_paths;
-mod jk2_diagnostics;
 mod streamer;
-mod server_browser;
 mod speedometer;
 mod surface_deformation;
-mod steam_audio;
 mod strafehelper;
 mod strafe_trail;
 mod thread_activity;
-mod startup_timeline;
 mod startup_console;
 mod ui;
-mod vgs;
-mod vote;
 mod weather;
 mod glass;
 mod water_wetness;
@@ -223,6 +198,7 @@ fn spawn_terminal_command_reader(proxy: EventLoopProxy<UserEvent>) {
 
 struct Options {
     base: PathBuf,
+    base_overridden: bool,
     source: scene::MapSource,
     launch_map: bool,
     game: Option<String>,
@@ -242,6 +218,7 @@ impl Options {
     fn parse() -> Result<Self, String> {
         let mut options = Self {
             base: filesystem_paths::default_base_directory()?,
+            base_overridden: false,
             source: scene::MapSource::Bsp("mp/ffa3".into()),
             launch_map: false,
             game: None,
@@ -254,7 +231,10 @@ impl Options {
         let mut args = std::env::args().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
-                "--base" => options.base = args.next().ok_or("--base needs a folder")?.into(),
+                "--base" => {
+                    options.base = args.next().ok_or("--base needs a folder")?.into();
+                    options.base_overridden = true;
+                },
                 "--map" | "+devmap" => {
                     let map = args.next().ok_or("map name required")?;
                     options.source = scene::MapSource::from_map_argument(&map)?;
@@ -355,6 +335,18 @@ fn is_demo_path(path: &std::path::Path) -> bool {
 }
 
 fn main() -> std::process::ExitCode {
+    // Crates split out of the client print through the client logger, exactly
+    // as their println!/eprintln! did in-crate; install before anything runs.
+    fn write_split_crate_line(error: bool, args: std::fmt::Arguments<'_>) {
+        logging::write_line(if error { logging::Level::Error } else { logging::Level::Info }, args)
+    }
+    jka_render_core::log::install(write_split_crate_line);
+    jka_audio::host::install(jka_audio::host::Host {
+        write_line: write_split_crate_line,
+        developer_enabled: logging::developer_enabled,
+        read_emote_asset: emotes::read_asset,
+        favorite_emote_asset: emotes::favorite_asset,
+    });
     crate::startup_timeline::start();
     if let Some(code) = jk2_diagnostics::cli_entry() {
         return code;
@@ -375,6 +367,14 @@ fn main() -> std::process::ExitCode {
         Ok(true) => return std::process::ExitCode::SUCCESS,
         Ok(false) => {},
         Err(e) => std::eprintln!("Pending update could not start: {e}"),
+    }
+
+    // phonon.dll is delay-loaded on MSVC. Load our bundled copy by its
+    // absolute path before any Steam Audio FFI; never rely on the process PATH.
+    #[cfg(windows)]
+    if let Err(error) = dependency_dll::preload("phonon.dll") {
+        std::eprintln!("Steam Audio dependency: {error}");
+        return std::process::ExitCode::FAILURE;
     }
 
     crate::startup_console::prepare_own_console();
@@ -408,13 +408,47 @@ fn main() -> std::process::ExitCode {
 
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::GammaReady);
 
-    let options = match Options::parse() {
+    let mut options = match Options::parse() {
         Ok(options) => options,
         Err(error) => {
             eprintln!("{error}");
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // Install game roots before resolving the initial fs_game or prewarming assets.
+    // --base remains an explicit JKA base-directory override; otherwise
+    // fs_basepath selects the installation root containing base/.
+    let mut fs_roots = filesystem_paths::load(&options.base);
+    if let Err(error) = filesystem_paths::apply_startup_commands(
+        &options.base, &mut fs_roots, &options.startup_commands
+    ) {
+        eprintln!("Invalid filesystem startup setting: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    if !options.base_overridden {
+        if let Some(root) = &fs_roots.basepath { options.base = root.join("base"); }
+    }
+    fs_roots.client_install = Some(match filesystem_paths::installation_directory() {
+        Ok(root) => root,
+        Err(error) => { eprintln!("Cannot locate executable root: {error}"); return std::process::ExitCode::FAILURE; }
+    });
+    // Prevent a configured JK2 root from overlapping JKA's mod namespace.
+    // Canonicalize existing roots so junction/symlink aliases cannot defeat it.
+    let jka_root = options.base.parent().unwrap_or(&options.base).to_path_buf();
+    let jk2_root = jka_assets::pk3::jk2_root_directory(&options.base, &fs_roots);
+    let normalized = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let jka_cmp = normalized(&jka_root);
+    let jk2_cmp = normalized(&jk2_root);
+    if jka_cmp.starts_with(&jk2_cmp) || jk2_cmp.starts_with(&jka_cmp) {
+        eprintln!("[FILESYSTEM] JK2 and JKA roots must be separate: {} / {}", jka_root.display(), jk2_root.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    let client_root = normalized(&fs_roots.client_install.as_ref().expect("set above").join("DinurdoJK"));
+    if [jka_cmp, jk2_cmp].iter().any(|game| game.starts_with(&client_root) || client_root.starts_with(game)) {
+        eprintln!("[FILESYSTEM] A game root overlaps DinurdoJK's private directory; choose independent roots");
+        return std::process::ExitCode::FAILURE;
+    }
 
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::OptionsReady);
 
@@ -449,27 +483,12 @@ fn main() -> std::process::ExitCode {
     // the window and GPU device are being created.
     grass::prewarm_noise();
 
-    // Bootstrap filesystem roots before any worker indexes or reads assets.
-    // CLI +set fs_* overrides the small exe-local paths file on this run.
-    let mut fs_roots = filesystem_paths::load(&options.base);
-    if let Err(error) = filesystem_paths::apply_startup_commands(
-        &options.base, &mut fs_roots, &options.startup_commands
-    ) {
-        eprintln!("Invalid filesystem startup setting: {error}");
-        return std::process::ExitCode::FAILURE;
-    }
+    // Configure once for renderer/map workers. No legacy folder migration.
     jka_assets::pk3::configure_filesystem_roots(&options.base, fs_roots.clone());
-    // Before anything creates DinurdoJK/cache or DinurdoJK/render-studio.
-    for line in jka_assets::pk3::migrate_legacy_dinurdojk_data(&options.base) {
-        println!("[DINURDOJK DATA] moved {line}");
-    }
 
     // A missing retail installation is not fatal (2D menu and tools still work).
     // Explain the fix once on startup instead of flooding the console with
     // secondary missing-map/texture errors. fs_cdpath points to GameData, NOT base/.
-    let asset_dirs = jka_assets::pk3::filesystem_search_dirs(
-        &options.base, game_dir.as_deref(), &fs_roots,
-    );
     if let Some(cdpath) = &fs_roots.cdpath {
         if !cdpath.join("base").is_dir() {
             eprintln!(
@@ -478,9 +497,9 @@ fn main() -> std::process::ExitCode {
             );
         }
     }
-    if !asset_dirs.iter().any(|dir| (0..=3).any(|n| dir.join(format!("assets{n}.pk3")).is_file())) {
+    if !app::asset_mapping::jka_assets_present(&options.base, &fs_roots) {
         eprintln!(
-            "[FILESYSTEM] No retail JKA assets0.pk3..assets3.pk3 found in mounted base folders. Set fs_cdpath to the GameData directory containing base/assets0.pk3, then restart. The 2D menu remains available."
+            "[FILESYSTEM] Missing one or more JKA retail archives (assets0.pk3..assets3.pk3) in JKA base layers. Opening Asset Mapping; configure fs_basepath or fs_cdpath, then Save & Restart."
         );
     }
 

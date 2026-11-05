@@ -69,7 +69,7 @@ impl QualityPreset {
                     "r_igpuMemoryAB" => *value = "1", // Depth16Unorm (latched)
                     "r_rgb565" => *value = "1", // native RGB565 swapchain when supported (latched)
                     "r_competitiveAB" => *value = "5", // retained for ordinary renderer A/B; the flat-world path bypasses authored stages
-                    "r_collisionWorld" => *value = "1", // position-only compiled solid surfaces, independent of audio
+                    "r_collisionWorld" => *value = "1", // native BSP flat-shaded multidraw, independent of audio
                     "r_fragmentShaderMode" => *value = "5", // current measured compact-world family
                     "r_drawfog" => *value = "0", // avoid Legacy 2 FP16/post on fog maps
                     "r_fullbright" => *value = "0", // BSP baked global lightmaps, not forced unlit

@@ -90,6 +90,14 @@ impl GameSession {
             prediction,
             input,
         )?;
+        // PMF_FOLLOW is a server-owned camera, not a predicted local player.
+        // The remote entity smoother has already sampled this frame's visual
+        // time. Apply that SAME clock to the followed player's snapshot PS.
+        // Only origin, angles and velocity of this render copy are touched;
+        // event, HUD, prediction and protocol state keep their original clock.
+        if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+            self.remote_smoothing.apply_follow(&mut ps, std::time::Instant::now(), teleported);
+        }
         // Prediction failures fall back to snapshots, which can themselves
         // contain NaNs. Keep those out of the camera, models and audio too.
         let fallback = self.current_snapshot.as_ref()
@@ -376,11 +384,7 @@ pub(in crate::app) fn playerstate_vec3(
     state: &jka_protocol::server::PlayerState,
     base: &str,
 ) -> Option<[f32; 3]> {
-    Some([
-        state.field_f32(&format!("{base}[0]"))?,
-        state.field_f32(&format!("{base}[1]"))?,
-        state.field_f32(&format!("{base}[2]"))?,
-    ])
+    state.field_vec3(base)
 }
 
 /// TaystJK `CG_IsWalkingAnim` for spectator/demo strafehelper command

@@ -96,7 +96,7 @@ use view::{
     WP_BRYAR_PISTOL, WP_SABER,
 };
 pub use view::{Ghoul2PresentationView, ViewerAnimDebug};
-pub use studio_camera::{SABER_HILT_ANCHOR, SABER_TIP_ANCHOR};
+pub use studio_camera::SABER_TIP_ANCHOR;
 
 // Shared JKA player visual presentation for snapshot, followed, and local players.
 //

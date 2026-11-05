@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 const ACTIVATE_DELAY: Duration = Duration::from_millis(170);
 
 const PLAY: [&str; 3] = ["JOIN A GAME", "SOLO GAME", "PLAY DEMO"];
-const DEV: [&str; 4] = ["ASSET VIEWER", "RENDER STUDIO", "MAP VIEWER", "PK3 MANAGER"];
+const DEV: [&str; 4] = ["ASSET VIEWER", "RENDER STUDIO", "MAP VIEWER", "PACKAGE MANAGER"];
 
 impl App {
     pub(in crate::app::egui_menu) fn draw_neon_frontend_submenu(

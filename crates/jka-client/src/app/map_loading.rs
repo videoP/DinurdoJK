@@ -606,28 +606,9 @@ impl App {
         self.request_map_internal(source, MapLoadPurpose::StudioDemo);
     }
 
-    /// Explicitly request the optional collision render world. This is never
-    /// called on the off path and performs no BSP IO or polygon work itself.
-    /// The renderer reuses the active Steam Audio mesh, or starts a worker to
-    /// read the BSP and reconstruct brush sides only after this request.
-    pub(in crate::app) fn ensure_collision_world_mesh(&self) {
-        if !crate::renderer::collision_world_only()
-            || self.loading.is_some()
-            || self.render.is_none()
-        {
-            return;
-        }
-        let scene::MapSource::Bsp(_) = &self.initial_source else { return; };
-        let Some(cache) = self.prepared_map_cache.as_ref().filter(|cache|
-            cache.label == self.initial_source.label()) else { return; };
-        self.render_command(RenderCommand::BuildCollisionWorld {
-            map_hash: cache.map.map_hash,
-            root: self.base.clone(),
-            game: self.game.clone(),
-            source: self.initial_source.clone(),
-            allow_asset_overrides: self.video.allow_asset_overrides,
-        });
-    }
+    /// Native flat BSP rendering requires no map job: the normal world mesh
+    /// is already loaded and its current PVS/index ranges are reused directly.
+    pub(in crate::app) fn ensure_collision_world_mesh(&self) {}
 
     /// Client physics only needs the BSP's static triangle mesh, so turning it
     /// on for a map that was prepared without one builds just that mesh on a

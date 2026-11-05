@@ -56,7 +56,7 @@ The directories used during the glass work were:
 
 ```text
 glass-preview-base/                  test cfg, assets, cache, screenshots, renderperf
-glass-preview-run/                   copied executable, phonon.dll, latest.log
+glass-preview-run/                   copied executable, DinurdoJK/dependencies/phonon.dll, latest.log
 artifacts/glass-investigation/       retained images, stdout logs, test/perf reports
 ```
 
@@ -82,7 +82,9 @@ foreach ($name in @('assets0.pk3', 'assets1.pk3', 'assets2.pk3', 'assets3.pk3'))
 
 cargo build -p DinurdoJK --quiet
 Copy-Item -LiteralPath 'target/debug/DinurdoJK.exe' -Destination $testRun
-Copy-Item -LiteralPath 'target/debug/phonon.dll' -Destination $testRun
+$testDependencies = Join-Path $testRun 'DinurdoJK/dependencies'
+New-Item -ItemType Directory -Force -Path $testDependencies | Out-Null
+Copy-Item -LiteralPath 'target/debug/DinurdoJK/dependencies/phonon.dll' -Destination $testDependencies
 ```
 
 The PK3s are read by the client. A hard link shares the original file's contents:

@@ -493,6 +493,9 @@ impl WorldGpu {
 
 pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) collision_mesh: Option<crate::renderer::collision_world::CollisionGpuMesh>,
+    /// Shitter reuses the native BSP geometry and its current PVS selection.
+    /// Only this compact draw-argument stream is lazily allocated.
+    pub(in crate::renderer) native_flat_draw: Option<crate::renderer::collision_world::NativeFlatDraw>,
     /// Immutable index source retained for material-only AUTO4 recipe rebinding.
     pub(in crate::renderer) remap_index_source: Arc<Vec<u32>>,
     /// Remap-only reuse key; never consulted by frame/draw code.

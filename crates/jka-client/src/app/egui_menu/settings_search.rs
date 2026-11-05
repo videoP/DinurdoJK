@@ -55,7 +55,7 @@ fn category(item: SearchItem) -> &'static str {
             SETUP_TAB_INTERFACE => "Interface",
             SETUP_TAB_EXTENSIONS => "Extensions",
             SETUP_TAB_STREAMER => "Streamer mode",
-            SETUP_TAB_PK3 => "PK3 Manager",
+            SETUP_TAB_PK3 => "Package Manager",
             SETUP_TAB_MOD => "Mod",
             _ => "Video",
         }

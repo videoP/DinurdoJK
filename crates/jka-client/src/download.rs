@@ -64,8 +64,8 @@ pub fn referenced_downloads(
     // PK3 autodownloads follow the writable root, but remain in their server
     // game directory (NOT fs_forcegame). No download ever lands in fs_cdpath.
     let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
-    let download_root = roots.homepath.as_deref().unwrap_or(game_data);
-    // The server's mod name (a reserved name is stored in an escaped folder).
+    let download_root = jka_assets::pk3::game_home_root(&roots, false).unwrap_or_else(|| game_data.to_path_buf());
+    // The server's mod name is its literal directory name (no prefixes).
     let active_name = jka_assets::pk3::fs_game_name(active_game_dir);
     let active_name = active_name.as_str();
 
@@ -95,7 +95,7 @@ pub fn referenced_downloads(
             continue;
         }
 
-        let game_dir = download_root.join(jka_assets::pk3::jka_game_folder(game));
+        let game_dir = download_root.join(game);
         let downloaded = game_dir.join(format!("dl_{pak}.pk3"));
         let local_path = if downloaded.exists() {
             game_dir.join(format!("dl_{pak}.{:08x}.pk3", checksum as u32))

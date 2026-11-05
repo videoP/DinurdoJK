@@ -844,7 +844,7 @@ impl App {
                     let actor_result = (|| -> Result<Vec<DynamicModelSurface>, String> {
                         let mut actor_info=info.clone();
                         // Each track starts from the profile, not the lead actor's overrides.
-                        self.studio_profile_sabers().apply(&mut actor_info);
+                        super::render_studio::apply_studio_sabers(&self.studio_profile_sabers(), &mut actor_info);
                         self.render_studio.apply_actor_sabers(lane,&mut actor_info);
                         let staged=ClientInfo::solo_model(&model);
                         actor_info.model_name=staged.model_name;

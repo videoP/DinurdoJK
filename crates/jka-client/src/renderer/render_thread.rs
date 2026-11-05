@@ -361,7 +361,7 @@ impl RenderThread {
             RendererBackend::Vulkan => wgpu::Backends::VULKAN,
             RendererBackend::Dx12 => wgpu::Backends::DX12,
         };
-        // DX12 prefers the DXC runtime shipped beside DinurdoJK.exe (loaded by
+        // DX12 prefers the DXC runtime in DinurdoJK/dependencies (loaded by
         // absolute path so no other dxcompiler.dll on the system can shadow it).
         // If it is missing or fails to initialise (seen: LoadLibrary error 1114
         // on an Intel iGPU PC), wgpu drops the whole DX12 backend and surface
@@ -372,7 +372,7 @@ impl RenderThread {
             .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
         let dxc_path = exe_dir
             .as_ref()
-            .map(|dir| dir.join("dxcompiler.dll"))
+            .map(|dir| dir.join("DinurdoJK").join("dependencies").join("dxcompiler.dll"))
             .filter(|path| path.is_file() && path.with_file_name("dxil.dll").is_file());
         if backend == RendererBackend::Dx12 {
             // wgpu has no DX12 pipeline cache and DXC takes ~120 ms per large
@@ -384,7 +384,7 @@ impl RenderThread {
                 },
                 None => {
                     eprintln!(
-                        "[GPU] DX12: dxcompiler.dll/dxil.dll not beside DinurdoJK.exe; using the Windows FXC shader compiler"
+                        "[GPU] DX12: dxcompiler.dll/dxil.dll missing in DinurdoJK/dependencies/; using the Windows FXC shader compiler"
                     );
                     wgpu::Dx12Compiler::Fxc
                 }

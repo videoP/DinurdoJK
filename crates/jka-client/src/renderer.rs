@@ -33,7 +33,7 @@ fn igpu_ab_model_upload(queue: &wgpu::Queue, buffer: &wgpu::Buffer, bytes: &[u8]
     queue.write_buffer(buffer, 0, bytes);
 }
 
-// Session-only A/B: use RBSP solid brush/patch collision instead of authored world.
+// Session-only A/B: flat-shaded native BSP geometry (legacy cvar name).
 // Atomic allows a live console toggle without a frame-wide settings rebuild.
 static COLLISION_WORLD_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

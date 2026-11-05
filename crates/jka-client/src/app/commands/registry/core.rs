@@ -320,7 +320,7 @@ commands! {
         self.push_console_line(format!("^2FS:^7 basepath = {}", self.base.parent().unwrap_or(&self.base).display()));
         self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(portable)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 cdpath = {}", effective.cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
-        self.push_console_line(format!("^2FS:^7 jk2basepath = {} (local JK2 base; not mounted in JKA)", jka_assets::pk3::jk2_base_directory(&self.base, &effective).display()));
+        self.push_console_line(format!("^2FS:^7 jk2basepath = {} (JK2 root containing base/)", jka_assets::pk3::jk2_root_directory(&self.base, &effective).display()));
         self.push_console_line(format!("^2FS:^7 jk2cdpath = {} (JK2 retail fallback; not mounted in JKA)", effective.jk2cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
         self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));

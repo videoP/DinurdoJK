@@ -12,6 +12,17 @@ const LATEST: &str = "https://api.github.com/repos/videop/DinurdoJK/releases/lat
 const MAX_DOWNLOAD: u64 = 1024 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 const MAX_MANIFEST: u64 = 16 * 1024;
+// Release assets are published with plain basenames but installed under
+// DinurdoJK/dependencies/. Keep this explicit list: never accept arbitrary
+// signed subpaths or filesystem traversal.
+const DEPENDENCY_RELEASE_FILES: &[&str] = &[
+    "phonon.dll", "OpenALSoft.x86_64.dll", "nvngx_dlss.dll",
+    "dxcompiler.dll", "dxil.dll", "ffmpeg.exe",
+    "OpenAL-Soft-LGPL-2.0.txt", "EalMan-LGPL-2.1.txt",
+    "NVIDIA-DLSS-SDK-LICENSE.txt", "Bevy-Solari-MIT.txt",
+    "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt",
+];
+
 const MANIFEST_NAME: &str = "release-manifest.json";
 const SIGNATURE_NAME: &str = "release-manifest.sig";
 // The build must supply only the PUBLIC key. Never ship or embed the private key.
@@ -134,16 +145,18 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     if manifest.format != 2 || stable_version(&manifest.tag).is_none() {
         return Err("unsupported signed per-file release manifest format or tag".into());
     }
-    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > 17 {
+    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > 18 {
         return Err("signed file allowlist must contain DinurdoJK.exe".into());
     }
     let mut total = 0u64;
     for (name, info) in &manifest.files {
-        if !matches!(name.as_str(), "DinurdoJK.exe" | "phonon.dll" | "OpenALSoft.x86_64.dll" | "OpenAL-Soft-LGPL-2.0.txt" | "EalMan-LGPL-2.1.txt"
-            | "msvcp140.dll" | "msvcp140_atomic_wait.dll" | "vcruntime140.dll" | "vcruntime140_1.dll"
-            | "nvngx_dlss.dll" | "NVIDIA-DLSS-SDK-LICENSE.txt" | "Bevy-Solari-MIT.txt"
-            | "dxcompiler.dll" | "dxil.dll" | "DXC-LICENSE.txt" | "DXC-ThirdPartyNotices.txt"
-            | "base/dinurdo-assets.pk3") {
+        let allowed_root = matches!(name.as_str(), "DinurdoJK.exe"
+            | "msvcp140.dll" | "msvcp140_atomic_wait.dll"
+            | "vcruntime140.dll" | "vcruntime140_1.dll"
+            | "DinurdoJK/shared/dinurdo-assets.pk4");
+        let allowed_dependency = name.strip_prefix("DinurdoJK/dependencies/")
+            .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file));
+        if !allowed_root && !allowed_dependency {
             return Err("signed manifest contains an unexpected file".into());
         }
         check_digest(&info.sha256)?;
@@ -162,14 +175,12 @@ fn check_digest(hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Each GitHub asset has a simple filename; the one nested installation path
-// is the project-owned PK3, published as the plain release asset filename.
+// GitHub release asset names are flat; signed install paths may be nested.
+// The asset PK4 and runtime dependencies have fixed, validated destinations.
 fn release_asset_name(installed_name: &str) -> &str {
-    if installed_name == "base/dinurdo-assets.pk3" {
-        "dinurdo-assets.pk3"
-    } else {
-        installed_name
-    }
+    installed_name.strip_prefix("DinurdoJK/dependencies/")
+        .or_else(|| installed_name.strip_prefix("DinurdoJK/shared/"))
+        .unwrap_or(installed_name)
 }
 
 fn asset_url(tag: &str, file: &str) -> String {
@@ -309,31 +320,49 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-// Only one nested install path is authorized. Keep writable staging flat and
-// never allow arbitrary paths, traversal, symlinks or Windows junctions.
-fn stage_filename(signed_name: &str) -> &str {
-    if signed_name == "base/dinurdo-assets.pk3" {
-        "base__dinurdo-assets.pk3"
+// Signed installation targets are restricted by parse_signed_manifest_with_key.
+// Keep the update staging directory flat, even for nested install paths.
+fn stage_filename(signed_name: &str) -> String {
+    if let Some(name) = signed_name.strip_prefix("DinurdoJK/dependencies/") {
+        format!("deps__{name}")
+    } else if signed_name == "DinurdoJK/shared/dinurdo-assets.pk4" {
+        "shared__dinurdo-assets.pk4".into()
     } else {
-        signed_name
+        signed_name.into()
     }
 }
 
-fn signed_name_from_stage(staged_name: &str) -> &str {
-    if staged_name == "base__dinurdo-assets.pk3" {
-        "base/dinurdo-assets.pk3"
-    } else {
-        staged_name
+fn signed_name_from_stage(staged_name: &str) -> String {
+    if let Some(name) = staged_name.strip_prefix("deps__") {
+        if DEPENDENCY_RELEASE_FILES.contains(&name) {
+            return format!("DinurdoJK/dependencies/{name}");
+        }
     }
+    if staged_name == "shared__dinurdo-assets.pk4" {
+        "DinurdoJK/shared/dinurdo-assets.pk4".into()
+    } else { staged_name.into() }
 }
 
 fn ensure_install_parent(root: &Path, signed_name: &str) -> Result<(), String> {
-    if signed_name == "base/dinurdo-assets.pk3" {
-        let base = root.join("base");
-        assert_no_reparse(&base)?;
-        if !base.exists() { fs::create_dir(&base).map_err(|e| e.to_string())?; }
-        if !base.is_dir() { return Err("base asset directory is not a directory".into()); }
-        assert_no_reparse(&base)?;
+    let destination = if signed_name == "DinurdoJK/shared/dinurdo-assets.pk4" {
+        Some("shared")
+    } else if signed_name.strip_prefix("DinurdoJK/dependencies/")
+        .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file)) {
+        Some("dependencies")
+    } else {
+        None
+    };
+    if let Some(directory) = destination {
+        let client = root.join("DinurdoJK");
+        assert_no_reparse(&client)?;
+        if !client.exists() { fs::create_dir(&client).map_err(|e| e.to_string())?; }
+        if !client.is_dir() { return Err("client data directory is not a directory".into()); }
+        assert_no_reparse(&client)?;
+        let child = client.join(directory);
+        assert_no_reparse(&child)?;
+        if !child.exists() { fs::create_dir(&child).map_err(|e| e.to_string())?; }
+        if !child.is_dir() { return Err("client destination directory is not a directory".into()); }
+        assert_no_reparse(&child)?;
     }
     Ok(())
 }
@@ -363,7 +392,7 @@ fn validate_stage(stage: &Path, install_root: &Path) -> Result<SignedManifest, S
         let path = item.map_err(|e| e.to_string())?.path();
         assert_no_reparse(&path)?;
         let name = path.file_name().and_then(|n| n.to_str()).ok_or("invalid staged name")?;
-        let info = manifest.files.get(signed_name_from_stage(name)).ok_or("unexpected staged file")?;
+        let info = manifest.files.get(&signed_name_from_stage(name)).ok_or("unexpected staged file")?;
         if !path.is_file() || fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size
             || file_sha256(&path)? != info.sha256 {
             return Err(format!("staged {name} does not match signed manifest"));
@@ -856,33 +885,57 @@ mod security_tests {
         let signing = SigningKey::from_bytes(&[41; 32]);
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        for name in ["phonon.dll", "OpenALSoft.x86_64.dll", "OpenAL-Soft-LGPL-2.0.txt", "EalMan-LGPL-2.1.txt",
-            "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll",
-            "nvngx_dlss.dll", "NVIDIA-DLSS-SDK-LICENSE.txt", "Bevy-Solari-MIT.txt",
-            "dxcompiler.dll", "dxil.dll", "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
+        for name in DEPENDENCY_RELEASE_FILES {
+            value["files"][format!("DinurdoJK/dependencies/{name}")] =
+                serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+        }
+        for name in ["msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "vcruntime140_1.dll"] {
             value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let raw = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_ok());
-        value["files"].as_object_mut().unwrap().remove("phonon.dll");
+        value["files"].as_object_mut().unwrap().remove("DinurdoJK/dependencies/phonon.dll");
         value["files"]["../OpenALSoft.x86_64.dll"] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         let raw = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_err());
     }
 
     #[test]
-    fn signed_dxc_files_are_allowed_only_at_install_root() {
+    fn signed_dxc_files_are_allowed_only_under_dependencies() {
         let signing = SigningKey::from_bytes(&[41; 32]);
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         for name in ["dxcompiler.dll", "dxil.dll", "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
-            value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+            value["files"][format!("DinurdoJK/dependencies/{name}")] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let valid = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
-        value["files"]["bin/dxcompiler.dll"] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
-        let invalid = serde_json::to_vec(&value).unwrap();
-        assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
+        assert_eq!(stage_filename("DinurdoJK/dependencies/dxcompiler.dll"), "deps__dxcompiler.dll");
+        assert_eq!(signed_name_from_stage("deps__dxcompiler.dll"), "DinurdoJK/dependencies/dxcompiler.dll");
+        assert_eq!(release_asset_name("DinurdoJK/dependencies/dxcompiler.dll"), "dxcompiler.dll");
+        for bad in ["dxcompiler.dll", "bin/dxcompiler.dll", "DinurdoJK/dependencies/../phonon.dll"] {
+            let mut rejected = value.clone();
+            rejected["files"][bad] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
+            let invalid = serde_json::to_vec(&rejected).unwrap();
+            assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
+        }
+    }
+
+    #[test]
+    fn dependencies_require_new_install_directory() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["files"]["DinurdoJK/dependencies/ffmpeg.exe"] =
+            serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
+        let valid = serde_json::to_vec(&value).unwrap();
+        assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
+        for old in ["dxcompiler.dll", "nvngx_dlss.dll", "ffmpeg.exe", "DinurdoJK/other/phonon.dll"] {
+            let mut outdated = value.clone();
+            outdated["files"][old] = serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
+            let raw = serde_json::to_vec(&outdated).unwrap();
+            assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_err());
+        }
     }
 
     #[test]
@@ -890,12 +943,25 @@ mod security_tests {
         let signing = SigningKey::from_bytes(&[41; 32]);
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        value["files"]["base/dinurdo-assets.pk3"] =
+        value["files"]["DinurdoJK/shared/dinurdo-assets.pk4"] =
             serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
         let valid = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
-        assert_eq!(stage_filename("base/dinurdo-assets.pk3"), "base__dinurdo-assets.pk3");
-        assert_eq!(release_asset_name("base/dinurdo-assets.pk3"), "dinurdo-assets.pk3");
+        assert_eq!(stage_filename("DinurdoJK/shared/dinurdo-assets.pk4"), "shared__dinurdo-assets.pk4");
+        assert_eq!(release_asset_name("DinurdoJK/shared/dinurdo-assets.pk4"), "dinurdo-assets.pk4");
+        assert_eq!(signed_name_from_stage("shared__dinurdo-assets.pk4"), "DinurdoJK/shared/dinurdo-assets.pk4");
+        assert_eq!(release_asset_name("DinurdoJK/dependencies/dxcompiler.dll"), "dxcompiler.dll");
+        assert_eq!(stage_filename("DinurdoJK/dependencies/nvngx_dlss.dll"), "deps__nvngx_dlss.dll");
+        assert_eq!(signed_name_from_stage("deps__OpenALSoft.x86_64.dll"), "DinurdoJK/dependencies/OpenALSoft.x86_64.dll");
+        // Do not re-allow previous destinations; no migration or fallback.
+        for old_path in ["DinurdoJK/dinurdo-assets.pk3", "base/dinurdo-assets.pk3", "DinurdoJK/shared/dinurdo-assets.pk3"] {
+            let mut outdated = value.clone();
+            outdated["files"].as_object_mut().unwrap().remove("DinurdoJK/shared/dinurdo-assets.pk4");
+            outdated["files"][old_path] =
+                serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
+            let invalid = serde_json::to_vec(&outdated).unwrap();
+            assert!(parse_signed_manifest_with_key(&invalid, &signing.sign(&invalid).to_bytes(), &key).is_err());
+        }
         value["files"]["base/../../evil.dll"] =
             serde_json::json!({"size": 5, "sha256": "c".repeat(64)});
         let invalid = serde_json::to_vec(&value).unwrap();

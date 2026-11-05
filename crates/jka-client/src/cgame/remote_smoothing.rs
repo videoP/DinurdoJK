@@ -1,16 +1,18 @@
-//! Live-only remote-player *visual* sampling. No prediction, collisions, event
+//! Live-only remote-player and spectator-follow *visual* sampling. No prediction, collisions, event
 //! discovery, server timing, demos or protocol fields are changed here.
 //!
-//! Mode 0 is the unmodified OpenJK-style CGame presentation path. Modes 1-3
+//! Mode 0 is the unmodified OpenJK-style CGame presentation path. Modes 1-4
 //! retain a small snapshot ring (including snapshots already received but not
 //! yet transitioned by CGame) to supply actual past states for visual sampling.
 //! ET: Legacy's cl_interpolation motivated a snapshot history; jaMME's demo
-//! command-history smoother is deliberately NOT used for live multiplayer.
+//! command-history smoother needs extended demo records not present on live servers.
+//! Mode 4 is an *experiment* using live playerState commandTime gaps to
+//! shape interpolation tangents (with fallback), NOT an exact jaMME port.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Instant;
 
-use jka_protocol::{gamestate::EntityState, server::Snapshot};
+use jka_protocol::{gamestate::EntityState, server::{PlayerState, Snapshot}};
 
 use super::{evaluate_trajectory_at, field_i32, lerp_angle, trajectory, PresentedEntity,
     Trajectory, EF_TELEPORT_BIT, ET_PLAYER, SNAPFLAG_SERVERCOUNT, TR_INTERPOLATE};
@@ -29,7 +31,7 @@ static EXTRAP_MAX_MS: AtomicU32 = AtomicU32::new(35);
 static DEBUG: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn mode() -> u8 { MODE.load(Ordering::Relaxed) }
-pub(crate) fn set_mode(value: u8) { MODE.store(value.min(3), Ordering::Relaxed); }
+pub(crate) fn set_mode(value: u8) { MODE.store(value.min(4), Ordering::Relaxed); }
 pub(crate) fn buffer_ms() -> u32 { BUFFER_MS.load(Ordering::Relaxed) }
 pub(crate) fn set_buffer_ms(value: u32) { BUFFER_MS.store(value.min(100), Ordering::Relaxed); }
 pub(crate) fn buffer_auto() -> bool { BUFFER_AUTO.load(Ordering::Relaxed) != 0 }
@@ -71,6 +73,7 @@ struct Frame {
     message: i32,
     flags: u8,
     poses: [Option<Pose>; MAX_PLAYERS],
+    follow: Option<FollowPose>,
     // Only movers supporting observed remote players are retained. This is
     // needed only when estimating platform translation during an underrun.
     movers: Vec<(u16, Trajectory)>,
@@ -78,6 +81,56 @@ struct Frame {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum Source { #[default] None, Interpolated, Extrapolated, Held, Discontinuity }
+
+// The followed player's *snapshot playerState* is not a packet entity. It is
+// usually omitted from snapshot.entities; therefore the ordinary remote-player
+// ring cannot drive a spectator camera. Retain the POV PS separately.
+#[derive(Clone)]
+struct FollowPose {
+    origin: [f32; 3],
+    angles: [f32; 3],
+    velocity: [f32; 3],
+    client: i32,
+    spawn: i32,
+    flags: i32,
+    pm_flags: i32,
+    pm_type: i32,
+    ground: i32,
+    vehicle: i32,
+    command_time: i32,
+}
+
+impl FollowPose {
+    fn new(ps: &PlayerState) -> Option<Self> {
+        let vec3 = |names: [&str; 3]| -> Option<[f32; 3]> {
+            let values = names.map(|name| ps.field_f32(name).unwrap_or(f32::NAN));
+            values.iter().all(|value| value.is_finite()).then_some(values)
+        };
+        let pm_flags = ps.field_i32("pm_flags")?;
+        if pm_flags & 4096 == 0 { return None; } // PMF_FOLLOW
+        Some(Self {
+            origin: vec3(["origin[0]", "origin[1]", "origin[2]"])?,
+            angles: vec3(["viewangles[0]", "viewangles[1]", "viewangles[2]"])?,
+            velocity: vec3(["velocity[0]", "velocity[1]", "velocity[2]"])?,
+            client: ps.field_i32("clientNum")?,
+            spawn: ps.persistant[4], flags: ps.field_i32("eFlags").unwrap_or(0),
+            pm_flags, pm_type: ps.field_i32("pm_type").unwrap_or(0),
+            ground: ps.field_i32("groundEntityNum").unwrap_or(0),
+            vehicle: ps.field_i32("m_iVehicleNum").unwrap_or(0),
+            command_time: ps.field_i32("commandTime").unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FollowSample {
+    origin: [f32; 3],
+    angles: [f32; 3],
+    velocity: [f32; 3],
+    source: Source,
+    continuous: bool,
+    used_command_time: bool,
+}
 
 struct Sample {
     origin: [f32; 3],
@@ -150,6 +203,11 @@ pub(crate) struct RemoteSmoothing {
     last_report: Option<Instant>,
     automatic_delay_ms: Option<f64>,
     last_delay_wall: Option<Instant>,
+    last_visual_time: Option<f64>,
+    follow_last_client: Option<(i32, i32)>, // clientNum, spawnCount
+    follow_continuity: VisualContinuity,
+    follow_samples: [u64; 4], // interpolated, extrapolated, held, command-time segments
+    follow_skip_until: Option<i32>, // prevent rewinding across follow switch/teleport
 }
 
 impl Default for RemoteSmoothing {
@@ -158,7 +216,10 @@ impl Default for RemoteSmoothing {
             continuity: [VisualContinuity::default(); MAX_PLAYERS], last_receive: None,
             interval_ms: 50.0, arrival_jitter_ms: 0.0, last_mode: 0,
             counters: Counters::default(), last_report: None,
-            automatic_delay_ms: None, last_delay_wall: None }
+            automatic_delay_ms: None, last_delay_wall: None,
+            last_visual_time: None, follow_last_client: None,
+            follow_continuity: VisualContinuity::default(), follow_samples: [0; 4],
+            follow_skip_until: None }
     }
 }
 
@@ -171,6 +232,33 @@ fn continuous(a: &Pose, b: &Pose, old: &Frame, new: &Frame) -> bool {
         && (old.flags ^ new.flags) & SNAPFLAG_SERVERCOUNT == 0
         && a.vehicle == b.vehicle
         && distance(a.origin, b.origin) <= HARD_SNAP_UNITS
+}
+
+fn follow_continuous(a: &FollowPose, b: &FollowPose, old: &Frame, new: &Frame) -> bool {
+    a.client == b.client && a.spawn == b.spawn && a.vehicle == b.vehicle
+        && a.pm_flags & 4096 != 0 && b.pm_flags & 4096 != 0
+        && a.pm_type == b.pm_type
+        && (a.flags ^ b.flags) & EF_TELEPORT_BIT == 0
+        && (old.flags ^ new.flags) & SNAPFLAG_SERVERCOUNT == 0
+        && distance(a.origin, b.origin) <= HARD_SNAP_UNITS
+}
+
+fn angle_delta(a: f32, b: f32) -> f32 { (b - a + 180.0).rem_euclid(360.0) - 180.0 }
+
+fn hermite_follow(a: &FollowPose, b: &FollowPose, fraction: f32, dt: f32) -> [f32; 3] {
+    let t = fraction.clamp(0.0, 1.0);
+    let h00 = 2.0 * t.powi(3) - 3.0 * t * t + 1.0;
+    let h10 = t.powi(3) - 2.0 * t * t + t;
+    let h01 = -2.0 * t.powi(3) + 3.0 * t * t;
+    let h11 = t.powi(3) - t * t;
+    std::array::from_fn(|i| {
+        let d = b.origin[i] - a.origin[i];
+        let max_tangent = 2.0 * d.abs();
+        let m0 = (a.velocity[i] * dt).clamp(-max_tangent, max_tangent);
+        let m1 = (b.velocity[i] * dt).clamp(-max_tangent, max_tangent);
+        (h00 * a.origin[i] + h10 * m0 + h01 * b.origin[i] + h11 * m1)
+            .clamp(a.origin[i].min(b.origin[i]), a.origin[i].max(b.origin[i]))
+    })
 }
 
 /// Tangent-limited cubic Hermite. Velocity is JKA units/second; dt is seconds.
@@ -206,6 +294,11 @@ impl RemoteSmoothing {
         self.last_report = None;
         self.automatic_delay_ms = None;
         self.last_delay_wall = None;
+        self.last_visual_time = None;
+        self.follow_last_client = None;
+        self.follow_continuity = VisualContinuity::default();
+        self.follow_samples = [0; 4];
+        self.follow_skip_until = None;
         self.last_mode = selected;
     }
 
@@ -243,6 +336,10 @@ impl RemoteSmoothing {
             // Map restart/servercount, or a new timeline. Don't interpolate across it.
             self.frames.clear();
             self.continuity.fill(VisualContinuity::default());
+            self.follow_continuity = VisualContinuity::default();
+            self.follow_last_client = None;
+            self.follow_skip_until = None;
+            self.last_visual_time = None;
             self.clock = VisualClock::default();
             self.last_receive = None;
         }
@@ -255,16 +352,18 @@ impl RemoteSmoothing {
                 poses[id] = Pose::new(entity, snapshot.server_time);
             }
         }
+        let follow = FollowPose::new(&snapshot.player_state);
         let mut movers = Vec::new();
         for entity in &snapshot.entities {
             if field_i32(entity, "eType") == super::ET_MOVER
-                && poses.iter().any(|pose| pose.as_ref().is_some_and(|p| p.ground == i32::from(entity.number))) {
+                && (poses.iter().any(|pose| pose.as_ref().is_some_and(|p| p.ground == i32::from(entity.number)))
+                    || follow.as_ref().is_some_and(|p| p.ground == i32::from(entity.number))) {
                 movers.push((entity.number, trajectory(entity, "pos")));
             }
         }
         if self.frames.len() == HISTORY { self.frames.pop_front(); }
         self.frames.push_back(Frame { time: snapshot.server_time, message: snapshot.message_num,
-            flags: snapshot.snap_flags, poses, movers });
+            flags: snapshot.snap_flags, poses, follow, movers });
     }
 
     /// Cvars can be enabled mid-session, after snapshots were received while
@@ -374,10 +473,16 @@ impl RemoteSmoothing {
         self.sync_mode(selected);
         if selected == 0 || self.frames.is_empty() { return; }
         let time = self.clock.sample(game_ms, now) - self.buffer_delay_ms(now);
+        // Sampled once per presentation frame. The spectator POV must use the
+        // exact same visual clock as every remote entity and attachment.
+        self.last_visual_time = Some(time);
         for entity in entities.iter_mut().filter(|e| e.entity_type == ET_PLAYER
                 && usize::from(e.number) < MAX_PLAYERS) {
             let id = usize::from(entity.number);
-            let Some(mut sample) = self.sample_player(id, time, selected) else { continue; };
+            // Mode 4 tests a different POV clock; ordinary remote packet
+            // entities retain mode 2's linear + bounded extrapolation.
+            let entity_mode = if selected == 4 { 2 } else { selected };
+            let Some(mut sample) = self.sample_player(id, time, entity_mode) else { continue; };
             if !sample.origin.iter().chain(sample.angles.iter()).all(|n| n.is_finite()) { continue; }
             let previous = &mut self.continuity[id];
             if !sample.continuous {
@@ -432,17 +537,200 @@ impl RemoteSmoothing {
         }
     }
 
+    /// Prefer server time for modes 1-3. Mode 4 adapts jaMME's history
+    /// idea to ordinary live snapshots, using valid commandTime intervals to
+    /// scale Hermite velocity tangents. It cannot reconstruct extra usercmd
+    /// states never sent by the server.
+    fn sample_follow(&self, visual_ms: f64, target: i32, selected: u8) -> Option<FollowSample> {
+        let first = self.frames.front()?;
+        if visual_ms < f64::from(first.time) { return None; }
+        let mut index = self.frames.len() - 1;
+        for (i, frame) in self.frames.iter().enumerate() {
+            if f64::from(frame.time) > visual_ms {
+                index = i.checked_sub(1)?;
+                break;
+            }
+        }
+        let old = &self.frames[index];
+        let a = old.follow.as_ref()?;
+        if a.client != target { return None; }
+        if let Some(new) = self.frames.get(index + 1) {
+            let b = new.follow.as_ref()?;
+            if b.client != target { return None; }
+            if !follow_continuous(a, b, old, new) {
+                // Never jump early to a future teleport or POV switch. Stay
+                // at the old position until the new snapshot is due.
+                return Some(FollowSample { origin: a.origin, angles: a.angles,
+                    velocity: a.velocity, source: Source::Discontinuity,
+                    continuous: false, used_command_time: false });
+            }
+            let elapsed = f64::from(new.time - old.time);
+            if elapsed <= 0.0 { return None; }
+            let server_f = ((visual_ms - f64::from(old.time)) / elapsed).clamp(0.0, 1.0);
+            let command_interval = f64::from(b.command_time - a.command_time);
+            // jaMME skips duplicate/empty command-history slots. Ordinary live
+            // JKA has only one playerState per snapshot, so we cannot recover
+            // those intermediate slots. We CAN use commandTime to estimate
+            // each endpoint's velocity-tangent duration. Always evaluate the
+            // curve at server-time fraction: both endpoints must remain exact
+            // and continuous as the render clock crosses snapshot boundaries.
+            let usable_command = selected == 4
+                && command_interval >= 4.0 && command_interval <= 200.0
+                && (command_interval - elapsed).abs() <= 35.0
+                && a.command_time > 0;
+            let f = server_f as f32;
+            let origin = if selected == 3 || (selected == 4 && usable_command) {
+                hermite_follow(a, b, f, if usable_command {
+                    command_interval as f32 * 0.001
+                } else {
+                    elapsed as f32 * 0.001
+                })
+            } else {
+                std::array::from_fn(|axis| a.origin[axis] + f * (b.origin[axis] - a.origin[axis]))
+            };
+            return Some(FollowSample {
+                origin,
+                angles: std::array::from_fn(|axis| lerp_angle(a.angles[axis], b.angles[axis], f)),
+                velocity: std::array::from_fn(|axis| a.velocity[axis] + f * (b.velocity[axis] - a.velocity[axis])),
+                source: Source::Interpolated, continuous: true,
+                used_command_time: usable_command,
+            });
+        }
+        // An underrun. Mode 1 holds. Mode 2/3/4 predicts only a short,
+        // strictly limited visual interval; then it HOLDS THE CAPPED POSITION
+        // (rather than snapping backwards to the last server pose).
+        let elapsed = (visual_ms - f64::from(old.time)).max(0.0);
+        let extrap = if selected >= 2 { elapsed.min(f64::from(extrap_max_ms())) } else { 0.0 };
+        let mut origin: [f32; 3] = std::array::from_fn(|axis| a.origin[axis] + a.velocity[axis] * (extrap as f32 * 0.001));
+        if extrap > 0.0 && a.ground > 0 {
+            if let Some((_, mover)) = old.movers.iter().find(|(id, _)| i32::from(*id) == a.ground) {
+                if let (Ok(start), Ok(end)) = (
+                    evaluate_trajectory_at(*mover, f64::from(old.time)),
+                    evaluate_trajectory_at(*mover, f64::from(old.time) + extrap),
+                ) {
+                    for axis in 0..3 { origin[axis] += end[axis] - start[axis]; }
+                }
+            }
+        }
+        let mut angles = a.angles;
+        if extrap > 0.0 && index > 0 {
+            if let Some(before) = self.frames[index - 1].follow.as_ref() {
+                let previous = &self.frames[index - 1];
+                let delta = f64::from(old.time - previous.time);
+                if delta > 0.0 && delta <= 150.0 && follow_continuous(before, a, previous, old) {
+                    for axis in 0..3 {
+                        let turn = angle_delta(before.angles[axis], a.angles[axis]);
+                        let rate = (turn / delta as f32).clamp(-0.72, 0.72); // degrees/ms
+                        angles[axis] += rate * extrap as f32;
+                    }
+                }
+            }
+        }
+        Some(FollowSample { origin, angles, velocity: a.velocity,
+            source: if extrap > 0.0 && elapsed <= extrap { Source::Extrapolated } else { Source::Held },
+            continuous: true, used_command_time: false })
+    }
+
+    /// Called after the original playerState has been chosen and input
+    /// ownership resolved, but before its camera, Ghoul2 body, sabers, audio,
+    /// and shadows are derived. Never change server gameplay/discrete fields.
+    pub(crate) fn apply_follow(&mut self, ps: &mut PlayerState, now: Instant, teleported: bool) {
+        let selected = mode();
+        if selected == 0 || teleported {
+            if teleported {
+                // The old buffered timeline contains the position from before
+                // the teleport. Never rewind the camera into it next frame.
+                self.follow_skip_until = self.frames.back().map(|f| f.time);
+            } else {
+                self.follow_skip_until = None;
+            }
+            self.follow_last_client = None;
+            self.follow_continuity = VisualContinuity::default();
+            return;
+        }
+        let Some(current) = FollowPose::new(ps) else {
+            self.follow_last_client = None;
+            self.follow_skip_until = None;
+            self.follow_continuity = VisualContinuity::default();
+            return;
+        };
+        let owner = (current.client, current.spawn);
+        if self.follow_last_client != Some(owner) {
+            if self.follow_last_client.is_some() {
+                self.follow_skip_until = self.frames.back().map(|f| f.time);
+            }
+            self.follow_last_client = Some(owner);
+            self.follow_continuity = VisualContinuity::default();
+        }
+        let Some(time) = self.last_visual_time else { return; };
+        if let Some(block) = self.follow_skip_until {
+            if time < f64::from(block) { return; }
+            self.follow_skip_until = None;
+        }
+        let Some(mut sampled) = self.sample_follow(time, current.client, selected) else { return; };
+        if !sampled.continuous {
+            self.follow_continuity = VisualContinuity::default();
+        } else {
+            let previous = &mut self.follow_continuity;
+            let dt = previous.last_wall.map_or(0.0, |last|
+                now.saturating_duration_since(last).as_secs_f32() * 1000.0).min(200.0);
+            for component in &mut previous.offset { *component *= (-dt / 65.0).exp(); }
+            if matches!(previous.source, Source::Extrapolated | Source::Held)
+                && sampled.source == Source::Interpolated {
+                let elapsed = ((time - previous.at_ms) * 0.001).clamp(0.0, 0.1) as f32;
+                let guess: [f32; 3] = std::array::from_fn(|axis|
+                    previous.raw_origin[axis] + if previous.source == Source::Extrapolated {
+                        previous.velocity[axis] * elapsed
+                    } else { 0.0 });
+                let error = distance(guess, sampled.origin);
+                if error > 0.01 && error <= CORRECTION_LIMIT {
+                    for axis in 0..3 { previous.offset[axis] += guess[axis] - sampled.origin[axis]; }
+                } else if error > CORRECTION_LIMIT {
+                    previous.offset = [0.0; 3];
+                }
+            }
+            if previous.offset.iter().map(|x| x * x).sum::<f32>() > CORRECTION_LIMIT.powi(2) {
+                previous.offset = [0.0; 3];
+            }
+            for axis in 0..3 { sampled.origin[axis] += previous.offset[axis]; }
+        }
+        let previous = &mut self.follow_continuity;
+        previous.raw_origin = std::array::from_fn(|axis| sampled.origin[axis] - previous.offset[axis]);
+        previous.velocity = sampled.velocity;
+        previous.at_ms = time;
+        previous.source = sampled.source;
+        previous.last_wall = Some(now);
+        match sampled.source {
+            Source::Interpolated => self.follow_samples[0] += 1,
+            Source::Extrapolated => self.follow_samples[1] += 1,
+            Source::Held => self.follow_samples[2] += 1,
+            _ => {},
+        }
+        if sampled.used_command_time { self.follow_samples[3] += 1; }
+        for (axis, name) in ["origin[0]", "origin[1]", "origin[2]"].iter().enumerate() {
+            ps.set_field_bits(name, sampled.origin[axis].to_bits());
+        }
+        for (axis, name) in ["viewangles[0]", "viewangles[1]", "viewangles[2]"].iter().enumerate() {
+            ps.set_field_bits(name, sampled.angles[axis].to_bits());
+        }
+        for (axis, name) in ["velocity[0]", "velocity[1]", "velocity[2]"].iter().enumerate() {
+            ps.set_field_bits(name, sampled.velocity[axis].to_bits());
+        }
+    }
+
     pub(crate) fn summary(&self) -> String {
         let c = &self.counters;
         let total = c.interpolated + c.extrapolated + c.held;
         let rate = |count| if total == 0 { 0.0 } else { count as f64 * 100.0 / total as f64 };
-        format!("[REMOTE SMOOTH] mode={} buffer={:.1}ms (auto={}) extrapMax={}ms history={} interval={:.1}ms arrivalJitter={:.1}ms samples={} interpolate={:.1}% extrapolate={:.1}% hold={:.1}% discontinuities={} correctionCount={} worstCorrection={:.2}u meanUnderrun={:.1}ms",
+        let follow = self.follow_samples;
+        format!("[REMOTE SMOOTH] mode={} buffer={:.1}ms (auto={}) extrapMax={}ms history={} interval={:.1}ms arrivalJitter={:.1}ms samples={} interpolate={:.1}% extrapolate={:.1}% hold={:.1}% discontinuities={} correctionCount={} worstCorrection={:.2}u meanUnderrun={:.1}ms follow[interp={} extrap={} hold={} commandTime={}]",
             mode(), self.automatic_delay_ms.unwrap_or_else(|| self.requested_delay_ms()),
             buffer_auto() as u8, extrap_max_ms(),
             self.frames.len(), self.interval_ms, self.arrival_jitter_ms, total,
             rate(c.interpolated), rate(c.extrapolated), rate(c.held), c.discontinuities,
             c.corrections, c.max_correction,
-            if c.underruns == 0 { 0.0 } else { c.underrun_ms / c.underruns as f64 })
+            if c.underruns == 0 { 0.0 } else { c.underrun_ms / c.underruns as f64 },
+            follow[0], follow[1], follow[2], follow[3])
     }
 
     pub(crate) fn report_if_enabled(&mut self, now: Instant) {
@@ -459,6 +747,7 @@ impl RemoteSmoothing {
             }
         }
         self.counters = Counters::default();
+        self.follow_samples = [0; 4];
     }
 }
 
@@ -572,6 +861,90 @@ mod tests {
         let at = remote.sample_player(2, 120.0, 2).unwrap();
         assert!((at.origin[0] - 11.0).abs() < 0.01);
     }
+    fn follow_snapshot(time: i32, msg: i32, target: i32, x: f32,
+                       velocity: f32, command_time: i32) -> Snapshot {
+        let mut frame = snapshot(time, msg, x, velocity, 0);
+        frame.entities.clear(); // followed player is sent as playerState, not entityState
+        let ps = &mut frame.player_state;
+        for (name, bits) in [("pm_flags", 4096), ("clientNum", target as u32),
+            ("commandTime", command_time as u32),
+            ("origin[0]", x.to_bits()), ("velocity[0]", velocity.to_bits())] {
+            ps.set_field_bits(name, bits);
+        }
+        frame
+    }
+
+    #[test]
+    fn spectator_follow_reads_playerstate_not_packet_entity() {
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 95));
+        smooth.insert_snapshot(&follow_snapshot(150, 2, 3, 5.0, 100.0, 145));
+        let mid = smooth.sample_follow(125.0, 3, 1).unwrap();
+        assert_eq!(mid.source, Source::Interpolated);
+        assert!((mid.origin[0] - 2.5).abs() < 0.01);
+        assert!(smooth.sample_player(3, 125.0, 2).is_none());
+    }
+
+    #[test]
+    fn spectator_extrapolation_caps_position_without_snapping_back() {
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 95));
+        smooth.insert_snapshot(&follow_snapshot(150, 2, 3, 5.0, 100.0, 145));
+        let predicted = smooth.sample_follow(160.0, 3, 2).unwrap();
+        assert_eq!(predicted.source, Source::Extrapolated);
+        assert!((predicted.origin[0] - 6.0).abs() < 0.01);
+        let capped = smooth.sample_follow(235.0, 3, 2).unwrap();
+        assert_eq!(capped.source, Source::Held);
+        assert!((capped.origin[0] - 8.5).abs() < 0.01);
+        assert_eq!(smooth.sample_follow(235.0, 3, 1).unwrap().origin[0], 5.0);
+    }
+
+    #[test]
+    fn spectator_follow_switch_spawn_and_teleport_never_blend() {
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 95));
+        smooth.insert_snapshot(&follow_snapshot(150, 2, 4, 50.0, 100.0, 145));
+        assert!(smooth.sample_follow(125.0, 3, 4).is_none());
+        assert!(smooth.sample_follow(125.0, 4, 4).is_none());
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 95));
+        let mut teleported = follow_snapshot(150, 2, 3, 500.0, 100.0, 145);
+        teleported.player_state.set_field_bits("eFlags", EF_TELEPORT_BIT as u32);
+        smooth.insert_snapshot(&teleported);
+        let mid = smooth.sample_follow(125.0, 3, 3).unwrap();
+        assert_eq!(mid.source, Source::Discontinuity);
+        assert_eq!(mid.origin[0], 0.0); // stay before jump until snapshot is due
+        assert_eq!(smooth.sample_follow(150.0, 3, 3).unwrap().origin[0], 500.0);
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 95));
+        let mut respawn = follow_snapshot(150, 2, 3, 5.0, 100.0, 145);
+        respawn.player_state.persistant[4] = 1;
+        smooth.insert_snapshot(&respawn);
+        assert_eq!(smooth.sample_follow(125.0, 3, 2).unwrap().source, Source::Discontinuity);
+    }
+
+    #[test]
+    fn spectator_jamme_inspired_mode_preserves_endpoints_and_falls_back() {
+        let mut smooth = test_smoother();
+        let mut a = follow_snapshot(100, 1, 3, 0.0, 100.0, 95);
+        a.player_state.set_field_bits("velocity[0]", 200.0f32.to_bits());
+        let b = follow_snapshot(150, 2, 3, 10.0, 0.0, 135);
+        smooth.insert_snapshot(&a);
+        smooth.insert_snapshot(&b);
+        let mid = smooth.sample_follow(125.0, 3, 4).unwrap();
+        assert_eq!(mid.source, Source::Interpolated);
+        assert!(mid.used_command_time);
+        assert!((0.0..=10.0).contains(&mid.origin[0]));
+        assert_eq!(smooth.sample_follow(100.0, 3, 4).unwrap().origin[0], 0.0);
+        assert_eq!(smooth.sample_follow(150.0, 3, 4).unwrap().origin[0], 10.0);
+        let mut smooth = test_smoother();
+        smooth.insert_snapshot(&follow_snapshot(100, 1, 3, 0.0, 100.0, 0));
+        smooth.insert_snapshot(&follow_snapshot(150, 2, 3, 10.0, 100.0, 0));
+        let fallback = smooth.sample_follow(125.0, 3, 4).unwrap();
+        assert!(!fallback.used_command_time);
+        assert!((fallback.origin[0] - 5.0).abs() < 0.01);
+    }
+
     #[test]
     fn hermite_is_bounded_on_reversal() {
         let a = Pose::new(&entity(0.0, -2000.0, 0), 100).unwrap();

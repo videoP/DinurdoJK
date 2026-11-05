@@ -11,27 +11,7 @@ use super::{App, FrontendPage};
 use std::collections::BTreeMap;
 use serde::{Serialize,Deserialize};
 
-/// Explicit Studio-only HUD allowlist. No gameplay cvar is written or applied.
-pub(in crate::app) const HUD_ELEMENTS: &[(&str, &str)] = &[
-    ("core", "Health / armor / ammo / force"),
-    ("crosshair", "Crosshair"),
-    ("race_timer", "Race timer"),
-    ("game_timer", "Game timer"),
-    ("speedometer", "Speedometer"),
-    ("strafe_helper", "Strafe helper"),
-    ("movement_keys", "Movement keys"),
-    ("follow", "Followed player"),
-    ("score", "Player score"),
-    ("mini_scores", "Team / duel scores (cg_drawScores)"),
-    ("enemy_info", "Enemy / duel info"),
-    ("crosshair_name", "Crosshair name"),
-    ("player_names", "Player names"),
-    ("player_names_cinematic", "Cinematic player names"),
-];
-
-pub(in crate::app) fn studio_hud_key(key: &str) -> bool {
-    HUD_ELEMENTS.iter().any(|(id,_)| *id == key)
-}
+pub(in crate::app) use jka_studio::render_studio_cfg::{studio_hud_key, HUD_ELEMENTS};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::app) struct StudioHudSettings {

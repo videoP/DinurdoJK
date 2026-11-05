@@ -29,7 +29,7 @@ impl App {
         };
         let minor = if version == jka_protocol::jk2::Version::V102 { 2 } else { 4 };
         if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, minor) {
-            self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath or fs_jk2cdpath/base", version.name())); return;
+            self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath/base or fs_jk2cdpath/base", version.name())); return;
         }
         self.connect_to_server_game(target, None, Some(version));
     }

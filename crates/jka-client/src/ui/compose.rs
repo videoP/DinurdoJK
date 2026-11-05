@@ -26,6 +26,16 @@ pub fn build_vertices(
         build_splash_background(&mut out, width, height, splash_size.filter(|_| ui.startup_splash_art));
         return out;
     }
+    if ui.asset_mapping.is_some() {
+        // Treat Asset Mapping as a normal menu underlay. The classic console
+        // is an independent global overlay and must remain usable on this page
+        // even when there are no stock PK3s mounted.
+        crate::ui::asset_mapping::build(&mut out, ui, width, height);
+        if ui.mode == OverlayMode::Console && !ui.console_hl2 {
+            build_console(&mut out, ui, width, height);
+        }
+        return out;
+    }
     if ui.demo_browser.is_some() {
         crate::ui::demo_browser::build(&mut out, ui, width, height);
         return out;

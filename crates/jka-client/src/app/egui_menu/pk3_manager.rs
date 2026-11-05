@@ -1,4 +1,4 @@
-//! Mounted archive manager. Package edits are staged locally and then applied
+//! PK3/PK4 archive manager. Package edits are staged locally and then applied
 //! through the same fs_restart path used by the console command.
 use super::{theme, App};
 use std::{collections::HashSet, fs::File, path::{Path, PathBuf}};
@@ -190,7 +190,7 @@ impl App {
                         ui.separator();
                         let Some(path) = &self.pk3_manager_selected else {
                             ui.add_space(12.0);
-                            ui.colored_label(theme::TEXT_DIM(), "Select a PK3 from either pane to inspect its contents.");
+                            ui.colored_label(theme::TEXT_DIM(), "Select a package from either pane to inspect its contents.");
                             return;
                         };
                         let Some((priority, package)) = self.pk3_manager_packages.iter().enumerate()
@@ -240,9 +240,9 @@ impl App {
 
     pub(in crate::app::egui_menu) fn egui_pk3_manager_page(&mut self, ui: &mut egui::Ui) {
         self.pk3_manager_inventory();
-        theme::page_title(ui, "PK3 MANAGER", "Move packages between Disabled and Enabled. Changes are staged until Apply.");
+        theme::page_title(ui, "PACKAGE MANAGER", "Move packages between Disabled and Enabled. Changes are staged until Apply.");
         ui.horizontal(|ui| {
-            ui.label("Search PK3s:");
+            ui.label("Search packages:");
             ui.add(egui::TextEdit::singleline(&mut self.pk3_manager_search)
                 .hint_text("Filename or source directory...").desired_width(360.0));
             if ui.small_button("Clear").clicked() { self.pk3_manager_search.clear(); }
@@ -308,7 +308,7 @@ impl App {
                                     self.pk3_manager_status = Some(if needs_rebuild {
                                         "Applied. Full CGame, sound, world and GPU rebuild requested; network session preserved.".into()
                                     } else {
-                                        "Applied. Additive PK3 mounts re-indexed (fs_restart); existing assets retained.".into()
+                                        "Applied. Additive package mounts re-indexed (fs_restart); existing assets retained.".into()
                                     });
                                 }
                                 Err(error) => {

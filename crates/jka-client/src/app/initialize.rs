@@ -21,6 +21,9 @@ impl App {
         // main.rs configures roots before the index prewarm. Direct App::new
         // callers (unit tests/tooling) retain a portable default.
         let fs_roots = jka_assets::pk3::configured_filesystem_roots(&base);
+        let asset_mapping = (!super::asset_mapping::jka_assets_present(&base, &fs_roots))
+            .then(|| super::asset_mapping::AssetMappingState::new(&fs_roots, &base));
+        let missing_retail_assets = asset_mapping.is_some();
         let map_loader_latest_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let loader_tx = spawn_map_loader(
             base.clone(),
@@ -99,8 +102,8 @@ impl App {
         let fresh_install = !config_path.is_file();
         let initial_label = initial_source.label();
         let initial_loading =
-            launch_map.then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
-        let front_end = !launch_map;
+            (launch_map && !missing_retail_assets).then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
+        let front_end = !launch_map || missing_retail_assets;
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
         // Favorites, history and JK2 master lists: per user, not per fs_game.
         let servers_dir = jka_assets::pk3::dinurdojk_directory(&base).join("servers");
@@ -186,6 +189,7 @@ impl App {
             updater: crate::updater::State::load(&settings_dir),
             base,
             fs_roots,
+            asset_mapping,
             startup_game: game.clone(),
             game,
             map_name: initial_label.clone(),
@@ -864,7 +868,7 @@ impl App {
                 loading.apply_prepare_options(&options);
             }
         }
-        if app.front_end {
+        if app.front_end && app.asset_mapping.is_none() {
             app.open_ui_page(&[app.game_launch_screen.page_name()]);
         }
         Ok(app)

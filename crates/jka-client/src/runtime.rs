@@ -206,23 +206,7 @@ pub fn clear_video_frame_pool() {
     VIDEO_FRAME_POOL.lock().unwrap_or_else(|error| error.into_inner()).clear();
 }
 
-/// Renderer-side milestones of one video-frame capture, for export profiling.
-/// Consecutive instants; `gpu_wait_ms`/`readback_copy_ms` split presented..queued.
-#[derive(Clone, Copy, Debug)]
-pub struct VideoFrameTiming {
-    /// CaptureVideoFrame was handled by the render thread.
-    pub received: Instant,
-    /// The capturing render frame prepared its readback (after surface acquire).
-    pub frame_started: Instant,
-    /// That frame was recorded, submitted and presented; readback mapping begins.
-    pub presented: Instant,
-    pub gpu_wait_ms: f64,
-    pub readback_copy_ms: f64,
-    /// Mapped pixels were handed to the encode worker.
-    pub queued: Instant,
-    pub worker_started: Instant,
-    pub worker_done: Instant,
-}
+pub use jka_studio::render_studio_profile::VideoFrameTiming;
 
 pub enum UserEvent {
     Update(crate::updater::Event),

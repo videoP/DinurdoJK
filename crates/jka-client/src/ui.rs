@@ -39,6 +39,7 @@ pub(crate) use studio_race_map::{StudioRaceMap, MAX_MAP_TRIANGLES};
 mod console;
 mod demo;
 pub mod demo_browser;
+pub(crate) mod asset_mapping;
 mod frametime_graph;
 pub(crate) use frametime_graph::{build_frame_time_graph_vertices, FrameGraphSummary};
 mod tile_cost;
@@ -1608,6 +1609,8 @@ pub struct UiSnapshot {
     pub scoreboard_focus_client: Option<i32>,
     pub demo_timeline: Option<DemoTimelineUi>,
     pub demo_browser: Option<demo_browser::DemoBrowserUi>,
+    /// Taffy/WGPU asset path recovery, independent of mounted game archives.
+    pub asset_mapping: Option<asset_mapping::AssetMappingUi>,
     pub prediction_debug: Option<PredictionDebugUi>,
     pub hud: Option<HudState>,
     pub team_overlay: Option<TeamOverlayUi>,
@@ -1734,6 +1737,7 @@ impl Default for UiSnapshot {
             scoreboard_focus_client: None,
             demo_timeline: None,
             demo_browser: None,
+            asset_mapping: None,
             prediction_debug: None,
             hud: None,
             team_overlay: None,

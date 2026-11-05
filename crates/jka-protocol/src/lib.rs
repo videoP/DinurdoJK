@@ -9,6 +9,7 @@ pub mod demo;
 pub mod demo_bake;
 mod entity_fields;
 pub mod entity_event;
+pub mod entity_type;
 pub mod gamestate;
 pub mod jk2;
 mod huffman_codes;

@@ -998,6 +998,16 @@ pub fn read_asset(qpath: &str, limit: usize) -> Result<Option<Vec<u8>>, String> 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn favorite_emote_marks_its_bundle_assets() {
+        use super::*;
+        let prefix = "emotes/.bundles/favorite/";
+        let catalogue = jka_emotes::manifest::parse_manifest(&json!({"emotes":[{"id":"fav","name":"Fav","gla":format!("{prefix}a.gla"),"first_frame":0,"end_frame":30,"fps":30}]})).unwrap();
+        update_favorite_assets(&catalogue, &["fav".into()]);
+        assert!(favorite_asset(&format!("{prefix}a.flac")));
+        assert!(!favorite_asset("emotes/.bundles/ordinary/a.flac"));
+        update_favorite_assets(&[], &[]);
+    }
+    #[test]
     fn unbound_world_emote_cancels_pending_preparation_on_attack() {
         use super::*;
         let idle = jka_assets::animation::animation_index("BOTH_STAND1").unwrap() as i32;

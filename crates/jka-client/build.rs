@@ -49,21 +49,19 @@ fn main() {
         );
     }
 
-    println!("cargo:rerun-if-changed=native");
-    println!("cargo:rerun-if-changed=../../vendor/ealman");
-    cc::Build::new()
-        .cpp(true).std("c++17").define("EAXMANVERSION", "3")
-        .include("../../vendor/ealman")
-        .files(["native/eal_scene.cpp", "../../vendor/ealman/EalMan.cpp", "../../vendor/ealman/Chunk.cpp"])
-        .flag_if_supported("/EHsc")
-        .compile("djk_eal_scene");
-
     if let Err(error) = build_windows_icon() {
         panic!("failed to embed ../../icon.png as the DinurdoJK executable icon: {error}");
     }
 
+    // Import by name is delay-loaded: startup preloads phonon.dll from an
+    // absolute dependencies path before audionimbus is first called.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bin=DinurdoJK=/DELAYLOAD:phonon.dll");
+        println!("cargo:rustc-link-lib=delayimp");
+    }
+
     if let Err(error) = copy_steam_audio_runtime_dll() {
-        println!("cargo:warning=could not stage phonon.dll next to the executable: {error}");
+        println!("cargo:warning=could not stage phonon.dll in DinurdoJK/dependencies: {error}");
     }
 }
 
@@ -114,9 +112,8 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 
 /// audionimbus-sys auto-installs Steam Audio's `phonon.dll` into its own
 /// build-script OUT_DIR, but Cargo never copies a dependency's runtime DLL
-/// next to the final executable. Without this, the built binary starts and
-/// immediately fails with "the code execution cannot proceed because
-/// phonon.dll was not found" the moment it touches the audionimbus FFI.
+/// into the game's dependencies directory. The MSVC import is delay-loaded;
+/// runtime startup preloads the exact DLL path before the first Steam Audio call.
 fn copy_steam_audio_runtime_dll() -> Result<(), Box<dyn std::error::Error>> {
     // OUT_DIR is target/<profile>/build/DinurdoJK-<hash>/out; the profile
     // directory (where the .exe lands) is three levels up from there.
@@ -151,7 +148,9 @@ fn copy_steam_audio_runtime_dll() -> Result<(), Box<dyn std::error::Error>> {
         // `cargo check`, or Steam Audio was supplied another way.
         return Ok(());
     };
-    let destination = profile_dir.join("phonon.dll");
+    let dependencies = profile_dir.join("DinurdoJK").join("dependencies");
+    fs::create_dir_all(&dependencies)?;
+    let destination = dependencies.join("phonon.dll");
     fs::copy(&source, &destination)?;
     println!("cargo:rerun-if-changed={}", source.display());
     Ok(())

@@ -2,7 +2,7 @@
 //! GPU capture readback and encoding profiles as the rest of the client.
 //! The stage is intentionally isolated: nothing here spawns network entities.
 use crate::app::{App, FrontendPage, Instant, RenderCommand};
-use crate::app::demos::video_export::{adjacent_ffmpeg_path, DemoVideoPreset};
+use crate::app::demos::video_export::{dependency_ffmpeg_path, DemoVideoPreset};
 use std::{io::Write, path::PathBuf, process::{Child, ChildStdin, Command, Stdio}};
 use image::ImageEncoder;
 use super::render_studio_camera::{StudioCameraRig, StudioCameraRigRuntime};
@@ -317,7 +317,7 @@ fn finish_studio_export_blocking(mut export: RenderStudioExport) -> StudioExport
         (||->Result<(),String> {
             let video=export.encoded_video.as_ref().ok_or("Encoded video was lost")?;
             let wav=export.audio_wav.as_ref().ok_or("Captured audio WAV was lost")?;
-            let ffmpeg=adjacent_ffmpeg_path().ok_or("ffmpeg.exe missing at mux stage")?;
+            let ffmpeg=dependency_ffmpeg_path().ok_or("ffmpeg.exe missing at mux stage")?;
             let mut command=Command::new(ffmpeg);
             command.args(["-hide_banner","-loglevel","error","-y"])
                 .arg("-i").arg(video).arg("-i").arg(wav)
@@ -842,13 +842,25 @@ impl Default for RenderStudio {
     }
 }
 
+/// Studio saber choice onto a player's client info.
+pub(in crate::app) fn apply_studio_sabers(
+    sabers: &super::render_studio_timeline::StudioSabers,
+    info: &mut crate::cgame::ClientInfo,
+) {
+    info.saber_name = sabers.names[0].clone();
+    info.saber2_name = sabers.names[1].clone();
+    info.saber_color = sabers.colors[0];
+    info.saber2_color = sabers.colors[1];
+    info.definition_saber_colors = false;
+}
+
 impl RenderStudio {
     pub fn actor_with_sabers(&self, lane: usize) -> bool {
         self.timeline.lane_sabers.get(lane).and_then(Option::as_ref)
             .map_or(self.with_sabers, |sabers| sabers.enabled)
     }
     pub fn apply_actor_sabers(&self, lane: usize, info: &mut crate::cgame::ClientInfo) {
-        if let Some(Some(sabers)) = self.timeline.lane_sabers.get(lane) { sabers.apply(info); }
+        if let Some(Some(sabers)) = self.timeline.lane_sabers.get(lane) { apply_studio_sabers(sabers, info); }
     }
     pub fn actor_center(&self, zoom: f32) -> [f32;3] {
         let time=self.timeline_time();
@@ -2086,8 +2098,8 @@ impl App {
             self.render_studio.status = "Add an animation or demo clip before exporting".into();
             return;
         }
-        let Some(ffmpeg) = adjacent_ffmpeg_path() else {
-            self.render_studio.status = "Place ffmpeg.exe next to DinurdoJK.exe".into();
+        let Some(ffmpeg) = dependency_ffmpeg_path() else {
+            self.render_studio.status = "Place ffmpeg.exe in DinurdoJK/dependencies/".into();
             return;
         };
         if let Some(codec) = self.render_studio.preset.nvenc_codec() {
@@ -2206,8 +2218,8 @@ impl App {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
         let output = folder.join(format!("studio_{stamp}.png"));
-        if self.render_studio.screenshot_depth && adjacent_ffmpeg_path().is_none() {
-            self.render_studio.status = "ffmpeg.exe required next to game for depth EXR".into();
+        if self.render_studio.screenshot_depth && dependency_ffmpeg_path().is_none() {
+            self.render_studio.status = "ffmpeg.exe required in DinurdoJK/dependencies/ for depth EXR".into();
             return;
         }
         let current_time = self.render_studio.timeline_time();
@@ -2404,7 +2416,7 @@ impl App {
                 let pixels = depth.ok_or("Depth capture returned no depth pixels")?;
                 let depth_path = output.with_file_name(format!("{}_depth.exr",
                     output.file_stem().and_then(|name| name.to_str()).unwrap_or("studio")));
-                let ffmpeg = adjacent_ffmpeg_path().ok_or("ffmpeg.exe required to write depth EXR")?;
+                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe required to write depth EXR")?;
                 let mut child = Command::new(ffmpeg)
                     .args(["-hide_banner", "-loglevel", "error", "-y",
                         "-f", "rawvideo", "-pix_fmt", "grayf32le"])
@@ -2528,7 +2540,7 @@ impl App {
                 Some(_) => {}
             }
             if export.child.is_none() {
-                let ffmpeg = adjacent_ffmpeg_path().ok_or("ffmpeg.exe disappeared")?;
+                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe disappeared")?;
                 let mut command = Command::new(ffmpeg);
                 command.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgra"])
                     .arg("-s").arg(format!("{width}x{height}"))
@@ -2608,7 +2620,7 @@ impl App {
                 let pixels = depth_f32le.ok_or("Studio depth readback missing")?;
                 if pixels.len() != color_bytes { return Err("Studio depth readback size mismatch".into()); }
                 if export.depth_child.is_none() {
-                    let ffmpeg = adjacent_ffmpeg_path().ok_or("ffmpeg.exe not found for depth")?;
+                    let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe not found for depth")?;
                     let output = export.depth_dir.as_ref().ok_or("Missing depth output directory")?
                         .join("depth_%06d.exr");
                     let mut child = Command::new(ffmpeg)

@@ -422,9 +422,5 @@ impl RaceGhost {
 }
 
 fn playerstate_vec3(state: &PlayerState, base: &str) -> Option<[f32; 3]> {
-    Some([
-        state.field_f32(&format!("{base}[0]"))?,
-        state.field_f32(&format!("{base}[1]"))?,
-        state.field_f32(&format!("{base}[2]"))?,
-    ])
+    state.field_vec3(base)
 }

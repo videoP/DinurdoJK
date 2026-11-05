@@ -30,9 +30,7 @@ pub(in crate::scene) fn decode_lightgrid_direction(lat_long: [u8; 2]) -> [f32; 3
     [render[0] / length, render[1] / length, render[2] / length]
 }
 
-pub(in crate::scene) fn light_luminance(rgb: [f32; 3]) -> f32 {
-    rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
-}
+pub(in crate::scene) use jka_render_core::light::light_luminance;
 
 pub(in crate::scene) fn smoothstep_range(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);

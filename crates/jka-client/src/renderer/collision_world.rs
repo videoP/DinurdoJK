@@ -1,6 +1,6 @@
-//! Competitive world A/B. Indexed compiled BSP visible-surface mesh,
-//! flat directional shading and no BSP material or lightmap bindings.
-//! All ordinary dynamic player and weapon presentation stays unchanged.
+//! Competitive world A/B. Shitter reuses the normal world BSP GPU geometry,
+//! PVS, index ranges and indirect draw calls, with a flat no-texture shader.
+//! Steam Audio and gameplay collision are independent of this path.
 use super::{camera_depth_compare, depth_format, PvsMode, Renderer};
 use crate::scene;
 use std::sync::{mpsc, Arc};
@@ -8,6 +8,49 @@ use std::path::PathBuf;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use wgpu::util::DeviceExt;
+
+/// One tiny indirect stream for the native BSP geometry. Allocated lazily only
+/// while Shitter is active. No duplicate vertex/index mesh is ever uploaded.
+pub(in crate::renderer) struct NativeFlatDraw {
+    pub buffer: wgpu::Buffer,
+    pub capacity: usize,
+    pub count: u32,
+    uploaded: Vec<u8>,
+}
+
+/// The original BSP PVS/area/frustum-selected draw list is already available.
+/// Only the draw arguments are compacted, never the geometry itself. Skip the
+/// queue upload when the list is unchanged, including stationary-camera frames.
+pub(in crate::renderer) fn update_native_flat_draw(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cached: &mut Option<NativeFlatDraw>,
+    draws: &[super::DrawIndexedIndirectArgs],
+) {
+    let Ok(count) = u32::try_from(draws.len()) else { return; };
+    if count == 0 {
+        if let Some(cached) = cached.as_mut() { cached.count = 0; }
+        return;
+    }
+    let bytes = bytemuck::cast_slice(draws);
+    if cached.as_ref().is_none_or(|cached| cached.capacity < draws.len()) {
+        let capacity = draws.len().next_power_of_two();
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Native BSP Shitter multi-draw arguments"),
+            size: (capacity * std::mem::size_of::<super::DrawIndexedIndirectArgs>()) as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        *cached = Some(NativeFlatDraw { buffer, capacity, count: 0, uploaded: Vec::new() });
+    }
+    let cached = cached.as_mut().expect("native flat indirect buffer allocated");
+    if cached.uploaded.as_slice() != bytes {
+        queue.write_buffer(&cached.buffer, 0, bytes);
+        cached.uploaded.clear();
+        cached.uploaded.extend_from_slice(bytes);
+    }
+    cached.count = count;
+}
 
 /// A spatially bounded contiguous index range. Culling it costs no GPU memory
 /// copies and never uploads a new per-frame index buffer.
@@ -243,29 +286,38 @@ impl Renderer {
             return;
         }
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Collision-only shaded BSP shader"),
+            label: Some("Native BSP flat Shitter shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../collision_world.wgsl").into()),
         });
         let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Collision-only BSP pipeline layout"),
+            label: Some("Native BSP flat Shitter pipeline layout"),
             bind_group_layouts: &[Some(&self.camera_layout)],
             immediate_size: 0,
         });
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Collision-only BSP pipeline"),
+            label: Some("Native BSP flat Shitter pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
+                // Read position and normal directly from existing GpuVertex.
+                // Both sources refer to the NORMAL BSP vertex/index buffers.
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 16,
+                    array_stride: std::mem::size_of::<scene::GpuVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: std::mem::offset_of!(scene::GpuVertex, normal) as u64,
+                            shader_location: 1,
+                        },
+                    ],
                 })],
             },
             primitive: wgpu::PrimitiveState {
