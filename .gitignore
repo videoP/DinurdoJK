@@ -4,7 +4,9 @@
 /.ocean-work/
 /base/
 /assets/temp
-/scripts/
+# Ignore scripts except the GitHub release signer.
+/scripts/*
+!/scripts/make_signed_release.py
 /.codex/
 *.zip
 /tools/
