@@ -7,6 +7,9 @@
 # Ignore scripts except the GitHub release signer.
 /scripts/*
 !/scripts/make_signed_release.py
+!/scripts/build-cache-report.ps1
+!/scripts/ensure-smaa-vendor.ps1
+!/scripts/ensure-openal-runtime.ps1
 /.codex/
 *.zip
 /tools/
