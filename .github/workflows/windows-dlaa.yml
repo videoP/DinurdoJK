@@ -8,7 +8,7 @@ on:
 # A new Cargo version publishes once; subsequent same-version pushes are skipped.
 concurrency:
   group: dinurdojk-signed-windows-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read

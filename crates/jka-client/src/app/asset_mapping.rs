@@ -399,6 +399,14 @@ impl App {
     fn save_asset_mapping(&mut self,restart:bool) {
         let Some(state)=self.asset_mapping.as_ref() else {return;};
         let result=state.proposed(&self.base,&self.fs_roots).and_then(|proposed| {
+            // Creating the explicitly selected client override is not a game
+            // asset migration. It stays client-owned and is never a write root
+            // for configs, demos, screenshots, or downloaded game files.
+            if let Some(name)=proposed.forcegame.as_deref() {
+                let directory=jka_assets::pk3::dinurdojk_directory_for(&self.base,&proposed).join(name);
+                std::fs::create_dir_all(&directory).map_err(|error|
+                    format!("Cannot create client override {}: {error}",directory.display()))?;
+            }
             // Existing INI store and no live VFS remount. Root paths are never
             // redirected into base/ and forcegame never becomes a write root.
             crate::filesystem_paths::save(&self.base,&proposed)?;

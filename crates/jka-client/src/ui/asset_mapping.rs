@@ -99,7 +99,9 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
     let (w,h)=(width.max(1) as f32,height.max(1) as f32);
     // Scale the *content* as well as the geometry on high-DPI displays.  The
     // original 1.17 cap left 1440p/4K text physically tiny on screen.
-    let s=(w/1500.0).min(h/850.0).clamp(0.80,1.72);
+    // Slightly more compact than the initial legibility pass, without
+    // reverting to the original undersized typography.
+    let s=(w/1500.0).min(h/850.0).clamp(0.80,1.72)*0.95;
     let mw=(w-26.0*s).max(1.0).min(1200.0*s);
     let gap=16.0*s;
     let wide = (mw-gap)*0.5 >= 470.0*s;
@@ -301,6 +303,7 @@ fn status_line(out:&mut Vec<UiVertex>,font:&UiText<'_>,b:Bounds,message:&str,
     color:[f32;4],w:u32,h:u32,s:f32) {
     let background=if color==GREEN {[0.039,0.145,0.087,0.92]}
         else if color==RED {[0.21,0.065,0.074,0.92]}
+        else if color==AMBER {[0.18,0.13,0.06,0.94]}
         else {[0.067,0.09,0.12,0.94]};
     fill(out,b,background,w,h);
     rect(out,b[0],b[1],4.0*s,b[3],color,w,h);
@@ -380,16 +383,17 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
             } else if state.force_status==Some(true) {
                 ("FOUND  /  DinurdoJK override directory exists",GREEN)
             } else {
-                ("NOT FOUND  /  DinurdoJK override directory is missing",RED)
+                ("NEW  /  override folder will be created on save",AMBER)
             };
             status_line(out,&font,row.status,status,color,w,h,s);
         }
     }
     if visible(l.retail,l.viewport) {
         let found=state.retail.iter().filter(|x|**x).count();
-        line(out,&font,[l.retail[0],l.retail[1],l.retail[2],27.0*s],
-            &format!("JKA RETAIL ARCHIVES  /  {found} OF 4 FOUND"),17.0*s,
-            if found==4 {GREEN}else{RED});
+        // Same filled, color-coded status treatment as the JK2 retail checks.
+        status_line(out,&font,[l.retail[0],l.retail[1],l.retail[2],27.0*s],
+            &format!("JKA RETAIL  /  {found} OF 4 ARCHIVES FOUND"),
+            if found==4 {GREEN}else{RED},w,h,s);
         let gap=5.0*s;
         let per=((l.retail[2]-3.0*gap)/4.0).max(1.0);
         for i in 0..4 {
