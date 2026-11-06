@@ -30,15 +30,21 @@ app_cvars! {
     }
     APP_R_BLUECLOUDSHADOWMODE {
         runtime: CvarDef::new("r_blueCloudShadowMode", "0", "0..1",
-            "0 native; 1 bypass distant Beer attenuation in cloud lighting/shafts (diagnostic). Shadow-map generation and ground shadows continue.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            "0 native; 1 no distant Beer self-shadowing in cloud lighting/shafts (keeps low-sun and night clouds lit; skips the cascade passes). Ground shadows continue.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.blue_water_environment.cloud_shadow_mode as i32),
             |app, value| {
                 let CvarValue::Int(value) = value else { unreachable!() };
                 app.video.blue_water_environment.cloud_shadow_mode = value as u8;
-                app.sync_post_effects(); app.publish_ui(); Ok(())
+                app.sync_post_effects(); app.mark_config_dirty(); app.publish_ui(); Ok(())
             }),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.blue_water_environment.cloud_shadow_mode = v.min(1); }
+            }),
+            archive: Some((36367, |state| state.video.blue_water_environment.cloud_shadow_mode.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: []
     }
     APP_R_BLUECLOUDSUNSTEPS {
@@ -82,7 +88,7 @@ app_cvars! {
     }
     APP_R_BLUECLOUDSHADOWFAR {
         runtime: CvarDef::new("r_blueCloudShadowFar", "0", "0..200000",
-            "Beer cascade fitting distance in metres: 0 native camera; try 10000/60000/200000. Independent fitting projection preserves scene depth. Larger ranges reduce shadow texel density.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            "Beer cascade fitting distance in metres: 0 native 30 km (independent of distancecull); try 10000/60000/200000. Independent fitting projection preserves scene depth. Larger ranges reduce shadow texel density.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.blue_water_environment.cloud_shadow_far.to_string()),
             |app, value| App::cvar_set_bluecloud_shadow_far(app, APP_R_BLUECLOUDSHADOWFAR.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_bluecloud_shadow_far, None),
@@ -300,47 +306,105 @@ app_cvars! {
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.night_sky=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27327,|state|state.video.blue_water_environment.night_sky.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_night_sky(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.night_sky=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
+    APP_R_BLUESKYSUNSIZE {
+        runtime:CvarDef::new("r_blueSkySunSize","1","0.1..30","Apparent size of the Blue Water sun disc and corona (1 upstream); sunlight unchanged",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.sun_size.to_string()),|app,value|App::cvar_set_bluesky_sun_size(app,APP_R_BLUESKYSUNSIZE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_sun_size,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.sun_size=v.clamp(0.1, 30.0);}}}),archive:Some((36368,|state|state.video.blue_water_environment.sun_size.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_sun_size(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.sun_size=App::parse_cvar_finite(name,value)?.clamp(0.1,30.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONSIZE {
+        runtime:CvarDef::new("r_blueSkyMoonSize","1","0.1..30","Apparent size of the Blue Water moon disc and halo (1 upstream); moonlight unchanged",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_size.to_string()),|app,value|App::cvar_set_bluesky_moon_size(app,APP_R_BLUESKYMOONSIZE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_size,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_size=v.clamp(0.1, 30.0);}}}),archive:Some((36369,|state|state.video.blue_water_environment.moon_size.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_size(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_size=App::parse_cvar_finite(name,value)?.clamp(0.1,30.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
 
     APP_R_SKYBACKEND {
         runtime: CvarDef::new("r_skyBackend", "0", "0|1",
-            "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting. Fastsky and Star Nest remain separate archived compatibility cvars.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.sky_backend as i32),
             |app, value| {
                 let CvarValue::Int(backend) = value else { unreachable!() };
                 app.video.sky_backend = backend as u8;
                 app.sync_post_effects();
+                app.mark_config_dirty();
                 app.publish_ui();
                 Ok(())
             }),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() { settings.sky_backend = mode.min(1); }
+            }),
+            archive: Some((36370, |state| state.video.sky_backend.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: []
     }
     APP_R_CLOUDBACKEND {
         runtime: CvarDef::new("r_cloudBackend", "0", "0|1",
-            "0 JKA volumetric clouds; 1 original Blue Water cloud march, reconstruction and shadows.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            "0 JKA volumetric clouds; 1 original Blue Water cloud march, reconstruction and shadows. r_clouds is the master enable.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.cloud_backend as i32),
             |app, value| {
                 let CvarValue::Int(backend) = value else { unreachable!() };
                 app.video.cloud_backend = backend as u8;
-                app.sync_post_effects(); app.publish_ui(); Ok(())
+                app.sync_post_effects(); app.mark_config_dirty(); app.publish_ui(); Ok(())
             }),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() { settings.cloud_backend = mode.min(1); }
+            }),
+            archive: Some((36371, |state| state.video.cloud_backend.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: []
     }
     APP_R_CLOUDPORTALDEPTH {
         runtime: CvarDef::new("r_cloudPortalDepth", "0", "0|1|2",
             "Sky-portal geometry vs volumetric clouds. 0 clouds draw over portal geometry; 1 depth-only redraw of the portal view; 2 reuse the portal pass depth (no extra draw, needs MSAA off).",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None,
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.cloud_portal_depth as i32),
             |app, value| {
                 let CvarValue::Int(mode) = value else { unreachable!() };
                 app.video.cloud_portal_depth = mode as u8;
-                app.sync_post_effects(); app.publish_ui(); Ok(())
+                app.sync_post_effects(); app.mark_config_dirty(); app.publish_ui(); Ok(())
             }),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() { settings.cloud_portal_depth = mode.min(2); }
+            }),
+            archive: Some((36372, |state| state.video.cloud_portal_depth.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: []
+    }
+    APP_R_RELIGHTTIME {
+        runtime: CvarDef::new("r_relightTime", "15", "3..27",
+            "Simulated time of day for the Relighting slider; 3 = 3 AM, 15 = 3 PM, 27 = next 3 AM. Updates sun and moon positions, not moon phase, baked lighting, sky mode or shadow mode.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.relight_time.to_string()),
+            |app, value| App::cvar_set_relighttime(app, APP_R_RELIGHTTIME.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_relighttime, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(hour) = value.trim().parse::<f32>() {
+                    if hour.is_finite() { settings.relight_time = hour.clamp(3.0, 27.0); }
+                }
+            }),
+            archive: Some((36373, |state| state.video.relight_time.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_relighttime(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let hour = Self::parse_cvar_finite(name, value)? as f32;
+                    if !(3.0..=27.0).contains(&hour) { return Err(format!("{name}: expected 3..27")); }
+                    self.set_relighting_time(hour);
+                    Ok(())
+                }
+            }
+        ]
     }
     APP_R_CLOUDAERIAL {
         runtime: CvarDef::new(

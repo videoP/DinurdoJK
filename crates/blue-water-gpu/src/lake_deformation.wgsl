@@ -44,7 +44,9 @@ fn jka_lake_reflection(world: vec3<f32>, up: vec3<f32>, fallback: vec3<f32>) -> 
     if projected.w <= 0.0 { return fallback; }
     let uv = projected.xy / projected.w * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) { return fallback; }
-    return textureSampleLevel(jka_lake_planar, jka_lake_planar_sampler, uv, i32(lake.reflection.x), 0.0).rgb;
+    let reflected = textureSampleLevel(jka_lake_planar, jka_lake_planar_sampler, uv, i32(lake.reflection.x), 0.0);
+    // Sky the view left empty (alpha -1, black) under the Blue Water sky: the lake's own sky.
+    return reflected.rgb + fallback * (1.0 - clamp(reflected.a + 1.0, 0.0, 1.0));
 }
 
 // Lake-local SSR reads the opaque copy taken before the water draw. It never

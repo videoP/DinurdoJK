@@ -20,9 +20,11 @@ impl App {
         let e = crate::blue_water_environment::Settings::default();
         let mut flags = vec![
             v.sky_backend != d.sky_backend,
+            v.fast_sky != d.fast_sky,
             v.sky_fractal_override != d.sky_fractal_override,
             v.sun_visibility != d.sun_visibility,
             s.moon_custom != e.moon_custom,
+            s.quality != e.quality,
             differs(s.moon_phase, e.moon_phase),
             s.moon_intensity_custom != e.moon_intensity_custom,
             s.moon_intensity_custom && differs(s.moon_intensity, e.moon_intensity),
@@ -34,6 +36,8 @@ impl App {
             differs(s.mie_g, e.mie_g),
             differs(s.multiple, e.multiple),
             differs(s.night_sky, e.night_sky),
+            differs(s.sun_size, e.sun_size),
+            differs(s.moon_size, e.moon_size),
         ];
         if v.sun_override {
             flags.extend([
@@ -53,6 +57,8 @@ impl App {
         let e = crate::blue_water_environment::Settings::default();
         let v = &mut self.video;
         v.sky_backend = d.sky_backend;
+        // r_fastsky also needs its dedicated render-thread command.
+        let reset_fastsky = v.fast_sky != d.fast_sky;
         v.sky_fractal_override = d.sky_fractal_override;
         v.sun_yaw = d.sun_yaw;
         v.sun_pitch = d.sun_pitch;
@@ -60,6 +66,7 @@ impl App {
         v.sun_color = d.sun_color;
         v.sun_visibility = d.sun_visibility;
         let s = &mut v.blue_water_environment;
+        s.quality = e.quality;
         s.moon_phase = e.moon_phase;
         s.moon_intensity = e.moon_intensity;
         s.moon_intensity_custom = e.moon_intensity_custom;
@@ -72,7 +79,10 @@ impl App {
         s.mie_g = e.mie_g;
         s.multiple = e.multiple;
         s.night_sky = e.night_sky;
+        s.sun_size = e.sun_size;
+        s.moon_size = e.moon_size;
         // Reset appearance without changing the Relight map master switch.
+        if reset_fastsky { let _ = self.set_console_cvar("r_fastsky", "0"); }
         self.sun_custom_initialized = true;
         self.baked_sun_debug_view = 0;
         self.sun_ray_until = None;
@@ -117,12 +127,23 @@ impl App {
 
         // ------------------------------------------------------------ sky --
         theme::section(ui, "SKY", "Which sky is drawn behind the map.");
-        theme::row(ui, "Sky renderer", "The map's authored BSP sky, or the Blue Water atmosphere. Blue Water also unlocks sky-referenced auto exposure (Color page, on by default) and sky world illumination on the Relighting page (off by default).", theme::Reset::None, |ui| {
-            for (backend, name) in [(0, "JKA sky"), (1, "Blue Water sky")] {
-                if theme::chip(ui, name, self.video.sky_backend == backend).clicked()
-                    && self.video.sky_backend != backend
-                {
-                    self.video.sky_backend = backend;
+        let sky_mode = if self.video.fast_sky != 0 {
+            0 // r_fastsky wins over authored/Blue Water rendering
+        } else if self.video.sky_fractal_override {
+            3
+        } else if self.video.sky_backend == 1 {
+            2
+        } else {
+            1
+        };
+        theme::row(ui, "Sky mode", "Fastsky uses r_fastsky 1. Vanilla draws authored BSP sky stages. Blue Water adds its atmosphere; Star Nest replaces BSP sky faces with the fractal renderer. These modes are exclusive in the UI; clouds are chosen separately.", theme::Reset::None, |ui| {
+            for (mode, name) in [(0, "Fastsky"), (1, "Vanilla"), (2, "Blue Water"), (3, "Star Nest")] {
+                if theme::chip(ui, name, sky_mode == mode).clicked() && (sky_mode != mode || (mode == 0 && self.video.fast_sky != 1)) {
+                    // The fastsky cvar also sends a specialized render-thread command.
+                    let fast = if mode == 0 { "1" } else { "0" };
+                    let _ = self.set_console_cvar("r_fastsky", fast);
+                    self.video.sky_backend = u8::from(mode == 2);
+                    self.video.sky_fractal_override = mode == 3;
                     self.sync_post_effects();
                     self.mark_config_dirty();
                     self.publish_ui();
@@ -130,20 +151,20 @@ impl App {
                 ui.add_space(3.0);
             }
         });
-        theme::row(
-            ui,
-            "Star Nest sky (experimental)",
-            "Replaces BSP skybox and sky cloud stages with a procedural fractal nebula. Optional A/B test; real-world parallax, 12 x 10 shader loops. Does not replace volumetric clouds. Off by default.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(value) = theme::switch(ui, self.video.sky_fractal_override) {
-                    self.video.sky_fractal_override = value;
-                    self.sync_post_effects();
-                    self.mark_config_dirty();
-                    self.publish_ui();
+        if self.video.sky_backend == 1 && self.video.fast_sky == 0 {
+            theme::row(ui, "Sky quality", "Blue Water sky lookup tables, environment bake, and native weather budget. Cloud quality is independent on the Clouds page.", theme::Reset::None, |ui| {
+                for (i, name) in ["Low", "Medium", "High", "Ultra"].iter().enumerate() {
+                    if theme::chip(ui, name, self.video.blue_water_environment.quality == i as u8).clicked() {
+                        if self.video.blue_water_environment.quality != i as u8 {
+                            self.video.blue_water_environment.quality = i as u8;
+                            self.sync_post_effects();
+                            self.mark_config_dirty();
+                            self.publish_ui();
+                        }
+                    }
                 }
-            },
-        );
+            });
+        }
 
         // ------------------------------------------------------------ sun --
         theme::section(ui, "SUN", "Sun position and appearance. Relight map enables editing; live map illumination is configured on the Relighting page.");

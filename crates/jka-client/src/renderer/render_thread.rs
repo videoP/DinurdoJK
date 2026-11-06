@@ -172,6 +172,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetEntityMarkers(..) => "SetEntityMarkers",
         RenderCommand::SetCoastalDebugMesh(..) => "SetCoastalDebugMesh",
         RenderCommand::SetCoastalWater { .. } => "SetCoastalWater",
+        RenderCommand::SetRelightBakeDeferred(..) => "SetRelightBakeDeferred",
         RenderCommand::SetSunRayPreview { .. } => "SetSunRayPreview",
         RenderCommand::SetPvsMode(..) => "SetPvsMode",
         RenderCommand::SetFacePlaneCull(..) => "SetFacePlaneCull",
@@ -706,6 +707,13 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         entity_sun_lighting: effective_lighting.entity_sun_lighting,
         baked_sun_removal: effective_lighting.baked_sun_removal,
         baked_sun_cache: video.baked_sun_cache,
+        lightmap_smoothing: video.lightmap_smoothing,
+        baked_sun_aa: video.baked_sun_aa,
+        lightmap_signal: video.lightmap_signal,
+        sun_receiver_normals: video.sun_receiver_normals,
+        sun_terminator: video.sun_terminator,
+        sky_world_bake: video.sky_world_bake,
+        bake_threads: video.bake_threads,
         baked_sun_shadow_map: video.baked_sun_shadow_map,
         baked_sun_edge_softness: video.baked_sun_edge_softness,
         baked_sun_direct_limit: video.baked_sun_direct_limit,
@@ -967,6 +975,8 @@ pub(in crate::renderer) fn render_thread_main(
         adapter_type: format!("{:?}", renderer.adapter.get_info().device_type),
     });
     let mut companion_renderers: HashMap<CompanionId, CompanionRenderThread> = HashMap::new();
+    // Coalesce live static-sun bake progress; no event per ray or per frame.
+    let mut last_sun_bake_status: Option<(u32, crate::renderer::SunBakeStage)> = None;
 
     let mut stats_started = Instant::now();
     // Start of the current cap interval. Pacing from a fixed cadence rather than
@@ -1505,6 +1515,9 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.coastal_pool = pool;
                         renderer.coastal_atlas = atlas;
                         renderer.upstream_shore_source = upstream_source;
+                    }
+                    Ok(RenderCommand::SetRelightBakeDeferred(deferred)) => {
+                        renderer.sun_bake_deferred = deferred;
                     }
                     Ok(RenderCommand::SetSunRayPreview { enabled, debug_mode }) => {
                         renderer.debug_volumes.sun_ray_enabled = enabled;
@@ -2469,6 +2482,14 @@ pub(in crate::renderer) fn render_thread_main(
                 }
             }
         };
+        let sun_status = renderer.static_sun_bake_status();
+        if last_sun_bake_status != Some(sun_status) {
+            last_sun_bake_status = Some(sun_status);
+            let _ = proxy.send_event(UserEvent::SunBakeProgress {
+                completed: sun_status.0,
+                stage: sun_status.1,
+            });
+        }
         if gamma_preparation.is_some() && render_result.is_ok() && !renderer.baked_brightness.busy {
             let generation = gamma_preparation.take().unwrap();
             let _ = proxy.send_event(UserEvent::GammaPrepared(generation));

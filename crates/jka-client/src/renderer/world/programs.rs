@@ -855,6 +855,7 @@ impl ProgramModules {
             None,
             Some(material),
             minimal,
+            false,
         )
     }
 }

@@ -273,6 +273,7 @@ pub struct Sky {
     camera_height: f64,
     sea_level: SeaLevel,
     light: state::Light,
+    moonlight: Option<f64>,
     time: f64,
     uniforms: SkyUniforms,
     dirty: Dirty,
@@ -646,6 +647,7 @@ impl Sky {
                 intensity: 0.0,
                 night: false,
             },
+            moonlight: None,
             time: 0.0,
             uniforms: SkyUniforms::default(),
             dirty: Dirty {
@@ -686,6 +688,7 @@ impl Sky {
         };
         // No deck: the fog is the clear sky's own.
         sky.uniforms.haze = [0.0, 1.0, 1.0, 0.0];
+        sky.uniforms.discs = [1.0, 1.0, 0.0, 0.0];
         sky.set_camera_height(0.03);
         sky.apply(&DEFAULT_SKY_SCENE);
         sky
@@ -751,7 +754,12 @@ impl Sky {
     fn light_the_sea(&mut self) {
         let scene = self.scene;
         let moon_elevation = self.model.moon.y.clamp(-1.0, 1.0).asin().to_degrees();
-        let moon_irradiance = DVec3::from(self.uniforms.moon_irradiance.map(f64::from));
+        // The moon's light on the scene: its phase's, or the set share of a full moon's (`set_moonlight`). The disc,
+        // its halo and the bake keep the phase's.
+        let moon_irradiance = match self.moonlight {
+            Some(share) => state::moon_tint() * (state::MOONLIGHT * share),
+            None => DVec3::from(self.uniforms.moon_irradiance.map(f64::from)),
+        };
         let (sun, moon) = model::sea_level_light(
             scene.sun_elevation,
             scene.sun_intensity,
@@ -940,6 +948,26 @@ impl Sky {
     /// stars and the Milky Way are not dimmed. Rides in `SkyUniforms.haze.z`.
     pub fn set_night_sky_brightness(&mut self, scale: f32) {
         self.uniforms.haze[2] = if scale.is_finite() { scale.clamp(0.0, 1.0) } else { 1.0 };
+    }
+
+    /// The apparent size of the sun's and the moon's discs on the dome, as multiples of the authored radius (the
+    /// corona and the halo widen with them). Appearance only: the light they cast, the bake and the moonlight keep
+    /// the authored discs. Rides in `SkyUniforms.discs`.
+    pub fn set_disc_scales(&mut self, sun: f32, moon: f32) {
+        let scale = |value: f32| if value.is_finite() { value.clamp(0.1, 30.0) } else { 1.0 };
+        self.uniforms.discs[0] = scale(sun);
+        self.uniforms.discs[1] = scale(moon);
+    }
+
+    /// The moon's light on the scene (the sea, the ships, the clouds' shadow) as a share of a full moon's, or none to
+    /// follow its phase. The disc, its halo and the environment bake keep the phase's light. Costs no bake.
+    pub fn set_moonlight(&mut self, share: Option<f64>) {
+        let share = share.map(|value| if value.is_finite() { value.max(0.0) } else { 1.0 });
+        if share == self.moonlight {
+            return;
+        }
+        self.moonlight = share;
+        self.light_the_sea();
     }
 
     /// The accumulated cloud drift (m, world XZ).

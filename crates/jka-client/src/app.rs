@@ -994,6 +994,8 @@ pub struct App {
     sun_ray_sent_mode: u8,
     /// Session-only live baked-sun visualization: 0 auto on drag, 1 removal, 2 visibility.
     baked_sun_debug_view: u8,
+    /// Temporary while holding the mouse on the Sky/Relighting page.
+    relight_bake_deferred: bool,
     ocean_settings_open: bool,
     authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     map_authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
@@ -1146,6 +1148,8 @@ pub struct App {
     display_transition_until: Option<Instant>,
     loading: Option<MapLoadingState>,
     static_ao_progress: Option<(u32, u32)>,
+    sun_bake_progress: Option<(u32, crate::renderer::SunBakeStage)>,
+    sun_bake_ready_at: Option<Instant>,
     preserve_game_state_on_next_map_upload: bool,
     renderer_restart_started: Option<Instant>,
     /// The renderer restart spans several event-loop turns. Unlike TaystJK's

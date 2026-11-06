@@ -356,6 +356,8 @@ pub struct VideoSettings {
     /// Master Relight map gate (r_relightMap; legacy alias r_sunOverride).
     /// False preserves authored illumination and retains saved relighting edits.
     pub sun_override: bool,
+    /// Simulated Relighting clock, 3 AM through the following 3 AM (3..27).
+    pub relight_time: f32,
     /// q3map azimuth in degrees: 0=east, 90=north.
     pub sun_yaw: f32,
     /// q3map elevation in degrees above the horizon.
@@ -377,6 +379,20 @@ pub struct VideoSettings {
     /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
     pub baked_sun_removal: f32,
     pub baked_sun_cache: bool,
+    /// 0 original bilinear, 1 bicubic reconstruction, 2 softened bicubic.
+    pub lightmap_smoothing: u8,
+    /// Bake-only static sunlight shadow-edge AA. 0=legacy, 1=edge filter, 2=2x2, 3=4x4.
+    pub baked_sun_aa: u8,
+    /// Session-only r_lightmapSignal: composed-lightmap signal debug view 0..8.
+    pub lightmap_signal: u8,
+    /// Session-only r_bakedSunNormals: 0 authored, 1 shared-edge, 2 auto-smooth.
+    pub sun_receiver_normals: u8,
+    /// Session-only r_bakedSunTerminator: curved-surface sun ray origins.
+    pub sun_terminator: bool,
+    /// Session-only r_skyWorldBake: 0 live, 1 baked, 2 baked + sky visibility.
+    pub sky_world_bake: u8,
+    /// 0 = original automatic worker counts, 1..32 = fixed workers for relighting bakes.
+    pub bake_threads: u8,
     pub baked_sun_shadow_map: bool,
     pub baked_sun_edge_softness: f32,
     pub baked_sun_direct_limit: f32,
@@ -901,6 +917,7 @@ impl Default for VideoSettings {
             fog_mode: FogMode::Off,
             fog_strength: 0.0,
             sun_override: false,
+            relight_time: 15.0,
             // Matches the renderer's legacy fallback direction when a map has no authored sun.
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
@@ -913,6 +930,13 @@ impl Default for VideoSettings {
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
             baked_sun_cache: true,
+            lightmap_smoothing: 0,
+            baked_sun_aa: 1,
+            lightmap_signal: 0,
+            sun_receiver_normals: 1,
+            sun_terminator: false,
+            sky_world_bake: 1,
+            bake_threads: 0,
             baked_sun_shadow_map: true,
             baked_sun_edge_softness: 2.5,
             baked_sun_direct_limit: 0.48,

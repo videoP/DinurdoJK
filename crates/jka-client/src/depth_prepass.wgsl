@@ -221,7 +221,12 @@ fn active_planar_for_surface(world_position: vec3<f32>) -> bool {
 }
 
 fn reflection_policy(world_position: vec3<f32>) -> vec4<f32> {
-    let ssr_eligible = select(0.0, 1.0, (material.header.z & 4194304u) != 0u);
+    // R >= 0.5 stays "SSR eligible". The quarter steps additionally mark
+    // lightmapped world (0.25 / 0.75): the Blue Water sky world-light pass skips
+    // those pixels when the composed lightmap already carries that light.
+    let lightmapped = (material.header.z & (2u | 8388608u | 16777216u)) != 0u || material.header.x == 1u;
+    let ssr_eligible = select(select(0.0, 0.25, lightmapped), select(1.0, 0.75, lightmapped),
+        (material.header.z & 4194304u) != 0u);
     let active_planar = select(0.0, 1.0, active_planar_for_surface(world_position));
     // Alpha is an Rgba8Unorm channel. Pack two exact bits into its four
     // representable thirds: bit 0 = reflection probe, bit 1 = BSP global fog.

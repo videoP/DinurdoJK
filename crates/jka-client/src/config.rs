@@ -2167,3 +2167,32 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod sky_cloud_archive_regression {
+    use super::*;
+
+    #[test]
+    fn selected_sky_and_cloud_modes_survive_config_roundtrip() {
+        let file = std::env::temp_dir().join(format!("djk-sky-cloud-{}-{:?}.cfg", std::process::id(), std::thread::current().id()));
+        let mut settings = VideoSettings::default();
+        settings.sky_backend = 1;
+        settings.cloud_backend = 1;
+        settings.cloud_portal_depth = 2;
+        settings.clouds = true;
+        settings.relight_time = 22.25;
+        save_video_settings(&file, settings, &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        for name in ["r_skyBackend", "r_cloudBackend", "r_cloudPortalDepth", "r_relightTime"] {
+            assert!(text.contains(&format!("seta {name} ")), "missing archived {name}");
+        }
+        let loaded = load_video_settings(&file);
+        assert_eq!(loaded.sky_backend, 1);
+        assert_eq!(loaded.cloud_backend, 1);
+        assert_eq!(loaded.cloud_portal_depth, 2);
+        assert!(loaded.clouds);
+        assert_eq!(loaded.relight_time, 22.25);
+        let _ = fs::remove_file(file);
+    }
+}

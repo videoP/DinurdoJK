@@ -357,7 +357,7 @@ impl Renderer {
                         &self.device, &self.surface_layout, &self.white, &self.missing,
                         &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
                         &self.pbr_repeat_sampler, &self.pbr_clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, detail_texture, &textures, &world.lightmaps, &[],
+                        &self.sky_sampler, detail_texture, &textures, &world.lightmaps, &[], &[],
                         &world.deluxemaps, &texture_clamp, primary_skybox, &marks,
                         &world.reflection_probes, stage, &material_buffer, &additive_uniforms,
                         fog_buffer, self.surface_deformation.buffer(),
@@ -368,7 +368,7 @@ impl Renderer {
                     create_fast_world_bind_group(
                         &self.device, &self.fast_surface_layout, &self.white, &self.missing,
                         &self.repeat_sampler, &self.clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, &textures, &world.lightmaps, &[], &texture_clamp,
+                        &self.sky_sampler, &textures, &world.lightmaps, &[], &[], &texture_clamp,
                         primary_skybox, &marks, stage, &material_buffer, &additive_uniforms,
                         self.surface_deformation.buffer(), self.surface_deformation.field_views(),
                         self.surface_deformation.field_sampler(),

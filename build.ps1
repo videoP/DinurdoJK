@@ -233,6 +233,14 @@ function Sync-IfDifferent([string]$Source, [string]$Destination) {
 $previousCargoIncremental = $env:CARGO_INCREMENTAL
 if ($Fast) { $env:CARGO_INCREMENTAL = '1' }
 if ($Faster) { $env:CARGO_INCREMENTAL = '0' }
+# The auto-updater's Ed25519 verification key is baked in at compile time. It is
+# the public half of the signing pair, so it is committed in update-public-key.hex.
+# An already-set variable (CI, or a local key override) wins. Restored in finally.
+$previousUpdateKey = $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX
+$updateKeyFile = Join-Path $PSScriptRoot 'update-public-key.hex'
+if (-not $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -and (Test-Path -LiteralPath $updateKeyFile)) {
+    $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX = ([System.IO.File]::ReadAllText($updateKeyFile)).Trim()
+}
 $cacheReport = New-CargoArtifactReport
 $cacheSnapshot = $null
 Push-Location $PSScriptRoot
@@ -360,6 +368,7 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = $existingEncoded
     $env:Path = $existingPath
     $env:CARGO_INCREMENTAL = $previousCargoIncremental
+    $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX = $previousUpdateKey
     $buildWallClock.Stop()
     $cargoSeconds = if ($null -ne $cargoBuildElapsed) { $cargoBuildElapsed.TotalSeconds } else { [double]0 }
     $preSeconds = if ($null -ne $beforeCargoSeconds) { $beforeCargoSeconds } else { $buildWallClock.Elapsed.TotalSeconds - $auditClock.Elapsed.TotalSeconds }

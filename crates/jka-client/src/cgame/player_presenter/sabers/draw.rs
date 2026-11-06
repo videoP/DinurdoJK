@@ -8,6 +8,20 @@ use crate::cgame::player_presenter::{
     SaberBladeLengthState, SaberDefinition, SaberThrowState, EF_DEAD, MAX_CLIENTS, WP_SABER,
 };
 
+/// One immutable saber colour per non-team mode, and a team colour in TFFA.
+/// Return the original JKA colour ID so the existing palette conversion stays shared.
+#[inline]
+fn shitter_saber_color(info: &crate::cgame::ClientInfo) -> i32 {
+    if info.gametype == crate::cgame::GT_TEAM {
+        match info.team {
+            crate::cgame::TEAM_RED => return crate::cgame::SABER_RED,
+            crate::cgame::TEAM_BLUE => return crate::cgame::SABER_BLUE,
+            _ => {}
+        }
+    }
+    3 // SABER_GREEN in the OpenJK saber-colour enum.
+}
+
 impl PlayerPresenter {
     /// The `clientInfo_t::saber[]` pair `WP_SetSaber` produces for this client.
     pub(in crate::cgame::player_presenter) fn equipped_sabers(
@@ -315,8 +329,11 @@ impl PlayerPresenter {
                     } else {
                         saber_color
                     };
-                let saber_color =
-                    blade_color(info, client_color, &blade, Some(self.saber_team_colors));
+                let saber_color = if crate::renderer::collision_world_only() {
+                    shitter_saber_color(info)
+                } else {
+                    blade_color(info, client_color, &blade, Some(self.saber_team_colors))
+                };
                 if i32::from(entity.number) == self.viewer_client && blade_index < 8 {
                     if let Some(debug) = self.viewer_anim_debug.as_mut() {
                         debug.blade_world[saber_num][blade_index] = Some(origin_world);
@@ -609,7 +626,11 @@ impl PlayerPresenter {
             } else {
                 info.saber_color
             };
-            let saber_color = blade_color(info, client_color, &blade, Some(self.saber_team_colors));
+            let saber_color = if crate::renderer::collision_world_only() {
+                shitter_saber_color(info)
+            } else {
+                blade_color(info, client_color, &blade, Some(self.saber_team_colors))
+            };
             if i32::from(owner.number) == self.viewer_client && blade_index < 8 {
                 if let Some(debug) = self.viewer_anim_debug.as_mut() {
                     debug.blade_world[0][blade_index] = Some(origin_world);
@@ -681,5 +702,25 @@ impl PlayerPresenter {
         }
 
         Ok(draws)
+    }
+}
+
+#[cfg(test)]
+mod shitter_saber_tests {
+    use super::shitter_saber_color;
+    use crate::cgame::{ClientInfo, GT_TEAM, SABER_BLUE, SABER_RED, TEAM_BLUE, TEAM_RED};
+
+    #[test]
+    fn shitter_saber_colors_use_green_in_ffa_and_red_blue_in_tffa() {
+        let mut info = ClientInfo::solo_kyle();
+        assert_eq!(shitter_saber_color(&info), 3);
+        info.team = TEAM_RED;
+        assert_eq!(shitter_saber_color(&info), 3, "FFA ignores team assignments");
+        info.gametype = GT_TEAM;
+        assert_eq!(shitter_saber_color(&info), SABER_RED);
+        info.team = TEAM_BLUE;
+        assert_eq!(shitter_saber_color(&info), SABER_BLUE);
+        info.team = 0;
+        assert_eq!(shitter_saber_color(&info), 3, "unknown team stays green");
     }
 }

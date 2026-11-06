@@ -50,23 +50,26 @@ const NIGHT_GLOW: vec3<f32> = vec3<f32>(0.75, 1.15, 1.9);
 // Share of the view along `direction` the moon's disc covers.
 fn moon_cover(direction: vec3<f32>, moon: vec3<f32>, pixel: f32) -> f32 {
     let offset = direction - moon;
-    return smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(sqrt(dot(offset, offset)) - DISC_RADIUS));
+    return smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(sqrt(dot(offset, offset)) - DISC_RADIUS * sky.discs.y));
 }
 
 // Limb-darkened sun and its corona along `direction`, behind the moon.
 fn sun_disc(direction: vec3<f32>, pixel: f32) -> vec3<f32> {
-    let reach = DISC_RADIUS + CORONA_WIDTH * 9.0;
+    // The host's apparent size (`sky.discs.x`) scales the disc and its corona together.
+    let radius = DISC_RADIUS * sky.discs.x;
+    let corona_width = CORONA_WIDTH * sky.discs.x;
+    let reach = radius + corona_width * 9.0;
     let offset = direction - sky.sun_direction;
     let angle2 = dot(offset, offset);
     if angle2 >= reach * reach {
         return vec3<f32>(0.0);
     }
     let angle = sqrt(angle2);
-    let r = min(angle / DISC_RADIUS, 1.0);
+    let r = min(angle / radius, 1.0);
     let mu = sqrt(1.0 - r * r);
     let limb = vec3<f32>(1.0) - SUN_LIMB * (1.0 - mu);
-    let edge = smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(angle - DISC_RADIUS));
-    let corona = exp(max(angle - DISC_RADIUS, 0.0) / -CORONA_WIDTH) * CORONA;
+    let edge = smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(angle - radius));
+    let corona = exp(max(angle - radius, 0.0) / -corona_width) * CORONA;
     return sky.sun_irradiance * ((limb * edge + corona) * SUN_DISC) * (1.0 - moon_cover(direction, sky.moon_direction, pixel));
 }
 
@@ -150,22 +153,25 @@ fn moon_albedo(p: vec2<f32>, pixels: f32) -> vec3<f32> {
 
 // The moon along `direction`: a sphere lit by the true sun, Lommel–Seeliger, earthshine and a tight halo.
 fn moon_disc(direction: vec3<f32>, pixel: f32) -> vec3<f32> {
-    let reach = DISC_RADIUS + MOON_HALO_WIDTH * 10.0;
+    // The host's apparent size (`sky.discs.y`) scales the disc and its halo together.
+    let radius = DISC_RADIUS * sky.discs.y;
+    let halo_width = MOON_HALO_WIDTH * sky.discs.y;
+    let reach = radius + halo_width * 10.0;
     let offset = direction - sky.moon_direction;
     let angle2 = dot(offset, offset);
     if angle2 >= reach * reach {
         return vec3<f32>(0.0);
     }
     let angle = sqrt(angle2);
-    let edge = smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(angle - DISC_RADIUS));
-    var result = sky.moon_surface * sky.moon_glow * exp(max(angle - DISC_RADIUS, 0.0) / -MOON_HALO_WIDTH) * (1.0 - edge);
+    let edge = smoothstep(-pixel * EDGE_PX, pixel * EDGE_PX, -(angle - radius));
+    var result = sky.moon_surface * sky.moon_glow * exp(max(angle - radius, 0.0) / -halo_width) * (1.0 - edge);
     if edge > 0.0 {
-        let p = vec2<f32>(dot(offset, sky.moon_right), dot(offset, sky.moon_up)) / DISC_RADIUS;
+        let p = vec2<f32>(dot(offset, sky.moon_right), dot(offset, sky.moon_up)) / radius;
         let z = sqrt(max(1.0 - dot(p, p), 0.0));
         let rough = mx_noise_float2(p * 9.3 + 2.2) * 0.03 + mx_noise_float2(p * 23.1) * 0.01;
         let lit = max(dot(vec3<f32>(p, z), sky.moon_sun) + rough, 0.0);
         let shade = lit / (lit + z + 1e-3) * 1.7 + lit * 0.15;
-        let albedo = moon_albedo(p, (1.0 / pixel) * (DISC_RADIUS * 2.0));
+        let albedo = moon_albedo(p, (1.0 / pixel) * (radius * 2.0));
         result += sky.moon_surface * albedo * (sky.earthshine * pow(z, 0.4) + shade * sky.moon_opposition) * edge;
     }
     return result;

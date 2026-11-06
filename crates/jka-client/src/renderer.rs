@@ -45,6 +45,18 @@ pub(crate) fn set_collision_world_only(enabled: bool) {
     COLLISION_WORLD_ONLY.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+// One optional universal BSP image for Shitter. No materials, lightmaps or
+// extra draw calls. A separate pipeline keeps the flat 0 path sample-free.
+static SHITTER_TEXTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn shitter_texture_enabled() -> bool {
+    SHITTER_TEXTURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn set_shitter_texture_enabled(enabled: bool) {
+    SHITTER_TEXTURE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Native Vulkan RGB565 swapchain A/B. No offscreen conversion or resolution change.
 static RGB565_REQUESTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static RGB565_EFFECTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -150,6 +162,18 @@ pub(crate) fn set_legacy_blend_mode(mode: u8) {
     LEGACY_BLEND_MODE.store(mode.min(4), std::sync::atomic::Ordering::Relaxed);
 }
 
+// Session-only planar reflection fill A/B: 0 full target, 1 scissor to the
+// reflector's screen rectangle, 2 scissor + depth mask of its screen polygon.
+static PLANAR_REFLECTION_MASK: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn planar_reflection_mask() -> u8 {
+    PLANAR_REFLECTION_MASK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_planar_reflection_mask(mode: u8) {
+    PLANAR_REFLECTION_MASK.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+}
 // Narrow trace flag bridge for ocean startup instrumentation.
 pub(crate) fn first_world_frame_trace() -> bool {
     diagnostics::perf_capture::first_world_frame_trace()
@@ -226,7 +250,7 @@ pub use api::{
     ClientFramePerf, CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
-    InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
+    InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand, SunBakeStage,
     RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     StudioSourceFrame, StudioSceneFrame, StudioSceneLighting,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
@@ -317,7 +341,8 @@ use lighting::shadow_resources::{
 use lighting::upload::{upload_reflection_probes, upload_static_light_grid, upload_voxel_probe_gi};
 use models::pipelines::{
     create_dynamic_model_pipeline_inner,
-    create_world_pipeline, create_world_pipeline_specialized, create_world_wireframe_pipeline,
+    create_reflection_world_pipeline, create_world_pipeline,
+    create_world_pipeline_specialized, create_world_wireframe_pipeline,
     world_base_fragment_entry,
     project_blob_shadow_mark,
 };
@@ -1209,6 +1234,17 @@ struct Renderer {
     entity_sun_lighting: bool,
     baked_sun_removal: f32,
     baked_sun_cache: bool,
+    lightmap_smoothing: u8,
+    baked_sun_aa: u8,
+    /// Session diagnostics: r_lightmapSignal, r_bakedSunNormals, r_bakedSunTerminator.
+    lightmap_signal: u8,
+    sun_receiver_normals: u8,
+    sun_terminator: bool,
+    /// r_skyWorldBake: 0 live screen pass, 1 baked, 2 baked with sky visibility.
+    sky_world_bake: u8,
+    bake_threads: u8,
+    /// UI drag guard: live sky and CSM remain responsive; static sun ray jobs wait.
+    sun_bake_deferred: bool,
     /// 0 off, 1 removal amount, 2 authored-sun visibility.
     baked_sun_debug_mode: u32,
     baked_sun_shadow_map: bool,

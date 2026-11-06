@@ -38,6 +38,22 @@ impl App {
                 self.set_sun_override(enabled, enabled);
             }
         });
+        ui.add_enabled_ui(self.video.sun_override, |ui| {
+            theme::section(ui, "TIME OF DAY", "Artistic 24-hour cycle; sunrise 6 AM, noon 12 PM, sunset 6 PM. Sun and moon positions update together; lunar phase and original map lighting stay independently adjustable.");
+            theme::row(ui, "Time", "3 AM to the following 3 AM. Moves the sun and moon along opposite arcs. Your selected Sky mode and shadow method are not changed.", theme::Reset::None, |ui| {
+                let mut time = self.video.relight_time;
+                let minutes = (((time % 24.0) * 60.0) / 15.0).round() as u32 * 15;
+                let hours = (minutes / 60) % 24;
+                let hh = hours % 12;
+                let readout = format!("{}:{:02} {}", if hh == 0 { 12 } else { hh }, minutes % 60, if hours < 12 { "AM" } else { "PM" });
+                if theme::slider_default(ui, &mut time, 3.0..=27.0, &readout, 15.0) {
+                    self.set_relighting_time((time * 4.0).round() * 0.25);
+                }
+            });
+            if self.video.sky_backend != 1 || self.video.fast_sky != 0 {
+                theme::hint(ui, "Blue Water Sky gives the clock a matching sunrise, sunset and night sky; other sky modes retain their own appearance.", theme::TEXT_DIM());
+            }
+        });
         if theme::ghost_button(ui, "OPEN SKY / SUN & MOON").clicked() {
             self.video_section = VideoSection::Sun;
         }
@@ -134,7 +150,7 @@ impl App {
                 if self.baked_slider(
                     ui,
                     "Subtract baked sunlight",
-                    "0 leaves baked lighting unchanged. 1 subtracts the full direct-sun estimate. Known compiler settings use the authored sun strength, color, direction and shadow sampling in the original lightmap UVs. Baked edge samples refine the projected soft shadow. Other surfaces use a measured fit or the conservative fallback below. This never adds the runtime sun; its intensity and CSM setting do not affect removal.",
+                    "Minimum baked-sun subtraction: 0 leaves authored lighting unchanged under clear skies; 1 removes the full direct-sun estimate. While relighting with volumetric clouds, coverage automatically raises effective subtraction to remove old hard sunlight before adding the soft, dim replacement. Your chosen minimum is retained. This never adds runtime sunlight.",
                     theme::Reset::Environment(ui::ENV_ROW_BAKED_SUN_REMOVAL),
                     0.0..=1.0,
                     defaults.baked_sun_removal,
@@ -315,6 +331,7 @@ impl App {
         self.video.baked_indirect_power = d.baked_indirect_power;
         self.video.baked_indirect_highlight_preserve = d.baked_indirect_highlight_preserve;
         self.video.sun_lighting = d.sun_lighting;
+        self.video.relight_time = d.relight_time;
         self.video.static_world_csm = d.static_world_csm;
         self.video.promote_shader_glow = d.promote_shader_glow;
         self.video.promote_shader_additive = d.promote_shader_additive;

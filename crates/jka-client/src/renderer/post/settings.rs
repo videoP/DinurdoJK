@@ -137,6 +137,7 @@ impl Renderer {
         self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
         let previous_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
                             self.sun_intensity, self.sun_color);
+        let previous_relight_cloud = (self.clouds_enabled, self.cloud_coverage);
         let previous_sky_backend = self.sky_backend;
         let previous_moon = (
             self.blue_water_environment.moon_phase,
@@ -163,6 +164,14 @@ impl Renderer {
         let old_baked_sun_removal = self.baked_sun_removal;
         self.baked_sun_removal = effects.baked_sun_removal.clamp(0.0, 1.0);
         self.baked_sun_cache = effects.baked_sun_cache;
+        self.lightmap_smoothing = effects.lightmap_smoothing.min(2);
+        self.baked_sun_aa = effects.baked_sun_aa.min(3);
+        self.lightmap_signal = effects.lightmap_signal.min(8);
+        self.sun_receiver_normals = effects.sun_receiver_normals.min(2);
+        self.sun_terminator = effects.sun_terminator;
+        self.sky_world_bake = effects.sky_world_bake.min(2);
+        // Worker-count changes affect the next bake; do not cancel an active bake.
+        self.bake_threads = effects.bake_threads.min(32);
         let old_baked_sun_shadow_map = self.baked_sun_shadow_map;
         self.baked_sun_shadow_map = effects.baked_sun_shadow_map;
         let old_indirect = (self.baked_indirect_scale, self.baked_indirect_saturation,
@@ -205,11 +214,6 @@ impl Renderer {
             self.blue_water_environment.moon_intensity,
             self.blue_water_environment.moon_intensity_custom,
         );
-        if solar_uniforms_changed || previous_sky_backend != self.sky_backend
-            || previous_moon != current_moon
-        {
-            self.update_lighting_settings();
-        }
         self.cloud_backend = effects.cloud_backend.min(1);
         let cloud_portal_depth = effects.cloud_portal_depth.min(2);
         if self.cloud_portal_depth != cloud_portal_depth {
@@ -234,6 +238,14 @@ impl Renderer {
         self.cloud_type = effects.cloud_type;
         self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);
         self.cloud_coverage = effects.cloud_coverage.clamp(0.0, 1.0);
+        // This upload must follow both cloud fields: relit_celestial() now
+        // depends on them, including when Clouds is switched back to Off.
+        if solar_uniforms_changed || previous_sky_backend != self.sky_backend
+            || previous_moon != current_moon
+            || previous_relight_cloud != (self.clouds_enabled, self.cloud_coverage)
+        {
+            self.update_lighting_settings();
+        }
         self.cloud_height = effects
             .cloud_height
             .clamp(ui::CLOUD_HEIGHT_MIN, ui::CLOUD_HEIGHT_MAX);

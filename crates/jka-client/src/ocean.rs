@@ -2085,6 +2085,14 @@ impl Default for OceanEnvironment {
     }
 }
 
+impl OceanEnvironment {
+    /// The map sun in Blue Water's sea units (about 6 by day) when no Blue Water
+    /// sky supplies the light: the Hybrid surface and the lakes take the same.
+    fn map_sun_intensity(&self) -> f32 {
+        self.sun_direction_intensity[3] * 5.0
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct OceanRenderUniform {

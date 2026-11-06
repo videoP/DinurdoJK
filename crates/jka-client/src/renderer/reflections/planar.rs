@@ -482,6 +482,171 @@ pub(in crate::renderer) fn ndc_rect_narrowing(ndc_min: Vec2, ndc_max: Vec2) -> M
     )
 }
 
+/// Vertex budget shared by every slot's mask polygons in one frame.
+pub(in crate::renderer) const PLANAR_MASK_MAX_VERTICES: usize = 4096;
+
+/// Pixel scissor `[x, y, w, h]` for a reflected view's NDC rectangle, padded by
+/// `margin_ndc` (at least the 0.02 culling margin of `ndc_rect_narrowing`).
+pub(in crate::renderer) fn planar_mask_scissor(
+    ndc_min: Vec2,
+    ndc_max: Vec2,
+    margin_ndc: Vec2,
+    width: u32,
+    height: u32,
+) -> [u32; 4] {
+    let margin = margin_ndc.max(Vec2::splat(0.02));
+    let ndc_min = (ndc_min - margin).max(Vec2::splat(-1.0));
+    let ndc_max = (ndc_max + margin).min(Vec2::splat(1.0));
+    let size = Vec2::new(width as f32, height as f32);
+    // NDC +y is up; pixel rows grow downward.
+    let x0 = (((ndc_min.x * 0.5 + 0.5) * size.x).floor() as u32).min(width.saturating_sub(1));
+    let x1 = (((ndc_max.x * 0.5 + 0.5) * size.x).ceil() as u32).clamp(x0 + 1, width.max(1));
+    let y0 = (((0.5 - ndc_max.y * 0.5) * size.y).floor() as u32).min(height.saturating_sub(1));
+    let y1 = (((0.5 - ndc_min.y * 0.5) * size.y).ceil() as u32).clamp(y0 + 1, height.max(1));
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// Append the screen polygon (plane ∩ AABB, clipped to the view) of every
+/// reflector on `plane` as NDC triangles, each grown outward by `margin_ndc`
+/// so edge texels and the five-tap environment filter stay inside the mask.
+/// Returns false, leaving `out` untouched, when the vertex budget runs out.
+pub(in crate::renderer) fn append_planar_mask_triangles(
+    reflectors: &[PlanarReflector],
+    plane: [f32; 4],
+    view_proj: Mat4,
+    margin_ndc: Vec2,
+    out: &mut Vec<[f32; 2]>,
+) -> bool {
+    let start = out.len();
+    for reflector in reflectors {
+        if !planar_planes_equivalent(reflector.plane, plane) {
+            continue;
+        }
+        let Some((world_points, world_count)) =
+            planar_aabb_intersection_polygon(reflector.bounds_min, reflector.bounds_max, plane)
+        else {
+            continue;
+        };
+        let Some((clip_points, clip_count)) =
+            clip_planar_polygon_to_viewport(world_points, world_count, view_proj)
+        else {
+            continue;
+        };
+        let mut ndc = [Vec2::ZERO; 16];
+        let mut count = 0usize;
+        for clip in &clip_points[..clip_count] {
+            let point = clip.truncate().truncate() / clip.w;
+            if point.is_finite()
+                && (count == 0 || ndc[count - 1].distance_squared(point) > 1e-10)
+            {
+                ndc[count] = point;
+                count += 1;
+            }
+        }
+        if count >= 2 && ndc[0].distance_squared(ndc[count - 1]) <= 1e-10 {
+            count -= 1;
+        }
+        if count < 3 {
+            continue;
+        }
+        let area2 = (0..count)
+            .map(|i| ndc[i].perp_dot(ndc[(i + 1) % count]))
+            .sum::<f32>();
+        if area2.abs() <= 1e-12 {
+            continue;
+        }
+        // Outward normal of edge a->b for either winding.
+        let outward = |a: Vec2, b: Vec2| {
+            let edge = b - a;
+            let normal = if area2 > 0.0 { Vec2::new(edge.y, -edge.x) } else { Vec2::new(-edge.y, edge.x) };
+            normal.normalize_or_zero()
+        };
+        let mut grown = [Vec2::ZERO; 16];
+        for i in 0..count {
+            let previous = ndc[(i + count - 1) % count];
+            let next = ndc[(i + 1) % count];
+            let n0 = outward(previous, ndc[i]);
+            let n1 = outward(ndc[i], next);
+            let miter = (n0 + n1).normalize_or_zero();
+            // Clamp the miter on sharp corners instead of spiking.
+            let scale = 1.0 / miter.dot(n0).max(0.5);
+            grown[i] = ndc[i] + miter * scale * margin_ndc;
+        }
+        // `out` holds every slot's mask for the frame; the buffer fits the total.
+        if out.len() + (count - 2) * 3 > PLANAR_MASK_MAX_VERTICES {
+            out.truncate(start);
+            return false;
+        }
+        for i in 1..count - 1 {
+            out.extend([grown[0].to_array(), grown[i].to_array(), grown[i + 1].to_array()]);
+        }
+    }
+    true
+}
+
+const PLANAR_MASK_SHADER: &str = r#"
+@vertex
+fn vs_main(@location(0) ndc: vec2<f32>) -> @builtin(position) vec4<f32> {
+    // Reversed-Z far plane: the carved area accepts every reflected fragment.
+    return vec4<f32>(ndc, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+"#;
+
+fn create_planar_mask_pipeline(
+    device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("JKA planar reflection mask shader"),
+        source: wgpu::ShaderSource::Wgsl(PLANAR_MASK_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("JKA planar reflection mask layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA planar reflection mask"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+            })],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: depth_format(),
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })],
+        }),
+        multiview_mask: None,
+        cache: crate::pipeline_cache::get().as_ref(),
+    })
+}
+
 pub(in crate::renderer) fn planar_planes_equivalent(a: [f32; 4], b: [f32; 4]) -> bool {
     let a_n = Vec3::new(a[0], a[1], a[2]);
     let b_n = Vec3::new(b[0], b[1], b[2]);
@@ -739,6 +904,7 @@ pub(in crate::renderer) fn select_planar_reflection_views(
             cluster,
             coarse_batch_index: reflector.coarse_batch_index,
             cull_view_proj: ndc_rect_narrowing(ndc_rect.0, ndc_rect.1) * reflected_view_proj,
+            ndc_rect,
         });
     }
     views
@@ -894,6 +1060,17 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
             },
         ],
     });
+    let mask_pipeline = active.then(|| create_planar_mask_pipeline(device, color_format));
+    let mask_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("JKA planar reflection mask vertices"),
+        size: if active {
+            (PLANAR_MASK_MAX_VERTICES * std::mem::size_of::<[f32; 2]>()) as u64
+        } else {
+            std::mem::size_of::<[f32; 2]>() as u64
+        },
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     PlanarReflectionResources {
         _color: color,
         color_views,
@@ -906,6 +1083,8 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         _reflection_pass_uniform_buffer: reflection_pass_uniform_buffer,
         bind_group,
         reflection_pass_bind_group,
+        mask_pipeline,
+        mask_vertex_buffer,
         _width: width,
         _height: height,
         active,

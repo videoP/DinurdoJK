@@ -49,7 +49,36 @@ fn lightmap_moving_sun_visibility(input: VertexOut) -> f32 {
     return visibility;
 }
 
+// r_staticWorldCsm with a composed static sun: inside cascade range the full
+// static+moving cascades replace the bake's (softer) visibility. The composer
+// stores the unshadowed-minus-baked sun amount in static_sun_aux.r * 4, so
+// unshadowed = flux + that. Beyond range the baked lightmap stays as is.
+// Returns w = 0 when not applicable.
+fn static_csm_composed_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec4<f32> {
+    if (lighting_settings.baked_sun_debug_mode.z & 8u) == 0u || lighting_settings.runtime_sun_radiance.w < 0.5 {
+        return vec4(0.0);
+    }
+    let depth = max(dot(input.world_position - camera.camera_pos_time.xyz,
+        normalize(shadow_settings.camera_forward.xyz)), 0.0);
+    let far = shadow_settings.split_depths[u32(clamp(i32(shadow_settings.bevy_params.w + 0.5), 1, 4) - 1)];
+    let inside = 1.0 - smoothstep(far * 0.85, far, depth);
+    if inside <= 0.0 { return vec4(0.0); }
+    let aux = textureSampleLevel(static_sun_aux, lightmap_sampler, input.lightmap_uv, 0.0);
+    if aux.g > 0.5 { return vec4(0.0); }
+    let unshadowed = flux + aux.r * 4.0;
+    let radiance = lighting_settings.runtime_sun_radiance.rgb;
+    let csm = max(lightmap + radiance * (unshadowed * sun_shadow_transmission(input, input.world_normal) - flux), vec3(0.0));
+    if inside >= 1.0 { return vec4(csm, 1.0); }
+    var baked = lightmap;
+    if flux > 0.0 {
+        baked = max(lightmap - radiance * flux * (1.0 - lightmap_moving_sun_visibility(input)) * shadow_settings.params.z, vec3(0.0));
+    }
+    return vec4(mix(baked, csm, inside), 1.0);
+}
+
 fn shade_composed_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
+    let static_csm = static_csm_composed_sun(lightmap, flux, input);
+    if static_csm.w > 0.5 { return static_csm.rgb; }
     if flux <= 0.0 { return lightmap; }
     let visibility = lightmap_moving_sun_visibility(input);
     if lighting_settings.runtime_sun_radiance.w > 0.5 {

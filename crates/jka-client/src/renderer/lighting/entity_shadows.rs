@@ -498,7 +498,11 @@ impl Renderer {
             params: [
                 SHADOW_MAP_SIZE as f32,
                 0.00035,
-                self.sun_shadow_strength,
+                // Non-explicit relighting darkens the existing lightmap with
+                // CSM. Match that contrast to the overcast static lightmap.
+                self.sun_shadow_strength * if self.baked_sun_cache && !self.sun_lighting {
+                    self.relight_direct_fraction()
+                } else { 1.0 },
                 if !bevy_mode { 0.0 }
                 else if self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMapsEntities { 2.0 }
                 else { 1.0 },

@@ -413,7 +413,7 @@ impl Renderer {
         // Pending/unsupported reconstruction must preserve the authored image.
         let sun_bake_ready = self.world.as_ref().is_some_and(|world|
             world.sun_bake.ready && world.baked_sun_radiance.is_some());
-        let strength = if has_authored_sun && sun_bake_ready { self.baked_sun_removal } else { 0.0 };
+        let strength = if has_authored_sun && sun_bake_ready { self.effective_baked_sun_removal() } else { 0.0 };
         let old_toward = -Vec3::from_array(old.direction).normalize_or_zero();
         let radiance = |sun: DirectionalSun| {
             let rgb = Vec3::from_array(sun.color) * (sun.intensity.max(0.0) / 255.0);
@@ -503,7 +503,7 @@ impl Renderer {
                 self.baked_indirect_highlight_preserve,
                 baked_shadow_ids[0], baked_shadow_ids[1],
             ],
-            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)],
+            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2) | (u32::from(self.static_world_csm_composed()) << 3), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)],
             runtime_sun_direction: {
                 let toward = -Vec3::from_array(runtime_light.direction);
                 [toward.x, toward.y, toward.z, 0.0]

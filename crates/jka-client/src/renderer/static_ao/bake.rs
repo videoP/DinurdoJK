@@ -1115,6 +1115,7 @@ pub(in crate::renderer) fn collect_static_ao_lightmap_triangles(
                 continue;
             }
             triangles.push(StaticAoLightmapTriangle {
+                material: batch.material_debug_index,
                 texture,
                 owner,
                 positions: [

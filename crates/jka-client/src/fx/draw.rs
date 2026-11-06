@@ -310,6 +310,67 @@ impl Batch {
     }
 }
 
+/// Shitter's special untextured saber is deliberately kept outside authored FX
+/// shader stages. All player blades become one opaque, depth-writing surface,
+/// irrespective of team colour; the colour is per vertex, not per material.
+/// The hilt end stays square, and *only* the tip gets a semicircle made from
+/// four additional vertices (8 vertices and 6 front-facing triangles total).
+fn append_shitter_blade(draw: &FxDraw, view: &FxView, batch: &mut Batch) -> bool {
+    let FxDraw::Line { start, end, width, rgba, shader } = draw else { return false; };
+    if shader.as_ref() != "$shitter_blade" { return false; }
+    let forward = sub(*end, *start);
+    let right = cross(sub(*start, view.origin), sub(*end, view.origin));
+    if length(forward) < 0.001 || length(right) < 0.001 || *width <= 0.0 {
+        return true;
+    }
+    let forward = normalize(forward);
+    let right = normalize(right);
+    let color = rgba.map(|channel| f32::from(channel) / 255.0);
+    // Standard RB_SurfaceLine rectangular body: no extra base cap.
+    let base_right = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
+    let base_left = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
+    let tip_right = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
+    let tip_left = batch.vertex(sub(*end, scale(right, *width)), [1.0, 1.0], color);
+    batch.triangle(base_right, base_left, tip_right);
+    batch.triangle(tip_right, base_left, tip_left);
+
+    // Four vertices distributed along the outer half-circle. The existing two
+    // tip corners are its endpoints; a fan from tip_right adds four triangles.
+    let mut previous = tip_right;
+    for step in 1..=4 {
+        let angle = step as f32 * std::f32::consts::PI / 5.0;
+        let position = add(add(*end, scale(right, *width * angle.cos())),
+            scale(forward, *width * angle.sin()));
+        let vertex = batch.vertex(position, [0.5, 1.0], color);
+        if step != 1 { batch.triangle(tip_right, previous, vertex); }
+        previous = vertex;
+    }
+    batch.triangle(tip_right, previous, tip_left);
+    true
+}
+
+fn shitter_blade_surface(batch: Batch) -> Option<DynamicModelSurface> {
+    if batch.indices.is_empty() { return None; }
+    Some(DynamicModelSurface {
+        geometry_source: crate::renderer::ModelGeometrySource::Fx,
+        authored_lighting: false,
+        material_trace: None,
+        entity_num: FX_ENTITY_NUM,
+        wireframe_class: DynamicWireframeClass::Effect,
+        raster_visible: true,
+        vertices: Arc::new(batch.vertices),
+        indices: Arc::new(batch.indices),
+        lighting_origin: None,
+        rt_rigid: None,
+        rt_skinned_key: None,
+        ghoul2_gpu: None,
+        fx_gpu_sprites: None,
+        texture: None,
+        alpha_mode: DynamicModelAlphaMode::Opaque,
+        authored_glow: false,
+    })
+}
+
 /// Build per-shader/per-stage FX surfaces for this view. `materials` resolves
 /// every renderable stage of a shader. This matters for stock JKA effects such
 /// as `gfx/effects/sabers/saberBlur`, whose glow and hot core are two additive
@@ -336,8 +397,10 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     let mut batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
     let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
+    let mut shitter_blades = Batch::default();
     for (draw_index, draw) in draws.iter().enumerate() {
         if FILTER && visible.get(draw_index) == Some(&false) { continue; }
+        if append_shitter_blade(draw, view, &mut shitter_blades) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -386,6 +449,7 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             authored_glow: mat.authored_glow,
         })
         .collect();
+    if let Some(blades) = shitter_blade_surface(shitter_blades) { surfaces.push(blades); }
     surfaces.extend(lit_surfaces);
     // Deterministic submission order across frames.
     surfaces.sort_by_key(|surface| (surface.alpha_mode as u8, surface.vertices.len()));
@@ -429,9 +493,11 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     let mut groups: HashMap<(String, usize, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
     let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
+    let mut shitter_blades = Batch::default();
 
     for (draw_index, draw) in draws.iter().enumerate() {
         if FILTER && visible.get(draw_index) == Some(&false) { continue; }
+        if append_shitter_blade(draw, view, &mut shitter_blades) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -515,6 +581,7 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
         })
         .collect());
 
+    if let Some(blades) = shitter_blade_surface(shitter_blades) { surfaces.push(blades); }
     surfaces.extend(lit_surfaces);
     surfaces.sort_by_key(|surface| (surface.alpha_mode as u8, surface.vertices.len()));
     surfaces
@@ -586,9 +653,11 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     // collision compute or forces those shader variants to initialize.
     let mut sprite_batches: HashMap<(usize, usize, usize, bool, bool), (FxMaterial, Vec<FxGpuSpriteInstance>)> = HashMap::new();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
+    let mut shitter_blades = Batch::default();
 
     for (draw_index, draw) in draws.iter().enumerate() {
         if FILTER && visible.get(draw_index) == Some(&false) { continue; }
+        if append_shitter_blade(draw, view, &mut shitter_blades) { continue; }
         let shader = match draw {
             FxDraw::Sprite { shader, .. }
             | FxDraw::SaberGlow { shader, .. }
@@ -793,6 +862,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             }),
     );
 
+    if let Some(blades) = shitter_blade_surface(shitter_blades) { surfaces.push(blades); }
     surfaces.extend(lit_surfaces);
     surfaces.sort_by_key(|surface| (surface.alpha_mode as u8, surface.vertex_count()));
     surfaces
@@ -1435,6 +1505,42 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shitter_blade_tip_only_round_and_opaque_in_all_fx_geometry_paths() {
+        use super::*;
+        let blade = FxDraw::Line {
+            start: [100.0, 20.0, 0.0],
+            end: [180.0, 20.0, 0.0],
+            width: 1.0,
+            rgba: [0, 255, 0, 255],
+            shader: "$shitter_blade".into(),
+        };
+        for path in 0..3 {
+            let draws = [blade.clone(), blade.clone()];
+            let mut no_material_lookup = |_: &str| -> Vec<FxMaterial> {
+                panic!("Shitter blade must not resolve authored FX materials")
+            };
+            let surfaces = match path {
+                0 => tessellate(&draws, &view(), &mut no_material_lookup),
+                1 => tessellate_workers(&draws, &view(), &mut no_material_lookup),
+                _ => tessellate_gpu_particles(&draws, &view(), &mut no_material_lookup),
+            };
+            assert_eq!(surfaces.len(), 1, "one combined surface for all blades");
+            let surface = &surfaces[0];
+            assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::Opaque);
+            assert!(surface.texture.is_none());
+            assert!(surface.fx_gpu_sprites.is_none());
+            assert_eq!(surface.vertices.len(), 16, "8 vertices per blade; 4 at the rounded tip");
+            assert_eq!(surface.indices.len(), 72, "6 two-sided triangles per blade");
+            assert!(surface.vertices.iter().all(|vertex| vertex.color == [0.0, 1.0, 0.0, 1.0]));
+            // First four vertices are the rectangular strip; only the last four
+            // per blade may extend beyond the authored blade endpoint.
+            let endpoint = scene::render_position([180.0, 20.0, 0.0]);
+            assert!(surface.vertices[0..4].iter().all(|v| v.position[0] <= endpoint[0]));
+            assert!(surface.vertices[4..8].iter().any(|v| v.position[0] > endpoint[0]));
+        }
+    }
+
     #[test]
     fn gpu_force_lightning_uses_plasma_layers_and_endpoint_flare() {
         let bolt = FxDraw::Lightning {

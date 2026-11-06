@@ -44,6 +44,7 @@ struct Completed {
 struct Pending {
     rx: mpsc::Receiver<Result<Completed, String>>,
     cancelled: Arc<AtomicBool>,
+    started: Instant,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
@@ -252,6 +253,7 @@ fn run(
     source: &Source,
     cancelled: &AtomicBool,
     device: &wgpu::Device,
+    worker_override: u8,
 ) -> Result<Completed, String> {
     lower_priority();
     let started = Instant::now();
@@ -270,10 +272,7 @@ fn run(
     let data = if let Some(data) = cached {
         Some(data)
     } else {
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .saturating_sub(2)
-            .clamp(1, 4);
+        let workers = super::lightmap_sun::bake_worker_count(worker_override, 2);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .thread_name(|index| format!("jka-baked-sun-{index}"))
@@ -365,7 +364,8 @@ impl Renderer {
     /// One settings/ready/channel check in ordinary frames. Hashing, cache I/O,
     /// tracing and pipeline compilation stay on the background worker.
     pub(in crate::renderer) fn sync_sun_bake(&mut self) {
-        let desired = requested(self.baked_sun_removal, self.baked_sun_debug_mode);
+        let desired = requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
+        let worker_override = self.bake_threads;
         let Some(world) = self.world.as_mut() else {
             return;
         };
@@ -379,22 +379,25 @@ impl Renderer {
             .pending
             .as_ref()
             .and_then(|pending| match pending.rx.try_recv() {
-                Ok(result) => Some((!pending.cancelled.load(Ordering::Relaxed), result)),
+                Ok(result) => Some((!pending.cancelled.load(Ordering::Relaxed), result, pending.started)),
                 Err(mpsc::TryRecvError::Empty) => None,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    Some((true, Err("worker disconnected".into())))
+                    Some((true, Err("worker disconnected".into()), pending.started))
                 }
             });
-        if let Some((current, outcome)) = outcome {
+        if let Some((current, outcome, started)) = outcome {
             drop(state.pending.take());
             if desired && current {
                 match outcome {
-                    Ok(result) => self.install_sun_bake(result),
+                    Ok(result) => self.install_sun_bake(result, started),
                     Err(error) => {
                         let state = &mut self.world.as_mut().unwrap().sun_bake;
                         state.ready = true;
                         state.source = None;
-                        eprintln!("[BAKED SUN] background preparation failed; authored lighting preserved: {error}");
+                        eprintln!(
+                            "[BAKED SUN] background preparation failed after {:.2}s; authored lighting preserved: {error}",
+                            started.elapsed().as_secs_f64()
+                        );
                     }
                 }
             }
@@ -413,13 +416,14 @@ impl Renderer {
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
         let device = self.device.clone();
+        let started = Instant::now();
         match std::thread::Builder::new()
             .name("jka-baked-sun-cache".into())
             .spawn(move || {
-                let result = run(&source, &signal, &device);
+                let result = run(&source, &signal, &device, worker_override);
                 let _ = tx.send(result);
             }) {
-            Ok(_) => state.pending = Some(Pending { rx, cancelled }),
+            Ok(_) => state.pending = Some(Pending { rx, cancelled, started }),
             Err(error) => {
                 state.ready = true;
                 state.source = None;
@@ -428,7 +432,7 @@ impl Renderer {
         }
     }
 
-    fn install_sun_bake(&mut self, result: Completed) {
+    fn install_sun_bake(&mut self, result: Completed, started: Instant) {
         let Some(mut world) = self.world.take() else {
             return;
         };
@@ -436,6 +440,10 @@ impl Renderer {
             world.sun_bake.ready = true;
             world.sun_bake.source = None;
             self.world = Some(world);
+            println!(
+                "[BAKED SUN] calibration unavailable after {:.2}s (background {:.2}s); authored lighting retained",
+                started.elapsed().as_secs_f64(), result.elapsed_ms / 1000.0
+            );
             return;
         };
         if let (Some(masks), Some(upload)) = (data.masks, result.upload) {
@@ -477,13 +485,10 @@ impl Renderer {
         self.update_lighting_settings();
         self.sync_baked_brightness_assets();
         println!(
-            "[BAKED SUN] {} ready after {:.1} ms in background; installed at frame boundary",
-            if result.cache_hit {
-                "lossless cache"
-            } else {
-                "reconstruction"
-            },
-            result.elapsed_ms
+            "[BAKED SUN] {} ready in {:.2}s total (background {:.2}s); installed at frame boundary",
+            if result.cache_hit { "lossless cache" } else { "reconstruction" },
+            started.elapsed().as_secs_f64(),
+            result.elapsed_ms / 1000.0
         );
     }
 }

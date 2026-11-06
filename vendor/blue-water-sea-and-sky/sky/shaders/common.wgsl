@@ -84,6 +84,8 @@ struct SkyUniforms {
     lightning_position: vec3<f32>,
     lightning_intensity: f32,
     haze: vec4<f32>,
+    // The apparent size of the sun's (x) and the moon's (y) discs, multiples of DISC_RADIUS (`Sky::set_disc_scales`).
+    discs: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> sky: SkyUniforms;

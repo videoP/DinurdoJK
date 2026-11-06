@@ -123,6 +123,8 @@ impl Scene {
                 },
                 tex(1, true),
                 tex(2, false),
+                tex(3, false),
+                tex(4, false),
             ],
         });
         let csm_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -236,12 +238,17 @@ impl Scene {
             })
         };
         let replace = pipeline(&blit, "fragment", &[&image_layout], None);
-        let over = pipeline(
-            &blit,
-            "fragment",
-            &[&image_layout],
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
+        // The cloud overlay over the scene: premultiplied colour, the scene's own alpha kept
+        // (the overlay's alpha is the clouds' opacity, not a coverage the scene should take on).
+        let cloud_over = wgpu::BlendState {
+            color: wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING.color,
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let over = pipeline(&blit, "fragment", &[&image_layout], Some(cloud_over));
         let module = blue_water_clouds::shaders::compose(
             include_str!("blue_water_scene.wgsl"),
             "JKA native world light",
@@ -441,6 +448,9 @@ impl Scene {
         flash: f32,
         moon_light: Option<([f32; 3], f32)>,
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
+        // Depth-prepass policy mask, and whether lightmapped world pixels in it
+        // already carry this sky light from the composed lightmap.
+        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
     ) {
         let mut values = [0f32; 36];
         values[..16].copy_from_slice(&camera.inverse_view_projection);
@@ -455,6 +465,8 @@ impl Scene {
             values[31] = intensity;
             values[32] = 1.0; // explicit moon-light mode; even intensity 0 hides the sun
         }
+        values[33] = u8::from(world_mask.2) as f32;
+        values[34] = crate::ocean::OCEAN_UNITS_PER_METER;
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&values));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("native lighting inputs"),
@@ -471,6 +483,14 @@ impl Scene {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.copy.color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(world_mask.0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(world_mask.1),
                 },
             ],
         });

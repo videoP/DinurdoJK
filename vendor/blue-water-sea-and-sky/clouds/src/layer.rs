@@ -1996,7 +1996,8 @@ impl CloudLayer {
         }
         let size = self.tier.shadow.map_size;
         let cascades = self.tier.shadow.cascade_count as u32;
-        {
+        // Shadow mode 1 reads no cascade (`shadow_optical_depth` returns 0); a change of mode drops the history.
+        if self.tuning.shadow_mode == 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cloud shadow maps"),
                 timestamp_writes: self.timestamp_writes(timer, "cloud shadow maps", 0),
@@ -2011,7 +2012,7 @@ impl CloudLayer {
                 plan.shadow_count.clamp(1, cascades),
             );
         }
-        {
+        if self.tuning.shadow_mode == 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cloud shadow resolve"),
                 timestamp_writes: self.timestamp_writes(timer, "cloud shadow resolve", 2),
@@ -2419,9 +2420,13 @@ fn composite_pipeline(
                         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                         operation: wgpu::BlendOperation::Add,
                     },
+                    // Opacity accumulates as the colour does (premultiplied over). The JKA host draws
+                    // the clouds into a cleared overlay and blends that over its scene, so a kept
+                    // destination alpha (Zero, One) left the overlay at 0 and the clouds purely additive:
+                    // the sky, the moon and the stars showed through a closed deck.
                     alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::Zero,
-                        dst_factor: wgpu::BlendFactor::One,
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                         operation: wgpu::BlendOperation::Add,
                     },
                 }),

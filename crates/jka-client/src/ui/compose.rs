@@ -101,8 +101,18 @@ pub fn build_vertices(
     if let Some(progress) = &ui.static_ao_progress {
         build_background_progress(&mut out, progress, width, height);
     }
+    if let Some(progress) = &ui.sun_bake_progress {
+        // Native WGPU HUD, not a second egui window. Shift above AO if both are baking.
+        let offset = if ui.static_ao_progress.is_some() { 52 } else { 0 };
+        build_background_progress(&mut out, progress, width, height.saturating_sub(offset));
+    }
     if let Some(progress) = &ui.shader_compile_progress {
         build_shader_compile_progress(&mut out, progress, ui.shader_compile_stage.as_deref(), width, height);
+    }
+    // The release notice is above the menu world/chrome, not an egui area.
+    // Drawing and hitboxes both come from ui::update_notice::layout.
+    if let Some(notice) = &ui.update_notice {
+        super::update_notice::build(&mut out, ui, notice, small_font, width, height);
     }
     out
 }

@@ -317,8 +317,29 @@ impl App {
             // Studio draws its own progress modal; the native fullscreen
             // loading HUD must never replace the editing canvas.
             loading: self.unified_loading_ui(),
+            update_notice: self.native_update_notice_ui(),
             shader_compile_progress: None, // Render thread owns worker progress.
             shader_compile_stage: None,
+            sun_bake_progress: self.sun_bake_progress.and_then(|(completed, stage)| {
+                let just_finished = stage == crate::renderer::SunBakeStage::Ready
+                    && self.sun_bake_ready_at.is_some_and(|at| at.elapsed().as_secs_f32() < 2.5);
+                (just_finished || !matches!(stage, crate::renderer::SunBakeStage::Off | crate::renderer::SunBakeStage::Ready | crate::renderer::SunBakeStage::Fallback | crate::renderer::SunBakeStage::Failed))
+                    .then_some(MapLoadingBar {
+                        label: match stage {
+                            crate::renderer::SunBakeStage::Ready => "BAKE: READY",
+                            crate::renderer::SunBakeStage::Preparing => "BAKE: GEOMETRY",
+                            crate::renderer::SunBakeStage::Tracing => "BAKE: SUN RAYS",
+                            crate::renderer::SunBakeStage::Refining => "BAKE: EDGE AA",
+                            crate::renderer::SunBakeStage::Local => "BAKE: MAP LIGHTS",
+                            crate::renderer::SunBakeStage::Uploading => "BAKE: GPU UPLOAD",
+                            _ => "BAKE: COMPOSITING",
+                        },
+                        completed,
+                        total: 1000,
+                        skipped: false,
+                        no_work: false,
+                    })
+            }),
             static_ao_progress: self
                 .static_ao_progress
                 .map(|(completed, total)| MapLoadingBar {

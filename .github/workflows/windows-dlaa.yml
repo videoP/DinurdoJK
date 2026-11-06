@@ -207,6 +207,77 @@ jobs:
           }
           Write-Host "Pre-staged OpenALSoft.x86_64.dll in $dependencyDir"
 
+      # Render Studio resolves ffmpeg.exe only from DinurdoJK/dependencies/.
+      # Gyan's Windows x64 essentials build is static and includes the codecs
+      # used by the exporter (libx264, prores_ks, and NVENC support).
+      # Pin the immutable versioned archive and its published SHA-256.
+      - name: Stage pinned FFmpeg 9.0.2 x64 runtime
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          $url = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip'
+          $expectedSha256 = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-9.0.2-essentials_build.zip'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'ffmpeg-9.0.2-essentials_build'
+          Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actualSha256 -cne $expectedSha256) {
+            throw "FFmpeg archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -Force
+          $candidates = @(Get-ChildItem -LiteralPath $unpacked -Recurse -File -Filter 'ffmpeg.exe' |
+            Where-Object { (Split-Path -Path $_.DirectoryName -Leaf) -ieq 'bin' })
+          if ($candidates.Count -ne 1) {
+            throw "Expected one x64 FFmpeg bin/ffmpeg.exe in the pinned archive; found $($candidates.Count)."
+          }
+          $ffmpeg = $candidates[0].FullName
+          $stream = [IO.File]::OpenRead($ffmpeg)
+          try { $isPe = ($stream.ReadByte() -eq 0x4d -and $stream.ReadByte() -eq 0x5a) }
+          finally { $stream.Dispose() }
+          if (-not $isPe -or (Get-Item -LiteralPath $ffmpeg).Length -lt 5000000) {
+            throw "FFmpeg is missing, truncated or not a Windows executable: $ffmpeg"
+          }
+          $versionInfo = (& $ffmpeg -hide_banner -version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $versionInfo -notmatch 'ffmpeg version 9\.0\.2' -or
+              $versionInfo -notmatch '--enable-gpl') {
+            throw 'Pinned FFmpeg build is not the expected GPL-enabled 9.0.2 release.'
+          }
+          $encoders = (& $ffmpeg -hide_banner -encoders 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg could not enumerate encoders.' }
+          foreach ($encoder in @('libx264', 'prores_ks', 'h264_nvenc')) {
+            if ($encoders -notmatch "\b$encoder\b") {
+              throw "Pinned FFmpeg lacks required Render Studio encoder: $encoder"
+            }
+          }
+          $deps = 'target/release/DinurdoJK/dependencies'
+          New-Item -ItemType Directory -Force $deps | Out-Null
+          $destination = Join-Path $deps 'ffmpeg.exe'
+          Copy-Item -LiteralPath $ffmpeg -Destination $destination -Force -ErrorAction Stop
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash -ne
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $ffmpeg).Hash) {
+            throw 'Staged FFmpeg executable does not match the verified archive.'
+          }
+          Write-Host "Staged pinned ffmpeg.exe ($('{0:N1}' -f ((Get-Item $destination).Length / 1MB)) MiB) in $deps"
+
+          # Supplemental legal asset stays OUTSIDE the signed update payload:
+          # older clients reject unknown manifest paths, but accept ffmpeg.exe.
+          $noticeDir = 'dist/ffmpeg-notices'
+          New-Item -ItemType Directory -Force $noticeDir | Out-Null
+          $gpl = Join-Path $noticeDir 'FFmpeg-GPL-3.0.txt'
+          Invoke-WebRequest -Uri 'https://www.gnu.org/licenses/gpl-3.0.txt' -OutFile $gpl -ErrorAction Stop
+          if ((Get-Item -LiteralPath $gpl).Length -lt 20000) {
+            throw 'FFmpeg GPLv3 license download was empty or truncated.'
+          }
+          @'
+          FFmpeg 9.0.2 (Gyan Windows x64 Essentials GPLv3 build)
+          Binary archive: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+          Build provider and third-party library information: https://www.gyan.dev/ffmpeg/builds/
+          FFmpeg source revision referenced by the build provider: https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+          This notice and GPLv3 license are separate GitHub Release assets, not updater payload files.
+          FFmpeg and its bundled third-party codecs have source distribution obligations;
+          the upstream FFmpeg source link alone may not fulfill them.
+          '@ | Set-Content -LiteralPath (Join-Path $noticeDir 'FFmpeg-SOURCE-NOTICE.txt') -Encoding utf8
+
       - name: Build optimized Release with DLAA
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
@@ -294,6 +365,9 @@ jobs:
               throw "Missing Microsoft DXC runtime before signing: $name"
             }
           }
+          if (-not (Test-Path -LiteralPath 'target/release/DinurdoJK/dependencies/ffmpeg.exe' -PathType Leaf)) {
+            throw 'Missing pinned FFmpeg runtime before signing: DinurdoJK/dependencies/ffmpeg.exe'
+          }
           python scripts/make_signed_release.py --runtime target/release --out dist/release --tag '${{ steps.version.outputs.tag }}'
           if ($LASTEXITCODE -ne 0) { throw 'Release signing failed.' }
           if ((Get-Item 'dist/release/release-manifest.sig').Length -ne 64) {
@@ -302,7 +376,7 @@ jobs:
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
           $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
-          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); assert m["format"]==2; assert set(z.namelist())==set(m["files"]); assert "DinurdoJK/shared/dinurdo-assets.pk4" in z.namelist(); assert "DinurdoJK.exe" in z.namelist(); assert "DinurdoJK/dependencies/dxcompiler.dll" in z.namelist() and "DinurdoJK/dependencies/dxil.dll" in z.namelist(); assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified full ZIP and signed per-file hashes")' $archive
+          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); assert m["format"]==2; assert set(z.namelist())==set(m["files"]); assert "DinurdoJK/shared/dinurdo-assets.pk4" in z.namelist(); assert "DinurdoJK.exe" in z.namelist(); assert "DinurdoJK/dependencies/dxcompiler.dll" in z.namelist() and "DinurdoJK/dependencies/dxil.dll" in z.namelist(); assert "DinurdoJK/dependencies/ffmpeg.exe" in z.namelist(); assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified full ZIP and signed per-file hashes")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout and hashes failed verification.' }
 
       - name: Upload signed updater artifact
@@ -319,13 +393,16 @@ jobs:
         shell: pwsh
         run: |
           $tag = '${{ steps.version.outputs.tag }}'
-          $assets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+          $updateAssets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+          $noticeAssets = @(Get-ChildItem 'dist/ffmpeg-notices' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+          if ($noticeAssets.Count -ne 2) { throw 'Expected FFmpeg GPLv3 and source notices.' }
+          $assets = @($updateAssets) + @($noticeAssets)
           $manifest = Get-Content 'dist/release/release-manifest.json' -Raw | ConvertFrom-Json
-          $expectedCount = @($manifest.files.PSObject.Properties).Count + 3
+          $expectedCount = @($manifest.files.PSObject.Properties).Count + 3 + $noticeAssets.Count
           if ($assets.Count -ne $expectedCount) {
             throw "Expected $expectedCount assets (individual files + full ZIP + manifest + signature); found $($assets.Count)"
           }
-          gh release create $tag @assets --target $env:GITHUB_SHA --title "DinurdoJK $tag" --latest --notes "Windows x64 with Vulkan DLAA. Download the full ZIP for a new install. Existing DinurdoJK clients with signed per-file update support download only changed files. Retail Jedi Academy assets are NOT included."
+          gh release create $tag @assets --target $env:GITHUB_SHA --title "DinurdoJK $tag" --latest --notes "Windows x64 with Vulkan DLAA and FFmpeg for Render Studio exports. Download the full ZIP for a new install. Existing DinurdoJK clients with signed per-file update support download only changed files. FFmpeg is GPLv3; see the separate FFmpeg-GPL-3.0.txt and FFmpeg-SOURCE-NOTICE.txt assets and review source distribution obligations. Retail Jedi Academy assets are NOT included."
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create official GitHub Release.' }
           $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) {

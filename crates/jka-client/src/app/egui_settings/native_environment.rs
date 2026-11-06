@@ -111,14 +111,6 @@ impl App {
             if response.response.double_clicked() { s.cloud_quality = d.cloud_quality; }
             changed |= old != s.cloud_quality;
         });
-        theme::row(ui, "Sky quality", "Sky lookup tables, environment bake and native weather budget. Cloud quality can override this independently.", theme::Reset::None, |ui| {
-            for (i, name) in ["Low", "Medium", "High", "Ultra"].iter().enumerate() {
-                if theme::chip(ui, name, s.quality == i as u8).clicked() {
-                    changed |= s.quality != i as u8;
-                    s.quality = i as u8;
-                }
-            }
-        });
         ui.label("Blue Water always reconstructs a 4×4 temporal pattern. Render resolution below scales both its cloud buffer and reconstruction.");
         changed |= choice(
             ui,
@@ -188,7 +180,7 @@ impl App {
             "Blue Water sky only. Map illumination requires Relight map and Sky world illumination on Relighting. Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
         );
         changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. The automatic moon light follows phase, independently of its position lock.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
-        theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. Requires Relight map; separate from moon disc brightness.", theme::Reset::None, |ui| {
+        theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. The world needs Relight map; the water always follows it. Separate from moon disc brightness.", theme::Reset::None, |ui| {
             let locked = !s.moon_intensity_custom;
             let mut shown = if locked { s.phase_moon_intensity() } else { s.moon_intensity };
             let label = format!("{shown:.2}");
@@ -243,6 +235,8 @@ impl App {
         changed |= sky_slider(ui, "Mie directionality", "How tightly the aureole hugs the sun. Higher is a smaller, brighter halo.", &mut s.mie_g, d.mie_g, 0.0, 0.95);
         changed |= sky_slider(ui, "Multiple scattering", "Light scattered more than once; brightens the sky away from the sun.", &mut s.multiple, d.multiple, 0.0, 3.0);
         changed |= sky_slider(ui, "Night sky brightness", "Dims the dome's flat night glow only (1 is upstream). Stars, the Milky Way and the world's night light are unchanged.", &mut s.night_sky, d.night_sky, 0.0, 1.0);
+        changed |= sky_slider(ui, "Sun size", "Apparent size of the sun's disc and corona (1 is upstream). Appearance only; sunlight is unchanged.", &mut s.sun_size, d.sun_size, 0.25, 30.0);
+        changed |= sky_slider(ui, "Moon size", "Apparent size of the moon's disc and halo (1 is upstream). Appearance only; moonlight is unchanged.", &mut s.moon_size, d.moon_size, 0.25, 30.0);
         if changed {
             self.commit_sky_environment(s);
         }

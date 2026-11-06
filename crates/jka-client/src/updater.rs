@@ -60,6 +60,8 @@ pub struct Release {
 pub enum Event {
     Checked(Result<Option<Release>, String>),
     Progress { received: u64, total: u64 },
+    /// Individual decisions, computed on the download worker, for the console log.
+    FileDecision(String),
     Staged(Result<PathBuf, String>),
     /// The restart helper was started (Ok) and the game may quit.
     Applied(Result<(), String>),
@@ -74,6 +76,7 @@ pub struct State {
     pub notice: bool,
     pub downloading: bool,
     pub applying: bool,
+    pub(crate) notice_hovered: Option<crate::ui::update_notice::Action>,
     pub downloaded: u64,
     pub total: u64,
     pub staged: Option<PathBuf>,
@@ -179,7 +182,7 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
         let allowed_dependency = name.strip_prefix("DinurdoJK/dependencies/")
             .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file));
         if !allowed_root && !allowed_dependency {
-            return Err("signed manifest contains an unexpected file".into());
+            return Err(format!("signed manifest contains an unexpected file: {name:?}"));
         }
         check_digest(&info.sha256)?;
         if info.size == 0 || info.size > MAX_DOWNLOAD {
@@ -406,12 +409,42 @@ fn ensure_install_parent(root: &Path, signed_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn installed_matches(root: &Path, name: &str, info: &FileInfo) -> Result<bool, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledFileStatus {
+    Identical,
+    Missing,
+    NotARegularFile,
+    SizeMismatch { local: u64, release: u64 },
+    HashMismatch { local: String, release: String },
+}
+impl InstalledFileStatus {
+    fn is_identical(&self) -> bool { matches!(self, Self::Identical) }
+    fn reason(&self) -> String {
+        match self {
+            Self::Identical => "identical SHA-256 - skipping".into(),
+            Self::Missing => "missing - downloading".into(),
+            Self::NotARegularFile => "not a regular file - downloading".into(),
+            Self::SizeMismatch { local, release } =>
+                format!("size mismatch ({local} local vs {release} release bytes) - downloading"),
+            Self::HashMismatch { local, release } =>
+                format!("SHA-256 mismatch (local {local}, release {release}) - downloading"),
+        }
+    }
+}
+fn installed_file_status(root: &Path, name: &str, info: &FileInfo) -> Result<InstalledFileStatus, String> {
     let path = root.join(name);
     assert_no_reparse(&path)?;
-    if !path.is_file() { return Ok(false); }
-    if fs::metadata(&path).map_err(|e| e.to_string())?.len() != info.size { return Ok(false); }
-    Ok(file_sha256(&path)? == info.sha256)
+    if !path.is_file() {
+        return Ok(if path.exists() { InstalledFileStatus::NotARegularFile } else { InstalledFileStatus::Missing });
+    }
+    let local = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if local != info.size { return Ok(InstalledFileStatus::SizeMismatch {local, release:info.size}); }
+    let hash = file_sha256(&path)?;
+    if hash != info.sha256 { return Ok(InstalledFileStatus::HashMismatch { local:hash, release:info.sha256.clone() }); }
+    Ok(InstalledFileStatus::Identical)
+}
+fn installed_matches(root: &Path, name: &str, info: &FileInfo) -> Result<bool, String> {
+    Ok(installed_file_status(root, name, info)?.is_identical())
 }
 
 fn sibling(target: &Path, suffix: &str) -> PathBuf {
@@ -510,8 +543,8 @@ fn preinstall(stage: &Path, root: &Path, manifest: &SignedManifest) -> Result<()
     Ok(())
 }
 
-pub fn stage<F>(release: &Release, mut report: F) -> Result<PathBuf, String>
-where F: FnMut(u64, u64) {
+pub fn stage<F, G>(release: &Release, mut report: F, mut report_file: G) -> Result<PathBuf, String>
+where F: FnMut(u64, u64), G: FnMut(String) {
     let manifest = parse_signed_manifest(&release.manifest_bytes, &release.manifest_signature)?;
     if manifest.tag != release.tag ||
         release.total_size != manifest.files.values().map(|info| info.size).sum::<u64>() {
@@ -528,12 +561,16 @@ where F: FnMut(u64, u64) {
     assert_no_reparse(install_root)?;
     let mut needed = Vec::new();
     let mut total = 0u64;
+    report_file(format!("[UPDATE] Comparing {} signed files in {}", manifest.files.len(), install_root.display()));
     for (name, info) in &manifest.files {
-        if !installed_matches(install_root, name, info)? {
+        let status = installed_file_status(install_root, name, info)?;
+        report_file(format!("[UPDATE] {} -> {}: {}", name, install_root.join(name).display(), status.reason()));
+        if !status.is_identical() {
             total = total.checked_add(info.size).ok_or("download size overflow")?;
             needed.push((name, info));
         }
     }
+    report_file(format!("[UPDATE] {} file(s) require download; {} unchanged", needed.len(), manifest.files.len()-needed.len()));
     report(0, total);
     let stage = stage_for(&release.tag)?;
     fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
@@ -549,6 +586,7 @@ where F: FnMut(u64, u64) {
         let mut completed = 0u64;
         for (name, info) in needed {
             let asset = release_asset_name(name);
+            report_file(format!("[UPDATE] Downloading {asset} -> {name} ({} bytes)", info.size));
             let url = asset_url(&release.tag, asset);
             let path = dir.join(stage_filename(name));
             let partial = dir.join(format!("{}.part", stage_filename(name)));
@@ -570,6 +608,7 @@ where F: FnMut(u64, u64) {
             }
             fs::rename(&partial, &path).map_err(|e| e.to_string())?;
             completed += count;
+            report_file(format!("[UPDATE] Verified {asset}: size and signed SHA-256 matched"));
         }
         for name in [MANIFEST_NAME, SIGNATURE_NAME, "ready"] {
             let path = stage.join(name);
@@ -1073,6 +1112,36 @@ mod security_tests {
         let raw = serde_json::to_vec(&manifest).unwrap();
         let signature = key.sign(&raw).to_bytes().to_vec();
         (raw, signature, key.verifying_key())
+    }
+
+    #[test]
+    fn unexpected_signed_filename_is_reported_without_weakening_the_allowlist() {
+        let signing = SigningKey::from_bytes(&[41; 32]);
+        let (raw, _, key) = signed_fixture();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["files"]["unapproved/secret.dll"] = serde_json::json!({"size":3,"sha256":"b".repeat(64)});
+        let raw = serde_json::to_vec(&value).unwrap();
+        let error = parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).unwrap_err();
+        assert!(error.contains("unapproved/secret.dll"), "{error}");
+    }
+
+    #[test]
+    fn file_decisions_distinguish_missing_size_hash_and_identical() {
+        let root=std::env::temp_dir().join(format!("djk-file-reason-{}-{:?}",std::process::id(),std::thread::current().id()));
+        let name="DinurdoJK/dependencies/dxil.dll";
+        let path=root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _=fs::remove_file(&path);
+        let expected=b"expected data";
+        let info=FileInfo {size:expected.len() as u64,sha256:format!("{:x}",Sha256::digest(expected))};
+        assert_eq!(installed_file_status(&root,name,&info).unwrap(),InstalledFileStatus::Missing);
+        fs::write(&path,b"short").unwrap();
+        assert!(matches!(installed_file_status(&root,name,&info).unwrap(),InstalledFileStatus::SizeMismatch{..}));
+        fs::write(&path,b"differentdata").unwrap();
+        assert!(matches!(installed_file_status(&root,name,&info).unwrap(),InstalledFileStatus::HashMismatch{..}));
+        fs::write(&path,expected).unwrap();
+        assert_eq!(installed_file_status(&root,name,&info).unwrap(),InstalledFileStatus::Identical);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

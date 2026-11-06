@@ -70,6 +70,7 @@ impl QualityPreset {
                     "r_rgb565" => *value = "1", // native RGB565 swapchain when supported (latched)
                     "r_competitiveAB" => *value = "5", // retained for ordinary renderer A/B; the flat-world path bypasses authored stages
                     "r_collisionWorld" => *value = "1", // native BSP flat-shaded multidraw, independent of audio
+                    "r_shitterTexture" => *value = "1", // universal factory/base image, no material stages
                     "r_fragmentShaderMode" => *value = "5", // current measured compact-world family
                     "r_drawfog" => *value = "0", // avoid Legacy 2 FP16/post on fog maps
                     "r_fullbright" => *value = "0", // BSP baked global lightmaps, not forced unlit
@@ -290,6 +291,7 @@ impl QualityPreset {
             ("r_fragmentShaderMode", "5"),
             ("r_competitiveAB", "0"),
             ("r_collisionWorld", "0"), // all non-Shitter presets restore authored geometry
+            ("r_shitterTexture", "0"), // no image sampling in other presets
             ("r_fullbright", "0"),
             ("r_vertexLight", "0"),
             ("r_lightmap", "0"),
@@ -625,6 +627,7 @@ mod tests {
             ("r_fragmentShaderMode", "5", "5"),
             ("r_competitiveAB", "5", "0"),
             ("r_collisionWorld", "1", "0"),
+            ("r_shitterTexture", "1", "0"),
             ("r_fullbright", "0", "0"),
             ("r_vertexLight", "0", "0"),
             ("r_lightmap", "0", "0"),

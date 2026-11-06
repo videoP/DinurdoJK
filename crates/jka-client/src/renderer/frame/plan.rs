@@ -218,7 +218,9 @@ impl Renderer {
             || self.ssr_enabled
             || self.reflection_debug_enabled
             || self.motion_blur_strength > 0.001
-            || self.dof_draws_this_plan();
+            || self.dof_draws_this_plan()
+            // The policy mask marks lightmapped world for baked sky light.
+            || self.sky_world_baked();
         let needs_linear_depth = other_linear_depth || rain_spatial_post;
         // Which consumers asked for the full prepass (bit order matches the
         // `other_linear_depth` terms, then rain); recorded by render_perf_capture.

@@ -1245,7 +1245,7 @@ impl OceanGpu {
                 ([-sun[0], -sun[1], -sun[2]], [tint[0], tint[1], tint[2]]),
                 |light| (light.direction.to_array(), light.color.to_array()),
             );
-            let intensity = sky_light.map_or(sun[3] * 5.0, |light| light.intensity);
+            let intensity = sky_light.map_or(self.environment.map_sun_intensity(), |light| light.intensity);
             slot.caustic_receiver.write(
                 queue,
                 &blue_water_gpu::caustics::ReceiverParams {
@@ -1291,7 +1291,7 @@ impl OceanGpu {
             }
             if sky_environment.is_none() {
                 slot.bindings
-                    .write_sun(queue, direction, color, sun[3] * 5.0);
+                    .write_sun(queue, direction, color, self.environment.map_sun_intensity());
             }
             let ambient = self.environment.sky_ambient;
             slot.bindings

@@ -93,7 +93,12 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", rt_taa: 0", "")
         .replace(", dlss: false, dlss_mode: Dlaa, dlss_model: Transformer", "")
         .replace(", baked_sun_removal: 0.0", "")
+        .replace(", relight_time: 15.0", "")
         .replace(", baked_sun_cache: false", "")
+        .replace(", lightmap_smoothing: 0", "")
+        .replace(", baked_sun_aa: 1", "")
+        .replace(", lightmap_signal: 0, sun_receiver_normals: 1, sun_terminator: false, sky_world_bake: 1", "")
+        .replace(", bake_threads: 0", "")
         .replace(", sun_shadow_strength: 0.3", "")
         .replace(", sun_shadow_strength: 0.6", "")
         .replace(", sun_lighting: false", "")
@@ -152,6 +157,8 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cg_swimTilt ")
                     && !line.starts_with("seta r_bakedSunRemoval ")
                     && !line.starts_with("seta r_bakedSunCache ")
+                    && !line.starts_with("seta r_lightmapSmoothing ")
+                    && !line.starts_with("seta r_bakedSunAA ")
                     && !line.starts_with("seta r_sunShadowStrength ")
                     && !line.starts_with("seta r_sunLighting ")
                     && !line.starts_with("seta r_bakedSunShadowMap ")
@@ -182,6 +189,10 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cl_serverFilters ")
                     // New controls are outside the frozen pre-registry archive.
                     && !line.starts_with("seta r_blueCloudQuality ")
+                    && !line.starts_with("seta r_skyBackend ")
+                    && !line.starts_with("seta r_cloudBackend ")
+                    && !line.starts_with("seta r_cloudPortalDepth ")
+                    && !line.starts_with("seta r_relightTime ")
                     && !line.starts_with("seta r_worldFlares ")
                     && !line.starts_with("seta r_saberFlares ")
                     && !line.starts_with("seta r_md3AutoLod ")
@@ -720,4 +731,57 @@ fn blue_cloud_quality_loads_and_archives_independently_of_sky_and_resolution() {
     assert_eq!(loaded.cloud_render_resolution, video.cloud_render_resolution);
     fs::write(&path, "seta r_blueSkyQuality 0\nseta r_blueCloudQuality NaN\n").unwrap();
     assert_eq!(config::load_video_settings(&path).blue_water_environment.cloud_quality(), blue_water_sky::SkyQuality::Low);
+}
+
+#[test]
+fn lightmap_smoothing_cvar_loads_and_archives_without_touching_legacy_matrix() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("lightmap-smoothing.cfg");
+    fs::write(&path, "seta r_lightmapSmoothing \"2\"\n").unwrap();
+    let video = config::load_video_settings(&path);
+    assert_eq!(video.lightmap_smoothing, 2);
+    config::save_video_settings(
+        &path, video,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_lightmapSmoothing \"2\""));
+    assert_eq!(config::load_video_settings(&path).lightmap_smoothing, 2);
+}
+
+#[test]
+fn baked_sun_aa_cvar_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("baked-sun-aa.cfg");
+    fs::write(&path, "seta r_bakedSunAA \"3\"\n").unwrap();
+    let video = config::load_video_settings(&path);
+    assert_eq!(video.baked_sun_aa, 3);
+    config::save_video_settings(
+        &path, video,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_bakedSunAA \"3\""));
+    assert_eq!(config::load_video_settings(&path).baked_sun_aa, 3);
+}
+
+#[test]
+fn bake_threads_cvar_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("bake-threads.cfg");
+    assert_eq!(crate::ui::VideoSettings::default().baked_sun_aa, 1);
+    assert_eq!(crate::ui::VideoSettings::default().bake_threads, 0);
+    fs::write(&path, "seta r_bakeThreads \"12\"\n").unwrap();
+    let video = config::load_video_settings(&path);
+    assert_eq!(video.bake_threads, 12);
+    config::save_video_settings(
+        &path, video,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_bakeThreads \"12\""));
+    assert_eq!(config::load_video_settings(&path).bake_threads, 12);
 }

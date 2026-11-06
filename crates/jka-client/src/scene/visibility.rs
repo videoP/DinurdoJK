@@ -489,6 +489,9 @@ pub fn auto4_audit_lines(map: &PreparedMap) -> Vec<String> {
     };
     let mut worst = (0u64, 0usize);
     let mut rows = Vec::<(usize, [u64; 11])>::new();
+    // Per cluster: IDEAL draws with a lightmap texture array, with bindless
+    // materials, and MINIMAL's unmergeable draws (for JKA_AUDIT_POS).
+    let mut relaxed_by_cluster = Vec::<[u64; 3]>::with_capacity(cluster_count);
 
     for cluster in 0..cluster_count {
         let visible = |b: &DrawBatch| portal_batch_visible_from_cluster(b, cluster);
@@ -531,6 +534,11 @@ pub fn auto4_audit_lines(map: &PreparedMap) -> Vec<String> {
         ideal.add(ideal_draws, full_tris);
         ideal_nolm += nolm.len() as u64 + min_unmergeable;
         ideal_bindless += bindless.len() as u64 + min_unmergeable;
+        relaxed_by_cluster.push([
+            nolm.len() as u64 + min_unmergeable,
+            bindless.len() as u64 + min_unmergeable,
+            min_unmergeable,
+        ]);
         for (class, members) in full_by_class.into_iter().enumerate() {
             if !members.is_empty() && members != class_full_members[class] {
                 ideal_recipes.insert((class, members));
@@ -740,6 +748,13 @@ pub fn auto4_audit_lines(map: &PreparedMap) -> Vec<String> {
                         "  POS [{x}, {y}, {z}] -> cluster {cluster}, plan {plan_id}: {} ref(s), {visible} visible FULL piece(s)",
                         refs.len()
                     ));
+                    if let Some((_, r)) = rows.iter().find(|(c, _)| *c == cluster) {
+                        let [nolm, bindless, unmergeable] = relaxed_by_cluster[cluster];
+                        lines.push(format!(
+                            "  POS cluster {cluster}: MINIMAL {}d ({unmergeable} transparent/sky/water/env)  AUTO4 warm {}d  IDEAL {}d  IDEAL+lightmap array {nolm}d  IDEAL+bindless {bindless}d",
+                            r[0], r[4], r[7]
+                        ));
+                    }
                     for reference in refs {
                         if let PreparedPortalPlanBatchRef::Merged(variant) = reference {
                             let recipe = &plan.variants[*variant];

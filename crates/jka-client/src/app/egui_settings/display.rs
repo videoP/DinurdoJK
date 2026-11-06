@@ -41,6 +41,14 @@ fn video_section_label(section: VideoSection) -> &'static str {
 
 impl App {
     pub(in crate::app) fn egui_video_page(&mut self, ui: &mut egui::Ui) {
+        // All sky/sun edits still publish live preview uniforms while dragging.
+        // Only the expensive static lightmap ray trace waits for pointer release.
+        let defer = matches!(self.video_section, VideoSection::Sun | VideoSection::Relighting | VideoSection::Clouds)
+            && ui.input(|i| i.pointer.primary_down());
+        if self.relight_bake_deferred != defer {
+            self.relight_bake_deferred = defer;
+            self.render_command(crate::renderer::RenderCommand::SetRelightBakeDeferred(defer));
+        }
         // Install the pending-row palette before building the page. The list is
         // derived from App's authoritative applied/prepared state, not a second
         // UI dirty bit, so orange always means the next Apply will consume it.

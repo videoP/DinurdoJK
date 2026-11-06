@@ -1195,7 +1195,7 @@ app_cvars! {
     }
 
     APP_R_COLLISION_WORLD {
-        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with flat shading, original PVS/area/frustum culling and one indexed multidraw. No collision/acoustic mesh, texture/lightmap samples, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with original PVS/area/frustum culling and one indexed multidraw. Uses flat shading by default; r_shitterTexture enables one shared factory/base image. No collision/acoustic mesh, lightmaps, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::collision_world_only()).to_string()),
             |app, value| App::cvar_set_collision_world(app, APP_R_COLLISION_WORLD.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_collision_world, Some(|name, value| {
@@ -1211,8 +1211,32 @@ app_cvars! {
                     _ => return Err(format!("{name}: expected 0 or 1")),
                 };
                 crate::renderer::set_collision_world_only(enabled);
-                self.console_status = format!("NATIVE FLAT WORLD: {}", if enabled { "ON" } else { "OFF" });
-                self.push_console_line(format!("[NATIVE FLAT WORLD] {} (original BSP geometry/PVS/multidraw, no collision mesh)", if enabled { "ON" } else { "OFF" }));
+                self.console_status = format!("NATIVE BSP WORLD: {}", if enabled { "ON" } else { "OFF" });
+                self.push_console_line(format!("[NATIVE BSP WORLD] {} (original BSP geometry/PVS/multidraw, optional raw image via r_shitterTexture)", if enabled { "ON" } else { "OFF" }));
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_SHITTER_TEXTURE {
+        runtime: CvarDef::new("r_shitterTexture", "", "0..1", "Shitter native BSP world only: 0 original flat shader (zero texture samples), 1 one repeating raw textures/factory/base image with directional lighting. Ignores the authored JKA material stages; lazily loads the image and builds a separate pipeline. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app: &App| CvarValue::String(u8::from(crate::renderer::shitter_texture_enabled()).to_string()),
+            |app, value| App::cvar_set_shitter_texture(app, APP_R_SHITTER_TEXTURE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_shitter_texture, Some(|name, value| {
+            value.trim().parse::<u8>().ok().filter(|v| *v <= 1)
+                .map(|v| v.to_string())
+                .ok_or_else(|| format!("{name}: expected 0 or 1"))
+        })),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_shitter_texture(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = match value.trim() {
+                    "0" => false, "1" => true,
+                    _ => return Err(format!("{name}: expected 0 or 1")),
+                };
+                crate::renderer::set_shitter_texture_enabled(enabled);
+                self.console_status = format!("SHITTER WORLD TEXTURE: {}", if enabled { "ON" } else { "OFF" });
+                self.push_console_line(format!("[SHITTER WORLD TEXTURE] {}: {}", if enabled { "ON" } else { "OFF" }, if enabled { "textures/factory/base, single sampled stage" } else { "original sample-free flat shader" }));
                 Ok(())
             }
         }]
@@ -2161,6 +2185,168 @@ app_cvars! {
                 self.video.player_contact_shadows = Self::parse_cvar_finite(name, value)?.clamp(0.0, 4.0);
                 self.mark_config_dirty();
                 self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_LIGHTMAPSMOOTHING {
+        runtime: CvarDef::new("r_lightmapSmoothing", "", "0..2", "Lightmap A/B: 0 original bilinear (default), 1 precomputed clamped Catmull-Rom bicubic, 2 softer cubic B-spline. Live; only regenerates cached lightmaps when changed. No extra world fragment texture samples.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_smoothing.to_string()), |app, value| App::cvar_set_r_lightmapsmoothing(app, APP_R_LIGHTMAPSMOOTHING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsmoothing, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    if mode <= 2 { settings.lightmap_smoothing = mode; }
+                }
+            }),
+            archive: Some((26048, |state| state.video.lightmap_smoothing.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_set_r_lightmapsmoothing(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .map_err(|_| format!("{name}: expected 0, 1 or 2"))?;
+                if mode > 2 { return Err(format!("{name}: expected 0, 1 or 2")); }
+                if self.video.lightmap_smoothing != mode {
+                    self.video.lightmap_smoothing = mode;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                }
+                self.console_status = format!("LIGHTMAP SMOOTHING: {mode} ({})", ["original bilinear", "bicubic", "soft bicubic"][mode as usize]);
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDSUNAA {
+        runtime: CvarDef::new("r_bakedSunAA", "", "0..3", "Static sunlight bake A/B: 0 original single-ray luxels, 1 chart-aware visibility edge filter, 2 adaptive 2x2 subluxel tracing, 3 adaptive 4x4 subluxel tracing. Extra work only when rebaking; does not modify CSM or add per-frame BSP texture lookups.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.baked_sun_aa.to_string()), |app, value| App::cvar_set_r_bakedsunaa(app, APP_R_BAKEDSUNAA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunaa, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    if mode <= 3 { settings.baked_sun_aa = mode; }
+                }
+            }),
+            archive: Some((26049, |state| state.video.baked_sun_aa.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_set_r_bakedsunaa(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .map_err(|_| format!("{name}: expected 0, 1, 2 or 3"))?;
+                if mode > 3 { return Err(format!("{name}: expected 0, 1, 2 or 3")); }
+                if self.video.baked_sun_aa != mode {
+                    self.video.baked_sun_aa = mode;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                }
+                self.console_status = format!("BAKED SUN AA: {mode} ({})", ["original", "edge filter", "adaptive 2x2", "adaptive 4x4"][mode as usize]);
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_LIGHTMAPSIGNAL {
+        runtime: CvarDef::new("r_lightmapSignal", "", "0..8", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges. 1-6 recompose only; 7/8 rebake. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_lightmapsignal(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .ok().filter(|mode| *mode <= 8)
+                    .ok_or_else(|| format!("{name}: expected 0..8"))?;
+                if self.video.lightmap_signal != mode {
+                    self.video.lightmap_signal = mode;
+                    self.sync_post_effects();
+                }
+                self.console_status = format!("LIGHTMAP SIGNAL: {mode} ({})", [
+                    "off", "authored as compiled", "authored residual", "authored sun removed",
+                    "new sun flux", "new sun cosine", "new sun visibility", "charts + triangles",
+                    "normal smoothing",
+                ][mode as usize]);
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDSUNNORMALS {
+        runtime: CvarDef::new("r_bakedSunNormals", "", "0..2", "Static sun bake receiver normals A/B: 0 authored vertex normals (flat brush facets), 1 shared-edge smoothing, same material, 45 degree crease (default), 2 vertex-position auto-smooth, 45 degree crease, any material/chart, handles T-junctions and split charts. Casters and dynamic CSM are unchanged. Rebakes. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sun_receiver_normals.to_string()), |app, value| App::cvar_set_r_bakedsunnormals(app, APP_R_BAKEDSUNNORMALS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunnormals, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_bakedsunnormals(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
+                if self.video.sun_receiver_normals != mode {
+                    self.video.sun_receiver_normals = mode;
+                    self.sync_post_effects();
+                }
+                self.console_status = format!("BAKED SUN NORMALS: {mode} ({})", ["authored", "shared-edge smooth", "auto-smooth"][mode as usize]);
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_SKYWORLDBAKE {
+        runtime: CvarDef::new("r_skyWorldBake", "", "0..2", "Blue Water sky world illumination on lightmapped world (r_blueSkyWorldLighting): 0 live screen pass (per-polygon depth normals, no geometry shadows), 1 baked into the composed lightmap with the static sun bake's smoothed normals (default), 2 baked with sky visibility (occlusion) traced per original luxel. Models, movers without lightmaps, cloud shadows and lightning stay live. Rebakes. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sky_world_bake.to_string()), |app, value| App::cvar_set_r_skyworldbake(app, APP_R_SKYWORLDBAKE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_skyworldbake, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_skyworldbake(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
+                if self.video.sky_world_bake != mode {
+                    self.video.sky_world_bake = mode;
+                    self.sync_post_effects();
+                }
+                self.console_status = format!("SKY WORLD BAKE: {mode} ({})", ["live screen pass", "baked", "baked + sky visibility"][mode as usize]);
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDSUNTERMINATOR {
+        runtime: CvarDef::new("r_bakedSunTerminator", "", "0|1", "Static sun bake A/B: 1 starts each sun ray on the curved surface implied by the smoothed normals (Hanika shadow-terminator fix), so coarse curved walls do not self-shadow facet by facet at low sun angles. 0 starts on the flat polygon. Rebakes. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(bool_value(app.video.sun_terminator)), |app, value| App::cvar_set_r_bakedsunterminator(app, APP_R_BAKEDSUNTERMINATOR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunterminator, None),
+        config: CvarBinding::NONE,
+        implementations: [ impl App {
+            fn cvar_set_r_bakedsunterminator(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                if self.video.sun_terminator != enabled {
+                    self.video.sun_terminator = enabled;
+                    self.sync_post_effects();
+                }
+                self.console_status = format!("BAKED SUN TERMINATOR: {}", if enabled { "curved origins" } else { "flat origins" });
+                Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKETHREADS {
+        runtime: CvarDef::new("r_bakeThreads", "", "0..32", "Relighting bake Rayon workers: 0 automatic (reserves main/render/audio, active game jobs, and one spare logical CPU; no 4-worker cap); 1..32 forces that many workers for static sunlight and authored-sun calibration. Takes effect on the next bake; higher values may reduce gameplay FPS while baking.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.bake_threads.to_string()), |app, value| App::cvar_set_r_bakethreads(app, APP_R_BAKETHREADS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakethreads, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(workers) = value.trim().parse::<u8>() {
+                    if workers <= 32 { settings.bake_threads = workers; }
+                }
+            }),
+            archive: Some((26050, |state| state.video.bake_threads.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_set_r_bakethreads(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let workers = value.trim().parse::<u8>()
+                    .map_err(|_| format!("{name}: expected a whole number from 0 to 32"))?;
+                if workers > 32 { return Err(format!("{name}: expected a whole number from 0 to 32")); }
+                if self.video.bake_threads != workers {
+                    self.video.bake_threads = workers;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                }
+                self.console_status = if workers == 0 {
+                    "BAKE THREADS: automatic (applies to the next bake)".into()
+                } else {
+                    format!("BAKE THREADS: {workers} (applies to the next bake)")
+                };
                 Ok(())
             }
         } ]
@@ -4656,6 +4842,30 @@ app_cvars! {
                     2 => "native blend with resolve",
                     3 => "native blend without legacy-forced resolve",
                     _ => "direct SDR UNORM alias (unsupported targets fall back to mode 0)",
+                });
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_PLANARREFLECTIONMASK {
+        runtime: CvarDef::new(
+            "r_planarReflectionMask", "0", "0..2",
+            "Planar reflection fill A/B (session-only, live): 0 shade the whole reflection target (original); 1 scissor each reflected view to its reflector's screen rectangle; 2 scissor plus a depth-mask carve of the reflector's screen polygon, so early-Z rejects reflected pixels the mirror never shows. Reflections should look identical in all modes.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(crate::renderer::planar_reflection_mask().to_string()),
+            |app, value| App::cvar_set_r_planarreflectionmask(app, APP_R_PLANARREFLECTIONMASK.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_planarreflectionmask, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_planarreflectionmask(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name} expects 0, 1 or 2"))?;
+                crate::renderer::set_planar_reflection_mask(mode);
+                self.console_status = format!("PLANAR REFLECTION MASK: {}", match mode {
+                    0 => "off (full target)",
+                    1 => "scissor rectangle",
+                    _ => "scissor + depth polygon mask",
                 });
                 Ok(())
             }

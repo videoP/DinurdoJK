@@ -2456,27 +2456,45 @@ impl WeaponFx {
             *start = std::time::Instant::now();
         }
         let time = self.time;
+        // One Mesh per trail shader rather than one Quad per live segment:
+        // no per-segment String or shader lookup at high presentation rates.
+        // FX tessellation batches by shader in draw order, so the triangles
+        // and their order within each shader batch are unchanged.
+        let live = self.saber_trail_segments.len();
+        let mut trail_meshes: Vec<(&'static str, FxDraw)> = Vec::new();
         self.saber_trail_segments.retain(|segment| {
             if time >= segment.end_time {
                 return false;
             }
+            let index = trail_meshes.iter().position(|(shader, _)| *shader == segment.shader)
+                .unwrap_or_else(|| {
+                    trail_meshes.push((segment.shader, FxDraw::Mesh {
+                        positions: Vec::with_capacity(live * 4),
+                        uvs: Vec::with_capacity(live * 4),
+                        rgba: Vec::with_capacity(live * 4),
+                        indices: Vec::with_capacity(live * 12),
+                        shader: segment.shader.to_owned(),
+                    }));
+                    trail_meshes.len() - 1
+                });
+            let FxDraw::Mesh { positions, uvs, rgba, indices, .. } = &mut trail_meshes[index].1 else {
+                unreachable!();
+            };
             // OpenJK CTrail::Update linearly advances each vertex ST toward
             // destST (which CG_AddSaberBlade sets to start U + 1), clamping
             // U at 1.0. Preserve that texture sweep over the segment life.
             let life = (segment.end_time - segment.start_time).max(1) as f32;
             let progress = ((time - segment.start_time).max(0) as f32 / life).clamp(0.0, 1.0);
-            let mut uvs = segment.start_uvs;
-            for uv in &mut uvs {
-                uv[0] = (uv[0] + progress).min(1.0);
-            }
-            frame.draws.push(FxDraw::Quad {
-                positions: segment.positions,
-                uvs,
-                rgba: segment.rgba,
-                shader: segment.shader.to_owned(),
-            });
+            let base = positions.len() as u32;
+            positions.extend_from_slice(&segment.positions);
+            uvs.extend(segment.start_uvs.map(|uv| [(uv[0] + progress).min(1.0), uv[1]]));
+            rgba.extend([segment.rgba; 4]);
+            // RB_AddQuadStamp (v0,v1,v3),(v3,v1,v2) plus the reverse winding
+            // the Quad path emits for cull-twosided FX shaders.
+            indices.extend([0, 1, 3, 3, 1, 2, 3, 1, 0, 2, 1, 3].map(|i| base + i));
             true
         });
+        frame.draws.extend(trail_meshes.into_iter().map(|(_, mesh)| mesh));
         // Histories only need to bridge nearby samples; discard entities that
         // have not submitted a blade for several seconds.
         self.saber_trail_history
@@ -2997,26 +3015,19 @@ impl WeaponFx {
                     *no_wall_marks,
                 );
                 if crate::renderer::collision_world_only() {
-                    // Collision mode: one untextured, player-color-readable
-                    // blade. $melt_glow is an existing engine-native vertex-
-                    // color material (one additive stage, no image sampling).
-                    // Do not generate the legacy glow/core layers or trails.
+                    // Shitter: one opaque untextured blade. The dedicated FX
+                    // tessellation draws a square hilt end and a four-vertex
+                    // rounded tip in one depth-writing batch, with no glow,
+                    // additive blending, texture sampling or trail.
                     self.saber_trail_history.remove(&key);
                     if !*no_blade && clipped_length >= 0.5 && *radius > 0.0 {
                         let color = saber_trail_rgb(*color);
-                        let opacity = (*entity_alpha).clamp(0.0, 1.0);
-                        let rgba = [
-                            (f32::from(color[0]) * opacity) as u8,
-                            (f32::from(color[1]) * opacity) as u8,
-                            (f32::from(color[2]) * opacity) as u8,
-                            255,
-                        ];
                         self.immediate_draws.push(FxDraw::Line {
                             start: *origin,
                             end: madd3(*origin, normalize3(*direction), clipped_length),
-                            width: (*radius * 0.85).max(0.75),
-                            rgba,
-                            shader: "$melt_glow".into(),
+                            width: (*radius * 0.32).max(0.35),
+                            rgba: [color[0], color[1], color[2], 255],
+                            shader: "$shitter_blade".into(),
                         });
                     }
                 } else {
@@ -5992,18 +6003,22 @@ mod tests {
         fx.player_fx(&blade);
         let frame = fx.end_frame();
         let quad = frame.draws.iter().find_map(|draw| match draw {
-            FxDraw::Quad { positions, uvs, rgba, shader } => Some((positions, uvs, rgba, shader)),
+            FxDraw::Mesh { positions, uvs, rgba, indices, shader } if shader.starts_with("gfx/effects/sabers/") =>
+                Some((positions, uvs, rgba, shader, indices)),
             _ => None,
-        }).expect("second sample should emit a saber trail quad");
+        }).expect("second sample should emit a saber trail mesh");
         assert_eq!(quad.3, "gfx/effects/sabers/saberBlur");
-        assert_eq!(quad.2[..3], [0, 64, 255]);
+        assert_eq!(quad.0.len(), 4, "one live segment = one quad");
+        assert_eq!(quad.4[..], [0, 1, 3, 3, 1, 2, 3, 1, 0, 2, 1, 3]);
+        assert_eq!(quad.2[0][..3], [0, 64, 255]);
         assert_eq!(quad.0[0], [0.0, 1.0, 0.0]);
         assert_eq!(quad.1[2][0], 0.25, "10 ms / 40 ms stock fallback duration");
 
         fx.set_saber_trail(0);
         fx.begin_frame(1060);
         fx.player_fx(&blade);
-        assert!(!fx.end_frame().draws.iter().any(|draw| matches!(draw, FxDraw::Quad { .. })));
+        assert!(!fx.end_frame().draws.iter().any(|draw| matches!(draw,
+            FxDraw::Mesh { shader, .. } if shader.starts_with("gfx/effects/sabers/"))));
     }
 
     #[test]
@@ -6016,7 +6031,12 @@ mod tests {
             saber_move: 0, torso_anim: 0, saber_in_flight: true, trail_style: 0,
             num_blades: 2, no_dlight: false, no_blade: false, no_wall_marks: false,
         };
-        let has_quad = |frame: &FxFrame| frame.draws.iter().any(|draw| matches!(draw, FxDraw::Quad { .. }));
+        let trail_positions = |frame: &FxFrame| frame.draws.iter().find_map(|draw| match draw {
+            FxDraw::Mesh { positions, shader, .. } if shader.starts_with("gfx/effects/sabers/") =>
+                Some(positions.clone()),
+            _ => None,
+        });
+        let has_quad = |frame: &FxFrame| trail_positions(frame).is_some();
 
         fx.begin_frame(1000);
         fx.player_fx(&blade([0.0, 0.0, 0.0], 10.0));
@@ -6031,10 +6051,7 @@ mod tests {
         fx.begin_frame(1020);
         fx.player_fx(&blade([100.0, 1.0, 0.0], 10.0));
         let frame = fx.end_frame();
-        let positions = frame.draws.iter().find_map(|draw| match draw {
-            FxDraw::Quad { positions, .. } => Some(*positions),
-            _ => None,
-        }).expect("relit blade should trail from the off sample");
+        let positions = trail_positions(&frame).expect("relit blade should trail from the off sample");
         assert_eq!(positions[3], [100.0, 0.0, 0.0], "old base is where the blade was switched off");
     }
 

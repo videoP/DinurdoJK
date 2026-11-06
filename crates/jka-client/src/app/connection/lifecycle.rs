@@ -56,6 +56,8 @@ impl App {
         self.preserve_game_state_on_next_map_upload = false;
         self.loading = None;
         self.static_ao_progress = None;
+        self.sun_bake_progress = None;
+        self.sun_bake_ready_at = None;
         self.prepared_map_cache = None;
         self.cross_game_map_seed = None;
         self.game_session = None;
@@ -155,6 +157,8 @@ impl App {
         self.frontend_cinematic = None;
         self.preserve_game_state_on_next_map_upload = false;
         self.static_ao_progress = None;
+        self.sun_bake_progress = None;
+        self.sun_bake_ready_at = None;
         self.prepared_map_cache = None;
         self.game_session = None;
         self.weapon_select_until = None;

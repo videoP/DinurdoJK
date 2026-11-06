@@ -70,6 +70,9 @@ pub struct SkyUniforms {
     pub lightning_intensity: f32,
     /// How the air under a closed deck greys (x, 0–1) and dims (y) the clear sky's haze (`overcast`); z is the dome's night sky brightness (1 authored, `Sky::set_night_sky_brightness`); w unused.
     pub haze: [f32; 4],
+    /// The apparent size of the sun's (x) and the moon's (y) discs as multiples of the authored radius
+    /// (`Sky::set_disc_scales`); the light they cast is unchanged. zw unused.
+    pub discs: [f32; 4],
 }
 
 pub(crate) fn v3(v: glam::DVec3) -> [f32; 3] {
@@ -93,7 +96,7 @@ mod tests {
                 {
                     let names: Vec<_> = members.iter().filter_map(|m| m.name.clone()).collect();
                     assert_eq!(names.first().map(String::as_str), Some("sun_scale"));
-                    assert_eq!(names.last().map(String::as_str), Some("haze"));
+                    assert_eq!(names.last().map(String::as_str), Some("discs"));
                     let offset_of = |field: &str| {
                         members
                             .iter()
@@ -122,6 +125,6 @@ mod tests {
             })
             .expect("SkyUniforms in the dome's module");
         assert_eq!(span as usize, std::mem::size_of::<SkyUniforms>());
-        assert_eq!(std::mem::size_of::<SkyUniforms>(), 544);
+        assert_eq!(std::mem::size_of::<SkyUniforms>(), 560);
     }
 }

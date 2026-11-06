@@ -12,6 +12,28 @@ use crate::renderer::{GrassDrawStats, ViewSampleMeasurement};
 use crate::ui::GlowMode;
 use crate::renderer::StudioLens;
 
+/// Visibility bake status sent from render worker to the native HUD and Relighting UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SunBakeStage {
+    Off, Preparing, Tracing, Refining, Local, Uploading, Composing, Ready, Fallback, Failed,
+}
+impl SunBakeStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Not running",
+            Self::Preparing => "Preparing geometry",
+            Self::Tracing => "Tracing static sun",
+            Self::Refining => "Antialiasing shadow edges",
+            Self::Local => "Baking map lights",
+            Self::Uploading => "Uploading lightmaps",
+            Self::Composing => "Compositing lighting",
+            Self::Ready => "Ready",
+            Self::Fallback => "Traced, but lightmap compositor unavailable",
+            Self::Failed => "Bake failed (see console)",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DynamicModelAlphaMode {
     Opaque,
@@ -873,6 +895,16 @@ pub struct PostEffects {
     /// 0..1: estimated subtraction of authored direct sunlight from BSP baked lighting.
     pub baked_sun_removal: f32,
     pub baked_sun_cache: bool,
+    pub lightmap_smoothing: u8,
+    pub baked_sun_aa: u8,
+    /// Session diagnostics: lightmap signal view 0..8, receiver normals 0..2,
+    /// shadow-terminator ray origins.
+    pub lightmap_signal: u8,
+    pub sun_receiver_normals: u8,
+    pub sun_terminator: bool,
+    /// Sky world illumination for lightmapped world: 0 live pass, 1 baked, 2 + sky visibility.
+    pub sky_world_bake: u8,
+    pub bake_threads: u8,
     pub baked_sun_shadow_map: bool,
     pub baked_sun_edge_softness: f32,
     pub baked_sun_direct_limit: f32,
@@ -1165,6 +1197,8 @@ pub enum RenderCommand {
     /// Preview a sun ray; debug modes also colorize BSP baked-sun inputs.
     /// 0 = active sun ray only, 1 = baked removal amount, 2 = authored-sun visibility.
     SetSunRayPreview { enabled: bool, debug_mode: u8 },
+    /// Pause expensive static-sun re-tracing while UI sliders are held.
+    SetRelightBakeDeferred(bool),
     SetPvsMode(PvsMode),
     SetFacePlaneCull(bool),
     SetWorldFlares(bool),

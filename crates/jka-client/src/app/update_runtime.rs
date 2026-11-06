@@ -32,6 +32,8 @@ impl App {
                     let _ = proxy.send_event(UserEvent::Update(Event::Progress { received, total }));
                     last_report = received;
                 }
+            }, |line| {
+                let _ = proxy.send_event(UserEvent::Update(Event::FileDecision(line)));
             });
             let _ = proxy.send_event(UserEvent::Update(Event::Staged(result)));
         });
@@ -72,6 +74,8 @@ impl App {
                 self.updater.checking = false;
                 // Automatic checks should fail quietly: no release/configured
                 // archive or temporary connectivity must not pop a modal.
+                self.push_console_line_no_notify(format!("[UPDATE] Check failed: {error}"),
+                    crate::logging::ConsoleLineKind::Normal);
                 self.updater.error = Some(error);
             }
             Event::Progress { received, total } => {
@@ -82,14 +86,23 @@ impl App {
                 self.updater.applying = false;
                 match result {
                     Ok(()) => quit = true,
-                    Err(e) => self.updater.error = Some(e),
+                    Err(e) => {
+                        self.push_console_error(format!("[UPDATE] Restart failed: {e}"));
+                        self.updater.error = Some(e);
+                    },
                 }
+            }
+            Event::FileDecision(line) => {
+                self.push_console_line_no_notify(line, crate::logging::ConsoleLineKind::Normal);
             }
             Event::Staged(result) => {
                 self.updater.downloading = false;
                 match result {
                     Ok(stage) => { self.updater.staged = Some(stage); self.updater.manual_result = Some("Update ready. Restart to apply.".into()); }
-                    Err(e) => self.updater.error = Some(e),
+                    Err(e) => {
+                        self.push_console_error(format!("[UPDATE] Download/staging failed: {e}"));
+                        self.updater.error = Some(e);
+                    },
                 }
             }
         }
@@ -98,45 +111,67 @@ impl App {
         if quit { self.request_quit(); }
     }
 
-    pub(in crate::app) fn egui_update_notice(&mut self, root: &mut egui::Ui) {
-        if !self.updater.notice { return; }
-        // Launch notifications only appear in the main menu. Never interrupt
-        // multiplayer/gameplay or steal keyboard focus while playing.
-        if !self.front_end || self.frontend_page != super::FrontendPage::Main { return; }
-        let Some(release) = self.updater.release.clone() else { return; };
-        egui::Area::new(egui::Id::new("djk_update_notice"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-22.0, 90.0))
-            .show(root.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(super::egui_theme::pick(egui::Color32::from_rgb(24, 29, 39), super::egui_theme::PANEL_FILL()))
-                    .stroke(egui::Stroke::new(1.0, super::egui_theme::pick(egui::Color32::from_gray(95), super::egui_theme::LINE_STRONG())))
-                    .inner_margin(egui::Margin::same(16))
-                    .show(ui, |ui| {
-                        ui.set_width(350.0);
-                        ui.heading(format!("DinurdoJK {} available", release.tag));
-                        ui.small("Download is manual. Gameplay will not be interrupted.");
-                        if !release.notes.is_empty() {
-                            egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| { ui.label(&release.notes); });
-                        }
-                        if self.updater.downloading {
-                            let fraction = if self.updater.total == 0 { 0.0 } else {
-                                self.updater.downloaded as f32 / self.updater.total as f32
-                            };
-                            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
-                        } else if self.updater.staged.is_some() {
-                            ui.label("Verified and ready to install when the game restarts.");
-                            if self.updater.applying {
-                                ui.label("Starting the installer...");
-                            } else if ui.button("Restart & Apply Update").clicked() {
-                                self.apply_update_now();
-                            }
-                        } else if ui.button("Download & Install").clicked() {
-                            self.download_update();
-                        }
-                        if let Some(error) = &self.updater.error { ui.colored_label(super::egui_theme::DANGER(), error); }
-                        if ui.button("Later / Dismiss").clicked() { self.updater.notice = false; }
-                    });
-            });
+    /// Only the actual frontend Main page shows this nonmodal native notice.
+    pub(in crate::app) fn native_update_notice_ui(&self) -> Option<crate::ui::update_notice::UpdateNoticeUi> {
+        if !self.front_end || self.frontend_page != super::FrontendPage::Main
+            || self.overlay == crate::ui::OverlayMode::Console || !self.updater.notice {
+            return None;
+        }
+        let release = self.updater.release.as_ref()?;
+        Some(crate::ui::update_notice::UpdateNoticeUi {
+            version: release.tag.clone(),
+            downloading: self.updater.downloading,
+            applying: self.updater.applying,
+            staged: self.updater.staged.is_some(),
+            received: self.updater.downloaded,
+            total: self.updater.total,
+            error: self.updater.error.clone(),
+            hovered: self.updater.notice_hovered,
+        })
+    }
+
+    /// Input and paint share the Taffy layout. No egui Area/widgets are used.
+    pub(in crate::app) fn native_update_notice_event(&mut self, event: &winit::event::WindowEvent) -> bool {
+        use winit::event::{WindowEvent, ElementState, MouseButton};
+        let Some(notice) = self.native_update_notice_ui() else { return false; };
+        let Some(window) = self.window.as_ref() else { return false; };
+        let size = window.inner_size();
+        let layout = crate::ui::update_notice::layout(&notice, size.width, size.height);
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let p = [position.x as f32, position.y as f32];
+                self.cursor_position = (position.x, position.y);
+                let hovered = layout.hit_test(p, &notice);
+                if self.updater.notice_hovered != hovered {
+                    self.updater.notice_hovered = hovered;
+                    self.publish_ui();
+                }
+                layout.contains(p)
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.updater.notice_hovered = None;
+                self.publish_ui();
+                false
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                let p = [self.cursor_position.0 as f32, self.cursor_position.1 as f32];
+                if !layout.contains(p) { return false; }
+                match layout.hit_test(p, &notice) {
+                    Some(crate::ui::update_notice::Action::Download) => self.download_update(),
+                    Some(crate::ui::update_notice::Action::Apply) => self.apply_update_now(),
+                    Some(crate::ui::update_notice::Action::Dismiss) => {
+                        self.updater.notice = false;
+                        self.updater.notice_hovered = None;
+                    }
+                    None => {},
+                }
+                self.publish_ui();
+                true
+            }
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
+                layout.contains([self.cursor_position.0 as f32, self.cursor_position.1 as f32])
+            }
+            _ => false,
+        }
     }
 }

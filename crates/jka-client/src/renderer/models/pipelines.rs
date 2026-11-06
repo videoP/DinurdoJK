@@ -1,6 +1,6 @@
 //! Models pipelines.
 use crate::renderer::{
-    camera_depth_compare, create_entity_shadow_pipeline, dynamic_model_writes_depth,
+    BlendFactor, camera_depth_compare, create_entity_shadow_pipeline, dynamic_model_writes_depth,
     gpu_blend_factor, pipeline_hash, polygon_offset_depth_bias, scene, BlendMode, CullMode,
     DrawClass, DynamicModelAlphaMode, DynamicModelRenderer, DynamicModelVertex,
     FxGpuSpriteInstance, Ghoul2GpuVertex, GpuVertex, PipelineJobKey, PipelineJobManager,
@@ -1691,7 +1691,50 @@ pub(in crate::renderer) fn create_world_pipeline(
     complexity_fragment: Option<&wgpu::ShaderModule>,
 ) -> wgpu::RenderPipeline {
     create_world_pipeline_specialized(device, layout, shader, surface_format, key, msaa_samples,
-        legacy_fog, fog_pass, shader_variant, legacy_dlight_pass, complexity_fragment, None, false)
+        legacy_fog, fog_pass, shader_variant, legacy_dlight_pass, complexity_fragment, None, false, false)
+}
+
+/// The planar capture shares the ordinary world shader and authored RGB blends,
+/// but its alpha channel also records whether the lake must supply sky radiance.
+/// Additive stages cannot claim coverage just because their JPG has alpha=1.
+pub(in crate::renderer) fn create_reflection_world_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    key: PipelineKey,
+    legacy_fog: bool,
+    shader_variant: WorldShaderVariantKey,
+) -> wgpu::RenderPipeline {
+    create_world_pipeline_specialized(device, layout, shader, surface_format, key, 1,
+        legacy_fog, false, Some(shader_variant), false, None, None, false, true)
+}
+
+/// In a reflected lake view the unrendered sky has alpha=-1. The lake later
+/// adds its own Blue Water sky wherever this marker survives. GL_ONE GL_ONE
+/// writes source alpha 1 even for black texels in opaque JPG cloud sprites;
+/// that would change -1 to 0 across the entire quad and erase the sky. An
+/// additive stage adds light, not geometric coverage: preserve destination
+/// alpha while applying the exact authored RGB blend. Opaque stages still
+/// write their actual alpha and thus correctly cover the sky.
+fn reflection_capture_blend(
+    blend_mode: BlendMode,
+    additive_fusion_count: u8,
+    mut blend: Option<wgpu::BlendState>,
+    capture: bool,
+) -> Option<wgpu::BlendState> {
+    if capture && (additive_fusion_count >= 2
+        || matches!(blend_mode, BlendMode::Custom(_, BlendFactor::One)))
+    {
+        if let Some(state) = &mut blend {
+            state.alpha = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            };
+        }
+    }
+    blend
 }
 
 /// Fragment entry point of a base-pass world PSO.
@@ -1735,6 +1778,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
     // r_fragmentShaderMode 2: vs_world_minimal / fs_world_minimal (see
     // material_minimal_entry); only for a plain base-pass stage.
     minimal_entry: bool,
+    reflection_capture: bool,
 ) -> wgpu::RenderPipeline {
     let shader_complexity = complexity_fragment.is_some();
     let blend = if shader_complexity {
@@ -1801,6 +1845,9 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             }
         }
     };
+    let blend = reflection_capture_blend(
+        key.blend, key.additive_fusion_count, blend, reflection_capture,
+    );
     let color_write = wgpu::ColorWrites::ALL;
     // ENABLE_ALPHA_TEST is per pipeline rather than per variant: an Opaque stage
     // never has an alpha cutoff, and leaving the discard out keeps early depth
@@ -1916,7 +1963,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         || (is_rt && rt_diagnostics::config().trace);
     let fingerprint = pipeline_hash(&(key, shader_variant, surface_format, msaa_samples,
         legacy_fog, fog_pass, legacy_dlight_pass, vertex_entry_point, fragment_entry_point,
-        material_key));
+        material_key, reflection_capture));
     // This line is flushed by the logger BEFORE entering the native compiler.
     // BEGIN without a matching END identifies an in-flight compilation on crash.
     let compile_id = if traced {
@@ -2037,7 +2084,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             return create_world_pipeline_specialized(
                 device, layout, shader, surface_format, key, msaa_samples,
                 legacy_fog, fog_pass, Some(wgsl_variant), legacy_dlight_pass,
-                complexity_fragment, material_key, minimal_entry,
+                complexity_fragment, material_key, minimal_entry, reflection_capture,
             );
         }
     }
@@ -2047,4 +2094,49 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             native_compile_started.elapsed().as_secs_f64() * 1000.0);
     }
     pipeline
+}
+
+#[cfg(test)]
+mod reflection_capture_blend_tests {
+    use super::*;
+
+    #[test]
+    fn additive_cloud_preserves_lake_sky_alpha_but_not_rgb() {
+        let authored = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let result = reflection_capture_blend(
+            BlendMode::Custom(BlendFactor::One, BlendFactor::One), 0,
+            Some(wgpu::BlendState { color: authored, alpha: authored }), true,
+        ).unwrap();
+        assert_eq!(result.color, authored);
+        assert_eq!(result.alpha.src_factor, wgpu::BlendFactor::Zero);
+        assert_eq!(result.alpha.dst_factor, wgpu::BlendFactor::One);
+        // Black cloud JPG texel = zero additive RGB, leaving Blue Water's
+        // fallback untouched; bright texels still add their color above it.
+        let background_alpha = -1.0_f32;
+        let source_alpha = 1.0_f32;
+        let preserved = 0.0 * source_alpha + 1.0 * background_alpha;
+        assert_eq!(preserved, -1.0);
+        assert_eq!(1.0 - (preserved + 1.0).clamp(0.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn normal_world_and_alpha_blends_keep_their_authored_alpha_equation() {
+        let authored = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let state = Some(wgpu::BlendState { color: authored, alpha: authored });
+        assert_eq!(reflection_capture_blend(
+            BlendMode::Custom(BlendFactor::One, BlendFactor::One), 0, state, false,
+        ), state);
+        assert_eq!(reflection_capture_blend(
+            BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
+            0, state, true,
+        ), state);
+    }
 }

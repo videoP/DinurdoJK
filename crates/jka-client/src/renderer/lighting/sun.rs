@@ -4,7 +4,39 @@ use crate::renderer::{
     FALLBACK_SUN_COLOR, FALLBACK_SUN_DIRECTION, FALLBACK_SUN_INTENSITY,
 };
 
+/// Overcast approximation for the relit (not the authored) sun. Coverage is
+/// quantized to the Cloud UI's 5% increments so moving the slider cannot queue
+/// a fresh multi-ray lightmap bake for every sub-pixel input change. The residual
+/// 8% represents weak directional light penetrating a fully overcast sky; the
+/// authored indirect light remains the diffuse sky fill.
+pub(super) fn overcast_direct_fraction(coverage_steps: u8) -> f32 {
+    let coverage = f32::from(coverage_steps.min(20)) / 20.0;
+    1.0 - 0.92 * coverage.powf(1.35)
+}
+
 impl Renderer {
+    /// Only relit BSPs inherit volumetric cloud coverage. Ordinary JKA
+    /// lightmaps/CSM retain their previous lighting without this feature.
+    pub(in crate::renderer) fn relight_cloud_coverage_steps(&self) -> u8 {
+        if self.sun_override && self.baked_sun_cache && self.clouds_enabled {
+            (self.cloud_coverage.clamp(0.0, 1.0) * 20.0).round() as u8
+        } else {
+            0
+        }
+    }
+
+    pub(in crate::renderer) fn relight_direct_fraction(&self) -> f32 {
+        overcast_direct_fraction(self.relight_cloud_coverage_steps())
+    }
+
+    /// Preserve the user's subtraction setting as a minimum. A cloud-covered
+    /// relit sky cannot retain the hard, authored sunlight that was baked under
+    /// clear conditions; remove progressively more of that original direct sun
+    /// before adding the soft replacement. Do not mutate the archived cvar.
+    pub(in crate::renderer) fn effective_baked_sun_removal(&self) -> f32 {
+        self.baked_sun_removal.max(f32::from(self.relight_cloud_coverage_steps()) / 20.0)
+    }
+
     /// Feeds the sun-to-head beam shown while the sun angles are edited. The head
     /// is the local player's eye (actor origin + JKA standing view height); the
     /// camera stands in when there is no local player (demos, free camera).
@@ -89,6 +121,9 @@ impl Renderer {
                 light.intensity = self.blue_water_environment.effective_moon_intensity() * (255.0 * 0.2);
             }
         }
+        // Clouds scatter the celestial key into the diffuse sky. Keep the
+        // original indirect lightmap (sky fill), rather than blackening the map.
+        light.intensity *= self.relight_direct_fraction();
         light
     }
 
@@ -176,5 +211,18 @@ impl Renderer {
             toward_sun: toward_sun.to_array(),
             gain: gain.to_array(),
         })
+    }
+}
+
+#[cfg(test)]
+mod overcast_tests {
+    use super::overcast_direct_fraction;
+
+    #[test]
+    fn overcast_attenuates_sun_without_removing_ambient_fill() {
+        assert_eq!(overcast_direct_fraction(0), 1.0);
+        assert!(overcast_direct_fraction(10) < 1.0);
+        assert!(overcast_direct_fraction(10) > overcast_direct_fraction(20));
+        assert!((overcast_direct_fraction(20) - 0.08).abs() < 1e-5);
     }
 }

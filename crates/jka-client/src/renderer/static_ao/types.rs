@@ -25,6 +25,8 @@ pub(in crate::renderer) struct StaticAoJobKey {
 
 #[derive(Clone)]
 pub(in crate::renderer) struct StaticAoLightmapTriangle {
+    /// Source material used to keep unrelated surfaces from sharing bake normals.
+    pub(in crate::renderer) material: u32,
     pub(in crate::renderer) texture: usize,
     pub(in crate::renderer) owner: u32,
     pub(in crate::renderer) positions: [[f32; 3]; 3],

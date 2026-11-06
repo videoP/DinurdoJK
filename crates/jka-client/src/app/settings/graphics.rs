@@ -382,6 +382,32 @@ impl App {
         self.publish_ui();
     }
 
+    /// One complete 24-hour synthetic arc. At noon the sun faces the map's
+    /// authored midday azimuth, and the moon occupies the opposing sky direction.
+    /// This is an artistic game clock, not an astronomical date/location model.
+    pub(in crate::app) fn set_relighting_time(&mut self, hour: f32) {
+        if !hour.is_finite() { return; }
+        let hour = hour.clamp(3.0, 27.0);
+        let noon_yaw = self.map_sun_editor_values()
+            .map(|(yaw, _, _, _)| yaw)
+            .unwrap_or_else(|| crate::ui::VideoSettings::default().sun_yaw);
+        let arc = relighting_celestial_arc(hour, noon_yaw);
+        self.video.relight_time = hour;
+        self.video.sun_yaw = arc.sun_yaw;
+        self.video.sun_pitch = arc.sun_elevation;
+        // Keep the authored solar intensity and chromaticity. Blue Water
+        // atmosphere/Relighting already fade the direct sun at sunset.
+        self.video.blue_water_environment.moon_custom = true;
+        self.video.blue_water_environment.moon_azimuth = arc.moon_azimuth;
+        self.video.blue_water_environment.moon_elevation = arc.moon_elevation;
+        // Moon phase controls visual brightness only; it never moves the clock's moon.
+        self.sun_custom_initialized = true;
+        self.touch_sun_ray();
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
     /// Shows the sun-to-head beam for a moment; called on every yaw/pitch edit and
     /// kept alive by `egui_sun` while a slider is still held.
     pub(in crate::app) fn touch_sun_ray(&mut self) {
@@ -693,6 +719,13 @@ impl App {
             entity_sun_lighting: effective.entity_sun_lighting,
             baked_sun_removal: effective.baked_sun_removal,
             baked_sun_cache: self.video.baked_sun_cache,
+            lightmap_smoothing: self.video.lightmap_smoothing,
+            baked_sun_aa: self.video.baked_sun_aa,
+            lightmap_signal: self.video.lightmap_signal,
+            sun_receiver_normals: self.video.sun_receiver_normals,
+            sun_terminator: self.video.sun_terminator,
+            sky_world_bake: self.video.sky_world_bake,
+            bake_threads: self.video.bake_threads,
             baked_sun_shadow_map: self.video.baked_sun_shadow_map,
             baked_sun_edge_softness: self.video.baked_sun_edge_softness,
             baked_sun_direct_limit: self.video.baked_sun_direct_limit,
@@ -2055,5 +2088,50 @@ impl App {
             _ => {}
         }
         self.publish_ui();
+    }
+}
+
+/// Synthetic 24-hour solar/lunar arc in JKA yaw/elevation conventions.
+/// Moon position is independent of the phase slider.
+#[derive(Debug, Clone, Copy)]
+struct RelightingCelestialArc {
+    sun_yaw: f32,
+    sun_elevation: f32,
+    moon_azimuth: f32,
+    moon_elevation: f32,
+}
+
+fn relighting_celestial_arc(hour: f32, noon_sun_yaw: f32) -> RelightingCelestialArc {
+    let time = hour.rem_euclid(24.0);
+    let sun_yaw = (noon_sun_yaw + (time - 12.0) * 15.0).rem_euclid(360.0);
+    // Sunrise 06:00, solar noon 12:00, sunset 18:00, midnight below horizon.
+    // Blue Water uses a sky azimuth convention rotated +90 degrees from Q3 yaw.
+    let sun_elevation = 60.0 * ((time - 6.0) * std::f32::consts::PI / 12.0).sin();
+    RelightingCelestialArc {
+        sun_yaw,
+        sun_elevation,
+        moon_azimuth: (sun_yaw + 270.0).rem_euclid(360.0),
+        moon_elevation: -sun_elevation,
+    }
+}
+
+#[cfg(test)]
+mod relighting_clock_tests {
+    use super::relighting_celestial_arc;
+
+    #[test]
+    fn midnight_moon_visible_noon_sun_visible_and_day_wraps() {
+        let noon = relighting_celestial_arc(12.0, 70.0);
+        assert!((noon.sun_yaw - 70.0).abs() < 0.01);
+        assert!((noon.sun_elevation - 60.0).abs() < 0.01);
+        assert!(noon.moon_elevation < 0.0);
+        let midnight = relighting_celestial_arc(24.0, 70.0);
+        assert!(midnight.sun_elevation < 0.0);
+        assert!(midnight.moon_elevation > 0.0);
+        let start = relighting_celestial_arc(3.0, 70.0);
+        let end = relighting_celestial_arc(27.0, 70.0);
+        assert!((start.sun_yaw - end.sun_yaw).abs() < 0.01);
+        assert!((start.sun_elevation - end.sun_elevation).abs() < 0.01);
+        assert!((start.moon_azimuth - end.moon_azimuth).abs() < 0.01);
     }
 }

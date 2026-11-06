@@ -411,6 +411,8 @@ pub(in crate::renderer) struct PlanarReflectionView {
     /// coplanar reflectors. The reflected camera shares the main camera's clip
     /// space, so geometry outside this rectangle can never be sampled.
     pub(in crate::renderer) cull_view_proj: Mat4,
+    /// Unmargined NDC rectangle behind `cull_view_proj`; the mask A/B scissors to it.
+    pub(in crate::renderer) ndc_rect: (glam::Vec2, glam::Vec2),
 }
 
 pub(in crate::renderer) struct PlanarReflectionResources {
@@ -425,6 +427,10 @@ pub(in crate::renderer) struct PlanarReflectionResources {
     pub(in crate::renderer) _reflection_pass_uniform_buffer: wgpu::Buffer,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
     pub(in crate::renderer) reflection_pass_bind_group: wgpu::BindGroup,
+    /// `r_planarReflectionMask 2`: depth-only carve of the reflector's screen
+    /// polygon. Built only while planar reflections are active.
+    pub(in crate::renderer) mask_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) mask_vertex_buffer: wgpu::Buffer,
     pub(in crate::renderer) _width: u32,
     pub(in crate::renderer) _height: u32,
     pub(in crate::renderer) active: bool,

@@ -3,13 +3,48 @@
 //! The shared lightmap compositor owns the final subtraction/tone/sun result.
 use crate::renderer::{
     Arc, DrawBatch, DrawClass, GpuImage, GpuVertex, Renderer, StaticAoBvh, StaticAoRenderTriangle,
-    SunVisibilityMode, TextureData, Vec3, scene,
+    SunVisibilityMode, SunBakeStage, StaticAoTexelSample, TextureData, Vec3, scene,
 };
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::time::Instant;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc,
 };
+
+/// Choose a bake-only Rayon worker count without touching any of the game's
+/// other thread pools. The automatic policy budgets for the main thread, the
+/// render thread, one audio callback thread, this bake's coordinator(s), and
+/// active background-game jobs, then reserves one more logical CPU's capacity.
+/// This is a scheduling budget, not CPU affinity: the OS may still schedule
+/// several threads on the same logical processor.
+fn automatic_bake_workers(logical: usize, coordinators: usize, active_background: usize) -> usize {
+    const MAIN_RENDER_AUDIO: usize = 3;
+    const FREE_LOGICAL_CPU: usize = 1;
+    logical.saturating_sub(
+        MAIN_RENDER_AUDIO
+            .saturating_add(coordinators)
+            .saturating_add(active_background)
+            .saturating_add(FREE_LOGICAL_CPU)
+    ).max(1)
+}
+
+pub(super) fn bake_worker_count(requested: u8, coordinators: usize) -> usize {
+    if requested != 0 {
+        return usize::from(requested.min(32));
+    }
+    let logical = std::thread::available_parallelism().map_or(1, usize::from);
+    // Main and render are already covered above, even if between tracked tasks.
+    // Only count *active* additional game workers, not parked pool threads.
+    let active_background = crate::thread_activity::snapshot().iter().filter(|entry| {
+        entry.active && !matches!(
+            entry.slot,
+            crate::thread_activity::ThreadSlot::Main | crate::thread_activity::ThreadSlot::Render
+        )
+    }).count();
+    automatic_bake_workers(logical, coordinators, active_background)
+}
 
 #[derive(Clone)]
 pub(in crate::renderer) struct Geometry {
@@ -17,6 +52,8 @@ pub(in crate::renderer) struct Geometry {
     batches: Vec<DrawBatch>,
     textures: Arc<Vec<TextureData>>,
     receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
+    sun_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
+    auto_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
     model_materials: Vec<bool>,
 }
 
@@ -30,6 +67,20 @@ impl Geometry {
         let receivers = Arc::new(crate::renderer::collect_static_ao_lightmap_triangles(
             &vertices, &batches,
         ));
+        // Curved BSP walls are frequently tessellated into hard-normal faces.
+        // Only the static sun's receiver normals are reconstructed. Preserve
+        // true polygon geometry for BVH visibility and preserve original AO,
+        // map-light and authored lightmap inputs.
+        let mut sun_receivers = (*receivers).clone();
+        let smoothed_corners = smooth_sun_receiver_normals(&mut sun_receivers);
+        let mut auto_receivers = (*receivers).clone();
+        let auto_corners = auto_smooth_sun_receiver_normals(&mut auto_receivers);
+        println!(
+            "[SUN LIGHTMAP] receiver normals smoothed: shared-edge {smoothed_corners} corners, vertex auto-smooth {auto_corners} corners (r_bakedSunNormals 1/2), {} triangles",
+            receivers.len()
+        );
+        let sun_receivers = Arc::new(sun_receivers);
+        let auto_receivers = Arc::new(auto_receivers);
         let model_materials = batches
             .iter()
             .map(|b| {
@@ -44,19 +95,291 @@ impl Geometry {
             batches,
             textures,
             receivers,
+            sun_receivers,
+            auto_receivers,
             model_materials,
         }
     }
+
+    /// r_bakedSunNormals: 0 authored vertex normals, 1 shared-edge smoothing,
+    /// 2 vertex-position auto-smooth. Casters always use the real triangles.
+    fn sun_receivers(&self, mode: u8) -> &[crate::renderer::StaticAoLightmapTriangle] {
+        match mode {
+            0 => &self.receivers,
+            1 => &self.sun_receivers,
+            _ => &self.auto_receivers,
+        }
+    }
+
+    /// Per-luxel lightmap chart IDs at the ORIGINAL lightmap resolution, for
+    /// the compositor's chart-aware reconstruction. 0 = no chart. Padding
+    /// luxels inherit their single adjacent chart, as bilinear sampling expects.
+    pub(in crate::renderer) fn lightmap_charts(&self, sizes: &[[u32; 2]]) -> Vec<Vec<u32>> {
+        let mut charted = (*self.receivers).clone();
+        for (triangle, chart) in charted.iter_mut().zip(triangle_charts(&self.receivers)) {
+            triangle.owner = chart;
+        }
+        let mut charts = crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&charted, sizes, 1);
+        for (page, &[w, h]) in charts.iter_mut().zip(sizes) {
+            crate::renderer::static_ao::bvh::dilate_static_ao_owners(page, w, h, 1);
+        }
+        charts
+    }
+}
+
+/// Lightmap charts are the connected components of lightmap-UV space: the
+/// triangles of one BSP surface share UV vertices; separately packed atlas
+/// islands never do. Returns a 1-based chart per triangle.
+fn triangle_charts(triangles: &[crate::renderer::StaticAoLightmapTriangle]) -> Vec<u32> {
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+    let mut parent: Vec<usize> = (0..triangles.len()).collect();
+    let mut first: HashMap<(usize, [i64; 2]), usize> = HashMap::new();
+    for (ti, triangle) in triangles.iter().enumerate() {
+        for uv in triangle.uvs {
+            let key = (triangle.texture, uv.map(|v| (f64::from(v) * 262144.0).round() as i64));
+            let other = *first.entry(key).or_insert(ti);
+            let a = root(&mut parent, other);
+            let b = root(&mut parent, ti);
+            if a != b { parent[b] = a; }
+        }
+    }
+    let mut ids = HashMap::new();
+    (0..triangles.len()).map(|ti| {
+        let r = root(&mut parent, ti);
+        let next = ids.len() as u32 + 1;
+        *ids.entry(r).or_insert(next)
+    }).collect()
+}
+
+/// q3map2-style smoothing angle: each corner averages the vertex normals of
+/// every corner at the same welded position whose FACE normal lies within 45
+/// degrees of its own face. No shared edge or material match is required, so
+/// T-junctions, split charts and blended terrain shaders still smooth. There is
+/// no transitive chaining: a 90-degree brush corner stays hard.
+fn auto_smooth_sun_receiver_normals(
+    triangles: &mut [crate::renderer::StaticAoLightmapTriangle],
+) -> usize {
+    let face_normals: Vec<Vec3> = triangles.iter().map(|t| {
+        let p = t.positions.map(Vec3::from_array);
+        let geometric = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+        let shading = t.normals.iter().fold(Vec3::ZERO, |s, &n| s + Vec3::from_array(n));
+        if geometric.dot(shading) < 0.0 { -geometric } else { geometric }
+    }).collect();
+    let mut welded: HashMap<[i32; 3], Vec<(usize, usize)>> = HashMap::new();
+    for (ti, triangle) in triangles.iter().enumerate() {
+        if face_normals[ti].length_squared() < 0.5 { continue; }
+        for corner in 0..3 {
+            let key = triangle.positions[corner].map(|v| (v * 8.0).round() as i32);
+            welded.entry(key).or_default().push((ti, corner));
+        }
+    }
+    let corner_angle = |t: &crate::renderer::StaticAoLightmapTriangle, corner: usize| {
+        let p = Vec3::from_array(t.positions[corner]);
+        let u = (Vec3::from_array(t.positions[(corner + 1) % 3]) - p).normalize_or_zero();
+        let v = (Vec3::from_array(t.positions[(corner + 2) % 3]) - p).normalize_or_zero();
+        u.dot(v).clamp(-1.0, 1.0).acos()
+    };
+    let mut updates = Vec::new();
+    for corners in welded.values() {
+        if corners.len() < 2 { continue; }
+        for &(ti, corner) in corners {
+            let face = face_normals[ti];
+            let mut sum = Vec3::ZERO;
+            let mut members = 0;
+            for &(other, other_corner) in corners {
+                if face_normals[other].dot(face) < 0.707_106_77 { continue; }
+                let n = Vec3::from_array(triangles[other].normals[other_corner]).normalize_or_zero();
+                sum += n * corner_angle(&triangles[other], other_corner);
+                members += 1;
+            }
+            let smooth = sum.normalize_or_zero();
+            let original = Vec3::from_array(triangles[ti].normals[corner]).normalize_or_zero();
+            if members >= 2 && smooth.is_finite() && smooth.length_squared() > 0.5
+                && original.dot(smooth) < 0.999_99
+            {
+                updates.push((ti, corner, smooth));
+            }
+        }
+    }
+    for &(ti, corner, smooth) in &updates {
+        triangles[ti].normals[corner] = smooth.to_array();
+    }
+    updates.len()
+}
+
+/// Hanika 2021 "Hacking the shadow terminator": move the ray origin from the
+/// flat facet onto the curved surface implied by the shading normals. Without
+/// this, a smoothed receiver on a coarse convex wall traces grazing sun rays
+/// into its neighbouring facets and the self-shadow is faceted again.
+fn terminator_origin(triangle: &crate::renderer::StaticAoLightmapTriangle, bary: [f32; 3]) -> Vec3 {
+    let p = triangle.positions.map(Vec3::from_array);
+    let position = p[0] * bary[0] + p[1] * bary[1] + p[2] * bary[2];
+    let mut curved = Vec3::ZERO;
+    for i in 0..3 {
+        let n = Vec3::from_array(triangle.normals[i]).normalize_or_zero();
+        curved += (position - n * (position - p[i]).dot(n).min(0.0)) * bary[i];
+    }
+    curved
+}
+
+/// Valid bit 31, octahedral normal (2 x 11 bits), sky visibility (8 bits).
+fn pack_sky_normal(normal: Vec3, open: f32) -> u32 {
+    let n = normal / (normal.x.abs() + normal.y.abs() + normal.z.abs()).max(1e-6);
+    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    let e = if n.z < 0.0 {
+        [(1.0 - n.y.abs()) * sign(n.x), (1.0 - n.x.abs()) * sign(n.y)]
+    } else {
+        [n.x, n.y]
+    };
+    let q = |v: f32| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 2047.0).round() as u32;
+    (1 << 31) | (q(e[1]) << 19) | (q(e[0]) << 8) | (open.clamp(0.0, 1.0) * 255.0).round() as u32
+}
+
+/// Barycentrics of a lightmap UV in a receiver triangle, or None outside it.
+fn lightmap_barycentric(t: &crate::renderer::StaticAoLightmapTriangle, uv: [f32; 2]) -> Option<[f32; 3]> {
+    let p = t.uvs;
+    let area = (p[1][0]-p[0][0])*(p[2][1]-p[0][1]) - (p[1][1]-p[0][1])*(p[2][0]-p[0][0]);
+    if area.abs() < 1e-12 { return None; }
+    let q = [uv[0]-p[0][0], uv[1]-p[0][1]];
+    let b = (q[0]*(p[2][1]-p[0][1])-q[1]*(p[2][0]-p[0][0]))/area;
+    let c = ((p[1][0]-p[0][0])*q[1]-(p[1][1]-p[0][1])*q[0])/area;
+    let a = 1.0-b-c;
+    (a >= -0.00001 && b >= -0.00001 && c >= -0.00001).then_some([a, b, c])
+}
+
+/// Reconstruct shading normals only across *shared geometric edges* of the
+/// same BSP material, with a 45-degree crease limit. Separate lightmap charts
+/// may still meet on a continuous cylinder, but intersecting/overlaid surfaces
+/// and deliberate 90-degree brush corners are not joined.
+///
+/// All of this happens once as map geometry is uploaded. The original vertices,
+/// shadow-caster BVH and AO receivers remain exactly as authored.
+fn smooth_sun_receiver_normals(
+    triangles: &mut [crate::renderer::StaticAoLightmapTriangle],
+) -> usize {
+    // A fine position quantization tolerates BSP floating-point seam noise.
+    // Never match vertices on normal/position alone: require a real common edge.
+    type Position = [i32; 3];
+    type Edge = (u32, Position, Position);
+    fn point(p: [f32; 3]) -> Position {
+        p.map(|v| (v * 32.0).round() as i32)
+    }
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            let next = parent[node];
+            parent[node] = parent[next];
+            node = parent[node];
+        }
+        node
+    }
+    fn join(parent: &mut [usize], a: usize, b: usize) {
+        let a = root(parent, a);
+        let b = root(parent, b);
+        if a != b { parent[b] = a; }
+    }
+    let count = triangles.len().saturating_mul(3);
+    let mut parent: Vec<usize> = (0..count).collect();
+    let mut edges: HashMap<Edge, Vec<(usize, usize, usize)>> = HashMap::new();
+    let mut face_normals = Vec::with_capacity(triangles.len());
+    for (ti, triangle) in triangles.iter().enumerate() {
+        let n = triangle.normals.iter().fold(Vec3::ZERO, |sum, &n| {
+            sum + Vec3::from_array(n)
+        }).normalize_or_zero();
+        face_normals.push(n);
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let pa = point(triangle.positions[a]);
+            let pb = point(triangle.positions[b]);
+            if pa == pb { continue; }
+            let (first, last, ca, cb) = if pa < pb {
+                (pa, pb, a, b)
+            } else {
+                (pb, pa, b, a)
+            };
+            edges.entry((triangle.material, first, last))
+                .or_default().push((ti, ca, cb));
+        }
+    }
+    let mut joined_edges = 0usize;
+    for adjacent in edges.values() {
+        // Non-manifold edges may represent overlapping surfaces or layers.
+        if adjacent.len() != 2 { continue; }
+        let (a, a0, a1) = adjacent[0];
+        let (b, b0, b1) = adjacent[1];
+        if a == b || face_normals[a].dot(face_normals[b]) < 0.707_106_77 {
+            continue;
+        }
+        join(&mut parent, a * 3 + a0, b * 3 + b0);
+        join(&mut parent, a * 3 + a1, b * 3 + b1);
+        joined_edges += 1;
+    }
+    if joined_edges == 0 { return 0; }
+
+    // Corner-angle weighting avoids triangulation bias: splitting a quad into
+    // two triangles must not count as two independent curved-wall segments.
+    let mut sums = vec![Vec3::ZERO; count];
+    let mut weights = vec![0.0f32; count];
+    let mut members = vec![0u32; count];
+    for (ti, triangle) in triangles.iter().enumerate() {
+        for corner in 0..3 {
+            let p = Vec3::from_array(triangle.positions[corner]);
+            let u = (Vec3::from_array(triangle.positions[(corner + 1) % 3]) - p)
+                .normalize_or_zero();
+            let v = (Vec3::from_array(triangle.positions[(corner + 2) % 3]) - p)
+                .normalize_or_zero();
+            let normal = Vec3::from_array(triangle.normals[corner]).normalize_or_zero();
+            if normal.length_squared() < 0.5 || u.length_squared() < 0.5 || v.length_squared() < 0.5 {
+                continue;
+            }
+            let weight = u.dot(v).clamp(-1.0, 1.0).acos();
+            let group = root(&mut parent, ti * 3 + corner);
+            sums[group] += normal * weight;
+            weights[group] += weight;
+            members[group] += 1;
+        }
+    }
+    let mut changed = 0;
+    for (ti, triangle) in triangles.iter_mut().enumerate() {
+        for corner in 0..3 {
+            let group = root(&mut parent, ti * 3 + corner);
+            if members[group] < 2 || weights[group] <= f32::EPSILON { continue; }
+            let smooth = sums[group].normalize_or_zero();
+            let original = Vec3::from_array(triangle.normals[corner]).normalize_or_zero();
+            if smooth.is_finite() && smooth.length_squared() > 0.5
+                && original.dot(smooth) < 0.999_99
+            {
+                triangle.normals[corner] = smooth.to_array();
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Key {
     direction: [f32; 3],
+    cloud_coverage_steps: u8,
     visibility: SunVisibilityMode,
     models: bool,
     tinted: bool,
     sizes: Vec<[u32; 2]>,
     bake_sun: bool,
+    aa: u8,
+    /// r_bakedSunNormals receiver set, r_bakedSunTerminator origins, and the
+    /// r_lightmapSignal 7/8 debug layers (replace flux/cosine with IDs).
+    normals: u8,
+    terminator: bool,
+    debug_layers: u8,
+    /// Baked sky world illumination: 0 off, 1 smoothed normals, 2 normals and
+    /// sky visibility traced at the original lightmap resolution (`sky_sizes`).
+    sky: u8,
+    sky_sizes: Vec<[u32; 2]>,
     local_sources: u32,
     local_sizes: Vec<[u32; 2]>,
     locals: Vec<(usize, scene::DynamicLight)>,
@@ -65,10 +388,32 @@ struct Key {
 struct BakeOutput {
     sun: Vec<Vec<f32>>,
     local: Vec<Vec<f32>>,
+    /// Per sun page: valid bit 31, octahedral normal 2x11 bits, sky visibility 8 bits.
+    sky: Vec<Vec<u32>>,
+}
+
+/// Worker counts real completed receiver luxels.  The UI reserves 2% for the
+/// render-thread upload/composition so 100% means the lightmap is actually ready.
+#[derive(Default)]
+struct BakeProgress {
+    stage: AtomicU32,
+    done: AtomicU32,
+}
+impl BakeProgress {
+    fn set(&self, stage: u32, done: u32) {
+        self.stage.store(stage, Ordering::Relaxed);
+        self.done.fetch_max(done.min(980), Ordering::Relaxed);
+    }
+    fn fraction(&self, from: u32, span: u32, finished: u32, total: u32) {
+        let done = from + (u64::from(span) * u64::from(finished.min(total))
+            / u64::from(total.max(1))) as u32;
+        self.done.fetch_max(done.min(980), Ordering::Relaxed);
+    }
 }
 
 struct Pending {
     key: Key,
+    progress: Arc<BakeProgress>,
     rx: mpsc::Receiver<Result<BakeOutput, String>>,
     cancel: Arc<AtomicBool>,
 }
@@ -85,10 +430,14 @@ pub(in crate::renderer) struct StaticSun {
     key: Option<Key>,
     pub flux: Vec<GpuImage>,
     pub local_flux: Vec<GpuImage>,
+    /// R32Uint packed smoothed normal + sky visibility per sun page.
+    pub sky_normals: Vec<GpuImage>,
     pub local_lights: Vec<(usize, scene::DynamicLight)>,
     pub generation: u64,
     failed: Option<Key>,
     source_sizes: Vec<[u32; 2]>,
+    bake_started: Option<Instant>,
+    bake_workers: usize,
 }
 
 /// Upsample sunlight independently of the authored indirect light. Half-float
@@ -125,8 +474,21 @@ pub(in crate::renderer) fn moving_static_material(
 ) -> bool {
     (batch.alpha_cutoff != 0.0
         || (visibility == SunVisibilityMode::Filtered
-            && batch.pipeline.class == DrawClass::Transparent))
+            && batch.pipeline.class == DrawClass::Transparent
+            && translucent_sun_caster(batch)))
         && !fixed_uv(batch)
+}
+
+/// Filtered sun visibility: a translucent surface occludes the sun only when
+/// it is alpha blended over what lies behind it (dst * (1 - src alpha)), or is
+/// an authored q3map2 alphaShadow / lightFilter caster. Additive glows and
+/// clouds (GL_ONE GL_ONE) and modulate filters add or tint light; their
+/// texture alpha is not coverage, so they never cast sun shadows.
+pub(in crate::renderer) fn translucent_sun_caster(batch: &DrawBatch) -> bool {
+    batch.alpha_shadow || batch.light_filter || matches!(
+        batch.pipeline.blend,
+        crate::scene::BlendMode::Custom(_, crate::materials::BlendFactor::OneMinusSrcAlpha)
+    )
 }
 
 fn fixed_uv(batch: &DrawBatch) -> bool {
@@ -222,10 +584,154 @@ fn fill_chart_border(values: &mut [f32], size: [u32; 2]) {
     }
 }
 
-fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool) -> Result<BakeOutput, String> {
+/// Approximate the growing angular extent of light scattered by clouds.
+/// Deterministic disk directions give actual penumbrae behind static casters;
+/// blurring the composed lightmap would also blur texture/indirect detail.
+/// The clear-sky path is exactly the historical single-ray path.
+fn sun_sample_directions(toward: Vec3, coverage_steps: u8) -> Vec<Vec3> {
+    if coverage_steps == 0 { return vec![toward]; }
+    let coverage = f32::from(coverage_steps.min(20)) / 20.0;
+    let count = if coverage < 0.35 { 5 } else if coverage < 0.70 { 9 } else { 13 };
+    // ~23 degrees at full overcast: nearby roofs yield visibly broad edges.
+    // We keep direct radiance separate, so the broad component is faint.
+    let radius = (0.40 * coverage.powf(1.5)).tan();
+    let tangent = toward.cross(if toward.y.abs() < 0.9 { Vec3::Y } else { Vec3::X }).normalize();
+    let bitangent = toward.cross(tangent).normalize();
+    let mut directions = Vec::with_capacity(count);
+    directions.push(toward);
+    for i in 1..count {
+        let angle = i as f32 * 2.399_963_1; // golden angle
+        let r = (((i as f32) - 0.5) / ((count - 1) as f32)).sqrt() * radius;
+        directions.push((toward + r * (tangent * angle.cos() + bitangent * angle.sin())).normalize());
+    }
+    directions
+}
+
+/// Recover a receiver triangle per *covered* luxel. Built only for the
+/// edge-AA A/B modes. Unlike an atlas-space blur, each lookup remains tied to
+/// its original brush/batch chart, so different lightmap islands never bleed.
+fn receiver_triangles(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle], page: usize, size: [u32; 2],
+    samples: &[Option<StaticAoTexelSample>],
+) -> Vec<usize> {
+    let [w, h] = size;
+    let mut ids = vec![usize::MAX; samples.len()];
+    if w == 0 || h == 0 { return ids; }
+    for (triangle_id, tri) in receivers.iter().enumerate() {
+        if tri.texture != page { continue; }
+        let p = tri.uvs.map(|uv| [uv[0] * w as f32 - 0.5, uv[1] * h as f32 - 0.5]);
+        let edge = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        let ab = [p[1][0]-p[0][0], p[1][1]-p[0][1]];
+        let ac = [p[2][0]-p[0][0], p[2][1]-p[0][1]];
+        let area = edge(ab, ac);
+        if area.abs() < 1e-8 { continue; }
+        let x0 = p.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+        let y0 = p.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+        let x1 = p.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max).ceil().min(w.saturating_sub(1) as f32) as u32;
+        let y1 = p.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max).ceil().min(h.saturating_sub(1) as f32) as u32;
+        for y in y0..=y1 { for x in x0..=x1 {
+            let idx = y as usize * w as usize + x as usize;
+            if ids[idx] != usize::MAX || samples[idx].is_none() { continue; }
+            let q = [x as f32 - p[0][0], y as f32 - p[0][1]];
+            let b = edge(q, ac) / area;
+            let c = edge(ab, q) / area;
+            if b >= -0.001 && c >= -0.001 && b + c <= 1.001 {
+                ids[idx] = triangle_id;
+            }
+        }}
+    }
+    ids
+}
+
+/// Sample the real receiver triangle at a sub-luxel position. Search the
+/// 3x3 adjacent center-owner IDs to handle a mesh's diagonal triangle seam.
+/// Reject other chart owners; an atlas seam must never create a false penumbra.
+fn subluxel_receiver(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle], ids: &[usize], size: [u32; 2],
+    index: usize, dx: f32, dy: f32, terminator: bool,
+) -> Option<StaticAoTexelSample> {
+    let [w, h] = size;
+    let x = (index % w as usize) as i32;
+    let y = (index / w as usize) as i32;
+    let central = receivers.get(ids[index])?;
+    let uv = [(x as f32 + 0.5 + dx) / w as f32,
+              (y as f32 + 0.5 + dy) / h as f32];
+    let mut visited = [usize::MAX; 9];
+    let mut used = 0;
+    for (ox, oy) in [(0, 0),(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)] {
+        let nx = x + ox; let ny = y + oy;
+        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+        let id = ids[ny as usize * w as usize + nx as usize];
+        if visited[..used].contains(&id) { continue; }
+        visited[used] = id;
+        used += 1;
+        let Some(t) = receivers.get(id) else { continue; };
+        if t.owner != central.owner || t.texture != central.texture { continue; }
+        let Some([a, b, c]) = lightmap_barycentric(t, uv) else { continue; };
+        let position = if terminator {
+            terminator_origin(t, [a, b, c])
+        } else {
+            Vec3::from_array(t.positions[0]) * a
+                + Vec3::from_array(t.positions[1]) * b
+                + Vec3::from_array(t.positions[2]) * c
+        };
+        let normal = (Vec3::from_array(t.normals[0]) * a
+                    + Vec3::from_array(t.normals[1]) * b
+                    + Vec3::from_array(t.normals[2]) * c).normalize_or_zero();
+        if normal.length_squared() < 0.5 { continue; }
+        return Some(StaticAoTexelSample { position: position.to_array(), normal: normal.to_array() });
+    }
+    None
+}
+
+/// Only reconstruct discontinuities between luxels on a continuous receiving
+/// surface. A shadow difference across unrelated atlased triangles is not an
+/// edge to filter, even if the texels are adjacent in the lightmap texture.
+fn continuous_neighbors(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle], ids: &[usize], samples: &[Option<StaticAoTexelSample>],
+    a: usize, b: usize,
+) -> bool {
+    let Some(a_id) = receivers.get(ids[a]) else { return false; };
+    let Some(b_id) = receivers.get(ids[b]) else { return false; };
+    if a_id.owner != b_id.owner { return false; }
+    let (Some(pa), Some(pb)) = (samples[a], samples[b]) else { return false; };
+    let na = Vec3::from_array(pa.normal);
+    let nb = Vec3::from_array(pb.normal);
+    let delta = Vec3::from_array(pa.position) - Vec3::from_array(pb.position);
+    na.dot(nb) > 0.975 && na.dot(delta).abs() < 0.75
+}
+
+fn sun_edge_indices(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle], ids: &[usize], samples: &[Option<StaticAoTexelSample>],
+    flux: &[f32], size: [u32; 2], toward: Vec3,
+) -> Vec<usize> {
+    let w = size[0] as usize; let h = size[1] as usize;
+    let mut out = Vec::new();
+    for (i, sample) in samples.iter().enumerate() {
+        let Some(sample) = sample else { continue; };
+        let facing = Vec3::from_array(sample.normal).dot(toward).max(0.0);
+        if facing < 0.03 || ids[i] == usize::MAX { continue; }
+        let v = (flux[i]/facing).clamp(0.0, 1.0);
+        let x = i%w; let y = i/w;
+        let mut edge = false;
+        for (dx,dy) in [(-1,0),(1,0),(0,-1),(0,1)] {
+            let nx=x as i32+dx; let ny=y as i32+dy;
+            if nx<0 || ny<0 || nx>=w as i32 || ny>=h as i32 { continue; }
+            let ni=ny as usize*w+nx as usize;
+            if !continuous_neighbors(receivers,ids,samples,i,ni) { continue; }
+            let nf=Vec3::from_array(samples[ni].unwrap().normal).dot(toward).max(0.0);
+            if nf>0.03 && (v-(flux[ni]/nf).clamp(0.0,1.0)).abs()>0.125 { edge=true; break; }
+        }
+        if edge { out.push(i); }
+    }
+    out
+}
+
+fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakeProgress) -> Result<BakeOutput, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
+    progress.set(1, 5);
     let mut triangles = Vec::new();
     let mut filters = Vec::new();
     let mut sky = Vec::new();
@@ -240,7 +746,8 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool) -> Result<BakeOutp
             && !matches!(batch.tc_gen, jka_assets::shader::TcGen::SkyCloud(_));
         let masked = batch.alpha_cutoff != 0.0;
         let translucent = key.visibility == SunVisibilityMode::Filtered
-            && batch.pipeline.class == DrawClass::Transparent;
+            && batch.pipeline.class == DrawClass::Transparent
+            && translucent_sun_caster(batch);
         if !is_sky && batch.pipeline.class != DrawClass::Opaque && !masked && !translucent {
             continue;
         }
@@ -310,51 +817,111 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool) -> Result<BakeOutp
             .is_some();
         if blocked { 0.0 } else { transmission }
     };
-    let samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
-        &geometry.receivers,
-        &key.sizes,
-        1,
+    progress.set(1, 25);
+    let receivers = geometry.sun_receivers(key.normals);
+    let mut samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
+        receivers, &key.sizes, 1,
     );
+    // Receiver triangle per covered luxel: terminator origins, edge AA and
+    // the chart/normal debug layers. Owner-checked, so charts never mix.
+    let page_ids: Vec<Vec<usize>> = if key.bake_sun && (key.terminator || key.aa != 0 || key.debug_layers != 0 || key.sky != 0) {
+        samples.par_iter().zip(&key.sizes).enumerate()
+            .map(|(page, (texels, &size))| receiver_triangles(receivers, page, size, texels))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if key.bake_sun && key.debug_layers != 0 {
+        progress.set(2, 40);
+        let charts = triangle_charts(receivers);
+        let hash = |id: u32| 0.05 + 0.95 * (id as f32 * 0.618_034).fract();
+        let pages = samples.par_iter().zip(&page_ids).zip(&key.sizes)
+            .map(|((texels, ids), &[w, _])| {
+                let mut first = vec![0.0f32; texels.len()];
+                let mut second = vec![0.0f32; texels.len()];
+                for (i, sample) in texels.iter().enumerate() {
+                    let (Some(sample), Some(t)) = (sample, receivers.get(ids[i])) else { continue; };
+                    second[i] = hash(ids[i] as u32 + 1);
+                    first[i] = if key.debug_layers == 7 {
+                        hash(charts[ids[i]])
+                    } else {
+                        // Angle between the bake normal and the authored
+                        // vertex normal at this luxel: what smoothing changed.
+                        let uv = [((i % w as usize) as f32 + 0.5) / w as f32,
+                                  ((i / w as usize) as f32 + 0.5) / (texels.len() / w as usize) as f32];
+                        let raw = &geometry.receivers[ids[i]];
+                        lightmap_barycentric(t, uv).map_or(0.0, |b| {
+                            let n = (0..3).fold(Vec3::ZERO, |n, k| n + Vec3::from_array(raw.normals[k]) * b[k])
+                                .normalize_or_zero();
+                            let angle = n.dot(Vec3::from_array(sample.normal)).clamp(-1.0, 1.0).acos();
+                            (angle / 20f32.to_radians()).clamp(0.0, 1.0)
+                        })
+                    };
+                }
+                first.extend(second);
+                first
+            })
+            .collect();
+        progress.set(5, 955);
+        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new() });
+    }
+    if key.bake_sun && key.terminator {
+        samples.par_iter_mut().zip(&page_ids).zip(&key.sizes)
+            .for_each(|((texels, ids), &[w, h])| {
+                for (i, sample) in texels.iter_mut().enumerate() {
+                    let (Some(sample), Some(t)) = (sample.as_mut(), receivers.get(ids[i])) else { continue; };
+                    let uv = [((i % w as usize) as f32 + 0.5) / w as f32,
+                              ((i / w as usize) as f32 + 0.5) / h as f32];
+                    if let Some(b) = lightmap_barycentric(t, uv) {
+                        sample.position = terminator_origin(t, b).to_array();
+                    }
+                }
+            });
+    }
     let toward = -Vec3::from_array(key.direction).normalize_or_zero();
-    let pages = samples
+    let sun_directions = sun_sample_directions(toward, key.cloud_coverage_steps);
+    let sun_flux = |sample: StaticAoTexelSample| -> f32 {
+        let normal = Vec3::from_array(sample.normal);
+        let facing = normal.dot(toward).max(0.0);
+        if facing == 0.0 { return 0.0; }
+        let origin = Vec3::from_array(sample.position) + normal * 0.5;
+        let mut transmission = 0.0;
+        for &direction in &sun_directions {
+            if cancel.load(Ordering::Relaxed) { break; }
+            if normal.dot(direction) <= 0.0 { continue; }
+            let distance = if key.visibility == SunVisibilityMode::Legacy {
+                Some(131072.0)
+            } else {
+                sky.as_ref().and_then(|s| s.trace(origin, direction, 131072.0))
+            };
+            if let Some(distance) = distance {
+                transmission += visibility(origin, direction, distance);
+            }
+        }
+        facing * (transmission / sun_directions.len() as f32).clamp(0.0, 1.0)
+    };
+    progress.set(2, 40);
+    let sun_total: u32 = samples.iter().map(|v| v.len() as u32).sum::<u32>().max(1);
+    let sun_done = AtomicU32::new(0);
+    let mut pages: Vec<Vec<f32>> = samples
         .par_iter()
         .zip(&key.sizes)
         .map(|(samples, size)| {
             let mut flux: Vec<f32> = samples
-                .par_iter()
-                .map(|sample| {
-                    if cancel.load(Ordering::Relaxed) {
-                        return -1.0;
+                .par_iter().enumerate()
+                .map(|(i, sample)| {
+                    if i % 128 == 0 {
+                        let n = sun_done.fetch_add(128, Ordering::Relaxed) + 128;
+                        progress.fraction(40, 610, n, sun_total);
                     }
-                    let Some(sample) = sample else {
-                        return -1.0;
-                    };
-                    if !key.bake_sun {
-                        return 0.0;
-                    }
-                    let normal = Vec3::from_array(sample.normal);
-                    let facing = normal.dot(toward).max(0.0);
-                    if facing == 0.0 {
-                        return 0.0;
-                    }
-                    let origin = Vec3::from_array(sample.position) + normal * 0.5;
-                    let distance = if key.visibility == SunVisibilityMode::Legacy {
-                        131072.0
-                    } else {
-                        let Some(d) = sky.as_ref().and_then(|s| s.trace(origin, toward, 131072.0))
-                        else {
-                            return 0.0;
-                        };
-                        d
-                    };
-                    facing * visibility(origin, toward, distance)
+                    if cancel.load(Ordering::Relaxed) { return -1.0; }
+                    let Some(sample) = sample else { return -1.0; };
+                    if !key.bake_sun { return 0.0; }
+                    sun_flux(*sample)
                 })
                 .collect();
-            let mut cosine: Vec<_> = samples
-                .iter()
-                .map(|sample| {
-                    sample.map_or(-1.0, |s| Vec3::from_array(s.normal).dot(toward).max(0.0))
-                })
+            let mut cosine: Vec<_> = samples.iter()
+                .map(|s| s.map_or(-1.0, |s| Vec3::from_array(s.normal).dot(toward).max(0.0)))
                 .collect();
             fill_chart_border(&mut flux, *size);
             fill_chart_border(&mut cosine, *size);
@@ -362,11 +929,179 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool) -> Result<BakeOutp
             flux
         })
         .collect();
+    progress.set(2, 650);
+    if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+
+    if key.bake_sun && key.aa != 0 {
+        progress.set(3, 650);
+        // Parallel by page; each update is gathered separately so no shared
+        // GPU/CPU lightmap mutation or per-ray atomic overhead is introduced.
+        let edge_pages: Vec<_> = samples.par_iter().zip(&pages).zip(&key.sizes).zip(&page_ids)
+            .map(|(((receiver_samples, flux), &size), ids)| {
+                (ids, sun_edge_indices(receivers, ids, receiver_samples, flux, size, toward))
+            }).collect();
+        let edge_total = edge_pages.iter().map(|(_, edges)| edges.len() as u32).sum::<u32>().max(1);
+        let edge_done = AtomicU32::new(0);
+        pages.par_iter_mut().zip(&samples).zip(&key.sizes).zip(&edge_pages)
+            .for_each(|(((flux, receiver_samples), &size), (ids, edges))| {
+                if cancel.load(Ordering::Relaxed) { return; }
+                if key.aa == 1 {
+                    // Small owner-aware visibility convolution only around true
+                    // binary transitions. This changes neither ambient light nor
+                    // the unoccluded cosine in the second flux layer.
+                    let w = size[0] as usize; let h = size[1] as usize;
+                    let updates: Vec<_> = edges.par_iter().enumerate().filter_map(|(ordinal, &i)| {
+                        if ordinal % 32 == 0 {
+                            let n=edge_done.fetch_add(32,Ordering::Relaxed)+32;
+                            progress.fraction(650, 220, n, edge_total);
+                        }
+                        if cancel.load(Ordering::Relaxed) { return None; }
+                        let sample=receiver_samples[i]?;
+                        let facing=Vec3::from_array(sample.normal).dot(toward).max(0.0);
+                        if facing <= 0.0 { return None; }
+                        let x=i%w; let y=i/w;
+                        let mut sum=0.0; let mut weight_sum=0.0;
+                        for dy in -1i32..=1 { for dx in -1i32..=1 {
+                            let nx=x as i32+dx; let ny=y as i32+dy;
+                            if nx<0 || ny<0 || nx>=w as i32 || ny>=h as i32 { continue; }
+                            let ni=ny as usize*w+nx as usize;
+                            if !continuous_neighbors(receivers,ids,receiver_samples,i,ni) { continue; }
+                            let ns=receiver_samples[ni]?;
+                            let nf=Vec3::from_array(ns.normal).dot(toward).max(0.0);
+                            if nf <= 0.03 { continue; }
+                            let weight=(if dx==0 {2.0} else {1.0}) * (if dy==0 {2.0} else {1.0});
+                            sum+=(flux[ni]/nf).clamp(0.0,1.0)*weight;
+                            weight_sum+=weight;
+                        }}
+                        (weight_sum>0.0).then_some((i, facing*(sum/weight_sum).clamp(0.0,1.0)))
+                    }).collect();
+                    for (i, value) in updates { flux[i]=value; }
+                } else {
+                    let subgrid = if key.aa == 2 { 2 } else { 4 };
+                    let updates: Vec<_> = edges.par_iter().enumerate().filter_map(|(ordinal, &i)| {
+                        if ordinal % 32 == 0 {
+                            let n=edge_done.fetch_add(32,Ordering::Relaxed)+32;
+                            progress.fraction(650, 220, n, edge_total);
+                        }
+                        if cancel.load(Ordering::Relaxed) { return None; }
+                        let sample=receiver_samples[i]?;
+                        let facing=Vec3::from_array(sample.normal).dot(toward).max(0.0);
+                        if facing <= 0.0 { return None; }
+                        let mut sum=0.0;
+                        for sy in 0..subgrid { for sx in 0..subgrid {
+                            let dx=(sx as f32+0.5)/subgrid as f32-0.5;
+                            let dy=(sy as f32+0.5)/subgrid as f32-0.5;
+                            let hit=subluxel_receiver(receivers,ids,size,i,dx,dy,key.terminator).unwrap_or(sample);
+                            let subf=Vec3::from_array(hit.normal).dot(toward).max(0.0);
+                            sum+=if subf>0.0 { sun_flux(hit)/subf } else { 0.0 };
+                        }}
+                        Some((i,facing*(sum/(subgrid*subgrid) as f32).clamp(0.0,1.0)))
+                    }).collect();
+                    for (i,value) in updates { flux[i]=value; }
+                }
+            });
+        progress.set(3, 870);
+    }
+    let sky_pages = if key.bake_sun && key.sky != 0 {
+        progress.set(3, 870);
+        let charts = triangle_charts(receivers);
+        // Sky visibility changes slowly across a surface: trace it once per
+        // ORIGINAL luxel, then resample within the same lightmap chart.
+        let base_visibility: Vec<Vec<f32>> = if key.sky == 2 {
+            let base_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
+                receivers, &key.sky_sizes, 1,
+            );
+            const RAYS: usize = 16;
+            base_samples.par_iter().map(|texels| texels.par_iter().map(|sample| {
+                let Some(sample) = sample else { return -1.0; };
+                if cancel.load(Ordering::Relaxed) { return -1.0; }
+                let normal = Vec3::from_array(sample.normal);
+                let tangent = normal.cross(if normal.y.abs() < 0.9 { Vec3::Y } else { Vec3::X }).normalize();
+                let bitangent = normal.cross(tangent);
+                let origin = Vec3::from_array(sample.position) + normal * 0.5;
+                let mut open = 0.0;
+                for i in 0..RAYS {
+                    // Cosine-weighted golden-angle hemisphere: irradiance weighting.
+                    let u = (i as f32 + 0.5) / RAYS as f32;
+                    let phi = i as f32 * 2.399_963_1;
+                    let radius = u.sqrt();
+                    let direction = (tangent * (radius * phi.cos()) + bitangent * (radius * phi.sin())
+                        + normal * (1.0 - u).sqrt()).normalize();
+                    let distance = if key.visibility == SunVisibilityMode::Legacy {
+                        Some(131072.0)
+                    } else {
+                        sky.as_ref().and_then(|s| s.trace(origin, direction, 131072.0))
+                    };
+                    if let Some(distance) = distance {
+                        open += visibility(origin, direction, distance);
+                    }
+                }
+                open / RAYS as f32
+            }).collect()).collect()
+        } else {
+            Vec::new()
+        };
+        let base_charts: Vec<Vec<u32>> = if key.sky == 2 {
+            let mut charted = receivers.to_vec();
+            for (triangle, &chart) in charted.iter_mut().zip(&charts) { triangle.owner = chart; }
+            crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&charted, &key.sky_sizes, 1)
+        } else {
+            Vec::new()
+        };
+        samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
+            .map(|(page, ((texels, ids), &[w, h]))| {
+                let mut packed: Vec<u32> = texels.iter().enumerate().map(|(i, sample)| {
+                    let Some(sample) = sample else { return 0; };
+                    let open = if key.sky == 2 {
+                        let chart = receivers.get(ids[i]).map_or(0, |_| charts[ids[i]]);
+                        let [bw, bh] = key.sky_sizes[page];
+                        let at = [((i % w as usize) as f32 + 0.5) * bw as f32 / w as f32 - 0.5,
+                                  ((i / w as usize) as f32 + 0.5) * bh as f32 / h as f32 - 0.5];
+                        let (x0, y0) = (at[0].floor(), at[1].floor());
+                        let (fx, fy) = (at[0] - x0, at[1] - y0);
+                        let mut sum = 0.0;
+                        let mut weights = 0.0;
+                        for (dx, dy, weight) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)),
+                                                 (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+                            let (x, y) = (x0 as i32 + dx, y0 as i32 + dy);
+                            if x < 0 || y < 0 || x >= bw as i32 || y >= bh as i32 { continue; }
+                            let index = y as usize * bw as usize + x as usize;
+                            let value = base_visibility[page][index];
+                            if value < 0.0 || base_charts[page][index] != chart { continue; }
+                            sum += value * weight;
+                            weights += weight;
+                        }
+                        if weights > 1e-4 { sum / weights } else { 1.0 }
+                    } else {
+                        1.0
+                    };
+                    pack_sky_normal(Vec3::from_array(sample.normal), open)
+                }).collect();
+                // Border luxels take a covered neighbour so bilinear world
+                // sampling at chart edges never sees an ungained texel.
+                let original = packed.clone();
+                for (i, value) in packed.iter_mut().enumerate().filter(|(_, v)| **v == 0) {
+                    let (x, y) = ((i % w as usize) as i32, (i / w as usize) as i32);
+                    *value = [(-1, 0), (1, 0), (0, -1), (0, 1)].into_iter()
+                        .filter(|(dx, dy)| x + dx >= 0 && y + dy >= 0 && x + dx < w as i32 && y + dy < h as i32)
+                        .map(|(dx, dy)| original[(y + dy) as usize * w as usize + (x + dx) as usize])
+                        .find(|v| *v != 0)
+                        .unwrap_or(0);
+                }
+                packed
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    progress.set(4, 870);
     let local_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
         &geometry.receivers,
         &key.local_sizes,
         1,
     );
+    let local_done=AtomicU32::new(0);
+    let local_total=key.local_sizes.len() as u32;
     let local = local_samples
         .par_iter()
         .zip(&key.local_sizes)
@@ -401,13 +1136,16 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool) -> Result<BakeOutp
                 page.extend(layer);
             }
             for c in 0..3 { page.extend(totals.iter().map(|total| total[c])); }
+            let n=local_done.fetch_add(1,Ordering::Relaxed)+1;
+            progress.fraction(870, 80, n, local_total);
             page
         })
         .collect();
+    progress.set(5, 955);
     if cancel.load(Ordering::Relaxed) {
         Err("cancelled".into())
     } else {
-        Ok(BakeOutput { sun: pages, local })
+        Ok(BakeOutput { sun: pages, local, sky: sky_pages })
     }
 }
 
@@ -426,17 +1164,36 @@ impl Renderer {
         let bake_sun = self.baked_sun_cache
             && self.baked_sun_debug_mode == 0
             && self.cascaded_shadow_mode.is_csm();
+        let cloud_coverage_steps = if bake_sun { self.relight_cloud_coverage_steps() } else { 0 };
         let light_sources = self.added_map_light_sources();
         let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
+        let debug_layers = if matches!(self.lightmap_signal, 7 | 8) { self.lightmap_signal } else { 0 };
+        // Only what changes the traced data keys the bake: the sky strength,
+        // light and environment are applied by the compositor.
+        let sky = if bake_sun && self.sky_backend == 1 && self.blue_water_environment.world_lighting > 0.0 {
+            self.sky_world_bake.min(2)
+        } else {
+            0
+        };
         let Some(world) = self.world.as_mut() else {
             return;
         };
         let state = &mut world.static_sun;
+        if self.sun_bake_deferred {
+            // A drag can begin while a previous trace is still running.
+            // Dropping Pending cancels it; no new worker starts until release.
+            if state.pending.take().is_some() {
+                state.bake_started = None;
+            }
+            return;
+        }
         if (!bake_sun && !bake_local) || world.source_map || state.geometry.is_none() {
             state.pending = None;
             state.key = None;
+            state.bake_started = None;
             state.flux.clear();
             state.local_flux.clear();
+            state.sky_normals.clear();
             state.local_lights.clear();
             return;
         }
@@ -457,7 +1214,13 @@ impl Renderer {
         let same_request = same_sizes
             && requested.is_some_and(|k| {
                 k.direction == sun.direction
+                    && k.cloud_coverage_steps == cloud_coverage_steps
                     && k.bake_sun == bake_sun
+                    && k.aa == self.baked_sun_aa
+                    && k.normals == self.sun_receiver_normals
+                    && k.terminator == self.sun_terminator
+                    && k.debug_layers == debug_layers
+                    && k.sky == sky
                     && k.local_sources
                         == if bake_local {
                             light_sources
@@ -500,6 +1263,7 @@ impl Renderer {
         state.source_sizes = base.clone();
         let key = Key {
             direction: sun.direction,
+            cloud_coverage_steps,
             visibility: self.sun_visibility,
             models: self.draw_bsp_model_surfaces,
             tinted: self.tinted_glass_enabled,
@@ -509,6 +1273,12 @@ impl Renderer {
                 base.clone()
             },
             bake_sun,
+            aa: self.baked_sun_aa,
+            normals: self.sun_receiver_normals,
+            terminator: self.sun_terminator,
+            debug_layers,
+            sky,
+            sky_sizes: if sky == 2 { base.clone() } else { Vec::new() },
             local_sources: if bake_local {
                 light_sources
             } else {
@@ -530,6 +1300,7 @@ impl Renderer {
             state.failed = Some(key);
             state.pending = None;
             state.key = None;
+            state.bake_started = None;
             state.flux.clear();
             return;
         }
@@ -608,7 +1379,33 @@ impl Renderer {
                             GpuImage::new(texture, view)
                         })
                         .collect();
+                    state.sky_normals = pages.sky.iter().zip(&key.sizes).map(|(packed, size)| {
+                        use wgpu::util::DeviceExt;
+                        let texture = self.device.create_texture_with_data(
+                            &self.queue,
+                            &wgpu::TextureDescriptor {
+                                label: Some("static sun bake normals and sky visibility"),
+                                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::R32Uint,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                view_formats: &[],
+                            },
+                            wgpu::util::TextureDataOrder::LayerMajor,
+                            bytemuck::cast_slice(packed),
+                        );
+                        let view = texture.create_view(&Default::default());
+                        GpuImage::new(texture, view)
+                    }).collect();
                     state.local_lights = key.locals.clone();
+                    if let Some(started) = state.bake_started {
+                        println!(
+                            "[SUN LIGHTMAP] tracing + texture upload: {:.2}s ({} workers, AA {})",
+                            started.elapsed().as_secs_f64(), state.bake_workers, key.aa
+                        );
+                    }
                     println!(
                         "[LOCAL LIGHTMAP] baked {} static emitters into {} page(s), sizes {:?}",
                         key.locals.len(),
@@ -618,17 +1415,20 @@ impl Renderer {
                     state.key = Some(key);
                     state.generation = state.generation.wrapping_add(1).max(1);
                     println!(
-                        "[SUN LIGHTMAP] static visibility ready, {} page(s), sizes {:?}; camera movement does not rebake",
+                        "[SUN LIGHTMAP] static visibility ready, {} page(s), sizes {:?}, relit cloud coverage {}% ({} sun rays/texel); camera movement does not rebake",
                         state.flux.len(),
                         state
                             .flux
                             .iter()
                             .map(|i| [i._texture.width(), i._texture.height() / 2])
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>(),
+                        state.key.as_ref().unwrap().cloud_coverage_steps as u32 * 5,
+                        sun_sample_directions(-Vec3::from_array(state.key.as_ref().unwrap().direction).normalize_or_zero(), state.key.as_ref().unwrap().cloud_coverage_steps).len(),
                     );
                 }
                 Err(e) => {
-                    eprintln!("[SUN LIGHTMAP] {e}");
+                    let elapsed = state.bake_started.take().map_or(0.0, |start| start.elapsed().as_secs_f64());
+                    eprintln!("[SUN LIGHTMAP] bake failed after {elapsed:.2}s: {e}");
                     state.failed = Some(key);
                 }
             }
@@ -639,30 +1439,74 @@ impl Renderer {
             let worker_key = key.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = Arc::clone(&cancel);
+            let progress = Arc::new(BakeProgress::default());
+            let worker_progress = Arc::clone(&progress);
             let (tx, rx) = mpsc::channel();
+            let workers = bake_worker_count(self.bake_threads, 1);
+            let started = Instant::now();
             match std::thread::Builder::new()
                 .name("static-sun-lightmap".into())
                 .spawn(move || {
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            std::thread::available_parallelism()
-                                .map_or(1, usize::from)
-                                .saturating_sub(1)
-                                .clamp(1, 4),
-                        )
+                        .num_threads(workers)
                         .build();
                     let result = pool.map_err(|e| e.to_string()).and_then(|pool| {
-                        pool.install(|| trace(&geometry, &worker_key, &worker_cancel))
+                        pool.install(|| trace(&geometry, &worker_key, &worker_cancel, &worker_progress))
                     });
                     let _ = tx.send(result);
                 }) {
-                Ok(_) => state.pending = Some(Pending { key, rx, cancel }),
+                Ok(_) => {
+                    state.bake_started = Some(started);
+                    state.bake_workers = workers;
+                    println!("[SUN LIGHTMAP] bake started: {} workers, AA {}, normals {}, terminator {}, debug layers {}, sky {}", workers, key.aa, key.normals, u8::from(key.terminator), key.debug_layers, key.sky);
+                    state.pending = Some(Pending { key, rx, cancel, progress });
+                }
                 Err(e) => {
+                    state.bake_started = None;
                     eprintln!("[SUN LIGHTMAP] could not start worker: {e}");
                     state.failed = Some(key);
                 }
             }
         }
+    }
+}
+
+impl Renderer {
+    /// Poll only: never starts a bake or blocks on worker/GPU completion.
+    /// Called after each render so Ready means the GPU lightmap was composed.
+    pub(in crate::renderer) fn static_sun_bake_status(&mut self) -> (u32, SunBakeStage) {
+        if self.sun_bake_deferred { return (0, SunBakeStage::Off); }
+        let Some(world) = self.world.as_mut() else { return (0, SunBakeStage::Off); };
+        let state = &mut world.static_sun;
+        if let Some(pending) = state.pending.as_ref() {
+            let stage = match pending.progress.stage.load(Ordering::Relaxed) {
+                2 => SunBakeStage::Tracing,
+                3 => SunBakeStage::Refining,
+                4 => SunBakeStage::Local,
+                5 => SunBakeStage::Uploading,
+                _ => SunBakeStage::Preparing,
+            };
+            return (pending.progress.done.load(Ordering::Relaxed).min(980), stage);
+        }
+        if state.key.is_some() {
+            let composed = world.baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition());
+            if composed {
+                if let Some(started) = state.bake_started.take() {
+                    println!(
+                        "[SUN LIGHTMAP] BAKE READY in {:.2}s total (AA {}, {} workers, {} sun pages, {} local pages); GPU composition submitted",
+                        started.elapsed().as_secs_f64(),
+                        state.key.as_ref().map_or(0, |k| k.aa),
+                        state.bake_workers,
+                        state.flux.len(),
+                        state.local_flux.len()
+                    );
+                }
+                return (1000, SunBakeStage::Ready);
+            }
+            return (1000, SunBakeStage::Fallback);
+        }
+        if state.failed.is_some() { return (0, SunBakeStage::Failed); }
+        (0, SunBakeStage::Off)
     }
 }
 
@@ -687,6 +1531,84 @@ impl StaticSun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn curved_bsp_receivers_smooth_only_matching_shared_edges() {
+        use crate::renderer::StaticAoLightmapTriangle;
+        let a = StaticAoLightmapTriangle {
+            material: 7,
+            texture: 0,
+            owner: 1,
+            positions: [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0], [2.0, 0.0, 0.0]],
+            normals: [[0.0, 1.0, 0.0]; 3],
+            uvs: [[0.1, 0.1], [0.2, 0.1], [0.1, 0.2]],
+        };
+        let b = StaticAoLightmapTriangle {
+            material: 7,
+            texture: 1, // Different chart is fine if geometry/material connect.
+            owner: 2,
+            positions: [[0.0, 0.0, 2.0], [0.0, 0.0, 0.0], [-1.0, 0.0, 1.0]],
+            normals: [[0.5, 0.866_025_4, 0.0]; 3],
+            uvs: [[0.7, 0.7], [0.8, 0.7], [0.8, 0.8]],
+        };
+        let mut curved = vec![a.clone(), b.clone()];
+        assert!(smooth_sun_receiver_normals(&mut curved) >= 4);
+        // Both ends of the *shared* edge get a gradual lighting normal.
+        assert!(curved[0].normals[0][0] > 0.05);
+        assert!(curved[1].normals[1][0] < 0.5);
+        // Vertices outside the shared edge retain their flat normals.
+        assert_eq!(curved[0].normals[2], a.normals[2]);
+
+        let mut different_material = vec![a.clone(), StaticAoLightmapTriangle {
+            material: 8, ..b.clone()
+        }];
+        assert_eq!(smooth_sun_receiver_normals(&mut different_material), 0);
+        assert_eq!(different_material[0].normals, a.normals);
+
+        let mut hard_corner = vec![a.clone(), StaticAoLightmapTriangle {
+            normals: [[1.0, 0.0, 0.0]; 3], ..b
+        }];
+        assert_eq!(smooth_sun_receiver_normals(&mut hard_corner), 0);
+        assert_eq!(hard_corner[0].normals, a.normals);
+    }
+
+    #[test]
+    fn auto_smooth_welds_by_position_without_chaining_hard_corners() {
+        use crate::renderer::StaticAoLightmapTriangle;
+        let facet = |positions: [[f32; 3]; 3], material, uv: f32| {
+            let p = positions.map(Vec3::from_array);
+            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize();
+            StaticAoLightmapTriangle {
+                material, texture: 0, owner: material,
+                positions, normals: [n.to_array(); 3],
+                uvs: [[uv, uv], [uv + 0.1, uv], [uv, uv + 0.1]],
+            }
+        };
+        // Two facets 30 degrees apart (different materials, no shared edge
+        // record needed) and a wall at 90 degrees sharing the same vertex.
+        let s = 30f32.to_radians();
+        let a = facet([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0], [2.0, 0.0, 0.0]], 1, 0.1);
+        let b = facet([[0.0, 0.0, 2.0], [0.0, 0.0, 0.0], [-2.0 * s.cos(), -2.0 * s.sin(), 1.0]], 2, 0.5);
+        let wall = facet([[0.0, 0.0, 0.0], [0.0, -2.0, 0.0], [0.0, 0.0, 2.0]], 3, 0.8);
+        let mut triangles = vec![a.clone(), b, wall.clone()];
+        assert!(auto_smooth_sun_receiver_normals(&mut triangles) >= 4);
+        let smoothed = Vec3::from_array(triangles[0].normals[0]);
+        let flat = Vec3::from_array(a.normals[0]);
+        assert!(smoothed.dot(flat) < 0.999 && smoothed.dot(flat) > 0.9);
+        // The 90-degree wall is not joined to either facet.
+        assert_eq!(triangles[2].normals, wall.normals);
+        // Unconnected UV islands are separate charts.
+        let charts = triangle_charts(&triangles);
+        assert_eq!(charts.len(), 3);
+        assert!(charts[0] != charts[1] && charts[1] != charts[2]);
+        // The curved origin rises above the flat facet's interior.
+        let mut bent = a.clone();
+        bent.normals = [[0.3, 1.0, 0.0], [0.0, 1.0, 0.3], [-0.3, 1.0, 0.0]]
+            .map(|n| Vec3::from_array(n).normalize().to_array());
+        let origin = terminator_origin(&bent, [1.0 / 3.0; 3]);
+        assert!(origin.y > 0.0);
+        assert_eq!(terminator_origin(&a, [1.0 / 3.0; 3]).y, 0.0);
+    }
+
     #[test]
     fn output_resolution_is_independent_and_bounded() {
         assert_eq!(output_sizes(&[[128, 128]], 8192), vec![[512, 512]]);
@@ -761,19 +1683,47 @@ mod tests {
         );
         let key = Key {
             direction: [0.0, -1.0, 0.0],
+            cloud_coverage_steps: 0,
             visibility: SunVisibilityMode::SkyPortals,
             models: true,
             tinted: false,
             sizes: vec![[32, 32]],
             bake_sun: true,
+            aa: 0,
+            normals: 1,
+            terminator: false,
+            debug_layers: 0,
+            sky: 0,
+            sky_sizes: Vec::new(),
             local_sources: 0,
             local_sizes: Vec::new(),
             locals: Vec::new(),
         };
+        assert_eq!(bake_worker_count(1, 1), 1);
+        assert_eq!(bake_worker_count(8, 1), 8);
+        assert_eq!(bake_worker_count(32, 2), 32);
+        assert_eq!(automatic_bake_workers(16, 1, 0), 11);
+        assert_eq!(automatic_bake_workers(16, 2, 0), 10);
+        assert_eq!(automatic_bake_workers(16, 1, 3), 8);
+        assert_eq!(automatic_bake_workers(4, 1, 0), 1);
+        assert_eq!(automatic_bake_workers(1, 2, 8), 1);
+        assert!(bake_worker_count(0, 1) >= 1);
+        assert!(bake_worker_count(0, 2) >= 1);
         let cancel = AtomicBool::new(false);
-        let pages = trace(&geometry, &key, &cancel).unwrap().sun;
+        let progress = BakeProgress::default();
+        let pages = trace(&geometry, &key, &cancel, &progress).unwrap().sun;
         assert_eq!(pages[0][4 * 32 + 4], 0.0, "roof blocks the sun");
         assert_eq!(pages[0][4 * 32 + 24], 1.0, "open floor receives the sun");
+        let cloudy_key = Key { cloud_coverage_steps: 20, ..key.clone() };
+        let cloudy = trace(&geometry, &cloudy_key, &cancel, &progress).unwrap().sun;
+        assert!(
+            cloudy[0].iter().zip(&cloudy[0][32 * 32..]).all(|(flux, facing)| flux <= &(facing + 1e-6)),
+            "angular visibility cannot exceed the unoccluded central cosine"
+        );
+        assert!(
+            cloudy[0][4 * 32 + 12] > 0.0 && cloudy[0][4 * 32 + 12] < 1.0,
+            "an overcast roof must produce a geometric penumbra near its edge"
+        );
         assert!(
             pages[0][..32 * 32]
                 .iter()
@@ -813,7 +1763,7 @@ mod tests {
                 },
             ),
         ];
-        let local = trace(&geometry, &local_key, &cancel).unwrap().local;
+        let local = trace(&geometry, &local_key, &cancel, &progress).unwrap().local;
         let receiver = 4 * 32 + 4;
         assert_eq!(local[0][receiver], 0.0, "roof blocks the upper lamp");
         assert!(
@@ -836,6 +1786,6 @@ mod tests {
             "negative alphaFunc must stay live too"
         );
         cancel.store(true, Ordering::Relaxed);
-        assert!(trace(&geometry, &key, &cancel).is_err());
+        assert!(trace(&geometry, &key, &cancel, &progress).is_err());
     }
 }

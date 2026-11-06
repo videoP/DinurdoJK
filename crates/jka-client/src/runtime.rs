@@ -268,6 +268,10 @@ pub enum UserEvent {
         completed: u32,
         total: u32,
     },
+    SunBakeProgress {
+        completed: u32,
+        stage: crate::renderer::SunBakeStage,
+    },
     /// Targeted current-BSP acoustic preparation requested by `snd_restart`.
     /// This does not rebuild or upload the rendered world.
     SteamAudioScenePrepared {

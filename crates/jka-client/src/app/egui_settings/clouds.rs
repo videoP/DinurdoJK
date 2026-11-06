@@ -7,30 +7,42 @@ use crate::app::egui_settings::{
 impl App {
     pub(in crate::app::egui_settings) fn egui_clouds(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "CLOUD RENDERER", "Volumetric clouds can be selected independently of the ocean. Sky controls are on the Sky page.");
-        theme::row(ui, "Volumetric clouds", "Select original JKA volumetrics or imported Blue Water cloud reconstruction.", theme::Reset::None, |ui| {
-            for (backend, name) in [(0, "JKA clouds"), (1, "Blue Water clouds")] {
-                if theme::chip(ui, name, self.video.cloud_backend == backend).clicked() && self.video.cloud_backend != backend {
-                    self.video.cloud_backend = backend; self.sync_post_effects(); self.publish_ui();
+        theme::row(ui, "Cloud mode", "Off disables volumetric clouds. Legacy Volumetric is DinurdoJK's JKA-based cloud deck; Blue Water Volumetric uses the native Blue Water march and temporal reconstruction. Independent of Sky mode.", theme::Reset::None, |ui| {
+            let selected = if !self.video.clouds { 0 } else if self.video.cloud_backend == 1 { 2 } else { 1 };
+            for (mode, label) in [(0, "Off"), (1, "Legacy Volumetric"), (2, "Blue Water Volumetric")] {
+                if theme::chip(ui, label, selected == mode).clicked() && selected != mode {
+                    self.video.clouds = mode != 0;
+                    self.video.cloud_backend = u8::from(mode == 2);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                 }
+                ui.add_space(3.0);
             }
         });
-        theme::row(ui, "Sky portal depth", "How clouds treat misc_skyportal geometry (distant terrain). Off draws clouds over it. Redraw re-renders the portal view depth-only. Reuse has the portal pass write the depth itself (no extra draw; needs MSAA off, otherwise acts as Redraw).", theme::Reset::None, |ui| {
-            for (mode, name) in [(0u8, "Off"), (1, "Redraw"), (2, "Reuse")] {
-                if theme::chip(ui, name, self.video.cloud_portal_depth == mode).clicked() && self.video.cloud_portal_depth != mode {
-                    self.video.cloud_portal_depth = mode; self.sync_post_effects(); self.publish_ui();
+        ui.add_enabled_ui(self.video.clouds, |ui| {
+            theme::row(ui, "Sky portal depth", "How clouds treat misc_skyportal geometry (distant terrain). Off draws clouds over it. Redraw re-renders portal view depth-only. Reuse has the portal pass write depth itself (requires MSAA off, otherwise Redraw).", theme::Reset::None, |ui| {
+                for (mode, name) in [(0u8, "Off"), (1, "Redraw"), (2, "Reuse")] {
+                    if theme::chip(ui, name, self.video.cloud_portal_depth == mode).clicked() && self.video.cloud_portal_depth != mode {
+                        self.video.cloud_portal_depth = mode;
+                        self.sync_post_effects();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
                 }
-            }
+            });
         });
-        self.egui_environment_toggle(ui, "Volumetric clouds enabled", "Enable the selected volumetric cloud renderer.", ui::ENV_ROW_CLOUDS, self.video.clouds);
-        self.egui_environment_toggle(ui, "Cloud shadows", "Project moving cloud shadows onto BSP surfaces.", ui::ENV_ROW_CLOUD_SHADOWS, self.video.cloud_shadows);
-        theme::row(ui, "Cloud coverage", "Fraction of sky filled by Blue Water clouds.", theme::Reset::Environment(ui::ENV_ROW_CLOUD_COVERAGE), |ui| {
-            let mut v = self.video.cloud_coverage;
-            let label = percent(v);
-            if theme::slider(ui, &mut v, 0.0..=1.0, &label) {
-                self.set_cloud_coverage(v);
-            }
+        ui.add_enabled_ui(self.video.clouds, |ui| {
+            self.egui_environment_toggle(ui, "Cloud shadows", "Project moving cloud shadows onto BSP surfaces.", ui::ENV_ROW_CLOUD_SHADOWS, self.video.cloud_shadows);
+            theme::row(ui, "Cloud coverage", "Fraction of sky filled by volumetric clouds. During Relight map, coverage also softens and weakens replacement sunlight and progressively removes the old baked direct sun. Static penumbrae require CSM.", theme::Reset::Environment(ui::ENV_ROW_CLOUD_COVERAGE), |ui| {
+                let mut v = self.video.cloud_coverage;
+                let label = percent(v);
+                if theme::slider(ui, &mut v, 0.0..=1.0, &label) {
+                    self.set_cloud_coverage(v);
+                }
+            });
         });
-        if self.video.cloud_backend == 1 { self.egui_native_clouds(ui); }
+        if self.video.clouds && self.video.cloud_backend == 1 { self.egui_native_clouds(ui); }
 
         ui.add_enabled_ui(self.video.clouds, |ui| {
             theme::section(ui, "RENDER COST", "Resolution applies to either cloud renderer.");
@@ -53,7 +65,11 @@ impl App {
             }
         });
 
-        ui.add_enabled_ui(self.video.clouds && self.video.cloud_backend == 0, |ui| {
+        // JKA cloud model rows only: hidden, not greyed, under Blue Water clouds.
+        if self.video.cloud_backend != 0 {
+            return;
+        }
+        ui.add_enabled_ui(self.video.clouds, |ui| {
             const TYPES: [(CloudType, &str); 3] = [
                 (CloudType::Cumulus, "Cumulus"),
                 (CloudType::Stratus, "Stratus"),

@@ -1180,6 +1180,7 @@ fn remove_baked_sun(rgb: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> { 
 fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(test_visibility); }
 fn static_sun_lightmap_receiver(input: VertexOut) -> bool { return lighting_settings.baked_sun_debug_mode.z != 0u; }
 fn lightmap_moving_sun_visibility(input: VertexOut) -> f32 { return test_visibility; }
+fn static_csm_composed_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec4<f32> { return vec4(0.0); }
 fn composed_lightmap_receiver(input: VertexOut) -> bool { return static_sun_lightmap_receiver(input); }
 fn baked_local_total(input: VertexOut) -> vec3<f32> { return vec3(0.0); }
 fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> { return lightmap; }

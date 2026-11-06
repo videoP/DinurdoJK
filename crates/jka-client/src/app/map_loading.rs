@@ -994,6 +994,8 @@ impl App {
         }
         let label = source.label();
         self.static_ao_progress = None;
+        self.sun_bake_progress = None;
+        self.sun_bake_ready_at = None;
         let prepare_options = if purpose == MapLoadPurpose::FrontendBackground {
             self.frontend_background_prepare_options()
         } else {
@@ -1139,6 +1141,8 @@ impl App {
         let request_id = self.latest_request_id;
         let started = Instant::now();
         self.static_ao_progress = None;
+        self.sun_bake_progress = None;
+        self.sun_bake_ready_at = None;
         self.preserve_game_state_on_next_map_upload = false;
         let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
         loading.sub_bsp_names = map.sub_bsp_names.clone();

@@ -4,6 +4,11 @@ struct Frame { inverse_vp:mat4x4<f32>,eye:vec4<f32>,viewport:vec4<f32>,options:v
 @group(0) @binding(0) var<uniform> frame:Frame;
 @group(0) @binding(1) var scene_depth:texture_depth_2d;
 @group(0) @binding(2) var scene_color:texture_2d<f32>;
+// Depth-prepass policy mask: R 0.25 / 0.75 = lightmapped world.
+@group(0) @binding(3) var world_mask:texture_2d<f32>;
+// Prepass radial depth (JKA units): grass, water and other main-pass-only
+// surfaces in front of the marked world must still receive the live light.
+@group(0) @binding(4) var world_mask_depth:texture_2d<f32>;
 @group(1) @binding(0) var shadow_map:texture_2d<f32>;
 @group(1) @binding(1) var shadow_sampler:sampler;
 @group(1) @binding(2) var<uniform> shadow:CloudShadow;
@@ -100,7 +105,14 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let incidence=max(dot(normal,light_direction),0.);
  let shade=select(1.,cloud_shadow(shadow_map,shadow_sampler,shadow,world),frame.options.y>0.5);
  var gain=vec3<f32>(mix(1.,shade,incidence*0.7));
- if frame.options.x>0. {
+ // Lightmapped world already received this light in the composed lightmap
+ // (r_skyWorldBake), from smoothed normals; only cloud shadows stay live here.
+ let mask_pixel=clamp(pixel,vec2<i32>(0),vec2<i32>(textureDimensions(world_mask))-1);
+ let mask=textureLoad(world_mask,mask_pixel,0).r;
+ let radial=distance(world,frame.eye.xyz)*frame.moon_mode.z;
+ let same_surface=abs(textureLoad(world_mask_depth,mask_pixel,0).r-radial)<=radial*0.01+2.;
+ let baked_world=frame.moon_mode.y>0.5 && same_surface && (abs(mask-0.25)<0.1 || abs(mask-0.75)<0.1);
+ if frame.options.x>0. && !baked_world {
   // The input holds baked illumination. This opt-in estimate retains its
   // material detail and dark interiors; it cannot recover separate albedo/GI.
   let ambient=env_irradiance(env_map,env_sampler,env,normal)/3.14159265;

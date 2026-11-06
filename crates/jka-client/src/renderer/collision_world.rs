@@ -271,90 +271,245 @@ pub(in crate::renderer) fn upload(
     })
 }
 
+// The original flat pipeline remains completely separate from the optional
+// textured variant, so /r_shitterTexture 0 executes no texture sampling.
+pub(in crate::renderer) struct CollisionWorldTexturedPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group: wgpu::BindGroup,
+    _image: super::GpuImage,
+}
+
 pub(in crate::renderer) struct CollisionWorldPipeline {
     pub pipeline: wgpu::RenderPipeline,
+    pub textured: Option<CollisionWorldTexturedPipeline>,
     format: wgpu::TextureFormat,
     samples: u32,
+    game: Option<PathBuf>,
+    texture_requested: bool,
+    texture_job: Option<mpsc::Receiver<Result<(crate::materials::TextureData, String), String>>>,
+}
+
+const SHITTER_IMAGE: &str = "textures/factory/base";
+
+// CPU-only work; runs once on a background thread, never in frame encoding.
+// Prefer the image at the shader qpath. If the qpath is script-only, resolve
+// one ordinary diffuse image from that script; do NOT execute its stages.
+fn load_shitter_image(
+    base: &std::path::Path,
+    game: Option<&std::path::Path>,
+) -> Result<(crate::materials::TextureData, String), String> {
+    let mut assets = jka_assets::pk3::AssetSearchPath::open_game(base, game)
+        .map_err(|error| format!("Shitter image asset search: {error}"))?;
+    if let Some(data) = super::try_load_texture_asset_from_search_path(
+        &mut assets, SHITTER_IMAGE, false, true, true, "Shitter raw world image",
+    ) {
+        return Ok((data, SHITTER_IMAGE.to_owned()));
+    }
+    // Resolve script-only aliases only on a background worker. The canonical
+    // shader library parser already handles .shader/.oshader precedence.
+    let (shaders, _) = crate::materials::shader_library(&mut assets, &mut Vec::new(), false)?;
+    let shader = jka_assets::shader::find_shader(&shaders, SHITTER_IMAGE)
+        .ok_or_else(|| format!("{SHITTER_IMAGE} has no raw image and no shader definition"))?;
+    for stage in &shader.stages {
+        if stage.video || stage.image.is_empty() || stage.image.starts_with('$')
+            || !matches!(stage.tc_gen, jka_assets::shader::TcGen::Base)
+        {
+            continue;
+        }
+        if let Some(data) = super::try_load_texture_asset_from_search_path(
+            &mut assets, &stage.image, false, true, true, "Shitter shader diffuse image",
+        ) {
+            return Ok((data, stage.image.clone()));
+        }
+    }
+    Err(format!("{SHITTER_IMAGE} shader defines no usable diffuse image"))
+}
+
+fn create_shitter_world_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+    image_layout: Option<&wgpu::BindGroupLayout>,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    shader_source: &str,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+    });
+    let mut layouts = vec![Some(camera_layout)];
+    if let Some(layout) = image_layout {
+        layouts.push(Some(layout));
+    }
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &layouts,
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            // Both shaders read the original BSP buffers, never upload a new mesh.
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<scene::GpuVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: std::mem::offset_of!(scene::GpuVertex, normal) as u64,
+                        shader_location: 1,
+                    },
+                ],
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None, // keep two-sided BSP/patch visibility
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: depth_format(),
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: crate::pipeline_cache::get().as_ref(),
+    })
 }
 
 impl Renderer {
     pub(in crate::renderer) fn ensure_collision_world_pipeline(&mut self) {
         let format = self.scene_format();
         let samples = self.msaa_samples;
-        if self.collision_world_pipeline.as_ref().is_some_and(|cached|
-            cached.format == format && cached.samples == samples) {
+        let reusable = self.collision_world_pipeline.as_ref().is_some_and(|cached|
+            cached.format == format && cached.samples == samples
+                && cached.game == self.detail_texture_game);
+        if !reusable {
+            let pipeline = create_shitter_world_pipeline(
+                &self.device, &self.camera_layout, None, format, samples,
+                include_str!("../collision_world.wgsl"), "Native BSP flat Shitter pipeline",
+            );
+            self.collision_world_pipeline = Some(CollisionWorldPipeline {
+                pipeline, textured: None, format, samples,
+                game: self.detail_texture_game.clone(),
+                texture_requested: false, texture_job: None,
+            });
+        }
+        if super::shitter_texture_enabled() {
+            self.ensure_shitter_textured_pipeline();
+        }
+    }
+
+    fn ensure_shitter_textured_pipeline(&mut self) {
+        let loaded = {
+            let Some(cached) = self.collision_world_pipeline.as_mut() else { return; };
+            if cached.textured.is_some() { return; }
+            match cached.texture_job.as_ref().map(|job| job.try_recv()) {
+                Some(Ok(result)) => {
+                    cached.texture_job = None;
+                    Some(result)
+                }
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    cached.texture_job = None;
+                    Some(Err("Shitter texture worker disconnected".to_owned()))
+                }
+                _ => None,
+            }
+        };
+        if let Some(result) = loaded {
+            self.finish_shitter_textured_pipeline(result);
             return;
         }
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Native BSP flat Shitter shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../collision_world.wgsl").into()),
+        let Some(cached) = self.collision_world_pipeline.as_mut() else { return; };
+        if cached.texture_requested { return; }
+        cached.texture_requested = true;
+        let root = self.base.clone();
+        let game = self.detail_texture_game.clone();
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new().name("shitter-world-image".into()).spawn(move || {
+            let _ = tx.send(load_shitter_image(&root, game.as_deref()));
+        }) {
+            Ok(_) => cached.texture_job = Some(rx),
+            Err(error) => self.finish_shitter_textured_pipeline(Err(format!(
+                "could not spawn Shitter image worker: {error}"
+            ))),
+        }
+    }
+
+    fn finish_shitter_textured_pipeline(
+        &mut self,
+        result: Result<(crate::materials::TextureData, String), String>,
+    ) {
+        let (data, path) = match result {
+            Ok((data, path)) => (data, path),
+            Err(error) => {
+                eprintln!("[SHITTER TEXTURE] {error}; showing missing-texture checker");
+                (crate::materials::missing_texture_data(), "MISSING".to_owned())
+            }
+        };
+        let width = data.width;
+        let height = data.height;
+        let image = super::upload_texture_picmip(&self.device, &self.queue, &data, self.picmip);
+        let image_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shitter single raw image layout"),
+            entries: &[
+                super::bindings::texture_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
-        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Native BSP flat Shitter pipeline layout"),
-            bind_group_layouts: &[Some(&self.camera_layout)],
-            immediate_size: 0,
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shitter single raw image bind group"),
+            layout: &image_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0, resource: wgpu::BindingResource::TextureView(&image.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                },
+            ],
         });
-        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Native BSP flat Shitter pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                // Read position and normal directly from existing GpuVertex.
-                // Both sources refer to the NORMAL BSP vertex/index buffers.
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<scene::GpuVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: std::mem::offset_of!(scene::GpuVertex, normal) as u64,
-                            shader_location: 1,
-                        },
-                    ],
-                })],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                // The normal BSP renderer uses two-sided faces. Shader-authored
-                // culling and patch winding are not represented in our single
-                // flat pipeline; one-sided rasterization can remove entire
-                // walls, floors or curved surfaces when seen from the back.
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format(),
-                depth_write_enabled: Some(true),
-                depth_compare: Some(camera_depth_compare()),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: samples, ..Default::default()
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: crate::pipeline_cache::get().as_ref(),
-        });
-        self.collision_world_pipeline = Some(CollisionWorldPipeline {
-            pipeline, format, samples,
-        });
+        let format = self.scene_format();
+        let pipeline = create_shitter_world_pipeline(
+            &self.device, &self.camera_layout, Some(&image_layout), format, self.msaa_samples,
+            include_str!("../collision_world_textured.wgsl"),
+            "Native BSP one-image Shitter pipeline",
+        );
+        if let Some(cached) = self.collision_world_pipeline.as_mut() {
+            cached.textured = Some(CollisionWorldTexturedPipeline {
+                pipeline, bind_group, _image: image,
+            });
+        }
+        println!("[SHITTER TEXTURE] sampled {} ({}x{}, picmip {}, one bind group, one texture fetch per world fragment)",
+            path, width, height, self.picmip);
     }
 }
 

@@ -500,7 +500,7 @@ impl OceanGpu {
                     .unwrap(),
             ) * -1.0,
             color: glam::Vec3::from_array(self.environment.sun_color[..3].try_into().unwrap()),
-            intensity: self.environment.sun_direction_intensity[3],
+            intensity: self.environment.map_sun_intensity(),
             night: false,
         };
         queue.write_buffer(

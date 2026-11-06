@@ -131,6 +131,7 @@ impl App {
     /// control rebinding needs the raw winit key/button rather than egui's
     /// logical key, so those events are handed back to the legacy handlers.
     pub(in crate::app) fn route_egui_window_event(&mut self, event: &WindowEvent) -> bool {
+        if self.native_update_notice_event(event) { return true; }
         if self.asset_mapping.is_some() {
             if self.overlay == OverlayMode::Console && !self.console_hl2 {
                 // Classic console takes keyboard input and pointer selection
@@ -399,6 +400,10 @@ impl App {
     }
 
     pub(in crate::app) fn tick_egui_menu(&mut self) {
+        if self.relight_bake_deferred && !self.egui_menu_active() {
+            self.relight_bake_deferred = false;
+            self.render_command(RenderCommand::SetRelightBakeDeferred(false));
+        }
         if !self.front_end { self.release_neon_chrome(); }
         self.poll_server_browser_events();
         self.poll_ui_catalog();
@@ -582,7 +587,6 @@ impl App {
             }
             return;
         }
-        self.egui_update_notice(ui);
         let painted_overlay = self.egui_display_overlay();
         if self.siege_dialog.is_some() {
             self.egui_siege_dialog(ui);

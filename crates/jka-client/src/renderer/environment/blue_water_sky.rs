@@ -453,7 +453,10 @@ impl AtmosphereRenderer {
         self.clouds.set_tuning(::blue_water_clouds::layer::CloudTuning {
             debug: settings.cloud_debug,
             shadow_mode: settings.cloud_shadow_mode,
-            shadow_far: settings.cloud_shadow_far,
+            // 0 fits the Beer cascades to the clouds' native 30 km, not the map's far plane
+            // (distancecull): a short far left the cascade square's edge as a V across the deck.
+            shadow_far: if settings.cloud_shadow_far > 0.0 { settings.cloud_shadow_far }
+                else { ::blue_water_render::camera::DEFAULT_FAR },
             far_step_scale: settings.cloud_far_step_scale,
             sun_steps: settings.cloud_sun_steps,
         });
@@ -496,6 +499,10 @@ impl AtmosphereRenderer {
             self.clouds.air_changed();
         }
         self.sky.set_night_sky_brightness(settings.night_sky);
+        self.sky.set_disc_scales(settings.sun_size, settings.moon_size);
+        // The water and every other reader of the sky's light take Moon intensity, as Relighting does.
+        self.sky.set_moonlight(Some(f64::from(settings.effective_moon_intensity()
+            / crate::blue_water_environment::Settings::FULL_MOON_WORLD_INTENSITY)));
         self.sky.seek(f64::from(time));
         let position = (camera.position - glam::Vec3::Y * sea_plane)
             / crate::ocean::OCEAN_UNITS_PER_METER
@@ -693,6 +700,7 @@ impl AtmosphereRenderer {
         portal: Option<(&wgpu::TextureView, f32)>,
         moon_light: Option<([f32; 3], f32)>,
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
+        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
     ) {
         self.scene.copy.capture(device, encoder, color, depth);
         if let Some(camera) = &self.frame_camera {
@@ -716,6 +724,7 @@ impl AtmosphereRenderer {
                     flash,
                     moon_light,
                     moon_csm,
+                    world_mask,
                 );
             }
         }

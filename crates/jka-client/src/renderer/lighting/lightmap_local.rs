@@ -150,7 +150,7 @@ impl crate::renderer::Renderer {
     pub(in crate::renderer) fn baked_local_lightmap_active(&self) -> bool {
         self.added_map_light_sources() != 0
             && self.world.as_ref().is_some_and(|w| {
-                w.static_sun.local_ready() && w.baked_sun_cache.as_ref().is_some_and(|c| c.active)
+                w.static_sun.local_ready() && w.baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition())
             })
     }
 }

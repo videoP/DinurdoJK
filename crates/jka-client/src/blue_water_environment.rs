@@ -53,6 +53,9 @@ pub struct Settings {
     /// The dome's night glow and floor as a share of the authored level (1 upstream, 0 black). Dome only: the
     /// environment bake and the world's night light keep the authored glow.
     pub night_sky: f32,
+    /// Apparent size of the sun's and the moon's discs on the dome (1 upstream). Appearance only.
+    pub sun_size: f32,
+    pub moon_size: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -97,6 +100,8 @@ impl Default for Settings {
             world_lighting: 0.0,
             filmic: true,
             night_sky: 1.0,
+            sun_size: 1.0,
+            moon_size: 1.0,
         }
     }
 }
@@ -160,6 +165,8 @@ impl Settings {
         limit!(fog, 0.0, 1.0);
         limit!(visibility, 200.0, 100000.0);
         limit!(night_sky, 0.0, 1.0);
+        limit!(sun_size, 0.1, 30.0);
+        limit!(moon_size, 0.1, 30.0);
         limit!(world_lighting, 0.0, 1.0);
         self
     }

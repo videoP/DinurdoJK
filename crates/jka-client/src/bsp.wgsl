@@ -286,6 +286,8 @@ override PBR_VERTEX_LIGHTGRID: bool = false;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
 @group(1) @binding(34) var baked_local_texture: texture_2d_array<f32>;
+// Composed static-sun shadow amount for r_staticWorldCsm (lightmap_sun.wgsl).
+@group(1) @binding(35) var static_sun_aux: texture_2d<f32>;
 @group(1) @binding(2) var lightmap_texture: texture_2d<f32>;
 @group(1) @binding(3) var lightmap_sampler: sampler;
 @group(1) @binding(4) var<uniform> material: Material;

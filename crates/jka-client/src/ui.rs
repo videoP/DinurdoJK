@@ -52,6 +52,7 @@ mod hud;
 pub(crate) mod movement_components;
 mod inspector;
 mod loading;
+pub(crate) mod update_notice;
 pub(crate) mod loading_layout;
 mod scoreboard;
 pub(crate) mod flex;
@@ -1677,7 +1678,10 @@ pub struct UiSnapshot {
     /// menu stage fade (cached scene photograph) instead of a different image.
     pub startup_splash_art: bool,
     pub loading: Option<MapLoadingUi>,
+    /// Signed GitHub release prompt, composed by native Taffy/WGPU only.
+    pub(crate) update_notice: Option<update_notice::UpdateNoticeUi>,
     pub static_ao_progress: Option<MapLoadingBar>,
+    pub sun_bake_progress: Option<MapLoadingBar>,
     /// Renderer-owned status of asynchronously compiled shader/PSO pipelines.
     pub shader_compile_progress: Option<MapLoadingBar>,
     /// Dedicated world worker: current individual BSP PSO and elapsed time.
@@ -1776,7 +1780,9 @@ impl Default for UiSnapshot {
             startup_splash: false,
             startup_splash_art: true,
             loading: None,
+            update_notice: None,
             static_ao_progress: None,
+            sun_bake_progress: None,
             shader_compile_progress: None,
             shader_compile_stage: None,
         }

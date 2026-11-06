@@ -681,6 +681,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.publish_ui();
                 }
             }
+            UserEvent::SunBakeProgress { completed, stage } => {
+                self.sun_bake_ready_at = if stage == crate::renderer::SunBakeStage::Ready {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.sun_bake_progress = if stage == crate::renderer::SunBakeStage::Off {
+                    None
+                } else {
+                    Some((completed.min(1000), stage))
+                };
+                self.publish_ui();
+            }
             UserEvent::StaticAoProgress { completed, total } => {
                 self.static_ao_progress = if total == 0 || completed >= total {
                     None

@@ -2,7 +2,7 @@
 use crate::renderer::{
     camera_depth_compare, create_cull_debug_pipeline, create_ssr_visibility_resources,
     create_surface_inspector_pipeline, create_taa_post_pipeline, create_targets,
-    create_world_pipeline, gpu_blend_factor, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
+    create_reflection_world_pipeline, create_world_pipeline, gpu_blend_factor, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
     BlendMode, CullDebugMode, CullMode, DrawBatch, DrawClass, GpuVertex, Instant, MaterialFragmentKey,
     MaterialUniform,
     OnceLock, Ordering, PipelineJobKey, PipelineKey, Renderer, RgbGen, TcGen, TcMod, Vec3,
@@ -1624,9 +1624,9 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&original| WorldPassPipelineIdentity::new(
                 shader_variant, WorldPipelinePass::Reflection { authored_fog: shader_variant.legacy_fog },
                 reflected_pipeline_key(original), surface_format, 1),
-            |&original| create_world_pipeline(
+            |&original| create_reflection_world_pipeline(
                 device, layout, shader, surface_format, reflected_pipeline_key(original),
-                1, shader_variant.legacy_fog, false, Some(shader_variant), false, None))?
+                shader_variant.legacy_fog, shader_variant))?
             .into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -2034,18 +2034,14 @@ pub(in crate::renderer) fn create_reflection_pipelines(
             CullMode::Front => CullMode::Back,
             CullMode::Back => CullMode::Front,
         };
-        create_world_pipeline(
+        create_reflection_world_pipeline(
             device,
             layout,
             shader,
             surface_format,
             reflected,
-            1,
             legacy_fog,
-            false,
-            Some(shader_variant),
-            false,
-            None,
+            shader_variant,
         )
     });
     originals.into_iter().zip(compiled).collect()

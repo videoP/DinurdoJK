@@ -156,6 +156,10 @@ fn blue_cloud_experiments_apply_live_validate_and_stay_out_of_archives() {
     app.flush_config();
     let saved = fs::read_to_string(path).unwrap();
     for (name, _, _) in controls {
+        if name == "r_blueCloudShadowMode" {
+            assert!(saved.contains("seta r_blueCloudShadowMode \"1\""), "shadow mode was not archived");
+            continue;
+        }
         assert!(!saved.contains(name), "diagnostic {name} was archived");
     }
     for (name, default, _) in controls {

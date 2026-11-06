@@ -17,7 +17,7 @@ use crate::renderer::{
     DeferredCommand, DeferredResources, DofMode, DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
     DynamicShadowsMode, FootprintMode, FrameInfo, GlowMode, GpuPass, Instant, LatestViewState, Mat4,
     WorldPipelineBinding, is_sky_cloud_stage,
-    PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PvsMode, RenderError,
+    PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PlanarReflectorKind, PvsMode, RenderError,
     Renderer, SpectatorHighlight, SunVisibilityMode, TcGen, TransientLight, Vec3, ViewLatchMode, WorldBatch,
     WorldBatchSet, WorldShaderFamily, CLOUD_INTERLEAVE_GRID, CLUSTER_COUNT,
     ENTITY_SHADOW_CAMERAS, PLANAR_REFLECTION_SLOTS, SHADOW_CASCADES,
@@ -25,6 +25,7 @@ use crate::renderer::{
 use bytemuck::Zeroable;
 use crate::renderer::world::inline_models::sky_portal_inline_eligible;
 use crate::renderer::lighting::local_shadows::ClipFrustum;
+use crate::renderer::reflections::planar::{append_planar_mask_triangles, planar_mask_scissor};
 use crate::renderer::lighting::shadow_resources::{CachedStaticCascade, padded_static_shadow_matrix, static_shadow_covers_camera};
 
 /// Return whether the main world color attachment must be loaded instead of
@@ -2199,7 +2200,8 @@ impl Renderer {
                                 draw_world_batch_secondary(&mut pass, batch, 0..1, None);
                             }
                             DrawClass::Transparent
-                                if self.sun_visibility == SunVisibilityMode::Filtered =>
+                                if self.sun_visibility == SunVisibilityMode::Filtered
+                                    && crate::renderer::lighting::lightmap_sun::translucent_sun_caster(&batch.source) =>
                             {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(&self.shadow_resources.bevy_translucent_pipeline);
@@ -2276,7 +2278,8 @@ impl Renderer {
                                         draw_world_batch_secondary(&mut pass, batch, 0..1, None);
                                     }
                                     DrawClass::Transparent
-                                        if self.sun_visibility == SunVisibilityMode::Filtered => {
+                                        if self.sun_visibility == SunVisibilityMode::Filtered
+                                            && crate::renderer::lighting::lightmap_sun::translucent_sun_caster(&batch.source) => {
                                             pass.set_pipeline(&self.shadow_resources.bevy_translucent_pipeline);
                                             mask_pipeline_active = true;
                                             pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -2802,6 +2805,36 @@ impl Renderer {
             let use_reflection_inline_grouping =
                 !planar_binding_test && !render_ocean && self.gpu_compaction_supported;
             let ocean_enabled = render_ocean;
+            // r_planarReflectionMask A/B: 1 scissors each view to its reflector's
+            // screen rectangle; 2 also carves the reflector's screen polygon into
+            // depth cleared to near, so early-Z rejects every reflected pixel the
+            // mirror never samples. The reflected camera shares main clip space.
+            let planar_mask_mode = if planar_binding_test { 0 } else { crate::renderer::planar_reflection_mask() };
+            let planar_mask_size = (self.planar_reflection._width, self.planar_reflection._height);
+            // Four target texels: texel-floor addressing plus the 3-texel
+            // environment filter stay inside the mask.
+            let planar_mask_margin = glam::Vec2::new(
+                8.0 / planar_mask_size.0 as f32,
+                8.0 / planar_mask_size.1 as f32,
+            );
+            let mut planar_mask_ranges = [None::<(u32, u32)>; PLANAR_REFLECTION_SLOTS];
+            if planar_mask_mode == 2 && self.planar_reflection.mask_pipeline.is_some() {
+                let mut mask_vertices = Vec::new();
+                for (slot, view) in planar_views.iter().enumerate() {
+                    let Some(view) = view else { continue };
+                    let first = mask_vertices.len();
+                    if append_planar_mask_triangles(&world.planar_reflectors, view.plane,
+                        view_proj, planar_mask_margin, &mut mask_vertices)
+                        && mask_vertices.len() > first
+                    {
+                        planar_mask_ranges[slot] = Some((first as u32, mask_vertices.len() as u32));
+                    }
+                }
+                if !mask_vertices.is_empty() {
+                    self.queue.write_buffer(&self.planar_reflection.mask_vertex_buffer, 0,
+                        bytemuck::cast_slice(&mask_vertices));
+                }
+            }
             let mut reflection_packed = 0_u32;
             for (slot, reflection_view) in planar_views.iter().enumerate() {
                 let Some(reflection_view) = reflection_view else {
@@ -2829,10 +2862,18 @@ impl Renderer {
                     .source
                     .vertices
                     .clone();
+                // Blue Water's dome is composited over the main view only, so this
+                // view would mirror the map's authored sky. A lake's view leaves its
+                // sky empty instead (alpha -1 on the float scene target) and the lake
+                // fills it from its own Blue Water sky.
+                let lake_sky = reflection_view.kind == PlanarReflectorKind::Ocean
+                    && self.ocean_settings.backend == 3
+                    && self.sky_backend == 1 && self.fast_sky == 0 && self.blue_water_sky.is_some()
+                    && self.scene_format() == wgpu::TextureFormat::Rgba16Float;
                 let reflection_visible = |batch: &WorldBatch| {
                     let sky = batch.source.pipeline.class == DrawClass::Sky;
                     !(batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
-                        && (!sky || self.fast_sky == 0)
+                        && (!sky || (self.fast_sky == 0 && !lake_sky))
                         && (!batch.is_inline_entity || self.draw_inline_models)
                         && !hidden_inline_batch(batch, &world.inline_models)
                         && batch_area_visible(batch, reflection_area_mask)
@@ -2942,6 +2983,8 @@ impl Renderer {
                                 }
                             } else if self.fast_sky != 0 {
                                 fast_sky_clear_color(self.fast_sky)
+                            } else if lake_sky {
+                                wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: -1.0 }
                             } else {
                                 self.weather.fog.clear_color()
                             }),
@@ -2951,7 +2994,13 @@ impl Renderer {
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.planar_reflection.depth_view,
                         depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(camera_depth_clear()),
+                            // Masked views clear to the reversed-Z near plane;
+                            // only the carved polygon is reset to far.
+                            load: wgpu::LoadOp::Clear(if planar_mask_ranges[slot].is_some() {
+                                1.0
+                            } else {
+                                camera_depth_clear()
+                            }),
                             store: wgpu::StoreOp::Store,
                         }),
                         stencil_ops: None,
@@ -2960,6 +3009,25 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                if planar_mask_mode != 0 {
+                    let [x, y, width, height] = planar_mask_scissor(
+                        reflection_view.ndc_rect.0,
+                        reflection_view.ndc_rect.1,
+                        planar_mask_margin,
+                        planar_mask_size.0,
+                        planar_mask_size.1,
+                    );
+                    pass.set_scissor_rect(x, y, width, height);
+                }
+                if let (Some((first, last)), Some(mask_pipeline)) =
+                    (planar_mask_ranges[slot], self.planar_reflection.mask_pipeline.as_ref())
+                {
+                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                    pass.set_pipeline(mask_pipeline);
+                    if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
+                    pass.set_vertex_buffer(0, self.planar_reflection.mask_vertex_buffer.slice(..));
+                    pass.draw(first..last, 0..1);
+                }
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(0, &self.planar_camera_bind_groups[slot], &[]);
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -3353,6 +3421,10 @@ impl Renderer {
         // The moon-shadow state is stable for this frame and is used by both
         // Blue Water lighting paths below.
         let blue_water_moon_direction = self.blue_water_moon_toward();
+        // Lightmapped world pixels skip the sky light only when this frame's
+        // full prepass wrote the policy mask that marks them.
+        let sky_world_baked = self.sky_world_baked() && self.frame_plan.needs_linear_depth
+            && !(self.frame_plan.rain_only_linear_depth && self.weather.rain.lean_depth);
         let blue_water_moon_csm_active = shadow_matrices.is_some()
             && self.blue_water_moon_shadow_direction().is_some();
         // At night explicitly override the direct solar light even when there
@@ -4106,9 +4178,24 @@ impl Renderer {
                     (world.native_flat_draw.as_ref(), self.collision_world_pipeline.as_ref())
                 {
                     if draw.count != 0 {
-                        pass.set_pipeline(&pipeline.pipeline);
-                        // Vertex 0 and the index buffer are ALREADY the regular
-                        // BSP world buffers. Only group 0 (camera) is used.
+                        if crate::renderer::shitter_texture_enabled() {
+                            if let Some(textured) = pipeline.textured.as_ref() {
+                                pass.set_pipeline(&textured.pipeline);
+                                pass.set_bind_group(1, &textured.bind_group, &[]);
+                                if capture_api_calls {
+                                    info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1);
+                                }
+                            } else {
+                                // The raw image is decoding on an asset worker.
+                                pass.set_pipeline(&pipeline.pipeline);
+                            }
+                        } else {
+                            // A genuinely texture-free shader/pipeline, not a
+                            // uniform branch that still samples in the fragment.
+                            pass.set_pipeline(&pipeline.pipeline);
+                        }
+                        // Vertex 0 and indices are ALREADY regular BSP buffers;
+                        // textured mode adds only the one persistent bind group.
                         pass.multi_draw_indexed_indirect(&draw.buffer, 0, draw.count);
                         info.world_encoded_batches = draw.count;
                         info.world_multidraw_groups = info.world_multidraw_groups.saturating_add(1);
@@ -5386,7 +5473,7 @@ impl Renderer {
                 } else { None };
                 if let Some(atmosphere)=self.blue_water_sky.as_mut().filter(|_|self.sky_backend==1 || self.blue_water_environment.world_lighting > 0.0 || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked));
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                 }
                 // Light submerged receivers before atmospheric scattering is added.
@@ -6042,7 +6129,7 @@ impl Renderer {
                 } else { None };
                 if let Some(atmosphere)=self.blue_water_sky.as_mut() {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked));
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                     atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,&self.weather.rain.sky_admission());
                 }
