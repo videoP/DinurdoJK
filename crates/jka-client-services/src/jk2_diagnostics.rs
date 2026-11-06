@@ -61,13 +61,13 @@ mod jk2_demo_roots_tests {
         let install = std::env::temp_dir().join(format!("jk2-demo-roots-{}-{nonce}", std::process::id()));
         let local = install.join("JK2 GameData/base/demos");
         let retail = install.join("retail/base/demos");
-        let jka = install.join("JKA GameData/base/demos");
+        let jka = install.join("base/demos");
         std::fs::create_dir_all(&local).unwrap();
         std::fs::create_dir_all(&retail).unwrap();
         std::fs::create_dir_all(&jka).unwrap();
         std::fs::write(jka.join("jkaonly.dm_15"), b"no").unwrap();
         std::fs::write(retail.join("recording.dm_15"), b"retail").unwrap();
-        let base = install.join("JKA GameData/base");
+        let base = install.join("base");
         let roots = jka_assets::pk3::FilesystemRoots {
             jk2cdpath: Some(install.join("retail")), ..Default::default()
         };

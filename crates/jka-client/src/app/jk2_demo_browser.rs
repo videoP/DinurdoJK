@@ -178,7 +178,7 @@ mod tests {
         let home = install.join("home/JK2 GameData");
         for folder in [local.join("base/demos"), local.join("jk2/demos"),
             home.join("base/demos"), home.join("jka_mod/demos"), cd.join("base/demos"),
-            install.join("JKA GameData/jk2/demos")] {
+            install.join("jka/jk2/demos")] {
             fs::create_dir_all(&folder).unwrap();
             fs::write(folder.join("recording.dm_15"), b"demo").unwrap();
         }
@@ -186,7 +186,7 @@ mod tests {
         assert!(folders.iter().any(|folder| folder.label == "base/demos"));
         assert!(folders.iter().any(|folder| folder.label == "jk2/demos"));
         assert!(folders.iter().any(|folder| folder.label == "jka_mod/demos (home)"));
-        assert!(folders.iter().all(|folder| !folder.path.starts_with(install.join("JKA GameData"))));
+        assert!(folders.iter().all(|folder| !folder.path.starts_with(install.join("jka"))));
         assert_eq!(scan_recordings(&local.join("base/demos")).unwrap().len(), 1);
         fs::remove_dir_all(install).unwrap();
     }

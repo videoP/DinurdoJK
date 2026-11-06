@@ -312,7 +312,17 @@ pub(in crate::renderer) struct DynamicEntityLightingUniform {
     pub(in crate::renderer) studio_ambient: [f32;4],
     pub(in crate::renderer) studio_sun: [f32;4],
     pub(in crate::renderer) studio_sun_direction: [f32;4],
+    // Blue Water sky world light on models (r_blueSkyWorldLighting with
+    // r_skyWorldBake), GPU-written by blue_water_scene.rs model_sky_light and
+    // never by write_entity_lighting: [0..6) ambient cube +X -X +Y -Y +Z -Z
+    // (already * 0.5), [6] rgb direct * 0.2, w strength (0 = off), [7] xyz
+    // unit direction toward the light. All render space.
+    pub(in crate::renderer) sky_world: [[f32;4];8],
 }
+
+/// Byte offset of `sky_world`; CPU writes stop here so they never clobber it.
+pub(in crate::renderer) const ENTITY_SKY_WORLD_OFFSET: u64 =
+    std::mem::offset_of!(DynamicEntityLightingUniform, sky_world) as u64;
 
 /// Wet weather applied to entities. Zeroed (wetness 0) disables it.
 #[repr(C)]
@@ -357,6 +367,7 @@ impl DynamicEntityLightingUniform {
             weather,
             studio_lights: [[0.0;4];128],
             studio_ambient:[0.0;4], studio_sun:[0.0;4], studio_sun_direction:[0.0;4],
+            sky_world: [[0.0;4];8],
         }
     }
 }
@@ -438,6 +449,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) entity_water: Arc<std::collections::HashMap<u16, crate::water_wetness::WaterProfile>>,
     /// Last value written to the uniform's `cloud_shadow_sun`; w = 0 when off.
     pub(in crate::renderer) cloud_shadow_sun: [f32; 4],
+    /// `sky_world` holds GPU-written values (possibly from an earlier frame).
+    pub(in crate::renderer) sky_world_live: bool,
+    /// This frame's Blue Water pass refreshed `sky_world`.
+    pub(in crate::renderer) sky_world_refreshed: bool,
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
     pub(in crate::renderer) legacy_fog_compiled: bool,
     /// ENABLE_MODEL_WET in the model pipelines (see `set_model_wet`).

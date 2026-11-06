@@ -14,10 +14,13 @@ const AMBER: [f32; 4] = [1.0, 0.76, 0.42, 1.0];
 #[derive(Clone, Debug, Default)]
 pub struct FolderUi {
     pub address: String,
-    pub folders: Vec<String>,
+    pub target: usize,
+    pub entries: Vec<PickerEntryUi>,
     pub scroll: usize,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug, Default)]
+pub struct PickerEntryUi { pub name: String, pub is_dir: bool }
 #[derive(Clone, Debug, Default)]
 pub struct AssetMappingUi {
     /// 0 JKA base; 1 JKA CD; 2 JK2 base; 3 JK2 CD; 4 forced client override.
@@ -31,7 +34,8 @@ pub struct AssetMappingUi {
     pub allow_close: bool,
     pub focus: Option<usize>,
     pub caret: usize,
-    pub selection_all: bool,
+    pub selection_anchor: Option<usize>,
+    pub text_start: usize,
     pub scroll: f32,
     pub pointer: [f32; 2],
     pub picker: Option<FolderUi>,
@@ -52,7 +56,7 @@ pub struct Layout {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct PickerLayout {
-    pub panel: Bounds, pub title: Bounds, pub address: Bounds, pub go: Bounds,
+    pub panel: Bounds, pub title: Bounds, pub address: Bounds,
     pub parent: Bounds, pub refresh: Bounds, pub choose: Bounds, pub cancel: Bounds,
     pub list: Bounds, pub error: Bounds, pub row_h: f32,
 }
@@ -60,7 +64,7 @@ pub struct PickerLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Edit(usize), Browse(usize), Save, Restart, Back,
-    Address, Go, Parent, Refresh, Choose, Cancel, Folder(usize),
+    Address, Parent, Refresh, Choose, Cancel, Entry(usize),
 }
 
 fn translated(mut b: Bounds, y: f32) -> Bounds { b[1] -= y; b }
@@ -170,41 +174,40 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
 }
 fn picker_layout(width:u32,height:u32,s:f32)->PickerLayout {
     let (w,h)=(width as f32,height as f32);
-    let mw=(w-26.0*s).max(1.0).min(760.0*s);
-    let mh=(h-35.0*s).max(1.0).min(590.0*s);
+    let mw=(w-26.0*s).max(1.0).min(850.0*s);
+    let mh=(h-35.0*s).max(1.0).min(650.0*s);
     let inner=(mw-36.0*s).max(1.0);
     let mut f=Flex::new();
     let title=f.band(48.0*s);
-    let address=f.leaf((inner-80.0*s).max(1.0),38.0*s);
-    let go=f.leaf(72.0*s,38.0*s);
-    let address_row=f.node(Container::row().width(inner).height(38.0*s).gap(8.0*s), &[address,go]);
-    let parent=f.leaf(112.0*s,35.0*s);
-    let refresh=f.leaf(105.0*s,35.0*s);
-    let tools=f.node(Container::row().width(inner).height(35.0*s).gap(10.0*s),&[parent,refresh]);
-    let error=f.band(24.0*s);
+    let parent=f.leaf(44.0*s,44.0*s);
+    let refresh=f.leaf(44.0*s,44.0*s);
+    let address=f.leaf((inner-104.0*s).max(1.0),44.0*s);
+    let address_row=f.node(Container::row().width(inner).height(44.0*s).gap(8.0*s), &[parent,refresh,address]);
+    let error=f.band(27.0*s);
     let list=f.spring();
-    let choose=f.leaf(170.0*s,41.0*s);
-    let cancel=f.leaf(116.0*s,41.0*s);
-    let footer=f.node(Container::row().width(inner).height(41.0*s).gap(10.0*s),&[choose,cancel]);
+    let choose=f.leaf(170.0*s,44.0*s);
+    let cancel=f.leaf(116.0*s,44.0*s);
+    let footer=f.node(Container::row().width(inner).height(44.0*s).gap(10.0*s),&[choose,cancel]);
     let panel=f.node(Container::column().width(mw).height(mh).pad(18.0*s,15.0*s).gap(10.0*s),
-        &[title,address_row,tools,error,list,footer]);
+        &[title,address_row,error,list,footer]);
     let outer=f.node(Container::column().width(w).height(h).align(AlignItems::CENTER)
         .justify(JustifyContent::CENTER), &[panel]);
     f.compute(outer,w,h);
-    PickerLayout {panel:f.bounds(panel),title:f.bounds(title),address:f.bounds(address),go:f.bounds(go),
+    PickerLayout {panel:f.bounds(panel),title:f.bounds(title),address:f.bounds(address),
         parent:f.bounds(parent),refresh:f.bounds(refresh),choose:f.bounds(choose),cancel:f.bounds(cancel),
-        list:f.bounds(list),error:f.bounds(error),row_h:38.0*s }
+        list:f.bounds(list),error:f.bounds(error),row_h:39.0*s }
 }
+
 impl Layout {
     pub fn hit(&self, pointer:[f32;2],ui:&AssetMappingUi)->Option<Hit> {
         if let (Some(p),Some(picker))=(self.picker,&ui.picker) {
-            for (b,hit) in [(p.address,Hit::Address),(p.go,Hit::Go),(p.parent,Hit::Parent),
+            for (b,hit) in [(p.address,Hit::Address),(p.parent,Hit::Parent),
                 (p.refresh,Hit::Refresh),(p.choose,Hit::Choose),(p.cancel,Hit::Cancel)] {
                 if flex::contains(b,pointer) {return Some(hit);}
             }
             if flex::contains(p.list,pointer) {
                 let ix=picker.scroll + ((pointer[1]-p.list[1])/p.row_h).floor().max(0.0) as usize;
-                if ix<picker.folders.len() {return Some(Hit::Folder(ix));}
+                if ix<picker.entries.len() && ix-picker.scroll<self.picker_visible_rows() {return Some(Hit::Entry(ix));}
             }
             return None; // modal blocks main screen
         }
@@ -224,6 +227,100 @@ impl Layout {
     }
 }
 
+/// Path fields intentionally use the native monospaced fallback glyphs. The
+/// painter and winit pointer mapping therefore share exact character advances,
+/// including on the no-PK3 asset recovery screen.
+pub(crate) fn edit_capacity(width:f32, scale:f32)->usize {
+    ((width-24.0*scale).max(0.0)/(9.0*scale)).floor().max(1.0) as usize
+}
+fn byte_at_char(value:&str, char_index:usize)->usize {
+    value.char_indices().nth(char_index).map_or(value.len(),|(byte,_)|byte)
+}
+pub(crate) fn caret_from_x(value:&str, start:usize, b:Bounds, scale:f32, x:f32)->usize {
+    let capacity=edit_capacity(b[2],scale);
+    let start=start.min(value.chars().count().saturating_sub(capacity));
+    let shown=value.chars().count().saturating_sub(start).min(capacity);
+    let offset=((x-(b[0]+10.0*scale))/(9.0*scale)+0.5).floor()
+        .max(0.0).min(shown as f32) as usize;
+    byte_at_char(value,start+offset)
+}
+#[allow(clippy::too_many_arguments)]
+fn edit_contents(out:&mut Vec<UiVertex>,font:&UiText<'_>,b:Bounds,value:&str,
+    active:bool, caret:usize, anchor:Option<usize>, start:usize,w:u32,h:u32,s:f32) {
+    let px=18.0*s;
+    let capacity=edit_capacity(b[2],s);
+    let total=value.chars().count();
+    let first=if active {start.min(total.saturating_sub(capacity))}
+        else {total.saturating_sub(capacity)};
+    let last=(first+capacity).min(total);
+    let begin=byte_at_char(value,first);
+    let end=byte_at_char(value,last);
+    let x=b[0]+10.0*s;
+    let advance=9.0*s;
+    if active {
+        if let Some(anchor)=anchor.filter(|a|*a!=caret) {
+            let sel_a=value[..anchor.min(value.len())].chars().count();
+            let sel_b=value[..caret.min(value.len())].chars().count();
+            let left=sel_a.min(sel_b).max(first);
+            let right=sel_a.max(sel_b).min(last);
+            if right>left {
+                fill(out,[x+(left-first) as f32*advance,b[1]+4.0*s,
+                    (right-left) as f32*advance,b[3]-8.0*s],
+                    [0.13,0.37,0.53,0.94],w,h);
+            }
+        }
+    }
+    font.draw(out,&value[begin..end],x,font.baseline_in(b,px),px,WHITE);
+    if active {
+        let caret_char=value[..caret.min(value.len())].chars().count();
+        if caret_char>=first && caret_char<=last {
+            let cursor=(x+(caret_char-first) as f32*advance).min(b[0]+b[2]-9.0*s);
+            rect(out,cursor,b[1]+8.0*s,1.5*s,b[3]-16.0*s,CYAN,w,h);
+        }
+    }
+}
+fn navigation_icon(out:&mut Vec<UiVertex>,b:Bounds,refresh:bool,hover:bool,w:u32,h:u32,s:f32) {
+    fill(out,b,if hover {[0.12,0.30,0.39,0.98]}else{[0.055,0.11,0.16,0.98]},w,h);
+    rect_outline(out,b[0],b[1],b[2],b[3],1.0,
+        if hover{CYAN}else{[0.18,0.37,0.47,0.8]},w,h);
+    let cx=b[0]+b[2]*0.5;
+    let cy=b[1]+b[3]*0.5;
+    let c=if hover{WHITE}else{CYAN};
+    let thick=(2.6*s).max(1.7);
+    if refresh {
+        // Familiar clockwise refresh glyph with an arrowhead.
+        let radius=10.0*s;
+        let steps=18;
+        let mut previous=None;
+        for i in 0..=steps {
+            let angle=(-140.0+290.0*(i as f32/steps as f32)).to_radians();
+            let pos=[cx+radius*angle.cos(),cy+radius*angle.sin()];
+            if let Some(last)=previous {neon_stroke(out,last,pos,thick,c,w,h);}
+            previous=Some(pos);
+        }
+        let tip=[cx+radius*150.0_f32.to_radians().cos(),
+            cy+radius*150.0_f32.to_radians().sin()];
+        neon_stroke(out,tip,[tip[0]+8.0*s,tip[1]+1.0*s],thick,c,w,h);
+        neon_stroke(out,tip,[tip[0]+2.0*s,tip[1]+8.0*s],thick,c,w,h);
+    } else {
+        // Standard "up one folder" icon, not a text PARENT button.
+        neon_stroke(out,[cx,cy-11.0*s],[cx,cy+10.0*s],thick,c,w,h);
+        neon_stroke(out,[cx,cy-11.0*s],[cx-9.0*s,cy-2.0*s],thick,c,w,h);
+        neon_stroke(out,[cx,cy-11.0*s],[cx+9.0*s,cy-2.0*s],thick,c,w,h);
+    }
+}
+fn entry_icon(out:&mut Vec<UiVertex>,x:f32,y:f32,folder:bool,s:f32,w:u32,h:u32) {
+    if folder {
+        fill(out,[x+1.0*s,y+7.0*s,23.0*s,15.0*s],[0.18,0.54,0.72,1.0],w,h);
+        fill(out,[x+1.0*s,y+3.0*s,11.0*s,7.0*s],[0.18,0.54,0.72,1.0],w,h);
+        rect_outline(out,x+1.0*s,y+7.0*s,23.0*s,15.0*s,1.0,CYAN,w,h);
+    } else {
+        fill(out,[x+4.0*s,y+2.0*s,17.0*s,22.0*s],[0.16,0.23,0.30,1.0],w,h);
+        rect_outline(out,x+4.0*s,y+2.0*s,17.0*s,22.0*s,1.0,DIM,w,h);
+        rect(out,x+8.0*s,y+11.0*s,9.0*s,1.0,DIM,w,h);
+        rect(out,x+8.0*s,y+16.0*s,9.0*s,1.0,DIM,w,h);
+    }
+}
 fn fill(out:&mut Vec<UiVertex>,b:Bounds,c:[f32;4],w:u32,h:u32){rect(out,b[0],b[1],b[2],b[3],c,w,h);}
 fn frame(out:&mut Vec<UiVertex>,b:Bounds,w:u32,h:u32){
     fill(out,b,[0.028,0.050,0.073,0.97],w,h);
@@ -349,20 +446,17 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
         fill(out,row.edit,if active {[0.082,0.156,0.21,0.98]}else{[0.038,0.077,0.116,0.99]},w,h);
         rect_outline(out,row.edit[0],row.edit[1],row.edit[2],row.edit[3],1.0,
             if active{CYAN}else{[0.16,0.28,0.35,1.0]},w,h);
-        let value=if state.values[i].is_empty() {if i==4 {"Empty = disabled"}else{"Default / not configured"}} else {&state.values[i]};
-        let color=if state.values[i].is_empty(){DIM}else{WHITE};
-        let edit_text=[row.edit[0]+10.0*s,row.edit[1],row.edit[2]-20.0*s,row.edit[3]];
-        if active && state.selection_all {
-            fill(out,[row.edit[0]+5.0*s,row.edit[1]+4.0*s,row.edit[2]-10.0*s,row.edit[3]-8.0*s],
-                [0.14,0.35,0.45,0.65],w,h);
-        }
-        line(out,&font,edit_text,value,18.0*s,color);
-        if active {
-            // A constant visible caret prevents a frame-timer-dependent UI rebuild.
-            let before=state.values[i].get(..state.caret.min(state.values[i].len())).unwrap_or("");
-            let prefix=if state.selection_all {""} else {before};
-            let px=(row.edit[0]+10.0*s+font.width(prefix,18.0*s)).min(row.edit[0]+row.edit[2]-12.0*s);
-            rect(out,px,row.edit[1]+8.0*s,1.5*s,row.edit[3]-16.0*s,CYAN,w,h);
+        if state.values[i].is_empty() && !active {
+            line(out,&font,[row.edit[0]+10.0*s,row.edit[1],row.edit[2]-20.0*s,row.edit[3]],match i {
+                0=>"Default / EXE directory",
+                2=>"Default / JK2 GameData beside EXE",
+                4=>"Empty = disabled",
+                _=>"Not configured",
+            },18.0*s,DIM);
+        } else {
+            let mono=UiText::legacy_only(None,w,h);
+            edit_contents(out,&mono,row.edit,&state.values[i],active,state.caret,
+                if active {state.selection_anchor}else{None},state.text_start,w,h,s);
         }
         if i<4 {
             let hover=l.hit(state.pointer,state)==Some(Hit::Browse(i));
@@ -452,35 +546,64 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
     if let (Some(p),Some(data))=(l.picker,&state.picker) {
         fill(out,[0.0,0.0,w as f32,h as f32],[0.012,0.017,0.027,0.94],w,h);
         frame(out,p.panel,w,h);
-        line(out,&font,p.title,"CHOOSE GAME ROOT FOLDER",25.0*s,WHITE);
+        let title=match data.target {
+            0=>"JEDI ACADEMY / GAME ROOT",
+            1=>"JEDI ACADEMY / RETAIL ROOT",
+            2=>"JEDI OUTCAST / GAME ROOT",
+            3=>"JEDI OUTCAST / RETAIL ROOT",
+            _=>"SELECT FOLDER",
+        };
+        line(out,&font,p.title,title,25.0*s,WHITE);
+        for (bounds,hit,refresh) in [(p.parent,Hit::Parent,false),(p.refresh,Hit::Refresh,true)] {
+            navigation_icon(out,bounds,refresh,l.hit(state.pointer,state)==Some(hit),w,h,s);
+        }
         fill(out,p.address,[0.035,0.082,0.12,1.0],w,h);
         rect_outline(out,p.address[0],p.address[1],p.address[2],p.address[3],1.0,
             if state.focus==Some(5){CYAN}else{DIM},w,h);
-        line(out,&font,[p.address[0]+8.0*s,p.address[1],p.address[2]-16.0*s,p.address[3]],
-            &data.address,18.0*s,WHITE);
-        if state.focus==Some(5) {
-            let prefix=data.address.get(..state.caret.min(data.address.len())).unwrap_or("");
-            let x=(p.address[0]+8.0*s+font.width(prefix,18.0*s)).min(p.address[0]+p.address[2]-12.0*s);
-            rect(out,x,p.address[1]+7.0*s,1.5*s,p.address[3]-14.0*s,CYAN,w,h);
+        let mono=UiText::legacy_only(None,w,h);
+        edit_contents(out,&mono,p.address,&data.address,state.focus==Some(5),state.caret,
+            if state.focus==Some(5){state.selection_anchor}else{None},state.text_start,w,h,s);
+        for (bounds,hit,name) in [(p.choose,Hit::Choose,"SELECT FOLDER"),(p.cancel,Hit::Cancel,"CANCEL")] {
+            button(out,&font,bounds,name,l.hit(state.pointer,state)==Some(hit),hit==Hit::Choose,w,h,s);
         }
-        for (r,hit,text) in [(p.go,Hit::Go,"GO"),(p.parent,Hit::Parent,"PARENT"),
-            (p.refresh,Hit::Refresh,"REFRESH"),(p.choose,Hit::Choose,"SELECT FOLDER"),
-            (p.cancel,Hit::Cancel,"CANCEL")] {
-            button(out,&font,r,text,l.hit(state.pointer,state)==Some(hit),hit==Hit::Choose,w,h,s);
+        if let Some(error)=&data.error {
+            line(out,&font,p.error,error,16.0*s,RED);
+        } else {
+            let folders=data.entries.iter().filter(|entry|entry.is_dir).count();
+            let files=data.entries.len()-folders;
+            let summary=format!("{folders} folders  /  {files} files   -   Up arrow: parent folder   -   Enter: open typed path");
+            line(out,&font,p.error,&summary,16.0*s,DIM);
         }
-        if let Some(error)=&data.error {line(out,&font,p.error,error,16.0*s,RED);}
-        else {line(out,&font,p.error,"Click a folder to enter it. SELECT FOLDER uses the current directory.",16.0*s,DIM);}
         frame(out,p.list,w,h);
         let count=l.picker_visible_rows();
-        for (offset,path) in data.folders.iter().skip(data.scroll).take(count).enumerate() {
+        for (offset,entry) in data.entries.iter().skip(data.scroll).take(count).enumerate() {
             let b=[p.list[0]+9.0*s,p.list[1]+offset as f32*p.row_h+2.0*s,p.list[2]-18.0*s,p.row_h-2.0*s];
-            if l.hit(state.pointer,state)==Some(Hit::Folder(data.scroll+offset)) {
+            if entry.is_dir && l.hit(state.pointer,state)==Some(Hit::Entry(data.scroll+offset)) {
                 fill(out,b,[0.1,0.24,0.32,0.94],w,h);
+            } else if offset%2==1 {
+                fill(out,b,[0.044,0.074,0.100,0.65],w,h);
             }
-            line(out,&font,[b[0]+7.0*s,b[1],b[2]-14.0*s,b[3]],path,17.0*s,WHITE);
+            entry_icon(out,b[0]+7.0*s,b[1]+4.0*s,entry.is_dir,s,w,h);
+            let kind=if entry.is_dir {"FOLDER"}else{"FILE"};
+            let kind_width=font.width(kind,14.0*s);
+            let kind_x=b[0]+b[2]-kind_width-11.0*s;
+            let text_x=b[0]+39.0*s;
+            line(out,&font,[text_x,b[1],(kind_x-text_x-12.0*s).max(0.0),b[3]],
+                &entry.name,17.0*s,if entry.is_dir{WHITE}else{DIM});
+            line(out,&font,[kind_x,b[1],kind_width+3.0*s,b[3]],kind,14.0*s,DIM);
         }
-        if data.folders.is_empty() {line(out,&font,[p.list[0]+15.0*s,p.list[1]+15.0*s,p.list[2]-30.0*s,36.0*s],
-            "No subfolders in this directory",17.0*s,DIM);}
+        if data.entries.is_empty() && data.error.is_none() {
+            line(out,&font,[p.list[0]+15.0*s,p.list[1]+15.0*s,p.list[2]-30.0*s,36.0*s],
+                "This folder is empty",17.0*s,DIM);
+        }
+        if data.entries.len()>count {
+            let b=[p.list[0]+p.list[2]-5.0*s,p.list[1],3.0*s,p.list[3]];
+            fill(out,b,[0.16,0.26,0.35,0.8],w,h);
+            let thumb=(b[3]*count as f32/data.entries.len() as f32).max(18.0*s).min(b[3]);
+            let max_scroll=data.entries.len().saturating_sub(count).max(1);
+            let y=b[1]+data.scroll as f32/max_scroll as f32*(b[3]-thumb);
+            fill(out,[b[0],y,b[2],thumb],CYAN,w,h);
+        }
     }
 }
 

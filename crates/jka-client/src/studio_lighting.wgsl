@@ -36,3 +36,19 @@ fn studio_light_color(base: vec4<f32>, albedo: vec4<f32>, normal: vec3<f32>, pos
     }
     return vec4<f32>(base.rgb + albedo.rgb * radiance, base.a);
 }
+
+// Blue Water sky world light (r_blueSkyWorldLighting) on models: the gain the
+// post pass used to derive from per-triangle depth normals, here from the
+// smooth interpolated normal. Ambient cube + direct come from the sky
+// environment on the GPU (blue_water_scene.rs model_sky_light).
+fn sky_world_model_gain(normal: vec3<f32>) -> vec3<f32> {
+    let direct = entity_lighting.sky_world[6];
+    if (direct.w <= 0.0) { return vec3<f32>(1.0); }
+    let n = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
+    let w = n * n;
+    let ambient = select(entity_lighting.sky_world[1].rgb, entity_lighting.sky_world[0].rgb, n.x >= 0.0) * w.x
+        + select(entity_lighting.sky_world[3].rgb, entity_lighting.sky_world[2].rgb, n.y >= 0.0) * w.y
+        + select(entity_lighting.sky_world[5].rgb, entity_lighting.sky_world[4].rgb, n.z >= 0.0) * w.z;
+    let incidence = max(dot(n, entity_lighting.sky_world[7].xyz), 0.0);
+    return mix(vec3<f32>(1.0), clamp(ambient + direct.rgb * incidence, vec3<f32>(0.03), vec3<f32>(4.0)), direct.w);
+}

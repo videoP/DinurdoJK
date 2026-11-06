@@ -701,7 +701,11 @@ impl AtmosphereRenderer {
         moon_light: Option<([f32; 3], f32)>,
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
         world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
-    ) {
+        // The model lighting uniform and its `sky_world` offset, when this
+        // frame's prepass tagged model pixels. Returns whether models are lit.
+        model_sky: Option<(&wgpu::Buffer, u64)>,
+    ) -> bool {
+        let mut models_lit = false;
         self.scene.copy.capture(device, encoder, color, depth);
         if let Some(camera) = &self.frame_camera {
             let flash = if self.settings.weather_backend == 1 {
@@ -710,6 +714,11 @@ impl AtmosphereRenderer {
                 0.0
             };
             if self.settings.world_lighting > 0.0 || (self.clouds_active && shadows) || flash > 0.0 {
+                if let Some(target) = model_sky.filter(|_| self.settings.world_lighting > 0.0) {
+                    self.scene.model_sky_light(device, queue, encoder, &self.sky,
+                        self.settings.world_lighting, moon_light, target);
+                    models_lit = true;
+                }
                 self.scene.light(
                     device,
                     queue,
@@ -725,6 +734,7 @@ impl AtmosphereRenderer {
                     moon_light,
                     moon_csm,
                     world_mask,
+                    models_lit,
                 );
             }
         }
@@ -761,6 +771,7 @@ impl AtmosphereRenderer {
                     .blit(device, encoder, &self.scene.overlay, color, resolve, true);
             }
         }
+        models_lit
     }
     /// Lightning's current flash (a multiple of the sky's light), 0 without native weather.
     pub fn flash(&self) -> f32 {

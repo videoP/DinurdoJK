@@ -18,7 +18,34 @@ pub(super) struct Scene {
     merge_layout: wgpu::BindGroupLayout,
     merge_uniform: wgpu::Buffer,
     merge: wgpu::RenderPipeline,
+    model_sky_layout: wgpu::BindGroupLayout,
+    model_sky_uniform: wgpu::Buffer,
+    model_sky_buffer: wgpu::Buffer,
+    model_sky: wgpu::ComputePipeline,
 }
+
+/// The sky world light for models (md3/ghoul2 `sky_world_model_gain`): a six-axis
+/// ambient cube of the same irradiance the post pass reads per pixel, plus the
+/// direct key, in `DynamicEntityLightingUniform::sky_world` layout. The moon
+/// override matches `light` so models keep the look the post pass gave them.
+const MODEL_SKY_LIGHT: &str = "#import naval_sky::environment::{SkyEnvironment, env_irradiance}
+struct Params { strength:vec4<f32>, moon:vec4<f32> }
+@group(0) @binding(0) var<storage, read_write> model_sky:array<vec4<f32>,8>;
+@group(0) @binding(1) var<uniform> params:Params;
+@group(1) @binding(0) var env_map:texture_2d<f32>;
+@group(1) @binding(1) var env_sampler:sampler;
+@group(1) @binding(2) var<uniform> env:SkyEnvironment;
+@compute @workgroup_size(6) fn model_sky_light(@builtin(local_invocation_index) i:u32) {
+ var axes=array<vec3<f32>,6>(vec3(1.,0.,0.),vec3(-1.,0.,0.),vec3(0.,1.,0.),vec3(0.,-1.,0.),vec3(0.,0.,1.),vec3(0.,0.,-1.));
+ model_sky[i]=vec4<f32>(env_irradiance(env_map,env_sampler,env,axes[i])/3.14159265*0.5,0.);
+ if i==0u {
+  let moon=params.strength.y>0.5;
+  let color=select(env.light_color*env.light_intensity,vec3<f32>(0.70,0.82,1.)*params.moon.w,moon);
+  model_sky[6]=vec4<f32>(color*0.2,params.strength.x);
+  model_sky[7]=vec4<f32>(select(env.light_direction,params.moon.xyz,moon),0.);
+ }
+}
+";
 
 /// Writes sky-portal geometry into the reversed-Z depth copy the cloud march
 /// reads. The portal view is the host view shifted by a translation, so a portal
@@ -329,6 +356,62 @@ impl Scene {
             multiview_mask: None,
             cache: None,
         });
+        let model_sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("native model sky light"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let model_sky_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("native model sky light params"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let model_sky_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("native model sky light"),
+            size: 128,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let model_sky_module = blue_water_clouds::shaders::compose(MODEL_SKY_LIGHT, "JKA model sky light", &[])
+            .expect("model sky light shader");
+        let model_sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("native model sky light"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(model_sky_module)),
+        });
+        let model_sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("native model sky light"),
+            bind_group_layouts: &[Some(&model_sky_layout), Some(&sky.environment().bind_group_layout)],
+            immediate_size: 0,
+        });
+        let model_sky = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("native model sky light"),
+            layout: Some(&model_sky_pipeline_layout),
+            module: &model_sky_module,
+            entry_point: Some("model_sky_light"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         static DEPTH_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let depth_key = DEPTH_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
@@ -346,6 +429,10 @@ impl Scene {
             merge_layout,
             merge_uniform,
             merge,
+            model_sky_layout,
+            model_sky_uniform,
+            model_sky_buffer,
+            model_sky,
         }
     }
     /// Merges the sky-portal view's depth (`portal`, host-resolution reversed-Z)
@@ -451,6 +538,8 @@ impl Scene {
         // Depth-prepass policy mask, and whether lightmapped world pixels in it
         // already carry this sky light from the composed lightmap.
         world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
+        // Model pixels (policy R 0.125) lit by their own shader: skip them too.
+        models_lit: bool,
     ) {
         let mut values = [0f32; 36];
         values[..16].copy_from_slice(&camera.inverse_view_projection);
@@ -467,6 +556,7 @@ impl Scene {
         }
         values[33] = u8::from(world_mask.2) as f32;
         values[34] = crate::ocean::OCEAN_UNITS_PER_METER;
+        values[35] = u8::from(models_lit) as f32;
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&values));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("native lighting inputs"),
@@ -525,5 +615,47 @@ impl Scene {
         pass.set_bind_group(2, &sky.environment().bind_group, &[]);
         pass.set_bind_group(3, csm_group.as_ref().unwrap_or(&self.csm_fallback), &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    /// Refreshes the models' sky world light (`DynamicEntityLightingUniform::sky_world`
+    /// at `target.1` in `target.0`). Models draw before this pass, so they read
+    /// the previous frame's values; the sky changes far slower than that.
+    pub fn model_sky_light(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        sky: &Sky,
+        strength: f32,
+        moon_light: Option<([f32; 3], f32)>,
+        target: (&wgpu::Buffer, u64),
+    ) {
+        let mut params = [0f32; 8];
+        params[0] = strength.clamp(0.0, 1.0);
+        if let Some((direction, intensity)) = moon_light {
+            params[1] = 1.0;
+            params[4..7].copy_from_slice(&direction);
+            params[7] = intensity;
+        }
+        queue.write_buffer(&self.model_sky_uniform, 0, bytemuck::cast_slice(&params));
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native model sky light"),
+            layout: &self.model_sky_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.model_sky_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.model_sky_uniform.as_entire_binding() },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("native model sky light"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.model_sky);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(1, &sky.environment().bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.model_sky_buffer, 0, target.0, target.1, 128);
     }
 }

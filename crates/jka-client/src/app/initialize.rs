@@ -21,9 +21,17 @@ impl App {
         // main.rs configures roots before the index prewarm. Direct App::new
         // callers (unit tests/tooling) retain a portable default.
         let fs_roots = jka_assets::pk3::configured_filesystem_roots(&base);
-        let asset_mapping = (!super::asset_mapping::jka_assets_present(&base, &fs_roots))
-            .then(|| super::asset_mapping::AssetMappingState::new(&fs_roots, &base));
-        let missing_retail_assets = asset_mapping.is_some();
+        let assets_present = super::asset_mapping::jka_assets_present(&base, &fs_roots);
+        // Saved roots that failed validation were replaced by defaults at
+        // startup; show the screen with the reason even if assets were found.
+        let asset_mapping = match super::asset_mapping::startup_notice() {
+            Some((message, configured)) => Some(super::asset_mapping::AssetMappingState::from_startup_notice(
+                configured, &base, message, assets_present,
+            )),
+            None => (!assets_present)
+                .then(|| super::asset_mapping::AssetMappingState::new(&fs_roots, &base)),
+        };
+        let missing_retail_assets = !assets_present;
         let map_loader_latest_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let loader_tx = spawn_map_loader(
             base.clone(),

@@ -136,26 +136,26 @@ pub fn fs_game_name(game: Option<&Path>) -> String {
         .unwrap_or_else(|| "base".to_owned())
 }
 
-/// The executable root supplied at bootstrap, or its layout-derived fallback
-/// for tests/standalone asset tooling.
+/// The executable root supplied at bootstrap. Tests and standalone asset
+/// tooling that never set it assume the default layout, where the JKA root
+/// (the parent of base/) is the executable directory.
 fn client_install_directory(base: &Path, roots: &FilesystemRoots) -> PathBuf {
-    if let Some(install) = &roots.client_install { return install.clone(); }
-    let game_root = base.parent().unwrap_or(base);
-    if game_root.file_name().is_some_and(|name| name == "JKA GameData") {
-        game_root.parent().unwrap_or(game_root).to_path_buf()
-    } else {
-        game_root.to_path_buf()
-    }
+    roots.client_install.clone().unwrap_or_else(|| base.parent().unwrap_or(base).to_path_buf())
 }
+
+/// Folder name of the default JK2 root, a direct child of the executable
+/// directory. Reserved: a server cannot select it as a JKA `fs_game`.
+pub const JK2_DIRECTORY: &str = "JK2 GameData";
 
 /// Installed JK2 root (containing base/ and regular mod directories).
 pub fn jk2_root_directory(base: &Path, roots: &FilesystemRoots) -> PathBuf {
-    roots.jk2basepath.clone().unwrap_or_else(|| client_install_directory(base, roots).join("JK2 GameData"))
+    roots.jk2basepath.clone().unwrap_or_else(|| client_install_directory(base, roots).join(JK2_DIRECTORY))
 }
 
-/// Optional writable overlays stay separate by game even if fs_homepath is set.
+/// Optional writable overlays stay separate by game even if fs_homepath is set:
+/// JKA writes to fs_homepath itself, JK2 to its own folder beneath it.
 pub fn game_home_root(roots: &FilesystemRoots, jk2: bool) -> Option<PathBuf> {
-    roots.homepath.as_ref().map(|home| home.join(if jk2 { "JK2 GameData" } else { "JKA GameData" }))
+    roots.homepath.as_ref().map(|home| if jk2 { home.join(JK2_DIRECTORY) } else { home.clone() })
 }
 
 fn resolve_fs_game_in(game_data: &Path, value: &[u8]) -> Result<Option<PathBuf>, String> {
@@ -172,6 +172,12 @@ fn resolve_fs_game_in(game_data: &Path, value: &[u8]) -> Result<Option<PathBuf>,
         || name.contains(['/', '\\', ':'])
     {
         return Err(format!("invalid fs_game directory: {name:?}"));
+    }
+    // With the executable directory as the JKA root, these client-owned
+    // folders are siblings of the mods. A server must never reach them
+    // (downloads write into the active fs_game directory).
+    if name.eq_ignore_ascii_case(DINURDOJK_DIRECTORY) || name.eq_ignore_ascii_case(JK2_DIRECTORY) {
+        return Err(format!("reserved fs_game directory: {name:?}"));
     }
     let candidate = game_data.join(name);
 
@@ -211,7 +217,7 @@ pub struct FilesystemRoots {
     pub homepath: Option<PathBuf>,
     /// Extra, lowest-priority read-only root (usually a shared retail install).
     pub cdpath: Option<PathBuf>,
-    /// JK2 installation root containing base/; defaults to JK2 GameData/.
+    /// JK2 installation root containing base/; defaults to <exe>/JK2 GameData/.
     pub jk2basepath: Option<PathBuf>,
     /// Separate read-only JK2 retail GameData root; never mounted by JKA.
     pub jk2cdpath: Option<PathBuf>,
@@ -409,8 +415,9 @@ pub fn filesystem_write_directory(base: &Path, game: Option<&Path>, roots: &File
     root.join(game.and_then(Path::file_name).unwrap_or_else(|| std::ffi::OsStr::new("base")))
 }
 
-/// Client-owned data next to JK2 GameData/ and JKA GameData/, not inside
-/// either game's mod namespace. Independent of fs_game and fs_homepath.
+/// Client-owned data beside the executable, never inside either game's mod
+/// namespace (both names are reserved from fs_game). Independent of fs_game and
+/// fs_homepath.
 pub fn dinurdojk_directory(base: &Path) -> PathBuf {
     dinurdojk_directory_for(base, &configured_filesystem_roots(base))
 }
@@ -1967,16 +1974,16 @@ mod filesystem_roots_tests {
 
     #[test]
     fn four_layers_and_both_game_roots_are_isolated() {
-        let base = Path::new("/client/JKA GameData/base");
-        let game = Path::new("/client/JKA GameData/jk2");
+        let base = Path::new("/client/base");
+        let game = Path::new("/client/jk2");
         let roots = FilesystemRoots {
             cdpath: Some("/retail-jka".into()), jk2cdpath: Some("/retail-jk2".into()),
             ..Default::default()
         };
         assert_eq!(filesystem_search_dirs(base, Some(game), &roots), vec![
             PathBuf::from("/client/DinurdoJK/shared"),
-            PathBuf::from("/client/JKA GameData/jk2"),
-            PathBuf::from("/client/JKA GameData/base"),
+            PathBuf::from("/client/jk2"),
+            PathBuf::from("/client/base"),
             PathBuf::from("/retail-jka/base"),
         ]);
         let jk2 = FilesystemRoots { active_jk2: Some(4), ..roots };
@@ -1993,7 +2000,7 @@ mod filesystem_roots_tests {
 
     #[test]
     fn custom_jk2_root_is_a_root_not_a_base_folder() {
-        let base = Path::new("/client/JKA GameData/base");
+        let base = Path::new("/client/base");
         let roots = FilesystemRoots {
             jk2basepath: Some("/external/outcast".into()), active_jk2: Some(2),
             homepath: Some("/home".into()), jk2cdpath: Some("/cd".into()),
@@ -2015,18 +2022,18 @@ mod filesystem_roots_tests {
 
     #[test]
     fn forcegame_is_a_client_override_above_shared_without_redirecting_writes() {
-        let base = Path::new("/client/JKA GameData/base");
+        let base = Path::new("/client/base");
         let roots = FilesystemRoots {
             forcegame: Some("Eternal".into()),
             cdpath: Some("/jka-cd".into()), jk2cdpath: Some("/jk2-cd".into()),
             ..Default::default()
         };
-        let jka_mod = Path::new("/client/JKA GameData/japro");
+        let jka_mod = Path::new("/client/japro");
         assert_eq!(filesystem_search_dirs(base, Some(jka_mod), &roots), vec![
             PathBuf::from("/client/DinurdoJK/Eternal"),
             PathBuf::from("/client/DinurdoJK/shared"),
-            PathBuf::from("/client/JKA GameData/japro"),
-            PathBuf::from("/client/JKA GameData/base"),
+            PathBuf::from("/client/japro"),
+            PathBuf::from("/client/base"),
             PathBuf::from("/jka-cd/base"),
         ]);
         assert_eq!(filesystem_write_directory(base, Some(jka_mod), &roots), jka_mod);
@@ -2043,19 +2050,25 @@ mod filesystem_roots_tests {
     }
 
     #[test]
-    fn literal_mod_names_are_not_reserved_or_escaped() {
+    fn literal_mod_names_resolve_but_client_folders_are_reserved() {
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let install = std::env::temp_dir().join(format!("dinurdo-game-roots-{}-{unique}", std::process::id()));
-        let base = install.join("JKA GameData/base");
+        let base = install.join("base");
         std::fs::create_dir_all(&base).unwrap();
-        for name in ["jk2", "jk2_base", "jka_foo", "DinurdoJK"] {
-            std::fs::create_dir_all(install.join("JKA GameData").join(name)).unwrap();
+        for name in ["jk2", "jk2_base", "jka_foo"] {
+            std::fs::create_dir_all(install.join(name)).unwrap();
             std::fs::create_dir_all(install.join("JK2 GameData").join(name)).unwrap();
             assert_eq!(resolve_fs_game_directory_for_roots(&base, name.as_bytes(), &FilesystemRoots::default()).unwrap(),
-                Some(install.join("JKA GameData").join(name)));
+                Some(install.join(name)));
             let jk2 = FilesystemRoots { active_jk2: Some(2), ..Default::default() };
             assert_eq!(resolve_fs_game_directory_for_roots(&base, name.as_bytes(), &jk2).unwrap(),
                 Some(install.join("JK2 GameData").join(name)));
+        }
+        // The exe directory is the JKA root, so a server must not reach these.
+        let jk2 = FilesystemRoots { active_jk2: Some(2), ..Default::default() };
+        for name in ["DinurdoJK", "dinurdojk", "JK2 GameData"] {
+            assert!(resolve_fs_game_directory_for_roots(&base, name.as_bytes(), &FilesystemRoots::default()).is_err());
+            assert!(resolve_fs_game_directory_for_roots(&base, name.as_bytes(), &jk2).is_err());
         }
         assert!(resolve_fs_game_directory_for_roots(&base, b"../escape", &FilesystemRoots::default()).is_err());
         std::fs::remove_dir_all(install).unwrap();
@@ -2065,7 +2078,7 @@ mod filesystem_roots_tests {
     fn stock_check_combines_only_jk2_local_and_cd_base() {
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let install = std::env::temp_dir().join(format!("dinurdo-stock-roots-{}-{unique}", std::process::id()));
-        let base = install.join("JKA GameData/base");
+        let base = install.join("base");
         let local = install.join("JK2 GameData/base");
         let retail = install.join("retail/base");
         for dir in [&base, &local, &retail] { std::fs::create_dir_all(dir).unwrap(); }

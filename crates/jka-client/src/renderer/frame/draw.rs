@@ -1487,6 +1487,7 @@ impl Renderer {
         self.ensure_rt_model_receivers();
         self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
         self.sync_entity_cloud_shadow_sun();
+        self.dynamic_model_renderer.retire_sky_world(&self.queue);
         let ray_traced_shadows = self.hardware_rt_active();
         // Mirrors the draw_phase calls below: the RT receivers (which add these
         // lights per pixel) are bound only in the ocean-split branch.
@@ -3423,8 +3424,12 @@ impl Renderer {
         let blue_water_moon_direction = self.blue_water_moon_toward();
         // Lightmapped world pixels skip the sky light only when this frame's
         // full prepass wrote the policy mask that marks them.
-        let sky_world_baked = self.sky_world_baked() && self.frame_plan.needs_linear_depth
+        let full_policy_mask = self.frame_plan.needs_linear_depth
             && !(self.frame_plan.rain_only_linear_depth && self.weather.rain.lean_depth);
+        let sky_world_baked = self.sky_world_baked() && full_policy_mask;
+        // Models take the sky world light in their own shader from smooth
+        // normals whenever the prepass tagged them (r_skyWorldBake 1/2).
+        let model_sky_world = self.sky_world_bake != 0 && full_policy_mask;
         let blue_water_moon_csm_active = shadow_matrices.is_some()
             && self.blue_water_moon_shadow_direction().is_some();
         // At night explicitly override the direct solar light even when there
@@ -5473,7 +5478,9 @@ impl Renderer {
                 } else { None };
                 if let Some(atmosphere)=self.blue_water_sky.as_mut().filter(|_|self.sky_backend==1 || self.blue_water_environment.world_lighting > 0.0 || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked));
+                    let model_sky_lit = atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked),
+                        model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET)));
+                    self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                 }
                 // Light submerged receivers before atmospheric scattering is added.
@@ -6129,7 +6136,9 @@ impl Renderer {
                 } else { None };
                 if let Some(atmosphere)=self.blue_water_sky.as_mut() {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked));
+                    let model_sky_lit = atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked),
+                        model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET)));
+                    self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
                     atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,&self.weather.rain.sky_admission());
                 }

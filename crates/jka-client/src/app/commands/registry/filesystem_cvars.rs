@@ -10,8 +10,8 @@ type CvarDef = crate::console::cvars::CvarDef<App>;
 app_cvars! {
     APP_FS_BASEPATH {
         runtime: CvarDef::new(
-            "fs_basepath", "", "JKA GameData root",
-            "JKA installation root containing base/ and mod folders. Defaults to JKA GameData/. Restart required; --base can override at launch.",
+            "fs_basepath", "", "JKA game root",
+            "JKA root containing base/ and mod folders. Blank = the executable directory. fs_cdpath/base is an optional stock-asset fallback. Restart required; --base can override at launch.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.basepath.as_ref().map_or_else(|| app.base.parent().unwrap_or(&app.base).display().to_string(), |p| p.display().to_string())),
             |app, value| App::set_fs_basepath(app, &value.to_string())
@@ -33,7 +33,7 @@ app_cvars! {
     APP_FS_JK2BASEPATH {
         runtime: CvarDef::new(
             "fs_jk2basepath", "", "JK2 GameData root",
-            "JK2 installation root containing base/ and unprefixed mod folders; defaults to JK2 GameData/. Never mounted in JKA. Restart required.",
+            "JK2 installation root containing base/ and unprefixed mod folders; defaults to <executable directory>/JK2 GameData/. Never mounted in JKA. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(jka_assets::pk3::jk2_root_directory(&app.base, &app.fs_roots).display().to_string()),
             |app, value| App::set_fs_jk2basepath(app, &value.to_string())
@@ -55,7 +55,7 @@ app_cvars! {
     APP_FS_HOMEPATH {
         runtime: CvarDef::new(
             "fs_homepath", "", "writable/readable GameData root",
-            "Optional writable overlay parent. Separate JKA GameData/ and JK2 GameData/ directories are appended. Restart required.",
+            "Optional writable overlay root. JKA uses it directly (homepath/base); JK2 uses homepath/JK2 GameData/. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_homepath(app, &value.to_string())

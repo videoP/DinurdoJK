@@ -30,6 +30,18 @@ pub(crate) fn jka_assets_present(
     (0..=3).all(|n| dirs.iter().any(|dir| dir.join(format!("assets{n}.pk3")).is_file()))
 }
 
+/// Set by startup when the saved roots failed validation and defaults were
+/// substituted; `App::new` turns it into an Asset Mapping screen.
+static STARTUP_NOTICE: std::sync::OnceLock<(String, jka_assets::pk3::FilesystemRoots)> = std::sync::OnceLock::new();
+
+pub(crate) fn set_startup_notice(message: String, configured: jka_assets::pk3::FilesystemRoots) {
+    let _ = STARTUP_NOTICE.set((message, configured));
+}
+
+pub(crate) fn startup_notice() -> Option<&'static (String, jka_assets::pk3::FilesystemRoots)> {
+    STARTUP_NOTICE.get()
+}
+
 /// Preview the JKA base that would be active on a fresh launch without
 /// CLI --base overrides, which Save & Restart deliberately drops.
 fn restart_jka_base(roots: &jka_assets::pk3::FilesystemRoots, current: &Path) -> PathBuf {
@@ -42,54 +54,97 @@ fn restart_jka_base(roots: &jka_assets::pk3::FilesystemRoots, current: &Path) ->
 use crate::ui::asset_mapping::{AssetMappingUi, FolderUi, Hit};
 use winit::{event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent}, keyboard::{KeyCode, PhysicalKey}};
 
+struct FolderEntry {
+    path: PathBuf,
+    is_dir: bool,
+}
 struct FolderPicker {
     target: usize,
     current: PathBuf,
     address: String,
-    folders: Vec<PathBuf>,
+    entries: Vec<FolderEntry>,
     error: Option<String>,
     scroll: usize,
 }
 impl FolderPicker {
-    fn new(target:usize, preferred:&str, base:&Path)->Self {
-        let path=crate::filesystem_paths::parse_root(base,preferred)
-            .ok().flatten().unwrap_or_else(||base.parent().unwrap_or(base).to_path_buf());
-        let mut picker=Self {target,address:path.display().to_string(),current:path,folders:Vec::new(),error:None,scroll:0};
+    fn new(target: usize, preferred: &str, base: &Path) -> Self {
+        let wanted = crate::filesystem_paths::parse_root(base, preferred)
+            .ok().flatten().unwrap_or_else(|| base.parent().unwrap_or(base).to_path_buf());
+        // An invalid saved path shouldn't trap the user in an empty picker.
+        let start = if wanted.is_dir() { wanted } else {
+            wanted.ancestors().find(|p| p.is_dir()).map(Path::to_path_buf)
+                .unwrap_or_else(|| base.parent().unwrap_or(base).to_path_buf())
+        };
+        let mut picker = Self {
+            target, address: start.display().to_string(), current: start,
+            entries: Vec::new(), error: None, scroll: 0,
+        };
         picker.refresh();
         picker
     }
     fn refresh(&mut self) {
-        self.address=self.current.display().to_string();
-        self.folders.clear();
-        self.scroll=0;
-        self.error=None;
-        let entries=match std::fs::read_dir(&self.current) {
-            Ok(e)=>e,
-            Err(err)=>{self.error=Some(format!("{}: {err}",self.current.display()));return;}
+        self.address = self.current.display().to_string();
+        self.scroll = 0;
+        self.error = None;
+        let entries = match std::fs::read_dir(&self.current) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.entries.clear();
+                self.error = Some(format!("Cannot open {}: {err}", self.current.display()));
+                return;
+            }
         };
-        self.folders=entries.flatten().filter(|e|e.file_type().is_ok_and(|ty|ty.is_dir()))
-            .map(|e|e.path()).collect();
-        self.folders.sort_by_key(|p|p.file_name().unwrap_or_else(||std::ffi::OsStr::new("")).to_string_lossy().to_lowercase());
+        self.entries = entries.flatten().filter_map(|entry| {
+            let kind = entry.file_type().ok()?;
+            if !kind.is_dir() && !kind.is_file() { return None; }
+            Some(FolderEntry { path: entry.path(), is_dir: kind.is_dir() })
+        }).collect();
+        self.entries.sort_by(|a,b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let name = |entry: &FolderEntry| entry.path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new(""))
+                    .to_string_lossy().to_lowercase();
+                name(a).cmp(&name(b))
+            })
+        });
     }
-    fn navigate(&mut self,to:PathBuf) { self.current=to;self.refresh(); }
+    fn navigate(&mut self, to: PathBuf) {
+        let to = if to.is_absolute() { to } else { self.current.join(to) };
+        if !to.is_dir() {
+            self.error = Some(format!("Not a directory: {}", to.display()));
+            return;
+        }
+        self.current = to;
+        self.refresh();
+    }
 }
 
 pub(super) struct AssetMappingState {
     cdpath:String, jk2cdpath:String, basepath:String, jk2basepath:String, forcegame:String,
     picker:Option<FolderPicker>, feedback:Option<String>, allow_close:bool,
     /// 0..4 input fields, 5 is the folder picker address.
-    focus:Option<usize>, caret:usize, selection_all:bool, scroll:f32,
+    focus:Option<usize>, caret:usize, selection_anchor:Option<usize>, drag_text:bool, text_start:usize, scroll:f32,
 }
 impl AssetMappingState {
-    pub fn new(roots:&jka_assets::pk3::FilesystemRoots,base:&Path)->Self {
+    pub fn new(roots:&jka_assets::pk3::FilesystemRoots,_base:&Path)->Self {
         Self {
             cdpath:show_path(roots.cdpath.as_deref()),
             jk2cdpath:show_path(roots.jk2cdpath.as_deref()),
-            basepath:roots.basepath.as_deref().unwrap_or_else(||base.parent().unwrap_or(base)).display().to_string(),
-            jk2basepath:jka_assets::pk3::jk2_root_directory(base,roots).display().to_string(),
+            // Blank means "follow the executable"; never save today's default
+            // absolute path as an override or moving the client would break it.
+            basepath:show_path(roots.basepath.as_deref()),
+            jk2basepath:show_path(roots.jk2basepath.as_deref()),
             forcegame:roots.forcegame.clone().unwrap_or_default(),
-            picker:None,feedback:None,allow_close:false,focus:None,caret:0,selection_all:false,scroll:0.0,
+            picker:None,feedback:None,allow_close:false,focus:None,caret:0,selection_anchor:None,drag_text:false,text_start:0,scroll:0.0,
         }
+    }
+    /// Startup found the configured roots unusable and fell back to the
+    /// defaults. Show what was configured, and why it was rejected.
+    pub fn from_startup_notice(roots:&jka_assets::pk3::FilesystemRoots,base:&Path,message:&str,allow_close:bool)->Self {
+        let mut state=Self::new(roots,base);
+        state.allow_close=allow_close;
+        state.feedback=Some(format!("{message}. Default paths are in use; fix them here and Save & Restart."));
+        state
     }
     pub fn from_main_menu(roots:&jka_assets::pk3::FilesystemRoots,base:&Path)->Self {
         let mut state=Self::new(roots,base);
@@ -118,86 +173,133 @@ impl AssetMappingState {
             _=>None,
         }
     }
-    fn focus(&mut self,target:usize) {
-        self.focus=Some(target);
-        self.caret=self.edit(target).map_or(0,|s|s.len());
-        self.selection_all=false;
+    fn focus(&mut self, target: usize) {
+        self.focus = Some(target);
+        self.caret = self.edit(target).map_or(0, |s| s.len());
+        self.selection_anchor = None;
+        self.drag_text = false;
+        // Show the rightmost portion of long paths until the next caret update.
+        self.text_start = usize::MAX;
     }
-    fn replace_selection(&mut self,new:&str) {
-        let Some(i)=self.focus else {return;};
-        let at=self.caret;
-        let all=self.selection_all;
-        let mut new_caret=None;
-        if let Some(s)=self.edit(i) {
-            if all {s.clear();}
-            let at=if all {0}else{at.min(s.len())};
-            let mut at=at;
-            while !s.is_char_boundary(at) {at-=1;}
-            let room=4096usize.saturating_sub(s.len());
-            let replacement:String=new.chars().filter(|c|!c.is_control()).take(room).collect();
-            s.insert_str(at,&replacement);
-            new_caret=Some(at+replacement.len());
-        }
-        if let Some(caret)=new_caret {self.caret=caret;self.selection_all=false;self.feedback=None;}
+    fn selected_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor.filter(|a| *a != self.caret)
+            .map(|a| (a.min(self.caret), a.max(self.caret)))
     }
-    fn key_edit(&mut self,key:KeyCode,control:bool)->bool {
-        let Some(i)=self.focus else {return false;};
-        if control && key==KeyCode::KeyA {
-            self.selection_all=true;
-            self.caret=self.edit(i).map_or(0,|s|s.len());
+    fn set_caret(&mut self, index: usize, shift: bool) {
+        let Some(field) = self.focus else { return; };
+        let old = self.caret;
+        let end = self.edit(field).map_or(0, |s| s.len());
+        self.caret = index.min(end);
+        if shift {
+            if self.selection_anchor.is_none() { self.selection_anchor = Some(old); }
+        } else {
+            self.selection_anchor = None;
+        }
+    }
+    fn replace_selection(&mut self, new: &str) {
+        let Some(field) = self.focus else { return; };
+        let (start, end) = self.selected_range().unwrap_or((self.caret,self.caret));
+        if let Some(text) = self.edit(field) {
+            let start = start.min(text.len());
+            let end = end.min(text.len());
+            if !text.is_char_boundary(start) || !text.is_char_boundary(end) { return; }
+            let capacity = 4096usize.saturating_sub(text.len() - (end - start));
+            let replacement: String = new.chars().filter(|c| !c.is_control())
+                .scan(0usize, |used, ch| {
+                    let next = *used + ch.len_utf8();
+                    if next > capacity { None } else { *used = next; Some(ch) }
+                }).collect();
+            text.replace_range(start..end, &replacement);
+            self.caret = start + replacement.len();
+            self.selection_anchor = None;
+            self.feedback = None;
+        }
+    }
+    fn key_edit(&mut self, key: KeyCode, control: bool, shift: bool) -> bool {
+        let Some(field) = self.focus else { return false; };
+        if control && key == KeyCode::KeyA {
+            self.selection_anchor = Some(0);
+            self.caret = self.edit(field).map_or(0, |s| s.len());
             return true;
         }
-        if control && key==KeyCode::KeyC {
-            if self.selection_all {if let Some(s)=self.edit(i) {let _=crate::clipboard::set_text(s);}}
-            return true;
-        }
-        if control && key==KeyCode::KeyV {
-            if let Ok(value)=crate::clipboard::get_text() {self.replace_selection(&value);}
-            return true;
-        }
-        if control && key==KeyCode::KeyX {
-            if self.selection_all {
-                if let Some(s)=self.edit(i){let _=crate::clipboard::set_text(s);}
-                self.replace_selection("");
+        if control && (key == KeyCode::KeyC || key == KeyCode::KeyX) {
+            if let Some((start,end)) = self.selected_range() {
+                if let Some(text) = self.edit(field) {
+                    let _ = crate::clipboard::set_text(&text[start..end]);
+                }
+                if key == KeyCode::KeyX { self.replace_selection(""); }
             }
             return true;
         }
-        let old=self.caret;
-        let all=self.selection_all;
-        let mut caret=old;
-        let Some(s)=self.edit(i) else {return false;};
-        let at=old.min(s.len());
+        if control && key == KeyCode::KeyV {
+            if let Ok(value) = crate::clipboard::get_text() { self.replace_selection(&value); }
+            return true;
+        }
+        let old = self.caret;
+        let selected = self.selected_range();
+        let Some(text) = self.edit(field) else { return false; };
+        let at = old.min(text.len());
+        let mut caret = at;
+        let mut changed = false;
         match key {
-            KeyCode::Backspace=>{
-                if all {s.clear();caret=0;}
-                else if at>0 {let prev=s[..at].char_indices().last().map_or(0,|(i,_)|i);
-                    s.replace_range(prev..at,"");caret=prev;}
+            KeyCode::Backspace | KeyCode::Delete => {
+                let range = selected.or_else(|| {
+                    if key == KeyCode::Backspace {
+                        (at > 0).then(|| (text[..at].char_indices().last().map_or(0, |(i,_)| i),at))
+                    } else {
+                        (at < text.len()).then(|| (at,at+text[at..].chars().next().map_or(0,char::len_utf8)))
+                    }
+                });
+                if let Some((start,end)) = range { text.replace_range(start..end, ""); caret=start; changed=true; }
             }
-            KeyCode::Delete=>{
-                if all {s.clear();caret=0;}
-                else if at<s.len() {let next=at+s[at..].chars().next().map_or(0,char::len_utf8);
-                    s.replace_range(at..next,"");}
+            KeyCode::ArrowLeft => {
+                caret = if !shift { selected.map(|(a,_)| a).unwrap_or_else(||
+                    text[..at].char_indices().last().map_or(0, |(i,_)| i)) }
+                    else { text[..at].char_indices().last().map_or(0, |(i,_)| i) };
             }
-            KeyCode::ArrowLeft=>{caret=if all {0}else{s[..at].char_indices().last().map_or(0,|(i,_)|i)};}
-            KeyCode::ArrowRight=>{caret=if all {s.len()}else{at+s[at..].chars().next().map_or(0,char::len_utf8)};}
-            KeyCode::Home=>{caret=0;}
-            KeyCode::End=>{caret=s.len();}
-            _=>return false,
+            KeyCode::ArrowRight => {
+                caret = if !shift { selected.map(|(_,b)| b).unwrap_or_else(||
+                    at+text[at..].chars().next().map_or(0,char::len_utf8)) }
+                    else { at+text[at..].chars().next().map_or(0,char::len_utf8) };
+            }
+            KeyCode::Home => caret = 0,
+            KeyCode::End => caret = text.len(),
+            _ => return false,
         }
-        self.caret=caret;
-        self.selection_all=false;
-        self.feedback=None;
+        self.caret = caret;
+        if !changed && shift {
+            if self.selection_anchor.is_none() { self.selection_anchor=Some(old); }
+        } else { self.selection_anchor=None; }
+        self.feedback = None;
         true
+    }
+    fn keep_caret_visible(&mut self, width: f32, scale: f32) {
+        let Some(field) = self.focus else { return; };
+        let capacity = crate::ui::asset_mapping::edit_capacity(width,scale);
+        let caret = self.caret;
+        let start = self.text_start;
+        let Some(text) = self.edit(field) else { return; };
+        let count = text[..caret.min(text.len())].chars().count();
+        let total = text.chars().count();
+        let last_start = total.saturating_sub(capacity);
+        self.text_start = if count < start { count }
+            else if count >= start.saturating_add(capacity) { count.saturating_sub(capacity-1) }
+            else { start }.min(last_start);
     }
     fn ui(&self,base:&Path,roots:&jka_assets::pk3::FilesystemRoots,pointer:[f32;2])->AssetMappingUi {
         let mut result=AssetMappingUi {
             values:self.values(),feedback:self.feedback.clone(),allow_close:self.allow_close,
-            focus:self.focus,caret:self.caret,selection_all:self.selection_all,
+            focus:self.focus,caret:self.caret,selection_anchor:self.selection_anchor,text_start:self.text_start,
             scroll:self.scroll,pointer, ..Default::default()
         };
         for (i,v) in result.values.iter().take(4).enumerate() {
             result.valid[i]=match crate::filesystem_paths::parse_root(base,v) {
                 Ok(Some(root))=>Some(root.join("base").is_dir()),
+                // An unset root uses the ordinary startup default. Report its
+                // real availability without turning it into an INI override.
+                Ok(None) if i==0 => Some(crate::filesystem_paths::default_base_directory()
+                    .is_ok_and(|default|default.is_dir())),
+                Ok(None) if i==2 => Some(jka_assets::pk3::jk2_base_directory(base,roots).is_dir()),
                 Ok(None)=>None,
                 Err(_)=>Some(false),
             };
@@ -223,8 +325,12 @@ impl AssetMappingState {
         }
         if let Some(p)=&self.picker {
             result.picker=Some(FolderUi {
+                target:p.target,
                 address:p.address.clone(),
-                folders:p.folders.iter().map(|d|d.file_name().unwrap_or_else(||std::ffi::OsStr::new("(root)")).to_string_lossy().into_owned()).collect(),
+                entries:p.entries.iter().map(|entry| crate::ui::asset_mapping::PickerEntryUi {
+                    name:entry.path.file_name().unwrap_or_else(||std::ffi::OsStr::new("(root)"))
+                        .to_string_lossy().into_owned(), is_dir:entry.is_dir,
+                }).collect(),
                 scroll:p.scroll,error:p.error.clone(),
             });
         }
@@ -281,7 +387,7 @@ impl App {
             let state=self.asset_mapping.as_ref().expect("mapping");
             let mut ui=AssetMappingUi::default();
             ui.allow_close=state.allow_close;
-            ui.picker=state.picker.as_ref().map(|p|FolderUi {scroll:p.scroll,folders:vec![String::new();p.folders.len()],..Default::default()});
+            ui.picker=state.picker.as_ref().map(|p|FolderUi {scroll:p.scroll,entries:vec![Default::default();p.entries.len()],..Default::default()});
             ui.scroll=state.scroll;
             crate::ui::asset_mapping::layout(size.width,size.height,&ui)
         });
@@ -293,7 +399,21 @@ impl App {
                 let old=geometry.as_ref().and_then(|l|l.hit(point,&ui.hit_ui()));
                 let new=geometry.as_ref().and_then(|l|l.hit(next,&ui.hit_ui()));
                 self.cursor_position=(position.x,position.y);
-                if old!=new {self.publish_ui();}
+                if self.asset_mapping.as_ref().unwrap().drag_text {
+                    if let Some(layout)=geometry.as_ref() {
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                            else {state.focus.map(|i|layout.fields[i].edit)};
+                        if let (Some(bounds),Some(index))=(bounds,state.focus) {
+                            if let Some(text)=state.edit(index).map(|s|s.clone()) {
+                                let caret=crate::ui::asset_mapping::caret_from_x(&text,state.text_start,bounds,layout.scale,next[0]);
+                                state.set_caret(caret,true);
+                                state.keep_caret_visible(bounds[2],layout.scale);
+                            }
+                        }
+                    }
+                    self.publish_ui();
+                } else if old!=new {self.publish_ui();}
                 return true;
             }
             WindowEvent::CursorLeft{..}=>{
@@ -309,7 +429,7 @@ impl App {
                     if let (Some(modal),Some(picker))=(l.picker,state.picker.as_mut()) {
                         if crate::ui::flex::contains(modal.list,point) {
                             let step=(amount.abs()/modal.row_h).ceil().max(1.0) as usize;
-                            let max=picker.folders.len().saturating_sub(l.picker_visible_rows());
+                            let max=picker.entries.len().saturating_sub(l.picker_visible_rows());
                             picker.scroll=if amount<0.0 {picker.scroll.saturating_add(step).min(max)}
                                 else {picker.scroll.saturating_sub(step)};
                         }
@@ -319,25 +439,67 @@ impl App {
                 }
                 self.publish_ui();return true;
             }
+            WindowEvent::MouseInput{state:ElementState::Released,button:MouseButton::Left,..}=>{
+                self.asset_mapping.as_mut().unwrap().drag_text=false;
+                return true;
+            }
             WindowEvent::MouseInput{state:ElementState::Pressed,button:MouseButton::Left,..}=>{
                 let hit=geometry.as_ref().and_then(|l|l.hit(point,&self.asset_mapping.as_ref().expect("mapping").hit_ui()));
                 match hit {
-                    Some(Hit::Edit(i))=>{self.asset_mapping.as_mut().unwrap().focus(i);}
+                    Some(Hit::Edit(i))=>{
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        let bounds=geometry.as_ref().unwrap().fields[i].edit;
+                        let text=state.values()[i].clone();
+                        let cap=crate::ui::asset_mapping::edit_capacity(bounds[2],geometry.as_ref().unwrap().scale);
+                        let start=if state.focus==Some(i) { state.text_start }
+                            else { text.chars().count().saturating_sub(cap) };
+                        let caret=crate::ui::asset_mapping::caret_from_x(&text,start,bounds,geometry.as_ref().unwrap().scale,point[0]);
+                        if state.focus!=Some(i) { state.focus(i);state.text_start=start; }
+                        state.set_caret(caret,self.modifiers.shift_key());
+                        state.drag_text=true;
+                    }
                     Some(Hit::Browse(i))=>{
                         let state=self.asset_mapping.as_mut().unwrap();
                         let value=state.values()[i].clone();
                         state.picker=Some(FolderPicker::new(i,&value,&self.base));
                         state.focus(5);
                     }
-                    Some(Hit::Address)=>self.asset_mapping.as_mut().unwrap().focus(5),
-                    Some(Hit::Go)=>{if let Some(p)=self.asset_mapping.as_mut().unwrap().picker.as_mut(){p.navigate(PathBuf::from(p.address.clone()));}}
-                    Some(Hit::Parent)=>{if let Some(p)=self.asset_mapping.as_mut().unwrap().picker.as_mut(){
-                        if let Some(parent)=p.current.parent(){p.navigate(parent.to_path_buf());}
-                    }}
-                    Some(Hit::Refresh)=>{if let Some(p)=self.asset_mapping.as_mut().unwrap().picker.as_mut(){p.refresh();}}
-                    Some(Hit::Folder(i))=>{if let Some(p)=self.asset_mapping.as_mut().unwrap().picker.as_mut(){
-                        if let Some(folder)=p.folders.get(i).cloned(){p.navigate(folder);}
-                    }}
+                    Some(Hit::Address)=>{
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        let bounds=geometry.as_ref().unwrap().picker.unwrap().address;
+                        let text=state.picker.as_ref().unwrap().address.clone();
+                        let cap=crate::ui::asset_mapping::edit_capacity(bounds[2],geometry.as_ref().unwrap().scale);
+                        let start=if state.focus==Some(5) { state.text_start }
+                            else { text.chars().count().saturating_sub(cap) };
+                        let caret=crate::ui::asset_mapping::caret_from_x(&text,start,bounds,geometry.as_ref().unwrap().scale,point[0]);
+                        if state.focus!=Some(5) { state.focus(5);state.text_start=start; }
+                        state.set_caret(caret,self.modifiers.shift_key());
+                        state.drag_text=true;
+                    }
+                    Some(Hit::Parent)=>{
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        if let Some(p)=state.picker.as_mut() {
+                            if let Some(parent)=p.current.parent() {p.navigate(parent.to_path_buf());}
+                        }
+                        state.focus(5);
+                    }
+                    Some(Hit::Refresh)=>{
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        if let Some(p)=state.picker.as_mut() {p.refresh();}
+                        state.focus(5);
+                    }
+                    Some(Hit::Entry(i))=>{
+                        let state=self.asset_mapping.as_mut().unwrap();
+                        let mut navigated=false;
+                        if let Some(p)=state.picker.as_mut() {
+                            if let Some(folder)=p.entries.get(i).and_then(|entry|
+                                entry.is_dir.then(||entry.path.clone())) {
+                                p.navigate(folder);
+                                navigated=true;
+                            }
+                        }
+                        if navigated {state.focus(5);}
+                    }
                     Some(Hit::Choose)=>{
                         let state=self.asset_mapping.as_mut().unwrap();
                         if let Some(p)=state.picker.take() {
@@ -347,16 +509,28 @@ impl App {
                             } else {state.feedback=Some(format!("Not a directory: {}",p.current.display()));state.picker=Some(p);}
                         }
                     }
-                    Some(Hit::Cancel)=>{let state=self.asset_mapping.as_mut().unwrap();state.picker=None;state.focus=None;}
+                    Some(Hit::Cancel)=>{let state=self.asset_mapping.as_mut().unwrap();state.picker=None;state.focus=None;state.drag_text=false;}
                     Some(Hit::Save)=>self.save_asset_mapping(false),
                     Some(Hit::Restart)=>self.save_asset_mapping(true),
                     Some(Hit::Back)=>self.close_asset_mapping(),
-                    None=>{if self.asset_mapping.as_ref().unwrap().picker.is_none(){self.asset_mapping.as_mut().unwrap().focus=None;}}
+                    None=>{if self.asset_mapping.as_ref().unwrap().picker.is_none(){let state=self.asset_mapping.as_mut().unwrap();state.focus=None;state.drag_text=false;}}
+                }
+                if let (Some(layout),Some(state))=(geometry.as_ref(),self.asset_mapping.as_mut()) {
+                    let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                        else {state.focus.map(|i|layout.fields[i].edit)};
+                    if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
                 }
                 self.publish_ui();return true;
             }
             WindowEvent::Ime(Ime::Commit(value))=>{
-                if let Some(state)=self.asset_mapping.as_mut(){state.replace_selection(value);}
+                if let Some(state)=self.asset_mapping.as_mut(){
+                    state.replace_selection(value);
+                    if let Some(layout)=geometry.as_ref() {
+                        let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                            else {state.focus.map(|i|layout.fields[i].edit)};
+                        if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
+                    }
+                }
                 self.publish_ui();return true;
             }
             WindowEvent::KeyboardInput{event:key,..}=>{
@@ -375,13 +549,21 @@ impl App {
                     state.focus(next);
                 } else if code==KeyCode::Enter && !key.repeat && self.asset_mapping.as_ref().unwrap().picker.is_some() {
                     let state=self.asset_mapping.as_mut().unwrap();
-                    if state.focus==Some(5) {if let Some(p)=state.picker.as_mut(){p.navigate(PathBuf::from(p.address.clone()));}}
+                    if state.focus==Some(5) {
+                        if let Some(p)=state.picker.as_mut(){p.navigate(PathBuf::from(p.address.clone()));}
+                        state.focus(5);
+                    }
                 } else {
                     let control=self.modifiers.control_key();
-                    let handled=self.asset_mapping.as_mut().unwrap().key_edit(code,control);
+                    let handled=self.asset_mapping.as_mut().unwrap().key_edit(code,control,self.modifiers.shift_key());
                     if !handled && !control && !self.modifiers.alt_key() {
                         if let Some(text)=key.text.as_ref() {self.asset_mapping.as_mut().unwrap().replace_selection(text);}
                     }
+                }
+                if let (Some(layout),Some(state))=(geometry.as_ref(),self.asset_mapping.as_mut()) {
+                    let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                        else {state.focus.map(|i|layout.fields[i].edit)};
+                    if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
                 }
                 self.publish_ui();return true;
             }
@@ -436,7 +618,7 @@ impl AssetMappingState {
     /// Minimal hit-test data; never touches disks on every hover event.
     fn hit_ui(&self)->AssetMappingUi {
         AssetMappingUi {allow_close:self.allow_close,scroll:self.scroll,
-            picker:self.picker.as_ref().map(|p|FolderUi {scroll:p.scroll,folders:vec![String::new();p.folders.len()],..Default::default()}),
+            picker:self.picker.as_ref().map(|p|FolderUi {scroll:p.scroll,entries:vec![Default::default();p.entries.len()],..Default::default()}),
             ..Default::default()}
     }
 }
@@ -444,10 +626,22 @@ impl AssetMappingState {
 mod tests {
     use super::*;
     #[test]
+    fn unset_mapping_paths_remain_unset_instead_of_pinning_absolute_defaults() {
+        let roots = jka_assets::pk3::FilesystemRoots::default();
+        let base = std::env::temp_dir().join("djk-portable-map").join("base");
+        let state = AssetMappingState::new(&roots, &base);
+        assert!(state.basepath.is_empty());
+        assert!(state.jk2basepath.is_empty());
+        let proposed = state.proposed(&base, &roots).unwrap();
+        assert!(proposed.basepath.is_none());
+        assert!(proposed.jk2basepath.is_none());
+    }
+
+    #[test]
     fn full_jka_set_may_be_split_across_jka_base_and_jka_cd_base() {
         let dir = std::env::temp_dir().join(format!("djk-map-roots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let jka = dir.join("JKA GameData");
+        let jka = dir.clone();
         let jk2 = dir.join("JK2 GameData");
         let cd = dir.join("JKA Retail");
         for target in [jka.join("base"), jk2.join("base"), cd.join("base")] {

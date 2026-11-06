@@ -99,6 +99,7 @@ mod strafehelper;
 mod strafe_trail;
 mod thread_activity;
 mod startup_console;
+mod startup_error;
 mod ui;
 mod weather;
 mod glass;
@@ -369,12 +370,23 @@ fn main() -> std::process::ExitCode {
         Err(e) => std::eprintln!("Pending update could not start: {e}"),
     }
 
+    // DinurdoJK/ (with its dependencies) must sit beside the executable. Check
+    // before logging creates anything there, and say so in a dialog: this
+    // process has no visible console yet, so a bare exit looks like a crash.
+    match filesystem_paths::installation_directory() {
+        Ok(install) => {
+            if let Some(problem) = startup_error::verify_client_folder(&install) {
+                return startup_error::fatal(problem);
+            }
+        }
+        Err(error) => return startup_error::fatal(format!("Cannot locate the executable folder: {error}")),
+    }
+
     // phonon.dll is delay-loaded on MSVC. Load our bundled copy by its
     // absolute path before any Steam Audio FFI; never rely on the process PATH.
     #[cfg(windows)]
     if let Err(error) = dependency_dll::preload("phonon.dll") {
-        std::eprintln!("Steam Audio dependency: {error}");
-        return std::process::ExitCode::FAILURE;
+        return startup_error::fatal(format!("Steam Audio dependency: {error}"));
     }
 
     crate::startup_console::prepare_own_console();
@@ -410,10 +422,7 @@ fn main() -> std::process::ExitCode {
 
     let mut options = match Options::parse() {
         Ok(options) => options,
-        Err(error) => {
-            eprintln!("{error}");
-            return std::process::ExitCode::FAILURE;
-        }
+        Err(error) => return startup_error::fatal(error),
     };
 
     // Install game roots before resolving the initial fs_game or prewarming assets.
@@ -423,31 +432,39 @@ fn main() -> std::process::ExitCode {
     if let Err(error) = filesystem_paths::apply_startup_commands(
         &options.base, &mut fs_roots, &options.startup_commands
     ) {
-        eprintln!("Invalid filesystem startup setting: {error}");
-        return std::process::ExitCode::FAILURE;
+        return startup_error::fatal(format!("Invalid filesystem startup setting: {error}"));
     }
     if !options.base_overridden {
         if let Some(root) = &fs_roots.basepath { options.base = root.join("base"); }
     }
-    fs_roots.client_install = Some(match filesystem_paths::installation_directory() {
+    let install = match filesystem_paths::installation_directory() {
         Ok(root) => root,
-        Err(error) => { eprintln!("Cannot locate executable root: {error}"); return std::process::ExitCode::FAILURE; }
-    });
-    // Prevent a configured JK2 root from overlapping JKA's mod namespace.
-    // Canonicalize existing roots so junction/symlink aliases cannot defeat it.
-    let jka_root = options.base.parent().unwrap_or(&options.base).to_path_buf();
-    let jk2_root = jka_assets::pk3::jk2_root_directory(&options.base, &fs_roots);
-    let normalized = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let jka_cmp = normalized(&jka_root);
-    let jk2_cmp = normalized(&jk2_root);
-    if jka_cmp.starts_with(&jk2_cmp) || jk2_cmp.starts_with(&jka_cmp) {
-        eprintln!("[FILESYSTEM] JK2 and JKA roots must be separate: {} / {}", jka_root.display(), jk2_root.display());
-        return std::process::ExitCode::FAILURE;
-    }
-    let client_root = normalized(&fs_roots.client_install.as_ref().expect("set above").join("DinurdoJK"));
-    if [jka_cmp, jk2_cmp].iter().any(|game| game.starts_with(&client_root) || client_root.starts_with(game)) {
-        eprintln!("[FILESYSTEM] A game root overlaps DinurdoJK's private directory; choose independent roots");
-        return std::process::ExitCode::FAILURE;
+        Err(error) => return startup_error::fatal(format!("Cannot locate the executable folder: {error}")),
+    };
+    fs_roots.client_install = Some(install.clone());
+    // Keep JKA, JK2 and DinurdoJK/ from overlapping. A bad saved/typed root is
+    // not fatal: fall back to the defaults (JKA = the executable directory) and
+    // let Asset Mapping show what was rejected so it can be fixed in place.
+    let validate = |options: &Options, roots: &jka_assets::pk3::FilesystemRoots| {
+        filesystem_paths::validate_root_layout(
+            &options.base, &jka_assets::pk3::jk2_root_directory(&options.base, roots), &install)
+    };
+    if let Err(error) = validate(&options, &fs_roots) {
+        eprintln!("[FILESYSTEM] {error}; using default roots");
+        let configured = fs_roots.clone();
+        fs_roots.basepath = None;
+        fs_roots.jk2basepath = None;
+        if !options.base_overridden {
+            options.base = match filesystem_paths::default_base_directory() {
+                Ok(base) => base,
+                Err(error) => return startup_error::fatal(error),
+            };
+        }
+        if let Err(still) = validate(&options, &fs_roots) {
+            // Only a --base override can get here: the defaults are valid.
+            return startup_error::fatal(format!("{still}\n\n(from the --base launch argument)"));
+        }
+        app::asset_mapping::set_startup_notice(error, configured);
     }
 
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::OptionsReady);
@@ -647,8 +664,7 @@ fn main() -> std::process::ExitCode {
     let event_loop = match event_loop_builder.build() {
         Ok(loop_) => loop_,
         Err(error) => {
-            eprintln!("Event loop creation failed: {error}");
-            return std::process::ExitCode::FAILURE;
+            return startup_error::fatal(format!("Event loop creation failed: {error}"));
         }
     };
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::EventLoopReady);
@@ -677,8 +693,7 @@ fn main() -> std::process::ExitCode {
             application
         }
         Err(error) => {
-            eprintln!("Application initialization failed: {error}");
-            return std::process::ExitCode::FAILURE;
+            return startup_error::fatal(format!("Application initialization failed: {error}"));
         }
     };
     crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppReady);

@@ -168,8 +168,11 @@ pub fn renderer_verbose_enabled(required: u8) -> bool {
 /// Falls back to the exe folder if the directory cannot be created.
 fn log_directory() -> Result<PathBuf, String> {
     let base = crate::filesystem_paths::default_base_directory()?;
-    let roots = crate::filesystem_paths::load(&base);
-    let directory = jka_assets::pk3::dinurdojk_directory_for(&base, &roots).join("logs");
+    let mut roots = crate::filesystem_paths::load(&base);
+    // Logging runs before main installs the VFS roots; name the executable
+    // location explicitly instead of deriving it from a game folder.
+    roots.client_install = Some(crate::filesystem_paths::installation_directory()?);
+    let directory =jka_assets::pk3::dinurdojk_directory_for(&base, &roots).join("logs");
     if std::fs::create_dir_all(&directory).is_ok() {
         return Ok(directory);
     }

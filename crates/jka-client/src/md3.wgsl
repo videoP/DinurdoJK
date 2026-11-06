@@ -49,6 +49,8 @@ struct EntityLightingSettings {
     studio_ambient: vec4<f32>,
     studio_sun: vec4<f32>,
     studio_sun_direction: vec4<f32>,
+    // Sky world light (sky_world_model_gain); w of [6] = 0 when off.
+    sky_world: array<vec4<f32>, 8>,
 };
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 
@@ -117,7 +119,7 @@ fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
     // placeholder only for irradiance-volume mode until dynamic models sample
     // the actual ambient-cube data.
     // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
-    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y), tex_in.a);
+    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y) * sky_world_model_gain(normal), tex_in.a);
     if (entity_lighting.values.x != 2u) {
         return tex;
     }
@@ -301,7 +303,9 @@ fn prepass_output(world_position: vec3<f32>, normal: vec3<f32>, heat_alpha: f32)
     out.linear_depth = distance(world_position, camera.camera_pos_time.xyz);
     out.motion_vector = vec2<f32>(0.0);
     let thermal = select(0.81, 0.83 + 0.17 * (1.0 - clamp(heat_alpha, 0.0, 1.0)), heat_alpha >= 0.0);
-    out.reflection_policy = vec4<f32>(0.0, cloud_shadow_facing_code(normal), thermal, 2.0 / 3.0);
+    // R 0.125 marks a model pixel (still < 0.5, never SSR): its colour shader
+    // applied the sky world light, so the Blue Water post pass skips it.
+    out.reflection_policy = vec4<f32>(0.125, cloud_shadow_facing_code(normal), thermal, 2.0 / 3.0);
     return out;
 }
 

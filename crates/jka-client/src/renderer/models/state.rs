@@ -324,6 +324,8 @@ impl DynamicModelRenderer {
             entity_weather: EntityWeather::default(),
             entity_water: Arc::new(std::collections::HashMap::new()),
             cloud_shadow_sun: [0.0; 4],
+            sky_world_live: false,
+            sky_world_refreshed: false,
             legacy_fog_compiled: false,
             model_wet_compiled: true,
             pipeline_layout,
@@ -985,8 +987,18 @@ impl DynamicModelRenderer {
         queue.write_buffer(
             &self.entity_lighting_buffer,
             0,
-            bytemuck::bytes_of(&uniform),
+            &bytemuck::bytes_of(&uniform)[..super::types::ENTITY_SKY_WORLD_OFFSET as usize],
         );
+    }
+
+    /// Once per frame, before models draw: turns the GPU-written model sky
+    /// light off when the previous frame's Blue Water pass stopped refreshing it.
+    pub(in crate::renderer) fn retire_sky_world(&mut self, queue: &wgpu::Queue) {
+        if self.sky_world_live && !self.sky_world_refreshed {
+            queue.write_buffer(&self.entity_lighting_buffer, super::types::ENTITY_SKY_WORLD_OFFSET,
+                bytemuck::bytes_of(&[[0f32; 4]; 8]));
+        }
+        self.sky_world_live = std::mem::take(&mut self.sky_world_refreshed);
     }
 
     pub(in crate::renderer) fn set_studio_lights(&mut self, lights:&[crate::renderer::TransientLight],queue:&wgpu::Queue) {
