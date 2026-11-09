@@ -1,0 +1,17 @@
+FFmpeg 9.0.2 — Gyan Windows x64 Essentials build
+
+Binary archive: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+Build provider and bundled libraries: https://www.gyan.dev/ffmpeg/builds/
+Upstream FFmpeg project: https://ffmpeg.org/
+Upstream source revision referenced by this build: https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+
+This software distribution contains FFmpeg and third-party codecs under
+open-source license terms. GPLv3 text is included as FFmpeg-GPL-3.0.txt.
+Source-code, build-configuration, modification, and redistribution obligations
+may apply to the particular FFmpeg binary and its bundled third-party codecs.
+An upstream source link alone may not fulfill all distribution obligations.
+Review the corresponding source and build provider's attribution requirements.
+
+These notices are included in the full manual ZIP under licenses/ and attached
+as loose GitHub Release assets. They are not included in DinurdoJK's signed
+per-file updater manifest to preserve compatibility with existing clients.
