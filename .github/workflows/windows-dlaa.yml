@@ -287,23 +287,17 @@ jobs:
           }
           Copy-Item -LiteralPath 'release-licenses/FFmpeg-SOURCE-NOTICE.txt' -Destination (Join-Path $noticeDir 'FFmpeg-SOURCE-NOTICE.txt') -ErrorAction Stop
 
-      - name: Build optimized Release with DLAA
+
+      # Restore the *archive*, not unpacked DLLs. Re-check its pinned SHA-256
+      # before use; saving here (rather than at job exit) protects against later
+      # compilation or publishing failures wasting an already verified download.
+      - name: Restore pinned Microsoft DXC archive cache
+        id: dxc_cache
         if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        run: |
-          .\build.ps1 -Fetch -Dlss
-          if ($LASTEXITCODE -ne 0) { throw 'DinurdoJK Release build failed.' }
-          if (-not (Test-Path 'target/release/DinurdoJK.exe' -PathType Leaf)) {
-            throw 'Missing release executable.'
-          }
-          # The packager understands either staging layout, but always publishes
-          # the updated DinurdoJK/dependencies layout in its signed manifest.
-          foreach ($dll in @('nvngx_dlss.dll', 'OpenALSoft.x86_64.dll')) {
-            if (-not (Test-Path "target/release/DinurdoJK/dependencies/$dll" -PathType Leaf) -and
-                -not (Test-Path "target/release/$dll" -PathType Leaf)) {
-              throw "Missing required runtime $dll (checked dependencies and legacy staging)."
-            }
-          }
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/dxc_2026_09_29.zip
+          key: dxc-windows-x64-v1.9.2609-ad31b1fc8443175d
 
       # Pin the exact official Microsoft Windows DXC archive and verify its
       # SHA-256 before any binaries are included in an authenticated release.
@@ -317,19 +311,39 @@ jobs:
           $expectedSha256 = 'ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1'
           $archive = Join-Path $env:RUNNER_TEMP 'dxc_2026_09_29.zip'
           $unpacked = Join-Path $env:RUNNER_TEMP 'dxc_2026_09_29'
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
-              break
-            } catch {
-              if ($attempt -eq 3) { throw }
-              Write-Warning "Download attempt $attempt failed; retrying..."
-              Start-Sleep -Seconds (2 * $attempt)
+          if (Test-Path -LiteralPath $archive -PathType Leaf) {
+            $cachedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+            if ($cachedSha256 -cne $expectedSha256) {
+              throw "Cached Microsoft DXC archive checksum mismatch: $cachedSha256. Refusing unverified cache."
             }
-          }
-          $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-          if ($actualSha256 -cne $expectedSha256) {
-            throw "Microsoft DXC download checksum mismatch: $actualSha256"
+            Write-Host 'Using checksum-verified cached DXC archive.'
+          } else {
+            $downloaded = $false
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $archive -ErrorAction Stop
+                $downloaded = $true
+                break
+              } catch {
+                Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+                Write-Warning "DXC direct download attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
+              }
+            }
+            if (-not $downloaded) {
+              # GitHub CLI uses the release-assets API rather than the browser
+              # download URL. Both paths still require the same pinned checksum.
+              Write-Warning 'DXC direct URL failed; trying GitHub CLI asset download.'
+              gh release download $version --repo microsoft/DirectXShaderCompiler --pattern 'dxc_2026_09_29.zip' --dir $env:RUNNER_TEMP --clobber
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+                throw 'Failed to download pinned Microsoft DXC archive from both endpoints.'
+              }
+            }
+            $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+            if ($actualSha256 -cne $expectedSha256) {
+              throw "Microsoft DXC download checksum mismatch: $actualSha256"
+            }
+            Write-Host 'Verified pinned DXC archive SHA-256.'
           }
           Expand-Archive -LiteralPath $archive -DestinationPath $unpacked -Force
           foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
@@ -360,10 +374,42 @@ jobs:
           }
           Write-Host 'Staged checksum-verified Microsoft DXC x64 DLLs and notices.'
 
+      # Save the verified archive immediately, not after the Rust build.
+      - name: Save verified Microsoft DXC archive cache
+        if: steps.version.outputs.publish == 'true' && steps.dxc_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dxc_2026_09_29.zip
+          key: ${{ steps.dxc_cache.outputs.cache-primary-key }}
+
+      # Fail fast on signer dependencies before the expensive compilation.
+      # The PRIVATE signing key is supplied only to the later signing step.
       - name: Install Ed25519 signer
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
-        run: python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
+        run: |
+          python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 cryptography installation failed.' }
+          python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
+
+      - name: Build optimized Release with DLAA
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          .\build.ps1 -Fetch -Dlss
+          if ($LASTEXITCODE -ne 0) { throw 'DinurdoJK Release build failed.' }
+          if (-not (Test-Path 'target/release/DinurdoJK.exe' -PathType Leaf)) {
+            throw 'Missing release executable.'
+          }
+          # The packager understands either staging layout, but always publishes
+          # the updated DinurdoJK/dependencies layout in its signed manifest.
+          foreach ($dll in @('nvngx_dlss.dll', 'OpenALSoft.x86_64.dll')) {
+            if (-not (Test-Path "target/release/DinurdoJK/dependencies/$dll" -PathType Leaf) -and
+                -not (Test-Path "target/release/$dll" -PathType Leaf)) {
+              throw "Missing required runtime $dll (checked dependencies and legacy staging)."
+            }
+          }
 
       - name: Package and sign updater release
         if: steps.version.outputs.publish == 'true'
