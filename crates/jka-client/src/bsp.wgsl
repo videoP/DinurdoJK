@@ -44,6 +44,8 @@ struct Material {
     ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
     ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
     ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
+    deform_move_vector: vec4<f32>,
+    deform_move_wave: vec4<f32>,
 };
 struct PlanarReflectionSettings {
     planes: array<vec4<f32>, 4>,
@@ -122,8 +124,15 @@ struct SurfaceFogSettings {
     color_depth: vec4<f32>,
     flags: vec4<f32>, // global, color override, Legacy2 in-stage safe, Legacy1 post eligible
 };
+struct LocalFogVolume {
+    mins: vec4<f32>,
+    maxs: vec4<f32>,
+    color_depth: vec4<f32>,
+};
 struct LegacyFogControl {
     values: vec4<f32>, // enabled, strength/scale, map has authored fog, r_drawfog mode
+    local_fog_count: vec4<u32>,
+    local_fogs: array<LocalFogVolume, 16>,
 };
 struct OceanRenderSettings {
     map_scales: array<vec4<f32>, 3>, // xy inverse tile length, z displacement, w normal scale
@@ -192,6 +201,7 @@ const MATERIAL_EXPLICIT_LIGHTMAP: u32 = 8388608u;
 const MATERIAL_DLIGHT_IN_LIGHTMAP_STAGE: u32 = 65536u; // header.w
 const MATERIAL_HAS_LIGHTMAP: u32 = 16777216u;
 const MATERIAL_OPAQUE_STAGE: u32 = 33554432u;
+const MATERIAL_EXTRA_STATIC_LIGHTSTYLE: u32 = 2147483648u;
 
 // Pipeline-specialized feature switches. These are WebGPU/WGSL override
 // constants, not runtime uniforms: the renderer supplies them when a pipeline
@@ -509,6 +519,7 @@ struct AdditiveVertexOut {
     @location(5) world_normal: vec3<f32>,
     @location(6) @interpolate(flat) shell_kind: u32,
     @location(7) shell_coverage: f32,
+    @location(8) lightmap_uv: vec2<f32>,
 };
 
 
@@ -1053,6 +1064,24 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
     return result;
 }
 
+// header.w bit 19: static world additive stages with no lightmap receiver.
+// The map uploader stores authored BSP vertex RGB as one exact 24-bit integer
+// in otherwise-unused lightmap_uv.x. Decode BEFORE interpolation: doing this
+// in the fragment shader would interpolate the packed integer incorrectly.
+// The sky compute updates vertex RGB only on bake changes. At fullbright/off,
+// updated RGB == authored RGB and the recovered gain is exactly neutral.
+fn baked_additive_vertex_gain(color: vec4<f32>, packed_rgb: f32) -> vec4<f32> {
+    let packed = u32(round(packed_rgb));
+    let authored = vec3<f32>(f32((packed >> 16u) & 255u),
+        f32((packed >> 8u) & 255u), f32(packed & 255u)) / 255.0;
+    // Baked sky gain can exceed 1.0 (up to 4x). Amplifying each additive
+    // layer overexposes multi-stage effects such as this waterfall to white.
+    // Additive overlays may lose sky light, but must never become brighter
+    // than their original authored stage color. Preserve authored RGB/alpha.
+    let gain = color.rgb / max(authored, vec3<f32>(1.0 / 255.0));
+    return vec4<f32>(clamp(gain, vec3<f32>(0.0), vec3<f32>(1.0)), color.a);
+}
+
 fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: u32) -> VertexOut {
     var output: VertexOut;
     // Only the planar-reflection pass sets render_flags.x, and it only exists while
@@ -1097,6 +1126,9 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     }
     output.lightmap_uv = input.lightmap_uv;
     output.color = input.color;
+    if ((material_flags_w() & 524288u) != 0u) {
+        output.color = baked_additive_vertex_gain(input.color, input.lightmap_uv.x);
+    }
     output.sky_dir_ao = vec4<f32>(world_position - camera.camera_pos_time.xyz, input.static_ao);
     output.world_position = world_position;
     output.world_normal = normalize(source_normal);
@@ -1147,27 +1179,73 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     return output;
 }
 
-// TaystJK rd-vanilla Autosprite2Deform, prepared per authored quad at map load.
-// position = midpoint of its short edge, normal = shared long axis,
-// lightmap_uv.x = signed half-width; y = -1337 is the encoding marker.
-// Unmodified geometry (including source .map) keeps its original positions.
-// This entry exists only for the autoSprite2 pipeline key; ordinary BSP vertex
-// shaders have no billboard branch, uniforms or per-vertex overhead.
+// Port of TaystJK rd-vulkan/tr_shade_calc.cpp AutospriteDeform / Autosprite2Deform.
+// Packed at BSP load, one quad at a time. These vertex entries are never
+// selected by ordinary world materials; do not add their logic to vs_main.
+// Recover the current camera's right/up from the UNJITTERED world-view matrix.
+// This keeps full autosprites correctly oriented with camera pitch, roll and
+// reflection views, without a new camera uniform field.
+fn autosprite_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    if (original.normal.z == -1337.0) {
+        let right = normalize(vec3<f32>(
+            camera.unjittered_view_proj[0].x,
+            camera.unjittered_view_proj[1].x,
+            camera.unjittered_view_proj[2].x));
+        let up = normalize(vec3<f32>(
+            camera.unjittered_view_proj[0].y,
+            camera.unjittered_view_proj[1].y,
+            camera.unjittered_view_proj[2].y));
+        input.position = original.position + right * original.normal.x + up * original.normal.y;
+        input.normal = -normalize(camera.camera_forward.xyz);
+    }
+    return input;
+}
+
+fn billboard_oct_decode(e: vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        n.x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
+        n.y = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
+    }
+    return normalize(n);
+}
+
 fn autosprite2_input(original: VertexIn) -> VertexIn {
     var input = original;
-    let half_width = original.lightmap_uv.x;
-    if (original.lightmap_uv.y == -1337.0) {
-        // BackEnd view axis[0] is the camera forward direction (not the
-        // position-to-eye vector). A single long-axis rotation, not full XYZ.
-        let minor = cross(original.normal, camera.camera_forward.xyz);
+    var major = original.normal;
+    var half_width = original.lightmap_uv.x;
+    var prepared = original.lightmap_uv.y == -1337.0;
+    // Lightmapped quads preserve their actual UVs: the long axis is oct-packed
+    // into normal.xy and signed half-width into normal.z + 8192.
+    if (!prepared && original.normal.z > 2048.0) {
+        major = billboard_oct_decode(original.normal.xy);
+        half_width = original.normal.z - 8192.0;
+        prepared = true;
+    }
+    if (prepared) {
+        let minor = cross(major, camera.camera_forward.xyz);
         let length_sq = dot(minor, minor);
         if (length_sq > 0.000001) {
             input.position = original.position + minor * (half_width * inverseSqrt(length_sq));
-            // Deformed surface normal for lighting passes that use it.
-            input.normal = normalize(cross(original.normal, minor));
+            input.normal = normalize(cross(major, minor));
+        } else {
+            input.normal = normalize(major);
         }
     }
     return input;
+}
+
+@vertex fn vs_autosprite(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return world_vertex(autosprite_input(input), instance_index, 0xffffffffu);
+}
+
+@vertex fn vs_autosprite_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return world_vertex(autosprite_input(input), instance_index, legacy_dlight_surface_id);
 }
 
 @vertex fn vs_autosprite2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
@@ -1180,6 +1258,25 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOut {
     return world_vertex(autosprite2_input(input), instance_index, legacy_dlight_surface_id);
+}
+
+// TaystJK RB_CalcMoveVertexes. This entry is selected only for authored
+// deformVertexes move stages; ordinary BSP vertex shaders do no extra math.
+fn moved_shader_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    let scale = wave_value(material.wave_funcs.z, material.deform_move_wave, shader_stage_time());
+    input.position += material.deform_move_vector.xyz * scale;
+    return input;
+}
+@vertex fn vs_move(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return world_vertex(moved_shader_input(input), instance_index, 0xffffffffu);
+}
+@vertex fn vs_move_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return world_vertex(moved_shader_input(input), instance_index, legacy_dlight_surface_id);
 }
 
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
@@ -2859,6 +2956,49 @@ fn apply_jump_shade(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(mix(color.rgb, tint, strength), color.a);
 }
 
+fn local_fog_ray_box(origin: vec3<f32>, direction: vec3<f32>, mins: vec3<f32>, maxs: vec3<f32>) -> vec2<f32> {
+    var entry = 0.0;
+    var exit = 1.0e30;
+    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
+        let d = direction[axis];
+        if (abs(d) < 1.0e-6) {
+            if (origin[axis] < mins[axis] || origin[axis] > maxs[axis]) {
+                return vec2<f32>(1.0, 0.0);
+            }
+        } else {
+            let t0 = (mins[axis] - origin[axis]) / d;
+            let t1 = (maxs[axis] - origin[axis]) / d;
+            entry = max(entry, min(t0, t1));
+            exit = min(exit, max(t0, t1));
+        }
+    }
+    return vec2<f32>(entry, exit);
+}
+
+fn local_brush_fog_distance(world_position: vec3<f32>) -> f32 {
+    let delta = world_position - camera.camera_pos_time.xyz;
+    let distance_to_surface = length(delta);
+    if (legacy_fog.local_fog_count.x == 0u || distance_to_surface < 0.00001) {
+        return distance_to_surface;
+    }
+    let dir = delta / distance_to_surface;
+    let requested_color = legacy_authored_fog_color(surface_fog.color_depth.rgb);
+    var matched = false;
+    var fogged_length = 0.0;
+    for (var index = 0u; index < min(legacy_fog.local_fog_count.x, 16u); index = index + 1u) {
+        let fog = legacy_fog.local_fogs[index];
+        if (abs(fog.color_depth.w - surface_fog.color_depth.w) > 0.01
+            || any(abs(fog.color_depth.rgb - requested_color) > vec3<f32>(0.001))) {
+            continue;
+        }
+        matched = true;
+        let interval = local_fog_ray_box(camera.camera_pos_time.xyz, dir, fog.mins.xyz, fog.maxs.xyz);
+        fogged_length = max(fogged_length,
+            max(min(interval.y, distance_to_surface) - max(interval.x, 0.0), 0.0));
+    }
+    return select(distance_to_surface, fogged_length, matched);
+}
+
 fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let has_map_fog = surface_fog.color_depth.a > 0.0;
     let has_override = legacy_fog.values.y > 0.001;
@@ -2866,6 +3006,25 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let drawfog_mode = legacy_fog.values.w;
     if (legacy_fog.values.x < 0.5) {
         return color;
+    }
+    // Additive surfaces contribute radiance on top of the already-fogged scene,
+    // so fade their light toward black rather than fogging the destination
+    // again. Authored glow is replayed later into a separate bloom source and
+    // must carry the same transmittance even in Legacy 1.
+    if (surface_fog.flags.z > 1.5 || surface_fog.flags.y < -0.5) {
+        // Legacy 1 global fog is applied once at display-space composition.
+        // Only glow replay bypasses that final scene pass. Never fog a normal
+        // additive stage twice when its source uses BSP global fog.
+        if (drawfog_mode < 1.5 && surface_fog.flags.x > 0.5
+            && surface_fog.flags.y >= -0.5) {
+            return color;
+        }
+        if ((map_has_authored_fog && !has_map_fog)
+            || (!map_has_authored_fog && !has_override)) {
+            return color;
+        }
+        let fog = legacy_fog_color_amount(world_position);
+        return vec4<f32>(color.rgb * (1.0 - fog.a), color.a);
     }
     // OpenJK r_drawfog 1 never folds fog into material stages: every fogged
     // surface is redrawn by the explicit fog pass after its material stages.
@@ -2909,6 +3068,10 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let authored_depth = select(1024.0, surface_fog.color_depth.a, has_map_fog);
     let radial_distance = distance(camera.camera_pos_time.xyz, world_position);
     let radial_normalized = radial_distance / max(authored_depth, 0.001);
+    var local_normalized = radial_normalized;
+    if (has_map_fog && surface_fog.flags.x < 0.5) {
+        local_normalized = local_brush_fog_distance(world_position) / max(authored_depth, 0.001);
+    }
     let camera_forward = normalize(camera.camera_forward.xyz);
     let forward_distance = max(
         dot(world_position - camera.camera_pos_time.xyz, camera_forward),
@@ -2921,7 +3084,7 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     let global_map_amount = 1.0 - exp(
         -5.5412635 * authored_scale * forward_normalized * forward_normalized
     );
-    let local_map_amount = clamp(radial_normalized * authored_scale, 0.0, 1.0);
+    let local_map_amount = sqrt(clamp(local_normalized * authored_scale, 0.0, 1.0));
     let map_amount = select(
         local_map_amount,
         clamp(global_map_amount, 0.0, 1.0),
@@ -2978,6 +3141,10 @@ fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
     if (legacy_fog.values.x < 0.5 || drawfog_mode < 0.5) {
         return vec4<f32>(0.0);
     }
+    // Pure-additive stages are fogged in-shader, not redrawn over the scene.
+    if (surface_fog.flags.z > 1.5) {
+        return vec4<f32>(0.0);
+    }
     if (map_has_authored_fog && !has_map_fog) {
         return vec4<f32>(0.0);
     }
@@ -3016,6 +3183,10 @@ fn legacy_fog_color_amount(world_position: vec3<f32>) -> vec4<f32> {
     let authored_depth = select(1024.0, surface_fog.color_depth.a, has_map_fog);
     let radial_distance = distance(camera.camera_pos_time.xyz, world_position);
     let radial_normalized = radial_distance / max(authored_depth, 0.001);
+    var local_normalized = radial_normalized;
+    if (has_map_fog && surface_fog.flags.x < 0.5) {
+        local_normalized = local_brush_fog_distance(world_position) / max(authored_depth, 0.001);
+    }
     let camera_forward = normalize(camera.camera_forward.xyz);
     let forward_distance = max(
         dot(world_position - camera.camera_pos_time.xyz, camera_forward),
@@ -3039,10 +3210,9 @@ fn legacy_fog_color_amount(world_position: vec3<f32>) -> vec4<f32> {
                 amount = openjk_global_fog_alpha(forward_normalized * authored_scale);
             }
         } else {
-            // The current BSP fog uniform does not yet carry the local brush
-            // clipping plane, so retain this renderer's established local-fog
-            // distance curve while moving it to OpenJK's correct separate pass.
-            amount = clamp(radial_normalized * authored_scale, 0.0, 1.0);
+            // Clip the ray to the BSP fog brush: other geometry, empty space,
+            // and camera-to-brush distance cannot add local fog opacity.
+            amount = sqrt(clamp(local_normalized * authored_scale, 0.0, 1.0));
         }
     } else {
         amount = clamp(
@@ -3763,6 +3933,14 @@ fn original_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
 // rather than adjacent SCREEN pixels make this stable with camera movement.
 // Samples remain within the same bound texture, but may cross chart borders:
 // therefore this is a soft limiter, not a claimed lightmap reconstruction.
+// Each composed lightmap stores the sky gain at the same UV in the existing
+// static-sun aux G/B/A channels. R continues to serve static-world CSM.
+// Read this only for prepared overlay stages while the sky bake is enabled.
+fn baked_sky_overlay_gain(uv: vec2<f32>) -> vec3<f32> {
+    let packed = textureSampleLevel(static_sun_aux, lightmap_sampler, uv, 0.0).gba;
+    return packed / max(vec3<f32>(1.0) - packed, vec3<f32>(0.001));
+}
+
 fn baked_indirect_tone(rgb: vec3<f32>) -> vec3<f32> {
     let intensity = lighting_settings.baked_indirect_adjust.x;
     let saturation = lighting_settings.baked_indirect_adjust.y;
@@ -3998,6 +4176,12 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
+    if ((material_flags_w() & 524288u) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
+    if (ENABLE_BAKED_SUN_RELIGHT && (material_flags_w() & (1u << 20u)) != 0u
+        && (lighting_settings.baked_sun_debug_mode.w & (1u << 8u)) != 0u) {
+        // Fade post-lightmap environmental overlays with the composed sky.
+        stage_color = vec4<f32>(stage_color.rgb * baked_sky_overlay_gain(input.lightmap_uv), stage_color.a);
+    }
 
     let authored_planar = ENABLE_PLANAR_REFLECTIONS && (material_flags() & 4096u) != 0u;
     let tcgen_environment = material_tc_gen() == 3u;
@@ -4120,6 +4304,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     // For tcGen environment this removes the legacy sphere-map image/UVs and
     // substitutes the rendered planar scene. Later shader stages (base decal,
     // lightmap, etc.) remain ordered and blended exactly as authored.
+    var authored_portal_sample = vec4<f32>(0.0);
+    var authored_portal_sampled = false;
     if (planar_candidate && selected_plane) {
         let debug_raw = planar_debug_mode == 4u || planar_debug_mode == 5u;
         let reflected = sample_planar_reflection(
@@ -4146,6 +4332,12 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
                 blended_environment
             );
             source_sample = vec4<f32>(reflected.rgb * response, source_sample.a);
+        } else if (authored_planar && (material_flags_w() & (64u | 128u)) != 0u) {
+            // Unlike a promoted tcGen environment pass, an id Tech 3 portal
+            // draws the authored surface OVER a full secondary scene view.
+            // Preserve the image texels, authored blending and alphaGen portal.
+            authored_portal_sample = reflected;
+            authored_portal_sampled = true;
         } else {
             source_sample = reflected;
         }
@@ -4307,7 +4499,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
             // sampling. r_lightmap + r_vertexLight is the vanilla white debug case.
             lightmap_color = select(input.color.rgb, vec3<f32>(1.0), classic_lightmap_only);
         }
-        if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u) {
+        if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
+            && (material_flags() & MATERIAL_EXTRA_STATIC_LIGHTSTYLE) == 0u) {
             lightmap_color = light_bsp_surface(lightmap_color, lightmap_sample.a, input);
             if (lighting_settings.baked_sun_debug_mode.x != 0u) {
                 return vec4<f32>(lightmap_color, base.a);
@@ -4324,6 +4517,13 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
             let baked = static_baked_pbr(input, albedo, surface_uv, lightmap_color, weather, shared_frame, shared_pbr);
             base = vec4<f32>(base.rgb * baked.diffuse_factor + baked.specular, base.a);
         }
+    }
+
+    // Static extra styles are only another authored lightmap contribution.
+    // Do not also add runtime sun/lamps, probes, emissive or wetness on the
+    // second pass; the original depth-seeding style already evaluated those.
+    if ((material_flags() & MATERIAL_EXTRA_STATIC_LIGHTSTYLE) != 0u) {
+        return base;
     }
 
     // LIGHTMAP_BY_VERTEX surfaces have no lightmap texture to expose. Preserve
@@ -4415,6 +4615,24 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         // attenuation, while bloom/HDR can consume the resulting bright color.
         base = vec4<f32>(base.rgb + textureSample(emissive_texture, base_sampler, surface_uv).rgb, base.a);
     }
+    if (authored_portal_sampled) {
+        // TaystJK tr_shade_calc.cpp AGEN_PORTAL: the distance fade reaches 1
+        // once the viewer is portalRange units away. The texture's own alpha
+        // still modulates the generated stage alpha.
+        let portal_range = max(material.vector_s.w, 0.001);
+        let generated_alpha = clamp(distance(input.world_position,
+            camera.camera_pos_time.xyz) / portal_range, 0.0, 1.0);
+        let portal_alpha = clamp(base.a * generated_alpha, 0.0, 1.0);
+        if ((material_flags_w() & 64u) != 0u) {
+            // Authored GL_ONE GL_SRC_ALPHA. The shader already contains the
+            // reflected destination; set output alpha=0 so the GPU does NOT
+            // blend the main scene behind the marble a second time.
+            base = vec4<f32>(base.rgb + authored_portal_sample.rgb * portal_alpha, 0.0);
+        } else {
+            // Authored GL_ONE GL_ONE_MINUS_SRC_ALPHA (black alpha-zero mirror).
+            base = vec4<f32>(base.rgb + authored_portal_sample.rgb * (1.0 - portal_alpha), 1.0);
+        }
+    }
     if (!ENABLE_SURFACE_DEFORMATION) {
         return base;
     }
@@ -4456,12 +4674,12 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
 }
 
 
-// Unified legacy RGB policy: the opaque lightmap/overlay fusion below can
-// compose its known inputs exactly in encoded sRGB. Additive BSP passes have
-// an unknown framebuffer destination, so their encoded source is a no-pass
-// approximation while blending remains linear in the scene target. Both use
-// the SAME transfer function. Keep alpha and authored blend factors unchanged.
+// Shared authored RGB modulation. Display-space PSOs encode each source and
+// blend against the encoded destination, as TaystJK's UNORM framebuffer does.
+// Other redraws retain their existing linear output and authored blend factors.
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
+// Enabled only by the display-space BSP PSOs (SDR alias or float transfer).
+override LEGACY_WORLD_ENCODED_BLEND: bool = false;
 // Approximate TaystJK's additive SOURCE modulation: its 8-bit rgbGen wave
 // multiplies the encoded texture sample before the blend. The scene target
 // remains linear, so this does not emulate encoded-framebuffer destination
@@ -4480,6 +4698,12 @@ fn legacy_additive_source(source: vec4<f32>, waveform: f32, has_wave: bool) -> v
     let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;
     return vec4<f32>(legacy_rgb_decode(legacy_rgb_encode(texel_linear) * vertex_wave_byte), source.a);
 }
+fn encoded_world_output(color: vec4<f32>) -> vec4<f32> {
+    if (LEGACY_WORLD_ENCODED_BLEND) {
+        return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
+    }
+    return color;
+}
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material_flags() & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
         let has_wave = (material_flags() & 134217728u) != 0u;
@@ -4487,9 +4711,13 @@ fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
         if (has_wave) {
             wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
         }
-        return legacy_additive_source(color, wave, has_wave);
+        let source = legacy_additive_source(color, wave, has_wave);
+        if (LEGACY_WORLD_ENCODED_BLEND) {
+            return vec4<f32>(legacy_rgb_encode(source.rgb), source.a);
+        }
+        return source;
     }
-    return color;
+    return encoded_world_output(color);
 }
 
 fn legacy_rgb_encode(value: vec3<f32>) -> vec3<f32> {
@@ -4537,8 +4765,8 @@ fn classic_three_stage_rgb(input: VertexOut, shaded_base: vec4<f32>) -> vec4<f32
     let shaded_base = shade_surface(input, front);
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) { return shaded_base; }
     let result = apply_jump_shade(classic_three_stage_rgb(input, shaded_base), input.world_position);
-    if (ENABLE_LEGACY_FOG) { return apply_legacy_fog(result, input.world_position); }
-    return result;
+    if (ENABLE_LEGACY_FOG) { return encoded_world_output(apply_legacy_fog(result, input.world_position)); }
+    return encoded_world_output(result);
 }
 
 
@@ -4615,6 +4843,7 @@ fn additive_vertex_output(base: VertexOut, count: u32) -> AdditiveVertexOut {
     out.color = base.color;
     out.world_position = base.world_position;
     out.world_normal = base.world_normal;
+    out.lightmap_uv = base.lightmap_uv;
     out.shell_kind = base.shell_kind;
     out.shell_coverage = base.shell_coverage;
     let raw_uv = additive_untransform_uv(base.uv, material);
@@ -4661,10 +4890,14 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     if ((m.header.z & 268435456u) != 0u) {
         color.a = clamp(wave_value(m.wave_funcs.y, m.wave_alpha, additive_time(m)), 0.0, 1.0);
     }
+    if ((m.header.w & 524288u) != 0u) { color = vec4<f32>(color.rgb * vertex_color.rgb, color.a); }
     return color;
 }
-fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
+fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>, sky_gain: vec3<f32>) -> vec4<f32> {
     var sample = texel * additive_stage_tint(m, vertex_color);
+    if ((m.header.w & (1u << 20u)) != 0u) {
+        sample = vec4<f32>(sample.rgb * sky_gain, sample.a);
+    }
     if ((m.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
         let has_wave = (m.header.z & 134217728u) != 0u;
         var wave = 1.0;
@@ -4673,29 +4906,38 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
         }
         sample = legacy_additive_source(sample, wave, has_wave);
     }
+    // Encode EACH source before weighting/summing: E(a + b) differs from E(a) + E(b).
+    if (LEGACY_WORLD_ENCODED_BLEND) {
+        sample = vec4<f32>(legacy_rgb_encode(sample.rgb), sample.a);
+    }
     // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
     // so preweight RGB and alpha by the source alpha as before.
     return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
+    var overlay_sky_gain = vec3<f32>(1.0);
+    if (ENABLE_BAKED_SUN_RELIGHT && (lighting_settings.baked_sun_debug_mode.w & (1u << 8u)) != 0u
+        && ((material.header.w | additive_stage1.header.w | additive_stage2.header.w) & (1u << 20u)) != 0u) {
+        overlay_sky_gain = baked_sky_overlay_gain(input.lightmap_uv);
+    }
     let base = textureSample(base_texture, base_sampler, input.uv);
-    var total = additive_weighted_sample(base, material, input.color);
+    var total = additive_weighted_sample(base, material, input.color, overlay_sky_gain);
     // Every companion shares the same primary inverse tcMods. Evaluate that
     // inverse once per fragment, then apply independent authored sibling tcMods.
     // Three-stage fusion previously recomputed the inverse twice; no sampling,
     // stage ordering, blending or shader permutation changes.
     let uv1 = input.additive_uv1;
     if ((additive_stage1.header.w & 65536u) != 0u) {
-        total += additive_weighted_sample(textureSample(sky_rt, additive_clamp_sampler, uv1), additive_stage1, input.color);
+        total += additive_weighted_sample(textureSample(sky_rt, additive_clamp_sampler, uv1), additive_stage1, input.color, overlay_sky_gain);
     } else {
-        total += additive_weighted_sample(textureSample(sky_rt, detail_sampler, uv1), additive_stage1, input.color);
+        total += additive_weighted_sample(textureSample(sky_rt, detail_sampler, uv1), additive_stage1, input.color, overlay_sky_gain);
     }
     if (count >= 3u) {
         let uv2 = input.additive_uv2;
         if ((additive_stage2.header.w & 65536u) != 0u) {
-            total += additive_weighted_sample(textureSample(sky_bk, additive_clamp_sampler, uv2), additive_stage2, input.color);
+            total += additive_weighted_sample(textureSample(sky_bk, additive_clamp_sampler, uv2), additive_stage2, input.color, overlay_sky_gain);
         } else {
-            total += additive_weighted_sample(textureSample(sky_bk, detail_sampler, uv2), additive_stage2, input.color);
+            total += additive_weighted_sample(textureSample(sky_bk, detail_sampler, uv2), additive_stage2, input.color, overlay_sky_gain);
         }
     }
     return total;
@@ -4859,9 +5101,9 @@ fn competitive_one_stage_lit(uv: vec2<f32>, lm_uv: vec2<f32>, vertex_color: vec4
     let fog = legacy_separate_fog(input.world_position);
     // Only Legacy 2 (EXP2) bands visibly; Legacy 1 keeps its authored 8-bit table.
     if (legacy_fog.values.w >= 1.5) {
-        return legacy_fog_dither_alpha(fog, input.clip_position.xy);
+        return encoded_world_output(legacy_fog_dither_alpha(fog, input.clip_position.xy));
     }
-    return fog;
+    return encoded_world_output(fog);
 }
 
 fn sky_uv(s: f32, t: f32) -> vec2<f32> {

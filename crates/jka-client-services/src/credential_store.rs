@@ -406,6 +406,26 @@ mod platform {
 
 pub use platform::{delete, delete_secret, list, read, read_secret, save, save_secret, supported};
 
+/// Only the Server credential is eligible for automatic join authentication.
+/// `Login`, `Admin` and `Rcon` must never be offered during a handshake.
+pub fn server_password(server: SocketAddr) -> Result<Option<String>, String> {
+    let Some(credential) = read(server, AccountType::Server)? else {
+        return Ok(None);
+    };
+    if !valid_server_password(&credential.password) {
+        return Err(format!("Saved server password for {server} has invalid info-string characters"));
+    }
+    Ok(Some(credential.password))
+}
+
+/// Quake info strings cannot contain backslashes, semicolons, quotes or NULs.
+/// Validate *before* building the connect packet instead of silently omitting
+/// the saved password when Info_SetValueForKey refuses it.
+pub fn valid_server_password(password: &str) -> bool {
+    !password.is_empty()
+        && !password.chars().any(|c| c.is_control() || matches!(c, '\\' | ';' | '"'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +440,15 @@ mod tests {
             );
         }
         assert!(parse_target("DinurdoJK/account/unknown/203.0.113.7:29070").is_none());
+    }
+
+    #[test]
+    fn private_server_password_must_be_wire_safe() {
+        assert!(valid_server_password("hello world"));
+        assert!(!valid_server_password(""));
+        assert!(!valid_server_password("foo\\bar"));
+        assert!(!valid_server_password("foo;bar"));
+        assert!(!valid_server_password("foo\"bar"));
+        assert!(!valid_server_password("foo\nbar"));
     }
 }

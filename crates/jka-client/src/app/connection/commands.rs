@@ -97,12 +97,16 @@ impl App {
                     .to_vec()
             })
             .unwrap_or_default();
+        let mut settings = self.network.clone();
+        if let Some(password) = self.connection_saved_password.as_ref() {
+            settings.password.clone_from(password);
+        }
         let info = if let Some(version) = self.net.as_ref().and_then(|net| net.session().jk2_version()) {
-            let mut info = self.network.jk2_userinfo_for_version(&self.solo_client_info.model_cvar(), version);
+            let mut info = settings.jk2_userinfo_for_version(&self.solo_client_info.model_cvar(), version);
             let powers = self.jk2_effective_forcepowers();
             jka_protocol::session::set_info_value(&mut info, b"forcepowers", powers.as_bytes());
             info
-        } else { self.network.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info) };
+        } else { settings.userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info) };
         let command = [b"userinfo \"".as_slice(), &info, b"\""].concat();
         let Some(net) = self.net.as_mut() else {
             return Err("network session disappeared while queuing userinfo".to_owned());
@@ -197,17 +201,11 @@ impl App {
                 );
                 return;
             }
-            // TaystJK UI_UpdateClientForcePowers writes forcepowers first, then
-            // executes `cmd forcechanged [team]` only when force was touched.
-            // Always put a fresh userinfo immediately before that notification:
-            // the server reads forcepowers from userinfo while handling it.
-            if self.profile_userinfo_pending || force_touched {
-                if let Err(error) = self.queue_userinfo() {
-                    self.push_console_line(format!("^1Could not apply profile userinfo: {error}"));
-                    return;
-                }
-                self.profile_userinfo_pending = false;
-            }
+            // TaystJK UI_UpdateClientForcePowers sets forcepowers and appends
+            // `cmd forcechanged [team]`; the next frame's Cbuf_Execute queues
+            // that command before CL_CheckUserinfo queues userinfo. Keep the
+            // order: sv_floodProtect only runs a game command a full interval
+            // after the previous client command, while userinfo always runs.
             if force_touched {
                 let command = self.live_forcechanged_team_arg().map_or_else(
                     || "forcechanged".to_owned(),
@@ -219,11 +217,18 @@ impl App {
                     self.push_console_line(format!("^1Could not apply Force loadout: {error}"));
                     return;
                 }
-                let sequence = self.net.as_ref().map_or(-1, |net| net.session().reliable_sequence());
                 self.profile_force_pending = false;
-                self.push_console_line(format!(
-                    "^5Force loadout applied: sent userinfo + {command} (reliable seq {sequence})"
-                ));
+            }
+            if self.profile_userinfo_pending || force_touched {
+                if let Err(error) = self.queue_userinfo() {
+                    self.push_console_line(format!("^1Could not apply profile userinfo: {error}"));
+                    return;
+                }
+                self.profile_userinfo_pending = false;
+            }
+            if force_touched {
+                let sequence = self.net.as_ref().map_or(-1, |net| net.session().reliable_sequence());
+                self.push_console_line(format!("^5Force loadout applied: sent forcechanged + userinfo (reliable seq {sequence})"));
             }
         } else {
             // No server can consume forcechanged. The cvar is still retained

@@ -158,6 +158,11 @@ impl App {
         if password.chars().any(char::is_control) {
             return Err("Passwords cannot contain control characters".to_owned());
         }
+        if account_type == AccountType::Server
+            && !crate::credential_store::valid_server_password(password)
+        {
+            return Err("Server passwords cannot contain backslashes, semicolons, quotes, or control characters".to_owned());
+        }
         if matches!(account_type, AccountType::Login | AccountType::Admin)
             && invalid_command_arg(password)
         {

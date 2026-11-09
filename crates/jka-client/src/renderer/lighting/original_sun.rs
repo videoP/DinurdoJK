@@ -11,6 +11,7 @@ use crate::renderer::lighting::shadow_resources::OriginalSunShadowCache;
 
 pub(in crate::renderer) struct BakedSunCalibration {
     pub radiance: [f32; 3],
+    pub auto_strength: Option<f32>,
     /// Shadow luminance, direct upper bound, classification, reserved.
     /// Classification: 0 fallback, 1 paired fit, 2 fully lit, 3 fully shadowed,
     /// 4 authored UV projection (exposure, gamma, kind, signed compensation).
@@ -145,8 +146,7 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     let traced: usize = lightmaps
         .par_iter_mut()
         .zip(samples.par_iter())
-        .zip(owners.par_iter())
-        .map(|((image, texels), owners)| {
+        .map(|(image, texels)| {
             if image.rgba16f.is_some() {
                 return 0;
             }
@@ -223,6 +223,21 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 return 0;
             }
+            traced
+        })
+        .sum();
+    if traced == 0 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // Fit BEFORE RGB-driven shadow-edge refinement. The refinement uses the
+    // authored sun magnitude, which may be exactly what needs calibration;
+    // allowing its edge reconstruction to influence the fit is circular.
+    let auto_strength = calibrate_authored_sun(lightmaps, &samples, &owners, sun_y, encoding, cancelled);
+    // Refine/extend only after the fitted coefficient is fixed, retaining
+    // the existing manually selected edge reconstruction behavior.
+    lightmaps.par_iter_mut().zip(samples.par_iter()).zip(owners.par_iter())
+        .for_each(|((image, texels), owners)| {
+            if image.rgba16f.is_some() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return; }
             refined.fetch_add(
                 refine_authored_sun_edges(
                     image, texels, owners, toward, sun_y, encoding, cancelled,
@@ -255,12 +270,8 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
                     image.rgba[index * 4 + 3] = (sum / count) as u8;
                 }
             }
-            traced
-        })
-        .sum();
-    if traced == 0 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
+        });
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
     let mut surfaces = vec![[0.0; 4]; surface_count];
     for batch in batches {
         let Some(image) = batch
@@ -290,10 +301,115 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
         color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness / 255.0;
     println!("[BAKED SUN] authored UV projection: {} luxels, {} sun samples, intensity {}, exposure {}, gamma {}, {} edge luxels refined, {:.1} ms",
         traced, count, sun.intensity, encoding.exposure, encoding.gamma, refined.load(std::sync::atomic::Ordering::Relaxed), started.elapsed().as_secs_f64() * 1000.0);
+    println!("[BAKED SUN AUTO] {}", auto_strength.map_or_else(
+        || "calibration unavailable (insufficient reliable shadow boundaries)".to_string(),
+        |strength| format!("measured {strength:.3}x from source lightmap shadow edges")));
     Some(BakedSunCalibration {
         radiance: radiance.to_array(),
+        auto_strength,
         surfaces,
     })
+}
+
+/// Fit one *global* removal multiplier against local discontinuities in the
+/// original lightmap, not the brightness/variance of the whole level.  The
+/// authored sun's flux is the independent variable; the input is the actual
+/// unmodified RGB in Q3Map2 photon units. This is intentionally a one-time CPU
+/// job following sun-mask reconstruction, not a render-time optimization.
+///
+/// We use sparse short pairs crossing sun-visibility transitions on the same
+/// atlas chart and (nearly) the same geometric plane. Smooth lamp/sky bounce
+/// gradients largely cancel, while the predicted direct-sun term changes.
+/// Local ratios are summarized by 32x32 tiles and then by a median of tiles,
+/// so one enormous floor, a strong lamp, or a few anomalous pixels cannot
+/// monopolize the answer. The MAD gate refuses inconsistent estimates.
+fn calibrate_authored_sun(
+    lightmaps: &[crate::materials::TextureData],
+    samples: &[Vec<Option<crate::renderer::StaticAoTexelSample>>],
+    owners: &[Vec<u32>],
+    predicted_sun_y: f32,
+    encoding: crate::scene::BakedSunEncoding,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Option<f32> {
+    if predicted_sun_y <= 0.001 || !predicted_sun_y.is_finite() { return None; }
+    let luma = Vec3::new(0.2126, 0.7152, 0.0722);
+    let mut tile_estimates = Vec::new();
+    let mut total_pairs = 0usize;
+    for ((image, texels), chart) in lightmaps.iter().zip(samples).zip(owners) {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        let width = image.width as usize;
+        let height = image.height as usize;
+        if width < 8 || height < 8 || image.rgba16f.is_some()
+            || image.rgba.len() != width.checked_mul(height)?.checked_mul(4)?
+            || texels.len() != width * height || chart.len() != width * height { continue; }
+        let tiles_w = width.div_ceil(32);
+        let tiles_h = height.div_ceil(32);
+        let mut tiles = vec![Vec::<f32>::new(); tiles_w * tiles_h];
+        // 1/4 resolution in each axis, but compare each selected point with
+        // nearby original-resolution samples so narrow shadows survive.
+        for y in (0..height.saturating_sub(4)).step_by(4) {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+            for x in (0..width.saturating_sub(4)).step_by(4) {
+                let i = y * width + x;
+                if chart[i] == 0 { continue; }
+                let Some(a) = texels[i] else { continue; };
+                let pix_a = &image.rgba[i * 4..i * 4 + 4];
+                if pix_a[..3].iter().any(|&value| value >= 250) { continue; }
+                let flux_a = pix_a[3] as f32 / 255.0;
+                let normal_a = Vec3::from_array(a.normal);
+                // Read each starting texel only once, rather than evaluating
+                // every possible multiplier in multiple full lightmap passes.
+                let rgb_a = compiled_lightmap_photons(pix_a, encoding);
+                for (dx, dy) in [(4usize, 0usize), (0, 4), (8, 0), (0, 8)] {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx >= width || ny >= height { continue; }
+                    let j = ny * width + nx;
+                    if chart[j] != chart[i] { continue; }
+                    let Some(b) = texels[j] else { continue; };
+                    let normal_b = Vec3::from_array(b.normal);
+                    if normal_a.dot(normal_b) < 0.995 ||
+                        normal_a.dot(Vec3::from_array(b.position) - Vec3::from_array(a.position)).abs() > 0.75 {
+                        continue;
+                    }
+                    let pix_b = &image.rgba[j * 4..j * 4 + 4];
+                    if pix_b[..3].iter().any(|&value| value >= 250) { continue; }
+                    let delta_flux = pix_b[3] as f32 / 255.0 - flux_a;
+                    if delta_flux.abs() < 0.15 { continue; }
+                    let delta_rgb = compiled_lightmap_photons(pix_b, encoding) - rgb_a;
+                    let ratio = delta_rgb.dot(luma) / (predicted_sun_y * delta_flux);
+                    // Keep negative ratios as evidence of bad reconstruction;
+                    // they must not turn into artificially positive estimates.
+                    if ratio.is_finite() && (-1.0..=3.0).contains(&ratio) {
+                        tiles[(y / 32) * tiles_w + x / 32].push(ratio);
+                        total_pairs += 1;
+                    }
+                }
+            }
+        }
+        for mut ratios in tiles {
+            if ratios.len() >= 4 {
+                tile_estimates.push(median_f32(&mut ratios));
+            }
+        }
+    }
+    // A single local contrast boundary is not sufficient. Require multiple
+    // spatial regions and agreement, without falsely claiming a guarantee.
+    if total_pairs < 24 || tile_estimates.len() < 4 { return None; }
+    let value = median_f32(&mut tile_estimates);
+    let mut deviations: Vec<f32> = tile_estimates.iter().map(|v| (v - value).abs()).collect();
+    let mad = median_f32(&mut deviations);
+    if !(0.03..=2.0).contains(&value) || mad > 0.12 + value * 0.35 {
+        println!("[BAKED SUN AUTO] rejected inconsistent fit: {value:.3}x, MAD {mad:.3}, {total_pairs} pairs, {} regions", tile_estimates.len());
+        return None;
+    }
+    println!("[BAKED SUN AUTO] {total_pairs} sparse pairs in {} regions, median {value:.3}x, MAD {mad:.3}", tile_estimates.len());
+    Some(value)
+}
+
+fn median_f32(values: &mut [f32]) -> f32 {
+    values.sort_unstable_by(f32::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 { (values[mid - 1] + values[mid]) * 0.5 } else { values[mid] }
 }
 
 /// Inverse of Q3Map2's exposed or default linear output transform. Input is
@@ -577,7 +693,7 @@ pub(in crate::renderer) fn estimate_baked_sun_radiance(
     let fitted = fitted_direct_energy(&mut estimates)?;
     println!("[BAKED SUN] calibrated from {} mixed sun/shadow surfaces: linear direct RGB {:?}",
         estimates.len(), (hue * fitted).to_array());
-    Some(BakedSunCalibration { radiance: (hue * fitted).to_array(), surfaces: surface_fits })
+    Some(BakedSunCalibration { radiance: (hue * fitted).to_array(), auto_strength: None, surfaces: surface_fits })
 }
 
 fn fitted_direct_energy(estimates: &mut [(f32, f32)]) -> Option<f32> {
@@ -589,6 +705,57 @@ fn fitted_direct_energy(estimates: &mut [(f32, f32)]) -> Option<f32> {
         weight += w;
         (weight >= half).then_some(energy)
     })
+}
+
+#[cfg(test)]
+mod automatic_removal_tests {
+    use super::{calibrate_authored_sun, Vec3};
+    use crate::{materials::TextureData, renderer::StaticAoTexelSample};
+    use std::sync::atomic::AtomicBool;
+
+    fn fixture(strength: f32, with_shadow: bool, noisy: bool) -> (Vec<TextureData>, Vec<Vec<Option<StaticAoTexelSample>>>, Vec<Vec<u32>>) {
+        const W: usize = 128;
+        let mut rgba = Vec::with_capacity(W * W * 4);
+        let mut samples = Vec::with_capacity(W * W);
+        let mut owners = Vec::with_capacity(W * W);
+        for y in 0..W {
+            for x in 0..W {
+                let flux = if with_shadow && x < 64 { 0.0 } else { 1.0 };
+                // A lamp gradient remains after sunlight removal, and local
+                // isolated outliers must not dominate the global median.
+                let local = 50.0 + x as f32 * 0.018 + (y as f32 * 0.1).sin() * 1.5
+                    + if noisy && (x * 73 + y * 37) % 47 == 0 { 30.0 } else { 0.0 };
+                let v = (local + 80.0 * strength * flux).round() as u8;
+                rgba.extend_from_slice(&[v, v, v, (flux * 255.0) as u8]);
+                samples.push(Some(StaticAoTexelSample {
+                    position: [x as f32, 0.0, y as f32],
+                    normal: Vec3::Y.to_array(),
+                }));
+                owners.push(1);
+            }
+        }
+        (vec![TextureData { label: "synthetic sun".into(), source: None, width: W as u32,
+            height: W as u32, rgba: rgba.into(), rgba16f: None, mip_level_count: 1,
+            clamp: true, srgb: true }], vec![samples], vec![owners])
+    }
+
+    fn fit(strength: f32, with_shadow: bool, noisy: bool) -> Option<f32> {
+        let (images, samples, owners) = fixture(strength, with_shadow, noisy);
+        calibrate_authored_sun(&images, &samples, &owners, 80.0,
+            crate::scene::BakedSunEncoding { exposure: 0.0, gamma: 1.0, compensate: 1.0,
+                brightness: 1.0, deviance: 0.0, samples: 1 }, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn auto_recovers_lightmap_sun_without_flattening_lamp_gradient() {
+        assert!((fit(0.35, true, false).unwrap() - 0.35).abs() < 0.04);
+        assert!((fit(1.0, true, true).unwrap() - 1.0).abs() < 0.06);
+    }
+
+    #[test]
+    fn auto_refuses_fully_lit_map_without_a_shadow_boundary() {
+        assert!(fit(0.35, false, false).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -759,7 +926,7 @@ impl Renderer {
         &mut self, encoder: &mut wgpu::CommandEncoder, camera_pos_time: [f32; 4],
     ) {
         if !self.baked_sun_shadow_map
-            || (self.baked_sun_removal <= 0.0 && self.baked_sun_debug_mode != 2)
+            || (self.effective_baked_sun_removal() <= 0.0 && self.baked_sun_debug_mode != 2)
         {
             return;
         }

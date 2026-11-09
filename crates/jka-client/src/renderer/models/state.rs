@@ -5,6 +5,8 @@ use crate::renderer::{
     storage_buffer_entry, texture_entry, uniform_entry, upload_texture, Arc,
     DynamicEntityLightingUniform, DynamicGpuTexture, DynamicModelAlphaMode, DynamicModelRenderer,
     DynamicModelVertex, EntityAmbientLightingMode, EntityLegacyFog, EntityWeather, Entry,
+    IrradianceVolumeUniform, StaticLightGridGpu, texture_3d_entry,
+    depth_array_texture_entry, comparison_sampler_entry,
     Ghoul2BatchMode,
     Ghoul2GpuVertex, Ghoul2PendingDraw, GpuImage, HashMap, PipelineJobManager, TextureData,
     DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
@@ -33,6 +35,12 @@ impl DynamicModelRenderer {
                 // shaders, which simply do not declare it: wgpu only requires a
                 // shader's bindings to be a subset of its layout.
                 texture_entry(3),
+                texture_3d_entry(4),
+                uniform_entry(5, wgpu::ShaderStages::FRAGMENT),
+                sampler_entry(6),
+                depth_array_texture_entry(7),
+                comparison_sampler_entry(8),
+                uniform_entry(9, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let entity_lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -157,6 +165,57 @@ impl DynamicModelRenderer {
                 srgb: false,
             },
         );
+        // The volume is map-owned. Bind a harmless empty atlas when no BSP is
+        // loaded, so studio/menu models and all pipeline variants stay valid.
+        let irradiance_fallback_texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("JKA model empty irradiance volume"),
+                size: wgpu::Extent3d { width: 1, height: 2, depth_or_array_layers: 3 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[0u8; 24],
+        );
+        let irradiance_fallback_view =
+            irradiance_fallback_texture.create_view(&Default::default());
+        let irradiance_fallback_info_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA model empty irradiance volume uniform"),
+            contents: bytemuck::bytes_of(&IrradianceVolumeUniform {
+                light_from_world: [
+                    [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0],
+                ],
+                falloff_intensity: [0.0, 0.0, 0.0, 1.0],
+                volume_enabled_pad: [0.0; 4],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let irradiance_volume_view = irradiance_fallback_view.clone();
+        let irradiance_volume_info_buffer = irradiance_fallback_info_buffer.clone();
+        let celestial_fallback = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("model celestial shadow fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: crate::renderer::depth_format(), usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let celestial_shadow_view = celestial_fallback.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
+        });
+        let celestial_shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            compare: Some(wgpu::CompareFunction::GreaterEqual), ..Default::default()
+        });
+        let celestial_shadow_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model celestial shadow fallback uniform"),
+            size: std::mem::size_of::<crate::renderer::ShadowReceiverUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false,
+        });
         let fallback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA dynamic model white fallback"),
             layout: &texture_layout,
@@ -177,6 +236,18 @@ impl DynamicModelRenderer {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&flat_normal.view),
                 },
+                wgpu::BindGroupEntry { binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&irradiance_volume_view) },
+                wgpu::BindGroupEntry { binding: 5,
+                    resource: irradiance_volume_info_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&clamp_sampler) },
+                wgpu::BindGroupEntry { binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&celestial_shadow_view) },
+                wgpu::BindGroupEntry { binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&celestial_shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 9,
+                    resource: celestial_shadow_uniform.as_entire_binding() },
             ],
         });
         let vertex_capacity = 4096;
@@ -312,6 +383,19 @@ impl DynamicModelRenderer {
             camera_layout: camera_layout.clone(),
             texture_layout,
             entity_lighting_buffer,
+            irradiance_volume_view,
+            irradiance_volume_info_buffer,
+            _irradiance_fallback_texture: irradiance_fallback_texture,
+            irradiance_fallback_view,
+            irradiance_fallback_info_buffer,
+            fallback_white_view: white.view.clone(),
+            celestial_shadow_view,
+            celestial_fallback_view: celestial_fallback.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
+            }),
+            fallback_caster_bind_group: fallback_bind_group.clone(),
+            celestial_shadow_sampler,
+            celestial_shadow_uniform,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             entity_sun_relight: None,
             entity_dlights: Vec::new(),
@@ -334,6 +418,12 @@ impl DynamicModelRenderer {
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
+            planar_model_pipelines: Default::default(),
+            planar_skin_pipelines: Default::default(),
+            planar_skin_source_pipelines: Default::default(),
+            planar_fx_sprite_pipelines: Default::default(),
+            planar_fx_rope_pipeline: None,
+            planar_model_format: None,
             legacy_blend_mode: 0,
             legacy_blend_pipeline_format: wgpu::TextureFormat::Rgba16Float,
             legacy_blend: None,
@@ -439,6 +529,7 @@ impl DynamicModelRenderer {
             capture_prepare: false,
             perf_prepare: super::prepare::PreparePerf::default(),
             perf_phase_calls: std::cell::Cell::new(super::submission::ModelPhaseCalls::default()),
+            perf_phase_cpu_ms: std::cell::Cell::new(0.0),
             companion_excluded_entity: None,
             ghoul2_input_instances: 0,
             ghoul2_encoded_draws: 0,
@@ -880,10 +971,7 @@ impl DynamicModelRenderer {
             } else {
                 &self.repeat_sampler
             };
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("JKA dynamic model texture {}", texture.label)),
-                layout: &self.texture_layout,
-                entries: &[
+            let mut entries = [
                     wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::TextureView(&image.view),
@@ -904,18 +992,131 @@ impl DynamicModelRenderer {
                                 .map_or(&self.flat_normal.view, |normal| &normal.view),
                         ),
                     },
-                ],
+                    wgpu::BindGroupEntry { binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.irradiance_volume_view) },
+                    wgpu::BindGroupEntry { binding: 5,
+                        resource: self.irradiance_volume_info_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&self.clamp_sampler) },
+                    wgpu::BindGroupEntry { binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&self.celestial_shadow_view) },
+                    wgpu::BindGroupEntry { binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&self.celestial_shadow_sampler) },
+                    wgpu::BindGroupEntry { binding: 9,
+                        resource: self.celestial_shadow_uniform.as_entire_binding() },
+                ];
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("JKA dynamic model texture {}", texture.label)),
+                layout: &self.texture_layout, entries: &entries,
+            });
+            entries[7].resource = wgpu::BindingResource::TextureView(&self.celestial_fallback_view);
+            let caster_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("model caster material"), layout: &self.texture_layout, entries: &entries,
             });
             entry.insert(DynamicGpuTexture {
                 binding_id,
                 _image: image,
                 _normal_image: normal_image,
+                clamp: texture.clamp,
                 bind_group,
+                caster_bind_group,
             });
         }
         self.frame_texture_keys
             .insert(pointer_key, Arc::clone(&key));
         Some(key)
+    }
+
+    /// Rebind only on map installation/removal. Reuse model albedo/normal GPU
+    /// images; a map change must not reupload every MD3/Ghoul2 material.
+    pub(in crate::renderer) fn install_irradiance_volume(
+        &mut self,
+        device: &wgpu::Device,
+        world_grid: Option<&StaticLightGridGpu>,
+    ) {
+        let (view, info) = if let Some(grid) = world_grid {
+            (grid.irradiance_volume_view.clone(), grid.irradiance_volume_uniform_buffer.clone())
+        } else {
+            (self.irradiance_fallback_view.clone(), self.irradiance_fallback_info_buffer.clone())
+        };
+        self.irradiance_volume_view = view;
+        self.irradiance_volume_info_buffer = info;
+        self.rebind_model_lighting(device);
+    }
+
+    /// Reuse the renderer's existing cascades. Texture identity changes only
+    /// when shadow resources are recreated; warm frames do not rebind materials.
+    pub(in crate::renderer) fn install_celestial_shadows(&mut self, device: &wgpu::Device,
+        view: &wgpu::TextureView, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer)
+    {
+        if &self.celestial_shadow_view == view && &self.celestial_shadow_sampler == sampler
+            && &self.celestial_shadow_uniform == uniform { return; }
+        self.celestial_shadow_view = view.clone();
+        self.celestial_shadow_sampler = sampler.clone();
+        self.celestial_shadow_uniform = uniform.clone();
+        self.rebind_model_lighting(device);
+    }
+
+    fn rebind_model_lighting(&mut self, device: &wgpu::Device) {
+        let layout = &self.texture_layout;
+        let lighting_buffer = &self.entity_lighting_buffer;
+        let irradiance_view = &self.irradiance_volume_view;
+        let irradiance_info = &self.irradiance_volume_info_buffer;
+        let volume_sampler = &self.clamp_sampler;
+        let repeat_sampler = &self.repeat_sampler;
+        let clamp_sampler = &self.clamp_sampler;
+        let flat_normal = &self.flat_normal.view;
+        let celestial_sampler = &self.celestial_shadow_sampler;
+        let celestial_uniform = &self.celestial_shadow_uniform;
+        let rebind = |image: &wgpu::TextureView, normal: &wgpu::TextureView,
+                      sampler: &wgpu::Sampler, celestial: &wgpu::TextureView, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0,
+                        resource: wgpu::BindingResource::TextureView(image) },
+                    wgpu::BindGroupEntry { binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 2,
+                        resource: lighting_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3,
+                        resource: wgpu::BindingResource::TextureView(normal) },
+                    wgpu::BindGroupEntry { binding: 4,
+                        resource: wgpu::BindingResource::TextureView(irradiance_view) },
+                    wgpu::BindGroupEntry { binding: 5,
+                        resource: irradiance_info.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6,
+                        resource: wgpu::BindingResource::Sampler(volume_sampler) },
+                    wgpu::BindGroupEntry { binding: 7,
+                        resource: wgpu::BindingResource::TextureView(celestial) },
+                    wgpu::BindGroupEntry { binding: 8,
+                        resource: wgpu::BindingResource::Sampler(celestial_sampler) },
+                    wgpu::BindGroupEntry { binding: 9,
+                        resource: celestial_uniform.as_entire_binding() },
+                ],
+            })
+        };
+        self.fallback_bind_group = rebind(
+            &self.fallback_white_view, flat_normal, clamp_sampler, &self.celestial_shadow_view,
+            "JKA dynamic model white fallback (volume rebound)");
+        self.fallback_caster_bind_group = rebind(
+            &self.fallback_white_view, flat_normal, clamp_sampler, &self.celestial_fallback_view,
+            "model caster fallback");
+        for material in self.textures.values_mut() {
+            // Preserve per-texture wrap mode by persisting the original sampler
+            // selection; a map swap changes only the shared volume bindings.
+            let sampler = if material.clamp { clamp_sampler } else { repeat_sampler };
+            material.bind_group = rebind(
+                &material._image.view,
+                material._normal_image.as_ref().map_or(flat_normal, |n| &n.view),
+                sampler,
+                &self.celestial_shadow_view,
+                "JKA dynamic model texture (volume rebound)");
+            material.caster_bind_group = rebind(&material._image.view,
+                material._normal_image.as_ref().map_or(flat_normal, |n| &n.view),
+                sampler, &self.celestial_fallback_view, "model caster material");
+        }
     }
 
     pub(in crate::renderer) fn set_entity_ambient_lighting(
@@ -993,12 +1194,13 @@ impl DynamicModelRenderer {
 
     /// Once per frame, before models draw: turns the GPU-written model sky
     /// light off when the previous frame's Blue Water pass stopped refreshing it.
-    pub(in crate::renderer) fn retire_sky_world(&mut self, queue: &wgpu::Queue) {
-        if self.sky_world_live && !self.sky_world_refreshed {
+    pub(in crate::renderer) fn retire_sky_world(&mut self, queue: &wgpu::Queue, enabled: bool) {
+        let refreshed = std::mem::take(&mut self.sky_world_refreshed);
+        if (self.sky_world_live || refreshed) && (!enabled || !refreshed) {
             queue.write_buffer(&self.entity_lighting_buffer, super::types::ENTITY_SKY_WORLD_OFFSET,
                 bytemuck::bytes_of(&[[0f32; 4]; 8]));
         }
-        self.sky_world_live = std::mem::take(&mut self.sky_world_refreshed);
+        self.sky_world_live = enabled && refreshed;
     }
 
     pub(in crate::renderer) fn set_studio_lights(&mut self, lights:&[crate::renderer::TransientLight],queue:&wgpu::Queue) {

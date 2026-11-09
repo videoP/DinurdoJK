@@ -282,7 +282,7 @@ pub(in crate::scene) fn prepare_static_light_grid(
                         irradiance_volume_rgba[dst] = encode_irradiance(rgb[0]);
                         irradiance_volume_rgba[dst + 1] = encode_irradiance(rgb[1]);
                         irradiance_volume_rgba[dst + 2] = encode_irradiance(rgb[2]);
-                        irradiance_volume_rgba[dst + 3] = 255;
+                        irradiance_volume_rgba[dst + 3] = 0;
                     }
                 }
             }
@@ -332,6 +332,7 @@ pub(in crate::scene) fn prepare_static_light_grid(
             external_hdr: external_values.is_some(),
             cells: classic_cells,
             map_toward_sun: None,
+            relit: None,
         },
     }))
 }

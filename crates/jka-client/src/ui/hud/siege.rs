@@ -1,7 +1,7 @@
 //! Siege-specific HUD overlays ported from TaystJK/OpenJK semantics.
 
 use crate::ui::{fixed_charset_text, proportional_text, rect, rect_outline, textured_rect_with_source, ProportionalFont, UiSiegeTimerMenu, UiSnapshot, UiVertex};
-use super::extensions::{image_cell_uv_for_count, EXT_IMAGE_TEXTURE_SOURCE};
+use super::extensions::EXT_IMAGE_TEXTURE_SOURCE;
 
 
 /// Parse the same menu and item names consumed by TaystJK's
@@ -145,14 +145,15 @@ pub(crate) fn append_mp_timer_image(images: &mut Vec<String>, menu: Option<&UiSi
     }
 }
 
-fn draw_mp_timer(out: &mut Vec<UiVertex>, text: &str, menu: &UiSiegeTimerMenu, images: &[String], font: Option<&ProportionalFont>, w: u32, h: u32) {
+fn draw_mp_timer(out: &mut Vec<UiVertex>, text: &str, menu: &UiSiegeTimerMenu, images: &[String], uvs: &[([f32; 2], [f32; 2])], font: Option<&ProportionalFont>, w: u32, h: u32) {
     // CG_DrawSiegeDeathTimer anchors to the right using cgs.widthRatioCoef.
     // The framebuffer's Y scale gives the 4:3 virtual coordinate unit.
     let unit = h as f32 / 480.0;
     let x = |virtual_x: f32| w as f32 - (640.0 - virtual_x) * unit;
     if let Some(index) = images.iter().position(|p| p == &menu.frame_shader) {
         let [fx, fy, fw, fh] = menu.frame_rect;
-        let (uv0, uv1) = image_cell_uv_for_count(index, images.len());
+        let (uv0, uv1) = uvs.get(index).copied()
+            .unwrap_or(([0.0, 0.0], [0.0, 0.0]));
         textured_rect_with_source(out, x(fx), fy * unit, fw * unit, fh * unit, uv0, uv1, menu.frame_color, EXT_IMAGE_TEXTURE_SOURCE, w, h);
     }
     if let Some(font) = font {
@@ -213,7 +214,7 @@ pub(in crate::ui) fn build_siege_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, f
 
     if let Some(respawn) = siege.respawn.as_deref() {
         if let Some(menu) = siege.mp_timer.as_ref() {
-            draw_mp_timer(out, respawn, menu, &ui.extension_images, font, w, h);
+            draw_mp_timer(out, respawn, menu, &ui.extension_images, &ui.extension_image_uvs, font, w, h);
         } else if !siege.vote_delay {
             // Other Siege status still has its own separate text presentation.
             centered_text(out, respawn, h as f32 * 0.66, 1.35, [1.0, 0.78, 0.28, 1.0], w, h);

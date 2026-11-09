@@ -183,6 +183,10 @@ pub struct Thunder {
     pub distance: f64,
     pub delay: f64,
     pub loudness: f64,
+    /// Absolute multiplayer serverTime of the strike. None on the original local clock.
+    pub strike_time_ms: Option<i64>,
+    /// A stable bundled sample index shared by clients for this strike.
+    pub sample: Option<u8>,
 }
 
 pub fn thunder_for(kind: StrikeKind, distance: f64) -> Thunder {
@@ -196,6 +200,8 @@ pub fn thunder_for(kind: StrikeKind, distance: f64) -> Thunder {
         distance,
         delay: distance / SOUND_SPEED,
         loudness,
+        strike_time_ms: None,
+        sample: None,
     }
 }
 
@@ -347,6 +353,36 @@ impl LightningScheduler {
         due
     }
 
+    /// Deterministic, seekable multiplayer clock: one independent 25 ms slot.
+    /// Each slot has an exponential/Poisson probability p = 1 - exp(-rate*dt).
+    /// This has no frame-rate dependence, no accumulated RNG history, and is
+    /// reproducible for late joins or demo seeks. At the 30/minute UI maximum,
+    /// limiting a slot to one strike changes the expected rate by < 1%.
+    pub fn at_server_slot(
+        slot: i64,
+        rate_per_minute: f64,
+        origin: Vec3,
+        clouds: StrikeClouds,
+    ) -> Option<(i64, Strike)> {
+        const SLOT_MS: i64 = 25;
+        if rate_per_minute <= 0.0 { return None; }
+        // SplitMix64 gives adjacent slots independent reproducible streams.
+        let mut x = (slot as u64).wrapping_add(0x9e3779b97f4a7c15 ^ 1941);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        let seed = (x ^ (x >> 31)) as u32;
+        let mut rng = Random::new(seed);
+        let probability = -(-rate_per_minute.min(30.0) / 2400.0).exp_m1();
+        if rng.draw() >= probability { return None; }
+        let offset = (rng.draw() * SLOT_MS as f64) as i64;
+        let mut scheduler = Self {
+            rate: rate_per_minute,
+            random: rng,
+            budget: 0.0,
+        };
+        Some((slot * SLOT_MS + offset, scheduler.next(origin, clouds)))
+    }
+
     /// The next strike around `camera`.
     pub fn next(&mut self, camera: Vec3, clouds: StrikeClouds) -> Strike {
         let random = &mut self.random;
@@ -386,6 +422,23 @@ mod tests {
         for expected in [0.7352093060035259, 0.6761041986756027, 0.6805352955125272] {
             assert_eq!(random.draw(), expected);
         }
+    }
+
+    #[test]
+    fn server_slots_repeat_independent_of_frame_rate_or_join_time() {
+        let clouds = StrikeClouds { altitude: 650.0, thickness: 900.0 };
+        let anchor = Vec3::new(120.0, 0.0, 330.0);
+        let slots: Vec<_> = (0..2400).filter_map(|slot| {
+            LightningScheduler::at_server_slot(slot, 30.0, anchor, clouds)
+                .map(|(time, strike)| (time, strike.seed, strike.ground))
+        }).collect();
+        assert!(!slots.is_empty());
+        let replay: Vec<_> = (0..2400).filter_map(|slot| {
+            LightningScheduler::at_server_slot(slot, 30.0, anchor, clouds)
+                .map(|(time, strike)| (time, strike.seed, strike.ground))
+        }).collect();
+        assert_eq!(slots, replay);
+        assert!(slots.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
 
     /// The review page's forced strike (`forceStrike` at (2600, 0, 380), 6 ms, ground, seed 7, a 650 m base), as Bun

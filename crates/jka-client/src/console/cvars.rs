@@ -103,6 +103,50 @@ impl CvarFlags {
     }
 }
 
+/// Adapter for scalar settings whose console, config and archive forms are
+/// identical. Only implement types with a lossless, checked conversion.
+/// Complex/legacy cvars keep explicit adapters in their declaration.
+pub(crate) trait CvarScalar: Copy {
+    fn cvar_value(self) -> CvarValue;
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String>;
+}
+
+impl CvarScalar for bool {
+    fn cvar_value(self) -> CvarValue { CvarValue::Bool(self) }
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String> {
+        match value { CvarValue::Bool(v) => Ok(v), _ => Err("expected boolean cvar".into()) }
+    }
+}
+impl CvarScalar for f32 {
+    fn cvar_value(self) -> CvarValue { CvarValue::Float(self) }
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String> {
+        match value { CvarValue::Float(v) if v.is_finite() => Ok(v), _ => Err("expected finite float cvar".into()) }
+    }
+}
+impl CvarScalar for i32 {
+    fn cvar_value(self) -> CvarValue { CvarValue::Int(self) }
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String> {
+        match value { CvarValue::Int(v) => Ok(v), _ => Err("expected integer cvar".into()) }
+    }
+}
+impl CvarScalar for u8 {
+    fn cvar_value(self) -> CvarValue { CvarValue::Int(self.into()) }
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String> {
+        match value { CvarValue::Int(v) => Self::try_from(v).map_err(|_| "integer exceeds u8 range".into()),
+            _ => Err("expected integer cvar".into()) }
+    }
+}
+
+impl CvarScalar for u32 {
+    fn cvar_value(self) -> CvarValue { CvarValue::Int(i32::try_from(self).expect("u32 cvar exceeds i32 domain")) }
+    fn from_cvar_value(value: CvarValue) -> Result<Self, String> {
+        match value {
+            CvarValue::Int(v) => Self::try_from(v).map_err(|_| "negative integer for u32 cvar".into()),
+            _ => Err("expected integer cvar".into()),
+        }
+    }
+}
+
 pub struct CvarDef<State: 'static> {
     pub entry: Entry,
     pub value_type: CvarType,
@@ -111,6 +155,9 @@ pub struct CvarDef<State: 'static> {
     pub set: fn(&mut State, CvarValue) -> Result<(), String>,
     pub set_text: Option<fn(&mut State, &str, &str) -> Result<(), String>>,
     pub normalize: Option<fn(&str, &str) -> Result<String, String>>,
+    /// Predicate for resource-dependent changes that cannot take effect live.
+    /// Unlike LatchScope, this can depend on the resources currently prepared.
+    pub restart_required: Option<fn(&State) -> bool>,
 }
 
 impl<State> CvarDef<State> {
@@ -141,6 +188,7 @@ impl<State> CvarDef<State> {
             set,
             set_text: None,
             normalize: None,
+            restart_required: None,
         }
     }
 
@@ -156,6 +204,13 @@ impl<State> CvarDef<State> {
         self
     }
 
+    /// Conditional restart contract lives on the cvar declaration rather
+    /// than being independently reinvented in the renderer and menus.
+    pub const fn with_restart_requirement(mut self, required: fn(&State) -> bool) -> Self {
+        self.restart_required = Some(required);
+        self
+    }
+
     pub const fn copy(&self) -> Self {
         Self {
             entry: self.entry,
@@ -165,6 +220,7 @@ impl<State> CvarDef<State> {
             set: self.set,
             set_text: self.set_text,
             normalize: self.normalize,
+            restart_required: self.restart_required,
         }
     }
     pub fn with_default(&self, default: String) -> &'static Self {
@@ -177,6 +233,17 @@ impl<State> CvarDef<State> {
         self.value_type
             .parse(value)
             .map_err(|error| format!("{}: {error}", self.entry.name))
+    }
+
+    /// One validator/normalizer for staged console values. The same
+    /// declaration owns the type, optional legacy text normalization, and
+    /// active setter; staging cannot accept a different syntax by accident.
+    pub fn normalize_for_latch(&self, value: &str) -> Result<String, String> {
+        if let Some(normalize) = self.normalize {
+            normalize(self.entry.name, value)
+        } else {
+            self.parse(value).map(|value| value.to_string())
+        }
     }
 
     pub fn default_value(&self) -> CvarValue {
@@ -198,6 +265,7 @@ impl<State> CvarDef<State> {
             set,
             set_text: None,
             normalize: None,
+            restart_required: None,
         }
     }
 }
@@ -253,6 +321,10 @@ impl<State> CvarRegistry<State> {
     }
     pub fn iter(&self) -> impl Iterator<Item = &'static CvarDef<State>> + '_ {
         self.definitions.iter().copied()
+    }
+    /// Single registry-driven check for resource-dependent restarts.
+    pub fn requires_restart(&self, state: &State) -> bool {
+        self.iter().any(|def| def.restart_required.is_some_and(|required| required(state)))
     }
     #[cfg(test)]
     pub fn archived(&self) -> impl Iterator<Item = &'static CvarDef<State>> + '_ {

@@ -167,6 +167,7 @@ impl Renderer {
                 bytemuck::cast_slice(&world.static_ao_gpu_vertices),
             );
         }
+        self.reapply_baked_vertex_sky();
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 //! Prepare.
 use crate::scene::{
-    append_authored_ocean_planes, append_material_batches, assign_planar_reflection_planes,
+    append_authored_ocean_planes, append_material_batches, append_static_lightstyle_batch,
+    static_extra_lightstyle_eligible, assign_planar_reflection_planes,
     assign_reflection_probes, authored_sun, bsp_brush_entities, bsp_dynamic_lights, bsp_fx_runners,
     bsp_global_fog_num, bsp_global_fog_params, bsp_physics_collision_mesh,
     bsp_portal_surface_anchors, bsp_sky_portal, bsp_surface_lights, bsp_weather_occlusion_source,
@@ -491,6 +492,7 @@ pub(in crate::scene) fn prepare_internal(
     let sky_portal = bsp_sky_portal(&bsp);
     let global_fog_num = bsp_global_fog_num(&bsp);
     let global_fog = bsp_global_fog_params(&bsp, &library);
+    let local_fogs = crate::weather::fog::bsp_local_fog_volumes(&bsp, &library);
     if let Some(fog) = global_fog {
         devprintln!(
             1,
@@ -948,15 +950,22 @@ pub(in crate::scene) fn prepare_internal(
     // lightmaps, vertex lighting and fog exactly like the world's.
     let batch_geometry = |mesh: &jka_assets::bsp::Mesh,
                           batch_index: usize,
-                          batch: &jka_assets::bsp::DrawBatch|
+                          batch: &jka_assets::bsp::DrawBatch,
+                          style_slot: usize|
      -> Option<(GroupKey, WorldGeometryChunk)> {
         let material = &surface_materials[batch.shader];
         if material.hidden {
             return None;
         }
         let surface = &bsp.surfaces[batch.surface];
-        let lightmap_slot =
-            (0..4).find(|&i| batch.lightmaps[i] >= 0 && batch.lightmap_styles[i] < 254);
+        let lightmap_slot = if style_slot == 0 {
+            (0..4).find(|&i| batch.lightmaps[i] >= 0 && batch.lightmap_styles[i] < 254)
+        } else {
+            // Extra normal styles must use *their own* q3map2 UV channel and
+            // lightmap page. Never accidentally sample the first style's UVs.
+            static_extra_lightstyle_eligible(material, batch, style_slot, false)
+                .then_some(style_slot)
+        };
         let vertex_lit_slot = (0..4)
             .find(|&i| batch.lightmaps[i] == LIGHTMAP_BY_VERTEX && surface.vertex_styles[i] < 254);
         // TaystJK's R_FindLightmaps falls back for the entire shader if ANY
@@ -968,6 +977,9 @@ pub(in crate::scene) fn prepare_internal(
                 && missing_external_lightmaps.contains(&(batch.lightmaps[i] as usize))
         });
         let vertex_lit = vertex_lit_slot.is_some() || missing_lightmap;
+        if style_slot != 0 && (vertex_lit || lightmap_slot.is_none()) {
+            return None;
+        }
         if material_render_is_guaranteed_discarded(material, vertex_lit) {
             invisible_render_culled_batches.fetch_add(1, AtomicOrdering::Relaxed);
             invisible_render_culled_triangles
@@ -1034,15 +1046,15 @@ pub(in crate::scene) fn prepare_internal(
             }
         }
 
-        // The authored BSP triangles are already expanded into a non-indexed
-        // stream. Do NOT rotate the whole material/PVS batch: one tree quad
-        // must pivot independently of the next. Encode each consecutive pair
-        // before batching, retaining original vertices for malformed pairs.
-        // This packing uses the (unused) lightmap UV on no-lightmap billboards.
-        if material.auto_sprite2 && lightmap_slot.is_none() {
-            for quad in geometry.chunks_exact_mut(6) {
-                super::geometry::encode_autosprite2_quad(quad);
-            }
+        // TaystJK treats each quad independently, not each shader batch.
+        // Pair triangles by their actual shared BSP edge; a compiler may
+        // interleave the triangles of several quads. Packed billboard data
+        // costs no extra GPU vertex bytes and is ignored by normal PSOs.
+        // A different encoding preserves true UVs on lightmapped quads.
+        if material.auto_sprite || material.auto_sprite2 {
+            super::geometry::prepare_billboard_quads(
+                &mut geometry, material.auto_sprite, lightmap_slot.is_some(),
+            );
         }
 
         let has_environment_stage = material_has_promotable_environment_stage(material);
@@ -1065,6 +1077,7 @@ pub(in crate::scene) fn prepare_internal(
             // Fixed-point keeps GroupKey totally ordered without f32 NaNs.
             sort_priority: super::material_batches::effective_material_sort(material),
             shader: batch.shader,
+            lightstyle_slot: style_slot as u8,
             lightmap,
             vertex_lit,
             color_slot,
@@ -1176,7 +1189,16 @@ pub(in crate::scene) fn prepare_internal(
             .enumerate()
             .map(|(batch_index, batch)| {
                 crate::thread_activity::label_rayon_worker();
-                let (key, chunk) = batch_geometry(&mesh, batch_index, batch)?;
+                let primary = batch_geometry(&mesh, batch_index, batch, 0)?;
+                // Extra geometry only for static LS_NORMAL styles. Dynamic
+                // styles require server-driven style color, handled separately.
+                let material = &surface_materials[batch.shader];
+                // Nearly all BSPs use a single lightmap. Gate expensive quad
+                // expansion before entering batch_geometry for extra slots.
+                let additional = (1..4)
+                    .filter(|&slot| static_extra_lightstyle_eligible(material, batch, slot, false))
+                    .filter_map(|style| batch_geometry(&mesh, batch_index, batch, style))
+                    .collect::<Vec<_>>();
                 let signature_started = Instant::now();
                 let signature = bsp
                     .visibility
@@ -1189,29 +1211,29 @@ pub(in crate::scene) fn prepare_internal(
                     .as_ref()
                     .and_then(|vis| vis.surface_area_masks.get(batch.surface).copied())
                     .unwrap_or([0_u64; 4]);
-                Some((key, chunk, signature, area_signature, signature_elapsed))
+                Some((primary, additional, signature, area_signature, signature_elapsed))
             })
             .collect::<Vec<_>>()
     };
-    for (key, batch_geometry, signature, area_signature, signature_elapsed) in
+    for (primary, additional, signature, area_signature, signature_elapsed) in
         walked.into_iter().flatten()
     {
         signature_time += signature_elapsed;
-        triangles += batch_geometry.vertices.len() / 3;
-        let chunk = groups
-            .entry(key)
-            .or_default()
-            .by_pvs_signature
-            .entry((signature, area_signature))
-            .or_default();
-        let offset = chunk.vertices.len() as u32;
-        chunk.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
-            patch.vertices.start += offset; patch.vertices.end += offset; patch
-        }));
-        chunk.vertices.extend_from_slice(&batch_geometry.vertices);
-        chunk
-            .surface_ids
-            .extend_from_slice(&batch_geometry.surface_ids);
+        for (key, batch_geometry) in std::iter::once(primary).chain(additional) {
+            triangles += batch_geometry.vertices.len() / 3;
+            let chunk = groups
+                .entry(key)
+                .or_default()
+                .by_pvs_signature
+                .entry((signature.clone(), area_signature))
+                .or_default();
+            let offset = chunk.vertices.len() as u32;
+            chunk.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
+                patch.vertices.start += offset; patch.vertices.end += offset; patch
+            }));
+            chunk.vertices.extend_from_slice(&batch_geometry.vertices);
+            chunk.surface_ids.extend_from_slice(&batch_geometry.surface_ids);
+        }
     }
     let walk_ms = walk_stage.elapsed().as_secs_f64() * 1000.0;
 
@@ -1292,19 +1314,19 @@ pub(in crate::scene) fn prepare_internal(
             // OpenJK clips the sky from visible BSP surfaces, not the union of
             // every surface that happens to share a material.
             let stage_start = pvs_batches.len();
-            append_material_batches(
-                &mut pvs_batches,
-                material,
-                key.shader,
-                material_debug_index,
-                key.vertex_lit,
-                piece_start..piece_end,
-                key.lightmap,
-                &signature,
-                area_signature,
-                fog,
-                fog_is_global,
-            );
+            if key.lightstyle_slot == 0 {
+                append_material_batches(
+                    &mut pvs_batches, material, key.shader, material_debug_index,
+                    key.vertex_lit, piece_start..piece_end, key.lightmap,
+                    &signature, area_signature, fog, fog_is_global,
+                );
+            } else {
+                append_static_lightstyle_batch(
+                    &mut pvs_batches, material, key.shader, material_debug_index,
+                    key.lightstyle_slot, piece_start..piece_end, key.lightmap,
+                    &signature, area_signature, fog, fog_is_global,
+                );
+            }
             recover_impossible_masked_depth_seed(
                 &mut pvs_batches[stage_start..], &piece.vertices,
             );
@@ -1327,19 +1349,19 @@ pub(in crate::scene) fn prepare_internal(
             global_fog,
         );
         let stage_start = batches.len();
-        append_material_batches(
-            &mut batches,
-            material,
-            key.shader,
-            material_debug_index,
-            key.vertex_lit,
-            coarse_start..coarse_end,
-            key.lightmap,
-            &coarse_signature,
-            coarse_area_signature,
-            fog,
-            fog_is_global,
-        );
+        if key.lightstyle_slot == 0 {
+            append_material_batches(
+                &mut batches, material, key.shader, material_debug_index,
+                key.vertex_lit, coarse_start..coarse_end, key.lightmap,
+                &coarse_signature, coarse_area_signature, fog, fog_is_global,
+            );
+        } else {
+            append_static_lightstyle_batch(
+                &mut batches, material, key.shader, material_debug_index,
+                key.lightstyle_slot, coarse_start..coarse_end, key.lightmap,
+                &coarse_signature, coarse_area_signature, fog, fog_is_global,
+            );
+        }
         recover_impossible_masked_depth_seed(
             &mut batches[stage_start..],
             &vertices[coarse_start as usize..coarse_end as usize],
@@ -1374,15 +1396,22 @@ pub(in crate::scene) fn prepare_internal(
             let mut model_groups: BTreeMap<GroupKey, WorldGeometryChunk> = BTreeMap::new();
             for batch_index in start..end {
                 let batch = &inline_mesh.batches[batch_index];
-                if let Some((key, batch_geometry)) =
-                    batch_geometry(&inline_mesh, batch_index, batch)
-                {
-                    let group = model_groups.entry(key).or_default();
-                    let offset = group.vertices.len() as u32;
-                    group.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
-                        patch.vertices.start += offset; patch.vertices.end += offset; patch
-                    }));
-                    group.vertices.extend_from_slice(&batch_geometry.vertices);
+                for slot in 0..4 {
+                    if slot != 0 && !static_extra_lightstyle_eligible(
+                        &surface_materials[batch.shader], batch, slot, false,
+                    ) {
+                        continue;
+                    }
+                    if let Some((key, batch_geometry)) =
+                        batch_geometry(&inline_mesh, batch_index, batch, slot)
+                    {
+                        let group = model_groups.entry(key).or_default();
+                        let offset = group.vertices.len() as u32;
+                        group.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
+                            patch.vertices.start += offset; patch.vertices.end += offset; patch
+                        }));
+                        group.vertices.extend_from_slice(&batch_geometry.vertices);
+                    }
                 }
             }
             let vertex_start = u32::try_from(inline_vertices.len())
@@ -1416,19 +1445,19 @@ pub(in crate::scene) fn prepare_internal(
                     global_fog,
                 );
                 let stage_start = inline_batches.len();
-                append_material_batches(
-                    &mut inline_batches,
-                    material,
-                    key.shader,
-                    material_debug_index,
-                    key.vertex_lit,
-                    range_start..range_end,
-                    key.lightmap,
-                    &[],
-                    [0_u64; 4],
-                    fog,
-                    fog_is_global,
-                );
+                if key.lightstyle_slot == 0 {
+                    append_material_batches(
+                        &mut inline_batches, material, key.shader, material_debug_index,
+                        key.vertex_lit, range_start..range_end, key.lightmap,
+                        &[], [0_u64; 4], fog, fog_is_global,
+                    );
+                } else {
+                    append_static_lightstyle_batch(
+                        &mut inline_batches, material, key.shader, material_debug_index,
+                        key.lightstyle_slot, range_start..range_end, key.lightmap,
+                        &[], [0_u64; 4], fog, fog_is_global,
+                    );
+                }
                 recover_impossible_masked_depth_seed(
                     &mut inline_batches[stage_start..], &group_vertices,
                 );
@@ -2124,6 +2153,7 @@ pub(in crate::scene) fn prepare_internal(
         surface_sprite_effects,
         surface_sprite_bake,
         global_fog,
+        local_fogs,
         warnings,
         spawns,
         fx_runners,

@@ -379,10 +379,10 @@ fn shader_source(skin: bool) -> Result<String, String> {
             1,
         );
         source = source.replace(
-            "lit_color(input.normal, tex) * input.color",
+            "lit_color(input.normal, input.world_position, tex) * input.color",
             "fixture_color(input, tex)",
         );
-        source.push_str("\nfn fixture_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {\n let base = lit_color(input.normal,tex)*input.color;\n return vec4(base.rgb + tex.rgb*input.fixture_raw.rgb*bitcast<f32>(entity_lighting.values.y)*fixture_irradiance(input.world_position,input.normal),base.a);\n}\n");
+        source.push_str("\nfn fixture_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {\n let base = lit_color(input.normal,input.world_position,tex)*input.color;\n return vec4(base.rgb + tex.rgb*input.fixture_raw.rgb*bitcast<f32>(entity_lighting.values.y)*fixture_irradiance(input.world_position,input.normal),base.a);\n}\n");
     }
     source.push_str(
         &include_str!("fixture_lighting.wgsl")

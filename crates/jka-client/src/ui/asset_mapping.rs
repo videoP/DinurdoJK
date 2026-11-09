@@ -354,7 +354,7 @@ fn neon_stroke(out:&mut Vec<UiVertex>, a:[f32;2], b:[f32;2], thick:f32,
     let ny=dx/distance*thick*0.5;
     let point=|x:f32,y:f32|UiVertex {
         position:[x/w.max(1) as f32*2.0-1.0,1.0-y/h.max(1) as f32*2.0],
-        uv:[0.0,0.0],color,textured:0.0,
+        uv:[0.0,0.0],color:UiVertex::pack_color(color),textured:0.0,
     };
     let v0=point(a[0]+nx,a[1]+ny);
     let v1=point(a[0]-nx,a[1]-ny);
@@ -449,7 +449,7 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
         if state.values[i].is_empty() && !active {
             line(out,&font,[row.edit[0]+10.0*s,row.edit[1],row.edit[2]-20.0*s,row.edit[3]],match i {
                 0=>"Default / EXE directory",
-                2=>"Default / JK2 GameData beside EXE",
+                2=>"Not set / JK2 disabled",
                 4=>"Empty = disabled",
                 _=>"Not configured",
             },18.0*s,DIM);

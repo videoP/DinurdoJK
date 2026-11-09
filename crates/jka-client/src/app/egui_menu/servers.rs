@@ -192,14 +192,41 @@ impl App {
             match self.server_browser_rx.try_recv() {
                 Ok(tagged) => {
                     let protocol = tagged.protocol;
-                    let completed_server_info = match &tagged.event {
+                    // /serverstatus is an independent console query. Consume it
+                    // without touching browser selection, details or clipboard.
+                    let event = match tagged.event {
+                        BrowserEvent::ConsoleServerStatus { address, result } => {
+                            match result {
+                                Ok(status) => {
+                                    let output = server_browser::format_openjk_server_status(&status);
+                                    for line in output.lines() {
+                                        crate::logging::write_line(
+                                            crate::logging::Level::Info,
+                                            format_args!("{line}"),
+                                        );
+                                    }
+                                    self.sync_console_log();
+                                    if self.overlay == crate::ui::OverlayMode::Console {
+                                        self.publish_ui();
+                                    }
+                                }
+                                Err(error) => self.push_console_error(format!(
+                                    "^1serverstatus {address}: {error}"
+                                )),
+                            }
+                            changed = true;
+                            continue;
+                        }
+                        event => event,
+                    };
+                    let completed_server_info = match &event {
                         BrowserEvent::ServerInfo(status) => Some((
                             status.address,
                             server_browser::format_server_status(status),
                         )),
                         _ => None,
                     };
-                    self.server_browser_for_mut(protocol).handle_event(tagged.event);
+                    self.server_browser_for_mut(protocol).handle_event(event);
                     if let Some((address, dump)) = completed_server_info {
                         // `Get server info` is an explicit fresh getstatus request.
                         // Copy the complete result and mirror the same text into
@@ -364,6 +391,8 @@ impl App {
         if self.server_browser_for(protocol).servers.get(&address)
             .is_some_and(|server| server.need_password)
             && self.network.password.is_empty()
+            && !crate::credential_store::server_password(address)
+                .is_ok_and(|password| password.is_some())
         {
             // Retain the JK2 version in the pending password dialog.
             self.show_server_password_prompt(

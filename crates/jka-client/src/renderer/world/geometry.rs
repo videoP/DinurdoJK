@@ -4,6 +4,37 @@ use crate::renderer::{
     WorldBatchSet, WorldDrawGroup,
 };
 
+pub(in crate::renderer) fn billboard_radius(vertex: &GpuVertex) -> f32 {
+    if vertex.normal[2] == -1337.0 { vertex.normal[0].hypot(vertex.normal[1]) }
+    else if vertex.lightmap_uv[1] == -1337.0 { vertex.lightmap_uv[0].abs() }
+    else if vertex.normal[2] > 2048.0 { (vertex.normal[2] - 8192.0).abs() }
+    else { 0.0 }
+}
+
+fn pose_inline_vertex(vertex: &GpuVertex, pose: InlineModelInstance) -> GpuVertex {
+    let mut out = *vertex;
+    out.position = pose.transform_point(vertex.position);
+    // autoSprite's normal is signed billboard offsets and a tag, not a normal.
+    // TaystJK cancels the entity rotation when constructing camera-facing axes.
+    if vertex.normal[2] == -1337.0 { return out; }
+    if vertex.normal[2] > 2048.0 {
+        // Lightmapped autoSprite2 stores an octahedral long axis plus width/tag.
+        let [x,y] = [vertex.normal[0],vertex.normal[1]];
+        let mut axis = [x,y,1.0-x.abs()-y.abs()];
+        if axis[2] < 0.0 {
+            axis[0]=(1.0-y.abs())*x.signum();
+            axis[1]=(1.0-x.abs())*y.signum();
+        }
+        let axis = pose.transform_normal(axis);
+        let sum = axis.iter().map(|v| v.abs()).sum::<f32>().max(1e-20);
+        let n = axis.map(|v| v/sum);
+        let oct = if n[2]>=0.0 {[n[0],n[1]]}
+            else {[(1.0-n[1].abs())*n[0].signum(),(1.0-n[0].abs())*n[1].signum()]};
+        out.normal = [oct[0],oct[1],vertex.normal[2]];
+    } else { out.normal = pose.transform_normal(vertex.normal); }
+    out
+}
+
 /// Transform real, present inline model geometry. Hidden models never call
 /// this function: they retain their existing vertex storage and are culled
 /// by explicit visibility, not collapsed into zero-area triangles.
@@ -16,12 +47,11 @@ pub(in crate::renderer) fn posed_inline_vertices(
     let vertices = base
         .iter()
         .map(|vertex| {
-            let mut out = *vertex;
-            out.position = pose.transform_point(vertex.position);
-            out.normal = pose.transform_normal(vertex.normal);
+            let out = pose_inline_vertex(vertex, pose);
+            let radius = billboard_radius(&out);
             for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(out.position[axis]);
-                maximum[axis] = maximum[axis].max(out.position[axis]);
+                minimum[axis] = minimum[axis].min(out.position[axis] - radius);
+                maximum[axis] = maximum[axis].max(out.position[axis] + radius);
             }
             out
         })
@@ -54,12 +84,11 @@ pub(in crate::renderer) fn posed_inline_vertices_workers(
                 let mut minimum = [f32::INFINITY; 3];
                 let mut maximum = [f32::NEG_INFINITY; 3];
                 for (vertex, out) in source.iter().zip(destination) {
-                    *out = *vertex;
-                    out.position = pose.transform_point(vertex.position);
-                    out.normal = pose.transform_normal(vertex.normal);
+                    *out = pose_inline_vertex(vertex, pose);
+                    let radius = billboard_radius(out);
                     for axis in 0..3 {
-                        minimum[axis] = minimum[axis].min(out.position[axis]);
-                        maximum[axis] = maximum[axis].max(out.position[axis]);
+                        minimum[axis] = minimum[axis].min(out.position[axis] - radius);
+                        maximum[axis] = maximum[axis].max(out.position[axis] + radius);
                     }
                 }
                 (minimum, maximum)
@@ -76,29 +105,9 @@ pub(in crate::renderer) fn make_cull_record(
     vertices: &[GpuVertex],
     index_range: &std::ops::Range<u32>,
 ) -> GpuCullRecord {
-    let start = usize::try_from(source.vertices.start).unwrap_or(usize::MAX);
-    let end = usize::try_from(source.vertices.end)
-        .unwrap_or(usize::MAX)
-        .min(vertices.len());
-    let mut minimum = [f32::INFINITY; 3];
-    let mut maximum = [f32::NEG_INFINITY; 3];
-    if start < end {
-        for vertex in &vertices[start..end] {
-            for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(vertex.position[axis]);
-                maximum[axis] = maximum[axis].max(vertex.position[axis]);
-            }
-        }
-    } else {
-        minimum = [0.0; 3];
-        maximum = [0.0; 3];
-    }
-    if source.foliage_wind {
-        for axis in 0..3 {
-            minimum[axis] -= crate::foliage::BOUNDS_PADDING;
-            maximum[axis] += crate::foliage::BOUNDS_PADDING;
-        }
-    }
+    // Billboard positions contain centers; their packed offsets must contribute
+    // to the bounds used by both CPU frustum checks and GPU indirect culling.
+    let (minimum, maximum) = scene::auto4_source_bounds(source, vertices);
     GpuCullRecord {
         minimum: [minimum[0], minimum[1], minimum[2], 0.0],
         maximum: [maximum[0], maximum[1], maximum[2], 0.0],

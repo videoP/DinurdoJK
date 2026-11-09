@@ -177,6 +177,11 @@ pub struct HazeState {
 pub struct Weather {
     tier: quality::CloudTier,
     scheduler: LightningScheduler,
+    /// None outside a live multiplayer/demo server clock.
+    sync_server_time_ms: Option<i64>,
+    sync_origin: Vec3,
+    last_sync_time_ms: Option<i64>,
+    active_sync_strike_ms: Option<i64>,
     active: Option<Strike>,
     bolt_visible: bool,
     channel_count: u32,
@@ -583,6 +588,10 @@ impl Weather {
         let mut weather = Self {
             tier: quality::tier(quality),
             scheduler: LightningScheduler::new(1941),
+            sync_server_time_ms: None,
+            sync_origin: Vec3::ZERO,
+            last_sync_time_ms: None,
+            active_sync_strike_ms: None,
             active: None,
             bolt_visible: false,
             channel_count: 0,
@@ -705,6 +714,20 @@ impl Weather {
         self.splash_uniforms.grey = grey;
         self.haze.grey = grey;
         self.splash_uniforms.size = (0.5 + 0.5 * self.precipitation.sqrt()) as f32;
+    }
+
+    /// Use JKA's actual presentation serverTime, not elapsed wall time or frame dt.
+    /// When absent, preserve the upstream seeded local Poisson scheduler.
+    pub fn set_server_time_ms(&mut self, time: Option<i64>, origin: Vec3) {
+        if self.sync_server_time_ms.is_some() != time.is_some()
+            || (time.is_some() && self.sync_origin != origin)
+        {
+            self.clear_strike();
+            self.last_sync_time_ms = None;
+            self.active_sync_strike_ms = None;
+        }
+        self.sync_server_time_ms = time;
+        self.sync_origin = origin;
     }
 
     /// Diagnostics (`forceStrike`): fire a flash of `kind` at `position` (where a ground bolt meets the sea) and show
@@ -902,6 +925,11 @@ impl Weather {
     }
 
     fn update_lightning(&mut self, queue: &mut UploadSink<'_>, camera: Vec3, dt: f64) {
+        if let Some(now_ms) = self.sync_server_time_ms {
+            self.update_lightning_synced(queue, now_ms);
+            self.update_lightning_light(camera);
+            return;
+        }
         let due = self.scheduler.advance(dt);
         let mut fresh = false;
         for _ in 0..due {
@@ -920,6 +948,73 @@ impl Weather {
         if self.active.as_ref().is_some_and(Strike::done) {
             self.active = None;
         }
+        self.update_lightning_light(camera);
+    }
+
+    /// Shared server-time storm. The normal frame path checks only crossed
+    /// slots. Late joins and seeks additionally recover a visible flash and
+    /// thunders which have not yet reached their server-time deadline.
+    fn update_lightning_synced(&mut self, queue: &mut UploadSink<'_>, now_ms: i64) {
+        const SLOT_MS: i64 = 25;
+        // The upstream maximum audible range is 22 km / 343 m/s = 64.14 s.
+        const THUNDER_LOOKBACK_MS: i64 = 65_000;
+        let previous = self.last_sync_time_ms.replace(now_ms);
+        let continuous = previous.is_some_and(|prev| now_ms >= prev && now_ms - prev <= 2000);
+        let from_ms = if continuous { previous.unwrap() } else { now_ms.saturating_sub(THUNDER_LOOKBACK_MS).max(0) };
+        if !continuous {
+            self.active = None;
+            self.active_sync_strike_ms = None;
+        }
+        // Strike placement has a fixed map-world anchor, not each client's
+        // independently-moving camera; sound delay and sample are shared too.
+        let origin = self.sync_origin;
+        let mut latest_seek = None;
+        for slot in from_ms.div_euclid(SLOT_MS)..=now_ms.div_euclid(SLOT_MS) {
+            let Some((strike_ms, strike)) = LightningScheduler::at_server_slot(
+                slot, self.scheduler.rate, origin, self.clouds,
+            ) else { continue; };
+            if strike_ms > now_ms || (continuous && strike_ms <= from_ms) { continue; }
+            if continuous {
+                let sample = (strike.seed % 5) as u8;
+                self.show(queue, strike, true);
+                if let Some(cue) = self.thunder.last_mut() {
+                    cue.strike_time_ms = Some(strike_ms);
+                    cue.sample = Some(sample);
+                }
+                self.active_sync_strike_ms = Some(strike_ms);
+            } else {
+                // A player joining after the visible flash can still hear its
+                // pending thunder at the SAME serverTime as everyone already
+                // connected. Never replay a sound whose deadline has passed.
+                let mut cue = lightning::thunder_for(strike.kind, strike.distance);
+                let due_ms = strike_ms + (cue.delay * 1000.0).round() as i64;
+                if due_ms >= now_ms {
+                    cue.strike_time_ms = Some(strike_ms);
+                    cue.sample = Some((strike.seed % 5) as u8);
+                    self.thunder.push(cue);
+                }
+                if (now_ms - strike_ms) as f64 * 0.001 < strike.duration {
+                    latest_seek = Some((strike_ms, strike));
+                }
+            }
+        }
+        if let Some((strike_ms, strike)) = latest_seek {
+            self.show(queue, strike, false);
+            self.active_sync_strike_ms = Some(strike_ms);
+        }
+        if let (Some(active), Some(start_ms)) = (&mut self.active, self.active_sync_strike_ms) {
+            let from = (previous.unwrap_or(start_ms).max(start_ms) - start_ms) as f64 * 0.001;
+            let to = (now_ms - start_ms).max(0) as f64 * 0.001;
+            active.age = to;
+            active.expose(from.min(to), to);
+            if active.done() {
+                self.active = None;
+                self.active_sync_strike_ms = None;
+            }
+        }
+    }
+
+    fn update_lightning_light(&mut self, camera: Vec3) {
         self.bolt_visible = false;
         let Some(active) = &self.active else {
             self.light = WeatherLight::default();

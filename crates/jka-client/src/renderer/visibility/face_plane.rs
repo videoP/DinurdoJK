@@ -87,7 +87,8 @@ pub(in crate::renderer) fn authored_face_runs(
 ) -> Vec<FacePlaneRun> {
     // Runs also carry per-surface bounds for the water cull, so cull-none and
     // transparent surfaces get them too (with no plane, they are never face-culled).
-    if runs.is_empty() || source.pipeline.offset || source.water_deformed || source.water_primary || source.foliage_wind
+    if runs.is_empty() || source.pipeline.offset || source.pipeline.deform_move || source.pipeline.auto_sprite
+        || source.pipeline.auto_sprite2 || source.water_deformed || source.water_primary || source.foliage_wind
         || source.pipeline.class == DrawClass::Sky
     { return Vec::new(); }
     let planar = source.pipeline.cull != CullMode::None && source.pipeline.class != DrawClass::Transparent;

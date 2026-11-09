@@ -1,4 +1,5 @@
 //! Editors.
+use crate::app::hud_edit_history;
 use crate::app::egui_menu::{
     scene, theme, ui, App, HudElementId, HudLayout, MapEditTool, OverlayMode,
 };
@@ -37,6 +38,41 @@ impl App {
             root.max_rect().min,
             egui::vec2(to_points(size.width as f32), to_points(size.height as f32)),
         );
+
+        // HUD Edit owns these shortcuts while the overlay is open.
+        let (undo_key, redo_key) = root.input(|input| {
+            let ctrl = input.modifiers.ctrl && !input.modifiers.alt;
+            (ctrl && !input.modifiers.shift && input.key_pressed(egui::Key::Z),
+             ctrl && (input.key_pressed(egui::Key::Y)
+                 || (input.modifiers.shift && input.key_pressed(egui::Key::Z))))
+        });
+        if undo_key || redo_key {
+            let current = hud_edit_history::HudEditState {
+                layout: self.hud_layout,
+                extension_placements: self.extensions.hud_layouts.clone(),
+            };
+            let restored = if undo_key {
+                self.hud_edit_history.undo(current)
+            } else {
+                self.hud_edit_history.redo(current)
+            };
+            if let Some(state) = restored {
+                self.hud_layout = state.layout;
+                self.extensions.hud_layouts = state.extension_placements;
+                self.extensions.save_widget_layouts();
+                self.publish_extension_hud_editor_state();
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.hud_edit_drag_origin = None;
+                self.hud_edit_chat_resize_origin = None;
+                self.hud_edit_chat_resize_corner = None;
+            }
+        }
+        // Snapshot prior to this frame's drag, resize, toolbar, and reset edits.
+        let frame_before = hud_edit_history::HudEditState {
+            layout: self.hud_layout,
+            extension_placements: self.extensions.hud_layouts.clone(),
+        };
 
         // Recover from a drag that was interrupted by focus loss, reset, or an
         // egui ownership change. A stale resize state must never disable chat
@@ -546,7 +582,12 @@ impl App {
         let mut selected_scale = self
             .hud_edit_selected
             .map(|id| self.hud_layout.element(id).scale)
+            .or_else(|| self.hud_edit_extension_selected.as_ref().and_then(|key| {
+                self.extensions.hud_widgets.iter().any(|widget| &widget.key == key)
+                    .then(|| self.extensions.widget_placement(key).scale)
+            }))
             .unwrap_or(1.0);
+        let mut extension_layout_changed = false;
         egui::Area::new(egui::Id::new("jka_hud_edit_toolbar"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 14.0))
             .order(egui::Order::Foreground)
@@ -570,7 +611,9 @@ impl App {
                                 layout_changed = true;
                             }
                             ui.separator();
-                            ui.add_enabled_ui(self.hud_edit_selected.is_some(), |ui| {
+                            ui.add_enabled_ui(
+                                self.hud_edit_selected.is_some() || self.hud_edit_extension_selected.is_some(),
+                                |ui| {
                                 ui.label("Scale");
                                 if ui
                                     .add(
@@ -596,7 +639,7 @@ impl App {
                             theme::label(
                                 ui,
                                 theme::plain(
-                                    "Drag snaps actual panel edges to grid and nearby panels (align/touch). Wheel/Scale snaps dimensions to the grid; chat corners snap bounds and nearby sizes. ALT bypasses; arrows nudge 1 px, SHIFT+arrows use grid step.",
+                                    "Drag snaps actual panel edges to grid and nearby panels (align/touch). Wheel/Scale snaps dimensions to the grid; chat corners snap bounds and nearby sizes. ALT bypasses; arrows nudge 1 px, SHIFT+arrows use grid step. CTRL+Z undo, CTRL+Y redo.",
                                     10.5,
                                     theme::TEXT_FAINT(),
                                 ),
@@ -653,6 +696,20 @@ impl App {
             }
         }
 
+        // The main HUD Edit toolbar must also scale the selected extension.
+        // Extension placement is persisted separately in hud-layout.toml.
+        if let Some(key) = self.hud_edit_extension_selected.as_deref() {
+            if self.extensions.hud_widgets.iter().any(|widget| widget.key == key) {
+                let mut placement = self.extensions.widget_placement(key);
+                let scale = selected_scale.clamp(0.5, 2.0);
+                if placement.scale != scale {
+                    placement.scale = scale;
+                    self.extensions.set_widget_placement(key, placement);
+                    extension_layout_changed = true;
+                }
+            }
+        }
+
         // HUD editor invariant: the resizable chat rectangle remains on-screen.
         // This also clamps a dragged box immediately instead of allowing it to
         // disappear and relying on a later reset to recover it.
@@ -688,12 +745,16 @@ impl App {
             if let Some(selected) = self.hud_edit_selected {
                 self.hud_layout.reset_element(selected);
                 self.hud_layout.align_reset_element_to_grid(selected, &rect_ctx, size.width, size.height);
-                self.hud_edit_drag_origin = None;
-                self.hud_edit_drag_delta = [0.0, 0.0];
-                self.hud_edit_chat_resize_origin = None;
-                self.hud_edit_chat_resize_corner = None;
                 layout_changed = true;
+            } else if let Some(key) = self.hud_edit_extension_selected.as_deref() {
+                // Removing the override restores even a nonzero default offset
+                // declared with hud_register(..., anchor, x, y).
+                extension_layout_changed |= self.extensions.reset_widget_placement(key);
             }
+            self.hud_edit_drag_origin = None;
+            self.hud_edit_drag_delta = [0.0, 0.0];
+            self.hud_edit_chat_resize_origin = None;
+            self.hud_edit_chat_resize_corner = None;
         }
         if reset_all {
             // Reset must normalize the on-screen bounds of *every* element;
@@ -701,16 +762,34 @@ impl App {
             // `Default` values when the first pass ran.
             self.hud_layout = HudLayout::default();
             self.hud_layout.align_default_elements_to_grid(&rect_ctx, size.width, size.height);
+            extension_layout_changed |= self.extensions.reset_all_widget_placements();
             self.hud_edit_drag_origin = None;
             self.hud_edit_drag_delta = [0.0, 0.0];
             self.hud_edit_chat_resize_origin = None;
             self.hud_edit_chat_resize_corner = None;
             layout_changed = true;
         }
+        if extension_layout_changed {
+            self.extensions.save_widget_layouts();
+            self.publish_extension_hud_editor_state();
+        }
         if layout_changed {
             self.mark_config_dirty();
             self.publish_ui();
             self.egui_repaint_requested = true;
+        }
+        // A slider, pointer drag, or corner resize is a single undo action,
+        // no matter how many rendered frames it takes. Resets and key nudges
+        // are recorded exactly like extension widget edits.
+        let frame_after = hud_edit_history::HudEditState {
+            layout: self.hud_layout,
+            extension_placements: self.extensions.hud_layouts.clone(),
+        };
+        if frame_after != frame_before {
+            self.hud_edit_history.mark_changed(frame_before);
+        }
+        if close_editor || !root.input(|input| input.pointer.primary_down()) {
+            self.hud_edit_history.commit(&frame_after);
         }
         if close_editor {
             self.hud_edit_drag_origin = None;
@@ -1050,7 +1129,7 @@ impl App {
             if widgets.iter().any(|w|w.key==id) {
                 let mut p=self.extensions.widget_placement(&id);
                 let old=p;
-                let anchor=self.extensions.widget_anchor(&id);
+                let mut reset_widget=false;
                 egui::Area::new(egui::Id::new("extension_hud_toolbar"))
                     .anchor(egui::Align2::CENTER_BOTTOM,egui::vec2(0.0,-15.0))
                     .order(egui::Order::Foreground)
@@ -1062,28 +1141,42 @@ impl App {
                                 ui.checkbox(&mut p.visible,"Visible");
                                 ui.label("Scale");
                                 ui.add(egui::Slider::new(&mut p.scale,0.5..=2.0));
-                                if ui.button("RESET").clicked() { p=crate::extensions::HudPlacement::for_anchor(anchor); }
+                                if ui.button("RESET").clicked() { reset_widget=true; }
                             });
                         });
                     });
-                let scroll=root.input(|i|i.smooth_scroll_delta.y);
-                if scroll.abs()>f32::EPSILON {
-                    p.scale=(p.scale+scroll*0.0025).clamp(0.5,2.0);
-                }
-                if p!=old {
-                    self.extensions.set_widget_placement(&id,p);
-                    save_layout=true; visual_changed=true;
+                if reset_widget {
+                    if self.extensions.reset_widget_placement(&id) {
+                        save_layout=true; visual_changed=true;
+                    }
+                    self.hud_edit_drag_origin=None;
+                } else {
+                    let scroll=root.input(|i|i.smooth_scroll_delta.y);
+                    if scroll.abs()>f32::EPSILON {
+                        p.scale=(p.scale+scroll*0.0025).clamp(0.5,2.0);
+                    }
+                    if p!=old {
+                        self.extensions.set_widget_placement(&id,p);
+                        save_layout=true; visual_changed=true;
+                    }
                 }
             }
         }
         if save_layout { self.extensions.save_widget_layouts(); }
-        if visual_changed {
-            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
+        if visual_changed { self.publish_extension_hud_editor_state(); }
+    }
+
+    /// Send a placement-only update without reloading HUD art or shaders.
+    fn publish_extension_hud_editor_state(&mut self) {
+        self.render_command(crate::app::RenderCommand::SetExtensionHud(
+            self.extensions.placed_widgets(), self.extensions.native_hidden, {
+                let mut images = self.extensions.hud_images.clone();
                 crate::ui::append_native_hud_images(&mut images, self.video.hud_style,
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
-                images }, self.extensions.hud_shaders.clone()));
-            self.egui_repaint_requested=true;
-        }
+                images
+            }, self.extensions.hud_shaders.clone(),
+        ));
+        self.egui_repaint_requested = true;
     }
 }

@@ -274,6 +274,8 @@ pub struct AudioSettings {
     pub voice_volume: f32,
     pub music_volume: f32,
     pub emote_music_volume: f32,
+    /// Listener-based gameplay sound muffling: 0 off, 1 subtle, 2 normal, 3 heavy.
+    pub underwater: u8,
     pub variometer: bool,
     pub variometer_style: u8,
     pub variometer_input: u8,
@@ -310,6 +312,7 @@ impl Default for AudioSettings {
             voice_volume: 1.0,
             music_volume: 0.25,
             emote_music_volume: 0.5,
+            underwater: 2,
             variometer: false,
             variometer_style: 0,
             variometer_input: 0,
@@ -340,6 +343,39 @@ pub(crate) fn int_in(value: &str, max: u8) -> Option<u8> {
     Some((number as i32).clamp(0, i32::from(max)) as u8)
 }
 
+/// A single Quake cfg assignment parser for all typed config owners.
+/// Game commands and binds are intentionally not interpreted here.
+struct ConfigAssignment {
+    name: String,
+    value: String,
+    /// Only explicit set/seta/setu/sets may create unknown user cvars.
+    user_flags: Option<crate::net::UserCvarFlags>,
+    user_value: String,
+}
+
+fn config_assignments(text: &str) -> impl Iterator<Item = ConfigAssignment> + '_ {
+    text.lines().filter_map(|raw| {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') { return None; }
+        let words = split_cfg_words(line);
+        if words.len() < 2 { return None; }
+        let flags = match words[0].to_ascii_lowercase().as_str() {
+            "set" => Some(crate::net::UserCvarFlags::NONE),
+            "seta" => Some(crate::net::UserCvarFlags::ARCHIVE),
+            "setu" => Some(crate::net::UserCvarFlags::USERINFO),
+            "sets" => Some(crate::net::UserCvarFlags::SERVERINFO),
+            _ => None,
+        };
+        let (name, value, user_value) = if flags.is_some() {
+            if words.len() < 3 { return None; }
+            (words[1].clone(), words[2].clone(), words[2..].join(" "))
+        } else {
+            (words[0].clone(), words[1].clone(), String::new())
+        };
+        Some(ConfigAssignment { name, value, user_flags: flags, user_value })
+    })
+}
+
 /// Load the archived OpenJK sound controls that DinurdoJK already implements
 /// (plus music volume so it is ready for the background-track presenter).
 pub fn load_audio_settings(primary: &Path) -> AudioSettings {
@@ -350,28 +386,10 @@ pub fn load_audio_settings(primary: &Path) -> AudioSettings {
     };
 
     let text = strip_cfg_comments(&text);
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
-            continue;
+    for assignment in config_assignments(&text) {
+        if let Some(def) = crate::app::cvar_definition(&assignment.name) {
+            def.load_audio(&mut settings, &assignment.value);
         }
-        let words = split_cfg_words(line);
-        if words.len() < 2 {
-            continue;
-        }
-        let (name, value) = if matches!(
-            words[0].to_ascii_lowercase().as_str(),
-            "set" | "seta" | "sets" | "setu"
-        ) {
-            if words.len() < 3 {
-                continue;
-            }
-            (words[1].as_str(), words[2].as_str())
-        } else {
-            (words[0].as_str(), words[1].as_str())
-        };
-
-        if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_audio) { load(&mut settings, name, value); }
     }
     settings
 }
@@ -466,42 +484,12 @@ pub fn load_client_presentation_settings(
     };
 
     let text = strip_cfg_comments(&text);
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
-            continue;
-        }
-        let words = split_cfg_words(line);
-        if words.len() < 2 {
-            continue;
-        }
-        let (name, value) = if matches!(
-            words[0].to_ascii_lowercase().as_str(),
-            "set" | "seta" | "sets" | "setu"
-        ) {
-            if words.len() < 3 {
-                continue;
-            }
-            (words[1].as_str(), words[2].as_str())
-        } else {
-            (words[0].as_str(), words[1].as_str())
-        };
-
-        if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_presentation) {
-            load(&mut settings, name, value);
-        } else if crate::console::find(name).is_none() {
-            // Only an explicit set* line creates unknown cvars. These are
-            // restored before the first connect, including USERINFO flags.
-            let flags = match words[0].to_ascii_lowercase().as_str() {
-                "set" => Some(crate::net::UserCvarFlags::NONE),
-                "seta" => Some(crate::net::UserCvarFlags::ARCHIVE),
-                "setu" => Some(crate::net::UserCvarFlags::USERINFO),
-                "sets" => Some(crate::net::UserCvarFlags::SERVERINFO),
-                _ => None,
-            };
-            if let Some(flags) = flags {
-                let value = words[2..].join(" ");
-                let _ = settings.network.set_user_cvar(name, &value, flags);
+    for assignment in config_assignments(&text) {
+        if let Some(def) = crate::app::cvar_definition(&assignment.name) {
+            def.load_presentation(&mut settings, &assignment.value);
+        } else if crate::console::find(&assignment.name).is_none() {
+            if let Some(flags) = assignment.user_flags {
+                let _ = settings.network.set_user_cvar(&assignment.name, &assignment.user_value, flags);
             }
         }
     }
@@ -519,28 +507,10 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
 
     let mut context = cvars::VideoLoadState::default();
     let text = strip_cfg_comments(&text);
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
-            continue;
+    for assignment in config_assignments(&text) {
+        if let Some(def) = crate::app::cvar_definition(&assignment.name) {
+            def.load_video(&mut settings, &assignment.value, &mut context);
         }
-        let words = split_cfg_words(line);
-        if words.len() < 2 {
-            continue;
-        }
-        let (name, value) = if matches!(
-            words[0].to_ascii_lowercase().as_str(),
-            "set" | "seta" | "sets" | "setu"
-        ) {
-            if words.len() < 3 {
-                continue;
-            }
-            (words[1].as_str(), words[2].as_str())
-        } else {
-            (words[0].as_str(), words[1].as_str())
-        };
-
-        if let Some(load) = crate::app::cvar_definition(name).and_then(|def| def.config.load_video) { load(&mut settings, name, value, &mut context); }
     }
     // Legacy configs saved a separate on/off flag followed by a nonzero
     // strength even when disabled. Preserve that OFF state during migration,

@@ -312,6 +312,120 @@ pub fn unposed_foot(entity_origin: [f32; 3]) -> [f32; 3] {
     [entity_origin[0], entity_origin[1], entity_origin[2] - 22.0]
 }
 
+// ---------------------------------------------------------------------------
+// Jedi Outcast. JK2 has no animevents.cfg: `CG_RunLerpFrame` (mvsdk
+// cgame/cg_players.c) calls `CG_FootStep` when the legs frame crosses a
+// hard-coded step frame of the walking animations, and `CG_FootstepForSurface`
+// traces from the lower-lumbar bolt to pick `boot` or `clank`. No dust, no prints.
+// ---------------------------------------------------------------------------
+
+/// JK2 `SURF_METALSTEPS` / `SURF_NOSTEPS` (JK2 surfaceflags.h).
+const JK2_SURF_METALSTEPS: i32 = 0x0000_8000;
+const JK2_SURF_NOSTEPS: i32 = 0x0040_0000;
+/// `DEFAULT_MINS_2` / `DEFAULT_MAXS_2` and the 64 unit probe of `CG_FootstepForSurface`.
+const JK2_HULL_MINS: [f32; 3] = [-15.0, -15.0, -24.0];
+const JK2_HULL_MAXS: [f32; 3] = [15.0, 15.0, 40.0];
+const JK2_PROBE_LENGTH: f32 = 64.0;
+
+/// `CG_InWalkingAnim`: the last step frame of a legs animation (relative to its
+/// first frame), 0 for animations that make no steps. JK2 steps on every
+/// `BOTH_WALK1..BOTH_RUNAWAY1` entry, turns and strafes included.
+fn jk2_final_step_frame(name: &str) -> i32 {
+    match name {
+        "BOTH_WALL_RUN_RIGHT" | "BOTH_WALL_RUN_LEFT" => 8,
+        "BOTH_WALK1" | "BOTH_WALK2" | "BOTH_WALK3" | "BOTH_WALK4" | "BOTH_WALK5" | "BOTH_WALK6"
+        | "BOTH_WALK7" | "BOTH_WALK8" | "BOTH_WALK9" | "BOTH_WALK10" | "BOTH_WALKTORUN1"
+        | "BOTH_RUN1" | "BOTH_RUN1START" | "BOTH_RUN1STOP" | "BOTH_RUN2" | "BOTH_RUNINJURED1"
+        | "BOTH_STRAFE_LEFT1" | "BOTH_STRAFE_RIGHT1" | "BOTH_RUNSTRAFE_LEFT1" | "BOTH_RUNSTRAFE_RIGHT1"
+        | "BOTH_TURN_LEFT1" | "BOTH_TURN_RIGHT1" | "BOTH_TURNSTAND1" | "BOTH_TURNSTAND2"
+        | "BOTH_TURNSTAND3" | "BOTH_TURNSTAND4" | "BOTH_TURNSTAND5" | "BOTH_TURNCROUCH1"
+        | "BOTH_RUNAWAY1" | "BOTH_WALKBACK1" | "LEGS_WALKBACK1" => 18,
+        "BOTH_WALKBACK2" | "BOTH_RUNBACK1" | "BOTH_RUNBACK2" | "LEGS_WALKBACK2" | "LEGS_RUNBACK1"
+        | "LEGS_RUNBACK2" => 9,
+        _ => 0,
+    }
+}
+
+/// Whether the legs bone going from `old_frame` to `frame` of `anim` (a
+/// `CG_RunLerpFrame` advance) is a JK2 footfall, and if the animation steps at
+/// all, whether it is a wall run (which needs no ground under it).
+pub fn jk2_step_due(animations: &AnimationSet, anim: i32, old_frame: i32, frame: i32) -> Option<bool> {
+    let name = AnimationSet::name(anim)?;
+    let last = jk2_final_step_frame(name);
+    if last == 0 || old_frame == frame {
+        return None;
+    }
+    let first = i32::from(animations.get(anim)?.first_frame);
+    let crossed = |at: i32| frame >= first + at && old_frame < first + at;
+    let wall_run = name.starts_with("BOTH_WALL_RUN");
+    let due = if wall_run {
+        crossed(2) || crossed(last) || crossed(12) || crossed(16)
+    } else {
+        crossed(3) || crossed(last)
+    } || (old_frame > frame && frame > first + 1); // "missed one": the loop wrapped
+    due.then_some(wall_run)
+}
+
+/// A JK2 footfall that found a surface that makes steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Jk2Footstep {
+    pub entity: u16,
+    pub position: [f32; 3],
+    /// `SURF_METALSTEPS`: `clank` instead of `boot`.
+    pub metal: bool,
+}
+
+/// `CG_FootstepForSurface`: a player-sized hull from the lumbar bolt, 64 units
+/// along the bolt's down axis. Nothing under the player, or `SURF_NOSTEPS`, is silence.
+pub fn jk2_trace_footstep(
+    world: &mut impl TraceWorld,
+    entity: u16,
+    origin: [f32; 3],
+    down: [f32; 3],
+) -> Option<Jk2Footstep> {
+    let end = [
+        origin[0] + down[0] * JK2_PROBE_LENGTH,
+        origin[1] + down[1] * JK2_PROBE_LENGTH,
+        origin[2] + down[2] * JK2_PROBE_LENGTH,
+    ];
+    let hit = world.trace(TraceQuery {
+        start: origin,
+        mins: JK2_HULL_MINS,
+        maxs: JK2_HULL_MAXS,
+        end,
+        pass_entity: i32::from(entity),
+        mask: MASK_PLAYERSOLID,
+    });
+    if hit.fraction >= 1.0 || hit.surface_flags & JK2_SURF_NOSTEPS != 0 {
+        return None;
+    }
+    Some(Jk2Footstep { entity, position: origin, metal: hit.surface_flags & JK2_SURF_METALSTEPS != 0 })
+}
+
+/// `cgs.media.footsteps[type][rand()&3]` for a JK2 step: `boot`, or `clank` on
+/// metal, or `splash` for the water events.
+pub fn jk2_step_sound(kind: Jk2StepKind, variant: usize) -> String {
+    let stem = match kind {
+        Jk2StepKind::Boot => "boot",
+        Jk2StepKind::Metal => "clank",
+        Jk2StepKind::Splash => "splash",
+    };
+    format!("sound/player/footsteps/{stem}{}.wav", (variant & 3) + 1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jk2StepKind {
+    Boot,
+    Metal,
+    Splash,
+}
+
+/// `rand() & 3` for a JK2 step, from what is unique to it.
+pub fn jk2_sound_variant(entity: u16, time: i32) -> usize {
+    let mixed = (time as u32).wrapping_mul(0x9E37_79B9) ^ u32::from(entity).wrapping_mul(0x85EB_CA6B);
+    ((mixed >> 13) & 3) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,3 +588,66 @@ mod tests {
         assert!(trace_footstep(&mut Floor { water: true, ground_at: Some(3.0) }, [0.0, 0.0, 5.0]).is_none());
     }
 }
+
+#[cfg(test)]
+mod jk2_tests {
+    use super::*;
+    use jka_assets::animation::{animation_index, parse_animation_cfg};
+
+    fn animations() -> AnimationSet {
+        parse_animation_cfg(
+            b"BOTH_RUN1 100 30 0 20
+BOTH_RUNBACK2 200 30 0 20
+BOTH_WALL_RUN_RIGHT 300 30 0 20
+BOTH_STAND1 400 30 0 20
+",
+        )
+        .unwrap()
+    }
+
+    fn due(name: &str, old_frame: i32, frame: i32) -> Option<bool> {
+        jk2_step_due(&animations(), animation_index(name).unwrap() as i32, old_frame, frame)
+    }
+
+    #[test]
+    fn a_run_steps_at_frame_three_and_eighteen() {
+        assert_eq!(due("BOTH_RUN1", 102, 103), Some(false));
+        assert_eq!(due("BOTH_RUN1", 103, 104), None);
+        assert_eq!(due("BOTH_RUN1", 117, 118), Some(false));
+        assert_eq!(due("BOTH_RUN1", 118, 119), None);
+    }
+
+    #[test]
+    fn running_backwards_steps_at_nine() {
+        assert_eq!(due("BOTH_RUNBACK2", 208, 209), Some(false));
+        assert_eq!(due("BOTH_RUNBACK2", 217, 218), None);
+    }
+
+    #[test]
+    fn a_wrapped_loop_counts_as_a_missed_step() {
+        assert_eq!(due("BOTH_RUN1", 129, 102), Some(false));
+        assert_eq!(due("BOTH_RUN1", 129, 100), None, "back on the first frame is not past firstFrame+1");
+    }
+
+    #[test]
+    fn a_wall_run_steps_four_times_and_needs_no_ground() {
+        for (old, new) in [(301, 302), (307, 308), (311, 312), (315, 316)] {
+            assert_eq!(due("BOTH_WALL_RUN_RIGHT", old, new), Some(true), "{old}->{new}");
+        }
+        assert_eq!(due("BOTH_WALL_RUN_RIGHT", 303, 304), None);
+    }
+
+    #[test]
+    fn standing_and_a_held_frame_make_no_step() {
+        assert_eq!(due("BOTH_STAND1", 402, 403), None);
+        assert_eq!(due("BOTH_RUN1", 103, 103), None);
+    }
+
+    #[test]
+    fn step_sounds_use_the_jk2_pools() {
+        assert_eq!(jk2_step_sound(Jk2StepKind::Boot, 0), "sound/player/footsteps/boot1.wav");
+        assert_eq!(jk2_step_sound(Jk2StepKind::Metal, 3), "sound/player/footsteps/clank4.wav");
+        assert_eq!(jk2_step_sound(Jk2StepKind::Splash, 5), "sound/player/footsteps/splash2.wav");
+    }
+}
+

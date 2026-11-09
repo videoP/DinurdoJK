@@ -61,6 +61,12 @@ impl Renderer {
                 &self.device, &world.vertex_buffer, &world.inline_models,
             ));
         }
+        // CPU mover uploads overwrite RGB with their immutable authored
+        // colors. Reapply the cached sky gain only when those writes happen.
+        // GPU posing changes positions/normals in place and preserves RGB.
+        let vertex_sky_active = world.baked_sun_cache.as_ref()
+            .is_some_and(|cache| cache.vertex_sky_active());
+        let mut cpu_vertices_rewritten = false;
         let WorldGpu {
             inline_models,
             inline_transform,
@@ -179,6 +185,7 @@ impl Renderer {
                     u64::from(model.gpu_vertex_start) * stride,
                     bytemuck::cast_slice(&self.inline_vertex_scratch),
                 );
+                cpu_vertices_rewritten = true;
                 bounds
             } else {
                 let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, pose);
@@ -187,6 +194,7 @@ impl Renderer {
                     u64::from(model.gpu_vertex_start) * stride,
                     bytemuck::cast_slice(&vertices),
                 );
+                cpu_vertices_rewritten = true;
                 (minimum, maximum)
             };
             for (set, indices) in [
@@ -197,6 +205,18 @@ impl Renderer {
                     let Some(batch) = set.get_mut(index) else { continue; };
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
+                    if let Some(moving) = batch.source.move_deform {
+                        // Inline-model poses can rotate the local move vector.
+                        // Use a rotation-independent spherical extent rather
+                        // than the world BSP's axis-specific displacement.
+                        let max_wave = moving.wave.base.abs() + moving.wave.amplitude.abs();
+                        let v = moving.vector;
+                        let radius = v[0].hypot(v[1]).hypot(v[2]) * max_wave;
+                        for axis in 0..3 {
+                            batch.bounds_min[axis] -= radius;
+                            batch.bounds_max[axis] += radius;
+                        }
+                    }
                     if batch.source.foliage_wind {
                         for axis in 0..3 {
                             batch.bounds_min[axis] -= crate::foliage::BOUNDS_PADDING;
@@ -218,6 +238,18 @@ impl Renderer {
                 if let Some(batch) = auto4_batches.get_mut(auto4_index) {
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
+                    if let Some(moving) = batch.source.move_deform {
+                        // Inline-model poses can rotate the local move vector.
+                        // Use a rotation-independent spherical extent rather
+                        // than the world BSP's axis-specific displacement.
+                        let max_wave = moving.wave.base.abs() + moving.wave.amplitude.abs();
+                        let v = moving.vector;
+                        let radius = v[0].hypot(v[1]).hypot(v[2]) * max_wave;
+                        for axis in 0..3 {
+                            batch.bounds_min[axis] -= radius;
+                            batch.bounds_max[axis] += radius;
+                        }
+                    }
                     if batch.source.foliage_wind {
                         for axis in 0..3 {
                             batch.bounds_min[axis] -= crate::foliage::BOUNDS_PADDING;
@@ -257,6 +289,9 @@ impl Renderer {
                         bytemuck::bytes_of(&glass));
                 }
             }
+        }
+        if cpu_vertices_rewritten && vertex_sky_active {
+            self.reapply_baked_inline_vertex_sky();
         }
     }
 }
@@ -358,6 +393,7 @@ pub(in crate::renderer) fn inline_batch_needs_fog(
         batch.source.fog_is_global,
         batch.source.legacy2_fog_in_stage_safe,
         batch.source.global_fog_post_eligible,
+        batch.source.legacy_additive_only,
     ) && (batch.source.fog[3] > 0.001 || fog.legacy_drawfog_value() == 1)
 }
 

@@ -31,7 +31,7 @@ pub fn resolve_demo(
         dirs.push(PathBuf::new());
     } else {
         if let Some(home) = jka_assets::pk3::game_home_root(roots, true) { dirs.push(home.join("base/demos")); }
-        dirs.push(jka_assets::pk3::jk2_base_directory(base, roots).join("demos"));
+        if let Some(jk2_base) = jka_assets::pk3::jk2_base_directory(base, roots) { dirs.push(jk2_base.join("demos")); }
         if let Some(cd) = &roots.jk2cdpath { dirs.push(cd.join("base/demos")); }
     }
     for dir in dirs {
@@ -59,7 +59,7 @@ mod jk2_demo_roots_tests {
     fn resolves_local_first_then_retail_without_using_jka_demos() {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let install = std::env::temp_dir().join(format!("jk2-demo-roots-{}-{nonce}", std::process::id()));
-        let local = install.join("JK2 GameData/base/demos");
+        let local = install.join("outcast/base/demos");
         let retail = install.join("retail/base/demos");
         let jka = install.join("base/demos");
         std::fs::create_dir_all(&local).unwrap();
@@ -69,7 +69,7 @@ mod jk2_demo_roots_tests {
         std::fs::write(retail.join("recording.dm_15"), b"retail").unwrap();
         let base = install.join("base");
         let roots = jka_assets::pk3::FilesystemRoots {
-            jk2cdpath: Some(install.join("retail")), ..Default::default()
+            jk2basepath: Some(install.join("outcast")), jk2cdpath: Some(install.join("retail")), ..Default::default()
         };
         assert_eq!(resolve_demo(&base, &roots, "recording").unwrap(), retail.join("recording.dm_15"));
         assert!(resolve_demo(&base, &roots, "jkaonly").is_err());

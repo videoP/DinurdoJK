@@ -38,6 +38,9 @@ pub(in crate::app) struct VideoConfirmation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum PendingRendererRestartStage {
+    /// Give the old renderer a chance to present the native loading screen
+    /// before we stop it. This avoids exposing its last gameplay swapchain image.
+    ShowLoadingScreen,
     /// The old render thread was asked to exit; poll it from the event loop so
     /// the UI thread keeps pumping window messages while it tears down.
     WaitRenderExit,
@@ -669,6 +672,9 @@ impl App {
                 ),
             )
             || requested.pbr_materials != prepared.pbr_materials
+            || requested.glass_promotion != prepared.glass_promotion
+            || requested.overbright_bits != prepared.overbright_bits
+            || requested.map_overbright_bits != prepared.map_overbright_bits
             || requested.allow_asset_overrides != prepared.allow_asset_overrides
     }
 
@@ -698,8 +704,7 @@ impl App {
     pub(in crate::app) fn map_reprep_wanted(&self) -> bool {
         self.loaded_map_prepare_options().is_some()
             && (self.map_prepare_restart_required()
-                || (self.video.grass && !self.applied_grass)
-                || (self.video.ocean && !self.applied_ocean))
+                || crate::app::cvar_registry().requires_restart(self))
     }
 
     pub(in crate::app) fn video_restart_required(&self) -> bool {
@@ -707,8 +712,7 @@ impl App {
             // Disabling these effects is a live operation. Enabling still needs
             // a restart only when this renderer/map was started without the
             // resources needed to draw them.
-            || (self.video.grass && !self.applied_grass)
-            || (self.video.ocean && !self.applied_ocean)
+            || crate::app::cvar_registry().requires_restart(self)
             || self.map_prepare_restart_required()
             || !self.latched_console_cvars.is_empty()
     }
@@ -787,6 +791,10 @@ impl App {
         if self.video.ocean && !self.applied_ocean {
             add("ocean", "Ocean", "Off -> On".to_owned());
         }
+        if self.video.texture_compression != self.applied_texture_compression {
+            add("texture_compression", "Texture compression", format!("{} -> {}",
+                self.applied_texture_compression, self.video.texture_compression));
+        }
 
         if let Some(prepared) = self.loaded_map_prepare_options() {
             let requested = self.active_map_prepare_options();
@@ -845,6 +853,18 @@ impl App {
                         self.video.reflection_quality.label()
                     ),
                 );
+            }
+            if requested.glass_promotion != prepared.glass_promotion {
+                add("glass_promotion", "Glass promotion", format!("{} -> {}",
+                    on_off(prepared.glass_promotion), on_off(requested.glass_promotion)));
+            }
+            if requested.overbright_bits != prepared.overbright_bits {
+                add("overbright", "Output overbright", format!("{} -> {}",
+                    prepared.overbright_bits, requested.overbright_bits));
+            }
+            if requested.map_overbright_bits != prepared.map_overbright_bits {
+                add("map_overbright", "Map overbright", format!("{} -> {}",
+                    prepared.map_overbright_bits, requested.map_overbright_bits));
             }
             if requested.pbr_materials != prepared.pbr_materials {
                 add(
@@ -1246,6 +1266,7 @@ impl App {
             // invalidate; the next map load prepares with them.
             self.applied_grass = self.video.grass;
             self.applied_ocean = self.video.ocean;
+            self.applied_texture_compression = self.video.texture_compression;
             // A menu with no loaded BSP still needs the output-gain setting.
             self.render_command(RenderCommand::SetOverbrightBits(
                 self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
@@ -1311,6 +1332,7 @@ impl App {
         error: String,
     ) {
         self.renderer_restart_started = None;
+        self.renderer_restart_loading = false;
         self.show_window_after_restart();
         if !confirm_on_change {
             self.resume_client_after_video_restart();
@@ -1368,6 +1390,9 @@ impl App {
                 self.applied_hdr_output = self.video.hdr_output;
                 self.applied_grass = self.video.grass;
                 self.applied_ocean = self.video.ocean;
+                if self.loaded_map_prepare_options().is_none() {
+                    self.applied_texture_compression = self.video.texture_compression;
+                }
                 // Only DX12 has a present ceiling, so switching backends changes
                 // what the cap resolves to.
                 self.set_fps_cap(self.video.fps_cap);
@@ -1431,6 +1456,7 @@ impl App {
             }
             Err(error) => {
                 self.renderer_restart_started = None;
+                self.renderer_restart_loading = false;
                 self.preserve_game_state_on_next_map_upload = false;
                 self.show_window_after_restart();
                 if !confirm_on_change {
@@ -1528,6 +1554,14 @@ impl App {
         self.set_requested_video_mode(pending.target);
 
         match pending.stage {
+            PendingRendererRestartStage::ShowLoadingScreen => {
+                let timed_out = now >= pending.ready_at;
+                self.pending_renderer_restart = Some(pending);
+                if timed_out {
+                    rverbose!(1, "[VID_RESTART] loading frame ACK timed out; proceeding with teardown");
+                    self.retire_renderer_after_loading_screen();
+                }
+            }
             PendingRendererRestartStage::WaitRenderExit => {
                 // Generous: a healthy teardown is a few hundred ms. Past this the
                 // thread is wedged in a driver call; keep the UI alive and move on.
@@ -1756,25 +1790,33 @@ impl App {
         self.push_console_line(format!("^5{}", self.console_status));
         self.publish_ui();
 
-        // Display mode and renderer backend are a single latched transaction.
-        // Stop presenting first so a fullscreen-mode switch cannot invalidate a
-        // live WGPU surface underneath the render thread.
-        //
-        // Do not join here: the renderer's swapchain/surface teardown can
-        // synchronously message this thread's window, so blocking the event
-        // loop deadlocks on some drivers. Poll for the exit from the event loop.
-        if let Some(render) = self.render.take() {
-            render.request_shutdown();
-            self.retiring_render = Some((render, Instant::now()));
-            rverbose!(1, "[VID_RESTART] old renderer shutdown requested");
-        }
+        // Publish a real native loading frame BEFORE shutting down the old
+        // renderer. Otherwise Windows continues showing the last presented
+        // gameplay swapchain image throughout the GPU/device teardown.
+        self.renderer_restart_loading = true;
+        self.publish_ui();
         self.pending_renderer_restart = Some(PendingRendererRestart {
             previous,
             target,
             confirm_on_change,
-            stage: PendingRendererRestartStage::WaitRenderExit,
-            ready_at: Instant::now(),
+            stage: PendingRendererRestartStage::ShowLoadingScreen,
+            // Do not hang forever if the old renderer cannot present.
+            ready_at: Instant::now() + Duration::from_millis(1000),
         });
+    }
+
+    /// Called after the old renderer ACKs the loading frame (or on timeout).
+    /// The old thread must never be joined on the OS event-loop thread.
+    pub(in crate::app) fn retire_renderer_after_loading_screen(&mut self) {
+        let Some(pending) = self.pending_renderer_restart.as_mut() else { return; };
+        if pending.stage != PendingRendererRestartStage::ShowLoadingScreen { return; }
+        pending.stage = PendingRendererRestartStage::WaitRenderExit;
+        pending.ready_at = Instant::now();
+        if let Some(render) = self.render.take() {
+            render.request_shutdown();
+            self.retiring_render = Some((render, Instant::now()));
+            rverbose!(1, "[VID_RESTART] loading screen presented; old renderer shutdown requested");
+        }
     }
 
     /// Second half of a renderer restart, run once the old render thread is

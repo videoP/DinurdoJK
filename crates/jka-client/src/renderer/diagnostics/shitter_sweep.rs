@@ -16,20 +16,24 @@ struct Case {
     mode: Option<u32>,
     early: Option<bool>,
     copy: Option<bool>,
+    native: Option<bool>,
+    texture: Option<bool>,
 }
 
 // Baseline repeats bracket potential drift. Copy and early-submit experiments
 // intentionally use the same camera/world settings as the current preset.
 const CASES: [Case; 9] = [
-    Case { name: "baseline", description: "Exact original settings", mode: None, early: None, copy: None },
-    Case { name: "direct", description: "Original world; early-submit OFF; present-copy OFF", mode: None, early: Some(false), copy: Some(false) },
-    Case { name: "copy", description: "Original world; request offscreen render + swapchain copy", mode: None, early: Some(false), copy: Some(true) },
-    Case { name: "early", description: "Original world; request early offscreen submit + copy", mode: None, early: Some(true), copy: Some(false) },
-    Case { name: "shitter5", description: "Shitter BSP one-stage/lightmap; direct surface", mode: Some(5), early: Some(false), copy: Some(false) },
-    Case { name: "flat12", description: "Flat-color BSP; direct surface", mode: Some(12), early: Some(false), copy: Some(false) },
-    Case { name: "no_world10", description: "No world preparation/draw; other presentation remains", mode: Some(10), early: Some(false), copy: Some(false) },
-    Case { name: "clear15", description: "One swapchain color clear + submit + present", mode: Some(15), early: Some(false), copy: Some(false) },
-    Case { name: "baseline_repeat", description: "Restore original settings and measure drift", mode: None, early: None, copy: None },
+    Case { name: "baseline", description: "Exact original settings", mode: None, early: None, copy: None, native: None, texture: None },
+    Case { name: "direct", description: "Original world, acquire-first; copy/early OFF", mode: None, early: Some(false), copy: Some(false), native: None, texture: None },
+    Case { name: "copy", description: "Original world, offscreen render + swapchain copy request", mode: None, early: Some(false), copy: Some(true), native: None, texture: None },
+    Case { name: "early", description: "Original world, submit BEFORE acquiring + late copy request", mode: None, early: Some(true), copy: Some(false), native: None, texture: None },
+    // Real one-variable world shader A/B: both use identical renderer feature
+    // flags and PVS, unlike the old `competitiveAB 5 vs 12` comparison.
+    Case { name: "native_texture", description: "Original BSP geometry/PVS/MDI + one texture sample", mode: None, early: Some(false), copy: Some(false), native: Some(true), texture: Some(true) },
+    Case { name: "native_flat", description: "SAME original BSP geometry/PVS/MDI with NO texture sample", mode: None, early: Some(false), copy: Some(false), native: Some(true), texture: Some(false) },
+    Case { name: "no_world10", description: "No world preparation/draw, other scene/present work remains", mode: Some(10), early: Some(false), copy: Some(false), native: None, texture: None },
+    Case { name: "clear15", description: "One swapchain color clear + submit + present", mode: Some(15), early: Some(false), copy: Some(false), native: None, texture: None },
+    Case { name: "baseline_repeat", description: "Restore original settings and measure drift", mode: None, early: None, copy: None, native: None, texture: None },
 ];
 
 #[derive(Default)]
@@ -54,11 +58,16 @@ struct Sample {
     actual_early_frames: u64,
     actual_present_copy_frames: u64,
     errors: u64,
+    native_active_frames: u64,
+    textured_pipeline_ready_frames: u64,
 }
 
 impl Sample {
-    fn add(&mut self, info: &FrameInfo) {
+    fn add(&mut self, info: &FrameInfo, renderer: &Renderer) {
         self.frames += 1;
+        self.native_active_frames += u64::from(crate::renderer::collision_world_only());
+        self.textured_pipeline_ready_frames += u64::from(renderer.collision_world_pipeline
+            .as_ref().is_some_and(|pipeline| pipeline.textured.is_some()));
         self.cpu_frame += info.frame_ms;
         self.prepare += info.cpu_prepare_ms;
         self.world_prep += info.prep_world_ms;
@@ -92,6 +101,8 @@ pub(in crate::renderer) struct ShitterSweep {
     original_mode: u32,
     original_early: bool,
     original_copy: bool,
+    original_native: bool,
+    original_texture: bool,
     original_fps_cap: u32,
     surface_format: String,
     resolution: (u32, u32),
@@ -115,6 +126,8 @@ impl ShitterSweep {
             original_mode: renderer.competitive_ab,
             original_early: renderer.early_submit_enabled,
             original_copy: renderer.present_copy_enabled,
+            original_native: crate::renderer::collision_world_only(),
+            original_texture: crate::renderer::shitter_texture_enabled(),
             original_fps_cap: fps_cap,
             surface_format: format!("{:?}", renderer.config.format),
             resolution: (renderer.config.width, renderer.config.height),
@@ -139,11 +152,14 @@ impl ShitterSweep {
         renderer.set_competitive_ab(case.mode.unwrap_or(self.original_mode));
         renderer.early_submit_enabled = case.early.unwrap_or(self.original_early);
         renderer.present_copy_enabled = case.copy.unwrap_or(self.original_copy);
+        crate::renderer::set_collision_world_only(case.native.unwrap_or(self.original_native));
+        crate::renderer::set_shitter_texture_enabled(case.texture.unwrap_or(self.original_texture));
         self.configured_at = Instant::now();
         self.sampled_at = None;
-        eprintln!("[SHITTER SWEEP] case {}/{} {} mode={} early={} copy={} (warmup)",
+        eprintln!("[SHITTER SWEEP] case {}/{} {} mode={} early={} copy={} native={} texture={} (warmup)",
             self.case + 1, CASES.len(), case.name, renderer.competitive_ab,
-            renderer.early_submit_enabled, renderer.present_copy_enabled);
+            renderer.early_submit_enabled, renderer.present_copy_enabled,
+            crate::renderer::collision_world_only(), crate::renderer::shitter_texture_enabled());
     }
 
     pub(in crate::renderer) fn fps_cap(&self) -> u32 { self.original_fps_cap }
@@ -152,8 +168,11 @@ impl ShitterSweep {
         renderer.set_competitive_ab(self.original_mode);
         renderer.early_submit_enabled = self.original_early;
         renderer.present_copy_enabled = self.original_copy;
-        eprintln!("[SHITTER SWEEP] restored competitiveAB={}, earlySubmit={}, presentCopy={}",
-            self.original_mode, self.original_early, self.original_copy);
+        crate::renderer::set_collision_world_only(self.original_native);
+        crate::renderer::set_shitter_texture_enabled(self.original_texture);
+        eprintln!("[SHITTER SWEEP] restored competitiveAB={}, earlySubmit={}, presentCopy={}, native={}, texture={}",
+            self.original_mode, self.original_early, self.original_copy, self.original_native,
+            self.original_texture);
         self.original_fps_cap
     }
 
@@ -163,7 +182,7 @@ impl ShitterSweep {
         if now.duration_since(self.armed_at) < INITIAL_GRACE { return false; }
         if now.duration_since(self.configured_at) < WARMUP { return false; }
         let since = *self.sampled_at.get_or_insert(now);
-        self.samples[self.case].add(info);
+        self.samples[self.case].add(info, renderer);
         if now.duration_since(since) < SAMPLE { return false; }
         self.samples[self.case].wall_seconds = now.duration_since(since).as_secs_f64();
         let sample = &self.samples[self.case];
@@ -206,8 +225,9 @@ impl ShitterSweep {
         let _ = writeln!(s, "adapter: {}  backend: {}  driver: {}", self.adapter, self.backend, self.driver);
         let _ = writeln!(s, "surface: {}x{} {} present={}; max_frame_latency={}", self.resolution.0, self.resolution.1,
             self.surface_format, self.present_mode, self.max_frame_latency);
-        let _ = writeln!(s, "original settings: r_competitiveAB={} r_earlySubmit={} r_presentCopy={} com_maxfps={}",
-            self.original_mode, self.original_early as u8, self.original_copy as u8, self.original_fps_cap);
+        let _ = writeln!(s, "original settings: r_competitiveAB={} r_earlySubmit={} r_presentCopy={} r_collisionWorld={} r_shitterTexture={} com_maxfps={}",
+            self.original_mode, self.original_early as u8, self.original_copy as u8,
+            self.original_native as u8, self.original_texture as u8, self.original_fps_cap);
         let _ = writeln!(s, "warmup per phase: {:.2}s, measurement per phase: ~{:.2}s, initial grace: {:.1}s",
             WARMUP.as_secs_f64(), SAMPLE.as_secs_f64(), INITIAL_GRACE.as_secs_f64());
         let _ = writeln!(s, "All modes use the same resolution, surface format, adapter, present mode and world. Renderer-only FPS cap forced to 0 (uncapped), then restored.");
@@ -218,8 +238,13 @@ impl ShitterSweep {
             let early = case.early.unwrap_or(self.original_early);
             let copy = case.copy.unwrap_or(self.original_copy);
             let _ = writeln!(s, "[{}] {} | {}", index+1, case.name, case.description);
-            let _ = writeln!(s, "  request: mode={} earlySubmit={} presentCopy={}; frames={} wall={:.4}s fps={:.1} errors={}",
-                mode, early as u8, copy as u8, row.frames, row.wall_seconds, row.fps(), row.errors);
+            let native = case.native.unwrap_or(self.original_native);
+            let texture = case.texture.unwrap_or(self.original_texture);
+            let _ = writeln!(s, "  request: mode={} earlySubmit={} presentCopy={} native={} texture={}; frames={} wall={:.4}s fps={:.1} errors={}",
+                mode, early as u8, copy as u8, native as u8, texture as u8,
+                row.frames, row.wall_seconds, row.fps(), row.errors);
+            let _ = writeln!(s, "  native-active frames={}/{}; textured pipeline ready={}/{} (shader comparison is invalid unless ready in native_texture case)",
+                row.native_active_frames, row.frames, row.textured_pipeline_ready_frames, row.frames);
             let _ = writeln!(s, "  CPU mean ms: frame={:.4} prepare={:.4} world_prepare={:.4} models_prepare={:.4} acquire={:.4} encode={:.4} submit={:.4} present={:.4}",
                 row.mean(row.cpu_frame), row.mean(row.prepare), row.mean(row.world_prep), row.mean(row.dyn_prepare),
                 row.mean(row.acquire), row.mean(row.encode), row.mean(row.submit), row.mean(row.present));
@@ -245,7 +270,8 @@ impl ShitterSweep {
         let _ = writeln!(s, "\nINTERPRETATION NOTES:");
         let _ = writeln!(s, "- Copy and early-submit cases are requests. Actual early/copy frame counts reveal whether surface/CRT/UI eligibility allowed them.");
         let _ = writeln!(s, "- r_competitiveAB 15 bypasses rendering; clear/present has no depth attachment. It is not a full-game performance prediction.");
-        let _ = writeln!(s, "- r_competitiveAB 10 omits world prep/draw but retains other eligible rendering work. Flat12 keeps real world geometry.");
+        let _ = writeln!(s, "- Native texture vs native flat use IDENTICAL competitiveAB and original BSP/PVS; compare only after the sampled pipeline is ready, using the ready-frame counter.");
+        let _ = writeln!(s, "- r_competitiveAB 10 omits world prep/draw but retains other eligible rendering work.");
         let _ = writeln!(s, "- A full-screen transfer occurs only when the respective path is active, not merely because two render passes exist.");
         let _ = writeln!(s, "- CPU wall-time FPS includes renderer loop, app activity and scheduling; CPU stage timings do not include all frame scheduling.");
         let _ = writeln!(s, "- This test never changes output resolution, native format, depth format, graphics preset or player model fidelity; temporary renderer FPS cap override is restored.");

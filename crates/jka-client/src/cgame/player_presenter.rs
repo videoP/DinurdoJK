@@ -233,6 +233,8 @@ pub struct PlayerPresenter {
     footstep_solids: Vec<crate::net::SolidEntity>,
     /// This frame's footfalls that found ground (drained by the caller).
     footsteps: Vec<FootstepImpact>,
+    /// This frame's JK2 footfalls (`CG_FootStep`): sound only, no dust or prints.
+    jk2_footsteps: Vec<footsteps::Jk2Footstep>,
     /// `Q_irand(0, 99)` for footsteps that only play some of the time.
     footstep_rng: u32,
     /// Snapshot time of the current presentation pass: the clock of shader

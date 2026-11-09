@@ -9,7 +9,7 @@ use crate::renderer::{
     build_draw_compaction_groups, build_world_animation, create_cull_debug_bind_group,
     create_fast_world_bind_group, create_gpu_cull_bind_group, create_world_bind_group,
     instantiate_portal_draw_plans, material_uniform,
-    visible_batches_by_cluster, weather, Arc, Auto4CollapseCache, Auto4CollapseWorker,
+    visible_batches_by_cluster, sky_reachability_by_cluster, weather, Arc, Auto4CollapseCache, Auto4CollapseWorker,
     Auto4GeometryState, DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord,
     MaterialFragmentKey, Renderer, UniformArena, UniformSlot,
     WorldAnimationFrame, WorldBatch, WorldGpu, WorldUploadTimings, AUTO_DETAIL_ENABLED_BIT,
@@ -18,6 +18,49 @@ use crate::renderer::{
 use std::{collections::{BTreeMap, BTreeSet}, ops::Range};
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
+
+/// Cold shader remaps rebuild the sun receivers too. Keep the original
+/// static world prefix and the compiled *N geometry for BOTH original lightmap
+/// charts and LIGHTMAP_BY_VERTEX, using each inline instance's private GPU
+/// vertex region. R_RemapShader must not silently drop all BMODEL receivers.
+fn remapped_sun_geometry(
+    world: &WorldGpu, map: &crate::scene::PreparedRemapPlan,
+    textures: Arc<Vec<crate::renderer::TextureData>>,
+) -> crate::renderer::lighting::lightmap_sun::Geometry {
+    let mut vertices = map.base.vertices.clone();
+    let mut gpu_indices = world.static_ao_source_to_gpu.clone();
+    let mut batches = map.batches.clone();
+    let mut seen_lightmaps = BTreeSet::new();
+    let mut seen_vertex = BTreeSet::new();
+    for (slot, model) in map.inline_models.iter().enumerate() {
+        let Some(instance) = world.inline_models.get(slot) else { continue; };
+        for index in model.batches.clone() {
+            let Some(batch) = map.inline_batches.get(index) else { continue; };
+            let start = batch.vertices.start as usize;
+            let end = batch.vertices.end as usize;
+            let Some(source) = map.base.inline_vertices.get(start..end) else { continue; };
+            if start < model.vertices.start as usize || end > model.vertices.end as usize { continue; }
+            let lm = super::upload::inline_original_lightmap_receiver(
+                batch.lightmap, batch.pipeline.class, source, world.lightmaps.len());
+            let sky = super::upload::inline_vertex_sky_receiver(batch);
+            if !lm && !sky { continue; }
+            if lm {
+                let Some(page) = batch.lightmap else { continue; };
+                if !seen_lightmaps.insert((start, end, page)) { continue; }
+            } else if !seen_vertex.insert((slot, start, end)) { continue; }
+            let dst = vertices.len() as u32;
+            vertices.extend_from_slice(source);
+            gpu_indices.extend((start..end).map(|i| instance.gpu_vertex_start
+                + (i - model.vertices.start as usize) as u32));
+            let mut receiver = batch.clone();
+            receiver.vertices = dst..vertices.len() as u32;
+            batches.push(receiver);
+        }
+    }
+    crate::renderer::lighting::lightmap_sun::Geometry::new(
+        Arc::new(vertices), batches, textures, &map.base.material_debug,
+        map.batches.len(), gpu_indices)
+}
 
 /// The original indexed triangles, not the number/order of shader passes, are
 /// the identity of a BSP draw. Inline indices use a separate source buffer.
@@ -88,12 +131,14 @@ fn compatible_live_stage_layout(
             || old.source.bsp_shader_index != next.source.bsp_shader_index
             || old.source.material_debug_index != next.source.material_debug_index
             || old.source.pipeline != next.source.pipeline
+            || old.source.move_deform != next.source.move_deform
             || old.source.surface_material != next.source.surface_material
             || old.source.water != next.source.water
             || old.source.glass_primary != next.source.glass_primary
             || (old.source.water && !crate::renderer::same_draw_state(&old.source, &next.source))
             || old.source.skybox != next.source.skybox
             || old.source.authored_glow != next.source.authored_glow
+            || old.source.legacy_additive_only != next.source.legacy_additive_only
             || old.source.thermal_source_stage != next.source.thermal_source_stage
             || old.source.thermal_lava != next.source.thermal_lava
             || old.source.thermal_emission != next.source.thermal_emission
@@ -261,14 +306,24 @@ impl Renderer {
             sources.iter().map(|source| {
                 let candidates = &geometry[&geometry_key(source, inline)];
                 let detail_word = source.texture.and_then(|index| world.detail_texture_by_base.get(index).copied()).unwrap_or(0);
-                let uniform = material_uniform(source, (detail_word & AUTO_DETAIL_ENABLED_BIT) != 0);
+                let mut uniform = material_uniform(source, (detail_word & AUTO_DETAIL_ENABLED_BIT) != 0);
+                // The inline slot's baked receiver eligibility is geometric,
+                // independent of a runtime shader remap.
+                // Material stages may differ even for the same immutable
+                // triangle range. Any original lightmapped stage proves the
+                // geometry has an authored chart; don't rely on stage 0.
+                let inline_baked_lightmap = inline
+                    && source.lightmap.is_some()
+                    && candidates.iter().any(|old| old.inline_baked_lightmap);
+                if inline && !inline_baked_lightmap { uniform.header[3] |= 1 << 18; }
                 // Identical authored stages alias their existing GPU resources.
                 // The same geometry can have many stages; matching the first
                 // geometry owner unconditionally would accidentally restore
                 // an earlier stage's texture/material after an N-to-M remap.
                 let reusable = candidates.iter().copied().find(|old| {
                     let old_detail = old.source.texture.and_then(|i| world.detail_texture_by_base.get(i).copied()).unwrap_or(0);
-                    let old_uniform = material_uniform(&old.source, (old_detail & AUTO_DETAIL_ENABLED_BIT) != 0);
+                    let mut old_uniform = material_uniform(&old.source, (old_detail & AUTO_DETAIL_ENABLED_BIT) != 0);
+                    if old.is_inline_entity && !old.inline_baked_lightmap { old_uniform.header[3] |= 1 << 18; }
                     crate::renderer::same_draw_state(&old.source, source)
                         // Suffix slots are recreated for each remap, so old
                         // bind groups may only be aliased for original slots.
@@ -285,6 +340,7 @@ impl Renderer {
                         && old.source.bsp_shader_index == source.bsp_shader_index
                         && old.source.material_debug_index == source.material_debug_index
                         && old.source.authored_glow == source.authored_glow
+                        && old.source.legacy_additive_only == source.legacy_additive_only
                         && old.source.thermal_source_stage == source.thermal_source_stage
                         && old.source.water == source.water
                         && old.source.additive_companions.len() == source.additive_companions.len()
@@ -308,11 +364,16 @@ impl Renderer {
                                 .all(|(a,b)| crate::renderer::same_draw_state(a,b)
                                     && bytemuck::bytes_of(&material_uniform(a,false))
                                         == bytemuck::bytes_of(&material_uniform(b,false)))
-                            && bytemuck::bytes_of(&material_uniform(
-                                &prior.source,
-                                prior.source.texture.and_then(|i| world.detail_texture_by_base.get(i).copied())
-                                    .is_some_and(|word| (word & AUTO_DETAIL_ENABLED_BIT) != 0),
-                            )) == bytemuck::bytes_of(&uniform)
+                            && prior.is_inline_entity == inline
+                            && prior.inline_baked_lightmap == inline_baked_lightmap
+                            && {
+                                let mut prior_uniform = material_uniform(
+                                    &prior.source,
+                                    prior.source.texture.and_then(|i| world.detail_texture_by_base.get(i).copied())
+                                        .is_some_and(|word| (word & AUTO_DETAIL_ENABLED_BIT) != 0));
+                                if inline && !prior.inline_baked_lightmap { prior_uniform.header[3] |= 1 << 18; }
+                                bytemuck::bytes_of(&prior_uniform) == bytemuck::bytes_of(&uniform)
+                            }
                     })
                 } else { None };
                 // Physical index range, model, LOD and bounds must come from
@@ -328,6 +389,7 @@ impl Renderer {
                         || material_buffer.clone(),
                         |companion| {
                             let mut extra = material_uniform(companion, false);
+                            if inline && !inline_baked_lightmap { extra.header[3] |= 1 << 18; }
                             extra.params[3] = source.shader_time_offset;
                             extra.vector_t[3] = source.shader_clamp_time.unwrap_or(0.0);
                             if companion.texture.and_then(|i| texture_clamp.get(i)).copied().unwrap_or(false) {
@@ -338,12 +400,14 @@ impl Renderer {
                     )
                 });
                 let fog = weather::fog::surface_fog_uniform(source.fog, source.fog_is_global,
-                    source.fog_color_override, source.legacy2_fog_in_stage_safe, source.global_fog_post_eligible);
+                    source.fog_color_override, source.legacy2_fog_in_stage_safe,
+                    source.global_fog_post_eligible, source.legacy_additive_only);
                 let fog_buffer = fog_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&fog));
                 let glow_fog_buffer = (source.authored_glow || source.thermal_source_stage).then(|| {
                     let glow = weather::fog::surface_fog_uniform(source.fog, source.fog_is_global,
-                        weather::fog::FogColorOverride::Black,
-                        source.legacy2_fog_in_stage_safe, source.global_fog_post_eligible);
+                        weather::fog::FogColorOverride::GlowReplayBlack,
+                        source.legacy2_fog_in_stage_safe, source.global_fog_post_eligible,
+                        source.legacy_additive_only);
                     fog_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&glow))
                 });
                 let marks = std::array::from_fn(|slot| world.footprint_mark_textures[slot]
@@ -352,12 +416,17 @@ impl Renderer {
                     source, &self.detail_texture, self.detail_texture_auto,
                     &self.detail_auto_textures, &world.detail_texture_by_base,
                 );
+                let live_pages = world.baked_sun_cache.as_ref().filter(|c| c.active)
+                    .map(|c| c.original.as_slice());
+                let stage_lightmaps = if inline && !inline_baked_lightmap {
+                    live_pages.unwrap_or(world.lightmaps.as_slice())
+                } else { world.lightmaps.as_slice() };
                 let full_group = |stage: &DrawBatch, fog_buffer: &UniformSlot| {
                     create_world_bind_group(
                         &self.device, &self.surface_layout, &self.white, &self.missing,
                         &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
                         &self.pbr_repeat_sampler, &self.pbr_clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, detail_texture, &textures, &world.lightmaps, &[], &[],
+                        &self.sky_sampler, detail_texture, &textures, stage_lightmaps, &[], &[],
                         &world.deluxemaps, &texture_clamp, primary_skybox, &marks,
                         &world.reflection_probes, stage, &material_buffer, &additive_uniforms,
                         fog_buffer, self.surface_deformation.buffer(),
@@ -368,7 +437,7 @@ impl Renderer {
                     create_fast_world_bind_group(
                         &self.device, &self.fast_surface_layout, &self.white, &self.missing,
                         &self.repeat_sampler, &self.clamp_sampler, &self.lightmap_sampler,
-                        &self.sky_sampler, &textures, &world.lightmaps, &[], &[], &texture_clamp,
+                        &self.sky_sampler, &textures, stage_lightmaps, &[], &[], &texture_clamp,
                         primary_skybox, &marks, stage, &material_buffer, &additive_uniforms,
                         self.surface_deformation.buffer(), self.surface_deformation.field_views(),
                         self.surface_deformation.field_sampler(),
@@ -397,6 +466,7 @@ impl Renderer {
                 }
                 batch.source = source.clone();
                 if inline {
+                    batch.inline_baked_lightmap = inline_baked_lightmap;
                     // Keep uploaded inline vertex namespace as on a full map
                     // upload, independent of shader-stage count.
                     let shift = map.base.vertices.len() as u32;
@@ -672,6 +742,11 @@ impl Renderer {
             visible_batches_by_cluster(&world.coarse_batches, vis)).unwrap_or_default();
         world.full_visible_batches_by_cluster = world.visibility.as_ref().map(|vis|
             visible_batches_by_cluster(&world.full_batches, vis)).unwrap_or_default();
+        world.sky_reachable_by_cluster = if world.full_visible_batches_by_cluster.is_empty() {
+            sky_reachability_by_cluster(&world.coarse_batches, &world.coarse_visible_batches_by_cluster)
+        } else {
+            sky_reachability_by_cluster(&world.full_batches, &world.full_visible_batches_by_cluster)
+        };
         for (model, (coarse_range, full_range)) in world.inline_models.iter_mut().zip(model_ranges) {
             model.coarse_batches = coarse_range;
             model.full_batches = full_range;
@@ -771,9 +846,12 @@ impl Renderer {
         world.material_debug = map.base.material_debug.clone();
         let mut sun_textures=map.base.textures.as_ref().clone();
         sun_textures.extend(map.replacement_textures.iter().cloned());
-        world.static_sun.replace_geometry(crate::renderer::lighting::lightmap_sun::Geometry::new(
-            Arc::new(map.base.vertices.clone()),map.batches.clone(),Arc::new(sun_textures),&map.base.material_debug));
-        if let Some(cache)=world.baked_sun_cache.as_mut() {cache.strength=None;}
+        let new_sun_geometry = remapped_sun_geometry(world, map, Arc::new(sun_textures));
+        world.static_sun.replace_geometry(new_sun_geometry);
+        if let Some(cache)=world.baked_sun_cache.as_mut() {
+            cache.strength = None;
+            cache.invalidate_vertex_sky();
+        }
 
         // Batch keys changed in place: renumber slots before any frame uses them.
         world.refresh_pso_slots();

@@ -1130,7 +1130,7 @@ impl OriginalSurfaceBindings {
             false,
         );
         let hybrid_swell = buffer(device, "JKA Hybrid Gerstner and crest control", HYBRID_SWELL_BYTES, false);
-        let pure_fft: [[f32; 4]; 3] = [[0.0; 4], [0.0, 0.0, 1.0, 0.0], [0.0; 4]];
+        let pure_fft: [[f32; 4]; 3] = [[0.0; 4], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         queue.write_buffer(&hybrid_swell, 0, bytemuck::bytes_of(&pure_fft));
         let calm_wake = buffer(
             device,
@@ -1686,9 +1686,12 @@ impl OriginalSurfaceBindings {
         queue.write_buffer(&self.hybrid_swell, 0, bytemuck::bytes_of(two_vec4));
     }
 
-    pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8, fast_foam: f32, fast_foam_detail: bool) {
+    /// Sky reflection gain is packed into breaker.w (existing 112-byte uniform).
+    /// It affects atlas reflection only, not moon/sun highlights or SSR.
+    pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8, fast_foam: f32,
+        fast_foam_detail: bool, sky_reflection_gain: f32) {
         queue.write_buffer(&self.hybrid_swell, 32, bytemuck::bytes_of(&[f32::from(mode), fast_foam,
-            if fast_foam_detail { 1.0 } else { 0.0 }, 0.0]));
+            if fast_foam_detail { 1.0 } else { 0.0 }, sky_reflection_gain]));
     }
 
     /// `r_oceanType 5`: [1 on, wave scale, seconds, foam bits], the foam maps' centres [near x, z, far x, z] (m) and the

@@ -55,7 +55,7 @@ impl DynamicModelRenderer {
                         .map(|index| base_vertex.saturating_add(*index)),
                 );
                 self.draws.push(DynamicPreparedDraw {
-                    entity_num: surface.entity_num,
+                    entity_num: surface.entity_num, portal_only: surface.portal_only,
                     first_index,
                     index_count: self.blob_mesh_indices.len() as u32,
                     base_vertex: 0,
@@ -197,6 +197,7 @@ impl DynamicModelRenderer {
         self.rt_prepared = false;
         if let Some(fixtures) = &mut self.fixture_lighting { fixtures.raw_colors.clear(); }
         self.perf_phase_calls.set(ModelPhaseCalls::default());
+        self.perf_phase_cpu_ms.set(0.0);
         self.capture_prepare = crate::renderer::diagnostics::perf_capture::enabled();
         self.perf_prepare = PreparePerf::default();
         if ray_traced_shadows {
@@ -421,7 +422,7 @@ impl DynamicModelRenderer {
                         .map_or(0, |texture| texture.binding_id)
                 };
                 let mut pending = Ghoul2PendingDraw {
-                    entity_num: surface.entity_num,
+                    entity_num: surface.entity_num, portal_only: surface.portal_only,
                     mesh_key,
                     texture_key,
                     alpha_mode: surface.alpha_mode,
@@ -516,7 +517,7 @@ impl DynamicModelRenderer {
                 }
             }
             self.draws.push(DynamicPreparedDraw {
-                entity_num: surface.entity_num,
+                entity_num: surface.entity_num, portal_only: surface.portal_only,
                 first_index,
                 index_count: surface.indices.len() as u32,
                 base_vertex: 0,
@@ -600,7 +601,7 @@ impl DynamicModelRenderer {
         let mut pending_index = 0usize;
         while pending_index < skin_pending.len() {
             let pending = &skin_pending[ordered_index(pending_index)];
-            let candidate = batching_active
+            let candidate = batching_active && !pending.portal_only
                 && matches!(
                     pending.alpha_mode,
                     DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
@@ -610,7 +611,7 @@ impl DynamicModelRenderer {
             if candidate {
                 while group_end < skin_pending.len() {
                     let next = &skin_pending[ordered_index(group_end)];
-                    if Some(next.entity_num) == self.companion_excluded_entity
+                    if next.portal_only || Some(next.entity_num) == self.companion_excluded_entity
                         || next.alpha_mode != pending.alpha_mode
                         // One instanced draw call is one pipeline, and a Source
                         // material takes a different one.
@@ -657,7 +658,7 @@ impl DynamicModelRenderer {
                     self.skin_instance_entities.push(item.entity_num);
                 }
                 self.skin_draws.push(Ghoul2PreparedDraw {
-                    entity_num: pending.entity_num,
+                    entity_num: pending.entity_num, portal_only: pending.portal_only,
                     mesh_key: Arc::clone(&pending.mesh_key),
                     texture_key: pending.texture_key.as_ref().map(Arc::clone),
                     alpha_mode: pending.alpha_mode,
@@ -674,7 +675,7 @@ impl DynamicModelRenderer {
                     gpu_draw_data.push(item.uniform);
                     self.skin_instance_entities.push(item.entity_num);
                     self.skin_draws.push(Ghoul2PreparedDraw {
-                        entity_num: item.entity_num,
+                        entity_num: item.entity_num, portal_only: item.portal_only,
                         mesh_key: Arc::clone(&item.mesh_key),
                         texture_key: item.texture_key.as_ref().map(Arc::clone),
                         alpha_mode: item.alpha_mode,
@@ -794,6 +795,115 @@ impl DynamicModelRenderer {
 
     /// Primary scene draws these legacy shells in a separate encoded pass.
     #[allow(clippy::too_many_arguments)]
+    /// OpenJK/TaystJK portal view: ordinary world models plus RF_THIRD_PERSON
+    /// (first-person camera suppressed) models. We reuse the exact packed
+    /// vertices and skinned Ghoul2 pose from the ordinary frame; only the
+    /// camera group and single-sample pipelines differ. Prepared saber/FX
+    /// geometry also renders in the portal view rather than disappearing.
+    pub(in crate::renderer) fn draw_planar_scene_phase<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+        depth_writing_phase: bool,
+        authored_portal: bool,
+    ) {
+        let (vertices, indices) = self.prepared_dynamic_buffers();
+        pass.set_bind_group(0, camera, &[]);
+        for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
+            if alpha_mode == DynamicModelAlphaMode::Glass
+                || dynamic_model_writes_depth(alpha_mode) != depth_writing_phase { continue; }
+            if let Some(pipeline) = &self.planar_model_pipelines[alpha_mode.index()] {
+                let mut bound = false;
+                let mut prior = None;
+                for draw in &self.draws {
+                    if draw.alpha_mode != alpha_mode { continue; }
+                    if !bound {
+                        pass.set_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, vertices.slice(..));
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                        bound = true;
+                    }
+                    let texture = draw.texture_key.as_ref()
+                        .and_then(|key| self.textures.get(key))
+                        .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                    if !prior.is_some_and(|prev| std::ptr::eq(prev, texture)) {
+                        pass.set_bind_group(1, texture, &[]);
+                        prior = Some(texture);
+                    }
+                    pass.draw_indexed(draw.first_index..draw.first_index.saturating_add(draw.index_count),
+                        draw.base_vertex, 0..1);
+                }
+            }
+            // A saber's stationary blade and halo (and most other JKA FX)
+            // are effect geometry, not part of the Ghoul2 hilt. The earlier
+            // mirror port submitted only MD3/Ghoul2, so it reflected saber
+            // swing trails but not the idle blade. Replay the *prepared* FX
+            // sprites under the reflected view and their single-sample PSOs.
+            // No extra effect simulation or tessellation occurs here.
+            let mut current_fx_pipeline = None;
+            let mut current_fx_texture = None;
+            for draw in &self.fx_sprite_draws {
+                if !authored_portal || draw.alpha_mode != alpha_mode { continue; }
+                let pipeline = if draw.rope {
+                    self.planar_fx_rope_pipeline.as_ref()
+                } else {
+                    self.planar_fx_sprite_pipelines[alpha_mode.index()].as_ref()
+                };
+                let Some(pipeline) = pipeline else { continue; };
+                if current_fx_pipeline != Some(draw.rope) {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, camera, &[]);
+                    pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+                    current_fx_pipeline = Some(draw.rope);
+                    current_fx_texture = None;
+                }
+                let texture = draw.texture_key.as_ref()
+                    .and_then(|key| self.textures.get(key))
+                    .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                if !current_fx_texture.is_some_and(|prev| std::ptr::eq(prev, texture)) {
+                    pass.set_bind_group(1, texture, &[]);
+                    current_fx_texture = Some(texture);
+                }
+                pass.draw(0..if draw.lightning || draw.rope { 144 } else { 6 },
+                    draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
+            }
+            let mut current_source = None;
+            let mut current_mesh = None;
+            let mut current_texture = None;
+            for draw in &self.skin_draws {
+                if draw.alpha_mode != alpha_mode { continue; }
+                let pipeline = if draw.source_material {
+                    self.planar_skin_source_pipelines[alpha_mode.index()].as_ref()
+                } else {
+                    self.planar_skin_pipelines[alpha_mode.index()].as_ref()
+                };
+                let Some(pipeline) = pipeline else { continue; };
+                let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };
+                if current_source != Some(draw.source_material) {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                    current_source = Some(draw.source_material);
+                    current_mesh = None;
+                    current_texture = None;
+                }
+                if !current_mesh.is_some_and(|prior| std::ptr::eq(prior, mesh)) {
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    current_mesh = Some(mesh);
+                }
+                let texture = draw.texture_key.as_ref()
+                    .and_then(|key| self.textures.get(key))
+                    .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                if !current_texture.is_some_and(|prev| std::ptr::eq(prev, texture)) {
+                    pass.set_bind_group(1, texture, &[]);
+                    current_texture = Some(texture);
+                }
+                pass.draw_indexed(0..mesh.index_count, 0,
+                    draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
+            }
+        }
+    }
+
     pub(in crate::renderer) fn draw_scene_phase<'a>(
         &'a self, pass:&mut wgpu::RenderPass<'a>, camera:&'a wgpu::BindGroup,
         depth_writing_phase:bool,
@@ -818,6 +928,7 @@ impl DynamicModelRenderer {
         authored_glow_only:bool,studio_capture:bool,legacy_effects:Option<bool>,
     ) {
         let capture_calls = crate::renderer::diagnostics::perf_capture::enabled();
+        let phase_started = capture_calls.then(Instant::now);
         let mut calls = self.perf_phase_calls.get();
         // Match the renderer-wide opaque-before-blended contract across both
         // dynamic geometry backends. The phase split is also used by water:
@@ -932,6 +1043,7 @@ impl DynamicModelRenderer {
                     draw.alpha_mode == alpha_mode
                         && Some(draw.entity_num) != excluded_entity
                         && (!authored_glow_only || draw.authored_glow)
+                        && !draw.portal_only
                 }), self.dynamic_batch_draws) {
                     let bind_group = draw
                         .texture_key
@@ -1164,6 +1276,7 @@ impl DynamicModelRenderer {
                             && draw.source_material == source_material
                             && Some(draw.entity_num) != excluded_entity
                             && (!authored_glow_only || draw.authored_glow)
+                            && !draw.portal_only
                     }) {
                         let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else {
                             continue;
@@ -1204,6 +1317,10 @@ impl DynamicModelRenderer {
             }
         }
         if capture_calls { self.perf_phase_calls.set(calls); }
+        if let Some(started) = phase_started {
+            self.perf_phase_cpu_ms.set(self.perf_phase_cpu_ms.get()
+                + started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     pub(in crate::renderer) fn draw<'a>(
@@ -1487,6 +1604,7 @@ impl DynamicModelRenderer {
                 let masked = alpha_mode == DynamicModelAlphaMode::Mask;
                 for (draw, indices) in super::submission::depth_runs(
                     self.draws.iter().filter(|draw| draw.alpha_mode == alpha_mode
+                        && !draw.portal_only
                         && entities.is_none_or(|e| e.contains(&draw.entity_num))),
                     self.dynamic_batch_draws,
                     masked,
@@ -1495,7 +1613,7 @@ impl DynamicModelRenderer {
                         pass.set_pipeline(pipeline);
                         // Opaque depth never samples the texture; one bind keeps
                         // the layout satisfied without per-draw state changes.
-                        pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                        pass.set_bind_group(1, &self.fallback_caster_bind_group, &[]);
                         bound = true;
                     }
                     if masked {
@@ -1503,7 +1621,7 @@ impl DynamicModelRenderer {
                             .texture_key
                             .as_ref()
                             .and_then(|key| self.textures.get(key))
-                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                            .map_or(&self.fallback_caster_bind_group, |texture| &texture.caster_bind_group);
                         pass.set_bind_group(1, bind_group, &[]);
                     }
                     pass.draw_indexed(indices, draw.base_vertex, 0..1);
@@ -1518,14 +1636,14 @@ impl DynamicModelRenderer {
                 for draw in self
                     .skin_draws
                     .iter()
-                    .filter(|draw| draw.alpha_mode == alpha_mode)
+                    .filter(|draw| draw.alpha_mode == alpha_mode && !draw.portal_only)
                 {
                     let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else {
                         continue;
                     };
                     if !bound {
                         pass.set_pipeline(pipeline);
-                        pass.set_bind_group(1, &self.fallback_bind_group, &[]);
+                        pass.set_bind_group(1, &self.fallback_caster_bind_group, &[]);
                         pass.set_bind_group(2, &self.skin_bind_group, &[]);
                         if let Some(group) = skin_motion {
                             pass.set_bind_group(3, group, &[]);
@@ -1537,7 +1655,7 @@ impl DynamicModelRenderer {
                             .texture_key
                             .as_ref()
                             .and_then(|key| self.textures.get(key))
-                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                            .map_or(&self.fallback_caster_bind_group, |texture| &texture.caster_bind_group);
                         pass.set_bind_group(1, bind_group, &[]);
                     }
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));

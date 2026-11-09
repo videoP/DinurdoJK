@@ -304,7 +304,7 @@ impl App {
         let back = self.frontend_page != FrontendPage::Main
             || self.egui_display_overlay() == OverlayMode::Video;
         let pending_video_changes = if self.egui_display_overlay() == OverlayMode::Video
-            && self.setup_selected == SETUP_TAB_VIDEO && self.video_restart_required() {
+            && self.video_restart_required() {
             self.pending_video_changes()
         } else { Vec::new() };
         let action = (!pending_video_changes.is_empty())

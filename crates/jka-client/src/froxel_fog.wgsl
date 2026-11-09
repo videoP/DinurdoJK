@@ -11,6 +11,12 @@ const CLUSTER_FAR: f32 = 65536.0;
 const LOCAL_SHADOW_NEAR: f32 = 4.0;
 const JKA_TO_GODOT_METERS: f32 = 1.0 / 64.0;
 
+struct LocalFogVolume {
+    mins: vec4<f32>,
+    maxs: vec4<f32>,
+    color_depth: vec4<f32>, // linear RGB and depthForOpaque
+};
+
 struct FroxelSettings {
     inv_view_proj: mat4x4<f32>,
     camera_pos_time: vec4<f32>,
@@ -25,6 +31,8 @@ struct FroxelSettings {
     split_depths: vec4<f32>,
     shadow_params: vec4<f32>,
     grid: vec4<u32>,
+    local_fog_count: vec4<u32>,
+    local_fogs: array<LocalFogVolume, 16>,
 };
 
 struct PointLight {
@@ -295,6 +303,53 @@ fn fog_wind_density(world: vec3<f32>) -> f32 {
     return mix(1.0, moving_density, wind_response);
 }
 
+// Ray/axis-aligned BSP fog-brush overlap, in world-space JKA units.
+// OpenJK R_LoadFogs obtains these limits from the six axial brush planes.
+fn fog_ray_box(origin: vec3<f32>, ray: vec3<f32>, mins: vec3<f32>, maxs: vec3<f32>) -> vec2<f32> {
+    var enter = 0.0;
+    var leave = 1.0e30;
+    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
+        let d = ray[axis];
+        if (abs(d) < 1.0e-6) {
+            if (origin[axis] < mins[axis] || origin[axis] > maxs[axis]) {
+                return vec2<f32>(1.0, 0.0);
+            }
+        } else {
+            let t0 = (mins[axis] - origin[axis]) / d;
+            let t1 = (maxs[axis] - origin[axis]) / d;
+            enter = max(enter, min(t0, t1));
+            leave = min(leave, max(t0, t1));
+        }
+    }
+    return vec2<f32>(enter, leave);
+}
+
+// The local fog is *only* integrated where the view ray passes through its
+// brush. Evaluate the original Q3/JKA local fog lookup's sqrt-depth alpha
+// cumulatively, so froxel slices compose into the same fog at every Z LOD.
+// xyz = premultiplied local extinction/color, w = optical depth.
+fn local_fog_segment(ray: vec3<f32>, near: f32, far: f32) -> vec4<f32> {
+    if (settings.local_fog_count.x == 0u) { return vec4<f32>(0.0); }
+    var result = vec4<f32>(0.0);
+    let origin = settings.camera_pos_time.xyz;
+    for (var index = 0u; index < min(settings.local_fog_count.x, 16u); index = index + 1u) {
+        let fog = settings.local_fogs[index];
+        let bounds = fog_ray_box(origin, ray, fog.mins.xyz, fog.maxs.xyz);
+        if (bounds.y <= bounds.x || bounds.x >= far) { continue; }
+        let start = max(bounds.x, 0.0);
+        let left = clamp(near - start, 0.0, max(bounds.y - start, 0.0));
+        let right = clamp(far - start, 0.0, max(bounds.y - start, 0.0));
+        if (right <= left) { continue; }
+        let depth = max(fog.color_depth.w, 1.0);
+        let scale = max(settings.fog_params.y, 0.0);
+        let a0 = clamp(sqrt(clamp(left / depth, 0.0, 1.0)) * scale, 0.0, 0.996);
+        let a1 = clamp(sqrt(clamp(right / depth, 0.0, 1.0)) * scale, 0.0, 0.996);
+        let tau = max(log(max(1.0 - a0, 0.004)) - log(max(1.0 - a1, 0.004)), 0.0);
+        result += vec4<f32>(fog.color_depth.rgb * tau, tau);
+    }
+    return result;
+}
+
 fn rain_segment_extinction(
     world: vec3<f32>,
     midpoint_depth: f32,
@@ -512,6 +567,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
+        let local_fog = local_fog_segment(ray, previous_depth, current_depth);
+        fog_extinction += local_fog.w;
+
         let rain_extinction = rain_segment_extinction(
             world,
             midpoint_depth,
@@ -548,7 +606,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var medium_color = fog_color;
         if (extinction > 1.0e-7) {
             medium_color = (
-                fog_color * fog_extinction
+                fog_color * max(fog_extinction - local_fog.w, 0.0)
+                + local_fog.rgb
                 + rain_color * rain_extinction
                 + snow_color * snow_extinction
             ) / extinction;

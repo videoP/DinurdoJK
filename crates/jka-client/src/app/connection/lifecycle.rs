@@ -57,7 +57,7 @@ impl App {
         self.loading = None;
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
-        self.sun_bake_ready_at = None;
+        self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.prepared_map_cache = None;
         self.cross_game_map_seed = None;
         self.game_session = None;
@@ -69,6 +69,7 @@ impl App {
         self.live_without_world = false;
         self.demo_without_world = false;
         self.server_password_prompt = None;
+        self.connection_saved_password = None;
         self.missing_map_prompt = None;
         self.demo_missing_map_prompt = None;
         self.live_missing_map_authorized = false;
@@ -158,7 +159,7 @@ impl App {
         self.preserve_game_state_on_next_map_upload = false;
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
-        self.sun_bake_ready_at = None;
+        self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.prepared_map_cache = None;
         self.game_session = None;
         self.weapon_select_until = None;
@@ -168,6 +169,7 @@ impl App {
         self.live_without_world = false;
         self.demo_without_world = false;
         self.server_password_prompt = None;
+        self.connection_saved_password = None;
         self.missing_map_prompt = None;
         self.demo_missing_map_prompt = None;
         self.live_missing_map_authorized = false;

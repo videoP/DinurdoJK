@@ -86,6 +86,12 @@ impl Renderer {
                 weather::FROXEL_Z,
                 self.sun_visibility.shader_value() as u32,
             ],
+            local_fog_count: [
+                if self.weather.fog.mode == crate::ui::FogMode::Volumetric {
+                    self.weather.fog.local_fog_count() as u32
+                } else { 0 }, 0, 0, 0,
+            ],
+            local_fogs: self.weather.fog.local_fogs(),
         };
         self.queue.write_buffer(
             &self.weather.fog.resources.uniform_buffer,

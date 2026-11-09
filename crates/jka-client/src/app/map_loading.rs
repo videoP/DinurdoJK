@@ -408,6 +408,22 @@ impl App {
     /// snapshot. The SERVER CONTENT row becomes the current per-file download
     /// bar without introducing a new row partway through the join.
     pub(in crate::app) fn unified_loading_ui(&self) -> Option<MapLoadingUi> {
+        // A renderer restart is NOT a new network/map load. Keep the real map
+        // state intact and display a temporary native levelshot on both the
+        // outgoing renderer and its replacement instead of a stale world frame.
+        if self.renderer_restart_loading {
+            let label = if self.map_name.is_empty() {
+                self.initial_source.label()
+            } else {
+                self.map_name.clone()
+            };
+            let mut ui = MapLoadingState::new(0, label, self.game.as_deref()).ui();
+            ui.bars = vec![MapLoadingBar {
+                label: "VIDEO", completed: 0, total: 1, skipped: false, no_work: false,
+            }];
+            ui.status_line = Some("RESTARTING VIDEO...".to_owned());
+            return Some(ui);
+        }
         use jka_protocol::session::ConnectionState;
         let joining = self.server_password_prompt.is_some()
             || self.missing_map_prompt.is_some()
@@ -589,6 +605,7 @@ impl App {
             omit_environment_stages: self.video.reflection_quality.omits_environment_stages(),
             source_spatial_batches: self.video.gpu_driven,
             pbr_materials: self.video.pbr,
+            glass_promotion: crate::materials::glass_promotion_enabled(),
             allow_asset_overrides: self.video.allow_asset_overrides,
             steam_audio: self.audio.steam_audio,
             // `menudevmap`: the stage look (water, retextures, fx) without props.
@@ -995,7 +1012,7 @@ impl App {
         let label = source.label();
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
-        self.sun_bake_ready_at = None;
+        self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         let prepare_options = if purpose == MapLoadPurpose::FrontendBackground {
             self.frontend_background_prepare_options()
         } else {
@@ -1142,7 +1159,7 @@ impl App {
         let started = Instant::now();
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
-        self.sun_bake_ready_at = None;
+        self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.preserve_game_state_on_next_map_upload = false;
         let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
         loading.sub_bsp_names = map.sub_bsp_names.clone();

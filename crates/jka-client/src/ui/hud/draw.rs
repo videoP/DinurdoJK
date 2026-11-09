@@ -28,6 +28,22 @@ pub(in crate::ui) fn saber_style_display(style: i32) -> (&'static str, [f32; 4],
     }
 }
 
+/// jaPRO/TaystJK cg_tintHud from CG_DrawHUD. This colors the native status
+/// frames/tics, not health/armor numeric readouts, team overlays or selectors.
+/// JK2 server gametypes are remapped to JKA numbering before reaching HudState.
+pub(in crate::ui) fn native_hud_tint(hud: &crate::ui::HudState, enabled: bool) -> [f32; 4] {
+    if !enabled || hud.spectating || hud.gametype < crate::cgame::GT_TEAM
+        || hud.gametype == crate::cgame::GT_SIEGE
+    {
+        return [1.0; 4];
+    }
+    match hud.team {
+        crate::cgame::TEAM_RED => [1.0, 0.5, 0.5, 1.0],
+        crate::cgame::TEAM_BLUE => [0.5, 0.5, 1.0, 1.0],
+        _ => [1.0; 4],
+    }
+}
+
 pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let Some(hud) = ui.hud else {
         return;
@@ -42,6 +58,10 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
         return;
     }
     let ctx = HudRectContext::from_snapshot(ui);
+    // Custom panels have stat-coloured meters; only their chrome takes the
+    // team tint, preserving health, shield, ammo and force readability.
+    let team_tint = native_hud_tint(&hud, ui.video.tint_hud);
+    let frame_tint = (team_tint != [1.0; 4]).then_some(team_tint);
     if !ui.native_replaced(NativeHud::Health) {
         let health_layout = ui.hud_layout.health;
         let health = hud_element_rect(HudElementId::Health, health_layout, &ctx, w, h);
@@ -58,6 +78,7 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
             } else {
                 HUD_HEALTH
             },
+            frame_tint,
             w,
             h,
         );
@@ -74,6 +95,7 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
             hud.armor,
             hud.max_health.max(1),
             HUD_SHIELD,
+            frame_tint,
             w,
             h,
         );
@@ -83,7 +105,8 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
         // The ammo slot doubles as the saber-style readout while the saber is out.
         let ammo_layout = ui.hud_layout.ammo;
         let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, &ctx, w, h);
-        if hud.weapon == HUD_WP_SABER {
+        // HudState.weapon is JK2-numbered in JK2 mode (WP_SABER is 2 there).
+        if hud.weapon == if ui.jk2_mode { 2 } else { HUD_WP_SABER } {
             let style_pending = hud.saber_style != 0
                 && hud.saber_active_style != 0
                 && hud.saber_style != hud.saber_active_style;
@@ -93,6 +116,7 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
                 ammo_layout.scale,
                 hud.saber_style,
                 style_pending,
+                frame_tint,
                 w,
                 h,
             );
@@ -107,6 +131,7 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
                 "AMMO",
                 &ammo_text,
                 HUD_AMMO,
+                frame_tint,
                 w,
                 h,
             );
@@ -129,6 +154,7 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
                 } else {
                     HUD_FORCE
                 },
+                frame_tint,
                 w,
                 h,
             );
@@ -140,9 +166,61 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
                 "FORCE",
                 "--",
                 HUD_FORCE,
+                frame_tint,
                 w,
                 h,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tint_hud_tests {
+    use super::*;
+    use crate::ui::HudState;
+
+    #[test]
+    fn tint_hud_matches_taystjk_team_gates_in_both_native_modes() {
+        let mut state = HudState { gametype: 6, team: 1, ..Default::default() };
+        assert_eq!(native_hud_tint(&state, true), [1.0, 0.5, 0.5, 1.0]);
+        state.team = 2;
+        assert_eq!(native_hud_tint(&state, true), [0.5, 0.5, 1.0, 1.0]);
+        assert_eq!(native_hud_tint(&state, false), [1.0; 4]);
+        state.gametype = 3; // duel / FFA, even if stale team assignment survives
+        assert_eq!(native_hud_tint(&state, true), [1.0; 4]);
+        state.gametype = 7; // Siege explicitly excluded by TaystJK
+        assert_eq!(native_hud_tint(&state, true), [1.0; 4]);
+        state.gametype = 8; // CTF (JK2 7 -> JKA 8 in the presentation adapter)
+        assert_eq!(native_hud_tint(&state, true), [0.5, 0.5, 1.0, 1.0]);
+        state.spectating = true;
+        assert_eq!(native_hud_tint(&state, true), [1.0; 4]);
+        state.spectating = false;
+        state.team = 3;
+        assert_eq!(native_hud_tint(&state, true), [1.0; 4]);
+    }
+
+    #[test]
+    fn custom_style_only_tints_chrome_and_works_for_both_protocols() {
+        for jk2 in [false, true] {
+            let mut ui = UiSnapshot::default();
+            ui.jk2_mode = jk2;
+            ui.hud = Some(HudState {
+                gametype: 6, team: 1, health: 100, max_health: 100,
+                armor: 50, weapon: if jk2 { 2 } else { 3 },
+                force_power: Some(75), saber_style: 2, ..Default::default()
+            });
+            ui.video.hud_style = 0;
+            ui.video.tint_hud = false;
+            let mut untinted = Vec::new();
+            build_hud(&mut untinted, &ui, 1280, 720);
+            ui.video.tint_hud = true;
+            let mut tinted = Vec::new();
+            build_hud(&mut tinted, &ui, 1280, 720);
+            assert_eq!(untinted.len(), tinted.len());
+            assert_ne!(untinted[6].color, tinted[6].color,
+                "{jk2}: status panel chrome should change with cg_tintHud");
+            assert_eq!(untinted.last().unwrap().color, tinted.last().unwrap().color,
+                "{jk2}: force numeric/stat colors must remain unchanged");
         }
     }
 }
@@ -264,11 +342,12 @@ pub(in crate::ui) fn hud_meter(
     value: i32,
     maximum: i32,
     accent: [f32; 4],
+    frame_tint: Option<[f32; 4]>,
     w: u32,
     h: u32,
 ) {
     let s = scale.clamp(0.5, 2.0);
-    hud_frame(out, rect_, scale, accent, w, h);
+    hud_frame(out, rect_, scale, frame_tint.unwrap_or(accent), w, h);
     let fraction = (value.max(0) as f32 / maximum.max(1) as f32).clamp(0.0, 1.0);
     let track_x = rect_.x + 10.0 * s;
     let track_w = rect_.width - 18.0 * s;
@@ -341,11 +420,12 @@ pub(in crate::ui) fn hud_value_panel(
     label: &str,
     value: &str,
     accent: [f32; 4],
+    frame_tint: Option<[f32; 4]>,
     w: u32,
     h: u32,
 ) {
     let s = scale.clamp(0.5, 2.0);
-    hud_frame(out, rect_, scale, accent, w, h);
+    hud_frame(out, rect_, scale, frame_tint.unwrap_or(accent), w, h);
     rect(
         out,
         rect_.x + 10.0 * s,
@@ -367,6 +447,7 @@ pub(in crate::ui) fn hud_style_panel(
     scale: f32,
     style: i32,
     pending: bool,
+    frame_tint: Option<[f32; 4]>,
     w: u32,
     h: u32,
 ) {
@@ -376,7 +457,7 @@ pub(in crate::ui) fn hud_style_panel(
     // saberAnimLevel actually changes. Keep that immediate preview, but make
     // the distinction visible: queued = faded, active = fully lit.
     let pending_alpha = if pending { 0.48 } else { 1.0 };
-    hud_frame_with_accent_alpha(out, rect_, scale, accent, pending_alpha, w, h);
+    hud_frame_with_accent_alpha(out, rect_, scale, frame_tint.unwrap_or(accent), pending_alpha, w, h);
     let track_x = rect_.x + 10.0 * s;
     let track_w = rect_.width - 18.0 * s;
     let track_y = rect_.y + rect_.height - 6.0 * s;

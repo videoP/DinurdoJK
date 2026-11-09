@@ -30,6 +30,18 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_TINTHUD {
+        runtime: super::hud::APP_TINT_HUD.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                settings.tint_hud = parse_bool(value).unwrap_or(settings.tint_hud);
+            }),
+            archive: Some((456, |state| format!("{}", u8::from(state.video.tint_hud)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_HUDSTYLE {
         runtime: super::hud::APP_HUD_STYLE.copy(),
         config: CvarBinding {

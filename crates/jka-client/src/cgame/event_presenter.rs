@@ -468,7 +468,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         material_trace: None,
         entity_num: flash.entity_num,
         wireframe_class: DynamicWireframeClass::Effect,
-        raster_visible: true,
+        raster_visible: true, portal_only: false,
         vertices: Arc::new(vertices),
         indices: Arc::new(indices),
         lighting_origin: None,

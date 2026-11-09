@@ -48,39 +48,67 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Keep JKA, JK2 and the client-owned DinurdoJK/ folder from overlapping.
-/// By default the executable directory is the JKA root, so JK2's default root
-/// (and DinurdoJK/) are its direct children; that layout is valid.
-pub fn validate_root_layout(jka_base: &Path, jk2_root: &Path, client_install: &Path) -> Result<(), String> {
+/// By default the executable directory is the JKA root, so DinurdoJK/ (and a
+/// JK2 root chosen beside it) are its direct children; that layout is valid.
+/// An unset fs_jk2basepath uses a client-owned folder and needs no checks.
+pub fn validate_root_layout(jka_base: &Path, roots: &FilesystemRoots, client_install: &Path) -> Result<(), String> {
     let jka_base = normalize(jka_base);
     let jka_root = jka_base.parent().unwrap_or(&jka_base).to_path_buf();
-    let jk2_root = normalize(jk2_root);
     let install = normalize(client_install);
     let client_root = install.join(jka_assets::pk3::DINURDOJK_DIRECTORY);
+    let in_client = |path: &Path| is_within(path, &client_root);
+    let overlap = || format!(
+        "A game root overlaps the {} folder; choose independent roots", jka_assets::pk3::DINURDOJK_DIRECTORY);
+    let same = |a: &Path, b: &Path| is_within(a, b) && is_within(b, a);
 
-    let separate = || format!(
-        "JKA and JK2 roots must be separate folders: {} / {}", jka_root.display(), jk2_root.display());
-    // JK2 containing JKA (or the same folder) would expose one game's folders
-    // as the other's mods.
-    if is_within(&jka_root, &jk2_root) { return Err(separate()); }
-    // JK2 beneath JKA is only the default arrangement: JKA rooted at the
-    // executable directory with JK2 as a direct child folder.
-    if is_within(&jk2_root, &jka_root) {
-        let direct_child = jka_root == install && jk2_root.parent() == Some(install.as_path());
-        let reserved = jk2_root.file_name().is_some_and(|name| {
-            let name = name.to_string_lossy();
-            name.eq_ignore_ascii_case("base") || name.eq_ignore_ascii_case(jka_assets::pk3::DINURDOJK_DIRECTORY)
-        });
-        if !direct_child || reserved { return Err(separate()); }
+    if in_client(&jka_root) || is_within(&client_root, &jka_base) || is_within(&jka_base, &client_root) {
+        return Err(overlap());
     }
-    // Game roots and bases must stay out of DinurdoJK/ (and vice versa); the
-    // executable directory itself may of course contain it.
-    let jk2_base = jk2_root.join("base");
-    let overlaps = |game: &Path| is_within(game, &client_root) || is_within(&client_root, game);
-    if is_within(&jka_root, &client_root) || is_within(&jk2_root, &client_root)
-        || overlaps(&jka_base) || overlaps(&jk2_base) || is_within(&client_root, &jk2_root)
-    {
-        return Err(format!(
-            "A game root overlaps the {} folder; choose independent roots", jka_assets::pk3::DINURDOJK_DIRECTORY));
+    let jk2_root = roots.jk2basepath.as_deref().map(normalize);
+    if let Some(jk2_root) = &jk2_root {
+        let separate = || format!(
+            "JKA and JK2 roots must be separate folders: {} / {}", jka_root.display(), jk2_root.display());
+        // JK2 containing JKA (or the same folder) would expose one game's
+        // folders as the other's mods.
+        if is_within(&jka_root, jk2_root) { return Err(separate()); }
+        // JK2 beneath JKA is only the portable arrangement: JKA rooted at the
+        // executable directory with JK2 as a direct child folder.
+        if is_within(jk2_root, &jka_root) {
+            let direct_child = jka_root == install && jk2_root.parent() == Some(install.as_path());
+            let reserved = jk2_root.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.eq_ignore_ascii_case("base") || name.eq_ignore_ascii_case(jka_assets::pk3::DINURDOJK_DIRECTORY)
+            });
+            if !direct_child || reserved { return Err(separate()); }
+        }
+        let jk2_base = jk2_root.join("base");
+        if in_client(jk2_root) || is_within(&client_root, jk2_root)
+            || is_within(&client_root, &jk2_base) || is_within(&jk2_base, &client_root)
+        {
+            return Err(overlap());
+        }
+    }
+    // Home roots hold base/ and mods directly, one per game: sharing a folder
+    // would make JKA and JK2 write the same base/ (configs, demos, downloads).
+    let home = roots.homepath.as_deref().map(normalize);
+    let jk2_home = roots.jk2homepath.as_deref().map(normalize);
+    for path in [&home, &jk2_home].into_iter().flatten() {
+        if in_client(path) { return Err(overlap()); }
+    }
+    if let (Some(home), Some(jk2_home)) = (&home, &jk2_home) {
+        if same(home, jk2_home) {
+            return Err("fs_homepath and fs_jk2homepath must be different folders".into());
+        }
+    }
+    if let Some(jk2_home) = &jk2_home {
+        if same(jk2_home, &jka_root) {
+            return Err("fs_jk2homepath must not be the JKA root folder".into());
+        }
+    }
+    if let (Some(home), Some(jk2_root)) = (&home, &jk2_root) {
+        if same(home, jk2_root) {
+            return Err("fs_homepath must not be the JK2 root folder".into());
+        }
     }
     Ok(())
 }
@@ -123,6 +151,7 @@ pub fn load(base: &Path) -> FilesystemRoots {
             "fs_homepath" => parse_root(base, value).map(|v| { roots.homepath = v; }),
             "fs_cdpath" => parse_root(base, value).map(|v| { roots.cdpath = v; }),
             "fs_jk2basepath" => parse_root(base, value).map(|v| { roots.jk2basepath = v; }),
+            "fs_jk2homepath" => parse_root(base, value).map(|v| { roots.jk2homepath = v; }),
             "fs_jk2cdpath" => parse_root(base, value).map(|v| { roots.jk2cdpath = v; }),
             "fs_forcegame" => validate_game_name(value).map(|v| { roots.forcegame = v; }),
             _ => continue,
@@ -147,9 +176,9 @@ pub fn save(_base: &Path, roots: &FilesystemRoots) -> Result<(), String> {
         }
     });
     let contents = format!(
-        "# Game roots contain base/ and mod folders. Relative paths use the executable directory.\n# Blank fs_basepath = the executable directory; blank fs_jk2basepath = <executable directory>/JK2 GameData.\n# fs_forcegame mounts DinurdoJK/<name>/ above shared/ without changing write locations.\nfs_basepath={}\nfs_homepath={}\nfs_cdpath={}\nfs_jk2basepath={}\nfs_jk2cdpath={}\nfs_forcegame={}\n",
+        "# Game roots contain base/ and mod folders. Relative paths use the executable directory.\n# Blank fs_basepath = the executable directory; blank fs_jk2basepath = JK2 disabled. fs_homepath/fs_jk2homepath are optional per-game writable roots (they must differ).\n# fs_forcegame mounts DinurdoJK/<name>/ above shared/ without changing write locations.\nfs_basepath={}\nfs_homepath={}\nfs_cdpath={}\nfs_jk2basepath={}\nfs_jk2homepath={}\nfs_jk2cdpath={}\nfs_forcegame={}\n",
         show(&roots.basepath), show(&roots.homepath), show(&roots.cdpath),
-        show(&roots.jk2basepath), show(&roots.jk2cdpath),
+        show(&roots.jk2basepath), show(&roots.jk2homepath), show(&roots.jk2cdpath),
         roots.forcegame.as_deref().unwrap_or(""),
     );
     std::fs::write(&file, contents).map_err(|error| format!("{}: {error}", file.display()))
@@ -173,6 +202,7 @@ pub fn apply_startup_commands(
             "fs_homepath" => roots.homepath = parse_root(base, value)?,
             "fs_cdpath" => roots.cdpath = parse_root(base, value)?,
             "fs_jk2basepath" => roots.jk2basepath = parse_root(base, value)?,
+            "fs_jk2homepath" => roots.jk2homepath = parse_root(base, value)?,
             "fs_jk2cdpath" => roots.jk2cdpath = parse_root(base, value)?,
             "fs_forcegame" => roots.forcegame = validate_game_name(value)?,
             _ => {}
@@ -191,30 +221,50 @@ mod tests {
         let base = Path::new("/client/base");
         let mut roots = FilesystemRoots::default();
         apply_startup_commands(base, &mut roots, &["set fs_jk2basepath /outcast".into()]).unwrap();
-        assert_eq!(jka_assets::pk3::jk2_base_directory(base, &roots), PathBuf::from("/outcast/base"));
+        assert_eq!(jka_assets::pk3::jk2_base_directory(base, &roots), Some(PathBuf::from("/outcast/base")));
+    }
+
+    fn layout(jk2: Option<PathBuf>, home: Option<PathBuf>, jk2_home: Option<PathBuf>) -> FilesystemRoots {
+        FilesystemRoots { jk2basepath: jk2, homepath: home, jk2homepath: jk2_home, ..Default::default() }
     }
 
     #[test]
     fn portable_layout_allows_game_base_next_to_client_and_separate_jk2_root() {
         // None of these folders exist: a fresh install has no base/ yet.
         let install = std::env::temp_dir().join("djk-portable-layout-validation");
-        let jk2 = |name: &str| install.join(name);
-        assert!(validate_root_layout(&install.join("base"), &jk2("JK2 GameData"), &install).is_ok());
-        assert!(validate_root_layout(&install.join("base"), &jk2("JK2-install"), &install).is_ok());
-        assert!(validate_root_layout(&install.join("base"), &install, &install).is_err());
-        assert!(validate_root_layout(&install.join("base"), &jk2("base"), &install).is_err());
-        assert!(validate_root_layout(&install.join("base"), &jk2("DinurdoJK"), &install).is_err());
+        let ok = |jk2: Option<PathBuf>| validate_root_layout(&install.join("base"), &layout(jk2, None, None), &install);
+        assert!(ok(None).is_ok());
+        assert!(ok(Some(install.join("JK2 install"))).is_ok());
+        assert!(ok(Some(install.clone())).is_err());
+        assert!(ok(Some(install.join("base"))).is_err());
+        assert!(ok(Some(install.join("DinurdoJK"))).is_err());
     }
 
     #[test]
     fn root_layout_rejects_nested_or_client_private_game_roots() {
         let install = std::env::temp_dir().join("djk-portable-layout-validation");
-        assert!(validate_root_layout(&install.join("JKA/base"), &install.join("JKA/JK2"), &install).is_err());
-        assert!(validate_root_layout(&install.join("JKA/base"), &install, &install).is_err());
-        assert!(validate_root_layout(&install.join("DinurdoJK/base"), &install.join("JK2 GameData"), &install).is_err());
-        assert!(validate_root_layout(&install.join("base"), &install.join("DinurdoJK/JK2"), &install).is_err());
-        // JKA elsewhere is fine, as is the default JK2 folder beside the exe.
+        let check = |base: &str, jk2: Option<PathBuf>| validate_root_layout(&install.join(base), &layout(jk2, None, None), &install);
+        assert!(check("JKA/base", Some(install.join("JKA/JK2"))).is_err());
+        assert!(check("JKA/base", Some(install.clone())).is_err());
+        assert!(check("DinurdoJK/base", Some(install.join("JK2 install"))).is_err());
+        assert!(check("base", Some(install.join("DinurdoJK/JK2"))).is_err());
+        // JKA elsewhere is fine, as is a JK2 root beside the exe.
         let elsewhere = std::env::temp_dir().join("djk-elsewhere-jka");
-        assert!(validate_root_layout(&elsewhere.join("base"), &install.join("JK2 GameData"), &install).is_ok());
+        assert!(validate_root_layout(&elsewhere.join("base"),
+            &layout(Some(install.join("JK2 install")), None, None), &install).is_ok());
+    }
+
+    #[test]
+    fn home_roots_are_per_game_and_must_differ() {
+        let install = std::env::temp_dir().join("djk-portable-layout-validation");
+        let home = std::env::temp_dir().join("djk-homes");
+        let check = |roots: FilesystemRoots| validate_root_layout(&install.join("base"), &roots, &install);
+        assert!(check(layout(None, Some(home.join("jka")), Some(home.join("jk2")))).is_ok());
+        assert!(check(layout(None, Some(home.join("jka")), None)).is_ok());
+        assert!(check(layout(None, Some(home.join("jka")), Some(home.join("JKA")))).is_err());
+        assert!(check(layout(None, None, Some(install.clone()))).is_err());
+        assert!(check(layout(None, Some(install.join("DinurdoJK/home")), None)).is_err());
+        let jk2 = home.join("outcast");
+        assert!(check(layout(Some(jk2.clone()), Some(jk2), None)).is_err());
     }
 }

@@ -204,6 +204,8 @@ impl App {
                 sound.set_game_sounds(self.audio.game);
                 sound.set_music_volume(self.effective_music_volume());
                 sound.set_emote_music_volume(self.effective_emote_music_volume());
+                sound.set_underwater_mode(self.audio.underwater);
+                sound.set_underwater_oceans(&self.authored_oceans);
                 if inherit_map { sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
@@ -347,6 +349,8 @@ impl App {
                 sound.set_game_sounds(self.audio.game);
                 sound.set_music_volume(self.effective_music_volume());
                 sound.set_emote_music_volume(self.effective_emote_music_volume());
+                sound.set_underwater_mode(self.audio.underwater);
+                sound.set_underwater_oceans(&self.authored_oceans);
                 sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),

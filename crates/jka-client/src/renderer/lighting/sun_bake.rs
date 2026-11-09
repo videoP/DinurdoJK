@@ -56,6 +56,7 @@ pub(in crate::renderer) struct SunBake {
     source: Option<Arc<Source>>,
     pending: Option<Pending>,
     pub(in crate::renderer) ready: bool,
+    pub(in crate::renderer) auto_strength: Option<f32>,
     masks: Option<Vec<Vec<u8>>>,
     mask_sizes: Vec<[u32; 2]>,
     upload: Option<MaskUpload>,
@@ -103,6 +104,7 @@ impl SunBake {
             source,
             pending: None,
             ready: false,
+            auto_strength: None,
             masks: None,
             mask_sizes,
             upload: None,
@@ -181,7 +183,7 @@ fn fingerprint(source: &Source) -> u64 {
     // Same deterministic FoldHasher on disk and across runs. Bump the cache
     // magic/version whenever reconstruction math changes.
     let mut hash = scene::FoldHasher::default();
-    hash.write(b"baked-sun-v1");
+    hash.write(b"baked-sun-v2-auto");
     hash.write(&source.cache.map_hash.to_le_bytes());
     hash.write(bytemuck::cast_slice(&source.vertices));
     hash.write(bytemuck::cast_slice(&source.surface_ids));
@@ -361,10 +363,30 @@ fn run(
 }
 
 impl Renderer {
+    /// Read-only: the UI receives a notification only when this result changes.
+    /// Never expose a previous map's fitted value through the saved manual cvar.
+    pub(in crate::renderer) fn baked_sun_auto_status(&self) -> crate::renderer::BakedSunAutoStatus {
+        use crate::renderer::BakedSunAutoStatus;
+        let Some(bake) = self.world.as_ref().map(|world| &world.sun_bake) else {
+            return BakedSunAutoStatus::Unavailable;
+        };
+        if bake.ready {
+            return match bake.auto_strength.filter(|value| value.is_finite() && *value >= 0.0) {
+                Some(value) => BakedSunAutoStatus::Calibrated(value),
+                None => BakedSunAutoStatus::Unavailable,
+            };
+        }
+        if bake.source.is_none() && bake.pending.is_none() {
+            BakedSunAutoStatus::Unavailable
+        } else {
+            BakedSunAutoStatus::Calibrating
+        }
+    }
+
     /// One settings/ready/channel check in ordinary frames. Hashing, cache I/O,
     /// tracing and pipeline compilation stay on the background worker.
     pub(in crate::renderer) fn sync_sun_bake(&mut self) {
-        let desired = requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
+        let desired = self.baked_sun_removal_auto || requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
         let worker_override = self.bake_threads;
         let Some(world) = self.world.as_mut() else {
             return;
@@ -474,6 +496,13 @@ impl Renderer {
                 (world.legacy_dlight_surfaces.len().max(1) * 4) as u64,
                 bytemuck::cast_slice(&data.calibration.surfaces),
             );
+        }
+        world.sun_bake.auto_strength = data.calibration.auto_strength;
+        if self.baked_sun_removal_auto {
+            match data.calibration.auto_strength {
+                Some(strength) => println!("[BAKED SUN AUTO] applying calibrated removal {strength:.3}x"),
+                None => println!("[BAKED SUN AUTO] insufficient reliable shadow evidence; preserving authored lightmap"),
+            }
         }
         world.baked_sun_radiance = Some(data.calibration.radiance);
         world.sun_bake.ready = true;

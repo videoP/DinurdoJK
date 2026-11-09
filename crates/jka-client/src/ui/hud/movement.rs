@@ -192,6 +192,9 @@ pub(in crate::ui) fn build_speedometer(
 /// Image names of the icon atlas (see `renderer::load_ui_icon_atlas`): the two
 /// lagometer images in `crate::lagometer::Icon` order, then the image crosshairs
 /// from `ICON_CROSSHAIR_BASE` in `CROSSHAIR_IMAGE_NAMES` order.
+// Stock OpenJK/JA force icon paths. These feed the *native* UI atlas, including
+// the retail Force selector and active-effect displays. Never use replacement
+// HUD art here: the atlas exists even when no extension is enabled.
 pub const FORCE_ICON_NAMES: [&str; 18] = [
     "gfx/mp/f_icon_lt_heal",
     "gfx/mp/f_icon_levitation",
@@ -212,6 +215,49 @@ pub const FORCE_ICON_NAMES: [&str; 18] = [
     "gfx/mp/f_icon_saber_defend",
     "gfx/mp/f_icon_saber_throw",
 ];
+
+// Alternate Force artwork exposed to script-driven HUD extensions. It must
+// never be registered as the native Force atlas art. HUDs may select either
+// this style or the stock `FORCE_ICON_NAMES` style via their own API fields.
+pub const FORCE_EXTENSION_ICON_NAMES: [&str; 18] = [
+    "gfx/mp/new_f_icon_lt_heal",
+    "gfx/mp/new_f_icon_levitation",
+    "gfx/mp/new_f_icon_speed",
+    "gfx/mp/new_f_icon_push",
+    "gfx/mp/new_f_icon_pull",
+    "gfx/mp/new_f_icon_lt_telepathy",
+    "gfx/mp/new_f_icon_dk_grip",
+    "gfx/mp/new_f_icon_dk_l1",
+    "gfx/mp/new_f_icon_dk_rage",
+    "gfx/mp/new_f_icon_lt_protect",
+    "gfx/mp/new_f_icon_lt_absorb",
+    "gfx/mp/new_f_icon_lt_healother",
+    "gfx/mp/new_f_icon_dk_forceother",
+    "gfx/mp/new_f_icon_dk_drain",
+    "gfx/mp/new_f_icon_sight",
+    "gfx/mp/new_f_icon_saber_attack",
+    "gfx/mp/new_f_icon_saber_defend",
+    "gfx/mp/new_f_icon_saber_throw",
+];
+
+// OpenJK forcePowerSorted[] (also used by the original Force selector).
+// These are gameplay ordering/affinity metadata, not HUD-specific positions.
+pub const FORCE_POWER_SORTED: [u8; 18] =
+    [5, 0, 10, 9, 11, 1, 2, 3, 4, 14, 7, 13, 8, 6, 12, 15, 16, 17];
+pub const FORCE_POWER_NAMES: [&str; 18] = [
+    "Heal", "Levitation", "Speed", "Push", "Pull", "Mind Trick",
+    "Grip", "Lightning", "Rage", "Protect", "Absorb", "Team Heal",
+    "Team Energize", "Drain", "Seeing", "Saber Offense", "Saber Defense", "Saber Throw",
+];
+/// Stable protocol enum spellings for extension metadata (not display labels).
+pub const FORCE_POWER_INTERNAL_NAMES: [&str; 18] = [
+    "heal", "levitation", "speed", "push", "pull", "telepathy", "grip",
+    "lightning", "rage", "protect", "absorb", "team_heal", "team_force",
+    "drain", "see", "saber_offense", "saber_defense", "saberthrow",
+];
+/// OpenJK forcePowerDarkLight[]: 0 neutral; 1 light; 2 dark.
+pub const FORCE_POWER_SIDES: [u8; 18] =
+    [1, 0, 0, 0, 0, 1, 2, 2, 2, 1, 1, 1, 2, 2, 0, 0, 0, 0];
 
 // TaystJK CG_Init (cg_main.c): BG_FindItemForWeapon(i)->icon in WP_* order.
 // The paths match the pinned OpenJK bg_itemlist and retain their original artwork.
@@ -951,7 +997,7 @@ pub(in crate::ui) fn build_strafe_helper(out: &mut Vec<UiVertex>, ui: &UiSnapsho
 fn draw_extended(out: &mut Vec<UiVertex>, hud: crate::strafehelper::ExtendedHud, w:u32, h:u32) {
     let (sx,sy) = (w as f32/640.0,h as f32/480.0);
     for triangle in hud.triangles {
-        for [x,y] in triangle.points { out.push(UiVertex { position:[2.0*x/640.0-1.0,1.0-2.0*y/480.0], uv:[0.0,0.0], color:triangle.color,textured:0.0 }); }
+        for [x,y] in triangle.points { out.push(UiVertex { position:[2.0*x/640.0-1.0,1.0-2.0*y/480.0], uv:[0.0,0.0], color:UiVertex::pack_color(triangle.color),textured:0.0 }); }
     }
     for fill in hud.fills { rect(out,fill.x*sx,fill.y*sy,fill.w*sx,fill.h*sy,fill.color,w,h); }
     for label in hud.labels {
@@ -1082,7 +1128,7 @@ mod strafehelper_review {
             let source_y = crate::strafehelper::Q3DF_SPEED_TOP_Y * sy;
             let make_vertex = |x: f32| UiVertex {
                 position: [x / w as f32 * 2.0 - 1.0, 1.0 - source_y / h as f32 * 2.0],
-                uv: [0.0; 2], color: [1.0; 4], textured: 1.0,
+                uv: [0.0; 2], color: [255; 4], textured: 1.0,
             };
             let mut short = vec![make_vertex(source_x), make_vertex(source_x + 12.0 * sy)];
             let mut long = vec![make_vertex(source_x), make_vertex(source_x + 95.0 * sy)];
@@ -1183,7 +1229,7 @@ mod strafehelper_review {
                 let mut batch = Vec::new();
                 build_strafe_helper(&mut batch, &ui, 1280, 720);
                 let vertices: Vec<_> = batch.iter().map(|v| serde_json::json!({
-                    "position": v.position, "uv": v.uv, "color": v.color, "textured": v.textured,
+                    "position": v.position, "uv": v.uv, "color": crate::ui::UiVertex::unpack_color(v.color), "textured": v.textured,
                 })).collect();
                 panels.push(serde_json::json!({ "style": name, "yaw": yaw,
                     "right": ui.movement_hud.right_move, "width": 1280, "height": 720,
@@ -1272,6 +1318,27 @@ mod widescreen_lagometer_tests {
             let sy = h as f32 / 480.0;
             assert!((right - 620.0 * w as f32 / 640.0 - 1.0).abs() < 0.003);
             assert!(((right - left) - 24.0 * 0.5 * sy - 1.0).abs() < 0.003);
+        }
+    }
+}
+
+#[cfg(test)]
+mod force_icon_source_tests {
+    use super::*;
+
+    #[test]
+    fn native_force_atlas_uses_stock_paths_and_extension_art_is_separate() {
+        assert_eq!(FORCE_ICON_NAMES.len(), FORCE_EXTENSION_ICON_NAMES.len());
+        for (i, (&native, &alternate)) in FORCE_ICON_NAMES.iter()
+            .zip(FORCE_EXTENSION_ICON_NAMES.iter()).enumerate()
+        {
+            assert!(native.starts_with("gfx/mp/f_icon_"), "native {i}: {native}");
+            assert_eq!(ICON_NAMES[ICON_FORCE_BASE + i], native);
+            assert_eq!(
+                alternate.strip_prefix("gfx/mp/new_"),
+                native.strip_prefix("gfx/mp/"),
+                "alternate art should use the same force-power ID"
+            );
         }
     }
 }

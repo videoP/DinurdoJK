@@ -22,6 +22,10 @@ impl App {
     }
 
     pub(in crate::app) fn connect_to_jk2_server(&mut self, version: &str, target: &str) {
+        self.connect_to_jk2_server_inner(version, target, true);
+    }
+
+    fn connect_to_jk2_server_inner(&mut self, version: &str, target: &str, allow_saved: bool) {
         let version = match version {
             "1.02" => jka_protocol::jk2::Version::V102,
             "1.04" => jka_protocol::jk2::Version::V104,
@@ -31,7 +35,7 @@ impl App {
         if let Some(missing) = jka_assets::pk3::missing_jk2_stock_archive(&self.base, &self.fs_roots, minor) {
             self.push_console_line(format!("^1JK2 {} requires {missing} in fs_jk2basepath/base or fs_jk2cdpath/base", version.name())); return;
         }
-        self.connect_to_server_game(target, None, Some(version));
+        self.connect_to_server_game(target, None, Some(version), allow_saved);
     }
 
     /// A browser refresh is an early map/mod *hint*, not a verified gamestate.
@@ -42,10 +46,32 @@ impl App {
         target: &str,
         browser_hint: Option<(&str, &str)>,
     ) {
-        self.connect_to_server_game(target, browser_hint, None);
+        self.connect_to_server_game(target, browser_hint, None, true);
     }
 
-    fn connect_to_server_game(&mut self, target: &str, browser_hint: Option<(&str, &str)>, jk2: Option<jka_protocol::jk2::Version>) {
+    /// A password-dialog retry explicitly overrides any saved Server password
+    /// (which may be stale). This applies equally to direct and browser joins.
+    pub(in crate::app) fn connect_to_server_with_manual_password(
+        &mut self,
+        target: &str,
+        browser_hint: Option<(&str, &str)>,
+    ) {
+        if let Some(rest) = target.strip_prefix("jk2://") {
+            if let Some((version, address)) = rest.split_once('/') {
+                self.connect_to_jk2_server_inner(version, address, false);
+                return;
+            }
+        }
+        self.connect_to_server_game(target, browser_hint, None, false);
+    }
+
+    fn connect_to_server_game(
+        &mut self,
+        target: &str,
+        browser_hint: Option<(&str, &str)>,
+        jk2: Option<jka_protocol::jk2::Version>,
+        allow_saved: bool,
+    ) {
         self.leave_render_studio_for_launch();
         self.cancel_vote_map_prewarm();
         self.vote_map_candidate = None;
@@ -73,17 +99,65 @@ impl App {
         if self.network.color2_packed.is_none() {
             if let Err(error) = self.sync_packed_body_cvar() { self.push_console_error(error); }
         }
-        let userinfo = if let Some(version) = jk2 {
-            self.network.jk2_userinfo_for_version(&self.solo_client_info.model_cvar(), version)
-        } else { self.network.userinfo(&self.solo_client_info.model_cvar()) };
-        let connection = if let Some(version) = jk2 { crate::net::NetClient::connect_jk2_preflight(target, userinfo, self.network.net_port, version) }
-            else { crate::net::NetClient::connect_preflight(target, userinfo, self.network.net_port) };
+        // Resolve exactly once. A hostname can change IP between DNS lookups;
+        // credential selection and the eventual UDP destination MUST agree.
+        let default_port = if jk2.is_some() {
+            jka_protocol::jk2::DEFAULT_PORT
+        } else {
+            jka_protocol::DEFAULT_PORT
+        };
+        let resolved = crate::net::resolve_server_with_default_port(target, default_port);
+        let connection = resolved.and_then(|server| {
+            let saved = if allow_saved && crate::credential_store::supported() {
+                match crate::credential_store::server_password(server) {
+                    Ok(password) => password,
+                    Err(error) => {
+                        self.push_console_line(format!("^3Saved server credential unavailable:^7 {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            // Select the saved credential for this exact endpoint before
+            // ClientSession snapshots userinfo. Never mutate the global cvar.
+            let mut settings = self.network.clone();
+            if let Some(password) = saved.as_ref() {
+                settings.password.clone_from(password);
+            }
+            let model = self.solo_client_info.model_cvar();
+            let userinfo = if let Some(version) = jk2 {
+                settings.jk2_userinfo_for_version(&model, version)
+            } else {
+                settings.userinfo(&model)
+            };
+            let destination = server.to_string();
+            let mut net = if let Some(version) = jk2 {
+                crate::net::NetClient::connect_jk2_preflight(&destination, userinfo, self.network.net_port, version)
+            } else {
+                crate::net::NetClient::connect_preflight(&destination, userinfo, self.network.net_port)
+            }?;
+            // Keep the user's hostname for UI/history even though UDP uses
+            // the already-resolved numeric endpoint (the vault identity).
+            net.server_name = if jk2.is_some()
+                && !target.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+            {
+                format!("{target}:{default_port}")
+            } else {
+                target.to_owned()
+            };
+            Ok((net, saved))
+        });
         match connection {
-            Ok(net) => {
+            Ok((net, saved)) => {
                 // NET_OpenIP parity: if the requested port was occupied and we
                 // scanned upward, expose the actual bound port through net_port.
                 self.network.net_port = net.local_port();
                 let resolved_server = net.session().server();
+                if saved.is_some() {
+                    self.push_console_line(format!("^2Saved server password applied:^7 {resolved_server}"));
+                }
+                self.connection_saved_password = saved;
                 self.push_console_line(format!("^7{target} resolved to {}", resolved_server));
                 self.console_status = format!("CONNECTING TO {}...", target.to_ascii_uppercase());
                 self.reconnect_target = Some(jk2.map_or_else(|| target.to_owned(), |v| format!("jk2://{}/{target}", v.name())));
@@ -145,11 +219,50 @@ impl App {
                 self.publish_ui();
             }
             Err(error) => {
+                self.connection_saved_password = None;
                 self.select_demo_asset_game(None);
                 self.live_join_timing = None;
                 self.console_status = error.clone();
                 self.push_console_line(format!("^1{error}"));
             }
+        }
+    }
+
+    /// OpenJK CL_ServerStatus_f. Reuse the browser's getstatus worker/decoder,
+    /// but print its result only to the console (never to the browser or clipboard).
+    pub(in crate::app) fn query_console_server_status(&mut self, address: Option<&str>) {
+        let target = match address {
+            Some(text) => match crate::net::resolve_server(text) {
+                Ok(address) => address,
+                Err(error) => {
+                    self.push_console_error(format!("^1{error}"));
+                    return;
+                }
+            },
+            None => {
+                let Some(net) = self.net.as_ref().filter(|net| {
+                    net.state() == jka_protocol::session::ConnectionState::Active
+                }) else {
+                    self.push_console_line("Not connected to a server.");
+                    self.push_console_line("Usage: serverstatus [server]");
+                    return;
+                };
+                net.session().server()
+            }
+        };
+        // The response has the same OOB format for JKA and JK2. Preserve
+        // the current game's protocol tag without changing the selected tab.
+        let protocol = match self.net.as_ref().and_then(|net| net.session().jk2_version()) {
+            Some(jka_protocol::jk2::Version::V102) => crate::server_browser::BrowserProtocol::Jk2_102,
+            Some(jka_protocol::jk2::Version::V104) => crate::server_browser::BrowserProtocol::Jk2_104,
+            None if self.net.is_some() => crate::server_browser::BrowserProtocol::Jka,
+            None => self.server_browser.protocol,
+        };
+        if self.server_browser_tx.send(crate::server_browser::BrowserRequest {
+            protocol,
+            command: crate::server_browser::BrowserCommand::ConsoleServerStatus(target),
+        }).is_err() {
+            self.push_console_error("^1Server status worker is unavailable");
         }
     }
 
@@ -644,6 +757,7 @@ impl App {
                 let readable = crate::logging::strip_jka_colors(&reason);
                 if awaiting_admission && Self::is_server_password_rejection(&readable) {
                     if let Some(target) = target {
+                        self.network.password.clear();
                         self.show_server_password_prompt(target, Some(readable));
                         return;
                     }
@@ -665,7 +779,7 @@ impl App {
         self.loading = None;
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
-        self.sun_bake_ready_at = None;
+        self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.prepared_map_cache = None;
         self.live_join_ui = None;
 
@@ -983,8 +1097,12 @@ impl App {
         self.game_session = Some(session);
         self.sync_shader_remap_presenters();
         self.predictor.reset();
-        if self.live_input.is_jk2() {
-            self.live_input.set_jk2(true); // CG_Init selection state
+        // CG_Init selection state. Ask the connection, not live_input: a map
+        // upload that finishes before this gamestate takes the local-game
+        // entry path and resets live_input, and a JKA input layer would send
+        // JKA weapon/genCmd IDs (saberAttackCycle 26 is dropped as > 20).
+        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            self.live_input.set_jk2(true);
         }
         self.local_server = None;
         println!(

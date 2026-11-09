@@ -23,6 +23,12 @@ fn to_rect(origin: egui::Pos2, b: [f32; 4]) -> Rect {
     Rect::from_min_size(pos2(origin.x + b[0], origin.y + b[1]), vec2(b[2], b[3]))
 }
 
+/// UI_AllForceDisabled: every one of the 18 powers is in g_forcePowerDisable.
+fn all_force_disabled(disabled: u32) -> bool {
+    const ALL: u32 = (1 << 18) - 1;
+    disabled & ALL == ALL
+}
+
 /// Why a power cannot be changed, if it cannot.
 fn lock_reason(power: usize, disabled: u32, gametype: i32, force: &ProfileForceConfig) -> Option<&'static str> {
     // normalize() zeroes every disabled power, Jump and Saber included, so an
@@ -41,6 +47,12 @@ fn lock_reason(power: usize, disabled: u32, gametype: i32, force: &ProfileForceC
 impl App {
     pub(in crate::app::egui_menu) fn egui_profile_force(&mut self, ui: &mut egui::Ui) {
         let (max_rank, disabled, gametype, free_saber, forced_side) = self.profile_server_force_limits();
+        if all_force_disabled(disabled) {
+            // The stock player menu shows "Force Disabled" in place of the
+            // allocation and leaves the forcepowers string untouched.
+            Self::force_disabled_panel(ui);
+            return;
+        }
         let mut force = ProfileForceConfig::parse(&self.network.forcepowers);
         force.rank = max_rank;
         if let Some(side) = forced_side {
@@ -89,6 +101,28 @@ impl App {
                 self.profile_force_pending = true;
             }
         }
+    }
+
+    /// Every power disabled: a red blade under "FORCE DISABLED".
+    fn force_disabled_panel(ui: &mut egui::Ui) {
+        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 120.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_rgba_unmultiplied(DARK.r(), DARK.g(), DARK.b(), 14));
+        painter.rect_stroke(rect, egui::CornerRadius::ZERO, egui::Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
+        let y = rect.top() + 28.0;
+        holo::saber(painter, pos2(rect.left() + 22.0, y), pos2(rect.right() - 22.0, y), 3.0, DARK, 1.0);
+        let title = "FORCE DISABLED";
+        let cap = 16.0;
+        let x = rect.center().x - holo::neon_width(title, cap) * 0.5;
+        holo::neon_text(painter, pos2(x, rect.top() + 72.0), title, cap, DARK, 1.0);
+        painter.text(
+            pos2(rect.center().x, rect.top() + 96.0),
+            egui::Align2::CENTER_CENTER,
+            "Force abilities have been disabled on this server.",
+            egui::FontId::proportional(13.5),
+            theme::TEXT_DIM(),
+        );
     }
 
     /// Light and Dark as two cards, each with its saber drawn across it.
@@ -281,5 +315,13 @@ mod tests {
         assert!(lock_reason(11, 0, 0, &force).is_some());
         assert!(lock_reason(11, 0, 6, &force).is_none());
         assert!(lock_reason(3, 1 << 3, 6, &force).is_some());
+    }
+
+    #[test]
+    fn force_disabled_needs_every_power() {
+        assert!(all_force_disabled(262_143));
+        assert!(all_force_disabled(u32::MAX));
+        assert!(!all_force_disabled(163_837));
+        assert!(!all_force_disabled(0));
     }
 }

@@ -261,6 +261,11 @@ pub struct SoundPresenter {
     eal_enabled: bool,
     eal_hrtf_enabled: bool,
     eal_debug_mode: u8,
+    underwater_mode: u8,
+    listener_submerged: bool,
+    /// Authored BSP/server oceans; ordinary waterbrush contents are queried
+    /// from the authoritative collision world by the session.
+    underwater_oceans: Vec<([f32; 3], [f32; 3], f32)>,
     /// Physical-device backend parked while deterministic demo export owns an
     /// offline software mixer. None during ordinary gameplay.
     offline_restore_backend: Option<AudioBackend>,
@@ -292,6 +297,9 @@ pub struct SoundPresenter {
     music_dip_until: i32,
     /// `s_musicvolume` (after the unfocused mute).
     music_base: f32,
+    /// Local sound-pool selection only; this is not a synchronized strike clock.
+    thunder_seed: u64,
+    thunder_event_counter: u64,
 }
 
 /// `cg.soundBuffer` plus the `cgAnnouncerTime` / limit-warning flags of
@@ -316,6 +324,15 @@ fn emote_owner(connection: Option<u16>, listener: &Listener, entities: &[Present
     let origin=entities.iter().chain(followed.into_iter()).find(|entity|entity.number==id)
         .map(|entity|entity.origin).unwrap_or(listener.origin);
     (id,origin)
+}
+
+/// SplitMix64 finalizer: diffuse even coarse-resolution clock seeds and event
+/// numbers into all bits before selecting one of the five authored thunder files.
+fn thunder_sample_index(value: u64) -> usize {
+    let mut mixed = value;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((mixed ^ (mixed >> 31)) % 5) as usize
 }
 
 impl SoundPresenter {
@@ -347,6 +364,9 @@ impl SoundPresenter {
             eal_enabled: false,
             eal_hrtf_enabled: false,
             eal_debug_mode: 0,
+            underwater_mode: 2,
+            listener_submerged: false,
+            underwater_oceans: Vec::new(),
             offline_restore_backend: None,
             offline_capture_active: false,
             warnings: HashSet::new(),
@@ -371,6 +391,10 @@ impl SoundPresenter {
             music_mult_time: 0,
             music_dip_until: 0,
             music_base: 0.25,
+            thunder_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos() as u64),
+            thunder_event_counter: 0,
         }
     }
 
@@ -809,17 +833,45 @@ impl SoundPresenter {
         }
     }
 
-    /// Upstream weather supplies the delay and loudness. The five `sound/japro/thunder_0N.mp3`
-    /// samples in dinurdo-assets.pk3 are tried first, starting at a random one so strikes vary;
-    /// installed JKA thunder samples are the fallback.
-    pub fn play_weather_thunder(&mut self,volume:f32) {
-        const BUNDLED: [&str;5] = ["sound/japro/thunder_00.mp3","sound/japro/thunder_01.mp3","sound/japro/thunder_02.mp3","sound/japro/thunder_03.mp3","sound/japro/thunder_04.mp3"];
-        const STOCK: [&str;3] = ["sound/ambience/thunder2.wav","sound/ambience/thunder1.mp3","sound/ambient/1shot_thunder_02.wav"];
-        let start=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.subsec_nanos() as usize).unwrap_or(0)%BUNDLED.len();
-        let bundled=(0..BUNDLED.len()).map(|i|BUNDLED[(start+i)%BUNDLED.len()]);
-        for qpath in bundled.chain(STOCK) {
-            if let Ok(sound)=self.assets.register(qpath) {
-                if let Some(backend)=&mut self.backend {backend.play_ambient(SoundRequest {qpath:qpath.to_owned(),entity:1022,channel:0,origin:SoundOrigin::Local},sound,volume);}
+    /// Upstream weather supplies the delay and loudness. Start each thunder
+    /// lookup at a *mixed* sample index rather than subsec_nanos % 5: Windows
+    /// clocks can quantize timestamps to 100 ns, making that remainder 0.
+    /// Keep the authored five-sample pool and JKA fallback order unchanged.
+    pub fn play_weather_thunder(&mut self, volume: f32, sample: Option<u8>) {
+        const BUNDLED: [&str; 5] = [
+            "sound/japro/thunder_00.mp3",
+            "sound/japro/thunder_01.mp3",
+            "sound/japro/thunder_02.mp3",
+            "sound/japro/thunder_03.mp3",
+            "sound/japro/thunder_04.mp3",
+        ];
+        const STOCK: [&str; 3] = [
+            "sound/ambience/thunder2.wav",
+            "sound/ambience/thunder1.mp3",
+            "sound/ambient/1shot_thunder_02.wav",
+        ];
+        self.thunder_event_counter = self.thunder_event_counter.wrapping_add(1);
+        let start = sample.map_or_else(
+            || thunder_sample_index(self.thunder_seed.wrapping_add(self.thunder_event_counter)),
+            |sample| usize::from(sample) % BUNDLED.len(),
+        );
+        for qpath in (0..BUNDLED.len())
+            .map(|offset| BUNDLED[(start + offset) % BUNDLED.len()])
+            .chain(STOCK)
+        {
+            if let Ok(sound) = self.assets.register(qpath) {
+                if let Some(backend) = &mut self.backend {
+                    backend.play_ambient(
+                        SoundRequest {
+                            qpath: qpath.to_owned(),
+                            entity: 1022,
+                            channel: 0,
+                            origin: SoundOrigin::Local,
+                        },
+                        sound,
+                        volume,
+                    );
+                }
                 break;
             }
         }
@@ -904,12 +956,37 @@ impl SoundPresenter {
         self.dispatch_prepared(event,game,siege_classes,event.server_time,prepared);
     }
 
+    /// Set the archived listener-only preset live. No backend restart.
+    pub fn set_underwater_mode(&mut self, mode: u8) {
+        self.underwater_mode = mode.min(3);
+        if let Some(backend) = &mut self.backend {
+            backend.set_underwater(self.underwater_mode, self.listener_submerged);
+        }
+    }
+
+    pub fn underwater_enabled(&self) -> bool { self.underwater_mode != 0 }
+
+    pub fn set_underwater_oceans(&mut self, oceans: &[crate::ocean::authoring::AuthoredOcean]) {
+        self.underwater_oceans.clear();
+        self.underwater_oceans.extend(oceans.iter().map(|o| (o.mins, o.maxs, o.height)));
+    }
+
     pub fn frame(
         &mut self,
         listener: Listener,
         entities: &[PresentedEntity],
         followed_entity: Option<&PresentedEntity>,
+        bsp_submerged: bool,
     ) {
+        // The waterHeight plane is in JKA Z, unlike renderer Y. Unlike an
+        // infinite ocean plane, check the authored map brush bounds too.
+        self.listener_submerged = self.underwater_mode != 0 && (bsp_submerged ||
+            self.underwater_oceans.iter().any(|(mins, maxs, height)| {
+                let p = listener.origin;
+                p[0] >= mins[0] && p[0] <= maxs[0] &&
+                p[1] >= mins[1] && p[1] <= maxs[1] &&
+                p[2] >= mins[2] && p[2] <= *height
+            }));
         // Offline sessions have no connection ID; first-person presentation may
         self.poll_emote_warmup();
         for result in crate::emotes::poll_prepared_audio() { let _ = self.assets.cache_emote_decode(result); }
@@ -949,6 +1026,7 @@ impl SoundPresenter {
             }
         }
         if let Some(backend) = &mut self.backend {
+            backend.set_underwater(self.underwater_mode, self.listener_submerged);
             backend.frame(
                 listener,
                 audio_entities(entities, followed_entity)
@@ -1108,6 +1186,9 @@ impl SoundPresenter {
         self.offline_restore_backend = live;
         self.offline_capture_active = true;
         self.backend = Some(offline);
+        if let Some(backend) = &mut self.backend {
+            backend.set_underwater(self.underwater_mode, self.listener_submerged);
+        }
         self.map_music = None;
         self.start_map_music(game, true);
         Ok(output)
@@ -1284,6 +1365,7 @@ impl SoundPresenter {
         backend.set_mix(effects_volume, voice_volume, separation);
         backend.set_music_level((music_volume * self.music_mult).clamp(0.0, 1.0));
         backend.set_rate(rate);
+        backend.set_underwater(self.underwater_mode, self.listener_submerged);
         backend.set_steam_audio_map(acoustic_mesh, bake);
         backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
         backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
@@ -1895,7 +1977,15 @@ fn saber_attack_request(
 fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Option<SoundRequest>, &'static str> {
     let mut entity = event.entity_num;
     let variant4 = event_variant(event, 4) + 1;
+    // JK2 cg_event.c: landings and water steps pick boot / clank / splash 1-4 and never look at a material.
+    let jk2_step = |kind| (super::footsteps::jk2_step_sound(kind, variant4 - 1), 6, SoundOrigin::Entity(event.position));
+    let jk2 = jka_assets::pk3::active_jk2().is_some();
     let (qpath, channel, origin) = match event.event {
+        EntityEvent::EV_FOOTSTEP if jk2 => jk2_step(super::footsteps::Jk2StepKind::Boot),
+        EntityEvent::EV_FOOTSTEP_METAL if jk2 => jk2_step(super::footsteps::Jk2StepKind::Metal),
+        EntityEvent::EV_FOOTSPLASH | EntityEvent::EV_FOOTWADE | EntityEvent::EV_SWIM if jk2 => {
+            jk2_step(super::footsteps::Jk2StepKind::Splash)
+        }
         EntityEvent::EV_FOOTSTEP => { // eventParm is the Raven material type.
             let material = u32::try_from(event.parm).unwrap_or(0);
             let path = super::footsteps::material_step(material).sound.path(false, variant4 - 1);
@@ -2236,10 +2326,16 @@ fn complex_sound_event(
             }
             let mut alt_qpaths = Vec::new();
             if event.event == E::EV_ROLL {
+                // cg_rollSounds gates the voice in both games.
                 if own_or_other_allowed(prep.game_sounds.roll, local_client(game) == Some(entity)) {
-                    // A model without its own roll voice reuses its jump voice.
-                    plays.push(play("*roll.wav", CHAN_VOICE));
-                    alt_qpaths.push(("*roll.wav".to_owned(), "*jump1.wav".to_owned()));
+                    if jka_assets::pk3::active_jk2().is_some() {
+                        // JK2 cg_event.c: the roll voice is *jump1.wav.
+                        plays.push(play("*jump1.wav", CHAN_VOICE));
+                    } else {
+                        // A model without its own roll voice reuses its jump voice.
+                        plays.push(play("*roll.wav", CHAN_VOICE));
+                        alt_qpaths.push(("*roll.wav".to_owned(), "*jump1.wav".to_owned()));
+                    }
                 }
                 plays.push(play(ROLL_SOUND, CHAN_BODY));
             }
@@ -3205,5 +3301,26 @@ mod tests {
         let taunt = event(EntityEvent::EV_TAUNT, 0);
         assert!(with(&|o| o.no_taunt = true, &taunt).is_none());
         assert!(with(&|o| o.no_taunt = false, &taunt).is_some());
+    }
+}
+
+#[cfg(test)]
+mod thunder_selection_tests {
+    use super::thunder_sample_index;
+
+    #[test]
+    fn thunder_selection_works_with_100ns_windows_clock_ticks() {
+        let selected: std::collections::HashSet<_> = (0..100)
+            .map(|tick| thunder_sample_index((tick * 100) as u64))
+            .collect();
+        assert_eq!(selected, (0..5).collect());
+    }
+
+    #[test]
+    fn thunder_selection_varies_across_successive_events() {
+        let selected: std::collections::HashSet<_> = (0..100)
+            .map(|event| thunder_sample_index(1_700_000_000_000_000_000 + event))
+            .collect();
+        assert_eq!(selected, (0..5).collect());
     }
 }

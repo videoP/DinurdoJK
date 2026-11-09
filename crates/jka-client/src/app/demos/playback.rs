@@ -1528,6 +1528,22 @@ impl App {
                 if playback.live || self.demo_view_mode == DemoViewMode::Free {
                     None
                 } else {Some(effective_spectator)};
+            // A map without an authored portal must never pay the per-frame
+            // model/animation cost for a first-person mirror-only body.
+            // Cache the stage scan by immutable prepared-map identity.
+            if let Some(map) = self.prepared_map_cache.as_ref().map(|cache| &cache.map) {
+                let token = std::sync::Arc::as_ptr(map) as usize;
+                if playback.portal_body_map_token != Some(token) {
+                    playback.portal_body_map_has_authored = map.batches.iter()
+                        .any(|batch| batch.planar_reflection);
+                    playback.portal_body_map_token = Some(token);
+                }
+            } else {
+                playback.portal_body_map_token = None;
+                playback.portal_body_map_has_authored = false;
+            }
+            playback.portal_body_enabled = playback.portal_body_map_has_authored
+                && self.video.reflection_quality.planar_slot_budget() > 0;
             playback.demo_hidden_view_client = if playback.live ||
                 effective_spectator != SpectatorCameraMode::FirstPerson {
                 None
@@ -1660,6 +1676,7 @@ impl App {
                 max_detached_limbs: self.video.dismember_max,
                 detached_limb_lifetime_seconds: self.video.dismember_lifetime,
                 self_collision: self.video.ragdoll_self_collision,
+                joint_model: self.video.ragdoll_joint_model,
                 weapon_impulses: self.video.physics_weapon_impulses,
                 explosion_impulses: self.video.physics_explosion_impulses,
                 force_impulses: self.video.physics_force_impulses,
@@ -2497,6 +2514,9 @@ impl App {
                 fx_tessellate_started.elapsed().as_secs_f64() * 1000.0;
             let audio_started = Instant::now();
             if !playback.suppress_audio {
+                let audio_eye = scene::jka_position(self.camera.position.to_array());
+                let bsp_submerged = playback.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
+                    && playback.player_presenter.audio_listener_in_bsp_water(audio_eye);
                 if let Some(sound) = &mut playback.sound_presenter {
                     let yaw = self.camera.yaw;
                     sound.frame(
@@ -2509,6 +2529,7 @@ impl App {
                         },
                         &playback.presented_entities,
                         playback.audio_followed_entity.as_ref(),
+                        bsp_submerged,
                     );
                     if let Some(snapshot) = playback.client_game.current_snapshot() {
                         sound.update_announcer(

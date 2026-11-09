@@ -353,19 +353,15 @@ fn model_brightness() -> f32 {
     return bitcast<f32>(entity_lighting.values.y);
 }
 
-fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
-    // BSP LIGHTGRID is already applied above from the per-draw OpenJK probe
-    // sample. The previous directional placeholder remains only under
-    // irradiance-volume mode until Ghoul2 is bound to the ambient-cube data.
-    // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
-    let tex = vec4<f32>(tex_in.rgb * model_brightness() * sky_world_model_gain(normal), tex_in.a);
-    if (entity_lighting.values.x != 2u) {
-        return tex;
+fn lit_color(normal: vec3<f32>, world_position: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
+    // Ghoul2 GPU skinning produces a render-space world position and normal.
+    // Sample the same map irradiance volume as BSP, instead of a fake sun.
+    let sky_gain = sky_world_model_gain(normal, world_position);
+    if (entity_lighting.values.x == 2u) {
+        return vec4<f32>(tex_in.rgb * model_brightness() * sky_gain
+            * model_irradiance_volume_light(world_position, normal), tex_in.a);
     }
-    let light_dir = normalize(vec3<f32>(0.35, 0.75, 0.55));
-    let diffuse = max(dot(normalize(normal), light_dir), 0.0);
-    let lighting = 0.32 + 0.68 * diffuse;
-    return vec4<f32>(tex.rgb * lighting, tex.a);
+    return vec4<f32>(tex_in.rgb * model_brightness() * sky_gain, tex_in.a);
 }
 
 // OpenJK r_drawfog 2 applies GL_EXP2 hardware fog to entities too: their fog
@@ -529,7 +525,7 @@ fn source_material_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
     if (draw.params.y == 0u) {
         // No light grid sample for this draw (entity lighting off): there is
         // nothing for Valve's model to react to, so stay on the JKA path.
-        return lit_color(input.normal, tex) * input.color;
+        return lit_color(input.normal, input.world_position, tex) * input.color;
     }
     let geometric = normalize(input.normal);
     let n = source_tangent_normal(geometric, input.world_position, input.uv, normal_texel.rgb);
@@ -581,7 +577,7 @@ fn source_material_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
     // the grid routinely saturates, so the diffuse half keeps that range.
     let lighting = clamp(sum.diffuse, vec3<f32>(0.0), vec3<f32>(1.0));
     let albedo = tex.rgb * model_brightness() * input.color.rgb;
-    return vec4<f32>((albedo * lighting + specular) * sky_world_model_gain(n), tex.a * input.color.a);
+    return vec4<f32>((albedo * lighting + specular) * sky_world_model_gain(n, input.world_position), tex.a * input.color.a);
 }
 
 /// The lit colour for one fragment. `ENABLE_SOURCE_MATERIAL` is a pipeline
@@ -591,7 +587,7 @@ fn shaded_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
     if (ENABLE_SOURCE_MATERIAL) {
         return source_material_color(input, tex);
     }
-    return lit_color(input.normal, tex) * input.color;
+    return lit_color(input.normal, input.world_position, tex) * input.color;
 }
 
 // Profile is addressed by each skin instance, not the global camera rain.

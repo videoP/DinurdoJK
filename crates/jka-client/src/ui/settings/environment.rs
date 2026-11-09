@@ -271,6 +271,9 @@ pub const ENV_ROW_FOG_MODE: usize = 0;
 
 pub const ENV_ROW_FOG_STRENGTH: usize = 1;
 
+/// Fog-adjacent Blue Water geometry haze, distinct from authored map fog.
+pub const ENV_ROW_BLUE_SKY_AERIAL: usize = 43;
+
 pub const ENV_ROW_CLOUDS: usize = 2;
 
 pub const ENV_ROW_CLOUD_TYPE: usize = 3;

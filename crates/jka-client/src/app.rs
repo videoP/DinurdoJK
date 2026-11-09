@@ -25,6 +25,7 @@ mod frame;
 mod frontend_previews;
 mod frontend_scene_cache;
 mod hud;
+mod hud_edit_history;
 mod initialize;
 mod input;
 mod inspector;
@@ -548,6 +549,10 @@ pub struct App {
     /// `needpass` before joining from the browser; we also reuse the same prompt
     /// when a direct `/connect` is rejected because its password is missing/wrong.
     server_password_prompt: Option<ServerPasswordPrompt>,
+    /// Automatically selected Server credential for the currently resolved
+    /// endpoint. Never stored in the global `password` cvar/config, and cleared
+    /// when this session ends. Also used for subsequent userinfo updates.
+    connection_saved_password: Option<String>,
     /// Blocking pre-connect choice shown when infoResponse names a BSP that is not installed.
     missing_map_prompt: Option<MissingMapPrompt>,
     /// Blocking demo-playback choice shown when the recorded BSP is not installed.
@@ -762,6 +767,7 @@ pub struct App {
     hud_layout: HudLayout,
     hud_edit_selected: Option<HudElementId>,
     hud_edit_extension_selected: Option<String>,
+    hud_edit_history: hud_edit_history::HudEditHistory,
     hud_edit_drag_origin: Option<[f32; 2]>,
     hud_edit_drag_delta: [f32; 2],
     /// Chat corner-resize snapshot. Resize uses total drag distance from this
@@ -1047,6 +1053,11 @@ pub struct App {
     desktop_resolution: Option<[u32; 2]>,
     applied_grass: bool,
     applied_ocean: bool,
+    /// Texture upload compression of the currently resident GPU world.
+    applied_texture_compression: u8,
+    /// Keep the native levelshot on both sides of a renderer restart, until
+    /// a new world/menu frame has actually presented.
+    renderer_restart_loading: bool,
     video_confirmation: Option<VideoConfirmation>,
     /// A requested video mode/backend that has spawned but has not yet produced
     /// a visible world frame. The 15-second keep/revert clock must not run while
@@ -1149,7 +1160,8 @@ pub struct App {
     loading: Option<MapLoadingState>,
     static_ao_progress: Option<(u32, u32)>,
     sun_bake_progress: Option<(u32, crate::renderer::SunBakeStage)>,
-    sun_bake_ready_at: Option<Instant>,
+    /// Live calibrated coefficient from render thread; never stored in r_bakedSunRemoval.
+    baked_sun_auto_status: crate::renderer::BakedSunAutoStatus,
     preserve_game_state_on_next_map_upload: bool,
     renderer_restart_started: Option<Instant>,
     /// The renderer restart spans several event-loop turns. Unlike TaystJK's

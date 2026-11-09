@@ -3,6 +3,114 @@
 
 use std::io::{self, Read};
 
+use crate::message::{Error as MessageError, MessageWriter};
+
+/// JK2MV CL_Record_f: construct the initial server message from the *JK2 wire*
+/// gamestate when /record begins mid-match. Never use the mapped JKA decoder;
+/// JK2 1.02 and 1.04 have their own field tables, configstring indices, and
+/// gamestate footer (no protocol-26 RMG short).
+///
+/// Reference: mvdevs/jk2mv src/client/cl_main.cpp, CL_Record_f;
+/// src/qcommon/msg.cpp, MSG_WriteDeltaEntity.
+pub fn synthesize_gamestate_payload(
+    decoder: &super::Decoder,
+    reliable_sequence: i32,
+) -> Result<Vec<u8>, MessageError> {
+    let version = decoder.version().ok_or(MessageError {
+        bit: 0,
+        kind: crate::message::ErrorKind::InvalidValue("JK2 gamestate version"),
+    })?;
+    let mut writer = MessageWriter::new(super::MAX_MESSAGE_BYTES)?;
+    writer.write_bits(reliable_sequence, 32)?;
+    writer.write_bits(i32::from(super::SVC_GAMESTATE), 8)?;
+    writer.write_bits(decoder.server_command_sequence, 32)?;
+
+    // MSG_WriteBigString / MSG_WriteShort: retain raw JK2 configstring IDs.
+    for (&index, value) in &decoder.configstrings {
+        writer.write_bits(i32::from(super::SVC_CONFIGSTRING), 8)?;
+        writer.write_bits(i32::from(index), 16)?;
+        for &byte in value {
+            writer.write_bits(i32::from(byte), 8)?;
+        }
+        writer.write_bits(0, 8)?;
+    }
+
+    // JK2MV serializes the entity baselines as deltas from a null entity,
+    // using the selected JK2 version's exact field widths/order.
+    for (&number, entity) in &decoder.baselines {
+        if number >= super::ENTITY_NONE || entity.number != number {
+            return Err(MessageError {
+                bit: writer.bit_position(),
+                kind: crate::message::ErrorKind::InvalidValue("JK2 baseline number"),
+            });
+        }
+        writer.write_bits(i32::from(super::SVC_BASELINE), 8)?;
+        writer.write_bits(i32::from(number), 10)?;
+        write_baseline_delta(&mut writer, entity, version)?;
+    }
+
+    writer.write_bits(i32::from(super::SVC_EOF), 8)?;
+    writer.write_bits(decoder.client_number, 32)?;
+    writer.write_bits(decoder.checksum_feed as i32, 32)?;
+    // Unlike the JKA gamestate, JK2 has no RMG 16-bit field.
+    writer.write_bits(i32::from(super::SVC_EOF), 8)?;
+    Ok(writer.as_bytes().to_vec())
+}
+
+fn write_baseline_delta(
+    writer: &mut MessageWriter,
+    entity: &super::EntityState,
+    version: super::Version,
+) -> Result<(), MessageError> {
+    let values = entity.fields.iter().collect::<Vec<_>>();
+    let schema = version.entity_fields();
+    if values.len() != schema.len() {
+        return Err(MessageError {
+            bit: writer.bit_position(),
+            kind: crate::message::ErrorKind::InvalidValue("JK2 baseline schema"),
+        });
+    }
+    // MSG_WriteDeltaEntity(from = null, force = true): removed=0,
+    // fieldsChanged=0 if every field is zero, else lastChanged and delta bits.
+    writer.write_bits(0, 1)?;
+    let last_changed = values.iter().rposition(|(_, value)| *value != 0)
+        .map_or(0, |index| index + 1);
+    if last_changed == 0 {
+        writer.write_bits(0, 1)?;
+        return Ok(());
+    }
+    writer.write_bits(1, 1)?;
+    writer.write_bits(last_changed as i32, 8)?;
+    for (index, &(_, value)) in values.iter().take(last_changed).enumerate() {
+        if value == 0 {
+            writer.write_bits(0, 1)?;
+            continue;
+        }
+        writer.write_bits(1, 1)?; // field changed
+        writer.write_bits(1, 1)?; // nonzero
+        let width = schema[index].1;
+        if width != 0 {
+            writer.write_bits(value as i32, width)?;
+        } else {
+            // JK2MV MSG_WriteDeltaEntity's FLOAT_INT_BITS / FLOAT_INT_BIAS.
+            // Preserve raw non-integral floats (including negative zero).
+            let number = f32::from_bits(value);
+            let integral = number as i32;
+            if number.is_finite() && number == integral as f32
+                && (-4096..4096).contains(&integral)
+                && number.to_bits() == (integral as f32).to_bits()
+            {
+                writer.write_bits(0, 1)?;
+                writer.write_bits(integral + 4096, 13)?;
+            } else {
+                writer.write_bits(1, 1)?;
+                writer.write_bits(value as i32, 32)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 use super::{Decoder, Event, Snapshot, Version};
 use crate::commands::info_value;
 
@@ -212,4 +320,51 @@ pub fn inspect_with<R: Read>(
         ));
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use crate::demo::{write_end, write_record, DemoReader};
+
+    /// Rebuild JK2MV's synthetic starting gamestate from real 1.02/1.04
+    /// recordings, then decode the resulting native .dm_15/.dm_16 stream.
+    /// This also verifies that the entire baseline delta is lossless.
+    #[test]
+    fn synthetic_gamestate_roundtrips_both_jk2_wire_protocols() {
+        for (version, source) in [
+            (Version::V102, include_bytes!("../../tests/fixtures/jk2-102-prefix.dm_15").as_slice()),
+            (Version::V104, include_bytes!("../../tests/fixtures/jk2-104-prefix.dm_16").as_slice()),
+        ] {
+            let mut input = DemoReader::new(source);
+            let mut original = Decoder::new();
+            let initial_sequence = loop {
+                let record = input.next_record().unwrap().expect("JK2 fixture needs a gamestate");
+                let packet = original.parse_packet(record.sequence, &record.payload).unwrap();
+                if packet.events.iter().any(|event| matches!(event, Event::Gamestate)) {
+                    break record.sequence;
+                }
+            };
+            assert_eq!(original.version(), Some(version));
+            let payload = synthesize_gamestate_payload(&original, 17).unwrap();
+            assert!(payload.len() <= super::super::MAX_MESSAGE_BYTES);
+            let mut bytes = Vec::new();
+            write_record(&mut bytes, initial_sequence, &payload).unwrap();
+            write_end(&mut bytes).unwrap();
+            let mut recorded = DemoReader::new(bytes.as_slice());
+            let initial = recorded.next_record().unwrap().unwrap();
+            assert_eq!(initial.sequence, initial_sequence);
+            let mut decoded = Decoder::new();
+            let packet = decoded.parse_packet(initial.sequence, &initial.payload).unwrap();
+            assert!(packet.events.iter().any(|event| matches!(event, Event::Gamestate)));
+            assert_eq!(packet.reliable_acknowledge, 17);
+            assert_eq!(decoded.version(), original.version());
+            assert_eq!(decoded.server_command_sequence, original.server_command_sequence);
+            assert_eq!(decoded.client_number, original.client_number);
+            assert_eq!(decoded.checksum_feed, original.checksum_feed);
+            assert_eq!(decoded.configstrings, original.configstrings);
+            assert_eq!(decoded.baselines, original.baselines);
+            assert!(recorded.next_record().unwrap().is_none());
+        }
+    }
 }

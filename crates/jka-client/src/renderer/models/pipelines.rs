@@ -10,6 +10,7 @@ use crate::renderer::{
     LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_ATTRIBUTES, VERTEX_ATTRIBUTES,
 };
 use crate::renderer::lighting::rt_diagnostics;
+use crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
 
 fn studio_capture_blend(mode:DynamicModelAlphaMode, mut blend:Option<wgpu::BlendState>, capture:bool) -> Option<wgpu::BlendState> {
     if capture && matches!(mode, DynamicModelAlphaMode::AdditiveOne|DynamicModelAlphaMode::Additive
@@ -56,6 +57,12 @@ impl DynamicModelRenderer {
         // ensure_model_pipelines for only the modes that have draws.
         self.model_bundles.clear();
         self.model_pipelines = Default::default();
+        self.planar_model_pipelines = Default::default();
+        self.planar_skin_pipelines = Default::default();
+        self.planar_skin_source_pipelines = Default::default();
+        self.planar_fx_sprite_pipelines = Default::default();
+        self.planar_fx_rope_pipeline = None;
+        self.planar_model_format = None;
         self.legacy_model_pipelines = Default::default();
         self.legacy_skin_pipelines = Default::default();
         self.legacy_blend = None;
@@ -323,6 +330,119 @@ impl DynamicModelRenderer {
                     self.skin_glow_pipelines[index] = Some(pipeline);
                 } else {
                     self.request_model_glow_pipeline_variant(jobs, device, alpha_mode, true);
+                }
+            }
+        }
+    }
+
+    /// Portal views are single-sample regardless of the main camera AA mode.
+    /// Lazily compile these only when an active reflector and prepared actors
+    /// exist; reusing the primary-camera PSO would fail WGPU validation on MSAA.
+    pub(in crate::renderer) fn ensure_planar_model_pipelines(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        authored_portal_visible: bool,
+    ) {
+        if self.planar_model_format != Some(format) {
+            self.planar_model_format = Some(format);
+            self.planar_model_pipelines = Default::default();
+            self.planar_skin_pipelines = Default::default();
+            self.planar_skin_source_pipelines = Default::default();
+            self.planar_fx_sprite_pipelines = Default::default();
+            self.planar_fx_rope_pipeline = None;
+        }
+        let config = pipeline_hash(&(format, 1u32, self.legacy_fog_compiled, self.model_wet_compiled));
+        for mode in DYNAMIC_MODEL_ALPHA_ORDER {
+            // Screen-space glass has its own captured-scene bind group, which
+            // the isolated portal does not own. Do not borrow the main view's.
+            if mode == DynamicModelAlphaMode::Glass { continue; }
+            let index = mode.index();
+            if self.model_alpha_mask & (1 << index) != 0 && self.planar_model_pipelines[index].is_none() {
+                let key = PipelineJobKey::new("planar-dynamic-model", index as u32, config);
+                if let Some(pipeline) = jobs.take_ready(key) {
+                    self.planar_model_pipelines[index] = Some(pipeline);
+                } else {
+                    let device = device.clone();
+                    let layout = self.pipeline_layout.clone();
+                    let shader = self.shader.clone();
+                    let legacy_fog = self.legacy_fog_compiled;
+                    let model_wet = self.model_wet_compiled;
+                    jobs.request(key, "mirror MD3 variant", move || {
+                        create_dynamic_model_pipeline_inner_winding(&device, &layout, &shader,
+                            format, 1, mode, legacy_fog, model_wet, false, false, false, true)
+                    });
+                }
+            }
+            for (source, needed) in [(false, self.skin_alpha_mask), (true, self.skin_source_mask)] {
+                if needed & (1 << index) == 0 { continue; }
+                let pipeline = if source {
+                    &mut self.planar_skin_source_pipelines[index]
+                } else {
+                    &mut self.planar_skin_pipelines[index]
+                };
+                if pipeline.is_some() { continue; }
+                let kind = if source { "planar-ghoul2-source" } else { "planar-ghoul2-model" };
+                let key = PipelineJobKey::new(kind, index as u32, config);
+                if let Some(ready) = jobs.take_ready(key) {
+                    *pipeline = Some(ready);
+                } else {
+                    let device = device.clone();
+                    let layout = self.skin_pipeline_layout.clone();
+                    let shader = self.skin_shader.clone();
+                    let legacy_fog = self.legacy_fog_compiled;
+                    let model_wet = self.model_wet_compiled;
+                    jobs.request(key, "mirror Ghoul2 variant", move || {
+                        create_ghoul2_skin_pipeline_winding(&device, &layout, &shader, format,
+                            1, mode, legacy_fog, model_wet, false, source, true)
+                    });
+                }
+            }
+        }
+        if !authored_portal_visible { return; }
+        // Saber blade/core/glow are FX, not Ghoul2 meshes. Mirror them with
+        // single-sample PSOs; ordinary MSAA FX PSOs cannot target this texture.
+        // Do not compile these on maps without active mirror views.
+        let fx_config = pipeline_hash(&(format, 1u32, self.legacy_fog_compiled,
+            self.fx_zero_alpha_discard));
+        for mode in DYNAMIC_MODEL_ALPHA_ORDER {
+            if mode == DynamicModelAlphaMode::Glass { continue; }
+            let index = mode.index();
+            if self.planar_fx_sprite_pipelines[index].is_some()
+                || !self.fx_sprite_draws.iter().any(|draw| draw.alpha_mode == mode && !draw.rope)
+            { continue; }
+            let Some(shader) = self.fx_sprite_shader.as_ref() else { continue; };
+            let key = PipelineJobKey::new("planar-fx-sprite", index as u32, fx_config);
+            if let Some(ready) = jobs.take_ready(key) {
+                self.planar_fx_sprite_pipelines[index] = Some(ready);
+            } else {
+                let device = device.clone();
+                let layout = self.pipeline_layout.clone();
+                let shader = shader.clone();
+                let fog = self.legacy_fog_compiled;
+                let discard = self.fx_zero_alpha_discard;
+                jobs.request(key, "mirror FX sprite variant", move || {
+                    create_fx_sprite_pipeline(&device, &layout, &shader, format, 1, mode,
+                        fog, discard, false, false)
+                });
+            }
+        }
+        if self.fx_rope_present && self.planar_fx_rope_pipeline.is_none() {
+            if let Some(shader) = self.fx_rope_shader.as_ref() {
+                let key = PipelineJobKey::new("planar-fx-rope", 0, fx_config);
+                if let Some(ready) = jobs.take_ready(key) {
+                    self.planar_fx_rope_pipeline = Some(ready);
+                } else {
+                    let device = device.clone();
+                    let layout = self.pipeline_layout.clone();
+                    let shader = shader.clone();
+                    let fog = self.legacy_fog_compiled;
+                    let discard = self.fx_zero_alpha_discard;
+                    jobs.request(key, "mirror rope variant", move || {
+                        create_fx_sprite_pipeline(&device, &layout, &shader, format, 1,
+                            DynamicModelAlphaMode::BlendUnlit, fog, discard, false, false)
+                    });
                 }
             }
         }
@@ -1227,6 +1347,25 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     force_fog_black: bool,
     studio_capture: bool,
 ) -> wgpu::RenderPipeline {
+    create_dynamic_model_pipeline_inner_winding(device, layout, shader, surface_format,
+        samples, alpha_mode, legacy_fog, model_wet, rt_receiver, force_fog_black,
+        studio_capture, false)
+}
+
+fn create_dynamic_model_pipeline_inner_winding(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
+    model_wet: bool,
+    rt_receiver: bool,
+    force_fog_black: bool,
+    studio_capture: bool,
+    mirror_view: bool,
+) -> wgpu::RenderPipeline {
     let mut fragment_constants = vec![
         ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
         ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
@@ -1362,7 +1501,9 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
+            // Reflection matrices reverse handedness; TaystJK GL_Cull switches
+            // GL_FRONT/GL_BACK when viewParms.isMirror.
+            front_face: if mirror_view { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw },
             cull_mode: Some(wgpu::Face::Back),
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
@@ -1426,6 +1567,23 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
     model_wet: bool,
     force_fog_black: bool,
     source_material: bool,
+) -> wgpu::RenderPipeline {
+    create_ghoul2_skin_pipeline_winding(device, layout, shader, surface_format, samples,
+        alpha_mode, legacy_fog, model_wet, force_fog_black, source_material, false)
+}
+
+fn create_ghoul2_skin_pipeline_winding(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
+    model_wet: bool,
+    force_fog_black: bool,
+    source_material: bool,
+    mirror_view: bool,
 ) -> wgpu::RenderPipeline {
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
@@ -1553,7 +1711,8 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
+            // Mirror-view camera reverses triangle winding (TaystJK GL_Cull).
+            front_face: if mirror_view { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw },
             cull_mode: Some(wgpu::Face::Back),
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
@@ -1691,7 +1850,7 @@ pub(in crate::renderer) fn create_world_pipeline(
     complexity_fragment: Option<&wgpu::ShaderModule>,
 ) -> wgpu::RenderPipeline {
     create_world_pipeline_specialized(device, layout, shader, surface_format, key, msaa_samples,
-        legacy_fog, fog_pass, shader_variant, legacy_dlight_pass, complexity_fragment, None, false, false)
+        legacy_fog, fog_pass, shader_variant, legacy_dlight_pass, complexity_fragment, None, false, false, false)
 }
 
 /// The planar capture shares the ordinary world shader and authored RGB blends,
@@ -1701,13 +1860,12 @@ pub(in crate::renderer) fn create_reflection_world_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
     key: PipelineKey,
     legacy_fog: bool,
     shader_variant: WorldShaderVariantKey,
 ) -> wgpu::RenderPipeline {
-    create_world_pipeline_specialized(device, layout, shader, surface_format, key, 1,
-        legacy_fog, false, Some(shader_variant), false, None, None, false, true)
+    create_world_pipeline_specialized(device, layout, shader, PLANAR_COLOR_FORMAT, key, 1,
+        legacy_fog, false, Some(shader_variant), false, None, None, false, true, false)
 }
 
 /// In a reflected lake view the unrendered sky has alpha=-1. The lake later
@@ -1779,6 +1937,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
     // material_minimal_entry); only for a plain base-pass stage.
     minimal_entry: bool,
     reflection_capture: bool,
+    encoded_blend: bool,
 ) -> wgpu::RenderPipeline {
     let shader_complexity = complexity_fragment.is_some();
     let blend = if shader_complexity {
@@ -1854,6 +2013,9 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
     // rejection for ordinary walls and floors.
     let shader_constants = shader_variant.map(|variant| {
         let mut constants = variant.compilation_constants();
+        if encoded_blend {
+            constants.push(("LEGACY_WORLD_ENCODED_BLEND", 1.0));
+        }
         constants.push((
             "ENABLE_ALPHA_TEST",
             f64::from(u8::from(key.class != DrawClass::Opaque)),
@@ -1873,7 +2035,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             .iter()
             .copied()
             .filter(|(name, _)| {
-                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS")
+                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "LEGACY_WORLD_ENCODED_BLEND")
             })
             .collect::<Vec<_>>()
     });
@@ -1903,14 +2065,20 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
     let generated_entry = material_key.is_some_and(|key| matches!(key.program,
         crate::renderer::world::programs::StageProgram::GeneratedBasic
         | crate::renderer::world::programs::StageProgram::GeneratedEnhanced));
-    let vertex_entry_point = if generated_entry {
+    let vertex_entry_point = if key.auto_sprite {
+        if legacy_dlight_vertex_stream { "vs_autosprite_legacy" } else { "vs_autosprite" }
+    } else if key.auto_sprite2 {
+        if legacy_dlight_vertex_stream { "vs_autosprite2_legacy" } else { "vs_autosprite2" }
+    } else if key.deform_move {
+        if legacy_dlight_vertex_stream { "vs_move_legacy" } else { "vs_move" }
+    } else if generated_entry {
         "vs_generated"
     } else if minimal_entry {
         "vs_world_minimal"
     } else if key.additive_fusion_count >= 2
         && !legacy_dlight_pass
         && !fog_pass
-        && !key.auto_sprite2
+        && !(key.auto_sprite || key.auto_sprite2)
         && key.class != DrawClass::Sky
     {
         match (legacy_dlight_vertex_stream, key.additive_fusion_count) {
@@ -1920,13 +2088,11 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             (false, _) => "vs_additive_fused3",
         }
     } else {
-        match (key.class, legacy_dlight_vertex_stream, key.auto_sprite2) {
-            (_, true, true) => "vs_autosprite2_legacy",
-            (_, false, true) => "vs_autosprite2",
-            (DrawClass::Sky, true, false) => "vs_sky_legacy",
-            (DrawClass::Sky, false, false) => "vs_sky",
-            (_, true, false) => "vs_main_legacy",
-            (_, false, false) => "vs_main",
+        match (key.class, legacy_dlight_vertex_stream) {
+            (DrawClass::Sky, true) => "vs_sky_legacy",
+            (DrawClass::Sky, false) => "vs_sky",
+            (_, true) => "vs_main_legacy",
+            (_, false) => "vs_main",
         }
     };
     let base_vertex_layout = wgpu::VertexBufferLayout {
@@ -1963,7 +2129,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         || (is_rt && rt_diagnostics::config().trace);
     let fingerprint = pipeline_hash(&(key, shader_variant, surface_format, msaa_samples,
         legacy_fog, fog_pass, legacy_dlight_pass, vertex_entry_point, fragment_entry_point,
-        material_key, reflection_capture));
+        material_key, reflection_capture, encoded_blend));
     // This line is flushed by the logger BEFORE entering the native compiler.
     // BEGIN without a matching END identifies an in-flight compilation on crash.
     let compile_id = if traced {
@@ -2026,7 +2192,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: depth_format(),
-            depth_write_enabled: Some(if shader_complexity || legacy_dlight_pass {
+            depth_write_enabled: Some(if shader_complexity || legacy_dlight_pass || key.depth_test_disabled {
                 false
             } else {
                 key.depth_write
@@ -2035,6 +2201,8 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
                 // Test against the finished scene depth; don't blindly
                 // inherit Equal from the original stage's depth-fill contract.
                 camera_depth_compare()
+            } else if key.depth_test_disabled && !legacy_dlight_pass {
+                wgpu::CompareFunction::Always
             } else if legacy_dlight_pass || key.depth_equal {
                 wgpu::CompareFunction::Equal
             } else {
@@ -2084,7 +2252,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             return create_world_pipeline_specialized(
                 device, layout, shader, surface_format, key, msaa_samples,
                 legacy_fog, fog_pass, Some(wgsl_variant), legacy_dlight_pass,
-                complexity_fragment, material_key, minimal_entry, reflection_capture,
+                complexity_fragment, material_key, minimal_entry, reflection_capture, encoded_blend,
             );
         }
     }

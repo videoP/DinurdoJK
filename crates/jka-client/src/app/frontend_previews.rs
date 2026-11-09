@@ -464,7 +464,7 @@ impl App {
                 sound.set_emote_music_volume(emote_music*monitor_volume);
                 sound.frame(crate::audio::Listener {
                     entity:1023,origin:[0.0;3],ahead:[1.0,0.0,0.0],up:[0.0,0.0,1.0],left:[0.0,1.0,0.0],
-                }, &[], None);
+                }, &[], None, false);
             }
         } else { self.menu_emote_sound = None; }
         if !self.profile_preview_active {

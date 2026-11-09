@@ -44,6 +44,8 @@ struct Material {
     ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
     ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
     ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
+    deform_move_vector: vec4<f32>,
+    deform_move_wave: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -248,6 +250,24 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
     return apply_tc_mods(uv, input.position);
 }
 
+// header.w bit 19: static world additive stages with no lightmap receiver.
+// The map uploader stores authored BSP vertex RGB as one exact 24-bit integer
+// in otherwise-unused lightmap_uv.x. Decode BEFORE interpolation: doing this
+// in the fragment shader would interpolate the packed integer incorrectly.
+// The sky compute updates vertex RGB only on bake changes. At fullbright/off,
+// updated RGB == authored RGB and the recovered gain is exactly neutral.
+fn baked_additive_vertex_gain(color: vec4<f32>, packed_rgb: f32) -> vec4<f32> {
+    let packed = u32(round(packed_rgb));
+    let authored = vec3<f32>(f32((packed >> 16u) & 255u),
+        f32((packed >> 8u) & 255u), f32(packed & 255u)) / 255.0;
+    // Baked sky gain can exceed 1.0 (up to 4x). Amplifying each additive
+    // layer overexposes multi-stage effects such as this waterfall to white.
+    // Additive overlays may lose sky light, but must never become brighter
+    // than their original authored stage color. Preserve authored RGB/alpha.
+    let gain = color.rgb / max(authored, vec3<f32>(1.0 / 255.0));
+    return vec4<f32>(clamp(gain, vec3<f32>(0.0), vec3<f32>(1.0)), color.a);
+}
+
 fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     var output: VertexOut;
     let deformation = deform_surface_deformation_vertex(
@@ -262,6 +282,9 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     output.uv = generated_uv(input);
     output.lightmap_uv = input.lightmap_uv;
     output.color = input.color;
+    if ((material.header.w & 524288u) != 0u) {
+        output.color = baked_additive_vertex_gain(input.color, input.lightmap_uv.x);
+    }
     // Keep the known-fast fragment path free of the camera bind group.
     // When cached BSP AO is disabled, feed neutral AO (1.0) through the
     // existing interpolator so fs_main never needs camera.render_flags.
@@ -281,31 +304,88 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     return output;
 }
 
-// TaystJK rd-vanilla Autosprite2Deform, prepared per authored quad at map load.
-// position = midpoint of its short edge, normal = shared long axis,
-// lightmap_uv.x = signed half-width; y = -1337 is the encoding marker.
-// Unmodified geometry (including source .map) keeps its original positions.
-// This entry exists only for the autoSprite2 pipeline key; ordinary BSP vertex
-// shaders have no billboard branch, uniforms or per-vertex overhead.
+// Port of TaystJK rd-vulkan/tr_shade_calc.cpp AutospriteDeform / Autosprite2Deform.
+// Packed at BSP load, one quad at a time. These vertex entries are never
+// selected by ordinary world materials; do not add their logic to vs_main.
+// Recover the current camera's right/up from the UNJITTERED world-view matrix.
+// This keeps full autosprites correctly oriented with camera pitch, roll and
+// reflection views, without a new camera uniform field.
+fn autosprite_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    if (original.normal.z == -1337.0) {
+        let right = normalize(vec3<f32>(
+            camera.unjittered_view_proj[0].x,
+            camera.unjittered_view_proj[1].x,
+            camera.unjittered_view_proj[2].x));
+        let up = normalize(vec3<f32>(
+            camera.unjittered_view_proj[0].y,
+            camera.unjittered_view_proj[1].y,
+            camera.unjittered_view_proj[2].y));
+        input.position = original.position + right * original.normal.x + up * original.normal.y;
+        input.normal = -normalize(camera.camera_forward.xyz);
+    }
+    return input;
+}
+
+fn billboard_oct_decode(e: vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        n.x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
+        n.y = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
+    }
+    return normalize(n);
+}
+
 fn autosprite2_input(original: VertexIn) -> VertexIn {
     var input = original;
-    let half_width = original.lightmap_uv.x;
-    if (original.lightmap_uv.y == -1337.0) {
-        // BackEnd view axis[0] is the camera forward direction (not the
-        // position-to-eye vector). A single long-axis rotation, not full XYZ.
-        let minor = cross(original.normal, camera.camera_forward.xyz);
+    var major = original.normal;
+    var half_width = original.lightmap_uv.x;
+    var prepared = original.lightmap_uv.y == -1337.0;
+    // Lightmapped quads preserve their actual UVs: the long axis is oct-packed
+    // into normal.xy and signed half-width into normal.z + 8192.
+    if (!prepared && original.normal.z > 2048.0) {
+        major = billboard_oct_decode(original.normal.xy);
+        half_width = original.normal.z - 8192.0;
+        prepared = true;
+    }
+    if (prepared) {
+        let minor = cross(major, camera.camera_forward.xyz);
         let length_sq = dot(minor, minor);
         if (length_sq > 0.000001) {
             input.position = original.position + minor * (half_width * inverseSqrt(length_sq));
-            // Deformed surface normal for lighting passes that use it.
-            input.normal = normalize(cross(original.normal, minor));
+            input.normal = normalize(cross(major, minor));
+        } else {
+            input.normal = normalize(major);
         }
     }
     return input;
 }
 
+@vertex fn vs_autosprite(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return fast_world_vertex(autosprite_input(input), instance_index);
+}
+
 @vertex fn vs_autosprite2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
     return fast_world_vertex(autosprite2_input(input), instance_index);
+}
+
+// TaystJK RB_CalcMoveVertexes. This entry is selected only for authored
+// deformVertexes move stages; ordinary BSP vertex shaders do no extra math.
+fn moved_shader_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    let scale = wave_value(material.wave_funcs.z, material.deform_move_wave, shader_stage_time());
+    input.position += material.deform_move_vector.xyz * scale;
+    return input;
+}
+@vertex fn vs_move(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return fast_world_vertex(moved_shader_input(input), instance_index);
+}
+@vertex fn vs_move_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return fast_world_vertex(moved_shader_input(input), instance_index);
 }
 
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
@@ -322,12 +402,12 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
 }
 
 
-// Unified legacy RGB policy: the opaque lightmap/overlay fusion below can
-// compose its known inputs exactly in encoded sRGB. Additive BSP passes have
-// an unknown framebuffer destination, so their encoded source is a no-pass
-// approximation while blending remains linear in the scene target. Both use
-// the SAME transfer function. Keep alpha and authored blend factors unchanged.
+// Shared authored RGB modulation. Display-space PSOs encode each source and
+// blend against the encoded destination, as TaystJK's UNORM framebuffer does.
+// Other redraws retain their existing linear output and authored blend factors.
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
+// Enabled only by the display-space BSP PSOs (SDR alias or float transfer).
+override LEGACY_WORLD_ENCODED_BLEND: bool = false;
 // Approximate TaystJK's additive SOURCE modulation: its 8-bit rgbGen wave
 // multiplies the encoded texture sample before the blend. The scene target
 // remains linear, so this does not emulate encoded-framebuffer destination
@@ -346,6 +426,12 @@ fn legacy_additive_source(source: vec4<f32>, waveform: f32, has_wave: bool) -> v
     let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;
     return vec4<f32>(legacy_rgb_decode(legacy_rgb_encode(texel_linear) * vertex_wave_byte), source.a);
 }
+fn encoded_world_output(color: vec4<f32>) -> vec4<f32> {
+    if (LEGACY_WORLD_ENCODED_BLEND) {
+        return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
+    }
+    return color;
+}
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
         let has_wave = (material.header.z & 134217728u) != 0u;
@@ -353,9 +439,13 @@ fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
         if (has_wave) {
             wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
         }
-        return legacy_additive_source(color, wave, has_wave);
+        let source = legacy_additive_source(color, wave, has_wave);
+        if (LEGACY_WORLD_ENCODED_BLEND) {
+            return vec4<f32>(legacy_rgb_encode(source.rgb), source.a);
+        }
+        return source;
     }
-    return color;
+    return encoded_world_output(color);
 }
 
 fn legacy_rgb_encode(value: vec3<f32>) -> vec3<f32> {
@@ -390,7 +480,7 @@ fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
         input.world_normal, shell_kind, input.shell_coverage, input.clip_position.xy, true)) {
         discard;
     }
-    return classic_three_stage_rgb(input);
+    return encoded_world_output(classic_three_stage_rgb(input));
 }
 
 
@@ -504,6 +594,7 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     if ((m.header.z & 268435456u) != 0u) {
         color.a = clamp(wave_value(m.wave_funcs.y, m.wave_alpha, additive_time(m)), 0.0, 1.0);
     }
+    if ((m.header.w & 524288u) != 0u) { color = vec4<f32>(color.rgb * vertex_color.rgb, color.a); }
     return color;
 }
 fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
@@ -515,6 +606,10 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
             wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
         }
         sample = legacy_additive_source(sample, wave, has_wave);
+    }
+    // Encode EACH source before weighting/summing: E(a + b) differs from E(a) + E(b).
+    if (LEGACY_WORLD_ENCODED_BLEND) {
+        sample = vec4<f32>(legacy_rgb_encode(sample.rgb), sample.a);
     }
     // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
     // so preweight RGB and alpha by the source alpha as before.
@@ -620,6 +715,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
+    if ((material.header.w & 524288u) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
 
     var source_sample = textureSample(base_texture, base_sampler, input.uv);
 
@@ -733,6 +829,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
+    if ((material.header.w & 524288u) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
     let base = textureSample(base_texture, base_sampler, uv) * stage_color;
     if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;

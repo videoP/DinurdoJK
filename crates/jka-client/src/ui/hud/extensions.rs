@@ -37,41 +37,17 @@ pub(crate) fn hud_element_replaced(mask: NativeHudMask, draw_hud: bool, id: HudE
 pub const EXT_IMAGE_TEXTURE_SOURCE: f32 = 7.0;
 /// Same atlas, read with textureLoad for crisp pixel-art sprite regions.
 pub const EXT_IMAGE_REGION_TEXTURE_SOURCE: f32 = 7.25;
-/// Square cell, in pixels, each extension image is resampled into.
-pub const EXT_IMAGE_CELL: u32 = 256;
-pub const EXT_IMAGE_COLUMNS: u32 = 8;
-/// Texture-source marker for an authored HUD image. Kept separate from both
-/// the native UI image atlas and the native icon shader source tags.
+// Actual source-size UV rectangles come from the same variable-size packer used
+// by native HUD weapon icons, not from a 256px grid.
+/// Texture-source marker for an authored HUD image, distinct from native icons.
 pub(crate) const EXT_IMAGE_SHADER_SOURCE_BASE: f32 = 8192.0;
-/// Unique painter-order tag for each shaded image draw, across all widgets.
-/// Never interpreted by the plain UI shader: extracted by the shader splitter.
+/// Unique painter-order tag for each shaded image draw across widgets.
 pub(crate) const EXT_USER_SHADER_SOURCE_BASE: f32 = 16384.0;
 
-/// UV rectangle of atlas cell `index`, inset half a texel. The 32-image
-/// extension limit remains unchanged; native HUD assets may allocate extra rows
-/// only when a game HUD style requests them. Use identical sizing in the GPU.
-pub(crate) fn image_cell_uv_for_count(index: usize, wanted_count: usize) -> ([f32; 2], [f32; 2]) {
-    let columns = EXT_IMAGE_COLUMNS;
-    let rows = (wanted_count.max(MAX_HUD_IMAGES + 1) as u32).div_ceil(columns);
-    let cell = EXT_IMAGE_CELL as f32;
-    let (atlas_w, atlas_h) = (columns as f32 * cell, rows as f32 * cell);
-    let (col, row) = (index as u32 % columns, index as u32 / columns);
-    (
-        [(col as f32 * cell + 0.5) / atlas_w, (row as f32 * cell + 0.5) / atlas_h],
-        [((col + 1) as f32 * cell - 0.5) / atlas_w, ((row + 1) as f32 * cell - 0.5) / atlas_h],
-    )
-}
-
-
-/// Historical extension-only layout for existing tests and callers.
-#[allow(dead_code)]
-pub(crate) fn image_cell_uv(index: usize) -> ([f32; 2], [f32; 2]) {
-    image_cell_uv_for_count(index, MAX_HUD_IMAGES)
-}
-
 pub(in crate::ui) fn build_extension_hud(
-    out: &mut Vec<UiVertex>, widgets: &[PlacedHudWidget], images: &[String],
-    shader_flags: &[bool], image_dimensions: &[Option<[u32; 2]>], width: u32, height: u32,
+    ui: &UiSnapshot, out: &mut Vec<UiVertex>, widgets: &[PlacedHudWidget], images: &[String],
+    shader_flags: &[bool], image_dimensions: &[Option<[u32; 2]>],
+    image_uvs: &[([f32; 2], [f32; 2])], width: u32, height: u32,
 ) {
     if width == 0 || height == 0 { return; }
     // Reserve space in the preallocated UI dynamic buffer for the stock HUD.
@@ -121,7 +97,7 @@ pub(in crate::ui) fn build_extension_hud(
                     let ny = dx / len * thickness * 0.5;
                     let point = |x: f32,y: f32| UiVertex {
                         position: [x / width as f32 * 2.0 - 1.0, 1.0 - y / height as f32 * 2.0],
-                        uv: [0.0, 0.0], color: *color, textured: 0.0,
+                        uv: [0.0, 0.0], color: UiVertex::pack_color(*color), textured: 0.0,
                     };
                     let a=point(x1+nx,y1+ny); let b=point(x1-nx,y1-ny);
                     let c=point(x2-nx,y2-ny); let d=point(x2+nx,y2+ny);
@@ -129,8 +105,15 @@ pub(in crate::ui) fn build_extension_hud(
                 }
                 HudCommand::Image { name, x, y, w, h, color }
                 | HudCommand::ShaderImage { name, x, y, w, h, color, .. }
-                | HudCommand::ImageRegion { name, x, y, w, h, color, .. } => {
-                    let Some(index) = images.iter().position(|slot| slot == name) else { continue };
+                | HudCommand::ImageRegion { name, x, y, w, h, color, .. }
+                | HudCommand::NativeIcon { category: name, id: _, x, y, w, h, color } => {
+                    let native_cell = if let HudCommand::NativeIcon { category, id, .. } = command {
+                        crate::ui::native_hud_icon_index(category, i64::from(*id))
+                    } else { None };
+                    let image_index = if native_cell.is_none() {
+                        images.iter().position(|slot| slot == name)
+                    } else { None };
+                    if native_cell.is_none() && image_index.is_none() { continue; }
                     // A negative size mirrors the image, as menu rects do.
                     let (rx, flip_x) = if *w < 0.0 { (*x + *w, true) } else { (*x, false) };
                     let (ry, flip_y) = if *h < 0.0 { (*y + *h, true) } else { (*y, false) };
@@ -138,12 +121,20 @@ pub(in crate::ui) fn build_extension_hud(
                     let (x0, y0) = (rx.max(0.0), ry.max(0.0));
                     let (x1, y1) = ((rx + rw).min(max_x), (ry + rh).min(max_y));
                     if x1 <= x0 || y1 <= y0 { continue; }
-                    let (mut cell0, mut cell1) = image_cell_uv_for_count(index, images.len());
+                    let (mut cell0, mut cell1) = if let Some(cell) = native_cell {
+                        ui.icon_uv(cell)
+                    } else if image_index.is_some_and(|i| shader_flags.get(i).copied().unwrap_or(false)) {
+                        // Authored materials render standalone, in their own 0..1 UV space.
+                        ([0.0, 0.0], [1.0, 1.0])
+                    } else {
+                        image_index.and_then(|i| image_uvs.get(i).copied())
+                            .unwrap_or(([0.0, 0.0], [0.0, 0.0]))
+                    };
                     if let HudCommand::ImageRegion { source, .. } = command {
                         let [sx, sy, sw, sh] = *source;
-                        let Some([image_w, image_h]) = image_dimensions.get(index).and_then(|v| *v) else { continue };
+                        let Some([image_w, image_h]) = image_index.and_then(|i| image_dimensions.get(i)).and_then(|v| *v) else { continue };
                         if image_w == 0 || image_h == 0
-                            || shader_flags.get(index).copied().unwrap_or(false)
+                            || image_index.is_some_and(|i| shader_flags.get(i).copied().unwrap_or(false))
                             || sx + sw > image_w as f32 || sy + sh > image_h as f32 { continue; }
                         let old0 = cell0;
                         let old1 = cell1;
@@ -163,13 +154,15 @@ pub(in crate::ui) fn build_extension_hud(
                     let (v0, v1) = axis(y0, y1, ry, rh, flip_y, cell0[1], cell1[1]);
                     textured_rect_with_source(
                         out, x0, y0, x1 - x0, y1 - y0, [u0, v0], [u1, v1], *color,
-                        if matches!(command, HudCommand::ShaderImage { .. }) {
+                        if let Some(cell) = native_cell {
+                            ui.icon_texture_source(cell)
+                        } else if matches!(command, HudCommand::ShaderImage { .. }) {
                             EXT_USER_SHADER_SOURCE_BASE
                                 + (widget_index * MAX_HUD_COMMANDS + command_index) as f32
                         } else if matches!(command, HudCommand::ImageRegion { .. }) {
                             EXT_IMAGE_REGION_TEXTURE_SOURCE
-                        } else if shader_flags.get(index).copied().unwrap_or(false) {
-                            EXT_IMAGE_SHADER_SOURCE_BASE + index as f32
+                        } else if image_index.is_some_and(|i| shader_flags.get(i).copied().unwrap_or(false)) {
+                            EXT_IMAGE_SHADER_SOURCE_BASE + image_index.unwrap_or(0) as f32
                         } else { EXT_IMAGE_TEXTURE_SOURCE },
                         width, height,
                     );
@@ -211,7 +204,7 @@ mod tests {
             placement: HudPlacement { x: 30.0, y: 25.0, scale: 2.0, visible: true },
         };
         let mut out=Vec::new();
-        build_extension_hud(&mut out, &[widget], &[], &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[widget], &[], &[], &[], &[], 640, 480);
         assert_eq!(out.len(), 6);
         assert!((out[0].position[0] - ((34.0 / 640.0) * 2.0 - 1.0)).abs() < 0.0001);
     }
@@ -229,6 +222,21 @@ mod tests {
     }
 
     #[test]
+    fn native_icons_use_shared_atlas_even_with_zero_extension_images() {
+        let mut ui = UiSnapshot::default();
+        ui.icon_atlas_uvs = vec![([0.2, 0.3], [0.4, 0.5]); crate::ui::ICON_NAMES.len()];
+        let widget = image_widget(vec![HudCommand::NativeIcon {
+            category: "force".into(), id: 2, x: 0.0, y: 0.0,
+            w: 20.0, h: 20.0, color: [1.0; 4],
+        }], crate::extensions::HudAnchor::TopLeft);
+        let mut out = Vec::new();
+        build_extension_hud(&ui, &mut out, &[widget], &[], &[], &[], &[], 640, 480);
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0].uv, [0.2, 0.3]);
+        assert_eq!(out[0].textured, crate::ui::hud::movement::ICON_TEXTURE_SOURCE);
+    }
+
+    #[test]
     fn extension_wgsl_tags_are_stable_and_distinct_from_static_images() {
         let shaded = HudCommand::ShaderImage {
             name: "gfx/noise".into(), shader: "test/liquid".into(),
@@ -238,7 +246,7 @@ mod tests {
         let widget = image_widget(vec![image("gfx/noise", 0.0, 0.0, 5.0, 5.0), shaded],
             crate::extensions::HudAnchor::TopLeft);
         let mut out = Vec::new();
-        build_extension_hud(&mut out, &[widget], &["gfx/noise".into()], &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[widget], &["gfx/noise".into()], &[], &[], &[([0.1, 0.2], [0.3, 0.4])], 640, 480);
         assert_eq!(out.len(), 12);
         assert_eq!(out[0].textured, EXT_IMAGE_TEXTURE_SOURCE);
         assert_eq!(out[6].textured, EXT_USER_SHADER_SOURCE_BASE + 1.0);
@@ -251,18 +259,17 @@ mod tests {
             crate::extensions::HudAnchor::TopLeft);
         let mut out = Vec::new();
         let slots = ["gfx/a".to_owned(), "gfx/b".to_owned()];
-        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &slots, &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &slots, &[], &[], &[([0.1, 0.2], [0.3, 0.4]), ([0.5, 0.6], [0.8, 0.9])], 640, 480);
         assert_eq!(out.len(), 12);
         assert!(out.iter().all(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
-        // Cells follow the slot list: "gfx/b" is cell 1, "gfx/a" cell 0 (8 columns).
-        assert!(out[0].uv[0] > 1.0 / 8.0 && out[0].uv[0] < 2.0 / 8.0, "{:?}", out[0].uv);
-        assert!(out[6].uv[0] < 1.0 / 8.0, "{:?}", out[6].uv);
-        // A slot added later leaves existing cells where they were.
+        // Lookups must use each source-native rectangle, never fixed grid math.
+        assert_eq!(out[0].uv, [0.5, 0.6]);
+        assert_eq!(out[6].uv, [0.1, 0.2]);
         let mut more = slots.to_vec();
         more.push("gfx/c".to_owned());
         let mut again = Vec::new();
         let w2 = image_widget(vec![image("gfx/b", 0.0, 0.0, 10.0, 10.0)], crate::extensions::HudAnchor::TopLeft);
-        build_extension_hud(&mut again, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..w2.placement }, ..w2 }], &more, &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut again, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..w2.placement }, ..w2 }], &more, &[], &[], &[([0.1, 0.2], [0.3, 0.4]), ([0.5, 0.6], [0.8, 0.9])], 640, 480);
         assert_eq!(again[0].uv, out[0].uv);
     }
 
@@ -274,11 +281,12 @@ mod tests {
             crate::extensions::HudAnchor::TopLeft,
         );
         let mut out = Vec::new();
-        build_extension_hud(&mut out, &[widget],
-            &["gfx/a".into(), "gfx/b".into()], &[true, false], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[widget],
+            &["gfx/a".into(), "gfx/b".into()], &[true, false], &[],
+            &[([0.12, 0.23], [0.34, 0.45]), ([0.56, 0.67], [0.78, 0.89])], 640, 480);
         assert!(out[0..6].iter().all(|v| v.textured == EXT_IMAGE_SHADER_SOURCE_BASE));
         assert!(out[6..12].iter().all(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
-        let (uv0, uv1) = image_cell_uv(0);
+        let (uv0, uv1) = ([0.0, 0.0], [1.0, 1.0]);
         assert_eq!(out[0].uv, uv0);
         assert_eq!(out[2].uv, uv1);
     }
@@ -288,7 +296,7 @@ mod tests {
         let mut out = Vec::new();
         // Negative width mirrors; the 100-unit widget clips the right 20 units.
         let widget = image_widget(vec![image("gfx/a", 80.0, 0.0, -40.0, 10.0)], crate::extensions::HudAnchor::TopLeft);
-        build_extension_hud(&mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &["gfx/a".to_owned()], &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[PlacedHudWidget { placement: HudPlacement { x: 0.0, y: 0.0, ..widget.placement }, ..widget }], &["gfx/a".to_owned()], &[], &[], &[([0.2, 0.3], [0.6, 0.7])], 640, 480);
         assert_eq!(out.len(), 6);
         let (u_left, u_right) = (out[0].uv[0], out[2].uv[0]);
         assert!(u_left > u_right, "mirrored image must run right-to-left: {u_left} {u_right}");
@@ -300,7 +308,7 @@ mod tests {
     fn bottom_right_widgets_sit_in_the_corner() {
         let mut out = Vec::new();
         let widget = image_widget(vec![image("gfx/a", 0.0, 0.0, 100.0, 50.0)], crate::extensions::HudAnchor::BottomRight);
-        build_extension_hud(&mut out, &[widget], &["gfx/a".to_owned()], &[], &[], 640, 480);
+        build_extension_hud(&UiSnapshot::default(), &mut out, &[widget], &["gfx/a".to_owned()], &[], &[], &[([0.2, 0.3], [0.6, 0.7])], 640, 480);
         let right_px = (out[2].position[0] + 1.0) * 0.5 * 640.0;
         let bottom_px = (1.0 - out[2].position[1]) * 0.5 * 480.0;
         assert!((right_px - 640.0).abs() < 0.01 && (bottom_px - 480.0).abs() < 0.01, "{right_px} {bottom_px}");

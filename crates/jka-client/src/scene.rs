@@ -78,7 +78,8 @@ use lightmaps::{
 pub(crate) use material_batches::append_sky_batches;
 pub(crate) use material_batches::additive_fusion_rejection_reason;
 use material_batches::{
-    append_material_batches, class_for, material_debug_info,
+    append_material_batches, append_static_lightstyle_batch, static_extra_lightstyle_eligible,
+    class_for, material_debug_info,
     material_has_promotable_environment_stage,
     material_render_is_guaranteed_discarded, prepared_stages, resolved_bsp_surface_fog,
     recover_impossible_masked_depth_seed, stage_batch,
@@ -129,7 +130,7 @@ use vegetation::{
     grass_local_fog_slots,
 };
 pub use visibility::auto4_audit_lines;
-pub(crate) use visibility::draw_batches_share_state;
+pub(crate) use visibility::{auto4_source_bounds, draw_batches_share_state};
 use visibility::{build_prepared_portal_draw_plan, order_pvs_pieces, pvs_signature};
 
 // RBSP -> immutable render data. This runs once when a map is loaded.
@@ -143,6 +144,7 @@ use crate::{
     thread_activity::Task,
     weather::fog::{
         bsp_fog_params, bsp_global_fog_num, bsp_global_fog_params, material_legacy2_in_stage_safe,
+        material_legacy_additive_only,
         stage_fog_color_override, FogColorOverride,
     },
 };
@@ -206,11 +208,9 @@ pub enum BlendMode {
     Custom(BlendFactor, BlendFactor),
 }
 
-/// A single policy for the two zero-extra-pass legacy RGB implementations.
-/// The exact fused recipe can blend known texture inputs in encoded sRGB;
-/// independently blended additive stages can correct the source texture
-/// modulation, but cannot reproduce legacy destination-dependent blending
-/// exactly without reading the prior framebuffer color.
+/// Source modulation policy shared by ordinary and fused BSP stages. The
+/// renderer selects encoded destination blending separately, preserving the
+/// authored source alpha and independent texture-coordinate animations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyRgbCompositing {
     Linear,
@@ -224,8 +224,12 @@ pub struct PipelineKey {
     pub legacy_srgb_three_stage: bool,
     /// Number of coalesced consecutive additive shader stages (0 = ordinary).
     pub additive_fusion_count: u8,
+    /// Dedicated full-camera billboard entry, absent from normal BSP pipelines.
+    pub auto_sprite: bool,
     /// Dedicated vertex shader for TaystJK autoSprite2, absent from normal BSP pipelines.
     pub auto_sprite2: bool,
+    /// Special TaystJK move deformation vertex entry; never executes in ordinary PSOs.
+    pub deform_move: bool,
     /// True only for a sky outerbox with six authored images. Selects the
     /// minimal, no-discard sky fragment entry point, never a renderer path.
     pub sky_outer: bool,
@@ -235,9 +239,29 @@ pub struct PipelineKey {
     pub offset: bool,
     pub depth_write: bool,
     pub depth_equal: bool,
+    /// `depthFunc disable`, specialized only for authored BSP stages.
+    pub depth_test_disabled: bool,
 }
 
 impl DrawBatch {
+    /// A non-lightmapped *world* additive stage which consumes a fixed or
+    /// animated RGB generator instead of BSP vertex RGB. For baked sky lighting
+    /// it may use the cached sky gain without changing its authored rgbGen,
+    /// alphaGen, blending, or texture animation. Eligibility of its shared
+    /// vertex range and exclusion of inline/actual lightmap users are checked
+    /// by the world upload and sun baker, not by this stage predicate alone.
+    pub(crate) fn baked_sky_additive_stage(&self) -> bool {
+        matches!(self.pipeline.class, DrawClass::Transparent)
+            && matches!(self.pipeline.blend,
+                BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
+                | BlendMode::Custom(BlendFactor::One, BlendFactor::One))
+            && matches!(self.rgb_gen, RgbGen::Const | RgbGen::Wave(_))
+            && !self.modulate_lightmap && !self.texture_is_lightmap
+            && self.lightstyle_slot == 0
+            && !matches!(self.tc_gen, TcGen::Lightmap)
+            && self.authored_ocean.is_none()
+    }
+
     /// Whether this resolved BSP stage can affect the scene color or depth.
     ///
     /// A server shader remap to `clear` (`GL_ZERO GL_ONE`, without depthWrite)
@@ -314,6 +338,10 @@ pub struct DrawBatch {
     /// still part of the surface for ocean absorption, so it must not be
     /// deferred past the underwater optics capture.
     pub lit_overlay: bool,
+    /// Post-$lightmap environmental overlays that should follow the cached
+    /// world sky gain without changing their authored RGB/alpha generators.
+    /// Computed from stage order once during material preparation, not per frame.
+    pub baked_sky_overlay: bool,
     /// `sort additive` shader whose first stage is a depth-writing cutout
     /// (underwater seaweed and fish). The late sort keeps its stages behind the
     /// water, but when the ocean optics run they must be part of the scene the
@@ -364,6 +392,9 @@ pub struct DrawBatch {
     /// BSP lightmap page/atlas index for either an explicit `$lightmap` pass or
     /// the compact implicit base-texture × lightmap path.
     pub lightmap: Option<usize>,
+    /// 0: original BSP lightmap; 1..3: additive extra normal-style lightmap.
+    /// Additional pages are prepared only for eligible multi-lightmap surfaces.
+    pub lightstyle_slot: u8,
     /// True only for the compact implicit material path.
     pub modulate_lightmap: bool,
     /// 0=ordinary, 1=first $lightmap stage, 2=second diffuse stage of a
@@ -399,6 +430,8 @@ pub struct DrawBatch {
     /// no shader-name lookup or remap branch.
     pub shader_time_offset: f32,
     pub shader_clamp_time: Option<f32>,
+    /// Wave-driven full-surface move; resolved once from the shader script.
+    pub move_deform: Option<jka_assets::shader::MoveDeform>,
     pub no_picmip: bool,
     /// Exact JKA shader-stage `glow` marker.
     pub authored_glow: bool,
@@ -406,11 +439,16 @@ pub struct DrawBatch {
     pub fog: [f32; 4],
     /// This surface explicitly references the BSP global-fog record.
     pub fog_is_global: bool,
+    /// TaystJK FinishShader: early/see-through shaders or CONTENTS_FOG only.
+    pub legacy_fog_pass: bool,
     /// OpenJK fixed-function fog-color override for this individual shader stage.
     pub fog_color_override: FogColorOverride,
     /// True when this complete authored material can reproduce Legacy 2 global
     /// GL_EXP2 fog directly in each WGPU stage.
     pub legacy2_fog_in_stage_safe: bool,
+    /// Every authored stage adds light without replacing the destination.
+    /// Such materials are fogged per stage in both Legacy modes, not redrawn.
+    pub legacy_additive_only: bool,
     /// True when this material has a depth-writing stage, allowing its frontmost
     /// pixels to receive Legacy 1 global fog in the display-space post pass.
     pub global_fog_post_eligible: bool,
@@ -945,6 +983,8 @@ pub struct MapPrepareOptions {
     /// files are not parsed as overrides; ordinary JKA `.shader` / implicit
     /// materials remain authoritative until the next map load / vid_restart.
     pub pbr_materials: bool,
+    /// Glass shader promotion is resolved when preparing world materials.
+    pub glass_promotion: bool,
     /// Ordinary VFS compatibility policy. When false, qpaths supplied by retail
     /// assets0.pk3 through assets3.pk3 cannot be globally shadowed by addon/loose
     /// providers. Explicit dependencies of an active .mtr remain source-affine.
@@ -983,6 +1023,7 @@ impl Default for MapPrepareOptions {
             omit_environment_stages: false,
             source_spatial_batches: false,
             pbr_materials: true,
+            glass_promotion: false,
             allow_asset_overrides: true,
             steam_audio: false,
             menu_look: false,
@@ -1149,15 +1190,68 @@ pub struct ClassicEntityLightGrid {
     /// Unit direction toward the map's baked sun once `estimate_sun_weights`
     /// has run; `None` means no sun share is known for this grid.
     map_toward_sun: Option<[f32; 3]>,
+    /// One change-triggered model-lighting cache. Original cells remain intact.
+    relit: Option<RelitEntityLightGrid>,
+}
+
+#[derive(Debug, Clone)]
+struct RelitEntityLightGrid {
+    key: [u32; 9],
+    toward_sun: [f32; 3],
+    cells: Vec<ClassicEntityLight>,
 }
 
 impl StaticLightGrid {
+    /// Keep the existing RGB atlas unchanged. Its unused alpha stores the
+    /// estimated original sun fraction for model-only sun removal; BSP ignores it.
+    pub fn estimate_entity_sun(&mut self, direction: [f32; 3], color: [f32; 3]) {
+        self.classic_entity_grid.estimate_sun_weights(direction, color);
+        let [bx, by, bz] = self.bounds.map(|v| v as usize);
+        for z in 0..bz { for y in 0..by { for x in 0..bx {
+            let cell = self.classic_entity_grid.cells[x + bx * (y + by * z)];
+            for axis in 0..3 { for negative in 0..2 {
+                let at = 4 * (x + bx * ((y + negative * by) + 2 * by * (z + axis * bz)));
+                let facing = (cell.direction[axis] * if negative == 0 { 1.0 } else { -1.0 }).max(0.0);
+                let sun = jka_render_core::light::light_luminance(cell.directed) * cell.sun_weight * facing;
+                let rgb = std::array::from_fn(|c| f32::from(self.irradiance_volume_rgba[at + c]) * self.irradiance_intensity);
+                let total = jka_render_core::light::light_luminance(rgb);
+                let fraction = if cell.valid && total > 1e-4 { (sun / total).clamp(0.0, 1.0) } else { 0.0 };
+                self.irradiance_volume_rgba[at + 3] = (fraction * 255.0).round() as u8;
+            }}
+        }}}
+    }
+
     pub fn into_classic_entity_grid(self) -> ClassicEntityLightGrid {
         self.classic_entity_grid
     }
 }
 
 impl ClassicEntityLightGrid {
+    pub fn sun_relight_cached(&self) -> bool { self.relit.is_some() }
+
+    /// Recompute only when the celestial inputs change. Torch/room terms and
+    /// original probes survive mode changes, including returning to Off.
+    pub fn sync_sun_relight(&mut self, relight: Option<([f32; 3], [f32; 3], [f32; 3])>) {
+        let Some((map_toward, toward, gain)) = relight else {
+            self.relit = None;
+            return;
+        };
+        let key = std::array::from_fn(|i| [map_toward, toward, gain][i / 3][i % 3].to_bits());
+        if self.relit.as_ref().is_some_and(|cache| cache.key == key) { return; }
+        let mut cells = self.relit.take().map_or_else(Vec::new, |cache| cache.cells);
+        cells.clear();
+        cells.extend(self.cells.iter().map(|cell| {
+            let mut light = ClassicEntityLight {
+                ambient: cell.ambient, directed: cell.directed, direction: cell.direction,
+                baked_sun: cell.directed.map(|c| c * cell.sun_weight),
+                ..Default::default()
+            };
+            light.relight_sun(map_toward, toward, gain);
+            light
+        }));
+        self.relit = Some(RelitEntityLightGrid { key, toward_sun: toward, cells });
+    }
+
     /// Direction toward the baked map sun, if `estimate_sun_weights` found one.
     pub fn map_toward_sun(&self) -> Option<[f32; 3]> {
         self.map_toward_sun
@@ -1177,6 +1271,7 @@ impl ClassicEntityLightGrid {
     /// `sun_direction` is the direction the light travels (renderer coordinates,
     /// as in `DirectionalSun::direction`); `sun_color` is its chromaticity.
     pub fn estimate_sun_weights(&mut self, sun_direction: [f32; 3], sun_color: [f32; 3]) {
+        self.relit = None;
         let length = sun_direction.iter().map(|v| v * v).sum::<f32>().sqrt();
         if length <= 1e-6 {
             self.map_toward_sun = None;
@@ -1245,6 +1340,7 @@ impl ClassicEntityLightGrid {
         let mut directed = [0.0_f32; 3];
         let mut direction = [0.0_f32; 3];
         let mut baked_sun = [0.0_f32; 3];
+        let mut sun_directed = [0.0_f32; 3];
         let mut total_factor = 0.0_f32;
 
         for corner in 0..8_usize {
@@ -1267,11 +1363,13 @@ impl ClassicEntityLightGrid {
             }
 
             total_factor += factor;
+            let relit = self.relit.as_ref().map(|cache| cache.cells[index]);
             for channel in 0..3 {
                 ambient[channel] += factor * cell.ambient[channel];
-                directed[channel] += factor * cell.directed[channel];
+                directed[channel] += factor * relit.map_or(cell.directed[channel], |light| light.directed[channel]);
                 baked_sun[channel] += factor * cell.directed[channel] * cell.sun_weight;
-                direction[channel] += factor * cell.direction[channel];
+                direction[channel] += factor * relit.map_or(cell.direction[channel], |light| light.direction[channel]);
+                sun_directed[channel] += factor * relit.map_or(0.0, |light| light.sun_directed[channel]);
             }
         }
 
@@ -1283,6 +1381,7 @@ impl ClassicEntityLightGrid {
             ambient = ambient.map(|value| value * inv);
             directed = directed.map(|value| value * inv);
             baked_sun = baked_sun.map(|value| value * inv);
+            sun_directed = sun_directed.map(|value| value * inv);
         }
 
         // OpenJK defaults: r_ambientScale=0.6 and r_directedScale=1.0.
@@ -1318,8 +1417,8 @@ impl ClassicEntityLightGrid {
             directed,
             direction,
             baked_sun,
-            sun_directed: [0.0; 3],
-            sun_direction: [0.0; 3],
+            sun_directed,
+            sun_direction: self.relit.as_ref().map_or([0.0; 3], |cache| cache.toward_sun),
             direction_coherence,
         })
     }
@@ -1660,6 +1759,7 @@ pub struct PreparedMap {
     /// OpenJK-style global fog encoded by a BSP fog record whose brush number is -1.
     /// The color is also the scene clear color even when the optional fog effect is disabled.
     pub global_fog: Option<[f32; 4]>,
+    pub local_fogs: Vec<crate::weather::fog::LocalFogVolume>,
     pub warnings: Vec<String>,
     pub spawns: Vec<SpawnPoint>,
     /// Map-authored `fx_runner`s retained for the local server shim. Remote

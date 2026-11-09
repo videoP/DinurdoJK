@@ -34,6 +34,10 @@ impl Renderer {
     /// clear conditions; remove progressively more of that original direct sun
     /// before adding the soft replacement. Do not mutate the archived cvar.
     pub(in crate::renderer) fn effective_baked_sun_removal(&self) -> f32 {
+        if self.baked_sun_removal_auto {
+            // Pending or low-confidence calibration must not guess: preserve the BSP.
+            return self.world.as_ref().and_then(|world| world.sun_bake.auto_strength).unwrap_or(0.0);
+        }
         self.baked_sun_removal.max(f32::from(self.relight_cloud_coverage_steps()) / 20.0)
     }
 
@@ -95,8 +99,9 @@ impl Renderer {
     /// alter the map's baked lightmap (which requires baked-sun removal).
     pub(in crate::renderer) fn relit_sun(&self) -> DirectionalSun {
         let mut sun = self.active_sun();
-        if self.sky_backend == 1 {
-            // `direction` is light travel, so positive Y is below the horizon.
+        if self.sun_override {
+            // Both sky backends share the sun's horizon. `direction` is
+            // light travel, so positive Y is below the horizon.
             // Fade across the horizon instead of instantaneously popping.
             sun.intensity *= (-sun.direction[1] / 0.035).clamp(0.0, 1.0);
         }
@@ -182,10 +187,10 @@ impl Renderer {
 
     /// Sun swap for the entity lightgrid: strips the map's baked sun share out of
     /// each probe sample and lights entities with `active_sun()` instead. None
-    /// when the setting is off, the entity lightgrid mode isn't in use, or the
-    /// map has no authored sun to have been baked in.
+    /// when neither relighting nor the legacy switch is on, classic entity
+    /// lighting isn't selected, or the map has no authored sun.
     pub(in crate::renderer) fn entity_sun_relight(&self) -> Option<EntitySunRelight> {
-        if !self.entity_sun_lighting
+        if !(self.sun_override || self.entity_sun_lighting)
             || self.dynamic_model_renderer.entity_ambient_lighting
                 != EntityAmbientLightingMode::BspLightgridClassic
         {
@@ -211,6 +216,17 @@ impl Renderer {
             toward_sun: toward_sun.to_array(),
             gain: gain.to_array(),
         })
+    }
+
+    /// The original probes remain immutable. Model preparation samples this
+    /// one cached replacement in either relighting mode, without relighting
+    /// every player's sampled probe again on every frame.
+    pub(in crate::renderer) fn sync_entity_lightgrid_relight(&mut self) {
+        let relight = if self.sun_override { self.entity_sun_relight() } else { None };
+        if self.sun_bake_deferred && relight.is_some() { return; }
+        if let Some(grid) = self.world.as_mut().and_then(|world| world.entity_light_grid.as_mut()) {
+            grid.sync_sun_relight(relight.map(|light| (light.map_toward_sun, light.toward_sun, light.gain)));
+        }
     }
 }
 

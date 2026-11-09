@@ -54,6 +54,10 @@ pub(in crate::renderer) struct MaterialUniform {
     // xy reserved/amplitude hint; z source blend factor + 1 (0 = physical), w destination.
     pub(in crate::renderer) ocean_waves: [f32; 4],
     pub(in crate::renderer) ocean_blend_color: [f32;4],
+    /// `deformVertexes move`: JKA vector converted into render coordinates, w=1 if active.
+    pub(in crate::renderer) deform_move_vector: [f32; 4],
+    /// base/amplitude/phase/frequency; function id in wave_funcs.z.
+    pub(in crate::renderer) deform_move_wave: [f32; 4],
 }
 
 #[repr(C)]
@@ -110,6 +114,8 @@ impl Default for MaterialUniform {
             ocean_material: [-1.0; 4],
             ocean_waves: [1.0, 0.0, 0.0, 0.0],
             ocean_blend_color: [0.0;4],
+            deform_move_vector: [0.0; 4],
+            deform_move_wave: [0.0; 4],
         }
     }
 }

@@ -279,7 +279,7 @@ impl WorldFlareRenderer {
                 blend: Some(DEFAULT_FLARE_BLEND), alpha_cutoff: 0.0, opacity: 1.0,
                 color: [1.0; 3], rgb_gen: RgbGen::Vertex, alpha_gen: AlphaGen::Identity,
                 tc_gen: Default::default(), tc_mods: Vec::new(),
-                depth_write: false, depth_equal: false, glow: false,
+                depth_write: false, depth_equal: false, depth_test_disabled: false, glow: false,
             };
             let stages: &[materials::MaterialStage] = if fallback { std::slice::from_ref(&default_stage) } else { &flare.stages };
             let mut gpu_stages = Vec::new();

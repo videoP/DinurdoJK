@@ -72,6 +72,9 @@ impl Renderer {
         if let Some(blend) = &self.dynamic_model_renderer.legacy_blend {
             println!("MEMORY GPU legacy model blend: {:.2} MiB logical payload", blend.bytes() as f64 / mib);
         }
+        if let Some(blend) = &self.world_encoded_blend {
+            println!("MEMORY GPU legacy world blend: {:.2} MiB logical payload", blend.bytes() as f64 / mib);
+        }
         if !self.studio_scenes.is_empty() {
             let mut images = std::collections::HashSet::new();
             let mut unique = 0_u64;

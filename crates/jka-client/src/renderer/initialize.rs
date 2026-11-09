@@ -173,6 +173,9 @@ impl Renderer {
         // sampling. Request advertised support; river creation rejects devices
         // without it instead of substituting lower-precision/manual filtering.
         required_features |= adapter_features & wgpu::Features::FLOAT32_FILTERABLE;
+        // Use the half-size, alpha-free HDR format for the cached visible sky
+        // when supported. On other GPUs it falls back to Rgba16Float.
+        required_features |= adapter_features & wgpu::Features::RG11B10UFLOAT_RENDERABLE;
         // Directional shadow casters must not be clipped by the cascade's depth
         // range (Bevy's UNCLIPPED_DEPTH_ORTHO): occluders between the sun and the
         // cascade would otherwise vanish from the map.
@@ -413,6 +416,12 @@ impl Renderer {
         let screenshot_supported = native_hdr_selected || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        // Blue Water scene capture can sample the presentation image directly
+        // only when the actual WGPU surface advertises this capability.
+        // Otherwise the renderer uses the existing lazy sampleable-scene path.
+        if caps.usages.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
+            config.usage |= wgpu::TextureUsages::TEXTURE_BINDING;
         }
         // r_earlySubmit copies the offscreen frame into the acquired image.
         if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
@@ -714,7 +723,6 @@ impl Renderer {
         let planar_reflection = create_planar_reflection_resources(
             &device,
             &planar_reflection_layout,
-            config.format,
             1,
             1,
             false,
@@ -2415,6 +2423,7 @@ impl Renderer {
             studio_entity_mask: None,
             studio_revision: 0,
             scene_time: None,
+            weather_server_time_ms: None,
             studio_settings_signature: String::new(),
             scene_depth_capture: false,
             device,
@@ -2638,6 +2647,7 @@ impl Renderer {
             studio_cached_worlds: Vec::new(),
             world_videos: Vec::new(),
             dynamic_model_renderer,
+            world_encoded_blend: None,
             encoder_finish_threads: 0,
             igpu_ab_mode: 0,
             encoder_finisher: None,
@@ -2696,6 +2706,7 @@ impl Renderer {
             dlss: Default::default(),
             rt_taa_mode: 1,
             contact_shadows_enabled: false,
+            relighting_mode: 0,
             sun_override: false,
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
@@ -2706,13 +2717,16 @@ impl Renderer {
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
+            baked_sun_removal_auto: false,
             baked_sun_cache: true,
             lightmap_smoothing: 0,
             baked_sun_aa: 1,
             lightmap_signal: 0,
             sun_receiver_normals: 1,
             sun_terminator: false,
-            sky_world_bake: 1,
+            sky_world_bake_ab: 1,
+            sky_world_light_isolation: false,
+            sky_world_lighting_strength: 1.0,
             bake_threads: 0,
             sun_bake_deferred: false,
             baked_sun_debug_mode: 0,
@@ -2725,6 +2739,8 @@ impl Renderer {
             baked_indirect_highlight_preserve: 1.0,
             sky_fractal_override: false,
             sky_backend: 0,
+            blue_sky_cube_ab: 1,
+            blue_sky_diag: 0,
         blue_water_environment: crate::blue_water_environment::Settings::default(),
             cloud_backend: 0,
             cloud_portal_depth: 0,

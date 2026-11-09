@@ -95,6 +95,12 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn apply_underwater_audio(&mut self) {
+        if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+            sound.set_underwater_mode(self.audio.underwater);
+        }
+    }
+
     pub(in crate::app) fn apply_audio_mix(&mut self) {
         self.update_variometer();
         let (effects, voice, separation) = self.effective_audio_mix();

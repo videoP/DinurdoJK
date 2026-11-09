@@ -104,14 +104,11 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let light_intensity=select(env.light_intensity,frame.moon_light.w,moon_active);
  let incidence=max(dot(normal,light_direction),0.);
  let shade=select(1.,cloud_shadow(shadow_map,shadow_sampler,shadow,world),frame.options.y>0.5);
- // Lightmapped world already received this light in the composed lightmap
- // (r_skyWorldBake), from smoothed normals; only cloud shadows stay live here.
+ // Fullscreen lighting always uses its own original screen-space policy.
+ // The BSP lightmap bake does not suppress or supply its intensity.
  let mask_pixel=clamp(pixel,vec2<i32>(0),vec2<i32>(textureDimensions(world_mask))-1);
  let policy=textureLoad(world_mask,mask_pixel,0);
  let mask=policy.r;
- let radial=distance(world,frame.eye.xyz)*frame.moon_mode.z;
- let same_surface=abs(textureLoad(world_mask_depth,mask_pixel,0).r-radial)<=radial*0.01+2.;
- let baked_world=frame.moon_mode.y>0.5 && same_surface && (abs(mask-0.25)<0.1 || abs(mask-0.75)<0.1);
  // Models lit themselves (md3/ghoul2 sky_world_model_gain). No depth match:
  // the view weapon's depth hack moves its depth-buffer position, not its mask.
  let lit_model=frame.moon_mode.w>0.5 && abs(mask-0.125)<0.06;
@@ -120,12 +117,12 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let facing_code=policy.g*255.;
  let facing=select(incidence,clamp((facing_code-26.)/100.,0.,1.),abs(mask-0.125)<0.06 && facing_code>25.5 && facing_code<126.5);
  var gain=vec3<f32>(mix(1.,shade,facing*0.7));
- if frame.options.x>0. && !baked_world && !lit_model {
+ if frame.options.x>0. && !lit_model {
   // The input holds baked illumination. This opt-in estimate retains its
   // material detail and dark interiors; it cannot recover separate albedo/GI.
   let ambient=env_irradiance(env_map,env_sampler,env,normal)/3.14159265;
-  // Only moonlit direct illumination reads JKA cascades. Sunlight keeps its
-  // existing map-relighting shadow path; indirect sky remains unoccluded.
+  // Realtime sky lighting uses the existing cascades for its sun/moon key.
+  // Baked mode never runs this sky gain; its shadow filtering is unchanged.
   var moon_visibility=1.;
   if frame.options.w>0.5 && incidence>0. {
    moon_visibility=moon_csm_visibility(world,normal);

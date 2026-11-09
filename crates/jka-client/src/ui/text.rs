@@ -9,9 +9,23 @@ use crate::ui::{
 pub struct UiVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
-    pub color: [f32; 4],
+    /// RGBA8 UNORM (`Unorm8x4`), like JKA's byte4 2D vertex colors. Build it
+    /// with `UiVertex::pack_color`; this keeps the vertex at 24 bytes.
+    pub color: [u8; 4],
     /// 0.0 = solid color, 1.0 = charsgrid, 2.0 = proportional font, 3.0 = splash.
     pub textured: f32,
+}
+
+impl UiVertex {
+    #[inline]
+    pub fn pack_color(color: [f32; 4]) -> [u8; 4] {
+        color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+    }
+
+    #[inline]
+    pub fn unpack_color(color: [u8; 4]) -> [f32; 4] {
+        color.map(|c| f32::from(c) / 255.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1104,9 +1118,9 @@ mod centerprint_parity_tests {
             [1.0, 1.0, 1.0, 0.4], 640, 480,
         );
         assert_eq!(out.len(), 24); // two glyphs, two passes, six vertices each
-        assert_eq!(out[0].color, [0.15, 0.15, 0.15, 0.4]);
-        assert_eq!(out[12].color, [1.0, 0.5, 0.0, 0.4]);
-        assert_eq!(out[18].color, [0.5, 0.5, 0.5, 0.4]);
+        assert_eq!(out[0].color, UiVertex::pack_color([0.15, 0.15, 0.15, 0.4]));
+        assert_eq!(out[12].color, UiVertex::pack_color([1.0, 0.5, 0.0, 0.4]));
+        assert_eq!(out[18].color, UiVertex::pack_color([0.5, 0.5, 0.5, 0.4]));
         // Round(24 * 1.0 * .075) = 2 virtual pixels.
         assert!((out[0].position[0] - out[12].position[0] - (2.0 / 640.0 * 2.0)).abs() < 0.0001);
         assert!((out[12].position[1] - out[0].position[1] - (2.0 / 480.0 * 2.0)).abs() < 0.0001);

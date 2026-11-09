@@ -2,6 +2,28 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_S_UNDERWATER {
+        runtime: CvarDef::new("s_underwater", "2", "0..3",
+            "Underwater gameplay audio: 0 off, 1 subtle (3500 Hz/-2 dB), 2 normal (1400 Hz/-5 dB), 3 heavy (650 Hz/-8 dB). Map music and UI are unaffected.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.audio.underwater)),
+            |app, value| App::cvar_set_s_underwater(app, APP_S_UNDERWATER.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_underwater, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _, value| { settings.underwater = int_in(value, 3).unwrap_or(settings.underwater); }),
+            archive: Some((27355, |state| state.audio.underwater.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_underwater(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.underwater = Self::parse_cvar_finite(name, value)?.clamp(0.0, 3.0) as u8;
+                self.apply_underwater_audio();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
     APP_S_VARIOMETERINPUT {
         runtime: CvarDef::new("s_variometerInput", "0", "0..1", "Variometer input: 0 horizontal acceleration, 1 strafehelper angle error (high = overshooting, low = undershooting).", CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(i32::from(app.audio.variometer_input)),

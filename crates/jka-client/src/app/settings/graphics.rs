@@ -367,8 +367,16 @@ impl App {
         }
         if enabled {
             self.sun_custom_initialized = true;
+            if !self.video.sun_override {
+                // Enabling relighting also enables entity cascaded shadows.
+                // This is a one-way default: turning relighting off leaves the
+                // selected shadow method alone, and users can change it later.
+                self.video.cascaded_shadows = true;
+                self.video.dynamic_shadows = crate::ui::DynamicShadowsMode::CascadedShadowMapsEntities;
+            }
         }
         self.video.sun_override = enabled;
+        self.video.relighting_mode = if enabled { self.video.relighting_mode.clamp(1, 2) } else { 0 };
         if !enabled {
             self.baked_sun_debug_view = 0;
             self.sun_ray_until = None;
@@ -380,6 +388,11 @@ impl App {
         self.sync_post_effects();
         self.mark_config_dirty();
         self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_relighting_mode(&mut self, mode: u8) {
+        self.video.relighting_mode = mode.min(2);
+        self.set_sun_override(mode != 0, mode != 0);
     }
 
     /// One complete 24-hour synthetic arc. At noon the sun faces the map's
@@ -708,6 +721,7 @@ impl App {
             contact_shadows: self.video.contact_shadows,
             fog_mode: self.video.fog_mode,
             fog_strength: self.video.fog_strength,
+            relighting_mode: self.video.active_relighting_mode(),
             sun_override: self.video.sun_override,
             sun_yaw: self.video.sun_yaw,
             sun_pitch: self.video.sun_pitch,
@@ -718,13 +732,16 @@ impl App {
             sun_visibility: self.video.sun_visibility,
             entity_sun_lighting: effective.entity_sun_lighting,
             baked_sun_removal: effective.baked_sun_removal,
-            baked_sun_cache: self.video.baked_sun_cache,
+            baked_sun_removal_auto: effective.baked_sun_removal_auto,
+            baked_sun_cache: effective.baked_sun_cache,
             lightmap_smoothing: self.video.lightmap_smoothing,
             baked_sun_aa: self.video.baked_sun_aa,
             lightmap_signal: self.video.lightmap_signal,
             sun_receiver_normals: self.video.sun_receiver_normals,
             sun_terminator: self.video.sun_terminator,
-            sky_world_bake: self.video.sky_world_bake,
+            sky_world_bake_ab: effective.sky_world_bake_ab,
+            sky_world_light_isolation: effective.sky_world_light_isolation,
+            sky_world_lighting_strength: effective.sky_world_lighting_strength,
             bake_threads: self.video.bake_threads,
             baked_sun_shadow_map: self.video.baked_sun_shadow_map,
             baked_sun_edge_softness: self.video.baked_sun_edge_softness,
@@ -1844,6 +1861,9 @@ impl App {
         }
         if oceans != self.authored_oceans {
             self.authored_oceans = oceans;
+            if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+                sound.set_underwater_oceans(&self.authored_oceans);
+            }
             self.authored_ocean_selected = self
                 .authored_ocean_selected
                 .min(self.authored_oceans.len().saturating_sub(1));
@@ -1880,6 +1900,12 @@ impl App {
             }
             ui::ENV_ROW_FOG_STRENGTH => {
                 self.set_fog_strength(self.video.fog_strength + direction as f32 * 0.5);
+            }
+            ui::ENV_ROW_BLUE_SKY_AERIAL => {
+                self.video.blue_water_environment.aerial_perspective =
+                    !self.video.blue_water_environment.aerial_perspective;
+                self.sync_post_effects();
+                self.mark_config_dirty();
             }
             ui::ENV_ROW_CLOUDS => {
                 self.video.clouds = !self.video.clouds;

@@ -252,18 +252,7 @@ impl App {
         let needs_password = info
             .get(b"needpass")
             .is_some_and(|value| !value.is_empty() && value != b"0");
-        if needs_password && self.network.password.is_empty() {
-            // Use the saved Server (g_password) credential for this exact endpoint.
-            if let Some(server) = self.net.as_ref().map(|net| net.session().server()) {
-                if let Ok(Some(credential)) = crate::credential_store::read(
-                    server,
-                    crate::credential_store::AccountType::Server,
-                ) {
-                    self.network.password = credential.password;
-                }
-            }
-        }
-        if needs_password && self.network.password.is_empty() {
+        if needs_password && self.connection_saved_password.is_none() && self.network.password.is_empty() {
             let target = self
                 .reconnect_target
                 .clone()

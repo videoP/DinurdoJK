@@ -159,6 +159,8 @@ impl Renderer {
         latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
         let frame_started = Instant::now();
+        let perf_early_checks_started = crate::renderer::diagnostics::perf_capture::enabled()
+            .then(Instant::now);
         // World and screen-space targets use this size; post, HUD and
         // presentation stay at the window size. They differ only while DLSS
         // upscales from a lower internal resolution.
@@ -281,6 +283,8 @@ impl Renderer {
         // Structural render decisions must therefore follow the active variant,
         // not the desired settings. Mixing an Enhanced bind group with an active
         // Lean pipeline is a wgpu validation error because bindings 10..14 differ.
+        let perf_early_checks_ms = perf_early_checks_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         let active_world_variant = self
             .world
             .as_ref()
@@ -592,10 +596,43 @@ impl Renderer {
         let legacy_models_possible = !matches!(self.dynamic_model_renderer.legacy_blend_mode, 3 | 4)
             && dynamic_models.iter().any(|surface|
             surface.fx_gpu_sprites.is_none() && crate::renderer::models::legacy_blend::eligible(surface.alpha_mode));
-        let forced_scene_copy = !plan.use_post && (glass_scene_possible || legacy_models_possible);
+        // SMAA owns its scene target inside the vendored library; it does NOT
+        // advertise the UNORM view needed by encoded world blending. Render
+        // into our regular scene target and resolve through the existing post
+        // path instead of creating an invalid alias of the SMAA texture.
+        let legacy_world_possible = (!self.scene_format().is_srgb()
+            || !self.surface_unorm_alias_supported || self.smaa_enabled) && self.world.as_ref().is_some_and(|world|
+            !world.pipeline_variants[&world.active_pipeline_variant].encoded_world_pipelines.is_empty());
+        // A WGPU swapchain is not necessarily a texture-binding resource.
+        // The native Blue Water copy samples color for atmospheric lighting,
+        // aerial perspective, weather and water transmission. On surfaces that
+        // cannot be bound as textures, use the existing sampleable scene target
+        // and inexpensive gamma/presentation resolve, just like legacy glass.
+        // Only do this when we would otherwise draw directly into that
+        // non-bindable surface; MSAA, Studio, and offscreen color can be sampled.
+        // Pure native clouds without world lighting use depth-only capture.
+        let blue_water_color_reader = self.blue_water_sky.as_ref().is_some_and(|_| {
+            self.blue_water_environment.world_lighting > 0.0
+                || (self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled)
+                || (self.sky_backend == 1 && self.fast_sky == 0
+                    && self.blue_water_environment.aerial_perspective)
+                || self.blue_water_environment.weather_backend == 1
+        });
+        let blue_water_water_reader = render_ocean
+            && self.ocean.as_ref().is_some_and(|ocean| ocean.backend() != 0
+                && (self.ocean_settings.surface_pixels
+                    || self.camera_water_surface > crate::renderer::NO_WATER_SURFACE
+                    || ocean.original_caustic_receivers_active()));
+        let blue_water_needs_sampleable_scene = self.msaa_samples == 1
+            && self.offscreen_output.is_none()
+            && !self.config.usage.contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            && (blue_water_color_reader || blue_water_water_reader);
+        let forced_scene_copy = !plan.use_post && (glass_scene_possible
+            || legacy_models_possible || legacy_world_possible
+            || blue_water_needs_sampleable_scene);
         if forced_scene_copy {
-            // Scene transmission needs a sampleable color attachment. The
-            // swapchain image does not guarantee TEXTURE_BINDING support.
+            // Reuse the existing lazy scene transfer path; neither add a
+            // second Blue Water color copy nor allocate a texture each frame.
             plan.use_post = true;
             plan.gamma_only_post = true;
         }
@@ -1094,6 +1131,7 @@ impl Renderer {
             legacy_blend_scene_copy: legacy_models_possible,
             ..FrameInfo::default()
         };
+        info.perf_prepare_early_checks_ms = perf_early_checks_ms;
         info.perf_effective_post = plan.use_post;
         info.perf_forced_post = forced_scene_copy;
         info.perf_forced_post_glass = forced_scene_copy && glass_scene_possible;
@@ -1485,9 +1523,15 @@ impl Renderer {
         // ordinary RT-off vertex-shader skinning path remains unchanged.
         let dynamic_prepare_started = Instant::now();
         self.ensure_rt_model_receivers();
+        self.dynamic_model_renderer.install_celestial_shadows(&self.device,
+            &self.shadow_resources._array_view, &self.shadow_resources.bevy_sampler,
+            &self.shadow_resources.receiver_buffer);
+        self.sync_entity_lightgrid_relight();
         self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
         self.sync_entity_cloud_shadow_sun();
-        self.dynamic_model_renderer.retire_sky_world(&self.queue);
+        self.dynamic_model_renderer.retire_sky_world(&self.queue,
+            self.sun_override && self.sky_backend == 1 && self.blue_water_sky.is_some()
+                && self.sky_world_lighting_strength > 0.0);
         let ray_traced_shadows = self.hardware_rt_active();
         // Mirrors the draw_phase calls below: the RT receivers (which add these
         // lights per pixel) are bound only in the ocean-split branch.
@@ -1516,6 +1560,12 @@ impl Renderer {
             ray_traced_shadows && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
             self.glow_mode.authored(),
         );
+        if self.planar_reflection.active {
+            let planar_format = crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
+            self.dynamic_model_renderer.ensure_planar_model_pipelines(
+                &mut self.pipeline_jobs, &self.device, planar_format,
+                planar_views.iter().flatten().any(|view| view.kind == PlanarReflectorKind::Authored));
+        }
         let glass_capture_needed = world_glass_possible
             || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
             || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
@@ -2457,6 +2507,12 @@ impl Renderer {
                     if ocean_suppresses_batch(render_ocean, batch) {
                         continue;
                     }
+                    // The shared depth-only vertex shader has no authored
+                    // `deformVertexes move` input. Never render a phantom
+                    // static occluder at the surface's undeformed location.
+                    if batch.source.pipeline.deform_move {
+                        continue;
+                    }
                     // The linear-depth target must record only stages that
                     // actually establish scene depth. An opaque lightmap stage
                     // using depthFunc equal is NOT an independent depth writer:
@@ -2605,6 +2661,12 @@ impl Renderer {
                             continue;
                         }
                         if ocean_suppresses_batch(render_ocean, batch) {
+                            continue;
+                        }
+                        // Moving world geometry is drawn with a specialized
+                        // color vertex shader; the common Hi-Z depth shader
+                        // would otherwise write its original static location.
+                        if batch.source.pipeline.deform_move {
                             continue;
                         }
                         // Same depth-seeding rule as the linear-depth pass:
@@ -2865,12 +2927,11 @@ impl Renderer {
                     .clone();
                 // Blue Water's dome is composited over the main view only, so this
                 // view would mirror the map's authored sky. A lake's view leaves its
-                // sky empty instead (alpha -1 on the float scene target) and the lake
+                // sky empty instead (alpha -1 on the float capture target) and the lake
                 // fills it from its own Blue Water sky.
                 let lake_sky = reflection_view.kind == PlanarReflectorKind::Ocean
                     && self.ocean_settings.backend == 3
-                    && self.sky_backend == 1 && self.fast_sky == 0 && self.blue_water_sky.is_some()
-                    && self.scene_format() == wgpu::TextureFormat::Rgba16Float;
+                    && self.sky_backend == 1 && self.fast_sky == 0 && self.blue_water_sky.is_some();
                 let reflection_visible = |batch: &WorldBatch| {
                     let sky = batch.source.pipeline.class == DrawClass::Sky;
                     !(batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
@@ -3188,10 +3249,12 @@ impl Renderer {
                             && batch.source.pipeline.class != DrawClass::Sky
                             // GodotOcean fogs itself (bsp.wgsl apply_ocean_legacy_fog).
                             && !(render_ocean && batch.ocean_clipmap.is_some())
+                            && batch.source.legacy_fog_pass
                             && self.weather.fog.legacy_uses_separate_pass(
                                 batch.source.fog_is_global,
                                 batch.source.legacy2_fog_in_stage_safe,
                                 batch.source.global_fog_post_eligible,
+                                batch.source.legacy_additive_only,
                             )
                             && (batch.source.fog[3] > 0.001
                                 || self.weather.fog.legacy_drawfog_value() == 1);
@@ -3346,12 +3409,20 @@ impl Renderer {
                     }
                 }
                 self.inline_visible_scratch = inline_visible;
+                // Portal views render the dynamic scene with a secondary
+                // camera, not a BSP-only texture. The first-person body has
+                // portal_only=true and is invisible to the main camera.
+                let authored_portal = reflection_view.kind == PlanarReflectorKind::Authored;
+                self.dynamic_model_renderer.draw_planar_scene_phase(
+                    &mut pass, &self.planar_camera_bind_groups[slot], true, authored_portal);
+                self.dynamic_model_renderer.draw_planar_scene_phase(
+                    &mut pass, &self.planar_camera_bind_groups[slot], false, authored_portal);
                 drop(pass);
                 // Per-view world flares use this reflection's just-rendered depth
                 // before the next slot clears the shared depth attachment.
                 if self.world_flares_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                     && competitive_mask & probe::WORLD_FLARES == 0 {
-                    let flare_format = self.scene_format();
+                    let flare_format = crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
                     self.world_flares_planar[slot].draw_planar(
                         &self.device,
                         &self.queue,
@@ -3422,16 +3493,13 @@ impl Renderer {
         // The moon-shadow state is stable for this frame and is used by both
         // Blue Water lighting paths below.
         let blue_water_moon_direction = self.blue_water_moon_toward();
-        // Lightmapped world pixels skip the sky light only when this frame's
-        // full prepass wrote the policy mask that marks them.
-        let full_policy_mask = self.frame_plan.needs_linear_depth
-            && !(self.frame_plan.rain_only_linear_depth && self.weather.rain.lean_depth);
-        let sky_world_baked = self.sky_world_baked() && full_policy_mask;
-        // Models take the sky world light in their own shader from smooth
-        // normals whenever the prepass tagged them (r_skyWorldBake 1/2).
-        let model_sky_world = self.sky_world_bake != 0 && full_policy_mask;
+        // Moving models share one live sky gain in Baked and Realtime. The
+        // fullscreen sky pass skips those pixels to avoid a second application.
+        let sky_world_baked = false;
+        let model_sky_world = self.sun_override && self.sky_backend == 1 && self.sky_world_lighting_strength > 0.0;
         let blue_water_moon_csm_active = shadow_matrices.is_some()
-            && self.blue_water_moon_shadow_direction().is_some();
+            && (self.blue_water_environment.world_lighting > 0.0
+                || self.blue_water_moon_shadow_direction().is_some());
         // At night explicitly override the direct solar light even when there
         // is no visible moon (new moon, moon below horizon, or intensity zero).
         let blue_water_moon_light = if self.blue_water_night() {
@@ -3461,6 +3529,10 @@ impl Renderer {
 
         self.dynamic_model_renderer.resize_legacy_blend(&self.device,
             render_width,render_height,self.msaa_samples,flare_scene_format);
+        crate::renderer::models::legacy_blend::LegacyModelBlend::resize_world(
+            &mut self.world_encoded_blend, &self.device, render_width, render_height,
+            self.msaa_samples, flare_scene_format,
+            legacy_world_possible && !flare_scene_format.is_srgb());
         // While DLSS upscales, the world draws into a render-size target and
         // DLSS fills `scene_view` (window size) for everything after it.
         let scene_output = if plan.use_post {
@@ -3478,6 +3550,9 @@ impl Renderer {
             info.perf_pre_world_remaining_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
         let perf_scene_started = perf_timing.then(Instant::now);
+        // These exclusive subdivisions explain a large `encode_scene_ms` even
+        // when the main BSP draw is only one multi_draw_indexed_indirect.
+        let perf_scene_branch_started = perf_timing.then(Instant::now);
         let menu_scene_trace = crate::renderer::diagnostics::perf_capture::first_world_frame_trace();
         let mut menu_scene_checkpoint = menu_scene_trace.then(Instant::now);
         self.gpu_profiler
@@ -3586,6 +3661,19 @@ impl Renderer {
                     || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
             );
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
+            // A valid FULL BSP cluster with no sky source is a sealed-sky view.
+            // Suppress dome shading and the opaque aerial compute/composite;
+            // tables, environment, entity lighting, and weather stay current.
+            // Other readers (portals, planar mirrors, water) fail open.
+            let blue_water_indoor_skip = self.sky_backend == 1 && self.fast_sky == 0
+                && self.pvs_mode != PvsMode::Off && world.visibility.is_some()
+                && world.last_cluster.flatten().and_then(|cluster|
+                    world.sky_reachable_by_cluster.get(cluster).copied()) == Some(false)
+                && sky_portal_view.is_none()
+                && !render_ocean && optical_volumes.is_none()
+                && !planar_views.iter().any(Option::is_some)
+                && !(self.cloud_backend == 1 && self.clouds_enabled)
+                && self.blue_water_environment.weather_backend != 1;
             // A water reflection or aerial receiver can remain visible when this PVS has no sky polygons.
             // Keep the physical sky's camera/time current; the draw below still uses exact BSP sky admission.
             if let Some(atmosphere) = self.blue_water_sky.as_mut() {
@@ -3596,8 +3684,15 @@ impl Renderer {
                     let area = |s: &crate::ocean::OceanSurface| (s.maximum[0] - s.minimum[0]) * (s.maximum[1] - s.minimum[1]);
                     area(a).total_cmp(&area(b))
                 }).map_or(0.0, |surface| surface.plane_height);
-                atmosphere.prepare(&self.device, &self.queue, &mut encoder, key, camera, jitter,
-                    camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane, self.sky_backend == 1 && self.fast_sky == 0,
+                atmosphere.set_server_time_ms(
+                    self.weather_server_time_ms.map(i64::from), world.weather_anchor,
+                );
+                atmosphere.prepare(&self.device, &self.queue, &mut encoder,
+                    Some(&mut self.gpu_profiler), self.blue_sky_diag & 2 != 0
+                        || !self.blue_water_environment.aerial_perspective,
+                    key, camera, jitter,
+                    camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane,
+                    self.sky_backend == 1 && self.fast_sky == 0 && !blue_water_indoor_skip,
                     self.cloud_backend == 1 && self.clouds_enabled, self.cloud_coverage,
                     [self.weather_wind.speed, self.weather_wind.direction], self.blue_water_environment, self.cloud_render_resolution.scale(), ocean_sun.intensity, frame_delta, self.weather.rain.native_sheltered(camera.position.to_array()));
                 info.native_thunder.extend(atmosphere.take_thunder());
@@ -3608,6 +3703,12 @@ impl Renderer {
                 }
             }
             if optical_volumes.is_some() {
+                // Reuse the frame's solar snapshot: calling active_sun() here
+                // would borrow all of self while SMAA holds smaa_target mutably.
+                // The sky's selected key light may be the moon instead.
+                let ocean_sky_gains = crate::ocean::night_sky_reflection_gains(
+                    ocean_sun.direction[1], self.sky_backend == 1,
+                    self.blue_water_environment.night_sky);
                 if let Some(ocean) = self.ocean.as_mut().filter(|gpu| gpu.backend() != 0) {
                     // Share Godot's *exact* PVS tile admission with the native
                     // Blue Water mesh. An absent cluster means outside the BSP,
@@ -3645,6 +3746,7 @@ impl Renderer {
                         &self.ocean_optics.water_distance, self.camera_water_surface,
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.environment()),
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.light()),
+                        ocean_sky_gains,
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| &sky.aerial),
                         self.blue_water_sky.as_ref().filter(|_| self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled).map(|sky| sky.clouds.shadow()), optical_volumes.as_ref().expect("active water volumes"),
                         godot_receiver_live.then_some(&self.ocean_optics.receiver_color), self.weather.fog.legacy_self_fog(),
@@ -3669,7 +3771,9 @@ impl Renderer {
             if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1 || self.blue_water_environment.world_lighting > 0.0 || self.blue_water_environment.weather_backend==1 || (self.cloud_backend == 1 && self.clouds_enabled)) {
                 let probe = self.ocean.as_ref().filter(|ocean|ocean.backend()!=0).and_then(|ocean| ocean.original_underwater_probe());
                 let first_atmosphere_render_started = menu_scene_trace.then(Instant::now);
-                atmosphere.render_image(&self.device, &mut encoder, probe);
+                atmosphere.render_image(&self.device, &self.queue, &mut encoder, probe,
+                    self.relighting_mode == 1 && self.sky_backend == 1 && self.fast_sky == 0
+                        && self.blue_sky_cube_ab == 1);
                 if let Some(started) = first_atmosphere_render_started {
                     rverbose!(2, "[MAP FIRST SCENE SKY] atmosphere render_image {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -4066,6 +4170,7 @@ impl Renderer {
                         for &batch_index in &portal_depth_candidates {
                             let batch = &portal_batches[batch_index];
                             if batch.source.pipeline.class == DrawClass::Sky
+                                || batch.source.pipeline.deform_move
                                 || !batch.source.pipeline.depth_write
                                 || batch.source.pipeline.depth_equal
                             {
@@ -4098,11 +4203,28 @@ impl Renderer {
             };
             if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             // Keep the cloned QuerySet alive for the full render-pass lifetime.
-            let stats_query = self.frame_time_graph.stats_query_set();
+            // Blend the authored source against encoded destination values.
+            // SDR aliases share storage, including individual MSAA samples.
+            let encoded_world = (flare_scene_format.is_srgb() || self.world_encoded_blend.is_some())
+                && !active_pipeline_variant.encoded_world_pipelines.is_empty();
+            // A hardware query cannot span attachment/pass transitions. Avoid
+            // reporting a partial world sample or changing the image to profile it.
+            let stats_query = if encoded_world { None } else { self.frame_time_graph.stats_query_set() };
+            let encoded_alias = |view: &wgpu::TextureView| view.texture().create_view(&wgpu::TextureViewDescriptor {
+                label: Some("JKA world display-space alias"),
+                format: Some(flare_scene_format.remove_srgb_suffix()),
+                ..Default::default()
+            });
+            let encoded_color_view = (encoded_world && flare_scene_format.is_srgb()).then(|| encoded_alias(color_view));
+            let encoded_resolve_view = if encoded_world && flare_scene_format.is_srgb() { resolve_target.map(encoded_alias) } else { None };
+            let mut encoded_world_active = false;
             info.perf_world_skip_clear = skip_world_color_clear(
                 self.color_clear_mode, self.fast_sky, sky_portal_drawn, world.sky_covers_background,
             );
             info.perf_world_clear = !info.perf_world_skip_clear;
+            if let Some(started) = perf_scene_branch_started {
+                info.perf_scene_before_world_ms = started.elapsed().as_secs_f64() * 1000.0;
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4214,6 +4336,41 @@ impl Renderer {
                 }
             }
             let mut current_pipeline = None;
+            macro_rules! world_encoding {
+                ($encoded:expr) => {{
+                    let requested = $encoded && encoded_world;
+                    if requested != encoded_world_active {
+                        drop(pass);
+                        if let Some(blend) = &self.world_encoded_blend {
+                            if requested { blend.encode_world(&self.device, &mut encoder,
+                                if self.msaa_samples > 1 { color_view } else { scene_output }, &self.targets.depth_view); }
+                            else { blend.decode_world(&self.device, &mut encoder, color_view, resolve_target); }
+                        }
+                        pass = crate::renderer::world::legacy_blend::resume(
+                            &mut encoder,
+                            if requested { encoded_color_view.as_ref().unwrap_or_else(|| self.world_encoded_blend.as_ref().unwrap().color_view()) } else { color_view },
+                            if requested { if let Some(blend) = &self.world_encoded_blend { blend.resolve_view() } else { encoded_resolve_view.as_ref() } } else { resolve_target },
+                            &self.targets.depth_view, world, &self.camera_bind_group,
+                            if enhanced_world_shader { &world.lighting_bind_group } else { &world.lighting_bind_group_lean },
+                            world_shadow_receiver_bind_group, &self.planar_reflection.bind_group,
+                            enhanced_world_shader.then_some(&self.ocean_optics.bind_group),
+                            enhanced_world_shader.then_some(&self.ocean_inert_bind_group));
+                        tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
+                        current_pipeline = None;
+                        encoded_world_active = requested;
+                        if capture_api_calls {
+                            let transfers = if self.world_encoded_blend.is_some() { 1 } else { 0 };
+                            info.perf_encode_calls.render_passes += 1 + transfers;
+                            info.perf_encode_calls.draw += transfers;
+                            info.perf_encode_calls.set_pipeline += transfers;
+                            info.perf_encode_calls.set_bind_group += transfers;
+                            info.perf_encode_calls.set_bind_group += if enhanced_world_shader { 6 } else { 4 };
+                            info.perf_encode_calls.set_vertex_buffer += 2;
+                            info.perf_encode_calls.set_index_buffer += 1;
+                        }
+                    }
+                }};
+            }
             // Grass no longer interleaves mid-loop (see the comment at its one
             // remaining call site below), so this never flips true inside the
             // loop; it only gates that single post-loop draw.
@@ -4531,6 +4688,7 @@ impl Renderer {
                     }
                     continue;
                 }
+                world_encoding!(false);
                 if use_cpu_compaction {
                     if let Some(group_index) = batch.compact_group {
                         let group_index = group_index as usize;
@@ -4611,10 +4769,12 @@ impl Renderer {
                                 // material-then-fog ordering without disabling
                                 // batching for an entire foggy map.
                                 let needs_group_fog = batch.source.pipeline.class != DrawClass::Sky
+                                    && batch.source.legacy_fog_pass
                                     && self.weather.fog.legacy_uses_separate_pass(
                                         batch.source.fog_is_global,
                                         batch.source.legacy2_fog_in_stage_safe,
                                         batch.source.global_fog_post_eligible,
+                                        batch.source.legacy_additive_only,
                                     )
                                     && (batch.source.fog[3] > 0.001
                                         || self.weather.fog.legacy_drawfog_value() == 1);
@@ -4690,7 +4850,11 @@ impl Renderer {
                         continue;
                     }
                 }
+                world_encoding!(false);
                 let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                let base_pso = if encoded_world_active {
+                    &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                } else { base_pso };
                 if current_pipeline != Some(base_binding) {
                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                     pass.set_pipeline(base_pso);
@@ -4747,10 +4911,12 @@ impl Renderer {
                     // The displaced GodotOcean cannot pass this depth-EQUAL
                     // redraw; it fogs itself (bsp.wgsl apply_ocean_legacy_fog).
                     && !(render_ocean && batch.ocean_clipmap.is_some())
+                    && batch.source.legacy_fog_pass
                     && self.weather.fog.legacy_uses_separate_pass(
                         batch.source.fog_is_global,
                         batch.source.legacy2_fog_in_stage_safe,
                         batch.source.global_fog_post_eligible,
+                        batch.source.legacy_additive_only,
                     )
                     && (batch.source.fog[3] > 0.001
                         || self.weather.fog.legacy_drawfog_value() == 1)
@@ -4758,6 +4924,7 @@ impl Renderer {
                         same_world_surface(batch, &active.batches[next_index])
                     });
                 if needs_fog_pass {
+                        world_encoding!(false);
                     let surface_writes_depth = active.indices[..=active_pos]
                         .iter()
                         .rev()
@@ -4810,6 +4977,7 @@ impl Renderer {
                     }
                 }
             }
+            world_encoding!(false);
             if !snow_shell_drawn {
                 draw_snow_shell(
                     &mut pass,
@@ -4821,6 +4989,7 @@ impl Renderer {
                     &mut current_pipeline,
                 );
             }
+            world_encoding!(false);
             if !grass_drawn && self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                 && competitive_mask & probe::GRASS == 0 {
                 if let (Some(grass), Some(prepared)) = (&world.grass, prepared_grass.as_ref()) {
@@ -4877,6 +5046,8 @@ impl Renderer {
                 }
             }
             if !inline_visible.is_empty() {
+                let inline_encoded = inline_visible.iter().any(|&index|
+                    crate::renderer::world::legacy_blend::additive_pipeline(active.batches[index].source.pipeline));
                 let packed = pack_inline_draws(
                     &self.queue,
                     active.batches,
@@ -4893,7 +5064,11 @@ impl Renderer {
                     for (run_index, &(first, count)) in scratch.runs.iter().enumerate() {
                         let batch =
                             &active.batches[inline_visible[scratch.order[first as usize] as usize]];
-                        let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                        world_encoding!(inline_encoded && active_pipeline_variant.encoded_world_pipelines.contains_key(&batch.source.pipeline));
+                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                let base_pso = if encoded_world_active {
+                    &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                } else { base_pso };
                         if current_pipeline != Some(base_binding) {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                             pass.set_pipeline(
@@ -4981,7 +5156,11 @@ impl Renderer {
                     let kinds = inline_stage_info(active.batches, &inline_visible).1;
                     for (position, &batch_index) in inline_visible.iter().enumerate() {
                         let batch = &active.batches[batch_index];
-                        let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                        world_encoding!(inline_encoded && active_pipeline_variant.encoded_world_pipelines.contains_key(&batch.source.pipeline));
+                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                let base_pso = if encoded_world_active {
+                    &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                } else { base_pso };
                         if current_pipeline != Some(base_binding) {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                             pass.set_pipeline(
@@ -5043,7 +5222,9 @@ impl Renderer {
                     }
                 }
             }
-            if blue_sky_path || (self.cloud_backend == 1 && self.clouds_enabled && !sky_portal_drawn) {
+            world_encoding!(false);
+            if (blue_sky_path || (self.cloud_backend == 1 && self.clouds_enabled && !sky_portal_drawn))
+                && self.blue_sky_diag & 1 == 0 {
                 if let Some(atmosphere) = self.blue_water_sky.as_ref() {
                     self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::BlueWaterSkyDraw, false);
                     atmosphere.bind(&mut pass);
@@ -5239,6 +5420,7 @@ impl Renderer {
                 self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::SurfaceSprites, true);
             }
             self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::WorldMainPass, true);
+            world_encoding!(false);
             if stats_query.is_some() {
                 pass.end_pipeline_statistics_query();
                 self.frame_time_graph.stats_query_ended(info.world_shader_programs.active);
@@ -5398,7 +5580,11 @@ impl Renderer {
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 for (overlay_index, &active_pos) in pre_optics_overlay.iter().enumerate() {
                     let batch = &active.batches[active.indices[active_pos]];
-                    let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                    world_encoding!(active_pipeline_variant.encoded_world_pipelines.contains_key(&batch.source.pipeline));
+                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                let base_pso = if encoded_world_active {
+                    &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                } else { base_pso };
                     if current_pipeline != Some(base_binding) {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(base_pso);
@@ -5433,16 +5619,19 @@ impl Renderer {
                             same_world_surface(batch, &active.batches[active.indices[next_pos]])
                         });
                     let needs_fog_pass = !next_is_same_surface
+                        && batch.source.legacy_fog_pass
                         && self.weather.fog.legacy_uses_separate_pass(
                             batch.source.fog_is_global,
                             batch.source.legacy2_fog_in_stage_safe,
                             batch.source.global_fog_post_eligible,
+                            batch.source.legacy_additive_only,
                         )
                         && (batch.source.fog[3] > 0.001
                             || self.weather.fog.legacy_drawfog_value() == 1);
                     if needs_fog_pass {
-                        if let Some(fog_pipeline) = active_pipeline_variant
-                            .fog_pass_pipelines
+                        if let Some(fog_pipeline) = (if encoded_world_active {
+                            &active_pipeline_variant.encoded_fog_pipelines
+                        } else { &active_pipeline_variant.fog_pass_pipelines })
                             .get(&(batch.source.pipeline, true))
                         {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
@@ -5461,11 +5650,28 @@ impl Renderer {
                 }
             }
 
+            world_encoding!(false);
             // Legacy projected point/dynamic lights are not sunlight: draw
             // them after the cloud multiplier, including in the ocean path.
             if optical_volumes.is_some() {
                 draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
             }
+
+            // Avoid the native scene capture when there are no clouds, world
+            // lighting, entity sky lighting, or live native lightning flashes.
+            // Weather splashes are applied later, independently of this pass.
+            let blue_sky_scene_active = self.blue_sky_diag & 8 == 0 && (
+                (self.cloud_backend == 1 && self.clouds_enabled)
+                || self.blue_water_environment.world_lighting > 0.0
+                || model_sky_world
+                || self.blue_water_sky.as_ref().is_some_and(|sky| sky.flash() > 0.0)
+            );
+            // The sky dome is NOT affected by this haze toggle. Preserve the
+            // existing PVS-indoor gate and diagnostic A/B override.
+            let blue_sky_air_active = self.blue_sky_diag & 6 == 0
+                && self.sky_backend == 1 && self.fast_sky == 0
+                && self.blue_water_environment.aerial_perspective
+                && !blue_water_indoor_skip;
 
             if optical_volumes.is_some() {
                 drop(pass);
@@ -5476,12 +5682,24 @@ impl Renderer {
                     Some((&self.shadow_resources._array_view, &self.shadow_resources.bevy_sampler,
                         &self.shadow_resources.receiver_buffer))
                 } else { None };
-                if let Some(atmosphere)=self.blue_water_sky.as_mut().filter(|_|self.sky_backend==1 || self.blue_water_environment.world_lighting > 0.0 || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    let model_sky_lit = atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked),
-                        model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET)));
-                    self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
+                if blue_sky_scene_active {
+                    if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1
+                        || self.blue_water_environment.world_lighting > 0.0
+                        || (self.cloud_backend == 1 && self.clouds_enabled)
+                        || self.blue_water_environment.weather_backend == 1) {
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, false);
+                        let model_sky_lit = atmosphere.apply_scene(&self.device, &self.queue, &mut encoder,
+                            color_view, resolve_target, &self.targets.depth_view, self.cloud_shadows_enabled,
+                            bw_portal_depth, blue_water_moon_light, moon_csm,
+                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked),
+                            model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,
+                                crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET,
+                                self.sky_world_lighting_strength, self.sky_world_light_isolation)));
+                        self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, true);
+                    }
+                } else {
+                    self.dynamic_model_renderer.sky_world_refreshed = false;
                 }
                 // Light submerged receivers before atmospheric scattering is added.
                 if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0) {
@@ -5489,10 +5707,13 @@ impl Renderer {
                     ocean.apply_original_caustics(&self.device, &mut encoder, color_view, &self.targets.depth_view);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsReceiver, true);
                 }
-                if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1) {
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, false);
-                    atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder, color_view, resolve_target, &self.targets.depth_view, &self.weather.rain.sky_admission());
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, true);
+                if blue_sky_air_active {
+                    if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1) {
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, false);
+                        atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder,
+                            color_view, resolve_target, &self.targets.depth_view, &self.weather.rain.sky_admission());
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, true);
+                    }
                 }
                 self.gpu_profiler.write_encoder_timestamp(
                     &mut encoder,
@@ -6125,7 +6346,10 @@ impl Renderer {
                     .write_render_pass_timestamp(&mut pass, GpuPass::OceanSurface, true);
             }
 
-            if optical_volumes.is_none() && (self.sky_backend==1 || self.blue_water_environment.world_lighting > 0.0 || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
+            // An all-off A/B can omit the render-pass split itself, not just
+            // the shaders encoded inside it. Without this, a large pass-boundary
+            // cost would remain hidden even when all sky work is suppressed.
+            if optical_volumes.is_none() && (blue_sky_scene_active || blue_sky_air_active) {
                 drop(pass);
                 let bw_portal_depth = self.portal_depth.target_view().filter(|_| self.portal_depth.inverse_scale != 0.0).map(|view| (view, self.portal_depth.inverse_scale));
                 // Reuse the existing sun CSM for moonlit native world lighting.
@@ -6134,13 +6358,31 @@ impl Renderer {
                     Some((&self.shadow_resources._array_view, &self.shadow_resources.bevy_sampler,
                         &self.shadow_resources.receiver_buffer))
                 } else { None };
-                if let Some(atmosphere)=self.blue_water_sky.as_mut() {
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
-                    let model_sky_lit = atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled,bw_portal_depth,blue_water_moon_light,moon_csm,(&self.targets.reflection_mask_view,&self.targets.linear_depth_view,sky_world_baked),
-                        model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET)));
-                    self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
-                    atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,&self.weather.rain.sky_admission());
+                if blue_sky_scene_active {
+                    if let Some(atmosphere) = self.blue_water_sky.as_mut() {
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, false);
+                        let model_sky_lit = atmosphere.apply_scene(&self.device, &self.queue,
+                            &mut encoder, color_view, resolve_target, &self.targets.depth_view,
+                            self.cloud_shadows_enabled, bw_portal_depth, blue_water_moon_light, moon_csm,
+                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked),
+                            model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,
+                                crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET,
+                                self.sky_world_lighting_strength, self.sky_world_light_isolation)));
+                        self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, true);
+                    }
+                } else {
+                    self.dynamic_model_renderer.sky_world_refreshed = false;
+                }
+                // The unsplit water path formerly attributed aerial compositing
+                // to BlueWaterClouds; time it in the same bucket as the split path.
+                if blue_sky_air_active {
+                    if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1) {
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, false);
+                        atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder,
+                            color_view, resolve_target, &self.targets.depth_view, &self.weather.rain.sky_admission());
+                        self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, true);
+                    }
                 }
                 pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("scene after native clouds"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()});
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
@@ -6229,17 +6471,18 @@ impl Renderer {
                 // Unlike grouping by shader, the bundle cannot reorder alpha
                 // blending or depth-equal siblings. Legacy fog replay is left on
                 // the original direct path until it can be included in the key.
-                let cache_deferred = !glass_capture_needed && !self.gpu_driven_enabled
+                let cache_deferred = !encoded_world && !glass_capture_needed && !self.gpu_driven_enabled
                     && !render_ocean
                     && optical_volumes.is_none()
                     && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
                     && deferred_transparent.len() >= 48
                     && !deferred_transparent.iter().any(|&position| {
                         let batch = &active.batches[active.indices[position]];
-                        self.weather.fog.legacy_uses_separate_pass(
+                        batch.source.legacy_fog_pass && self.weather.fog.legacy_uses_separate_pass(
                             batch.source.fog_is_global,
                             batch.source.legacy2_fog_in_stage_safe,
                             batch.source.global_fog_post_eligible,
+                            batch.source.legacy_additive_only,
                         ) && (batch.source.fog[3] > 0.001
                             || self.weather.fog.legacy_drawfog_value() == 1)
                     });
@@ -6325,6 +6568,7 @@ impl Renderer {
                     let batch_index = active.indices[active_pos];
                     let batch = &active.batches[batch_index];
                     if batch.source.glass_primary {
+                        world_encoding!(false);
                         pass.set_pipeline(&self.glass_world.as_ref().expect("glass pipeline").pipelines[&batch.source.pipeline.cull]);
                         pass.set_bind_group(0, &self.camera_bind_group, &[]);
                         pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -6342,7 +6586,11 @@ impl Renderer {
                         // The captured opaque scene already contains its fog.
                         continue;
                     }
-                    let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                    world_encoding!(active_pipeline_variant.encoded_world_pipelines.contains_key(&batch.source.pipeline));
+                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                let base_pso = if encoded_world_active {
+                    &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                } else { base_pso };
                     if current_pipeline != Some(base_binding) {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(
@@ -6394,16 +6642,19 @@ impl Renderer {
                         .take_while(|sibling| same_world_surface(batch, sibling))
                         .any(|sibling| sibling.source.pipeline.depth_write);
                     let needs_fog_pass = !next_is_same_surface
+                        && batch.source.legacy_fog_pass
                         && self.weather.fog.legacy_uses_separate_pass(
                             batch.source.fog_is_global,
                             batch.source.legacy2_fog_in_stage_safe,
                             batch.source.global_fog_post_eligible,
+                            batch.source.legacy_additive_only,
                         )
                         && (batch.source.fog[3] > 0.001
                             || self.weather.fog.legacy_drawfog_value() == 1);
                     if needs_fog_pass {
-                        if let Some(fog_pipeline) = active_pipeline_variant
-                            .fog_pass_pipelines
+                        if let Some(fog_pipeline) = (if encoded_world_active {
+                            &active_pipeline_variant.encoded_fog_pipelines
+                        } else { &active_pipeline_variant.fog_pass_pipelines })
                             .get(&(batch.source.pipeline, surface_writes_depth))
                         {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
@@ -6438,6 +6689,7 @@ impl Renderer {
                 }
                 } // direct ordered transparent draws
             }
+            world_encoding!(false);
             if optical_volumes.is_none() {
                 draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
             }
@@ -7555,6 +7807,11 @@ impl Renderer {
                 }
             }
         }
+        if let Some(started) = perf_scene_branch_started {
+            info.perf_scene_world_branch_ms = (started.elapsed().as_secs_f64() * 1000.0
+                - info.perf_scene_before_world_ms).max(0.0);
+        }
+        let perf_scene_after_world_started = perf_timing.then(Instant::now);
         // The HDR/offscreen fallback normally encodes and decodes every
         // framebuffer pixel just to blend a few legacy shells. For geometry
         // with trustworthy CPU world positions, limit BOTH transfer draws to
@@ -7622,6 +7879,9 @@ impl Renderer {
         self.face_plane_cull_scratch = face_plane_cull_scratch;
         if let Some(started) = menu_scene_checkpoint {
             rverbose!(2, "[MAP FIRST SCENE CHECKPOINT] remaining world scene {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+        if let Some(started) = perf_scene_after_world_started {
+            info.perf_scene_after_world_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
         if let Some(started) = perf_scene_started {
             // The serial split's prefix finish is reported in finish, rather
@@ -8356,6 +8616,7 @@ impl Renderer {
         let native_ui_main_drawn = native_ui_in_main && (has_native_2d_batches
             || (self.frame_time_graph.draw_ready() && !self.egui_active)
             || tile_cost_overlay_ready);
+        let perf_native_ui_started = (perf_timing && native_ui_main_drawn).then(Instant::now);
         if native_ui_in_main
             && (self.enemy_icon_vertex_count != 0 || self.screen_fx_vertex_count != 0
                 || self.ui_vertex_count != 0
@@ -8454,6 +8715,9 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, true);
         }
 
+        if let Some(started) = perf_native_ui_started {
+            info.perf_post_native_ui_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
         // Avoid an extra queue submission when no external SMAA resolve sits
         // between the scene and CRT. This is the common low-latency path.
         let crt_encoded_in_main = crt_before_ui && !self.smaa_enabled;
@@ -8615,7 +8879,11 @@ impl Renderer {
                 && !scene_snapshot_requested
             {
                 if let Some(crt_view) = crt_view.as_ref() {
+                    let perf_ui_call_started = perf_timing.then(Instant::now);
                     self.submit_ui_overlay(crt_view, native_ui_crt_view.as_ref());
+                    if let Some(started) = perf_ui_call_started {
+                        info.perf_followup_native_ui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
             }
             self.submit_crt(direct_presentation_output);
@@ -8718,7 +8986,11 @@ impl Renderer {
             && self.crt_scope == ui::CrtScope::SceneHud && !menu_backdrop_active
             && (self.studio_world_viewport.is_none() || self.ui_state.mode == ui::OverlayMode::Console);
         if stream_scene_hud_crt {
+            let perf_ui_call_started = perf_timing.then(Instant::now);
             self.submit_ui_overlay(crt_view.as_ref().expect("CRT resources must exist while enabled"), native_ui_crt_view.as_ref());
+            if let Some(started) = perf_ui_call_started {
+                info.perf_followup_native_ui_ms += started.elapsed().as_secs_f64() * 1000.0;
+            }
             self.submit_crt(&frame_view);
         }
         let egui_had_pixels = self.egui_active
@@ -8731,9 +9003,17 @@ impl Renderer {
         let loading_egui_on_top = self.ui_state.loading.is_some() && self.egui_active;
         if !loading_egui_on_top {
             if legacy_hdr_ui {
+                let perf_ui_call_started = perf_timing.then(Instant::now);
                 self.submit_egui_deferred_hdr(ui_composite_target);
+                if let Some(started) = perf_ui_call_started {
+                    info.perf_followup_egui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
             } else {
+                let perf_ui_call_started = perf_timing.then(Instant::now);
                 self.submit_egui(ui_composite_target);
+                if let Some(started) = perf_ui_call_started {
+                    info.perf_followup_egui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
             }
         }
         let late_native_ui = !competitive_hide_hud && !native_ui_in_main && !stream_scene_hud_crt
@@ -8750,17 +9030,33 @@ impl Renderer {
             // Editor chrome owns this window. A recorded demo's native HUD,
             // crosshair and scoreboard must not paint over the Studio panels.
             // The developer console remains usable while editing.
+            let perf_ui_call_started = perf_timing.then(Instant::now);
             self.submit_ui_overlay(ui_composite_target, native_ui_late_encoded_view);
+            if let Some(started) = perf_ui_call_started {
+                info.perf_followup_native_ui_ms += started.elapsed().as_secs_f64() * 1000.0;
+            }
         }
         if loading_egui_on_top {
             if legacy_hdr_ui {
                 if native_ui_main_drawn || native_ui_late_drawn {
+                    let perf_ui_call_started = perf_timing.then(Instant::now);
                     self.submit_egui_deferred_hdr_over_native(ui_composite_target);
+                    if let Some(started) = perf_ui_call_started {
+                        info.perf_followup_egui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                 } else {
+                    let perf_ui_call_started = perf_timing.then(Instant::now);
                     self.submit_egui_deferred_hdr(ui_composite_target);
+                    if let Some(started) = perf_ui_call_started {
+                        info.perf_followup_egui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
             } else {
+                let perf_ui_call_started = perf_timing.then(Instant::now);
                 self.submit_egui(ui_composite_target);
+                if let Some(started) = perf_ui_call_started {
+                    info.perf_followup_egui_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
             }
         }
         if crt_everything {
@@ -8795,7 +9091,11 @@ impl Renderer {
                 // image now and copy the offscreen result into it.
                 match self.acquire_render_frame(&mut info) {
                     Ok(frame) => {
+                        let perf_copy_started = perf_timing.then(Instant::now);
                         self.submit_early_present_copy(&frame);
+                        if let Some(started) = perf_copy_started {
+                            info.perf_early_present_copy_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        }
                         frame
                     }
                     Err(error) => {

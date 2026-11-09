@@ -228,7 +228,9 @@ mod world_blend_probe_tests {
         PipelineKey {
             legacy_srgb_three_stage: false,
             additive_fusion_count: 0,
+            auto_sprite: false,
             auto_sprite2: false,
+            deform_move: false,
             sky_outer: false,
             class,
             blend,
@@ -236,6 +238,7 @@ mod world_blend_probe_tests {
             offset: false,
             depth_write: false,
             depth_equal: true,
+        depth_test_disabled: false,
         }
     }
 

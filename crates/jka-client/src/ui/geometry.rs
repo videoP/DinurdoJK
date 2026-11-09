@@ -98,6 +98,7 @@ pub(in crate::ui) fn textured_rect_with_source(
     let x1 = (x + w) / width.max(1) as f32 * 2.0 - 1.0;
     let y0 = 1.0 - y / height.max(1) as f32 * 2.0;
     let y1 = 1.0 - (y + h) / height.max(1) as f32 * 2.0;
+    let color = UiVertex::pack_color(color);
     let v = |position, uv| UiVertex {
         position,
         uv,
@@ -129,6 +130,7 @@ pub(in crate::ui) fn disc(
     let height = height.max(1) as f32;
     let to_ndc = |x: f32, y: f32| [x / width * 2.0 - 1.0, 1.0 - y / height * 2.0];
     let center = to_ndc(center_x, center_y);
+    let color = UiVertex::pack_color(color);
     let vertex = |position| UiVertex {
         position,
         uv: [0.0, 0.0],
@@ -160,6 +162,7 @@ pub(in crate::ui) fn rect(
     let x1 = (x + w) / width.max(1) as f32 * 2.0 - 1.0;
     let y0 = 1.0 - y / height.max(1) as f32 * 2.0;
     let y1 = 1.0 - (y + h) / height.max(1) as f32 * 2.0;
+    let color = UiVertex::pack_color(color);
     let v = |position| UiVertex {
         position,
         uv: [0.0, 0.0],

@@ -1,4 +1,5 @@
 //! World pipelines.
+use crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
 use crate::renderer::{
     camera_depth_compare, create_cull_debug_pipeline, create_ssr_visibility_resources,
     create_surface_inspector_pipeline, create_taa_post_pipeline, create_targets,
@@ -11,15 +12,13 @@ use crate::renderer::{
 };
 
 impl Renderer {
-    pub(in crate::renderer) fn native_atmosphere_active(&self) -> bool {
-        self.sky_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled)
-    }
-
     pub(in crate::renderer) fn native_display_mapping_active(&self) -> bool {
         // The meter reads the Blue Water sky's environment map, so it is only
         // meaningful when that sky is the one on screen (native clouds alone
         // leave the JKA skybox visible).
-        self.sky_backend == 1 && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
+        // SDR direct sky has already mapped its radiance into display range.
+        self.gameplay_scene_format() == wgpu::TextureFormat::Rgba16Float
+            && self.sky_backend == 1 && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
     }
 
     pub(in crate::renderer) fn effective_auto_exposure_strength(&self) -> f32 {
@@ -44,11 +43,12 @@ impl Renderer {
         // it explicitly. This is deliberately narrower than r_hdr: it changes
         // precision/order only, not tone mapping or any HDR lighting semantics.
         let legacy2_precision = self.weather.fog.legacy2_precision_active();
-        // Native atmosphere and weather produce HDR radiance even when the
-        // host's HDR option is off. Clamping it in an 8-bit scene destroys the
-        // contrast between the lightning channel and its surrounding airlight.
+        // A clear Blue Water sky uses the BSP shader's SDR display mapping
+        // when r_hdr is off; selecting that sky must not turn every world
+        // attachment into FP16. Native volumetric clouds and weather still
+        // need the float scene for their HDR scene/flash composites.
         if self.hdr_enabled
-            || self.native_atmosphere_active()
+            || (self.cloud_backend == 1 && self.clouds_enabled)
             || self.blue_water_environment.weather_backend == 1
             || self.glow_mode.enabled()
             || self.halation_enabled
@@ -225,6 +225,12 @@ impl Renderer {
             world.pipeline_variants.insert(
                 key,
                 WorldPipelineVariant {
+                    encoded_fog_pipelines: super::legacy_blend::fog_pipelines(
+                        &self.device, layout, shader, scene_format, samples,
+                        world.coarse_batches.iter().map(|b| b.source.pipeline), key),
+                    encoded_world_pipelines: super::legacy_blend::pipelines(
+                        &self.device, layout, shader, scene_format, samples,
+                        world.coarse_batches.iter().map(|b| b.source.pipeline), key),
                     ocean_far_pipeline: None,
                     ocean_native_mesh_pipeline: None,
                     ocean_native_mesh_wireframe_pipeline: None,
@@ -586,13 +592,9 @@ pub(in crate::renderer) fn material_uniform(
         out.header[2] |= 524288;
     }
 
-    // In the classic renderer rgbGen vertex leaves vertex alpha in place when
-    // alphaGen is identity (with the normal identity-light scale). exactVertex
-    // does not. Encode that implicit case here so the WGSL need not know the
-    // parser's defaulting rules.
-    let alpha_from_vertex = matches!(source.alpha_gen, AlphaGen::Vertex)
-        || (matches!(source.alpha_gen, AlphaGen::Identity)
-            && matches!(source.rgb_gen, RgbGen::Vertex));
+    // ParseStage already resolved the implicit vertex-alpha rule, including
+    // an explicit `alphaGen identity` before or after `rgbGen vertex`.
+    let alpha_from_vertex = matches!(source.alpha_gen, AlphaGen::Vertex);
     if alpha_from_vertex {
         out.header[2] |= 1048576;
     } else if matches!(source.alpha_gen, AlphaGen::OneMinusVertex) {
@@ -610,9 +612,26 @@ pub(in crate::renderer) fn material_uniform(
         out.wave_alpha = [wave.base, wave.amplitude, wave.phase, wave.frequency];
         out.wave_funcs[1] = wave.func.id();
     }
+    if let AlphaGen::Portal(range) = source.alpha_gen {
+        // vector_s.w is unused for the ordinary tcGen basis and keeps this
+        // shader-authored parameter out of global reflection/texture settings.
+        out.vector_s[3] = range;
+    }
 
+    if let Some(moving) = source.move_deform {
+        let v = moving.vector;
+        out.deform_move_vector = [v[0], v[2], -v[1], 1.0];
+        let w = moving.wave;
+        out.deform_move_wave = [w.base, w.amplitude, w.phase, w.frequency];
+        out.wave_funcs[2] = w.func.id();
+    }
     if source.modulate_lightmap {
         out.header[2] |= 2;
+    }
+    // Only the additional BSP lightstyle pass: shader skips runtime relighting,
+    // local dynamic lights and material overlays already drawn in style 0.
+    if source.lightstyle_slot != 0 {
+        out.header[2] |= 2147483648u32;
     }
     if source.texture_is_lightmap {
         out.header[2] |= 8388608;
@@ -637,6 +656,12 @@ pub(in crate::renderer) fn material_uniform(
     // participate in the compiled/recovered global fog (q3map_nofog stays out).
     if source.fog_is_global && source.fog[3] > 0.001 && source.global_fog_post_eligible {
         out.header[2] |= 67108864;
+    }
+    // This draw is an environmental overlay over an authored $lightmap. The
+    // baked sky gain is stored alongside static sun aux when the sky bake is
+    // active. Decode it only on these prepared stages (including fused ones).
+    if source.baked_sky_overlay {
+        out.header[3] |= super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY;
     }
     // Dedicated cached-AO receiver bit for q3map LIGHTMAP_BY_VERTEX stages.
     // Restrict it to the stage that actually consumes BSP vertex RGB so
@@ -821,6 +846,14 @@ pub(in crate::renderer) fn material_uniform(
         out.header[3] |= 1 << 2;
     }
     if source.planar_reflection {
+        // Portal stages are foreground shaders over the reflected secondary
+        // view, NOT replacement textures. Identify the exact legacy blend so
+        // the reflection background can be composited before WGPU blending.
+        match source.pipeline.blend {
+            BlendMode::Custom(BlendFactor::One, BlendFactor::SrcAlpha) => out.header[3] |= 1 << 6,
+            BlendMode::Custom(BlendFactor::One, BlendFactor::OneMinusSrcAlpha) => out.header[3] |= 1 << 7,
+            _ => {}
+        }
         out.header[2] |= 4096;
         out.planar_plane = source.planar_plane;
     } else if source.planar_environment_candidate {
@@ -1288,7 +1321,7 @@ pub(in crate::renderer) fn material_minimal_entry(
     variant.minimal_entry_compatible()
         && material_specialization_eligible(key)
         && !key.legacy_srgb_three_stage
-        && !key.auto_sprite2
+        && !(key.auto_sprite || key.auto_sprite2 || key.deform_move)
 }
 
 /// Base-pass pipelines that use the shared `shade_surface` material code. Sky and
@@ -1419,7 +1452,7 @@ fn log_material_specialization(
         }
         let programs = pipelines.iter().map(|&(pipeline, material)| (
             program_variant(variant, material), material, pipeline.class != DrawClass::Opaque,
-            pipeline.auto_sprite2, pipeline.legacy_srgb_three_stage,
+            (pipeline.auto_sprite || pipeline.auto_sprite2), pipeline.legacy_srgb_three_stage,
         )).collect::<BTreeSet<_>>();
         println!("[WORLD STAGE RECIPES] mode={} prepared_recipes={} program_pairs={} pipelines={} coverage={families:?} fallbacks={fallbacks:?} compile_ms={:.1}",
             super::programs::active_mode(variant), jobs.len(), programs.len(), pipelines.len(), started.elapsed().as_secs_f64()*1000.0);
@@ -1472,14 +1505,14 @@ impl WorldPipelineReuseCatalog {
             for (&original, pipeline) in &set.reflection_pipelines {
                 catalog.insert(WorldPassPipelineIdentity::new(
                     variant, WorldPipelinePass::Reflection { authored_fog: variant.legacy_fog },
-                    reflected_pipeline_key(original), format, 1,
+                    reflected_pipeline_key(original), PLANAR_COLOR_FORMAT, 1,
                 ), pipeline);
             }
             for (&(original, writes_depth), pipeline) in &set.reflection_fog_pass_pipelines {
                 catalog.insert(WorldPassPipelineIdentity::new(
                     variant, WorldPipelinePass::ReflectionFog,
                     reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
-                    format, 1,
+                    PLANAR_COLOR_FORMAT, 1,
                 ), pipeline);
             }
         }
@@ -1623,9 +1656,9 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
         compile_cached_world_pass("reflection-runtime", originals, reusable, cancelled,
             |&original| WorldPassPipelineIdentity::new(
                 shader_variant, WorldPipelinePass::Reflection { authored_fog: shader_variant.legacy_fog },
-                reflected_pipeline_key(original), surface_format, 1),
+                reflected_pipeline_key(original), PLANAR_COLOR_FORMAT, 1),
             |&original| create_reflection_world_pipeline(
-                device, layout, shader, surface_format, reflected_pipeline_key(original),
+                device, layout, shader, reflected_pipeline_key(original),
                 shader_variant.legacy_fog, shader_variant))?
             .into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
@@ -1638,9 +1671,9 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(original, writes_depth)| WorldPassPipelineIdentity::new(
                 shader_variant, WorldPipelinePass::ReflectionFog,
                 reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
-                surface_format, 1),
+                PLANAR_COLOR_FORMAT, 1),
             |&(original, writes_depth)| create_world_pipeline(
-                device, layout, shader, surface_format,
+                device, layout, shader, PLANAR_COLOR_FORMAT,
                 reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
                 1, true, true, Some(shader_variant), false, None))?
             .into_iter().zip(jobs.iter().copied())
@@ -1670,6 +1703,12 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     };
 
     Some(WorldPipelineVariant {
+        encoded_fog_pipelines: super::legacy_blend::fog_pipelines(
+            device, layout, shader, surface_format, msaa_samples,
+            plan.base_keys.iter().copied(), shader_variant),
+        encoded_world_pipelines: super::legacy_blend::pipelines(
+            device, layout, shader, surface_format, msaa_samples,
+            plan.base_keys.iter().copied(), shader_variant),
         ocean_far_pipeline: None,
         ocean_native_mesh_pipeline: None,
         ocean_native_mesh_wireframe_pipeline: None,
@@ -1948,7 +1987,9 @@ pub(in crate::renderer) fn legacy_fog_pass_pipeline_key(
     PipelineKey {
         legacy_srgb_three_stage: false,
         additive_fusion_count: 0,
+        auto_sprite: source.auto_sprite,
         auto_sprite2: source.auto_sprite2,
+        deform_move: source.deform_move,
         sky_outer: source.sky_outer,
         class: source.class,
         blend: BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
@@ -1958,6 +1999,7 @@ pub(in crate::renderer) fn legacy_fog_pass_pipeline_key(
         // OpenJK chooses FP_EQUAL for shaders whose material wrote depth and
         // ordinary depth testing for genuinely translucent/no-depth shaders.
         depth_equal,
+        depth_test_disabled: source.depth_test_disabled,
     }
 }
 
@@ -2001,7 +2043,9 @@ pub(in crate::renderer) fn ocean_pipeline_key() -> PipelineKey {
     PipelineKey {
         legacy_srgb_three_stage: false,
         additive_fusion_count: 0,
+        auto_sprite: false,
         auto_sprite2: false,
+        deform_move: false,
         sky_outer: false,
         class: DrawClass::Transparent,
         blend: BlendMode::Opaque,
@@ -2009,6 +2053,7 @@ pub(in crate::renderer) fn ocean_pipeline_key() -> PipelineKey {
         offset: false,
         depth_write: true,
         depth_equal: false,
+        depth_test_disabled: false,
     }
 }
 
@@ -2016,7 +2061,7 @@ pub(in crate::renderer) fn create_reflection_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
+    _surface_format: wgpu::TextureFormat,
     batches: &[WorldBatch],
     legacy_fog: bool,
     shader_variant: WorldShaderVariantKey,
@@ -2038,7 +2083,6 @@ pub(in crate::renderer) fn create_reflection_pipelines(
             device,
             layout,
             shader,
-            surface_format,
             reflected,
             legacy_fog,
             shader_variant,
@@ -2051,7 +2095,7 @@ pub(in crate::renderer) fn create_reflection_fog_pass_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
+    _surface_format: wgpu::TextureFormat,
     batches: &[WorldBatch],
     shader_variant: WorldShaderVariantKey,
 ) -> BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline> {
@@ -2070,7 +2114,7 @@ pub(in crate::renderer) fn create_reflection_fog_pass_pipelines(
                 device,
                 layout,
                 shader,
-                surface_format,
+                PLANAR_COLOR_FORMAT,
                 reflected,
                 1,
                 true,

@@ -4,7 +4,7 @@ use super::sun_bake::BakeData;
 use image::{ImageDecoder, ImageEncoder};
 use std::{hash::Hasher, io::Cursor, path::Path};
 
-const MAGIC: &[u8; 8] = b"JKASUN01";
+const MAGIC: &[u8; 8] = b"JKASUN02";
 const ROW: u32 = 4096;
 
 fn checksum(bytes: &[u8]) -> u64 {
@@ -18,6 +18,8 @@ pub(super) fn encode(key: u64, data: &BakeData) -> Result<Vec<u8>, String> {
     for value in data.calibration.radiance {
         raw.extend_from_slice(&value.to_le_bytes());
     }
+    // -1 means no trustworthy estimate. Old caches are invalidated by MAGIC.
+    raw.extend_from_slice(&data.calibration.auto_strength.unwrap_or(-1.0).to_le_bytes());
     raw.extend_from_slice(&(data.calibration.surfaces.len() as u32).to_le_bytes());
     for fit in &data.calibration.surfaces {
         for value in fit {
@@ -51,7 +53,7 @@ pub(super) fn encode(key: u64, data: &BakeData) -> Result<Vec<u8>, String> {
 
 fn max_payload(surface_count: usize, sizes: &[[u32; 2]]) -> Option<usize> {
     sizes.iter().try_fold(
-        20usize.checked_add(surface_count.checked_mul(16)?)?,
+        24usize.checked_add(surface_count.checked_mul(16)?)?,
         |bytes, size| {
             bytes
                 .checked_add(8)?
@@ -91,7 +93,7 @@ pub(super) fn decode(
     }
     let len = usize::try_from(header.u64()?).ok()?;
     let sum = header.u64()?;
-    if len < 20 || len > max_payload(surfaces, sizes)? {
+    if len < 24 || len > max_payload(surfaces, sizes)? {
         return None;
     }
     let decoder = image::codecs::png::PngDecoder::new(Cursor::new(header.0)).ok()?;
@@ -107,6 +109,8 @@ pub(super) fn decode(
     }
     let mut reader = Reader(&raw);
     let radiance = [reader.float()?, reader.float()?, reader.float()?];
+    let strength = reader.float()?;
+    let auto_strength = (strength >= 0.0 && strength <= 2.0).then_some(strength);
     if reader.u32()? as usize != surfaces {
         return None;
     }
@@ -142,6 +146,7 @@ pub(super) fn decode(
     Some(BakeData {
         calibration: BakedSunCalibration {
             radiance,
+            auto_strength,
             surfaces: fits,
         },
         masks,

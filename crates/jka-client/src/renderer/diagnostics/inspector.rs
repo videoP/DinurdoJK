@@ -895,13 +895,14 @@ impl Renderer {
             "NONE"
         };
         lines.push(format!(
-            "FOG: {}    RGB {:.3},{:.3},{:.3}    DEPTH {:.1}    STAGE OVERRIDE {:?}    L1 POST {}",
+            "FOG: {}    RGB {:.3},{:.3},{:.3}    DEPTH {:.1}    STAGE OVERRIDE {:?}    ADDITIVE-ONLY {}    L1 POST {}",
             fog_assignment,
             source.fog[0],
             source.fog[1],
             source.fog[2],
             source.fog[3],
             source.fog_color_override,
+            if source.legacy_additive_only { "YES" } else { "NO" },
             if source.global_fog_post_eligible {
                 "YES"
             } else {
@@ -910,6 +911,8 @@ impl Renderer {
         ));
         let drawfog = self.weather.fog.legacy_drawfog_value();
         let fog_path = match drawfog {
+            1 | 2 if source.fog[3] > 0.001 && source.legacy_additive_only =>
+                "ADDITIVE IN-STAGE ATTENUATION",
             1 if source.fog[3] > 0.001
                 && source.fog_is_global
                 && source.global_fog_post_eligible =>

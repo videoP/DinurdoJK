@@ -178,6 +178,9 @@ pub(in crate::renderer) struct WorldBatch {
     /// True for a CG_Mover inline BSP model rather than static world geometry.
     /// Used by grouped mover submission and diagnostics.
     pub(in crate::renderer) is_inline_entity: bool,
+    /// Any *N BSP model with an authored lightmap chart receives the cached bake,
+    /// even if its instance subsequently moves (compiled-pose approximation).
+    pub(in crate::renderer) inline_baked_lightmap: bool,
     /// Stable index in WorldGpu.inline_models, or u32::MAX for static geometry.
     /// Unlike model handles, this identifies each distinct render instance,
     /// including multiple movers sharing the same BSP model handle.
@@ -272,6 +275,8 @@ impl WorldPipelineCompilePlan {
 
 #[derive(Clone)]
 pub(in crate::renderer) struct WorldPipelineVariant {
+    pub(in crate::renderer) encoded_world_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    pub(in crate::renderer) encoded_fog_pipelines: BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
     pub(in crate::renderer) pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     /// Compiled asynchronously only on first use of r_oceanSkyExtend 2.
     pub(in crate::renderer) ocean_far_pipeline: Option<wgpu::RenderPipeline>,
@@ -498,6 +503,8 @@ impl WorldGpu {
 }
 
 pub(in crate::renderer) struct WorldGpu {
+    /// Static BSP world-geometry centre (X,Z), for deterministic weather strikes.
+    pub(in crate::renderer) weather_anchor: [f32; 2],
     pub(in crate::renderer) collision_mesh: Option<crate::renderer::collision_world::CollisionGpuMesh>,
     /// Shitter reuses the native BSP geometry and its current PVS selection.
     /// Only this compact draw-argument stream is lazily allocated.
@@ -664,6 +671,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) inline_pvs: crate::renderer::visibility::pvs::InlinePvsSelection,
     pub(in crate::renderer) coarse_visible_batches_by_cluster: Vec<Vec<usize>>,
     pub(in crate::renderer) full_visible_batches_by_cluster: Vec<Vec<usize>>,
+    /// Exact BSP PVS sky admission; rebuilt on map upload and R_RemapShader.
+    pub(in crate::renderer) sky_reachable_by_cluster: Vec<bool>,
     /// AUTO representation. `[0, auto4_variant_base)` is a shallow alias of
     /// `full_batches` (same indices, cull records and compaction groups, used
     /// as the exact cold fallback); `[auto4_variant_base, ..)` holds one batch

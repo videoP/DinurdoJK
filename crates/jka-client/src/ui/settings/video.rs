@@ -62,6 +62,8 @@ pub struct VideoSettings {
     pub draw_2d: bool,
     /// TaystJK cg_drawHud: core health/shield/ammo/force HUD, not movement tools.
     pub draw_hud: bool,
+    /// TaystJK cg_tintHud: tint native status-HUD chrome red/blue in team games.
+    pub tint_hud: bool,
     /// 0: DinurdoJK panels; 1: Native multiplayer HUD from active JK2/JKA protocol.
     pub hud_style: u8,
     pub pvs_mode: PvsMode,
@@ -217,6 +219,8 @@ pub struct VideoSettings {
     pub ragdoll_max: u32,
     pub ragdoll_lifetime: f32,
     pub ragdoll_self_collision: bool,
+    /// 0 classic hard limits, 1 anatomical soft limits with neutral posture tension.
+    pub ragdoll_joint_model: u8,
     /// Profile-driven post-Ghoul2 soft-tissue secondary motion.
     /// 0 off, 1 female, 2 male, 3 both (reported player sex).
     pub jiggle_physics: u8,
@@ -356,6 +360,9 @@ pub struct VideoSettings {
     /// Master Relight map gate (r_relightMap; legacy alias r_sunOverride).
     /// False preserves authored illumination and retains saved relighting edits.
     pub sun_override: bool,
+    /// 0/1 retain the legacy Off/On meaning; 2 selects realtime sky lighting.
+    /// sun_override remains the master gate for legacy callers.
+    pub relighting_mode: u8,
     /// Simulated Relighting clock, 3 AM through the following 3 AM (3..27).
     pub relight_time: f32,
     /// q3map azimuth in degrees: 0=east, 90=north.
@@ -378,6 +385,8 @@ pub struct VideoSettings {
     pub entity_sun_lighting: bool,
     /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
     pub baked_sun_removal: f32,
+    /// Estimate removal from contrasts across the original baked sun shadows.
+    pub baked_sun_removal_auto: bool,
     pub baked_sun_cache: bool,
     /// 0 original bilinear, 1 bicubic reconstruction, 2 softened bicubic.
     pub lightmap_smoothing: u8,
@@ -389,8 +398,15 @@ pub struct VideoSettings {
     pub sun_receiver_normals: u8,
     /// Session-only r_bakedSunTerminator: curved-surface sun ray origins.
     pub sun_terminator: bool,
-    /// Session-only r_skyWorldBake: 0 live, 1 baked, 2 baked + sky visibility.
-    pub sky_world_bake: u8,
+    /// Sky world lighting delivery: 0 live fullscreen, 1 baked, 2 baked with traced occlusion.
+    /// A/B for the luxel normal: 0 existing smoothed normal, 1 face normal (screen-pass parity).
+    pub sky_world_bake_ab: u8,
+    /// A/B: 0 original sky tint (including enclosed authored light), 1 use
+    /// traced sky exposure to protect enclosed/locally lit surfaces. In
+    /// Realtime the static BSP contribution uses the cached exposure bake.
+    pub sky_world_light_isolation: bool,
+    /// Shared sky-world adjustment: 0 off, 1 full, delivered by the active mode.
+    pub sky_world_lighting_strength: f32,
     /// 0 = original automatic worker counts, 1..32 = fixed workers for relighting bakes.
     pub bake_threads: u8,
     pub baked_sun_shadow_map: bool,
@@ -407,6 +423,11 @@ pub struct VideoSettings {
     /// Experimental Star Nest procedural override of map-authored sky faces.
     pub sky_fractal_override: bool,
     pub sky_backend: u8,
+    /// Saved A/B for the clear Blue Water sky in Relighting Baked:
+    /// 0 = live atmospheric shader, 1 = cached sky faces.
+    pub blue_sky_cube_ab: u8,
+    /// Session-only Blue Water GPU pass isolation; diagnostic, never archived.
+    pub blue_sky_diag: u8,
     pub blue_water_environment: crate::blue_water_environment::Settings,
     pub cloud_backend: u8,
     /// Sky-portal geometry vs volumetric clouds: 0 off (clouds draw over portal
@@ -735,6 +756,7 @@ impl Default for VideoSettings {
             skip_ui: false,
             draw_2d: true,
             draw_hud: true,
+            tint_hud: true,
             hud_style: 0,
             pvs_mode: PvsMode::Auto,
             face_plane_cull: false,
@@ -815,6 +837,7 @@ impl Default for VideoSettings {
             ragdoll_max: 8,
             ragdoll_lifetime: 20.0,
             ragdoll_self_collision: false,
+            ragdoll_joint_model: 0,
             jiggle_physics: 0,
             hair_physics: 2,
             jiggle_solver: 0,
@@ -917,25 +940,29 @@ impl Default for VideoSettings {
             fog_mode: FogMode::Off,
             fog_strength: 0.0,
             sun_override: false,
+            relighting_mode: 0,
             relight_time: 15.0,
             // Matches the renderer's legacy fallback direction when a map has no authored sun.
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,
             sun_shadow_strength: 0.6,
-            sun_lighting: false,
+            sun_lighting: true,
             static_world_csm: false,
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
+            baked_sun_removal_auto: true,
             baked_sun_cache: true,
             lightmap_smoothing: 0,
             baked_sun_aa: 1,
             lightmap_signal: 0,
             sun_receiver_normals: 1,
             sun_terminator: false,
-            sky_world_bake: 1,
+            sky_world_bake_ab: 1,
+            sky_world_light_isolation: false,
+            sky_world_lighting_strength: 1.0,
             bake_threads: 0,
             baked_sun_shadow_map: true,
             baked_sun_edge_softness: 2.5,
@@ -947,6 +974,8 @@ impl Default for VideoSettings {
             distance_cull_scale: 0.0,
             sky_fractal_override: false,
             sky_backend: 0,
+            blue_sky_cube_ab: 1,
+            blue_sky_diag: 0,
             blue_water_environment: crate::blue_water_environment::Settings::default(),
             cloud_backend: 0,
             cloud_portal_depth: 0,
@@ -1146,11 +1175,25 @@ impl VideoSettings {
 }
 
 impl VideoSettings {
-    /// The full-world cascade renderer is selected only by the additional
-    /// Relighting option; main shadow method remains entity-only CSM.
+    pub fn active_relighting_mode(&self) -> u8 {
+        if self.sun_override { self.relighting_mode.clamp(1, 2) } else { 0 }
+    }
+
+    pub fn parse_relighting_mode(value: &str) -> Option<u8> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Some(0),
+            "1" | "baked" | "on" | "true" => Some(1),
+            "2" | "realtime" => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Baked retains the saved nearby-world shadow option. Realtime includes
+    /// world casters; the main shadow method remains the user's choice.
     pub fn effective_shadow_mode(&self) -> DynamicShadowsMode {
         if self.dynamic_shadows == DynamicShadowsMode::CascadedShadowMapsEntities
-            && self.sun_override && self.static_world_csm
+            && self.sun_override
+            && (self.static_world_csm || self.active_relighting_mode() == 2)
         {
             DynamicShadowsMode::CascadedShadowMaps
         } else {
@@ -1174,16 +1217,54 @@ impl VideoSettings {
     /// leaves shadow quality, inferred lamp shadow sources and ordinary FX alone.
     pub fn effective_relighting(&self) -> Self {
         let mut effective = *self;
+        // Baked is the existing rendering path: preserve every saved sun,
+        // sky-bake, filtering and nearby-shadow preference. Only Realtime
+        // replaces its static lighting delivery with the fullscreen sky pass.
+        effective.blue_water_environment.world_lighting = 0.0;
+        effective.sky_world_lighting_strength = if self.sun_override {
+            self.sky_world_lighting_strength.clamp(0.0, 1.0)
+        } else { 0.0 };
+        if self.active_relighting_mode() == 2 {
+            if self.sky_backend == 1 {
+                // Preserve the newer isolation path: trace sky receivers into
+                // cached lighting instead of fullscreen tinting enclosed rooms.
+                let traced_sky = self.sky_world_light_isolation && self.dynamic_shadows.is_csm();
+                if traced_sky {
+                    effective.blue_water_environment.world_lighting = 0.0;
+                    effective.baked_sun_cache = true;
+                    effective.sky_world_bake_ab = 1;
+                } else {
+                    effective.blue_water_environment.world_lighting = effective.sky_world_lighting_strength;
+                    effective.baked_sun_cache = false;
+                    effective.sky_world_bake_ab = 0;
+                }
+                effective.sun_lighting = false;
+                effective.entity_sun_lighting = false;
+            } else {
+                // Vanilla Realtime keeps the change-triggered BSP compositor
+                // while live CSM handles world shadows; no Blue Water atlas.
+                effective.baked_sun_cache = true;
+                effective.sky_world_bake_ab = 1;
+                effective.sun_lighting = true;
+                effective.entity_sun_lighting = true;
+            }
+        }
         if !self.sun_override {
+            effective.baked_sun_cache = false;
+            effective.sky_world_bake_ab = 0;
             effective.sun_lighting = false;
             effective.entity_sun_lighting = false;
             effective.baked_sun_removal = 0.0;
+            effective.baked_sun_removal_auto = false;
+            effective.emissive_area_lights = false;
+        }
+        // Residual baked-light grading belongs to Baked only. Render with
+        // neutral values in Off/Realtime without overwriting saved edits.
+        if self.active_relighting_mode() != 1 {
             effective.baked_indirect_scale = 1.0;
             effective.baked_indirect_saturation = 1.0;
             effective.baked_indirect_power = 1.0;
             effective.baked_indirect_highlight_preserve = 0.0;
-            effective.blue_water_environment.world_lighting = 0.0;
-            effective.emissive_area_lights = false;
         }
         effective
     }
@@ -1192,6 +1273,29 @@ impl VideoSettings {
 #[cfg(test)]
 mod relighting_tests {
     use super::*;
+
+    #[test]
+    fn vanilla_realtime_uses_cached_world_light_without_blue_water_atmosphere() {
+        let mut video = VideoSettings::default();
+        video.sun_override = true;
+        video.relighting_mode = 2;
+        video.sky_backend = 0;
+        video.blue_water_environment.world_lighting = 1.0;
+        video.baked_sun_cache = false;
+        video.sky_world_bake_ab = 0;
+        let vanilla = video.effective_relighting();
+        assert_eq!(vanilla.blue_water_environment.world_lighting, 0.0);
+        assert!(vanilla.baked_sun_cache);
+        assert_eq!(vanilla.sky_world_bake_ab, 1);
+        assert!(vanilla.sun_lighting);
+        assert!(vanilla.entity_sun_lighting);
+
+        video.sky_backend = 1;
+        let blue_water = video.effective_relighting();
+        assert!(!blue_water.baked_sun_cache);
+        assert_eq!(blue_water.sky_world_bake_ab, 0);
+        assert!(blue_water.blue_water_environment.world_lighting > 0.0);
+    }
 
     #[test]
     fn sources_are_independent_of_lamp_shadow_selection() {
@@ -1207,6 +1311,28 @@ mod relighting_tests {
         video.sun_override = false;
         assert_eq!(video.added_map_light_sources(), 0);
         assert!(video.effective_relighting().map_light_simulation);
+    }
+
+    #[test]
+    fn sky_world_isolation_routes_realtime_to_cached_static_exposure() {
+        let mut v = VideoSettings::default();
+        v.sun_override = true;
+        v.relighting_mode = 2;
+        v.sky_backend = 1;
+        v.dynamic_shadows = DynamicShadowsMode::CascadedShadowMapsEntities;
+        let legacy = v.effective_relighting();
+        assert!(!legacy.baked_sun_cache);
+        assert!(legacy.blue_water_environment.world_lighting > 0.0);
+        v.sky_world_light_isolation = true;
+        let protected = v.effective_relighting();
+        assert!(protected.baked_sun_cache);
+        assert_eq!(protected.sky_world_bake_ab, 1);
+        assert_eq!(protected.blue_water_environment.world_lighting, 0.0);
+        assert!(!protected.sun_lighting);
+        assert_eq!(v.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        v.dynamic_shadows = DynamicShadowsMode::Off;
+        assert!(!v.effective_relighting().baked_sun_cache,
+            "without CSM the existing realtime fallback is retained");
     }
 
     #[test]
@@ -1247,6 +1373,6 @@ mod relighting_tests {
         assert_eq!(on.baked_sun_removal, 0.8);
         assert_eq!((on.baked_indirect_scale, on.baked_indirect_saturation, on.baked_indirect_power), (0.4, 0.3, 2.5));
         assert_eq!(on.baked_indirect_highlight_preserve, 0.7);
-        assert_eq!(on.blue_water_environment.world_lighting, 0.9);
+        assert_eq!(on.blue_water_environment.world_lighting, 0.0);
     }
 }

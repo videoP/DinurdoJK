@@ -1,6 +1,7 @@
 //! The original atmosphere on JKA's device; BSP sky polygons authorize display.
 use crate::{camera::Camera, scene::GpuVertex};
 use ::blue_water_sky::{Sky, SkyScene, SkyTargets, SkyView, math};
+use crate::renderer::diagnostics::profiling::{GpuPass, GpuProfiler};
 
 /// Only structural changes require a build. Sun, wind, coverage and weather
 /// intensity remain ordinary per-frame uniforms.
@@ -12,6 +13,27 @@ struct AtmosphereConfig {
     clouds: bool,
     weather: bool,
     aerial: bool,
+    // Latched r_picmip; changes cached visible sky allocation, never the
+    // low-resolution Blue Water lighting environment used by water/models.
+    picmip: u32,
+}
+
+/// A view-space aerial volume may be reused only for identical sky inputs
+/// and an identical (including TAA jitter) camera. When the view is stationary
+/// and sky time advances, cap reuse to one 60 Hz interval so moving celestial
+/// lighting never stays frozen. The compositing pass still uses live scene depth.
+#[derive(Clone, Copy, PartialEq)]
+struct AerialReuseKey {
+    scene: SkyScene,
+    settings: crate::blue_water_environment::Settings,
+    position: [f32; 3],
+    camera_to_world: [f32; 16],
+    projection: [f32; 16],
+}
+
+fn aerial_reuse_time_valid(last: f32, now: f32) -> bool {
+    last.is_finite() && now.is_finite() && now >= last
+        && now - last < (1.0 / 60.0)
 }
 
 impl crate::renderer::Renderer {
@@ -35,6 +57,7 @@ impl crate::renderer::Renderer {
             clouds: self.cloud_backend == 1 && self.clouds_enabled,
             weather: settings.weather_backend == 1,
             aerial: self.sky_backend == 1 && self.fast_sky == 0,
+            picmip: self.picmip.min(16),
         };
         if self.blue_water_sky.as_ref().is_some_and(|sky| sky.config == config) {
             return;
@@ -78,15 +101,17 @@ impl crate::renderer::Renderer {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("native atmosphere preparation"),
             });
-            atmosphere.prepare(&device, &queue, &mut encoder, config.target, &camera, [0.0; 2],
+            atmosphere.prepare(&device, &queue, &mut encoder, None, false,
+                config.target, &camera, [0.0; 2],
                 0.0, sun.direction.map(|value| -value), sea_plane, config.aerial, config.clouds, coverage,
                 wind, settings, render_scale, sun.intensity, 0.0, false);
-            atmosphere.render_image(&device, &mut encoder, None);
+            atmosphere.render_image(&device, &queue, &mut encoder, None, false);
             queue.submit([encoder.finish()]);
             // The view may have moved while compilation ran. First use must
             // start fresh temporal histories using the current frame's camera.
             atmosphere.last_view = None;
             atmosphere.last_time = 0.0;
+            atmosphere.aerial_reuse = None;
             rverbose!(1, "[ENVIRONMENT PREPARED] atmosphere worker {:.1} ms {config:?}",
                 started.elapsed().as_secs_f64() * 1000.0);
             atmosphere
@@ -113,18 +138,24 @@ pub(in crate::renderer) struct AtmosphereRenderer {
     map_height: f32,
     last_view: Option<(math::Vec3, math::Vec3, f32)>,
     last_scene: Option<SkyScene>,
+    aerial_reuse: Option<(AerialReuseKey, f32)>,
     probe: Option<wgpu::TextureView>,
     sea_heights: Option<wgpu::TextureView>,
     preview_strike: Option<math::Vec3>,
     show_atmosphere: bool,
     clouds_active: bool,
     key: (u32, u32, u32, wgpu::TextureFormat),
-    image: wgpu::TextureView,
+    // Clear-sky display evaluates the original dome fragment on BSP sky
+    // pixels directly. Only native clouds still need the offscreen image.
+    image: Option<wgpu::TextureView>,
+    direct: bool,
     camera: wgpu::Buffer,
     portal_camera: wgpu::Buffer,
     portal_group: wgpu::BindGroup,
     group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    baked: BakedSkyCube,
+    frame_host_vp: glam::Mat4,
 }
 impl AtmosphereRenderer {
     fn build(
@@ -195,12 +226,59 @@ impl AtmosphereRenderer {
         ::blue_water_sky::shaders::register(&mut context).expect("native sky shaders");
         ::blue_water_clouds::shaders::register(&mut context).expect("native cloud shaders");
         let sky_ids = sky.register_pipelines(&mut context).expect("native sky pipelines");
+        context.add_shader(::blue_water_render::ShaderFile {
+            path: "dinurdo/blue_water_sky_cube.wgsl",
+            source: include_str!("blue_water_sky_cube.wgsl"),
+        }).expect("baked Blue Water shader");
+        let sky_layout = sky.bind_group_layout().clone();
+        // Rg11b10Ufloat is a 32-bit, RGB-only HDR render target. WGPU gates
+        // render-attachment usage behind an optional device feature; retain
+        // Rgba16Float when that feature was not enabled (including test GPUs).
+        let baked_format = baked_sky_color_format(device);
+        let baked_cube_id = context.add_pipeline(
+            "baked Blue Water sky cubemap", "dinurdo/blue_water_sky_cube.wgsl",
+            Vec::new(), Box::new(move |build| {
+                let layout = build.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("baked Blue Water cube layout"),
+                    bind_group_layouts: &[None, Some(&sky_layout)], immediate_size: 0,
+                });
+                ::blue_water_render::Pipeline::Render(build.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("baked Blue Water cubemap"), layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: build.module, entry_point: Some("cube_vertex"),
+                        compilation_options: Default::default(), buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: build.module, entry_point: Some("cube_fragment"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: baked_format,
+                            blend: None, write_mask: wgpu::ColorWrites::RED
+                                | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                    depth_stencil: None, multisample: Default::default(),
+                    multiview_mask: None, cache: build.cache,
+                }))
+            }),
+        ).expect("baked Blue Water cubemap pipeline");
+        let mut baked_skies = (0..6).map(|_| Sky::new_deferred(
+            device,
+            queue,
+            quality,
+            SkyTargets { color: wgpu::TextureFormat::Rgba16Float, depth: None },
+            &placeholders,
+        )).collect::<Vec<_>>();
         let cloud_ids = config.clouds.then(|| clouds.register_pipelines(&mut context, &sky).expect("native cloud pipelines"));
         let weather_ids = config.weather.then(|| weather.register_pipelines(&mut context).expect("native weather pipelines"));
         let post_ids = config.weather.then(|| weather_post.register_pipelines(&mut context).expect("native weather post"));
         let aerial_ids = config.aerial.then(|| aerial_pass.register_pipelines(&mut context).expect("native aerial pipelines"));
         drop(context);
         sky.adopt_pipelines(&registry, &sky_ids);
+        for baked_sky in &mut baked_skies {
+            baked_sky.adopt_pipelines(&registry, &sky_ids);
+        }
         if let Some(ids) = cloud_ids { clouds.adopt_pipelines(&registry, &ids); }
         if let Some(ids) = weather_ids { weather.adopt_pipelines(&registry, &ids); }
         if let Some(ids) = post_ids { weather_post.adopt_pipelines(&registry, &ids); }
@@ -208,8 +286,12 @@ impl AtmosphereRenderer {
         let weather_reactive = config.weather.then(||
             ::blue_water_clouds::reactive::WeatherReactive::new(device, weather.draw_layouts()));
         let scene = super::blue_water_scene::Scene::new(device, key, &sky, &clouds);
-        let (image, camera, group, pipeline) = Self::targets(device, key);
-        let (portal_camera, portal_group) = Self::portal_binding(device, &image, &pipeline);
+        // With native clouds disabled, draw the original Blue Water sky
+        // radiance directly into the JKA scene; no screen-sized intermediate.
+        let direct = !config.clouds && config.aerial;
+        let (image, camera, group, pipeline) = Self::targets(device, key, &sky, direct);
+        let (portal_camera, portal_group) = Self::portal_binding(device, image.as_ref(), &pipeline);
+        let baked = BakedSkyCube::new(device, key, registry.render(baked_cube_id).clone(), &sky, baked_skies, config.picmip, baked_format);
         Self {
             config,
             sky,
@@ -229,6 +311,7 @@ impl AtmosphereRenderer {
             map_height: 0.0,
             last_view: None,
             last_scene: None,
+            aerial_reuse: None,
             probe: None,
             sea_heights: None,
             preview_strike: None,
@@ -236,16 +319,19 @@ impl AtmosphereRenderer {
             clouds_active: false,
             key,
             image,
+            direct,
             camera,
             portal_camera,
             portal_group,
             group,
             pipeline,
+            baked,
+            frame_host_vp: glam::Mat4::IDENTITY,
         }
     }
     fn portal_binding(
         device: &wgpu::Device,
-        image: &wgpu::TextureView,
+        image: Option<&wgpu::TextureView>,
         pipeline: &wgpu::RenderPipeline,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
         let camera = device.create_buffer(&wgpu::BufferDescriptor {
@@ -254,19 +340,20 @@ impl AtmosphereRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera.as_entire_binding(),
+        }];
+        if let Some(image) = image {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(image),
+            });
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water sky portal display"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(image),
-                },
-            ],
+            entries: &entries,
         });
         (camera, group)
     }
@@ -276,20 +363,111 @@ impl AtmosphereRenderer {
             0,
             bytemuck::bytes_of(&matrix.to_cols_array_2d()),
         );
+        self.baked.write_portal_camera(queue, matrix, [self.key.0, self.key.1]);
     }
     pub fn bind_portal<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.portal_group, &[]);
+        if self.baked.active {
+            self.baked.bind_portal(pass, &self.sky);
+        } else {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.portal_group, &[]);
+            if self.direct { pass.set_bind_group(1, self.sky.bind_group(), &[]); }
+        }
     }
     fn targets(
         device: &wgpu::Device,
         key: (u32, u32, u32, wgpu::TextureFormat),
+        sky: &Sky,
+        direct: bool,
     ) -> (
-        wgpu::TextureView,
+        Option<wgpu::TextureView>,
         wgpu::Buffer,
         wgpu::BindGroup,
         wgpu::RenderPipeline,
     ) {
+        if direct {
+            // Same atmosphere/celestial WGSL library as Sky::draw_dome,
+            // but the host BSP sky mask supplies coverage and reversed depth.
+            let camera = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Blue Water direct BSP sky camera"),
+                size: 64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let module = ::blue_water_sky::shaders::shader_module_with(
+                device,
+                include_str!("blue_water_sky_direct.wgsl"),
+                "jka/blue_water_sky_direct.wgsl",
+                &[],
+                &[("SKY_SDR", ::blue_water_sky::host_shader_defs::sdr_scene(key.3))],
+            );
+            let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blue Water direct sky mask camera"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Blue Water direct sky camera"),
+                layout: &group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera.as_entire_binding(),
+                }],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Blue Water direct BSP sky"),
+                bind_group_layouts: &[Some(&group_layout), Some(sky.bind_group_layout())],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blue Water direct BSP sky"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("sky_mask"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("sky_color"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.3,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::renderer::depth_format(),
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: key.2, ..Default::default() },
+                multiview_mask: None,
+                cache: crate::pipeline_cache::get().as_ref(),
+            });
+            return (None, camera, group, pipeline);
+        }
         let image = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("Blue Water atmosphere screen"),
@@ -406,7 +584,7 @@ impl AtmosphereRenderer {
             multiview_mask: None,
             cache: crate::pipeline_cache::get().as_ref(),
         });
-        (image, camera, group, pipeline)
+        (Some(image), camera, group, pipeline)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
@@ -414,6 +592,8 @@ impl AtmosphereRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        mut profiler: Option<&mut GpuProfiler>,
+        diagnostic_skip_aerial: bool,
         key: (u32, u32, u32, wgpu::TextureFormat),
         camera: &Camera,
         jitter: [f32; 2],
@@ -583,7 +763,9 @@ impl AtmosphereRenderer {
         let flash = self.weather.light();
         self.sky
             .set_lightning(flash.position, flash.intensity, flash.flash, flash.bolt);
+        if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterAtmoTables, false); }
         self.sky.update_tables(queue, encoder, &sky_view, 0.0);
+        if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterAtmoTables, true); }
         self.weather_post
             .update(&cloud_view, self.weather.haze(), flash);
         if clouds_enabled {
@@ -602,7 +784,9 @@ impl AtmosphereRenderer {
             self.clouds.write_shadow_interface(
                 &mut ::blue_water_render::UploadSink::Queue(queue), &self.sky, &cloud_view);
         }
+        if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterEnvironment, false); }
         self.sky.update_environment(queue, encoder);
+        if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterEnvironment, true); }
         if clouds_enabled { self.clouds.encode_shadows(encoder); }
         let vp = sky_view.projection * cloud_view.view;
         let camera_uniforms = ::blue_water_render::CameraUniforms {
@@ -629,22 +813,48 @@ impl AtmosphereRenderer {
             curvature: 0.0,
             padding: 0,
         };
-        self.aerial_pass.enabled = show_atmosphere;
-        self.aerial_pass.encode(
-            device,
-            &mut ::blue_water_render::UploadSink::Queue(queue),
-            encoder,
-            &camera_uniforms,
-            &self.aerial,
-            &self.sky,
-            self.clouds.shadow(),
-            [
-                self.clouds.uniforms().heights[0],
-                self.clouds.uniforms().heights[1],
-            ],
-            None,
-        );
+        // Do not retain a hidden-room/old-weather volume for the next outdoor
+        // camera. Cloud march and native lightning remain fully per-frame.
+        let can_cache_aerial = show_atmosphere && !diagnostic_skip_aerial && !clouds_enabled
+            && settings.weather_backend != 1;
+        let aerial_key = AerialReuseKey {
+            scene,
+            settings: self.settings,
+            position: sky_view.position.to_array(),
+            camera_to_world: sky_view.camera_to_world.to_cols_array(),
+            projection: sky_view.projection.to_cols_array(),
+        };
+        let reuse_aerial = can_cache_aerial && self.aerial_reuse.is_some_and(|(last, last_time)| {
+            last == aerial_key && aerial_reuse_time_valid(last_time, time)
+        });
+        // The sky dome also reads the camera-space aerial volume's *dome*
+        // slice. Skipping the compute pass without clearing that slice leaves
+        // the last frame's horizon stuck on screen while the camera rotates.
+        // A disabled upstream aerial dispatch writes clear air and copies it to
+        // the dome's buffer. Do that once on toggle-off, then skip GPU work.
+        let aerial_enabled = show_atmosphere && !diagnostic_skip_aerial;
+        if self.aerial_pass.enabled != aerial_enabled || (aerial_enabled && !reuse_aerial) {
+            self.aerial_pass.enabled = aerial_enabled;
+            if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterAerialBuild, false); }
+            self.aerial_pass.encode(
+                device,
+                &mut ::blue_water_render::UploadSink::Queue(queue),
+                encoder,
+                &camera_uniforms,
+                &self.aerial,
+                &self.sky,
+                self.clouds.shadow(),
+                [
+                    self.clouds.uniforms().heights[0],
+                    self.clouds.uniforms().heights[1],
+                ],
+                None,
+            );
+            if let Some(profiler) = profiler.as_deref_mut() { profiler.write_encoder_timestamp(encoder, GpuPass::BlueWaterAerialBuild, true); }
+        }
+        self.aerial_reuse = can_cache_aerial.then_some((aerial_key, time));
         self.frame_camera = Some(camera_uniforms);
+        self.frame_host_vp = camera.view_projection_jittered(key.0, key.1, jitter);
         queue.write_buffer(
             &self.camera,
             0,
@@ -659,18 +869,30 @@ impl AtmosphereRenderer {
     pub fn render_image(
         &mut self,
         _device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         probe: Option<&wgpu::TextureView>,
+        baked_requested: bool,
     ) {
+        if baked_requested && self.show_atmosphere && !self.clouds_active
+            && self.settings.weather_backend != 1
+            && self.baked.update(queue, encoder, self.last_scene, self.settings)
+        {
+            self.baked.write_camera(queue, self.frame_host_vp, [self.key.0, self.key.1]);
+            return;
+        }
+        self.baked.active = false;
         let next_probe = probe.cloned();
         if self.probe != next_probe {
             self.clouds.set_underwater_probe(next_probe.clone());
             self.probe = next_probe;
         }
+        // Direct BSP sky rendering uses no intermediate and submits no dome pass.
+        let Some(image) = self.image.as_ref() else { return; };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blue Water original atmosphere dome"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.image,
+                view: image,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -701,24 +923,35 @@ impl AtmosphereRenderer {
         moon_light: Option<([f32; 3], f32)>,
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
         world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
-        // The model lighting uniform and its `sky_world` offset, when this
-        // frame's prepass tagged model pixels. Returns whether models are lit.
-        model_sky: Option<(&wgpu::Buffer, u64)>,
+        // Shared live model lighting in Baked and Realtime. This does not
+        // require a fullscreen color/depth copy in Baked.
+        model_sky: Option<(&wgpu::Buffer, u64, f32, bool)>,
     ) -> bool {
-        let mut models_lit = false;
-        self.scene.copy.capture(device, encoder, color, depth);
+        let flash = if self.settings.weather_backend == 1 {
+            self.weather.light().flash
+        } else {
+            0.0
+        };
+        let world_strength = self.settings.world_lighting;
+        let models_lit = if let Some((buffer, offset, strength, isolation)) = model_sky {
+            self.scene.model_sky_light(queue, encoder, &self.sky, strength, isolation, moon_light, (buffer, offset));
+            true
+        } else { false };
+        let scene_lighting = self.frame_camera.is_some()
+            && (world_strength > 0.0 || (self.clouds_active && shadows) || flash > 0.0);
+        // Baked and Off retain the existing cloud/lightning-only copy policy.
+        // Realtime additionally evaluates the original fullscreen sky pass.
+        if scene_lighting {
+            self.scene.copy.capture(device, encoder, color, depth);
+        } else if self.clouds_active {
+            // Pure cloud marching needs only the reversed-Z depth copy. Do
+            // not read/copy scene color, which may be a non-sampleable swapchain
+            // in maximum-FPS direct presentation mode.
+            self.scene.copy.capture_depth(device, encoder, color, depth);
+        }
         if let Some(camera) = &self.frame_camera {
-            let flash = if self.settings.weather_backend == 1 {
-                self.weather.light().flash
-            } else {
-                0.0
-            };
-            if self.settings.world_lighting > 0.0 || (self.clouds_active && shadows) || flash > 0.0 {
-                if let Some(target) = model_sky.filter(|_| self.settings.world_lighting > 0.0) {
-                    self.scene.model_sky_light(device, queue, encoder, &self.sky,
-                        self.settings.world_lighting, moon_light, target);
-                    models_lit = true;
-                }
+            // Models already consume the shared sky gain in their shaders.
+            if scene_lighting {
                 self.scene.light(
                     device,
                     queue,
@@ -728,7 +961,7 @@ impl AtmosphereRenderer {
                     &self.clouds,
                     color,
                     resolve,
-                    self.settings.world_lighting,
+                    world_strength,
                     shadows && self.clouds_active,
                     flash,
                     moon_light,
@@ -777,6 +1010,16 @@ impl AtmosphereRenderer {
     pub fn flash(&self) -> f32 {
         if self.settings.weather_backend == 1 { self.weather.light().flash } else { 0.0 }
     }
+    pub fn set_server_time_ms(&mut self, time: Option<i64>, anchor: [f32; 2]) {
+        // The preview deliberately retains the original diagnostic path.
+        let origin = math::Vec3::new(
+            anchor[0] / crate::ocean::OCEAN_UNITS_PER_METER,
+            0.0,
+            anchor[1] / crate::ocean::OCEAN_UNITS_PER_METER,
+        );
+        self.weather.set_server_time_ms(if self.settings.strike_preview { None } else { time }, origin);
+    }
+
     pub fn take_thunder(&mut self) -> Vec<::blue_water_clouds::lightning::Thunder> {
         std::mem::take(&mut self.weather.thunder)
     }
@@ -887,8 +1130,338 @@ impl AtmosphereRenderer {
         }
     }
     pub fn bind<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.group, &[]);
+        if self.baked.active {
+            self.baked.bind(pass, &self.sky);
+        } else {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.group, &[]);
+            if self.direct { pass.set_bind_group(1, self.sky.bind_group(), &[]); }
+        }
+    }
+}
+
+// The cached visible sky is separate from Blue Water's *lighting* environment
+// map, which is too low-resolution and prefiltered to preserve celestial detail.
+// As in JKA's independent outerbox face images, the unimportant downward face
+// can have a different resolution. Five r_picmip-scaled array layers + one
+// fixed 2x2 texture preserve the independent -Y allocation.
+// No alpha is needed: the baked radiance is HDR RGB, sampled as .rgb.
+fn baked_sky_color_format(device: &wgpu::Device) -> wgpu::TextureFormat {
+    if device.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) {
+        wgpu::TextureFormat::Rg11b10Ufloat
+    } else {
+        wgpu::TextureFormat::Rgba16Float
+    }
+}
+
+const BAKED_SKY_FACE_BASE_SIZE: u32 = 2048;
+const BAKED_SKY_DOWN_SIZE: u32 = 2;
+
+// Same dimension-halving policy as map textures: r_picmip=0 preserves 2K,
+// r_picmip=1 yields 1K, etc. Keep 2x2 as the minimum useful sky face.
+fn baked_sky_face_size(picmip: u32) -> u32 {
+    (BAKED_SKY_FACE_BASE_SIZE >> picmip.min(16)).max(BAKED_SKY_DOWN_SIZE)
+}
+
+fn baked_face_sky_view(face: u32, size: u32) -> SkyView {
+    let forward = match face {
+        0 => math::Vec3::X,
+        1 => math::Vec3::NEG_X,
+        2 => math::Vec3::Y,
+        3 => math::Vec3::NEG_Y,
+        4 => math::Vec3::Z,
+        _ => math::Vec3::NEG_Z,
+    };
+    // Blue Water reads forward from local -Z (SkyView::forward), not +Z.
+    // A reversed basis clamps pixel_along to 0.2 on the ENTIRE captured face,
+    // shrinking catalogue stars to 0.2^1.5 of their intended texel footprint.
+    // Use its own camera constructor so stars, sun and moon get the fixed
+    // 90-degree face's angular sampling, including the off-axis correction.
+    // cube_direction supplies the texel directions; camera roll is immaterial.
+    // Sea level is a stable reference, independent of the player's position.
+    SkyView::looking_at(math::Vec3::ZERO, forward, 90.0, [size.max(1); 2])
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct SkyBakeKey {
+    scene: SkyScene,
+    visibility: f32,
+    night_sky: f32,
+    sun_size: f32,
+    moon_size: f32,
+    moon_intensity: f32,
+    moon_intensity_custom: bool,
+}
+
+struct BakedSkyCube {
+    // Five picmip-scaled faces in a D2 array, plus a genuine 2x2 -Y face.
+    // The display shader reconstructs cube face UVs from the viewing direction.
+    _texture: wgpu::Texture,
+    faces: [wgpu::TextureView; 5],
+    _down_texture: wgpu::Texture,
+    down_face: wgpu::TextureView,
+    face_array: wgpu::TextureView,
+    face_size: u32,
+    picmip: u32,
+    bake_pipeline: wgpu::RenderPipeline,
+    display_pipeline: wgpu::RenderPipeline,
+    screen_camera: wgpu::Buffer,
+    portal_camera: wgpu::Buffer,
+    screen_group: wgpu::BindGroup,
+    portal_group: wgpu::BindGroup,
+    last_key: Option<SkyBakeKey>,
+    active: bool,
+    bake_skies: Vec<Sky>,
+}
+impl BakedSkyCube {
+    fn new(device: &wgpu::Device, key: (u32, u32, u32, wgpu::TextureFormat),
+           bake_pipeline: wgpu::RenderPipeline, sky: &Sky, bake_skies: Vec<Sky>, picmip: u32,
+           baked_format: wgpu::TextureFormat) -> Self {
+        let face_size = baked_sky_face_size(picmip);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Blue Water clear-sky baked five-face array"),
+            size: wgpu::Extent3d {
+                width: face_size,
+                height: face_size,
+                depth_or_array_layers: 5,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: baked_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let faces = std::array::from_fn(|face| texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Blue Water baked high-res sky face"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: face as u32,
+            array_layer_count: Some(1),
+            ..Default::default()
+        }));
+        let face_array = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Blue Water baked high-res sky array sampler"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(5),
+            ..Default::default()
+        });
+        let down_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Blue Water clear-sky down face 2x2"),
+            size: wgpu::Extent3d {
+                width: BAKED_SKY_DOWN_SIZE,
+                height: BAKED_SKY_DOWN_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: baked_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let down_face = down_texture.create_view(&Default::default());
+        rverbose!(1, "[BLUE WATER SKY BAKE] cached face format: {baked_format:?} (r_picmip {picmip})");
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Blue Water sky cube linear filter"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // Each camera is two mat4s plus a vec4 viewport (144 bytes).
+        let camera_buffer = |label| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label), size: 144,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let screen_camera = camera_buffer("Blue Water baked sky camera");
+        let portal_camera = camera_buffer("Blue Water baked sky portal camera");
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blue Water baked sky display layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let make_group = |camera: &wgpu::Buffer, label| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label), layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&face_array) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&down_face) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let screen_group = make_group(&screen_camera, "Blue Water baked sky display");
+        let portal_group = make_group(&portal_camera, "Blue Water baked portal display");
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blue Water baked sky BSP pipeline layout"),
+            bind_group_layouts: &[Some(&layout), Some(sky.bind_group_layout())], immediate_size: 0,
+        });
+        let shader = ::blue_water_sky::shaders::shader_module_with(
+            device, include_str!("blue_water_sky_cached.wgsl"),
+            "jka/blue_water_sky_cached.wgsl", &[],
+            &[("SKY_SDR", ::blue_water_sky::host_shader_defs::sdr_scene(key.3))],
+        );
+        let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blue Water baked cubemap BSP sky"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader, entry_point: Some("sky_mask"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0, shader_location: 0,
+                    }],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader, entry_point: Some("sky_color"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: key.3,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::renderer::depth_format(), depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(), bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: key.2, ..Default::default() },
+            multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
+        });
+        Self {
+            _texture: texture, faces, _down_texture: down_texture, down_face, face_array,
+            face_size, picmip,
+            bake_pipeline, display_pipeline, screen_camera, portal_camera,
+            screen_group, portal_group, last_key: None, active: false, bake_skies,
+        }
+    }
+    fn write_camera_buffer(queue: &wgpu::Queue, buffer: &wgpu::Buffer,
+                           vp: glam::Mat4, size: [u32; 2]) {
+        let mut uniforms = [0.0f32; 36];
+        uniforms[..16].copy_from_slice(&vp.to_cols_array());
+        uniforms[16..32].copy_from_slice(&vp.inverse().to_cols_array());
+        uniforms[32] = size[0].max(1) as f32;
+        uniforms[33] = size[1].max(1) as f32;
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&uniforms));
+    }
+    fn write_camera(&self, queue: &wgpu::Queue, vp: glam::Mat4, size: [u32; 2]) {
+        Self::write_camera_buffer(queue, &self.screen_camera, vp, size);
+    }
+    fn write_portal_camera(&self, queue: &wgpu::Queue, vp: glam::Mat4, size: [u32; 2]) {
+        Self::write_camera_buffer(queue, &self.portal_camera, vp, size);
+    }
+    fn update(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
+              scene: Option<SkyScene>, settings: crate::blue_water_environment::Settings) -> bool {
+        let Some(scene) = scene else { self.active = false; return false; };
+        // Only the sky configuration participates in cache invalidation.
+        // Camera position, orientation, FOV and player movement must never
+        // regenerate the six world-space sky faces.
+        let key = SkyBakeKey {
+            scene,
+            visibility: settings.visibility,
+            night_sky: settings.night_sky,
+            sun_size: settings.sun_size,
+            moon_size: settings.moon_size,
+            moon_intensity: settings.effective_moon_intensity(),
+            moon_intensity_custom: settings.moon_intensity_custom,
+        };
+        // Active selects this frame's draw path, not texture validity. Indoor
+        // sky suppression and live-mode comparisons must retain the capture.
+        // Only the first use or changed sky inputs require another bake.
+        if self.last_key != Some(key) {
+            for bake_sky in &mut self.bake_skies {
+                bake_sky.apply(&scene);
+                bake_sky.set_weather_haze(::blue_water_sky::haze::Haze::new(
+                    settings.visibility as f64,
+                    settings.altitude.max(0.0) as f64,
+                ));
+                bake_sky.set_night_sky_brightness(settings.night_sky);
+                bake_sky.set_disc_scales(settings.sun_size, settings.moon_size);
+                bake_sky.set_moonlight(Some(f64::from(settings.effective_moon_intensity()
+                    / crate::blue_water_environment::Settings::FULL_MOON_WORLD_INTENSITY)));
+                // Freeze twinkle at a reproducible phase. Celestial positions
+                // come from scene, which remains part of the invalidation key.
+                bake_sky.seek(0.0);
+            }
+            // Bake each face from its own dedicated headless sky instance.
+            // This keeps all six sky-table updates and bound resources separate
+            // from the live player view and from each other.
+            for face_index in 0..6 {
+                let size = if face_index == 3 { BAKED_SKY_DOWN_SIZE } else { self.face_size };
+                let face_view = baked_face_sky_view(face_index as u32, size);
+                let bake_sky = &mut self.bake_skies[face_index];
+                bake_sky.update_tables(queue, encoder, &face_view, 0.0);
+                // The array skips cube face 3 (-Y): layers are +X,-X,+Y,+Z,-Z.
+                let view = if face_index == 3 {
+                    &self.down_face
+                } else {
+                    &self.faces[if face_index < 3 { face_index } else { face_index - 1 }]
+                };
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Blue Water bake sky cube face"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view, depth_slice: None, resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.bake_pipeline);
+                pass.set_bind_group(1, bake_sky.bind_group(), &[]);
+                pass.draw(0..3, face_index as u32..face_index as u32 + 1);
+            }
+            self.last_key = Some(key);
+            rverbose!(1, "[BLUE WATER SKY BAKE] refreshed 5 x {}x{} + down {}x{} (r_picmip {}; first capture or sky inputs changed)",
+                self.face_size, self.face_size, BAKED_SKY_DOWN_SIZE, BAKED_SKY_DOWN_SIZE, self.picmip);
+        }
+        self.active = true;
+        true
+    }
+    fn bind<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, sky: &'a Sky) {
+        pass.set_bind_group(1, sky.bind_group(), &[]);
+        pass.set_pipeline(&self.display_pipeline);
+        pass.set_bind_group(0, &self.screen_group, &[]);
+    }
+    fn bind_portal<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, sky: &'a Sky) {
+        pass.set_bind_group(1, sky.bind_group(), &[]);
+        pass.set_pipeline(&self.display_pipeline);
+        pass.set_bind_group(0, &self.portal_group, &[]);
     }
 }
 
@@ -904,6 +1477,64 @@ fn rebased_cloud_layers(scene: &SkyScene, rain_shafts: bool, reference_drop: f32
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    #[test]
+    fn cached_sky_cameras_keep_catalogue_stars_at_face_resolution() {
+        let axes = [math::Vec3::X, math::Vec3::NEG_X, math::Vec3::Y,
+                    math::Vec3::NEG_Y, math::Vec3::Z, math::Vec3::NEG_Z];
+        for (face, direction) in axes.into_iter().enumerate() {
+            for size in [2048, 1024, 512, 2] {
+                let view = baked_face_sky_view(face as u32, size);
+                // Exercise Blue Water's -Z forward convention and view_scale,
+                // which drive celestial::pixel_along and the catalogue PSF.
+                let forward = view.camera_to_world.transform_vector3(math::Vec3::NEG_Z).normalize();
+                let facing = direction.dot(forward).max(0.2);
+                let (pixel, gain) = ::blue_water_sky::state::view_scale(
+                    1.0 / f64::from(view.projection.y_axis.y), f64::from(size));
+                let center_pixel = pixel * f64::from(facing.powf(1.5));
+                assert!((center_pixel - 2.0 / f64::from(size)).abs() < 1e-7,
+                        "face {face}: stars must span the capture texels, not the off-axis minimum");
+                assert_eq!(gain, 1.0, "a face must not inherit player zoom gain");
+                assert_eq!(view.position, math::Vec3::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_sky_face_dimensions_obey_picmip() {
+        for (picmip, expected) in [(0, 2048), (1, 1024), (2, 512),
+                                   (3, 256), (4, 128), (10, 2), (16, 2)] {
+            assert_eq!(baked_sky_face_size(picmip), expected);
+        }
+    }
+
+    #[test]
+    fn direct_sky_shader_composes_for_sdr_and_fp16() {
+        // Shader correctness can be checked without creating a GPU device.
+        // In particular, group 0 is JKA's BSP camera, and group 1 is the
+        // original Blue Water atmosphere/table/celestial bind group.
+        for format in [wgpu::TextureFormat::Bgra8UnormSrgb, wgpu::TextureFormat::Rgba16Float] {
+            let definition = ::blue_water_sky::host_shader_defs::sdr_scene(format);
+            let shader = ::blue_water_sky::shaders::compose_with(
+                include_str!("blue_water_sky_direct.wgsl"),
+                "jka/blue_water_sky_direct.wgsl",
+                &[],
+                &[("SKY_SDR", definition)],
+            ).expect("direct sky shader must compose over upstream atmosphere modules");
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::default(),
+            ).validate(&shader).expect("direct sky shader must validate");
+        }
+    }
+    #[test]
+    fn aerial_reuse_window_expires_and_rejects_rewinds() {
+        assert!(aerial_reuse_time_valid(5.0, 5.0));
+        assert!(aerial_reuse_time_valid(5.0, 5.01));
+        assert!(!aerial_reuse_time_valid(5.0, 5.02));
+        assert!(!aerial_reuse_time_valid(5.0, 4.9));
+        assert!(!aerial_reuse_time_valid(f32::NAN, 5.0));
+    }
+
     #[test]
     fn cloud_altitude_experiment_preserves_world_heights_for_all_generated_layers() {
         for altitude in [200.0f32, 0.0, -200.0, -1000.0] {
@@ -951,9 +1582,9 @@ mod native_tests {
                 .expect("GPU device");
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             for samples in [1, 4] {
-              for (clouds, weather, aerial) in [(false, false, true), (true, false, false), (true, true, true)] {
+              for (clouds, weather, aerial, format) in [(false, false, true, wgpu::TextureFormat::Rgba16Float), (false, false, true, wgpu::TextureFormat::Bgra8UnormSrgb), (true, false, false, wgpu::TextureFormat::Rgba16Float), (true, true, true, wgpu::TextureFormat::Rgba16Float)] {
                 // Odd dimensions catch aspect and rounded-up cloud/depth coordinates.
-                let key = (65, 33, samples, wgpu::TextureFormat::Rgba16Float);
+                let key = (65, 33, samples, format);
                 let texture = |format, samples| {
                     device
                         .create_texture(&wgpu::TextureDescriptor {
@@ -997,7 +1628,7 @@ mod native_tests {
                     ..Default::default()
                 };
                 let config = AtmosphereConfig { target: key, quality: settings.quality, cloud_quality: settings.cloud_quality,
-                    clouds, weather, aerial };
+                    clouds, weather, aerial, picmip: 0 };
                 let mut atmosphere = AtmosphereRenderer::build(&device, &queue, config, settings);
                 assert_eq!(atmosphere.weather_reactive.is_some(), weather);
                 for frame in 0..8 {
@@ -1020,6 +1651,8 @@ mod native_tests {
                         &device,
                         &queue,
                         &mut encoder,
+                        None,
+                        false,
                         key,
                         &camera,
                         [0.; 2],
@@ -1054,7 +1687,7 @@ mod native_tests {
                             "live frames use the quarter-resolution reconstruction"
                         );
                     }
-                    atmosphere.render_image(&device, &mut encoder, None);
+                    atmosphere.render_image(&device, &queue, &mut encoder, None, false);
                     {
                         let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1094,6 +1727,9 @@ mod native_tests {
                         true,
                         None,
                         None,
+                        None,
+                        (&roof.0, &motion, false),
+                        None,
                     );
                     atmosphere.apply_opaque_air(
                         &device,
@@ -1122,7 +1758,8 @@ mod native_tests {
                             ..settings
                         };
                         let mut encoder = device.create_command_encoder(&Default::default());
-                        atmosphere.prepare(&device, &queue, &mut encoder, key, &camera, [0.0; 2],
+                        atmosphere.prepare(&device, &queue, &mut encoder, None, false,
+                            key, &camera, [0.0; 2],
                             100.0 + f32::from(debug), [0.3, 0.8, 0.2], 0.0, aerial, true, 0.5,
                             [100.0, 45.0], settings, 0.5, 255.0, 1.0 / 60.0, false);
                         let uniforms = atmosphere.clouds.uniforms();
@@ -1132,8 +1769,8 @@ mod native_tests {
                         assert_eq!(uniforms.frame[3], 0.0, "each new diagnostic drops its history");
                         assert_eq!(atmosphere.clouds.layers().0[0].altitude, 0.0);
                         assert_eq!(Some(atmosphere.last_time), atmosphere.frozen_time);
-                        atmosphere.render_image(&device, &mut encoder, None);
-                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None, None);
+                        atmosphere.render_image(&device, &queue, &mut encoder, None, false);
+                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None, None, None, (&roof.0, &motion, false), None);
                         queue.submit(Some(encoder.finish()));
                         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                     }

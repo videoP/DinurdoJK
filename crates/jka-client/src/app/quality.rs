@@ -94,7 +94,7 @@ impl QualityPreset {
                     "r_glow" => *value = "authored",
                     "fx_physics" => *value = "2",
                     "r_promoteFxLights" => *value = "1",
-                    "r_detailTextures" => *value = "1",
+                    "r_autoDetailTextures" => *value = "1",
                     "r_pbr" => *value = "1",
                     "r_genNormalMaps" => *value = "1",
                     "r_deluxeMapping" => *value = "1",
@@ -159,7 +159,7 @@ impl QualityPreset {
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
                 ("r_texturemode", "GL_LINEAR_MIPMAP_LINEAR"),
-                ("r_detailTextures", "0"),
+                ("r_autoDetailTextures", "0"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -213,7 +213,7 @@ impl QualityPreset {
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "0"),
+                ("r_autoDetailTextures", "0"),
                 ("r_hdr", "0"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "0"),
@@ -465,12 +465,12 @@ mod tests {
         // Preset previews must not report a change for an already-off checkbox.
         for preset in [QualityPreset::Shitter, QualityPreset::Minimal, QualityPreset::Low] {
             let value = preset.settings().into_iter()
-                .find(|(name, _)| *name == "r_detailTextures").unwrap().1;
+                .find(|(name, _)| *name == "r_autoDetailTextures").unwrap().1;
             assert_eq!(value, "0", "{} should not highlight an off detail-texture checkbox", preset.label());
             assert!(super::cvar_values_match("0", value));
         }
         for preset in [QualityPreset::Medium, QualityPreset::High, QualityPreset::Ultra] {
-            assert!(preset.settings().contains(&("r_detailTextures", "1")));
+            assert!(preset.settings().contains(&("r_autoDetailTextures", "1")));
         }
     }
 

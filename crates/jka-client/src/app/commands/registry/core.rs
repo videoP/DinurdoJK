@@ -103,6 +103,32 @@ commands! {
         }
     }
 
+    // TaystJK codemp/client/snd_dma.cpp S_Play_f: accept multiple sound
+    // names, append .wav when the name has no extension, register each and
+    // start it on the local sound channel (without a volume argument).
+    cmd_play ["play", ] ("play <sound> [sound ...]", "Play one or more local sound effects by asset path (TaystJK S_Play_f).", CommandScope::Always) |self, command| {
+        let mut names = command.split_whitespace().skip(1).peekable();
+        if names.peek().is_none() {
+            self.push_console_line("^3usage:^7 play <sound> [sound ...]".to_owned());
+            return CommandResult::Handled;
+        }
+        let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) else {
+            self.push_console_line("^3play:^7 no active game sound system".to_owned());
+            return CommandResult::Handled;
+        };
+        let mut failed = Vec::new();
+        for name in names {
+            let path = if name.contains('.') { name.to_owned() } else { format!("{name}.wav") };
+            if !sound.play_local_sound(&[path.as_str()]) {
+                failed.push(path);
+            }
+        }
+        for path in failed {
+            self.push_console_line(format!("^3play:^7 could not play {path}"));
+        }
+        CommandResult::Handled
+    }
+
     cmd_clear ["clear", ] ("clear", "Clear the console output.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -318,9 +344,10 @@ commands! {
         }
         let effective = jka_assets::pk3::configured_filesystem_roots(&self.base);
         self.push_console_line(format!("^2FS:^7 basepath = {}", self.base.parent().unwrap_or(&self.base).display()));
-        self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(portable)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 homepath = {}", effective.homepath.as_ref().map_or("(JKA root)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 cdpath = {}", effective.cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
-        self.push_console_line(format!("^2FS:^7 jk2basepath = {} (JK2 root containing base/)", jka_assets::pk3::jk2_root_directory(&self.base, &effective).display()));
+        self.push_console_line(format!("^2FS:^7 jk2basepath = {} (JK2 root containing base/)", jka_assets::pk3::jk2_root_directory(&self.base, &effective).map_or("(not set: JK2 disabled)".into(), |p| p.display().to_string())));
+        self.push_console_line(format!("^2FS:^7 jk2homepath = {}", effective.jk2homepath.as_ref().map_or("(JK2 root)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 jk2cdpath = {} (JK2 retail fallback; not mounted in JKA)", effective.jk2cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
         self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));
@@ -481,6 +508,18 @@ commands! {
             }
             _ => return CommandResult::Unhandled,
         }
+    }
+
+    // OpenJK CL_ServerStatus_f: an engine-side OOB query, not a command sent
+    // through the connected game's reliable command stream.
+    cmd_serverstatus ["serverstatus", ] ("serverstatus [server]", "Query server settings and players (current server or host[:port]), as in OpenJK.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => self.query_console_server_status(None),
+            [_verb, address] => self.query_console_server_status(Some(address)),
+            _ => self.push_console_line("^3usage:^7 serverstatus [server]"),
+        }
+        CommandResult::Handled
     }
 
     cmd_rcon ["rcon", ] ("rcon <command>", "Run a command on a server remotely: rcon <command>. Needs rconPassword, and a connection or rconAddress.", CommandScope::Always) |self, command| {

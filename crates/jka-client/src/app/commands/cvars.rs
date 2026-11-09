@@ -37,10 +37,7 @@ impl App {
         let def = super::registry::cvar_registry()
             .find(name)
             .ok_or_else(|| format!("Cvar {name} does not exist."))?;
-        match def.normalize {
-            Some(normalize) => normalize(name, value),
-            None => Ok(value.trim().to_owned()),
-        }
+        def.normalize_for_latch(value)
     }
 
     pub(in crate::app) fn set_console_cvar_from_console(
@@ -48,38 +45,32 @@ impl App {
         name: &str,
         value: &str,
     ) -> Result<ConsoleCvarSetResult, String> {
-        let Some(entry) = crate::console::find(name) else {
+        // Consult the actual registry, never a second console metadata table.
+        // User-created cvars remain the only unregistered write path.
+        let Some(def) = super::registry::cvar_registry().find(name) else {
             self.set_console_cvar(name, value)?;
             return Ok(ConsoleCvarSetResult::Applied);
         };
-        if entry.latch == crate::console::LatchScope::None {
-            self.set_console_cvar(name, value)?;
+        if def.entry.latch == crate::console::LatchScope::None {
+            self.set_console_cvar(def.entry.name, value)?;
             return Ok(ConsoleCvarSetResult::Applied);
         }
 
-        let normalized = self.normalize_latched_console_value(entry.name, value)?;
-        let key = entry.name.to_ascii_lowercase();
-        let current = self
-            .console_cvar_value(entry.name)
-            .ok_or_else(|| format!("{}: cvar is not writable here", entry.name))?;
+        let normalized = def.normalize_for_latch(value)?;
+        let key = def.entry.name.to_ascii_lowercase();
+        let current = (def.get)(self).to_string();
 
-        // OpenJK Cvar_Set2 cancels a pending latch when the requested value is
-        // set back to the current live value.
-        if normalized.eq_ignore_ascii_case(&current) {
-            let removed = self.latched_console_cvars.remove(&key).is_some();
-            if removed {
+        // Match OpenJK's Cvar_Set2: reverting to the active value removes the
+        // pending latch, including a case-only string change.
+        if normalized == current {
+            if self.latched_console_cvars.remove(&key).is_some() {
                 self.mark_config_dirty();
             }
             return Ok(ConsoleCvarSetResult::Unchanged);
         }
-        if self
-            .latched_console_cvars
-            .get(&key)
-            .is_some_and(|pending| pending.eq_ignore_ascii_case(&normalized))
-        {
+        if self.latched_console_cvars.get(&key).is_some_and(|pending| pending == &normalized) {
             return Ok(ConsoleCvarSetResult::Unchanged);
         }
-
         self.latched_console_cvars.insert(key, normalized);
         self.mark_config_dirty();
         Ok(ConsoleCvarSetResult::Latched)
@@ -90,8 +81,8 @@ impl App {
             .latched_console_cvars
             .iter()
             .filter_map(|(name, value)| {
-                let entry = crate::console::find(name)?;
-                let apply = match (scope, entry.latch) {
+                let def = super::registry::cvar_registry().find(name)?;
+                let apply = match (scope, def.entry.latch) {
                     (
                         ApplyLatchedScope::MapLoad,
                         crate::console::LatchScope::MapLoadOrVidRestart,
@@ -103,7 +94,7 @@ impl App {
                     ) => true,
                     _ => false,
                 };
-                apply.then(|| (entry.name.to_owned(), value.clone()))
+                apply.then(|| (def.entry.name.to_owned(), value.clone()))
             })
             .collect();
 
@@ -111,6 +102,9 @@ impl App {
             self.latched_console_cvars
                 .remove(&name.to_ascii_lowercase());
             if let Err(error) = self.set_console_cvar(&name, &value) {
+                // Validation normally happened when staging. A runtime state
+                // dependency can still fail; don't silently lose that request.
+                self.latched_console_cvars.insert(name.to_ascii_lowercase(), value);
                 self.push_console_line(format!("^1{error}"));
             }
         }
@@ -118,10 +112,8 @@ impl App {
 
     pub(in crate::app) fn apply_latched_values_to_settings(&self, settings: &mut VideoSettings) {
         for (name, value) in &self.latched_console_cvars {
-            if let Some(set) =
-                super::registry::cvar_definition(name).and_then(|def| def.config.apply_latched)
-            {
-                set(settings, value);
+            if let Some(def) = super::registry::cvar_definition(name) {
+                def.apply_latched(settings, value);
             }
         }
     }

@@ -14,7 +14,7 @@ use crate::renderer::{
     make_cull_record, material_uniform, ocean_surface_key, rt_alpha_mask_source_from_gpu_vertices, rt_glass_source_from_gpu_vertices,
     same_draw_state, scene, world_blend_probe_bucket, upload_reflection_probes, upload_static_light_grid,
     upload_texture_picmip, upload_voxel_probe_gi,
-    visible_batches_by_cluster, water_surface_extent, weather, Arc, Auto4CollapseCache,
+    visible_batches_by_cluster, sky_reachability_by_cluster, water_surface_extent, weather, Arc, Auto4CollapseCache,
     Auto4CollapseWorker, Auto4GeometryState, Auto4Instance, BTreeMap, BTreeSet, BlendMode,
     DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord, GpuImage, GpuPointLight,
     GpuVertex, GrassRenderer, HashMap, IndexedGeometryBuilder, InlineModelGpu, InspectorVertex,
@@ -89,6 +89,43 @@ fn sky_outer_box_covers_background<'a>(sources: impl Iterator<Item = &'a DrawBat
         }
     }
     sky_shaders == boxed_shaders
+}
+
+/// Eligibility is driven solely by the BSP-authored lightmap data, not
+/// classname, fixed/moving state, or an instance's current transform.
+pub(super) fn inline_original_lightmap_receiver(
+    page: Option<usize>, class: DrawClass, vertices: &[GpuVertex], page_count: usize,
+) -> bool {
+    page.is_some_and(|page| page < page_count)
+        && class != DrawClass::Sky
+        && vertices.chunks_exact(3).any(|triangle| triangle.iter().all(|vertex|
+            vertex.lightmap_uv.iter().all(|uv| uv.is_finite() && *uv >= 0.0)))
+}
+
+/// Retain original BSP vertex lighting for LIGHTMAP_BY_VERTEX surfaces.
+/// Do not fabricate lightmaps for the inline model's alpha-masked foliage.
+pub(super) fn inline_vertex_sky_receiver(batch: &DrawBatch) -> bool {
+    batch.lightmap.is_none() && batch.vertex_lit
+        && matches!(batch.rgb_gen, jka_assets::shader::RgbGen::Vertex | jka_assets::shader::RgbGen::ExactVertex)
+        && matches!(batch.pipeline.class, DrawClass::Opaque | DrawClass::Mask)
+}
+
+#[cfg(test)]
+mod inline_lightmap_receiver_tests {
+    use super::*;
+
+    #[test]
+    fn all_original_lightmapped_inline_models_are_eligible_regardless_of_class_or_pose() {
+        let mut vertices = [GpuVertex::zeroed(); 3];
+        for v in &mut vertices { v.lightmap_uv = [0.25, 0.75]; }
+        assert!(inline_original_lightmap_receiver(Some(0), DrawClass::Opaque, &vertices, 1));
+        assert!(inline_original_lightmap_receiver(Some(0), DrawClass::Mask, &vertices, 1));
+        assert!(!inline_original_lightmap_receiver(None, DrawClass::Opaque, &vertices, 1));
+        assert!(!inline_original_lightmap_receiver(Some(1), DrawClass::Opaque, &vertices, 1));
+        assert!(!inline_original_lightmap_receiver(Some(0), DrawClass::Sky, &vertices, 1));
+        vertices[0].lightmap_uv = [-1.0, -1.0];
+        assert!(!inline_original_lightmap_receiver(Some(0), DrawClass::Opaque, &vertices, 1));
+    }
 }
 
 pub(in crate::renderer) fn build_world(
@@ -248,9 +285,67 @@ pub(in crate::renderer) fn build_world(
     let texture_classify_ms = texture_classify_started.elapsed().as_secs_f64() * 1000.0;
     // No sunlight tracing, calibration or cache I/O on the upload thread.
     // Retain cheap material metadata plus shared inputs for a requested bake.
-    let sun_bake_batches = if !source_map {
-        coarse_sources.clone()
-    } else { Vec::new() };
+    // All *N brush-model classes use the same original BSP lightmap rules.
+    // A door, rotating platform or mod-defined BMODEL keeps its authored
+    // charts even when it moves: the single cached bake uses the compiled
+    // BSP pose. No class, instance-count or transform whitelist applies.
+    // Unlightmapped/vertex-lit stages never acquire synthetic charts.
+    let inline_bake_eligible: Vec<bool> = inline_batch_sources.iter().map(|batch| {
+        !source_map && inline_vertices
+            .get(batch.vertices.start as usize..batch.vertices.end as usize)
+            .is_some_and(|vertices| inline_original_lightmap_receiver(
+                batch.lightmap, batch.pipeline.class, vertices, lightmap_data.len()))
+    }).collect();
+    let mut sun_bake_batches = if !source_map { coarse_sources.clone() } else { Vec::new() };
+    let mut inline_bake_batches = 0usize;
+    let mut inline_vertex_sky_batches = 0usize;
+    let mut inline_bake_vertices = None::<Vec<GpuVertex>>;
+    // Each copied receiver range and its owning draw instance. Used after
+    // indexed vertices are allocated to resolve the actual GPU color slots.
+    let mut inline_sun_gpu_ranges = Vec::<(std::ops::Range<u32>, usize, u32)>::new();
+    if !source_map {
+        // All stage draws for one *N BSP surface share its original triangle
+        // range. Only bake each authored lightmap chart once, even when drawn
+        // in multiple stages or reused by several inline model instances.
+        // Unlike a lightmap, vertex RGB belongs to each posed instance.
+        let mut ranges = BTreeMap::<(usize, u32, u32), std::ops::Range<u32>>::new();
+        let mut seen_receivers = BTreeSet::<(u32, u32, usize)>::new();
+        let mut seen_vertex_sky = BTreeSet::<(usize, u32, u32)>::new();
+        for (slot, model) in inline_model_sources.iter().enumerate() {
+            for index in model.batches.clone() {
+                let batch = &inline_batch_sources[index];
+                let lightmapped = inline_bake_eligible.get(index).copied().unwrap_or(false);
+                let vertex_lit = inline_vertex_sky_receiver(batch);
+                if !lightmapped && !vertex_lit { continue; }
+                let key = (batch.vertices.start, batch.vertices.end);
+                if lightmapped {
+                    let Some(page) = batch.lightmap else { continue; };
+                    if !seen_receivers.insert((key.0, key.1, page)) { continue; }
+                } else if !seen_vertex_sky.insert((slot, key.0, key.1)) {
+                    continue;
+                }
+                let range = ranges.entry((slot, key.0, key.1)).or_insert_with(|| {
+                    let baked = inline_bake_vertices.get_or_insert_with(|| vertices.clone());
+                    let start = u32::try_from(baked.len()).expect("inline bake vertices exceed u32");
+                    baked.extend_from_slice(&inline_vertices[key.0 as usize..key.1 as usize]);
+                    let range = start..u32::try_from(baked.len()).expect("inline bake vertices exceed u32");
+                    inline_sun_gpu_ranges.push((range.clone(), slot, key.0));
+                    range
+                });
+                let mut receiver = batch.clone();
+                receiver.vertices = range.clone();
+                sun_bake_batches.push(receiver);
+                if lightmapped { inline_bake_batches += 1; }
+                else { inline_vertex_sky_batches += 1; }
+            }
+        }
+    }
+    if !inline_model_sources.is_empty() {
+        println!("[SUN LIGHTMAP] inline BSP: {} original-lightmap chart batch(es), {} original vertex-lit sky batch(es) (all BMODEL classes, compiled pose); {} model(s) without lightmap charts",
+            inline_bake_batches, inline_vertex_sky_batches,
+            inline_model_sources.iter().filter(|m| !m.batches.clone().any(|index|
+                inline_bake_eligible.get(index).copied().unwrap_or(false))).count());
+    }
     let may_project_authored_sun = !source_map && sun.is_some() && baked_sun_encoding.is_some()
         && lightmap_data.iter().all(|image| image.rgba16f.is_none() && image.mip_level_count == 1);
     // Existing GPU textures are safe to alias only when *all* decode/upload
@@ -353,6 +448,31 @@ pub(in crate::renderer) fn build_world(
     } else {
         None
     };
+    // Map-local, immutable storm origin. Never use the viewer's camera, or
+    // two clients at different positions will see different bolts and delays.
+    // Skip sky polygons and inline models so distant skyboxes/movers cannot
+    // displace the stable centre of the playable BSP.
+    let mut weather_min = [f32::INFINITY; 2];
+    let mut weather_max = [f32::NEG_INFINITY; 2];
+    for source in coarse_sources.iter().filter(|source| source.pipeline.class != DrawClass::Sky) {
+        if let Some(part) = vertices.get(source.vertices.start as usize..source.vertices.end as usize) {
+            for vertex in part {
+                for (slot, axis) in [0, 2].into_iter().enumerate() {
+                    let v = vertex.position[axis];
+                    if v.is_finite() {
+                        weather_min[slot] = weather_min[slot].min(v);
+                        weather_max[slot] = weather_max[slot].max(v);
+                    }
+                }
+            }
+        }
+    }
+    let weather_anchor = [0, 1].map(|axis| {
+        if weather_min[axis].is_finite() && weather_max[axis].is_finite() {
+            weather_min[axis] * 0.5 + weather_max[axis] * 0.5
+        } else { 0.0 }
+    });
+
     let snow_started = Instant::now();
     let snow_shell = create_snow_shell_gpu(device, &vertices, &coarse_sources);
     let snow_shell_ms = snow_started.elapsed().as_secs_f64() * 1000.0;
@@ -402,6 +522,29 @@ pub(in crate::renderer) fn build_world(
     upload_timings.texture_classify_ms = texture_classify_ms;
     upload_timings.prelude_ms = prelude_started.elapsed().as_secs_f64() * 1000.0;
 
+    // World-only, map-load classification. Every stage sharing a vertex range
+    // must agree that its stored lightmap coordinates are not used for lighting
+    // or tcGen. A fixed/wave additive stage gets sky gain from the SAME baked
+    // vertex RGB as an authored vertex-lit base (fish/seaweed caustics).
+    // No new vertex attributes, shader resources or render passes are needed.
+    let mut baked_additive_ranges = BTreeSet::<(u32, u32)>::new();
+    if !source_map {
+        let all = coarse_sources.iter().chain(full_sources.iter());
+        let lightmap_ranges: BTreeSet<_> = all.clone()
+            .flat_map(|s| std::iter::once(s).chain(s.additive_companions.iter()))
+            .filter(|s| s.modulate_lightmap || s.texture_is_lightmap
+                || s.lightstyle_slot != 0 || matches!(s.tc_gen, jka_assets::shader::TcGen::Lightmap))
+            .map(|s| (s.vertices.start, s.vertices.end)).collect();
+        for source in all {
+            let range = (source.vertices.start, source.vertices.end);
+            if !lightmap_ranges.contains(&range)
+                && source.baked_sky_additive_stage()
+                && source.additive_companions.iter().all(DrawBatch::baked_sky_additive_stage)
+            {
+                baked_additive_ranges.insert(range);
+            }
+        }
+    }
     let vertex_started = Instant::now();
     let mut vertex_gpu_calls_ms = 0.0;
     let mut indexed_builder =
@@ -695,6 +838,45 @@ pub(in crate::renderer) fn build_world(
         .filter(|source| source.water_primary && is_upward_water_face(source, &vertices))
         .count() as u32;
 
+    // A single unused lightmap-UV component holds 3x8-bit ORIGINAL BSP RGB
+    // for qualifying additive ranges. 24-bit integers are exactly representable
+    // as f32. Vertex RGB continues to be authored_RGB * baked_sky_gain, so
+    // rgbGen vertex siblings remain correct. Their additive siblings decode
+    // authored RGB in the VERTEX shader and recover gain independently.
+    // No lightmap user is allowed to reference one of these indexed vertices.
+    let lightmap_gpu_users: BTreeSet<u32> = coarse_sources.iter().chain(full_sources.iter())
+        .flat_map(|s| std::iter::once(s).chain(s.additive_companions.iter()))
+        .filter(|s| s.modulate_lightmap || s.texture_is_lightmap
+            || s.lightstyle_slot != 0 || matches!(s.tc_gen, jka_assets::shader::TcGen::Lightmap))
+        .flat_map(|s| s.vertices.clone())
+        .filter_map(|i| indexed_builder.source_to_index.get(i as usize).and_then(|&v| v))
+        .collect();
+    baked_additive_ranges.retain(|&(start, end)| {
+        vertices.get(start as usize..end as usize).is_some_and(|vs| !vs.is_empty()
+            && vs.iter().all(|v| v.color[..3].iter()
+                .all(|c| c.is_finite() && *c >= 1.0 / 255.0 && *c <= 1.0))
+            && (start..end).all(|i| indexed_builder.source_to_index.get(i as usize)
+                .and_then(|&v| v).is_some_and(|v| !lightmap_gpu_users.contains(&v))))
+    });
+    let mut additive_gpu_vertices = BTreeSet::new();
+    for &(start, end) in &baked_additive_ranges {
+        for source_index in start..end {
+            if let Some(Some(index)) = indexed_builder.source_to_index.get(source_index as usize) {
+                additive_gpu_vertices.insert(*index);
+            }
+        }
+    }
+    for gpu_index in additive_gpu_vertices.iter().copied() {
+        if let Some(vertex) = indexed_builder.vertices.get_mut(gpu_index as usize) {
+            let rgb = [vertex.color[0], vertex.color[1], vertex.color[2]]
+                .map(|c| (c * 255.0).round() as u32);
+            vertex.lightmap_uv[0] = ((rgb[0] << 16) | (rgb[1] << 8) | rgb[2]) as f32;
+        }
+    }
+    if !additive_gpu_vertices.is_empty() {
+        println!("[SUN LIGHTMAP] baked additive sky: {} world ranges, {} indexed vertices (const/wave, no lightmap consumers)",
+            baked_additive_ranges.len(), additive_gpu_vertices.len());
+    }
     let static_ao_source_to_gpu = indexed_builder
         .source_to_index
         .iter()
@@ -726,6 +908,22 @@ pub(in crate::renderer) fn build_world(
             inline_index_ranges[batch_index] = indexed_builder.append_indices(&indices);
         }
         inline_gpu_starts.push(gpu_start);
+    }
+    // The static sun's source includes copied inline BSP triangles beyond the
+    // static-AO world prefix. Record each copied receiver's own draw-buffer
+    // address, so LIGHTMAP_BY_VERTEX *N sky gain reaches actual BMODEL RGB.
+    // Never modify the AO-only mapping: its length must stay world-only.
+    let mut static_sun_vertex_to_gpu = static_ao_source_to_gpu.clone();
+    if let Some(source) = inline_bake_vertices.as_ref() {
+        static_sun_vertex_to_gpu.resize(source.len(), u32::MAX);
+        for (range, slot, first) in &inline_sun_gpu_ranges {
+            let model = &inline_model_sources[*slot];
+            let gpu_start = inline_gpu_starts[*slot];
+            for (offset, index) in (range.start..range.end).enumerate() {
+                static_sun_vertex_to_gpu[index as usize] = gpu_start
+                    + (*first - model.vertices.start) + offset as u32;
+            }
+        }
     }
     // Inline BSP surfaces occupy their own decoded vertex array, with batch
     // source ranges offset by the static world count below. The inspector
@@ -1041,9 +1239,12 @@ pub(in crate::renderer) fn build_world(
     let mut upload_batches = |sources: Vec<DrawBatch>,
                               index_ranges: Vec<std::ops::Range<u32>>,
                               source_vertices: &[GpuVertex],
-                              triangle_surfaces: Option<&[u32]>| {
+                              triangle_surfaces: Option<&[u32]>,
+                              inline_sources: bool| {
         let mut uploaded = Vec::with_capacity(sources.len());
-        for (mut source, index_range) in sources.into_iter().zip(index_ranges) {
+        for (source_index, (mut source, index_range)) in sources.into_iter().zip(index_ranges).enumerate() {
+            let inline_baked_lightmap = inline_sources
+                && inline_bake_eligible.get(source_index).copied().unwrap_or(false);
             let mut water_plane: Option<(f32, [f32; 2], [f32; 2])> = None;
             if source.water_primary {
                 if is_upward_water_face(&source, source_vertices) {
@@ -1089,6 +1290,16 @@ pub(in crate::renderer) fn build_world(
                 .unwrap_or(0);
             let mut material_uniform =
                 material_uniform(&source, (detail_auto_word & AUTO_DETAIL_ENABLED_BIT) != 0);
+            let additive_bake_enabled = !inline_sources
+                && baked_additive_ranges.contains(&(source.vertices.start, source.vertices.end))
+                && source.baked_sky_additive_stage()
+                && source.additive_companions.iter().all(DrawBatch::baked_sky_additive_stage);
+            if additive_bake_enabled { material_uniform.header[3] |= 1 << 19; }
+            if inline_sources && !inline_baked_lightmap {
+                // No original lightmap receiver exists here; do not sample
+                // cached UV-space sun visibility on this stage.
+                material_uniform.header[3] |= 1 << 18;
+            }
             if let Some(appearance) = surface_key.and_then(|key| ocean_appearances.get(&key)) {
                 material_uniform.ocean_color = appearance.color;
                 material_uniform.ocean_material = appearance.material;
@@ -1107,6 +1318,8 @@ pub(in crate::renderer) fn build_world(
                     || material_buffer.clone(),
                     |companion| {
                         let mut aux = crate::renderer::material_uniform(companion, false);
+                        if additive_bake_enabled { aux.header[3] |= 1 << 19; }
+                        if inline_sources && !inline_baked_lightmap { aux.header[3] |= 1 << 18; }
                         aux.params[3] = source.shader_time_offset;
                         aux.vector_t[3] = source.shader_clamp_time.unwrap_or(0.0);
                         if companion.texture.and_then(|idx| texture_clamp.get(idx)).copied().unwrap_or(false) {
@@ -1122,6 +1335,7 @@ pub(in crate::renderer) fn build_world(
                 source.fog_color_override,
                 source.legacy2_fog_in_stage_safe,
                 source.global_fog_post_eligible,
+                source.legacy_additive_only,
             );
             let fog_buffer = fog_arena.push(device, queue, bytemuck::bytes_of(&fog_uniform));
             // OpenJK Dynamic Glow renders only `glow` stages and temporarily
@@ -1134,9 +1348,10 @@ pub(in crate::renderer) fn build_world(
                 let glow_fog_uniform = weather::fog::surface_fog_uniform(
                     source.fog,
                     source.fog_is_global,
-                    weather::fog::FogColorOverride::Black,
+                    weather::fog::FogColorOverride::GlowReplayBlack,
                     source.legacy2_fog_in_stage_safe,
                     source.global_fog_post_eligible,
+                    source.legacy_additive_only,
                 );
                 fog_arena.push(device, queue, bytemuck::bytes_of(&glow_fog_uniform))
             });
@@ -1373,7 +1588,8 @@ pub(in crate::renderer) fn build_world(
                 legacy_dlight_runs,
                 face_cull_runs: face_cull_runs.into(),
                 face_cull_plane,
-                is_inline_entity: false,
+                is_inline_entity: inline_sources,
+                inline_baked_lightmap,
                 inline_model_slot: u32::MAX,
                 inline_group: u32::MAX,
                 ocean_clipmap,
@@ -1401,12 +1617,16 @@ pub(in crate::renderer) fn build_world(
         uploaded
     };
 
+    // upload_batches takes ownership of coarse_sources. Keep the original
+    // world-only batch boundary for the sun geometry (inline *N follows it).
+    let static_sun_world_batch_count = coarse_sources.len();
     let batch_started = Instant::now();
     let mut coarse_batches = upload_batches(
         coarse_sources,
         coarse_index_ranges,
         &vertices,
         Some(&legacy_dlight_triangle_surfaces),
+        false,
     );
     let mut full_batches = if visibility.is_some() {
         upload_batches(
@@ -1414,6 +1634,7 @@ pub(in crate::renderer) fn build_world(
             full_index_ranges,
             &vertices,
             Some(&legacy_dlight_triangle_surfaces),
+            false,
         )
     } else {
         Vec::new()
@@ -1615,6 +1836,7 @@ pub(in crate::renderer) fn build_world(
         inline_index_ranges.clone(),
         &inline_vertices,
         None,
+        true,
     ));
     let inline_full_start = full_batches.len();
     if visibility.is_some() {
@@ -1623,6 +1845,7 @@ pub(in crate::renderer) fn build_world(
             inline_index_ranges,
             &inline_vertices,
             None,
+            true,
         ));
     }
     // Map every authored inline stage to its *render-instance slot*, not to
@@ -1943,15 +2166,13 @@ pub(in crate::renderer) fn build_world(
         eprintln!("[JKA TINTED GLASS] {} sun triangles exceed raster capacity: sunlight tint disabled for this map", sunlight_glass_count);
     }
 
+    let mut static_light_grid = static_light_grid;
+    if let (Some(grid), Some(sun)) = (static_light_grid.as_mut(), sun) {
+        grid.estimate_entity_sun(sun.direction, sun.color);
+    }
     let static_light_grid_gpu = upload_static_light_grid(device, queue, static_light_grid.as_ref());
     let entity_light_grid = static_light_grid
-        .map(scene::StaticLightGrid::into_classic_entity_grid)
-        .map(|mut grid| {
-            if let Some(sun) = sun {
-                grid.estimate_sun_weights(sun.direction, sun.color);
-            }
-            grid
-        });
+        .map(scene::StaticLightGrid::into_classic_entity_grid);
     let voxel_probe_gi = upload_voxel_probe_gi(device, queue, voxel_probe_gi_data.as_ref());
     if light_count != 0 {
         rverbose!(
@@ -2128,6 +2349,12 @@ pub(in crate::renderer) fn build_world(
         pipeline_variants.insert(
             shader_variant,
             WorldPipelineVariant {
+                encoded_fog_pipelines: super::legacy_blend::fog_pipelines(
+                    device, pipeline_layout, shader, surface_format, msaa_samples,
+                    coarse_batches.iter().map(|b| b.source.pipeline), shader_variant),
+                encoded_world_pipelines: super::legacy_blend::pipelines(
+                    device, pipeline_layout, shader, surface_format, msaa_samples,
+                    coarse_batches.iter().map(|b| b.source.pipeline), shader_variant),
                 ocean_far_pipeline: None,
                 ocean_native_mesh_pipeline: None,
                 ocean_native_mesh_wireframe_pipeline: None,
@@ -2162,6 +2389,11 @@ pub(in crate::renderer) fn build_world(
         .filter(|_| !full_batches.is_empty())
         .map(|vis| visible_batches_by_cluster(&full_batches, vis))
         .unwrap_or_default();
+    let sky_reachable_by_cluster = if full_visible_batches_by_cluster.is_empty() {
+        sky_reachability_by_cluster(&coarse_batches, &coarse_visible_batches_by_cluster)
+    } else {
+        sky_reachability_by_cluster(&full_batches, &full_visible_batches_by_cluster)
+    };
     if let (Some(auto4), false) = (&auto4, coarse_visible_batches_by_cluster.is_empty()) {
         let plan_stats =
             |batches: &[WorldBatch], plans: &[Vec<usize>], by_cluster: Option<&[usize]>| {
@@ -2334,11 +2566,22 @@ pub(in crate::renderer) fn build_world(
         lightmap_sizes: Arc::new(static_ao_lightmap_sizes),
         lightmap_bases: Arc::new(static_ao_lightmap_bases),
     });
-    let static_sun = crate::renderer::lighting::lightmap_sun::StaticSun::new( static_ao_source.as_ref().filter(|_| !source_map).map(|source|
+    // The AO cache must stay world-only. Static sun calibration/receivers use
+    // their own immutable geometry snapshot, including lightmapped *N.
+    let sun_bake_source = static_ao_source.as_ref().map(|source| {
+        let mut out = source.clone();
+        if let Some(extra) = inline_bake_vertices.take() {
+            out.vertices = Arc::new(extra);
+        }
+        out
+    });
+    let static_sun = crate::renderer::lighting::lightmap_sun::StaticSun::new(
+        sun_bake_source.as_ref().filter(|_| !source_map).map(|source|
             crate::renderer::lighting::lightmap_sun::Geometry::new(
-                Arc::clone(&source.vertices), sun_bake_batches.clone(), Arc::clone(&texture_data), &material_debug)));
+                Arc::clone(&source.vertices), sun_bake_batches.clone(), Arc::clone(&texture_data), &material_debug,
+                static_sun_world_batch_count, static_sun_vertex_to_gpu)));
     let sun_bake = crate::renderer::lighting::sun_bake::SunBake::new(
-        static_ao_source.as_ref(), sun, baked_sun_encoding, sun_bake_batches,
+        sun_bake_source.as_ref(), sun, baked_sun_encoding, sun_bake_batches,
         texture_data, Arc::clone(&lightmap_data),
         &legacy_dlight_triangle_surfaces, &legacy_dlight_surfaces,
     );
@@ -2351,6 +2594,7 @@ pub(in crate::renderer) fn build_world(
 
     (
         WorldGpu {
+            weather_anchor,
             collision_mesh: None,
             native_flat_draw: None,
             remap_index_source: Arc::clone(&auto4_source_indices),
@@ -2465,6 +2709,7 @@ pub(in crate::renderer) fn build_world(
             inline_pvs: Default::default(),
             coarse_visible_batches_by_cluster,
             full_visible_batches_by_cluster,
+            sky_reachable_by_cluster,
             auto4_batches,
             auto4_plan_refs,
             auto4_plan_by_cluster,

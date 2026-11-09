@@ -17,7 +17,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
             Reset::Video(ui::VIDEO_ROW_ANTI_ALIASING),
         "r_texturemode" | "r_ext_texture_filter_anisotropic" =>
             Reset::Video(ui::VIDEO_ROW_TEXTURE_FILTER),
-        "r_detailTextures" => Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
+        "r_autoDetailTextures" => Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
         "r_hdr" => Reset::Video(ui::VIDEO_ROW_HDR),
         "r_floatLightmap" => Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP),
         "r_tonemap" => Reset::Video(ui::VIDEO_ROW_TONE_MAPPING),
@@ -86,7 +86,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
     Some(match name {
         name if name.starts_with("r_glass") && row_for_preset_cvar(name).is_some() => S::Glass,
         "r_maxFrameLatency" | "r_dlss" | "r_ext_multisample" | "r_fxaa" | "r_smaa" | "r_taa"
-        | "r_texturemode" | "r_ext_texture_filter_anisotropic" | "r_detailTextures" => S::Display,
+        | "r_texturemode" | "r_ext_texture_filter_anisotropic" | "r_autoDetailTextures" => S::Display,
         "r_distanceCullScale" | "r_subdivisions" | "r_lodCurveError" | "r_patchStitching"
         | "r_lodScale" | "r_lodbias" => S::Geometry,
         "r_ssao" | "r_ssaoResolution" | "r_staticBspAo" | "r_staticBspAoSamples" | "r_staticBspAoResolution"
@@ -169,7 +169,7 @@ fn preview_target_label_for_row(preset: QualityPreset, reset: theme::Reset) -> O
         | Reset::Ocean(OCEAN_SEA_SPRAY)
         | Reset::Ocean(OCEAN_WIND_FOAM) => {
             let cvar = match reset {
-                Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES) => "r_detailTextures",
+                Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES) => "r_autoDetailTextures",
                 Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP) => "r_floatLightmap",
                 Reset::Video(ui::VIDEO_ROW_TONE_MAPPING) => "r_tonemap",
                 Reset::Video(ui::VIDEO_ROW_AUTO_EXPOSURE) => "r_autoExposure",
@@ -374,7 +374,7 @@ mod tests {
         // Getters return "0" for disabled. Using "off" in the preset table
         // incorrectly showed a change and painted the checkbox as a preview.
         for preset in [QualityPreset::Shitter, QualityPreset::Minimal, QualityPreset::Low] {
-            let target = preset_value(preset, "r_detailTextures").unwrap();
+            let target = preset_value(preset, "r_autoDetailTextures").unwrap();
             assert!(cvar_values_match("0", target), "{} highlights unchanged detail textures", preset.label());
         }
     }

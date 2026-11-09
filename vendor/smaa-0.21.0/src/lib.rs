@@ -449,11 +449,13 @@ impl Targets {
             contents: &uniform_data,
         });
 
+        let encoded_formats = [format.remove_srgb_suffix()];
         Self {
             rt_uniforms,
             color_target: device
                 .create_texture(&wgpu::TextureDescriptor {
                     format,
+                    view_formats: if format.is_srgb() { &encoded_formats } else { &[] },
                     ..texture_desc
                 })
                 .create_view(&wgpu::TextureViewDescriptor {

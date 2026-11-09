@@ -219,7 +219,7 @@ impl DynamicModelRenderer {
             let slot = &mut self.model_bundles.slots[slot_index];
             slot.scratch.clear();
             for (draw, indices) in model_runs(
-                self.draws.iter().filter(|draw| draw.alpha_mode == alpha),
+                self.draws.iter().filter(|draw| draw.alpha_mode == alpha && !draw.portal_only),
                 self.dynamic_batch_draws,
             ) {
                 let texture = draw

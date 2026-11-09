@@ -25,9 +25,24 @@ fn transform(@builtin(global_invocation_id) id: vec3<u32>) {
     let dst = pose.params.y + i * pose.params.z;
     let p = rotate_render(vec3<f32>(base[src], base[src + 1u], base[src + 2u]))
         + vec3<f32>(pose.origin.x, pose.origin.z, -pose.origin.y);
-    var n = rotate_render(vec3<f32>(base[src + 3u], base[src + 4u], base[src + 5u]));
-    let length_sq = dot(n, n);
-    if length_sq > 1.0e-20 { n *= 1.0 / sqrt(length_sq); }
+    let packed = vec3<f32>(base[src + 3u], base[src + 4u], base[src + 5u]);
+    var n = packed;
+    if (packed.z > 2048.0) {
+        var axis = vec3<f32>(packed.xy, 1.0-abs(packed.x)-abs(packed.y));
+        if (axis.z < 0.0) {
+            axis = vec3<f32>((1.0-abs(axis.yx))*select(vec2<f32>(-1.0),vec2<f32>(1.0),axis.xy>=vec2<f32>(0.0)),axis.z);
+        }
+        let rotated = rotate_render(axis);
+        let oct = rotated / max(dot(abs(rotated),vec3<f32>(1.0)),1e-20);
+        n = vec3<f32>(oct.xy,packed.z);
+        if (oct.z < 0.0) {
+            n = vec3<f32>((1.0-abs(oct.yx))*select(vec2<f32>(-1.0),vec2<f32>(1.0),oct.xy>=vec2<f32>(0.0)),packed.z);
+        }
+    } else if (packed.z != -1337.0) {
+        n = rotate_render(packed);
+        let length_sq = dot(n, n);
+        if length_sq > 1.0e-20 { n *= 1.0 / sqrt(length_sq); }
+    }
     vertices[dst] = p.x;
     vertices[dst + 1u] = p.y;
     vertices[dst + 2u] = p.z;

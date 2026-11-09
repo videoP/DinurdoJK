@@ -216,6 +216,7 @@ impl App {
                 crate::app::FrontendPage::Main | crate::app::FrontendPage::Play
                 | crate::app::FrontendPage::DeveloperTools),
             mode: self.overlay,
+            video_restart_loading: self.renderer_restart_loading,
             setup_selected: self.setup_selected,
             console_input: self.console_input.clone(),
             console_cursor: self.console_cursor,
@@ -283,6 +284,7 @@ impl App {
                 images
             },
             extension_image_dimensions: Vec::new(), // renderer-owned, preserved in set_ui()
+            extension_image_uvs: Vec::new(),
             crosshair: if in_studio || (self.model_placement.active && self.overlay == OverlayMode::None) {
                 crate::ui::CrosshairSettings { style: 0, ..self.crosshair }
             } else { self.crosshair },
@@ -321,15 +323,13 @@ impl App {
             shader_compile_progress: None, // Render thread owns worker progress.
             shader_compile_stage: None,
             sun_bake_progress: self.sun_bake_progress.and_then(|(completed, stage)| {
-                let just_finished = stage == crate::renderer::SunBakeStage::Ready
-                    && self.sun_bake_ready_at.is_some_and(|at| at.elapsed().as_secs_f32() < 2.5);
-                (just_finished || !matches!(stage, crate::renderer::SunBakeStage::Off | crate::renderer::SunBakeStage::Ready | crate::renderer::SunBakeStage::Fallback | crate::renderer::SunBakeStage::Failed))
+                (!matches!(stage, crate::renderer::SunBakeStage::Off | crate::renderer::SunBakeStage::Ready | crate::renderer::SunBakeStage::Fallback | crate::renderer::SunBakeStage::Failed))
                     .then_some(MapLoadingBar {
                         label: match stage {
-                            crate::renderer::SunBakeStage::Ready => "BAKE: READY",
                             crate::renderer::SunBakeStage::Preparing => "BAKE: GEOMETRY",
                             crate::renderer::SunBakeStage::Tracing => "BAKE: SUN RAYS",
                             crate::renderer::SunBakeStage::Refining => "BAKE: EDGE AA",
+                            crate::renderer::SunBakeStage::SkyVisibility => "BAKE: SKY VISIBILITY",
                             crate::renderer::SunBakeStage::Local => "BAKE: MAP LIGHTS",
                             crate::renderer::SunBakeStage::Uploading => "BAKE: GPU UPLOAD",
                             _ => "BAKE: COMPOSITING",
@@ -1199,8 +1199,14 @@ impl App {
         &self,
         ps: &jka_protocol::server::PlayerState,
     ) -> HudState {
-        let weapon = ps.field_i32("weapon").unwrap_or(0);
-        let ammo_index = if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+        let mut weapon = ps.field_i32("weapon").unwrap_or(0);
+        let jk2 = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
+        if jk2 {
+            // Presented player states carry JKA weapon_t; the native JK2 HUD
+            // (saber = 2, jk2_ammo_index) works in JK2 numbering.
+            weapon = jka_protocol::jk2::presentation::wire_weapon(weapon).unwrap_or(0);
+        }
+        let ammo_index = if jk2 {
             ui::jk2_ammo_index(weapon)
         } else {
             jka_movement::weapon_info(weapon)
@@ -1210,6 +1216,7 @@ impl App {
             .then(|| ps.ammo.get(ammo_index).copied())
             .flatten();
         HudState {
+            gametype: self.game_session.as_ref().map_or(0, |s| s.client_game.gametype()),
             team: ps.persistant[3],
             spectating: matches!(ps.field_i32("pm_type"), Some(4 | 7 | 8)),
             ammo_index,
@@ -1275,6 +1282,7 @@ impl App {
             None
         };
         Some(HudState {
+            gametype: session.client_game.gametype(),
             team: recorder_team,
             health,
             max_health: health.max(100).max(1),

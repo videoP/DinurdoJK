@@ -20,6 +20,27 @@ fn vertex(i: usize) -> GpuVertex {
     }
 }
 
+#[test]
+fn authored_world_inline_cpu_preserves_billboard_offsets_and_bounds() {
+    let mut card=vertex(0);
+    card.position=[10.0,20.0,30.0];
+    card.normal=[-2403.0,2403.0,-1337.0];
+    let pose=poses()[1];
+    let (posed,lo,hi)=posed_inline_vertices(&[card],pose);
+    assert_eq!(posed[0].normal,card.normal);
+    assert_eq!(posed[0].position,pose.transform_point(card.position));
+    let radius=2403.0_f32.hypot(2403.0);
+    for axis in 0..3 {
+        assert_eq!(lo[axis],posed[0].position[axis]-radius);
+        assert_eq!(hi[axis],posed[0].position[axis]+radius);
+    }
+    let pool=rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let mut workers=Vec::new();
+    let worker_bounds=crate::renderer::world::geometry::posed_inline_vertices_workers(&[card],pose,&mut workers,&pool);
+    assert_eq!(bytemuck::cast_slice::<_,u8>(&posed),bytemuck::cast_slice::<_,u8>(&workers));
+    assert_eq!(worker_bounds,(lo,hi));
+}
+
 fn poses() -> [InlineModelInstance; 4] {
     [
         InlineModelInstance::compiled(1),

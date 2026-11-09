@@ -162,6 +162,7 @@ impl SceneCopy {
 
     /// Resolve reversed depth without reading or writing scene color. The color
     /// view only fills the shared bind-group layout and is unused by this shader.
+    /// In particular, the surface swapchain may not support TEXTURE_BINDING.
     pub fn capture_depth(
         &self,
         device: &wgpu::Device,
@@ -186,7 +187,16 @@ impl SceneCopy {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(color),
+                    // The depth-only pipeline never reads binding 0. Use our
+                    // own guaranteed-sampleable color view as its placeholder
+                    // instead of a potentially non-bindable swapchain image.
+                    resource: wgpu::BindingResource::TextureView(if depth_only && self.key.2 == 1 {
+                        &self.color
+                    } else {
+                        // Multisampled input layouts require a multisampled
+                        // placeholder; the MSAA scene target is sampleable.
+                        color
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -364,6 +374,25 @@ mod tests {
                     );
                     drop(mapped);
                     read.unmap();
+                }
+                if samples == 1 {
+                    // Regression: surface-backed targets can be renderable but
+                    // not TEXTURE_BINDING. Depth-only capture must not bind
+                    // the supplied color view, even as an unused input.
+                    let non_sampleable = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Non-sampleable presentation-like color"),
+                        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                        mip_level_count: 1, sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    });
+                    let non_sampleable_view = non_sampleable.create_view(&Default::default());
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    copy.capture_depth(&device, &mut encoder, &non_sampleable_view, &depth);
+                    queue.submit(Some(encoder.finish()));
+                    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                 }
             }
             assert!(

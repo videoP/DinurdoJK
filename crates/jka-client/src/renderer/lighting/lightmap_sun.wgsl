@@ -3,7 +3,8 @@ override ENABLE_CSM_COVERAGE: bool = false;
 // Shared by both world shader families. Static receivers already contain the
 // composed sunlight; only the moving-caster footprint needs a live comparison.
 fn static_sun_lightmap_receiver(input: VertexOut) -> bool {
-    return (lighting_settings.baked_sun_debug_mode.z & 1u) != 0u && input.shell_kind == 0u
+    return (lighting_settings.baked_sun_debug_mode.z & 1u) != 0u
+        && (material_flags_w() & 262144u) == 0u && input.shell_kind == 0u
         && ((material_flags() & (2u | 8388608u | 16777216u)) != 0u || material_tc_gen() == 1u);
 }
 

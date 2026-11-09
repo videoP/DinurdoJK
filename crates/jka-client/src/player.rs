@@ -492,6 +492,14 @@ impl LocalPlayer {
         self.mouse_input = settings;
     }
 
+    /// TaystJK IN_CenterView for the in-process /map authority. Its Pmove
+    /// input accumulator is independent of LiveInput's networked accumulator.
+    /// Only change pitch: the current playerState delta_angles is required to
+    /// make the resulting view horizontal even after forced-view corrections.
+    pub fn center_view(&mut self) {
+        self.input_angles[0] = -(self.state().view().delta_angles[0] as f32) * SHORT_TO_DEGREES;
+    }
+
     pub fn apply_mouse_look_timed(&mut self, mouse: (f64, f64), elapsed: Duration) {
         let (mx, my) = self.mouse_input.scale_delta(mouse, elapsed);
         self.input_angles[1] =
@@ -916,6 +924,27 @@ mod tests {
         let after_angles = player.subframe_view_angles();
         assert_ne!(before_angles[1], after_angles[1]);
         assert_eq!(player.state().view().command_time, before_time);
+    }
+
+    #[test]
+    fn centerview_respects_pmove_delta_after_pitch_clamp() {
+        let (mut player, _) = local();
+        // Force a nonzero delta_angles correction in the vendored OpenJK Pmove.
+        player.apply_mouse_look((0.0, 1000.0));
+        player.update(
+            Duration::from_millis(TICK_MSEC as u64),
+            &HashSet::new(), (0.0, 0.0), UserCmd::default(),
+        ).unwrap();
+        assert_ne!(player.state().view().delta_angles[0], 0);
+        let yaw = player.input_angles[1];
+        player.center_view();
+        assert!((player.subframe_view_angles()[0]).abs() < 0.02);
+        assert_eq!(player.input_angles[1], yaw);
+        player.update(
+            Duration::from_millis(TICK_MSEC as u64),
+            &HashSet::new(), (0.0, 0.0), UserCmd::default(),
+        ).unwrap();
+        assert!(player.view().view_angles[0].abs() < 0.02);
     }
 
     #[test]

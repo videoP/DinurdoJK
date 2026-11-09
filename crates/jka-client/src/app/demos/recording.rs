@@ -46,10 +46,6 @@ pub(in crate::app) struct DemoRecording {
 
 impl App {
     pub(in crate::app) fn start_demo_recording(&mut self, requested_name: Option<&str>) {
-        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
-            self.push_console_line("^3Live JK2 demo recording is not implemented yet.");
-            return;
-        }
         use jka_protocol::session::ConnectionState;
 
         if self.demo_recording.is_some() {
@@ -65,16 +61,37 @@ impl App {
             return;
         }
 
+        let jk2 = self.net.as_ref().and_then(|net| net.session().jk2_version());
+        let extension = jk2.map_or("dm_26".to_owned(), |version| format!("dm_{}", version.protocol()));
+        // JK2MV CL_Record_f chooses the first free demo0000..demo9999 when
+        // no name is supplied. Preserve the existing JKA timestamp default.
+        let auto_name = if jk2.is_some() && requested_name.is_none_or(|name| name.trim().is_empty()) {
+            (0..=9999).find_map(|number| {
+                let stem = format!("demo{number:04}");
+                (!self.game_write_path(format!("demos/{stem}.{extension}")).exists()).then_some(stem)
+            })
+        } else {
+            None
+        };
+        if jk2.is_some() && requested_name.is_none_or(|name| name.trim().is_empty()) && auto_name.is_none() {
+            self.push_console_line("^1No free JK2 demo0000..demo9999 filename.");
+            return;
+        }
         let mut stem = requested_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(|name| name.trim_matches('"').replace('\\', "/"))
-            .unwrap_or_else(|| format!("demo{}", demo_recording_timestamp()));
+            .unwrap_or_else(|| auto_name.unwrap_or_else(|| format!("demo{}", demo_recording_timestamp())));
         if let Some(stripped) = stem.strip_prefix("demos/") {
             stem = stripped.to_owned();
         }
-        if let Some(stripped) = stem.strip_suffix(".dm_26") {
-            stem = stripped.to_owned();
+        if stem.to_ascii_lowercase().ends_with(&format!(".{extension}")) {
+            stem.truncate(stem.len() - extension.len() - 1);
+        } else if jk2.is_some() && (stem.to_ascii_lowercase().ends_with(".dm_15")
+            || stem.to_ascii_lowercase().ends_with(".dm_16"))
+        {
+            self.push_console_line(format!("^1record name has the wrong JK2 protocol extension (expected .{extension})."));
+            return;
         }
         let relative = PathBuf::from(&stem);
         if stem.is_empty()
@@ -91,7 +108,7 @@ impl App {
             return;
         }
 
-        let qpath = PathBuf::from("demos").join(format!("{stem}.dm_26"));
+        let qpath = PathBuf::from("demos").join(format!("{stem}.{extension}"));
         let destination = self.game_write_path(&qpath);
         if let Some(parent) = destination.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
@@ -105,8 +122,14 @@ impl App {
 
         let initial = self.net.as_ref().map(|net| {
             let session = net.session();
-            demo::synthesize_gamestate_payload(session.decoder(), session.reliable_sequence())
-                .map(|payload| (session.server_message_sequence().wrapping_sub(1), payload))
+            // JK2MV CL_Record_f writes the native JK2 wire gamestate, not
+            // the presentation decoder's translated JKA configstrings.
+            let payload = if let Some(wire) = session.jk2_decoder() {
+                jka_protocol::jk2::demo::synthesize_gamestate_payload(wire, session.reliable_sequence())
+            } else {
+                demo::synthesize_gamestate_payload(session.decoder(), session.reliable_sequence())
+            };
+            payload.map(|payload| (session.server_message_sequence().wrapping_sub(1), payload))
         });
         let (sequence, payload) = match initial {
             Some(Ok(initial)) => initial,
@@ -190,10 +213,16 @@ impl App {
         }
         let result = demo::write_end(&mut recording.file).and_then(|()| recording.file.flush());
         match result {
-            Ok(()) => self.push_console_path_line(
-                format!("^2Stopped demo: {}", recording.path.display()),
-                recording.path.clone(),
-            ),
+            Ok(()) => {
+                if recording.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dm_15") || ext.eq_ignore_ascii_case("dm_16")) {
+                    // Rescan the JK2 Demo archive next time it is opened.
+                    self.jk2_demo_browser.reset();
+                }
+                self.push_console_path_line(
+                    format!("^2Stopped demo: {}", recording.path.display()),
+                    recording.path.clone(),
+                );
+            }
             Err(error) => self.push_console_path_line(
                 format!(
                     "^1Error finishing demo {}: {error}",

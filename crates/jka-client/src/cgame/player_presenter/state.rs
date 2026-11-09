@@ -228,6 +228,7 @@ impl PlayerPresenter {
             footstep_trace: false,
             footstep_solids: Vec::new(),
             footsteps: Vec::new(),
+            jk2_footsteps: Vec::new(),
             footstep_rng: 0x2545_f491,
             stage_time_ms: 0,
             stage_view_position: None,
@@ -477,6 +478,11 @@ impl PlayerPresenter {
     /// Footfalls that found ground since the last call.
     pub fn drain_footsteps(&mut self) -> Vec<FootstepImpact> {
         std::mem::take(&mut self.footsteps)
+    }
+
+    /// JK2 footfalls that found a stepping surface since the last call.
+    pub fn drain_jk2_footsteps(&mut self) -> Vec<footsteps::Jk2Footstep> {
+        std::mem::take(&mut self.jk2_footsteps)
     }
 
     /// Force-power effect requests produced since the last call.

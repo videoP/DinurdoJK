@@ -126,9 +126,10 @@ impl InlineTransformModel {
         let mut minimum = [f32::INFINITY; 3];
         let mut maximum = [f32::NEG_INFINITY; 3];
         for vertex in &model.base {
+            let radius = super::geometry::billboard_radius(vertex);
             for axis in 0..3 {
-                minimum[axis] = minimum[axis].min(vertex.position[axis]);
-                maximum[axis] = maximum[axis].max(vertex.position[axis]);
+                minimum[axis] = minimum[axis].min(vertex.position[axis] - radius);
+                maximum[axis] = maximum[axis].max(vertex.position[axis] + radius);
             }
         }
         Some(Self {

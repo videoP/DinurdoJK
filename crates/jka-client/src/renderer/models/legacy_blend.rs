@@ -104,9 +104,70 @@ pub(in crate::renderer) struct LegacyModelBlend {
     sampler: wgpu::Sampler,
     encode: wgpu::RenderPipeline,
     decode: wgpu::RenderPipeline,
+    per_sample: bool,
 }
 
 impl LegacyModelBlend {
+    pub(in crate::renderer) fn resize_world(
+        slot: &mut Option<Self>, device: &wgpu::Device, width: u32, height: u32,
+        samples: u32, format: wgpu::TextureFormat, needed: bool,
+    ) {
+        if !needed { *slot = None; return; }
+        let size = (width, height, samples, format, wgpu::TextureFormat::Rgba16Float);
+        if slot.as_ref().is_none_or(|blend| blend.size != size) {
+            *slot = Some(Self::new_with_samples(device, size, samples > 1));
+        }
+    }
+
+    pub(in crate::renderer) fn color_view(&self) -> &wgpu::TextureView {
+        self.msaa_view.as_ref().unwrap_or(&self.view)
+    }
+
+    pub(in crate::renderer) fn resolve_view(&self) -> Option<&wgpu::TextureView> {
+        self.msaa_view.as_ref().map(|_| &self.view)
+    }
+
+    pub(in crate::renderer) fn encode_world(
+        &self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView,
+    ) {
+        let source = self.bind(device, scene);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("JKA world encode destination"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: self.color_view(), depth_slice: None, resolve_target: self.resolve_view(),
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.encode);
+        pass.set_bind_group(0, &source, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    pub(in crate::renderer) fn decode_world(
+        &self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView, resolve: Option<&wgpu::TextureView>,
+    ) {
+        let source = self.bind(device, if self.per_sample { self.color_view() } else { &self.view });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("JKA world return to linear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color, depth_slice: None, resolve_target: resolve,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.decode);
+        pass.set_bind_group(0, &source, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     // SDR output can still have a 16-bit FLOAT encoded intermediate. Mode 1
     // intentionally tests quantization + bandwidth without dropping transfers.
     pub(in crate::renderer) fn intermediate_format(mode: u8) -> wgpu::TextureFormat {
@@ -115,9 +176,20 @@ impl LegacyModelBlend {
     }
 
     fn new(device: &wgpu::Device, size: (u32, u32, u32, wgpu::TextureFormat, wgpu::TextureFormat)) -> Self {
+        Self::new_with_samples(device, size, false)
+    }
+
+    fn new_with_samples(device: &wgpu::Device, size: (u32, u32, u32, wgpu::TextureFormat, wgpu::TextureFormat), per_sample: bool) -> Self {
+        let mut image_entry = texture_entry(0);
+        if per_sample {
+            image_entry.ty = wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2, multisampled: true,
+            };
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("legacy model colour transfer"),
-            entries: &[texture_entry(0), sampler_entry(1)],
+            entries: &[image_entry, sampler_entry(1)],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -126,7 +198,7 @@ impl LegacyModelBlend {
                 format!(
                     "{}\n{}",
                     include_str!("../../legacy_model_blend.wgsl"),
-                    TRANSFER
+                    if per_sample { TRANSFER_MSAA } else { TRANSFER }
                 )
                 .into(),
             ),
@@ -207,6 +279,7 @@ impl LegacyModelBlend {
             sampler,
             encode,
             decode,
+            per_sample,
         }
     }
 
@@ -484,6 +557,25 @@ impl DynamicModelRenderer {
         pass.draw(0..3, 0..1);
     }
 }
+
+// Preserve per-sample color/depth correspondence across world stage chains.
+// Resolving before a transfer would mix uncovered samples into subsequent
+// depth-equal/alpha-tested draws, leaving seams along ordinary BSP triangles.
+const TRANSFER_MSAA: &str = r#"
+@group(0) @binding(0) var image: texture_multisampled_2d<f32>;
+@vertex fn vertex(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+    let p = array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
+    return vec4(p[i],0.0,1.0);
+}
+@fragment fn encode(@builtin(position) p:vec4<f32>, @builtin(sample_index) sample:u32) -> @location(0) vec4<f32> {
+    let c = textureLoad(image,vec2<i32>(p.xy),i32(sample));
+    return vec4(legacy_effect_encode(c.rgb),c.a);
+}
+@fragment fn decode(@builtin(position) p:vec4<f32>, @builtin(sample_index) sample:u32) -> @location(0) vec4<f32> {
+    let c = textureLoad(image,vec2<i32>(p.xy),i32(sample));
+    return vec4(legacy_effect_decode(c.rgb),c.a);
+}
+"#;
 
 const TRANSFER: &str = r#"
 @group(0) @binding(0) var image: texture_2d<f32>;

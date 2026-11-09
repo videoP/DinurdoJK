@@ -96,11 +96,16 @@ const MATERIAL_FLAG_MASK_TEXTURE_ALPHA: u32 = 1073741824;
 /// MATERIAL_KEY_TC_GEN value that leaves tcGen read from the uniform.
 const MATERIAL_TC_GEN_DYNAMIC: u32 = u32::MAX;
 const MATERIAL_FLAGS_W_DETAIL: u32 = 2;
-const MATERIAL_FLAGS_W_PLANAR: u32 = 4;
+const MATERIAL_FLAGS_W_PLANAR: u32 = 4 | (1 << 6) | (1 << 7);
 const MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP: u32 = 65536;
 /// Promoted glass primary stage. Only `fs_main` / `fs_main_legacy_fog` shade it,
 /// so it is carried in the raw key for program selection; `for_variant` drops it.
 pub(in crate::renderer) const MATERIAL_FLAGS_W_GLASS: u32 = 1 << 17;
+/// Cached sun-visibility gain on static non-lightmapped additive BSP stages.
+pub(in crate::renderer) const MATERIAL_FLAGS_W_BAKED_ADDITIVE: u32 = 1 << 19;
+/// Prepared post-lightmap environmental overlay; uses composed sky gain only.
+/// Keep separate from foliage wind (bit 18) and baked additive gain (bit 19).
+pub(in crate::renderer) const MATERIAL_FLAGS_W_SKY_OVERLAY: u32 = 1 << 20;
 
 /// TaystJK-style per-material fragment specialization (r_fragmentShaderMode 1).
 ///
@@ -132,8 +137,8 @@ impl MaterialFragmentKey {
         Self {
             flags: header[2] & !MATERIAL_FLAGS_UNREAD,
             flags_mask: !MATERIAL_FLAGS_UNREAD,
-            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | crate::foliage::MATERIAL_FLAG),
-            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | crate::foliage::MATERIAL_FLAG,
+            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG),
+            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG,
             tc_gen: header[0],
             alpha_func: if alpha_cutoff > 0.0 {
                 2
@@ -193,7 +198,7 @@ impl MaterialFragmentKey {
             | MATERIAL_FLAGS_VERTEX_COLOR
             | MATERIAL_FLAGS_WAVES
             | MATERIAL_FLAG_LEGACY_SRGB;
-        let mut keep_w = crate::foliage::MATERIAL_FLAG;
+        let mut keep_w = crate::foliage::MATERIAL_FLAG | MATERIAL_FLAGS_W_BAKED_ADDITIVE;
         let mut fix_tc_gen = false;
         if alpha_test {
             keep |= MATERIAL_FLAG_MASK_TEXTURE_ALPHA;
@@ -205,6 +210,9 @@ impl MaterialFragmentKey {
             keep |= MATERIAL_FLAGS_PLANAR;
             keep_w |= MATERIAL_FLAGS_W_PLANAR;
             fix_tc_gen = true;
+        }
+        if variant.baked_sun_relight {
+            keep_w |= MATERIAL_FLAGS_W_SKY_OVERLAY;
         }
         if variant.classic_render_flags || variant.baked_sun_relight {
             keep |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP
@@ -548,5 +556,33 @@ impl WorldShaderVariantKey {
         } else {
             enabled.join("+")
         }
+    }
+}
+
+#[cfg(test)]
+mod baked_sky_flag_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_relighting_is_not_foliage_wind() {
+        let overlay = MATERIAL_FLAGS_W_SKY_OVERLAY;
+        let foliage = crate::foliage::MATERIAL_FLAG;
+        assert_eq!(overlay & foliage, 0, "sky overlay must never enable foliage wind");
+        assert_eq!(overlay & MATERIAL_FLAGS_W_BAKED_ADDITIVE, 0,
+            "sky overlay must never enable baked additive gain");
+        let material = MaterialFragmentKey::from_material([0, 0, 0, overlay], 0.0);
+        assert_eq!(material.flags_w & overlay, overlay);
+        assert_eq!(material.flags_w & foliage, 0);
+
+        let baked = WorldShaderVariantKey {
+            baked_sun_relight: true, ..Default::default()
+        };
+        assert_eq!(material.for_variant(baked, false).flags_w & overlay, overlay);
+        assert_eq!(material.for_variant(WorldShaderVariantKey::default(), false).flags_w & overlay, 0);
+
+        // Original foliage surfaces retain their own independent wind flag.
+        let wind = MaterialFragmentKey::from_material([0, 0, 0, foliage], 0.0);
+        assert_eq!(wind.flags_w & foliage, foliage);
+        assert_eq!(wind.flags_w & overlay, 0);
     }
 }

@@ -682,6 +682,14 @@ impl PlayerPresenter {
         self.rt_shadow_casters_enabled = enabled;
     }
 
+    /// Listener-eye CONTENTS_WATER test, using the same JKA collision BSP as
+    /// footsteps/breath instead of guessing from a rendered water plane.
+    pub fn audio_listener_in_bsp_water(&mut self, position: [f32; 3]) -> bool {
+        use jka_movement::{TraceWorld, ENTITY_NONE};
+        self.collision_world.as_mut().is_some_and(|world|
+            world.point_contents(position, ENTITY_NONE) & 0x4 != 0)
+    }
+
     /// Install the current map collision world for OpenJK-style blob traces.
     /// This is map-scoped and must not be rebound every frame.
     pub fn set_collision_world(&mut self, world: Option<CollisionWorld>) {
@@ -724,7 +732,7 @@ impl PlayerPresenter {
             material_trace: None,
             entity_num: u16::MAX,
             wireframe_class: DynamicWireframeClass::Effect,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             vertices: Arc::new(Vec::new()),
             indices: Arc::new(Vec::new()),
             lighting_origin: None,

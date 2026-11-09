@@ -36,7 +36,7 @@ impl App {
         // Password-required browser joins should keep their early map hint
         // after the dialog, too. A direct hostname /connect stays unchanged.
         if prompt.target.starts_with("jk2://") {
-            self.connect_to_server(&prompt.target);
+            self.connect_to_server_with_manual_password(&prompt.target, None);
             return;
         }
         let hint = prompt
@@ -44,7 +44,7 @@ impl App {
             .parse::<std::net::SocketAddr>()
             .ok()
             .and_then(|address| self.browser_map_hint(address));
-        self.connect_to_server_with_hint(
+        self.connect_to_server_with_manual_password(
             &prompt.target,
             hint.as_ref().map(|(map, game)| (map.as_str(), game.as_str())),
         );

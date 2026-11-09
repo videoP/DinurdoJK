@@ -1,6 +1,6 @@
 //! Materials.
 use crate::scene::{
-    bsp_fog_params, material_legacy2_in_stage_safe, materials, stage_fog_color_override, AlphaGen,
+    bsp_fog_params, material_legacy2_in_stage_safe, material_legacy_additive_only, materials, stage_fog_color_override, AlphaGen,
     AssetSearchPath, BTreeMap, BlendFactor, BlendMode, Bsp, CullMode, DrawBatch, DrawClass, MaterialDebugEntry,
     MaterialDebugInfo, MaterialStage, PipelineKey, Range, RgbGen, Shader, StageTexture,
     SurfaceMaterial, TcGen, TcMod, Textures, GpuVertex,
@@ -114,7 +114,7 @@ pub(in crate::scene) fn opaque_composite_before_clouds(material: &SurfaceMateria
         || material.water
         || material.planar_reflection
         || material.authored_translucent
-        || material.auto_sprite2
+        || (material.auto_sprite || material.auto_sprite2)
         // Explicit translucent sort classes start above the opaque/decal range.
         || material.sort.is_some_and(|sort| !sort.is_finite() || sort >= 5.0)
     {
@@ -134,7 +134,7 @@ fn late_sorted_depth_seed(material: &SurfaceMaterial) -> bool {
     if material.sky
         || material.water
         || material.planar_reflection
-        || material.auto_sprite2
+        || (material.auto_sprite || material.auto_sprite2)
         || material.glass_promotion
         || !material.sort.is_some_and(|sort| sort.is_finite() && sort >= 5.0)
     {
@@ -310,7 +310,9 @@ pub(in crate::scene) fn stage_pipeline(
     PipelineKey {
         legacy_srgb_three_stage: false,
         additive_fusion_count: 0,
+        auto_sprite: material.auto_sprite,
         auto_sprite2: material.auto_sprite2,
+        deform_move: material.move_deform.is_some(),
         sky_outer: material.sky && material.skybox.is_some()
             && !matches!(stage.tc_gen, TcGen::SkyCloud(_)),
         class: if material.sky {
@@ -319,7 +321,10 @@ pub(in crate::scene) fn stage_pipeline(
             stage_class(stage)
         },
         blend: blend_for(stage),
-        cull: if material.sky {
+        cull: if material.sky || material.auto_sprite {
+            // TaystJK rebuilds autoSprite quads facing the active view. The
+            // authored surface's original triangle winding must not hide a
+            // fully view-facing reconstructed quad after BSP expansion.
             CullMode::None
         } else {
             effective_world_cull(material)
@@ -328,9 +333,10 @@ pub(in crate::scene) fn stage_pipeline(
         // OpenJK's default opaque first stage writes depth. Treat GL_ONE GL_ZERO
         // as that same opaque replacement semantic; later genuinely blended
         // stages still need an explicit depthWrite.
-        depth_write: stage.depth_write
-            || (first && (stage.blend.is_none() || stage_is_opaque_replacement(stage))),
+        depth_write: !stage.depth_test_disabled && (stage.depth_write
+            || (first && (stage.blend.is_none() || stage_is_opaque_replacement(stage)))),
         depth_equal: stage.depth_equal,
+        depth_test_disabled: stage.depth_test_disabled,
     }
 }
 
@@ -434,6 +440,7 @@ pub(in crate::scene) fn stage_batch(
         glass_reflectance: material.glass_reflectance,
         opaque_composite_before_clouds: opaque_composite_before_clouds(material),
         lit_overlay: false,
+        baked_sky_overlay: false,
         late_depth_seed: late_sorted_depth_seed(material),
         late_sorted_material: material.sort.is_some_and(|sort| sort >= 5.0),
         authored_sort_priority: effective_material_sort(material),
@@ -458,6 +465,7 @@ pub(in crate::scene) fn stage_batch(
         specular_reflectance: stage.enhancements.specular_reflectance,
         parallax_depth: stage.enhancements.parallax_depth,
         lightmap,
+        lightstyle_slot: 0,
         modulate_lightmap: false,
         reverse_lightmap_fold_role: 0,
         reverse_lightmap_fold_detail: false,
@@ -478,10 +486,13 @@ pub(in crate::scene) fn stage_batch(
         alpha_test_texture_only: false,
         shader_time_offset: 0.0,
         shader_clamp_time: material.clamp_time,
+        move_deform: material.move_deform,
         no_picmip: material.no_picmip,
         authored_glow: stage.glow,
         fog,
         fog_is_global,
+        legacy_fog_pass: !material.no_fog
+            && (effective_material_sort(material) <= 5 * 1024 || material.fog_volume),
         fog_color_override: stage_fog_color_override(stage, first),
         // A sky's stages are cloud layers drawn as extra batches; they must not
         // change the fog eligibility the sky had when it was a single batch.
@@ -490,7 +501,9 @@ pub(in crate::scene) fn stage_batch(
         } else {
             &material.stages
         }),
-        global_fog_post_eligible: !material.sky
+        legacy_additive_only: !material.sky && material_legacy_additive_only(&material.stages),
+        global_fog_post_eligible: !material.sky && !material.no_fog
+            && (effective_material_sort(material) <= 5 * 1024 || material.fog_volume)
             && material
                 .stages
                 .iter()
@@ -1077,6 +1090,7 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
         && matches!(lightmap_stage.tc_gen, TcGen::Lightmap)
         && lightmap_stage.tc_mods.is_empty()
         && !lightmap_stage.depth_equal
+        && !lightmap_stage.depth_test_disabled
         && matches!(material_stage.texture, StageTexture::Image(_))
         && material_stage.blend
             == Some(materials::BlendFunc {
@@ -1090,6 +1104,7 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
         && matches!(material_stage.alpha_gen, AlphaGen::Identity)
         && matches!(material_stage.tc_gen, TcGen::Base)
         && !material_stage.depth_equal
+        && !material_stage.depth_test_disabled
 }
 
 /// OpenJK `CollapseMultitexture` explicitly permits the companion modulation
@@ -1118,7 +1133,7 @@ pub(in crate::scene) fn legacy_srgb_three_stage_overlay(
     if stages.len() < 3
         || !material.explicit
         || material.sky || material.water || material.planar_reflection
-        || material.offset || material.auto_sprite2 || material.water_deformed
+        || material.offset || (material.auto_sprite || material.auto_sprite2) || material.water_deformed
         || !material.surface_sprite_effects.is_empty()
         || material.authored_detail || material.sort.is_some()
         || fog[3] > 0.001
@@ -1127,7 +1142,7 @@ pub(in crate::scene) fn legacy_srgb_three_stage_overlay(
         // independent, retaining their original animation, blending and glow.
         || stages[..3].iter().any(|stage| stage.animation.is_some()
             || stage.glow || has_stage_enhancements(stage)
-            || !stage.tc_mods.is_empty() || stage.depth_equal
+            || !stage.tc_mods.is_empty() || stage.depth_equal || stage.depth_test_disabled
             || stage.alpha_cutoff != 0.0)
         || stages[0].depth_write || stages[1].depth_write
         || stages[2].depth_write
@@ -1211,6 +1226,7 @@ pub(crate) fn append_sky_batches(
         tc_mods: Vec::new(),
         depth_write: true,
         depth_equal: false,
+            depth_test_disabled: false,
             glow: false,
     };
     out.push(stage_batch(
@@ -1310,7 +1326,10 @@ fn additive_same_tcgen(a: &DrawBatch, b: &DrawBatch) -> bool {
 fn additive_candidate(b: &DrawBatch) -> bool {
     b.pipeline.blend == BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
         && b.pipeline.class == DrawClass::Transparent
-        && !b.pipeline.depth_write && !b.pipeline.offset && !b.pipeline.auto_sprite2
+        && !b.pipeline.depth_write && !b.pipeline.offset && !(b.pipeline.auto_sprite || b.pipeline.auto_sprite2)
+        // The move entry emits VertexOut; fused additive shaders require their
+        // own vertex interface carrying every companion's transformed UVs.
+        && !b.pipeline.deform_move
         && !b.pipeline.legacy_srgb_three_stage
         // Never re-fuse an already fused primary: that would overwrite its
         // companions rather than extend the authored stage sequence.
@@ -1342,7 +1361,9 @@ pub(crate) fn additive_fusion_rejection_reason(a: &DrawBatch, b: &DrawBatch) -> 
     if a.vertices != b.vertices || a.bsp_shader_index != b.bsp_shader_index {
         return Some("different BSP surface geometry or shader");
     }
-    if a.pipeline.cull != b.pipeline.cull || a.pipeline.depth_equal != b.pipeline.depth_equal {
+    if a.pipeline.cull != b.pipeline.cull || a.pipeline.depth_equal != b.pipeline.depth_equal
+        || a.pipeline.depth_test_disabled != b.pipeline.depth_test_disabled
+    {
         return Some("different culling or depth-test state");
     }
     if a.fog_color_override != b.fog_color_override
@@ -1394,6 +1415,94 @@ pub(in crate::scene) fn fuse_prepared_additive_batches(source: &[DrawBatch]) -> 
     fuse_adjacent_additive_batches(&mut draws, 0);
     let saved = source.len() - draws.len();
     (draws, saved)
+}
+
+/// Safe, opt-in-by-content part of TaystJK FinishShader's lightstyle duplication:
+/// when the BSP stores *another normal-style* lightmap for an implicit diffuse
+/// material, render diffuse * that lightmap as a GL_ONE GL_ONE sibling.
+///
+/// LS_NORMAL (style 0) is static and does not require a server lightstyle
+/// animation or color table. Nonzero style IDs must not be flattened to white:
+/// they depend on CS_LIGHT_STYLES and are deliberately excluded until that
+/// server-time driven modulation is implemented.
+pub(in crate::scene) fn static_extra_lightstyle_eligible(
+    material: &SurfaceMaterial,
+    batch: &jka_assets::bsp::DrawBatch,
+    slot: usize,
+    vertex_lit: bool,
+) -> bool {
+    (1..4).contains(&slot)
+        && !vertex_lit
+        && batch.lightmaps[0] >= 0
+        && batch.lightmap_styles[0] == 0 // first lightmap must be static
+        && batch.lightmaps[slot] >= 0
+        && batch.lightmap_styles[slot] == 0 // LS_NORMAL, no animated color
+        && !material.explicit
+        && !material.hidden && !material.sky && !material.water
+        && !material.planar_reflection && !material.authored_translucent
+        && !material.glass_promotion && !material.auto_sprite && !material.auto_sprite2
+        && material.move_deform.is_none()
+        && material.stages.len() == 1
+        && material.stages[0].animation.is_none()
+        && !has_stage_enhancements(&material.stages[0])
+        && matches!(material.stages[0].texture, StageTexture::Image(_))
+        && matches!(material.stages[0].tc_gen, TcGen::Base)
+        && matches!(material.stages[0].rgb_gen, RgbGen::Identity | RgbGen::IdentityLighting)
+        && matches!(material.stages[0].alpha_gen, AlphaGen::Identity)
+        && material.stages[0].color == [1.0; 3]
+        && material.stages[0].opacity == 1.0
+        && material.stages[0].tc_mods.is_empty()
+        && material.stages[0].alpha_cutoff == 0.0
+        && !material.stages[0].depth_equal
+        && !material.stages[0].depth_test_disabled
+        && !material.stages[0].glow
+        && material.stages[0].blend.is_none()
+}
+
+/// The extra lightmap is a sibling of the existing opaque base pass, not a
+/// replacement for the main shader. It uses the normal base+lightmap shader
+/// variant, with additive blending and *no* depth write, glow, extra lighting,
+/// or automatic detail. Normal single-style materials do not enter this path.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::scene) fn append_static_lightstyle_batch(
+    out: &mut Vec<DrawBatch>,
+    material: &SurfaceMaterial,
+    shader: usize,
+    material_debug_index: Option<usize>,
+    slot: u8,
+    vertices: Range<u32>,
+    lightmap: Option<usize>,
+    pvs_signature: &[u64],
+    area_signature: [u64; 4],
+    fog: [f32; 4],
+    fog_is_global: bool,
+) {
+    let Some(lightmap) = lightmap else { return };
+    let Some(source) = material.stages.first() else { return };
+    let mut stage = source.clone();
+    stage.blend = Some(materials::BlendFunc { src: BlendFactor::One, dst: BlendFactor::One });
+    stage.depth_write = false;
+    stage.depth_equal = false;
+    stage.glow = false;
+    let mut draw = stage_batch(
+        material, &stage, false, false, vertices, Some(shader),
+        material_debug_index, Some(lightmap), pvs_signature, area_signature,
+        fog, fog_is_global,
+    );
+    draw.lightstyle_slot = slot;
+    draw.modulate_lightmap = true;
+    draw.detail_texture_eligible = false;
+    draw.dlight_in_lightmap_stage = false;
+    draw.thermal_source_stage = false;
+    draw.thermal_emission = 0;
+    draw.authored_glow = false;
+    draw.global_fog_post_eligible = false;
+    draw.opaque_composite_before_clouds = true;
+    // Additional style contribution must never seed depth and must remain
+    // translucent/additive so extra lighting cannot be counted as geometry.
+    debug_assert_eq!(draw.pipeline.class, DrawClass::Transparent);
+    debug_assert!(!draw.pipeline.depth_write);
+    out.push(draw);
 }
 
 pub(in crate::scene) fn append_material_batches(
@@ -1456,6 +1565,22 @@ pub(in crate::scene) fn append_material_batches(
     }
 }
 
+/// An authored $lightmap has already lit the opaque base. Environmental
+/// caustic and fade passes after it do not automatically inherit that light.
+/// Keep this strictly stage-order/semantics based so ordinary emissive shader
+/// overlays and standalone additive effects are not reclassified by name.
+fn baked_sky_overlay_stage(lightmap_index: Option<usize>, index: usize, stage: &MaterialStage) -> bool {
+    lightmap_index.is_some_and(|lm| index > lm)
+        && matches!(stage.blend, Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::One | BlendFactor::OneMinusSrcAlpha,
+        }))
+        && matches!(stage.rgb_gen, RgbGen::Wave(_) | RgbGen::IdentityLighting | RgbGen::Identity | RgbGen::Const)
+        // A wave-driven caustic can use `glow` for bloom, but a fixed authored
+        // glow is self-emitting and must not be reduced with daylight.
+        && (!stage.glow || matches!(stage.rgb_gen, RgbGen::Wave(_)))
+}
+
 pub(in crate::scene) fn append_material_batches_unflagged(
     out: &mut Vec<DrawBatch>,
     material: &SurfaceMaterial,
@@ -1490,6 +1615,10 @@ pub(in crate::scene) fn append_material_batches_unflagged(
     if stages.is_empty() {
         return;
     }
+    let lightmap_stage = lightmap.and_then(|_| stages.iter().position(|s| {
+        matches!(s.texture, StageTexture::Lightmap)
+    }));
+
 
     // Keep the overwhelmingly common implicit BSP material in one draw call.
     if !material.explicit && !vertex_lit {
@@ -1586,8 +1715,8 @@ pub(in crate::scene) fn append_material_batches_unflagged(
         // draw, but an arbitrary fourth or later stage must still execute.
         // This generalizes the existing three-stage fast path without changing
         // any unsupported additive/animated/depth-equal/glow passes.
-        for stage in stages.iter().skip(if fused { 3 } else { 2 }) {
-            out.push(stage_batch(
+        for (stage_index, stage) in stages.iter().enumerate().skip(if fused { 3 } else { 2 }) {
+            let mut batch = stage_batch(
                 material,
                 stage,
                 false,
@@ -1600,7 +1729,9 @@ pub(in crate::scene) fn append_material_batches_unflagged(
                 area_signature,
                 fog,
                 fog_is_global,
-            ));
+            );
+            batch.baked_sky_overlay = baked_sky_overlay_stage(lightmap_stage, stage_index, stage);
+            out.push(batch);
         }
         return;
     }
@@ -1633,6 +1764,7 @@ pub(in crate::scene) fn append_material_batches_unflagged(
             fog,
             fog_is_global,
         );
+        batch.baked_sky_overlay = baked_sky_overlay_stage(lightmap_stage, stage_index, stage);
         if reverse_foldable && stage_index < 2 {
             batch.reverse_lightmap_fold_role = (stage_index + 1) as u8;
             if stage_index == 1 {
@@ -1662,8 +1794,134 @@ mod cloud_composite_order_tests {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
+            depth_test_disabled: false,
             glow: false,
         }
+    }
+
+    #[test]
+    fn baked_sky_overlay_follows_explicit_lightmap_not_alpha_alone() {
+        use jka_assets::shader::{Wave, WaveFunc};
+        let mut caustic = base_stage();
+        caustic.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        caustic.rgb_gen = RgbGen::Wave(Wave {
+            func: WaveFunc::Sin, base: 1.0, amplitude: 0.15,
+            phase: 0.0, frequency: 0.8,
+        });
+        // terrain_wetsand's caustic stages 2-4, including its authored glow
+        assert!(baked_sky_overlay_stage(Some(1), 2, &caustic));
+        caustic.glow = true;
+        assert!(baked_sky_overlay_stage(Some(1), 4, &caustic));
+        assert!(!baked_sky_overlay_stage(Some(4), 2, &caustic));
+        // waterfall is additive without an authored $lightmap and needs a
+        // different receiver strategy; this patch must not guess a gain there.
+        assert!(!baked_sky_overlay_stage(None, 2, &caustic));
+        let mut depthfade = base_stage();
+        depthfade.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha,
+        });
+        depthfade.rgb_gen = RgbGen::IdentityLighting;
+        assert!(baked_sky_overlay_stage(Some(1), 5, &depthfade));
+        depthfade.rgb_gen = RgbGen::Identity;
+        assert!(baked_sky_overlay_stage(Some(1), 5, &depthfade));
+        depthfade.rgb_gen = RgbGen::Const;
+        depthfade.glow = true;
+        assert!(!baked_sky_overlay_stage(Some(1), 5, &depthfade));
+        depthfade.glow = false;
+        assert!(baked_sky_overlay_stage(Some(1), 5, &depthfade));
+    }
+
+    // This is the static, implicit-material subset of TaystJK's lightstyles.
+    // A slot must carry its own lightmap UVs and page. Server-driven style IDs
+    // are excluded rather than being silently interpreted as a constant color.
+    fn test_style_surface() -> jka_assets::bsp::DrawBatch {
+        jka_assets::bsp::DrawBatch {
+            surface: 0,
+            shader: 0,
+            lightmaps: [4, 9, -1, -1],
+            lightmap_styles: [0, 0, 255, 255],
+            indices: 0..3,
+        }
+    }
+
+    fn test_style_material() -> SurfaceMaterial {
+        SurfaceMaterial {
+            stages: vec![MaterialStage {
+                texture: StageTexture::Image(7),
+                ..base_stage()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn additional_static_lightmap_is_content_gated() {
+        let material = test_style_material();
+        let mut surface = test_style_surface();
+        assert!(static_extra_lightstyle_eligible(&material, &surface, 1, false));
+        assert!(!static_extra_lightstyle_eligible(&material, &surface, 0, false));
+        assert!(!static_extra_lightstyle_eligible(&material, &surface, 2, false));
+        assert!(!static_extra_lightstyle_eligible(&material, &surface, 1, true));
+        surface.lightmap_styles[1] = 1; // server animated style
+        assert!(!static_extra_lightstyle_eligible(&material, &surface, 1, false));
+        surface.lightmap_styles[1] = 0;
+        surface.lightmaps[0] = -1; // no valid primary depth/lightmap stage
+        assert!(!static_extra_lightstyle_eligible(&material, &surface, 1, false));
+        surface.lightmaps[0] = 4;
+        let explicit = SurfaceMaterial { explicit: true, ..material.clone() };
+        assert!(!static_extra_lightstyle_eligible(&explicit, &surface, 1, false));
+        let mut alpha = material.clone();
+        alpha.stages[0].opacity = 0.5;
+        assert!(!static_extra_lightstyle_eligible(&alpha, &surface, 1, false));
+        let mut tinted = material.clone();
+        tinted.stages[0].rgb_gen = RgbGen::Vertex;
+        assert!(!static_extra_lightstyle_eligible(&tinted, &surface, 1, false));
+    }
+
+    #[test]
+    fn additional_static_lightmap_is_additive_and_cannot_write_depth() {
+        let material = test_style_material();
+        let mut original = Vec::new();
+        append_material_batches(
+            &mut original, &material, 0, None, false, 0..3, Some(4),
+            &[], [0; 4], [0.0; 4], false,
+        );
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].lightstyle_slot, 0);
+        assert!(original[0].modulate_lightmap);
+        assert!(original[0].pipeline.depth_write);
+
+        let mut extra = Vec::new();
+        append_static_lightstyle_batch(
+            &mut extra, &material, 0, None, 1, 3..6, Some(9),
+            &[], [0; 4], [0.0; 4], false,
+        );
+        assert_eq!(extra.len(), 1);
+        let style = &extra[0];
+        assert_eq!(style.lightstyle_slot, 1);
+        assert_eq!(style.lightmap, Some(9));
+        assert_eq!(style.vertices, 3..6);
+        assert_eq!(style.pipeline.class, DrawClass::Transparent);
+        assert_eq!(style.pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+        assert!(!style.pipeline.depth_write);
+        assert!(style.modulate_lightmap);
+        assert!(!style.dlight_in_lightmap_stage);
+        assert!(!style.detail_texture_eligible);
+        assert!(!style.thermal_source_stage);
+        assert!(!style.competitive_primary_stage);
+    }
+
+    #[test]
+    fn depthfunc_disable_is_not_an_opaque_depth_seed() {
+        let mut stage = base_stage();
+        stage.depth_test_disabled = true;
+        stage.depth_write = true;
+        let material = SurfaceMaterial::default();
+        let key = stage_pipeline(&material, &stage, true);
+        assert!(key.depth_test_disabled);
+        assert!(!key.depth_write);
     }
 
     #[test]
@@ -1765,6 +2023,53 @@ mod cloud_composite_order_tests {
         // The recovery is not applied when there is no dependent depth-equal pass.
         recover_impossible_masked_depth_seed(&mut batches[0..1], &[vertex; 3]);
         assert!(!batches[0].alpha_test_texture_only);
+    }
+
+    #[test]
+    fn moving_additive_stages_keep_the_move_vertex_interface() {
+        let mut stage = base_stage();
+        stage.texture = StageTexture::Image(14);
+        stage.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        let material = SurfaceMaterial {
+            explicit: true,
+            move_deform: Some(jka_assets::shader::MoveDeform {
+                vector: [10.0, 0.0, 0.0],
+                wave: jka_assets::shader::Wave {
+                    func: jka_assets::shader::WaveFunc::Sin,
+                    base: 0.0, amplitude: 1.0, phase: 0.0, frequency: 1.0,
+                },
+            }),
+            stages: vec![stage.clone(), stage],
+            ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..6, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 2);
+        assert!(draws.iter().all(|draw| draw.pipeline.deform_move
+            && draw.pipeline.additive_fusion_count == 0 && draw.additive_companions.is_empty()));
+    }
+
+    #[test]
+    fn additive_stages_with_different_depth_tests_remain_separate() {
+        let mut first = base_stage();
+        first.texture = StageTexture::Image(14);
+        first.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        let mut second = first.clone();
+        second.depth_test_disabled = true;
+        let material = SurfaceMaterial {
+            explicit: true, stages: vec![first, second], ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..6, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 2);
+        assert!(!draws[0].pipeline.depth_test_disabled);
+        assert!(draws[1].pipeline.depth_test_disabled);
     }
 
     #[test]

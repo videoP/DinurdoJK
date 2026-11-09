@@ -675,7 +675,7 @@ impl MapEditor {
             material_trace: None,
             entity_num: u16::MAX,
             wireframe_class: DynamicWireframeClass::Entity,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             vertices: Arc::new(vertices),
             indices: Arc::new(indices),
             lighting_origin: None,

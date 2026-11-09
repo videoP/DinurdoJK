@@ -84,7 +84,8 @@ impl BspModelLod {
                 // billboards encode their pivot in spare vertex attributes;
                 // changing triangle topology would break that encoding.
                 if source.pipeline.class != DrawClass::Opaque
-                    || source.pipeline.auto_sprite2
+                    || source.pipeline.deform_move
+                    || (source.pipeline.auto_sprite || source.pipeline.auto_sprite2)
                     || !matches!(source.tc_gen, TcGen::Base)
                     || source.water || source.water_deformed
                     || source.planar_reflection || source.authored_environment_composite

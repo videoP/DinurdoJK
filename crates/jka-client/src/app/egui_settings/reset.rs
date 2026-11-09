@@ -19,7 +19,7 @@ use crate::app::egui_settings::{
     PHYS_JIGGLE_STOMACH_STIFFNESS, PHYS_JIGGLE_STOMACH_DAMPING,
     PHYS_MAX_SUBSTEPS,
     PHYS_PLAYER_PUSH, PHYS_PROPS, PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME,
-    PHYS_RAGDOLL_MAX, PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS,
+    PHYS_RAGDOLL_MAX, PHYS_RAGDOLL_SELF_COLLISION, PHYS_RAGDOLL_JOINT_MODEL, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS,
     PHYS_WEAPON_IMPULSES,
 };
 
@@ -592,6 +592,12 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn reset_physics_field(&mut self, field: u8) {
+        // Use the same registered setter as the console/menu so mode switches
+        // invalidate ragdolls and refresh their physical joint definitions.
+        if field == PHYS_RAGDOLL_JOINT_MODEL {
+            let _ = self.set_console_cvar("r_ragdollJointModel", &VideoSettings::default().ragdoll_joint_model.to_string());
+            return;
+        }
         let defaults = VideoSettings::default();
         match field {
             PHYS_CLIENT_ENABLED => self.video.client_physics = defaults.client_physics,
@@ -708,6 +714,12 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_FOG_STRENGTH => self.set_fog_strength(defaults.fog_strength),
+            ui::ENV_ROW_BLUE_SKY_AERIAL => {
+                self.video.blue_water_environment.aerial_perspective =
+                    defaults.blue_water_environment.aerial_perspective;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
             ui::ENV_ROW_SUN_SOURCE => self.set_sun_override(false, false),
             ui::ENV_ROW_SUN_VISIBILITY => {
                 self.video.sun_visibility = defaults.sun_visibility;
@@ -716,6 +728,7 @@ impl App {
             }
             ui::ENV_ROW_BAKED_SUN_REMOVAL => {
                 self.video.baked_sun_removal = defaults.baked_sun_removal;
+                self.video.baked_sun_removal_auto = defaults.baked_sun_removal_auto;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }

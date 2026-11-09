@@ -9,7 +9,7 @@ use crate::ui::{
     HudState, UiSnapshot, UiVertex,
 };
 use super::extensions::{
-    image_cell_uv_for_count, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE,
+    EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE,
 };
 
 // Each tuple is (qpath, x, y, width, height) in the lefthud/righthud menu.
@@ -84,6 +84,7 @@ struct Painter<'a> {
     out: &'a mut Vec<UiVertex>,
     images: &'a [String],
     shader_flags: &'a [bool],
+    uvs: &'a [([f32; 2], [f32; 2])],
     screen: [u32; 2],
     origin: [f32; 2],
     unit: f32,
@@ -94,7 +95,11 @@ impl Painter<'_> {
     fn image(&mut self, name: &str, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         let Some(index) = self.images.iter().position(|slot| slot == name) else { return; };
         let [sw, sh] = self.screen;
-        let (mut uv0, mut uv1) = image_cell_uv_for_count(index, self.images.len());
+        let (mut uv0, mut uv1) = if self.shader_flags.get(index).copied().unwrap_or(false) {
+            ([0.0, 0.0], [1.0, 1.0])
+        } else {
+            self.uvs.get(index).copied().unwrap_or(([0.0, 0.0], [0.0, 0.0]))
+        };
         // The mirrored right-hand background uses a negative width in hud.menu.
         if width < 0.0 { std::mem::swap(&mut uv0[0], &mut uv1[0]); }
         if height < 0.0 { std::mem::swap(&mut uv0[1], &mut uv1[1]); }
@@ -162,11 +167,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     let Some(hud) = ui.hud else { return; };
     if hud.spectating { return; }
     let ctx = HudRectContext::from_snapshot(ui);
-    let tint = match hud.team {
-        1 => [1.0, 0.5, 0.5, 1.0], // red team
-        2 => [0.5, 0.5, 1.0, 1.0], // blue team
-        _ => WHITE,
-    };
+    let tint = super::draw::native_hud_tint(&hud, ui.video.tint_hud);
     let max = hud.max_health.max(1);
     let s = h as f32 / 480.0;
     let images = &ui.extension_images;
@@ -176,7 +177,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     if !ui.native_replaced(crate::extensions::NativeHud::Health) {
         let left = hud_element_rect(HudElementId::Health, ui.hud_layout.health, &ctx, w, h);
         let mut painter = Painter {
-            out, images, shader_flags: shaders, screen: [w, h],
+            out, images, shader_flags: shaders, uvs: &ui.extension_image_uvs, screen: [w, h],
             origin: [left.x, left.y], unit: s * ui.hud_layout.health.scale.clamp(0.5, 2.0),
             right: false,
         };
@@ -191,7 +192,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     if !ui.native_replaced(crate::extensions::NativeHud::Ammo) {
         let right = hud_element_rect(HudElementId::Ammo, ui.hud_layout.ammo, &ctx, w, h);
         let mut painter = Painter {
-            out, images, shader_flags: shaders, screen: [w, h],
+            out, images, shader_flags: shaders, uvs: &ui.extension_image_uvs, screen: [w, h],
             origin: [right.x, right.y], unit: s * ui.hud_layout.ammo.scale.clamp(0.5, 2.0),
             right: true,
         };

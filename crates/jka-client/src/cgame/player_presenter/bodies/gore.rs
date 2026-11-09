@@ -213,7 +213,7 @@ impl PlayerPresenter {
                     material_trace: None,
                     entity_num: body.entity_num,
                     wireframe_class: DynamicWireframeClass::Player,
-                    raster_visible: body.raster_visible,
+                    raster_visible: body.raster_visible, portal_only: false,
                     vertices: Arc::clone(&body.vertices),
                     indices: Arc::clone(&surface.indices),
                     lighting_origin: body.lighting_origin,

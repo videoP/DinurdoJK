@@ -32,12 +32,18 @@ impl App {
     pub(in crate::app::egui_menu) fn ensure_jk2_demo_catalog(&mut self) {
         if self.jk2_demo_browser.loaded { return; }
         self.jk2_demo_browser.loaded = true;
+        let Some(local_base) = jka_assets::pk3::jk2_base_directory(&self.base, &self.fs_roots) else {
+            // No JK2 mode without fs_jk2basepath.
+            self.jk2_demo_browser.pending = false;
+            self.jk2_demo_browser.error = Some("JK2 is not configured: set fs_jk2basepath".to_owned());
+            return;
+        };
         self.jk2_demo_browser.pending = true;
         self.jk2_demo_browser.error = None;
         self.ui_catalog.request(&self.base, None,
             ui_catalog::CatalogRequest::Jk2DemoFolders {
                 token: self.jk2_demo_browser.generation,
-                local_base: jka_assets::pk3::jk2_base_directory(&self.base, &self.fs_roots),
+                local_base,
                 home_base: jka_assets::pk3::game_home_root(&self.fs_roots, true).map(|p| p.join("base")),
                 root: self.fs_roots.jk2cdpath.clone(),
             });

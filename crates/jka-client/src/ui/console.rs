@@ -167,7 +167,7 @@ pub(in crate::ui) fn rect_gradient(
     let v = |position, color| UiVertex {
         position,
         uv: [0.0, 0.0],
-        color,
+        color: UiVertex::pack_color(color),
         textured: 0.0,
     };
     out.extend_from_slice(&[

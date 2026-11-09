@@ -458,6 +458,23 @@ impl App {
                         let size = w.inner_size();
                         [size.width, size.height]
                     }),
+                    // Read only pending selection (not raw STAT_HOLDABLE_ITEM,
+                    // which is a bg_itemlist index rather than a holdable tag).
+                    inventory_jk2: self.live_input.is_jk2(),
+                    selected_inventory: if (session.live || session.local)
+                        && session.presented_player_state().is_some_and(|ps| {
+                            ps.field_i32("pm_flags").unwrap_or(0) & 4096 == 0
+                        })
+                        && (session.local || self.net.as_ref().is_some_and(|net| {
+                            Some(net.session().client_num()) == session.client_game.presentation_client_num()
+                        })) { Some(self.live_input.inventory_select) } else { None },
+                    selected_force: if (session.live || session.local)
+                        && session.presented_player_state().is_some_and(|ps| {
+                            ps.field_i32("pm_flags").unwrap_or(0) & 4096 == 0
+                        })
+                        && (session.local || self.net.as_ref().is_some_and(|net| {
+                            Some(net.session().client_num()) == session.client_game.presentation_client_num()
+                        })) { Some(self.live_input.force_select) } else { None },
                     // Never show the local weapon selection when following
                     // another player or during demo playback.
                     selected_weapon: if (session.live || session.local)

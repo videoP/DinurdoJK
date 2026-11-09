@@ -3,14 +3,13 @@ use crate::app::egui_settings::{theme, App};
 use crate::credential_store::AccountType;
 
 impl App {
-    /// Secure, exact-endpoint credentials for normal login, mod admin login and
-    /// RCON. Nothing is sent or applied automatically on connect: every row has
-    /// explicit LOG IN / LOG OUT actions and only the current server can use them.
+    /// Secure, exact-endpoint credentials. Server (join) passwords are applied
+    /// automatically at connect; Login, Admin and RCON remain explicit actions.
     pub(in crate::app) fn egui_account(&mut self, ui: &mut egui::Ui) {
         theme::section(
             ui,
             "ACCOUNT",
-            "Saved credentials for the exact server endpoint. Login sends /login, Admin sends /amlogin, and RCON loads rconPassword.",
+            "Server passwords are used automatically on join for this exact IP:port. Login (/login), Admin (/amlogin), and RCON remain manual.",
         );
 
         if !crate::credential_store::supported() {

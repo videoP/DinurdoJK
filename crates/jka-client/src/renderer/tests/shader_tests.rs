@@ -684,7 +684,7 @@ fn sky_cloud_stages_become_ordered_sky_batches_with_view_direction_coordinates()
             tc_mods: mods,
             depth_write: false,
             depth_equal: false,
-                    glow: false,
+                    depth_test_disabled: false, glow: false,
         }
     };
     let material = SurfaceMaterial {
@@ -786,7 +786,7 @@ fn authored_world_lighting_diffuse_does_not_render_white() {
         alpha_cutoff: 0.0, opacity: 0.35, color: [1.0, 1.0, 1.0],
         rgb_gen: RgbGen::LightingDiffuse, alpha_gen: AlphaGen::Identity,
         tc_gen: TcGen::Base, tc_mods: Vec::new(),
-        depth_write: false, depth_equal: false, glow: false,
+        depth_write: false, depth_equal: false, depth_test_disabled: false, glow: false,
     };
     let material = SurfaceMaterial {
         sky: true, explicit: true, stages: vec![stage],
@@ -804,6 +804,35 @@ fn authored_world_lighting_diffuse_does_not_render_white() {
     let mut unaffected = batches[1].clone();
     unaffected.rgb_gen = RgbGen::Identity;
     assert_eq!(material_uniform(&unaffected, false).color, [1.0, 1.0, 1.0, 0.35]);
+}
+
+#[test]
+fn authored_alpha_identity_does_not_inherit_rgb_vertex_alpha() {
+    use crate::materials::{MaterialStage, StageTexture, SurfaceMaterial};
+    let base = MaterialStage {
+        texture: StageTexture::White,
+        animation: None,
+        enhancements: Default::default(),
+        blend: None,
+        alpha_cutoff: 0.0,
+        opacity: 1.0,
+        color: [1.0; 3],
+        rgb_gen: RgbGen::Vertex,
+        alpha_gen: AlphaGen::Identity,
+        tc_gen: TcGen::Base,
+        tc_mods: Vec::new(),
+        depth_write: false,
+        depth_equal: false,
+        depth_test_disabled: false,
+        glow: false,
+    };
+    let material = SurfaceMaterial { stages: vec![base], explicit: true, ..Default::default() };
+    let mut batches = Vec::new();
+    crate::scene::append_sky_batches(&mut batches, &material, Some(0), None,
+        false, 0..6, None, &[], [0; 4], [0.0; 4], false);
+    let uniform = material_uniform(&batches[1], false);
+    assert_ne!(uniform.header[2] & 1, 0); // RGB from vertex
+    assert_eq!(uniform.header[2] & (1048576 | 2097152), 0); // no vertex alpha
 }
 
 #[test]
@@ -840,7 +869,7 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
         })],
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
     };
     let material = SurfaceMaterial {
         sky: true,
@@ -1526,7 +1555,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             material_trace: None,
             entity_num: 1,
             wireframe_class: DynamicWireframeClass::Entity,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             vertices: Arc::new(vec![
                 vertex(-100.0, -100.0),
                 vertex(100.0, -100.0),
@@ -1817,6 +1846,8 @@ fn ocean_material_uniform_matches_world_shader_layouts() {
         assert_eq!(offset_of_member(&members, "ocean_material") as usize, offset_of!(MaterialUniform, ocean_material));
         assert_eq!(offset_of_member(&members, "ocean_waves") as usize, offset_of!(MaterialUniform, ocean_waves));
         assert_eq!(offset_of_member(&members, "ocean_blend_color") as usize, offset_of!(MaterialUniform, ocean_blend_color));
+        assert_eq!(offset_of_member(&members, "deform_move_vector") as usize, offset_of!(MaterialUniform, deform_move_vector));
+        assert_eq!(offset_of_member(&members, "deform_move_wave") as usize, offset_of!(MaterialUniform, deform_move_wave));
     }
 }
 

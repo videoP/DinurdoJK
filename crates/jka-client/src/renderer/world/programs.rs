@@ -107,6 +107,7 @@ pub(in crate::renderer) fn dry_variant(v: WorldShaderVariantKey) -> Option<World
 /// using vertex colour. Everything else compiles ENABLE_BAKED_SUN_RELIGHT out.
 fn baked_relight_live(m: MaterialFragmentKey) -> bool {
     m.flags & (2 | 8388608) != 0 || (m.flags & 131072 != 0 && m.flags & 1 != 0)
+        || (m.flags_w & super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY) != 0
 }
 
 /// Exact material-side eliminations in the main base pass. Reflection/fog/dlight
@@ -210,16 +211,20 @@ pub(in crate::renderer) fn program_key(
     // Glass shading exists only in fs_main; the minimal, shared and generated
     // entries would draw it as an opaque stage.
     let glass = m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0;
-    let ordinary = !p.auto_sprite2 && !p.legacy_srgb_three_stage && m.tc_gen <= 3 && !glass;
+    // These static additive stages use the authored vertex RGB to recover a
+    // baked sky gain in the vertex shader. Generated/shared entries can
+    // remove vertex colours when rgbGen is Const/Wave, so keep fs_main.
+    let baked_additive = m.flags_w & super::variants::MATERIAL_FLAGS_W_BAKED_ADDITIVE != 0;
+    let ordinary = !(p.auto_sprite || p.auto_sprite2 || p.deform_move) && !p.legacy_srgb_three_stage && m.tc_gen <= 3 && !glass;
     // A uniform-driven shared relight measured 4-13% slower than mode-1
     // specialization (RTX 3060, costadelsol/ffa3): keep it specialized in mode 3.
     let shared_relight = v.program_mode == WorldProgramMode::Shared
         && v.baked_sun_relight && baked_relight_live(m);
-    if !supported_variant(v) || !ordinary || shared_relight
+    if !supported_variant(v) || !ordinary || shared_relight || baked_additive
         || v.program_mode == WorldProgramMode::Specialized
     {
         let mut key = m.for_variant(v, alpha);
-        if !glass && super::pipelines::material_minimal_entry(v, &p) {
+        if !glass && !baked_additive && super::pipelines::material_minimal_entry(v, &p) {
             key.program = StageProgram::Minimal;
         }
         return key;
@@ -360,14 +365,17 @@ pub(in crate::renderer) fn stage_rejection_reasons(
         exclude!(dynamic_light_debug, "dynamic-light debug enabled");
         exclude!(sky_debug, "sky debug shader enabled");
     }
-    if p.auto_sprite2 {
-        reasons.push("autosprite2 deformation uses its own entry point");
+    if (p.auto_sprite || p.auto_sprite2) {
+        reasons.push("billboard vertex deformation uses its own entry point");
     }
     if p.legacy_srgb_three_stage {
         reasons.push("authored three-stage legacy sRGB composite");
     }
     if m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0 {
         reasons.push("glass stage requires fs_main");
+    }
+    if m.flags_w & super::variants::MATERIAL_FLAGS_W_BAKED_ADDITIVE != 0 {
+        reasons.push("baked additive sky requires specialized fs_main");
     }
     if mode >= 3 && m.tc_gen > 3 {
         reasons.push("special tcGen unsupported by shared/generated recipes");
@@ -404,7 +412,7 @@ pub(in crate::renderer) fn map_eligibility_counts(
             else if p == crate::renderer::ocean_pipeline_key() { 5 }
             else if (mode == 2 && !judged.minimal_entry_compatible())
                 || (mode >= 3 && !supported_variant(judged)) { 2 }
-            else if p.auto_sprite2 { 6 }
+            else if (p.auto_sprite || p.auto_sprite2) { 6 }
             else if p.legacy_srgb_three_stage { 7 }
             else if mode >= 3 && m.tc_gen > 3 { 8 }
             else if m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0 { 9 }
@@ -442,8 +450,8 @@ pub(in crate::renderer) fn fallback_reason(
     let v = dry_variant(v).unwrap_or(v);
     if !supported_variant(v) {
         "features outside Minimal/Low/Medium envelope"
-    } else if p.auto_sprite2 {
-        "autosprite2 vertex deformation"
+    } else if (p.auto_sprite || p.auto_sprite2) {
+        "billboard vertex deformation"
     } else if p.legacy_srgb_three_stage {
         "authored three-stage RGB composite"
     } else if m.tc_gen > 3 {
@@ -855,6 +863,7 @@ impl ProgramModules {
             None,
             Some(material),
             minimal,
+            false,
             false,
         )
     }

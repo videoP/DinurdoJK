@@ -1,5 +1,7 @@
 //! Native audio device/mixer and registered SFX cache. No CGame event IDs here.
 pub mod variometer;
+mod underwater;
+use underwater::{DryMusicSource, UnderwaterControl, UnderwaterSource};
 mod eal_scene;
 use eal_scene::{EalBus, EalVoiceHandle};
 use std::{
@@ -1649,6 +1651,9 @@ pub struct AudioBackend {
     // shares a cycle, and a loop that restarts resumes at that clock's phase.
     loop_epoch: Instant,
     mixer: Mixer,
+    music_mixer: Mixer,
+    underwater_control: UnderwaterControl,
+    underwater_mode: u8,
     _master_player: Option<Player>,
     _device: Option<MixerDeviceSink>,
     listener: Listener,
@@ -1713,7 +1718,12 @@ impl AudioBackend {
         // Use the physical device's native rate. Each RegisteredSound advertises
         // its real source rate, so Rodio resamples 11/22/44 kHz JKA assets to this
         // rate rather than treating them as if they were already 48 kHz.
-        let (mixer, mixed) = rodio::mixer::mixer(rodio::nz!(2), output_sample_rate);
+        let (master_mixer, mixed) = rodio::mixer::mixer(rodio::nz!(2), output_sample_rate);
+        let (mixer, game_output) = rodio::mixer::mixer(rodio::nz!(2), output_sample_rate);
+        let (music_mixer, music_output) = rodio::mixer::mixer(rodio::nz!(2), output_sample_rate);
+        let underwater_control = Arc::new(AtomicU8::new(0));
+        master_mixer.add(UnderwaterSource::new(game_output, Arc::clone(&underwater_control)));
+        master_mixer.add(DryMusicSource::new(music_output));
         let overload_samples = Arc::new(AtomicU64::new(0));
         let peak_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let tap = MasterTap {
@@ -1755,6 +1765,9 @@ impl AudioBackend {
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
             mixer,
+            music_mixer,
+            underwater_control,
+            underwater_mode: 0,
             _master_player: Some(master_player),
             _device: Some(device),
             origins: HashMap::new(),
@@ -1802,7 +1815,13 @@ impl AudioBackend {
         })
     }
 
-    fn from_mixer(mixer: Mixer) -> Self {
+    fn from_mixer(master_mixer: Mixer) -> Self {
+        let rate = rodio::nz!(48000);
+        let (mixer, game_output) = rodio::mixer::mixer(rodio::nz!(2), rate);
+        let (music_mixer, music_output) = rodio::mixer::mixer(rodio::nz!(2), rate);
+        let underwater_control = Arc::new(AtomicU8::new(0));
+        master_mixer.add(UnderwaterSource::new(game_output, Arc::clone(&underwater_control)));
+        master_mixer.add(DryMusicSource::new(music_output));
         Self {
             variometer: None,
             voices: Vec::new(),
@@ -1810,6 +1829,9 @@ impl AudioBackend {
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
             mixer,
+            music_mixer,
+            underwater_control,
+            underwater_mode: 0,
             _master_player: None,
             _device: None,
             origins: HashMap::new(),
@@ -1876,6 +1898,7 @@ impl AudioBackend {
         backend.separation = self.separation;
         backend.music_level = self.music_level;
         backend.rate = 1.0;
+        backend.set_underwater(self.underwater_mode, false);
         backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
         backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
         backend.set_eal_enabled(self.eal_enabled.load(Ordering::Relaxed));
@@ -2279,7 +2302,7 @@ impl AudioBackend {
             None => (MusicSource::new(looped, true, Arc::clone(&control))?, None),
         };
         self.stop_music();
-        let player = connect_player(&self.mixer, first);
+        let player = connect_player(&self.music_mixer, first);
         if self.rate == 0.0 {
             player.pause();
         }
@@ -2322,7 +2345,7 @@ impl AudioBackend {
         let control = MusicControl::new(self.music_level);
         match MusicSource::new(looped, true, Arc::clone(&control)) {
             Ok(source) => {
-                let player = connect_player(&self.mixer, source);
+                let player = connect_player(&self.music_mixer, source);
                 if self.rate == 0.0 {
                     player.pause();
                 }
@@ -2345,6 +2368,16 @@ impl AudioBackend {
             }).update(sample, volume, style);
         } else if let Some(tone) = self.variometer.take() {
             tone.stop();
+        }
+    }
+
+    /// Only the game-sound bus is filtered; the separate music mixer is dry.
+    /// A single atomic write updates the audio-thread DSP without reallocating voices.
+    pub fn set_underwater(&mut self, mode: u8, listener_submerged: bool) {
+        let next = if listener_submerged { mode.min(3) } else { 0 };
+        if self.underwater_mode != next {
+            self.underwater_mode = next;
+            self.underwater_control.store(next, Ordering::Relaxed);
         }
     }
 
@@ -2709,7 +2742,13 @@ impl AudioBackend {
         // the listener or an entity moves while the voice is still playing.
         let world_positional = matches!(request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_))
             && request.entity != self.listener.entity;
-        let wet_player = if matches!(request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_)) {
+        // A local UI/chat notification (8), legacy menu sound (11), or emote
+        // music (14) must stay intelligible even when the camera is submerged.
+        // Preserve Steam Audio's spatial treatment of positional emote music;
+        // only its final routing bypasses the underwater gameplay bus.
+        let is_dry_voice = matches!(request.channel, 8 | 11 | 14);
+        let voice_mixer = if is_dry_voice { &self.music_mixer } else { &self.mixer };
+        let wet_player = if !is_dry_voice && matches!(request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_)) {
             self.eal_send(&request.qpath, Arc::clone(&sound), Arc::clone(&gains), loop_start.is_some(), loop_start.unwrap_or(0), Some(0))
         } else { None };
         if let Some(send) = &wet_player { send.set_speed(self.rate.max(0.0)); }
@@ -2727,18 +2766,18 @@ impl AudioBackend {
                 ) {
                     Ok(mut source) => {
                         if let Some(start) = loop_start { source.looping = true; source.loop_start = start; source.seam_frames = (source.sound.sample_rate.get() as usize / 200).min((source.sound.samples.len() - start) / 8); }
-                        (connect_player(&self.mixer, source), true)
+                        (connect_player(voice_mixer, source), true)
                     },
                     Err(error) => {
                         eprintln!("STEAM AUDIO VOICE FALLBACK: {error}");
-                        (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
+                        (connect_player(voice_mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
                     }
                 }
             } else {
-                (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
+                (connect_player(voice_mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
             }
         } else {
-            (connect_player(&self.mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
+            (connect_player(voice_mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
         };
         if self.rate == 0.0 { player.pause(); } else { player.set_speed(self.rate); }
         self.voices.push(Voice { loop_start, player, wet_player, sound: retained_sound, gains, request, steam_audio_capable, volume });

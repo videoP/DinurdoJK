@@ -159,8 +159,8 @@ app_cvars! {
         ]
     }
 
-    APP_R_DETAILTEXTURES {
-        runtime: CvarDef::new("r_detailTextures", "0", "0|1", "Enable neutral 2x detail textures on eligible opaque BSP materials without authored detail stages.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_detailtextures(app)), |app, value| App::cvar_set_r_detailtextures(app, APP_R_DETAILTEXTURES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_detailtextures, None),
+    APP_R_AUTODETAILTEXTURES {
+        runtime: CvarDef::new("r_autoDetailTextures", "0", "0|1", "Enable neutral 2x synthetic detail textures on eligible opaque BSP materials without authored detail stages.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_autodetailtextures(app)), |app, value| App::cvar_set_r_autodetailtextures(app, APP_R_AUTODETAILTEXTURES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_autodetailtextures, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     // Older configs stored the selected blend mode. All modes
@@ -179,13 +179,49 @@ app_cvars! {
             },
         implementations: [
             impl App {
-                fn cvar_get_r_detailtextures(&self) -> String {
+                fn cvar_get_r_autodetailtextures(&self) -> String {
                     bool_value(self.video.detail_textures)
                 }
-                fn cvar_set_r_detailtextures(&mut self, name: &str, value: &str) -> Result<(), String> {
+                fn cvar_set_r_autodetailtextures(&mut self, name: &str, value: &str) -> Result<(), String> {
                     self.video.detail_textures = parse_bool(value)
                         .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
                     self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    // TaystJK rd-vanilla/tr_shader.cpp FinishShader: this is *not* the
+    // synthetic detail effect. It removes only stages authored with `detail`.
+    APP_R_DETAILTEXTURES {
+        runtime: CvarDef::new(
+            "r_detailTextures", "1", "0|1",
+            "Enable shader stages explicitly marked `detail` (TaystJK legacy behavior). Applies on the next map load or vid_restart; r_autoDetailTextures controls synthetic BSP micro-detail separately.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
+            |_app: &App| CvarValue::String(bool_value(crate::materials::legacy_detail_textures_enabled())),
+            |app, value| App::cvar_set_r_detailtextures(app, APP_R_DETAILTEXTURES.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_detailtextures, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) {
+                    crate::materials::set_legacy_detail_textures_enabled(enabled);
+                }
+            }),
+            archive: Some((36375, |_state| format!("{}", u8::from(crate::materials::legacy_detail_textures_enabled())))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_detailtextures(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if enabled != crate::materials::legacy_detail_textures_enabled() {
+                        crate::materials::set_legacy_detail_textures_enabled(enabled);
+                        // Resolved stage lists are immutable after map preparation.
+                        self.prepared_map_cache = None;
+                    }
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
@@ -268,7 +304,8 @@ app_cvars! {
                         .trim()
                         .parse::<u8>()
                         .map(|level| level.min(2).to_string())
-                        .map_err(|_| format!("{name}: expected 0, 1 or 2")) })),
+                        .map_err(|_| format!("{name}: expected 0, 1 or 2")) }))
+            .with_restart_requirement(|app| app.video.texture_compression != app.applied_texture_compression),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     if let Ok(level) = value.parse::<u8>() {
@@ -310,7 +347,7 @@ app_cvars! {
     }
 
     APP_R_PICMIP {
-        runtime: CvarDef::new("r_picmip", "", "0..16", "Classic texture-quality mip bias: omit this many highest map-texture mip levels on upload.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart, |app| CvarValue::String(App::cvar_get_r_picmip(app)), |app, value| App::cvar_set_r_picmip(app, APP_R_PICMIP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_picmip, Some(|name, value| { value
+        runtime: CvarDef::new("r_picmip", "", "0..16", "Classic texture-quality mip bias: omit this many highest map-texture mip levels on upload; also scales the cached Blue Water sky (2K base per main face, 2x2 down face).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart, |app| CvarValue::String(App::cvar_get_r_picmip(app)), |app, value| App::cvar_set_r_picmip(app, APP_R_PICMIP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_picmip, Some(|name, value| { value
                         .trim()
                         .parse::<u32>()
                         .map(|picmip| picmip.min(16).to_string())

@@ -31,20 +31,24 @@ app_cvars! {
     }
 
     APP_R_RELIGHTMAP {
-        runtime: CvarDef::new("r_relightMap", "", "0|1", "Master runtime map relighting gate. Off preserves authored lighting and retains saved edits. Sun and moon positions are on Sky. r_sunOverride is a legacy alias.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app| CvarValue::String(bool_value(app.video.sun_override)),
+        runtime: CvarDef::new("r_relightMap", "", "0|1|2", "0 Off: authored illumination. 1 Baked: existing cached relighting and saved nearby world shadows. 2 Realtime: live Sky world lighting and world CSM. Sun and moon positions are on Sky; r_sunOverride is a legacy alias.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.video.active_relighting_mode().to_string()),
             |app, value| App::cvar_set_r_relightmap(app, APP_R_RELIGHTMAP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_relightmap, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
-                settings.sun_override = parse_bool(value).unwrap_or(settings.sun_override);
+                if let Some(mode) = crate::ui::VideoSettings::parse_relighting_mode(value) {
+                    settings.relighting_mode = mode;
+                    settings.sun_override = mode != 0;
+                }
             }),
-            archive: Some((56, |state| bool_value(state.video.sun_override))),
+            archive: Some((56, |state| state.video.active_relighting_mode().to_string())),
             ..CvarBinding::NONE
         },
         implementations: [impl App {
             fn cvar_set_r_relightmap(&mut self, name: &str, value: &str) -> Result<(), String> {
-                let enabled = Self::parse_cvar_bool(name, value)?;
-                self.set_sun_override(enabled, enabled);
+                let mode = crate::ui::VideoSettings::parse_relighting_mode(value)
+                    .ok_or_else(|| format!("{name}: expected 0 (Off), 1 (Baked), or 2 (Realtime)"))?;
+                self.set_relighting_mode(mode);
                 Ok(())
             }
         }]
@@ -2087,6 +2091,28 @@ app_cvars! {
         ]
     }
 
+    APP_R_BAKEDSUNREMOVALAUTO {
+        runtime: CvarDef::new("r_bakedSunRemovalAuto", "", "0|1", "Automatically fit the authored baked-sun removal multiplier from local lightmap shadow contrast. Falls back to zero removal if the original lightmap provides insufficient evidence; keeps the manual r_bakedSunRemoval setting unchanged.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.baked_sun_removal_auto)),
+            |app, value| App::cvar_set_r_bakedsunremovalauto(app, APP_R_BAKEDSUNREMOVALAUTO.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremovalauto, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.baked_sun_removal_auto = parse_bool(value).unwrap_or(settings.baked_sun_removal_auto);
+            }),
+            archive: Some((59, |state| bool_value(state.video.baked_sun_removal_auto))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_bakedsunremovalauto(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.baked_sun_removal_auto = Self::parse_cvar_bool(name, value)?;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_STATICWORLDCSM {
         runtime: CvarDef::new(
             "r_staticWorldCsm", "", "0|1",
@@ -2119,7 +2145,7 @@ app_cvars! {
     }
 
     APP_R_SUNLIGHTING {
-        runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM sun shadows for occlusion. Default 0 preserves legacy baked lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
+        runtime: CvarDef::new("r_sunLighting", "", "0|1", "Add live directional sunlight to BSP lightmaps after baked-sun removal. Independent of removal strength and its cache. Use CSM sun shadows for occlusion. Enabled by default; Relighting Off still preserves authored lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(if app.video.sun_lighting { "1".into() } else { "0".into() }), |app, value| App::cvar_set_r_sunlighting(app, APP_R_SUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sunlighting, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Some(v) = parse_bool(value) { settings.sun_lighting = v; }
@@ -2286,22 +2312,59 @@ app_cvars! {
         } ]
     }
 
-    APP_R_SKYWORLDBAKE {
-        runtime: CvarDef::new("r_skyWorldBake", "", "0..2", "Blue Water sky world illumination on lightmapped world (r_blueSkyWorldLighting): 0 live screen pass (per-polygon depth normals, no geometry shadows), 1 baked into the composed lightmap with the static sun bake's smoothed normals (default), 2 baked with sky visibility (occlusion) traced per original luxel. Models, movers without lightmaps, cloud shadows and lightning stay live. Rebakes. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sky_world_bake.to_string()), |app, value| App::cvar_set_r_skyworldbake(app, APP_R_SKYWORLDBAKE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_skyworldbake, None),
+    APP_R_SKYWORLDBAKEAB {
+        runtime: CvarDef::new("r_skyWorldBakeAB", "", "0|1", "Static sky relighting A/B (default 1; requires CSM and r_bakedSunCache 1): 0=A, authored lightmap without sky gain; 1=B, Blue Water irradiance or vanilla sun-elevation sky gain in cached BSP lightmaps and eligible vertex-lit surfaces. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sky_world_bake_ab.to_string()), |app, value| App::cvar_set_r_skyworldbakeab(app, APP_R_SKYWORLDBAKEAB.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_skyworldbakeab, None),
         config: CvarBinding::NONE,
         implementations: [ impl App {
-            fn cvar_set_r_skyworldbake(&mut self, name: &str, value: &str) -> Result<(), String> {
+            fn cvar_set_r_skyworldbakeab(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>()
-                    .ok().filter(|mode| *mode <= 2)
-                    .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
-                if self.video.sky_world_bake != mode {
-                    self.video.sky_world_bake = mode;
+                    .ok().filter(|mode| *mode <= 1)
+                    .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
+                if self.video.sky_world_bake_ab != mode {
+                    self.video.sky_world_bake_ab = mode;
                     self.sync_post_effects();
                 }
-                self.console_status = format!("SKY WORLD BAKE: {mode} ({})", ["live screen pass", "baked", "baked + sky visibility"][mode as usize]);
+                self.console_status = if mode == 0 {
+                    "SKY BAKE A/B: A = original relighting (no baked sky gain). Legacy fullscreen sky lighting is disabled.".to_owned()
+                } else if !self.video.dynamic_shadows.is_csm() || !self.video.baked_sun_cache {
+                    "SKY BAKE A/B: B selected, but requires CSM and r_bakedSunCache 1.".to_owned()
+                } else {
+                    "SKY BAKE A/B: B = sky illumination baked into BSP lightmaps and eligible vertex-lit surfaces; static bake requested.".to_owned()
+                };
                 Ok(())
             }
         } ]
+    }
+
+    APP_R_SKYWORLDLIGHTISOLATION {
+        runtime: CvarDef::new("r_skyWorldLightIsolation", "0", "0|1", "Protect authored indoor/local lighting from Sky world gain using cached sky-visibility rays (0 legacy, 1 geometry-weighted). Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.sky_world_light_isolation)),
+            |app, value| App::cvar_set_r_skyworldlightisolation(app, APP_R_SKYWORLDLIGHTISOLATION.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_skyworldlightisolation, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.sky_world_light_isolation = parse_bool(value).unwrap_or(settings.sky_world_light_isolation);
+            }),
+            archive: Some((57, |state| bool_value(state.video.sky_world_light_isolation))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_skyworldlightisolation(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = Self::parse_cvar_bool(name, value)?;
+                if self.video.sky_world_light_isolation != enabled {
+                    self.video.sky_world_light_isolation = enabled;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                }
+                self.console_status = if enabled {
+                    "SKY LIGHT ISOLATION: geometry-weighted sky, protected enclosed lighting. Requires Blue Water / CSM / baked receivers.".to_owned()
+                } else {
+                    "SKY LIGHT ISOLATION: legacy sky-world tint restored.".to_owned()
+                };
+                self.publish_ui();
+                Ok(())
+            }
+        }]
     }
 
     APP_R_BAKEDSUNTERMINATOR {
@@ -2565,7 +2628,7 @@ app_cvars! {
     }
 
     APP_R_ENTITYSUNLIGHTING {
-        runtime: CvarDef::new("r_entitySunLighting", "", "0..1", "Remove the baked map sun from the entity lightgrid and re-light entities with the runtime sun (needs r_entityAmbientLighting bsp_lightgrid).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entitysunlighting(app)), |app, value| App::cvar_set_r_entitysunlighting(app, APP_R_ENTITYSUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entitysunlighting, None),
+        runtime: CvarDef::new("r_entitySunLighting", "", "0..1", "Legacy entity sun replacement preference. Relighting Baked and Realtime automatically update the selected BSP entity lightgrid and share live model sky lighting; Off preserves the authored lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entitysunlighting(app)), |app, value| App::cvar_set_r_entitysunlighting(app, APP_R_ENTITYSUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entitysunlighting, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     {

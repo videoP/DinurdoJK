@@ -1985,6 +1985,13 @@ impl App {
                                     },
                                     Err(error) => runtime.error = Some(error),
                                 }
+                                for step in source.playback.player_presenter.drain_jk2_footsteps() {
+                                    if let Some(sound)=source.playback.sound_presenter.as_mut() {
+                                        use crate::cgame::footsteps::{jk2_sound_variant,jk2_step_sound,Jk2StepKind};
+                                        let kind=if step.metal {Jk2StepKind::Metal}else{Jk2StepKind::Boot};
+                                        sound.play_footstep(&jk2_step_sound(kind,jk2_sound_variant(step.entity,actor_time)),step.entity,step.position);
+                                    }
+                                }
                                 for impact in source.playback.player_presenter.drain_footsteps() {
                                     if let Some(sound)=source.playback.sound_presenter.as_mut() {
                                         let variant=crate::cgame::footsteps::sound_variant(&impact,actor_time);
@@ -2302,6 +2309,7 @@ fn studio_hud_for_source(
                 .filter(|(index,_,_)|*index>0)
                 .and_then(|(index,_,_)|ps.ammo.get(index as usize).copied());
             ui.hud=Some(HudState {
+                gametype:session.client_game.gametype(),
                 team:ps.persistant[3],
                 spectating:matches!(ps.field_i32("pm_type"), Some(4 | 7 | 8)),
                 ammo_index:jka_movement::weapon_info(weapon)

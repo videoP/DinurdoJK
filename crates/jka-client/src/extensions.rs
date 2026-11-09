@@ -49,6 +49,13 @@ pub struct GameStateSnapshot {
     pub screen_size: [u32; 2],
     /// Local pending JKA weapon selection; absent in demos and when following.
     pub selected_weapon: Option<u8>,
+    /// Local pending inventory tag (same selection as invnext/invprev).
+    pub selected_inventory: Option<u8>,
+    /// Immediate local Force selection for the viewer; absent while spectating
+    /// or playing demos. Gameplay-selected power still comes from playerstate.
+    pub selected_force: Option<u8>,
+    /// Active protocol mode (legacy metadata only; selected_inventory is already normalized).
+    pub inventory_jk2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -195,12 +202,162 @@ fn player_map(ps: &PlayerState) -> Map {
     map
 }
 
+/// Resolve the selected holdable in the same presentation tag-space as
+/// `crate::items::holdable_definitions()`. LiveInput already translates JK2's
+/// wire tag in `mirror_jk2`; do not translate it a second time here.
+/// For demos/followed players, use STAT_HOLDABLE_ITEM, which is an index into
+/// the *presentation* bg_itemlist, not a holdable tag.
+fn selected_holdable_tag(ps: &PlayerState, pending: Option<u8>) -> i32 {
+    pending.filter(|tag| *tag != 0).map(i32::from).or_else(|| {
+        crate::items::item(ps.stats[1])
+            .filter(|item| item.item_type == 6)
+            .map(|item| item.tag)
+    }).unwrap_or(0)
+}
+
+/// Native item metadata is shared by inventory_definitions() (for prewarm and
+/// non-live HUD previews) and inventory() (metadata plus live state).
+fn holdable_definition_map(item: &crate::items::HoldableDefinition) -> Map {
+    let mut entry = Map::new();
+    entry.insert("tag".into(), Dynamic::from_int(i64::from(item.tag)));
+    entry.insert("item_index".into(), Dynamic::from_int(i64::from(item.item_index)));
+    entry.insert("classname".into(), Dynamic::from(item.classname.clone()));
+    entry.insert("icon".into(), Dynamic::from(item.icon.clone()));
+    entry.insert("selectable".into(), Dynamic::from_bool(item.selectable));
+    entry.insert("pickup_quantity".into(), Dynamic::from_int(i64::from(item.pickup_quantity)));
+    entry
+}
+
+fn inventory_definitions() -> rhai::Array {
+    crate::items::holdable_definitions().iter()
+        .map(|item| Dynamic::from_map(holdable_definition_map(item)))
+        .collect()
+}
+
+/// Generic read-only inventory snapshot for *any* HUD extension. `items` is
+/// the complete native definition list (including unowned and non-selectable
+/// holdables), in native tag order. Vanilla protocol 26 only provides an
+/// ownership bit per holdable; `count` is deliberately `()` (unknown) rather
+/// than fabricating a carried stack count from bg_itemlist.quantity.
+fn inventory_map(ps: &PlayerState, pending: Option<u8>) -> Map {
+    let owned_bits = ps.stats[2] as u32;
+    let selected_tag = selected_holdable_tag(ps, pending);
+    let mut items = rhai::Array::new();
+    for item in crate::items::holdable_definitions() {
+        let owned = owned_bits & (1_u32 << item.tag) != 0;
+        let mut entry = holdable_definition_map(item);
+        entry.insert("owned".into(), Dynamic::from_bool(owned));
+        entry.insert("selected".into(), Dynamic::from_bool(item.tag == selected_tag));
+        entry.insert("count".into(), Dynamic::UNIT);
+        entry.insert("count_known".into(), Dynamic::from_bool(false));
+        items.push(Dynamic::from_map(entry));
+    }
+    let mut result = Map::new();
+    result.insert("items".into(), Dynamic::from_array(items));
+    result.insert("selected_tag".into(), Dynamic::from_int(i64::from(selected_tag)));
+    result.insert("owned_bits".into(), Dynamic::from_int(i64::from(ps.stats[2])));
+    result
+}
+
+/// Native Force definitions: OpenJK IDs, affinity and forcePowerSorted[] order.
+/// All 18 are exposed so other HUDs may display Jump/Saber abilities even
+/// though the normal selection cycle omits them.
+fn force_power_definition_map(id: usize, order: usize) -> Map {
+    use crate::ui::{FORCE_ICON_NAMES, FORCE_EXTENSION_ICON_NAMES, FORCE_POWER_INTERNAL_NAMES, FORCE_POWER_NAMES, FORCE_POWER_SIDES};
+    let mut entry = Map::new();
+    entry.insert("id".into(), Dynamic::from_int(id as i64));
+    entry.insert("name".into(), Dynamic::from(FORCE_POWER_INTERNAL_NAMES[id]));
+    entry.insert("display_name".into(), Dynamic::from(FORCE_POWER_NAMES[id]));
+    // Preserve the alternative artwork used by existing extension HUDs.
+    // Stock icons are available explicitly; the native atlas always uses them.
+    entry.insert("icon".into(), Dynamic::from(FORCE_EXTENSION_ICON_NAMES[id]));
+    entry.insert("native_icon".into(), Dynamic::from(FORCE_ICON_NAMES[id]));
+    entry.insert("side".into(), Dynamic::from_int(i64::from(FORCE_POWER_SIDES[id])));
+    entry.insert("order".into(), Dynamic::from_int(order as i64));
+    entry.insert("selectable".into(), Dynamic::from_bool(!matches!(id, 1 | 15 | 16 | 17)));
+    entry.insert("passive".into(), Dynamic::from_bool(matches!(id, 15 | 16)));
+    entry
+}
+
+fn force_power_definitions() -> rhai::Array {
+    crate::ui::FORCE_POWER_SORTED.iter().enumerate()
+        .map(|(order, &id)| Dynamic::from_map(force_power_definition_map(usize::from(id), order)))
+        .collect()
+}
+
+/// Only expose states actually carried by JKA/JK2 protocol playerstate.
+/// Absent per-power levels, cooldowns, durations and energy costs are *not*
+/// silently predicted. Rage recovery deadline is explicitly networked.
+fn force_powers_map(ps: &PlayerState, selected_local: Option<u8>, server_time: i32) -> Map {
+    let known_bits = ps.field_i32("fd.forcePowersKnown").unwrap_or(0) as u32;
+    let active_bits = ps.field_i32("fd.forcePowersActive").unwrap_or(0) as u32;
+    let selected = selected_local.map(i32::from)
+        .unwrap_or_else(|| ps.field_i32("fd.forcePowerSelected").unwrap_or(-1));
+    let side = ps.field_i32("fd.forceSide").unwrap_or(0);
+    let rage_until = ps.field_i32("fd.forceRageRecoveryTime").unwrap_or(0);
+    let recovering = rage_until > server_time;
+    let mut items = rhai::Array::new();
+    for (order, &id) in crate::ui::FORCE_POWER_SORTED.iter().enumerate() {
+        let id = usize::from(id);
+        let mut item = force_power_definition_map(id, order);
+        item.insert("known".into(), Dynamic::from_bool(known_bits & (1 << id) != 0));
+        item.insert("selected".into(), Dynamic::from_bool(id as i32 == selected));
+        item.insert("active".into(), Dynamic::from_bool(active_bits & (1 << id) != 0));
+        // Only two power levels appear in vanilla protocol snapshots.
+        let known_level = match id {
+            1 => ps.field_i32("fd.forcePowerLevel[FP_LEVITATION]"),
+            14 => ps.field_i32("fd.forcePowerLevel[FP_SEE]"),
+            _ => None,
+        };
+        item.insert("level".into(), known_level.map_or(Dynamic::UNIT, |n| Dynamic::from_int(i64::from(n))));
+        item.insert("rage_recovering".into(), Dynamic::from_bool(id == 8 && recovering));
+        items.push(Dynamic::from_map(item));
+    }
+    let mut result = Map::new();
+    result.insert("items".into(), Dynamic::from_array(items));
+    result.insert("selected_id".into(), Dynamic::from_int(i64::from(selected)));
+    result.insert("side".into(), Dynamic::from_int(i64::from(side)));
+    result.insert("known_bits".into(), Dynamic::from_int(i64::from(known_bits)));
+    result.insert("active_bits".into(), Dynamic::from_int(i64::from(active_bits)));
+    result.insert("energy".into(), Dynamic::from_int(i64::from(ps.field_i32("fd.forcePower").unwrap_or(0))));
+    result.insert("rage_recovery_until_ms".into(), Dynamic::from_int(i64::from(rage_until)));
+    result.insert("rage_recovering".into(), Dynamic::from_bool(recovering));
+    result
+}
+
 /// Keep the network/equipped ps.weapon separate from the immediate local selection.
-fn player_map_selected(ps: &PlayerState, selected: Option<u8>) -> Map {
+fn player_map_selected(ps: &PlayerState, selected: Option<u8>,
+    inventory: Option<u8>, jk2: bool) -> Map {
     let mut map = player_map(ps);
+    // The selected weapon can lead ps.weapon by a snapshot or two. HUD ammo
+    // visuals must follow the immediate local selection rather than sampling
+    // the equipped weapon's ammo index while the wheel is still moving.
+    let weapon = selected.map(i32::from).unwrap_or_else(|| ps.field_i32("weapon").unwrap_or(0));
     if let Some(selected) = selected {
         map.insert("weapon_selected".into(), Dynamic::from_int(i64::from(selected)));
     }
+    // Legacy compatibility keys for extensions written before inventory().
+    // Input selection is already a presentation tag in both JKA and JK2.
+    let selected_item = selected_holdable_tag(ps, inventory);
+    map.insert("inventory_selected".into(), Dynamic::from_int(i64::from(selected_item)));
+    map.insert("inventory_owned_bits".into(), Dynamic::from_int(i64::from(ps.stats[2])));
+    map.insert("inventory_jk2".into(), Dynamic::from_bool(jk2));
+    let info = jka_movement::weapon_info(weapon);
+    let ammo_index = info.map_or(0, |(index, _, _)| index);
+    let ammo_max: i32 = match ammo_index {
+        1 => 100,
+        2 | 3 | 4 => 300,
+        5 => 25,
+        6 => 800,
+        7 | 8 | 9 => 10,
+        _ => 0,
+    };
+    let selected_ammo = usize::try_from(ammo_index).ok().filter(|&i| i > 0)
+        .and_then(|i| ps.ammo.get(i).copied());
+    map.insert("ammo_selected_current".into(), selected_ammo
+        .map_or(Dynamic::UNIT, |n| Dynamic::from_int(i64::from(n))));
+    map.insert("ammo_selected_max".into(), Dynamic::from_int(i64::from(ammo_max)));
+    map.insert("ammo_selected_infinite".into(), Dynamic::from_bool(info.is_some_and(|(_, e, a)| e == 0 && a == 0)));
     map
 }
 
@@ -251,6 +408,9 @@ pub enum HudCommand {
     /// image atlas. Negative destination sizes may mirror the sprite.
     ImageRegion { name: String, x: f32, y: f32, w: f32, h: f32,
         source: [f32; 4], color: [f32; 4] },
+    /// Existing native UI icon atlas cell, addressed by category and game ID.
+    /// Never consumes an extension image slot, even in JK2 mode.
+    NativeIcon { category: String, id: u8, x: f32, y: f32, w: f32, h: f32, color: [f32; 4] },
     /// The shader source lives inside this extension's shaders/ directory.
     /// The renderer runs the WGSL every present; Rhai provides only parameters.
     ShaderImage { name: String, shader: String, x: f32, y: f32, w: f32, h: f32,
@@ -264,6 +424,7 @@ pub enum HudAnchor {
     TopLeft,
     TopRight,
     BottomLeft,
+    BottomCenter,
     BottomRight,
 }
 
@@ -273,20 +434,23 @@ impl HudAnchor {
             "top-left" => Self::TopLeft,
             "top-right" => Self::TopRight,
             "bottom-left" => Self::BottomLeft,
+            "bottom-center" => Self::BottomCenter,
             "bottom-right" => Self::BottomRight,
             _ => return None,
         })
     }
 
     fn right(self) -> bool { matches!(self, Self::TopRight | Self::BottomRight) }
-    fn bottom(self) -> bool { matches!(self, Self::BottomLeft | Self::BottomRight) }
+    fn bottom(self) -> bool { matches!(self, Self::BottomLeft | Self::BottomCenter | Self::BottomRight) }
 }
 
 /// Distinct game images one frame of widgets may reference (atlas capacity).
 /// Rhai extensions retain their original 32-image budget; the shared UI atlas
 /// additionally accommodates the 31 built-in stock HUD pictures and Siege art.
-pub const MAX_EXTENSION_HUD_IMAGES: usize = 32;
-pub const MAX_HUD_IMAGES: usize = 64;
+// The Diabolic bar references its native weapon and inventory art at once.
+// Atlas packing remains dynamic; these are only per-extension image budgets.
+pub const MAX_EXTENSION_HUD_IMAGES: usize = 64;
+pub const MAX_HUD_IMAGES: usize = 96;
 
 /// Plain HUD art names and authored `fx/hud/` materials only: no file
 /// extensions, traversal or arbitrary filesystem path access.
@@ -318,7 +482,8 @@ pub fn hud_widget_origin(
 ) -> (f32, f32) {
     let (w, h) = (width * placement.scale, height * placement.scale);
     (
-        if anchor.right() { screen_w + placement.x - w } else { placement.x },
+        if matches!(anchor, HudAnchor::BottomCenter) { (screen_w - w) * 0.5 + placement.x }
+        else if anchor.right() { screen_w + placement.x - w } else { placement.x },
         if anchor.bottom() { screen_h + placement.y - h } else { placement.y },
     )
 }
@@ -330,6 +495,8 @@ pub struct HudWidget {
     pub width: f32,
     pub height: f32,
     pub anchor: HudAnchor,
+    /// Per-widget default placement offset, overridden by user HUD Edit layout.
+    pub default_offset: [f32; 2],
     pub commands: Vec<HudCommand>,
 }
 
@@ -362,9 +529,9 @@ pub struct PlacedHudWidget {
     pub placement: HudPlacement,
 }
 
-/// Native HUD elements an extension may replace. Only elements whose data a
-/// script can already read through `playerstate()`/`session_info()` are listed;
-/// chat, center print, scoreboard, vote and friends need a data bridge first.
+/// Native HUD elements an extension may replace. Selector flags affect only
+/// native rendering, not the underlying weapon/Force/inventory input or state.
+/// Chat, center print, scoreboard and vote UI are deliberately not replaceable.
 /// Hiding is a runtime overlay on the user's settings: it never touches a cvar
 /// or the saved config, and it ends when the extension stops running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,11 +542,24 @@ pub enum NativeHud {
     Force,
     /// The speedometer readout, its jump counter and its speed graph.
     Speedometer,
+    /// Native weapon selection icons and title, not weapon input/cycling.
+    WeaponSelect,
+    /// Native Force power selection icons and title, not Force input/cycling.
+    ForceSelect,
+    /// Native active-duration Force icons / Rage recovery icon.
+    ActiveForcePowers,
+    /// Native inventory selection icons and title, not item input/cycling.
+    InventorySelect,
+    /// JK2 selector background and idle/active edge prongs, not the icons.
+    Jk2Prongs,
 }
 
 impl NativeHud {
-    pub const ALL: [Self; 5] =
-        [Self::Health, Self::Shield, Self::Ammo, Self::Force, Self::Speedometer];
+    pub const ALL: [Self; 10] = [
+        Self::Health, Self::Shield, Self::Ammo, Self::Force, Self::Speedometer,
+        Self::WeaponSelect, Self::ForceSelect, Self::ActiveForcePowers,
+        Self::InventorySelect, Self::Jk2Prongs,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -388,6 +568,11 @@ impl NativeHud {
             Self::Ammo => "ammo",
             Self::Force => "force",
             Self::Speedometer => "speedometer",
+            Self::WeaponSelect => "weapon_select",
+            Self::ForceSelect => "force_select",
+            Self::ActiveForcePowers => "active_force_powers",
+            Self::InventorySelect => "inventory_select",
+            Self::Jk2Prongs => "jk2_prongs",
         }
     }
 
@@ -696,8 +881,14 @@ impl Manager {
     }
 
     pub fn widget_placement(&self, key: &str) -> HudPlacement {
-        self.hud_layouts.get(key).copied()
-            .unwrap_or_else(|| HudPlacement::for_anchor(self.widget_anchor(key)))
+        self.hud_layouts.get(key).copied().unwrap_or_else(|| {
+            let mut placement = HudPlacement::for_anchor(self.widget_anchor(key));
+            if let Some(widget) = self.hud_widgets.iter().find(|w| w.key == key) {
+                placement.x += widget.default_offset[0];
+                placement.y += widget.default_offset[1];
+            }
+            placement
+        })
     }
 
     pub fn set_widget_placement(&mut self, key: &str, placement: HudPlacement) {
@@ -708,6 +899,21 @@ impl Manager {
         };
         if self.widget_placement(key) == placement { return; }
         self.hud_layouts.insert(key.to_owned(), placement);
+    }
+
+    /// Clear the saved override, not just the visible position. This restores
+    /// the registered anchor *and* the extension's authored default X/Y offset.
+    pub fn reset_widget_placement(&mut self, key: &str) -> bool {
+        if !self.hud_widgets.iter().any(|widget| widget.key == key) { return false; }
+        self.hud_layouts.remove(key).is_some()
+    }
+
+    /// RESET ALL also clears saved layouts for temporarily disabled extensions,
+    /// so those widgets do not reappear at stale positions on their next load.
+    pub fn reset_all_widget_placements(&mut self) -> bool {
+        if self.hud_layouts.is_empty() { return false; }
+        self.hud_layouts.clear();
+        true
     }
 
     pub fn save_widget_layouts(&self) {
@@ -1249,7 +1455,26 @@ impl Worker {
         let presented = Arc::clone(&state);
         engine.register_fn("playerstate", move || -> Dynamic {
             presented.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                .and_then(|s| s.presented.as_ref().map(|ps| player_map_selected(ps, s.selected_weapon)))
+                .and_then(|s| s.presented.as_ref().map(|ps| player_map_selected(ps, s.selected_weapon,
+                    s.selected_inventory, s.inventory_jk2)))
+                .map_or(Dynamic::UNIT, Dynamic::from_map)
+        });
+        // Native item definitions can be queried during script initialization
+        // to hud_preload each icon, even before connecting to a game server.
+        engine.register_fn("inventory_definitions", inventory_definitions);
+        engine.register_fn("force_power_definitions", force_power_definitions);
+        let force_state = Arc::clone(&state);
+        engine.register_fn("force_powers", move || -> Dynamic {
+            force_state.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                .and_then(|s| s.presented.as_ref().map(|ps|
+                    force_powers_map(ps, s.selected_force, s.server_time)))
+                .map_or(Dynamic::UNIT, Dynamic::from_map)
+        });
+        let inventory_state = Arc::clone(&state);
+        engine.register_fn("inventory", move || -> Dynamic {
+            inventory_state.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                .and_then(|s| s.presented.as_ref()
+                    .map(|ps| inventory_map(ps, s.selected_inventory)))
                 .map_or(Dynamic::UNIT, Dynamic::from_map)
         });
         let authoritative = Arc::clone(&state);
@@ -1266,30 +1491,40 @@ impl Worker {
         let hud = Arc::new(Mutex::new(HudScriptState::default()));
         let registration = Arc::clone(&hud);
         let register = move |widget_id: &str, name: &str, width: rhai::FLOAT, height: rhai::FLOAT,
-            anchor: HudAnchor| -> bool {
+            anchor: HudAnchor, offset: [rhai::FLOAT; 2]| -> bool {
             let Some(w) = hud_number(width) else { return false; };
             let Some(h) = hud_number(height) else { return false; };
             if w < 16.0 || h < 12.0 || w > 2048.0 || h > 2048.0
-                || !valid_id(&widget_id) || name.len() > 80 || name.is_empty() { return false; }
+                || !valid_id(&widget_id) || name.len() > 80 || name.is_empty()
+                || offset.iter().any(|v| !v.is_finite() || v.abs() > 8192.0) { return false; }
             let mut state = registration.lock().unwrap_or_else(|p| p.into_inner());
             if !state.widgets.contains_key(widget_id) && state.widgets.len() >= MAX_HUD_WIDGETS {
                 return false;
             }
             state.widgets.insert(widget_id.to_string(), HudWidget {
                 key: widget_id.to_string(), name: name.to_string(), width: w, height: h,
-                anchor, commands: Vec::new(),
+                anchor, default_offset: [offset[0] as f32, offset[1] as f32], commands: Vec::new(),
             });
             true
         };
         let register_plain = register.clone();
         engine.register_fn("hud_register", move |id: rhai::ImmutableString, name: rhai::ImmutableString,
             width: rhai::FLOAT, height: rhai::FLOAT| -> bool {
-            register_plain(&id, &name, width, height, HudAnchor::TopLeft)
+            register_plain(&id, &name, width, height, HudAnchor::TopLeft, [0.0, 0.0])
         });
-        // Anchor is "top-left", "top-right", "bottom-left" or "bottom-right".
+        // Anchor may also be "bottom-center". Give each move closure its own
+        // clone so the 7-argument overload can still use the original register.
+        let register_anchored = register.clone();
         engine.register_fn("hud_register", move |id: rhai::ImmutableString, name: rhai::ImmutableString,
             width: rhai::FLOAT, height: rhai::FLOAT, anchor: rhai::ImmutableString| -> bool {
-            HudAnchor::parse(&anchor).is_some_and(|anchor| register(&id, &name, width, height, anchor))
+            HudAnchor::parse(&anchor).is_some_and(|anchor| register_anchored(&id, &name, width, height, anchor, [0.0, 0.0]))
+        });
+        // Same as anchored registration but with a default X/Y offset. The user
+        // can still drag/scale the widget in HUD Edit; saved placement wins.
+        engine.register_fn("hud_register", move |id: rhai::ImmutableString, name: rhai::ImmutableString,
+            width: rhai::FLOAT, height: rhai::FLOAT, anchor: rhai::ImmutableString,
+            x: rhai::FLOAT, y: rhai::FLOAT| -> bool {
+            HudAnchor::parse(&anchor).is_some_and(|anchor| register(&id, &name, width, height, anchor, [x, y]))
         });
         // Declaration runs on the extension worker, not from input handlers.
         // Scripts can choose their on-screen fixed-slot order, including weapons
@@ -1328,6 +1563,20 @@ impl Worker {
                 (hud_number(x), hud_number(y), hud_number(w), hud_number(h), bounded_color(color)) {
                 if w != 0.0 && h != 0.0 {
                     append_hud(&image_hud, &id, HudCommand::Image { name: name.to_string(), x, y, w, h, color });
+                }
+            }
+        });
+        let native_icon_hud = Arc::clone(&hud);
+        engine.register_fn("hud_native_icon", move |widget: rhai::ImmutableString,
+            category: rhai::ImmutableString, id: rhai::INT,
+            x: rhai::FLOAT, y: rhai::FLOAT, w: rhai::FLOAT, h: rhai::FLOAT, color: rhai::Array| {
+            if crate::ui::native_hud_icon_index(&category, id).is_none() { return; }
+            if let (Some(x), Some(y), Some(w), Some(h), Some(color)) =
+                (hud_number(x), hud_number(y), hud_number(w), hud_number(h), bounded_color(color)) {
+                if w != 0.0 && h != 0.0 {
+                    append_hud(&native_icon_hud, &widget, HudCommand::NativeIcon {
+                        category: category.to_string(), id: id as u8, x, y, w, h, color,
+                    });
                 }
             }
         });
@@ -1725,13 +1974,140 @@ mod tests {
         ps.set_field_bits("weapon", 5);
         ps.stats[4] = (1 << 3) | (1 << 5) | (1 << 15);
         for ammo in &mut ps.ammo { *ammo = 999; }
-        let state = player_map_selected(&ps, Some(15));
+        let state = player_map_selected(&ps, Some(15), Some(3), false);
         assert_eq!(state["weapon"].as_int().unwrap(), 5);
         assert_eq!(state["weapon_selected"].as_int().unwrap(), 15);
+        assert_eq!(state["inventory_selected"].as_int().unwrap(), 3);
+        assert_eq!(state["inventory_owned_bits"].as_int().unwrap(), ps.stats[2] as i64);
         assert_eq!(state["weapon_owned_bits"].as_int().unwrap(), ps.stats[4] as i64);
         let selectable = state["weapon_selectable_bits"].as_int().unwrap();
         assert_ne!(selectable & (1 << 15), 0);
         assert_eq!(selectable & (1 << 16), 0);
+    }
+
+    #[test]
+    fn inventory_snapshot_uses_native_definitions_and_never_invents_stacks() {
+        let definitions = crate::items::holdable_definitions();
+        let medpac = definitions.iter().find(|item| item.tag == 3).expect("JKA medpac in bg_itemlist");
+        assert!(!medpac.icon.is_empty());
+        let mut ps = PlayerState::default();
+        ps.stats[1] = medpac.item_index;
+        ps.stats[2] = (1 << 1) | (1 << 3);
+        let result = inventory_map(&ps, None);
+        assert_eq!(result["selected_tag"].as_int().unwrap(), 3);
+        let entries = result["items"].clone_cast::<rhai::Array>();
+        let med = entries.iter().find_map(|value| {
+            let entry = value.clone().try_cast::<Map>()?;
+            (entry["tag"].as_int().ok()? == 3).then_some(entry)
+        }).unwrap();
+        assert!(med["owned"].as_bool().unwrap());
+        assert!(med["selected"].as_bool().unwrap());
+        assert!(med["selectable"].as_bool().unwrap());
+        assert!(med["count"].is_unit());
+        assert!(!med["count_known"].as_bool().unwrap());
+        assert_eq!(med["icon"].clone_cast::<rhai::ImmutableString>().as_str(), medpac.icon);
+        assert_eq!(med["pickup_quantity"].as_int().unwrap(), medpac.pickup_quantity as i64);
+        let selected = inventory_map(&ps, Some(1));
+        assert_eq!(selected["selected_tag"].as_int().unwrap(), 1);
+        // JK2's LiveInput::mirror_jk2 has already normalized the selection.
+        let jk2_legacy = player_map_selected(&ps, None, Some(5), true);
+        assert_eq!(jk2_legacy["inventory_selected"].as_int().unwrap(), 5);
+    }
+
+    #[test]
+    fn force_api_uses_only_transmitted_fields_and_local_selection() {
+        let defs = force_power_definitions();
+        assert_eq!(defs.len(), 18);
+        for definition in &defs {
+            let item = definition.clone_cast::<Map>();
+            let id = item["id"].as_int().unwrap() as usize;
+            assert_eq!(
+                item["native_icon"].clone_cast::<rhai::ImmutableString>().as_str(),
+                crate::ui::FORCE_ICON_NAMES[id]
+            );
+            assert_eq!(
+                item["icon"].clone_cast::<rhai::ImmutableString>().as_str(),
+                crate::ui::FORCE_EXTENSION_ICON_NAMES[id]
+            );
+        }
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("fd.forcePowersKnown", (1 << 2) | (1 << 8) | (1 << 15));
+        ps.set_field_bits("fd.forcePowersActive", 1 << 2);
+        ps.set_field_bits("fd.forceSide", 2);
+        ps.set_field_bits("fd.forcePowerSelected", 8);
+        ps.set_field_bits("fd.forcePower", 45);
+        ps.set_field_bits("fd.forceRageRecoveryTime", 3500);
+        let state = force_powers_map(&ps, Some(2), 3000);
+        assert_eq!(state["side"].as_int().unwrap(), 2);
+        assert_eq!(state["energy"].as_int().unwrap(), 45);
+        assert_eq!(state["selected_id"].as_int().unwrap(), 2);
+        assert!(state["rage_recovering"].as_bool().unwrap());
+        let items = state["items"].clone_cast::<rhai::Array>();
+        let speed = items.iter().find(|v| v.clone_cast::<Map>()["id"].as_int().unwrap() == 2).unwrap().clone_cast::<Map>();
+        assert!(speed["known"].as_bool().unwrap());
+        assert!(speed["selected"].as_bool().unwrap());
+        assert!(speed["active"].as_bool().unwrap());
+        assert!(speed["level"].is_unit()); // not networked
+        let rage = items.iter().find(|v| v.clone_cast::<Map>()["id"].as_int().unwrap() == 8).unwrap().clone_cast::<Map>();
+        assert!(rage["rage_recovering"].as_bool().unwrap());
+        let saber_offense = items.iter().find(|v| v.clone_cast::<Map>()["id"].as_int().unwrap() == 15).unwrap().clone_cast::<Map>();
+        assert!(!saber_offense["selectable"].as_bool().unwrap());
+        assert!(saber_offense["passive"].as_bool().unwrap());
+        assert!(!force_powers_map(&ps, None, 4000)["rage_recovering"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn native_hud_icon_commands_dont_use_extension_atlas_slots() {
+        let (tx, _rx) = mpsc::channel();
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
+        let mut active = worker.compile("native-art", r#"
+            hud_register("bar", "Icons", 180.0, 40.0);
+            fn on_update() {
+                hud_native_icon("bar", "weapon", 3, 0.0, 0.0, 30.0, 30.0, [1.0,1.0,1.0,1.0]);
+                hud_native_icon("bar", "inventory", 3, 35.0, 0.0, 30.0, 30.0, [1.0,1.0,1.0,1.0]);
+                hud_native_icon("bar", "force", 2, 70.0, 0.0, 30.0, 30.0, [1.0,1.0,1.0,1.0]);
+                hud_native_icon("bar", "force", 999, 105.0, 0.0, 30.0, 30.0, [1.0,1.0,1.0,1.0]);
+            }
+        "#).unwrap();
+        active.callback("on_update", None).unwrap();
+        let guard = active.hud.lock().unwrap();
+        let commands = &guard.widgets["bar"].commands;
+        assert_eq!(commands.len(), 3);
+        assert!(commands.iter().all(|c| matches!(c, HudCommand::NativeIcon { .. })));
+        assert!(guard.preload.is_empty());
+    }
+
+    #[test]
+    fn inventory_api_is_available_to_generic_rhai_extensions() {
+        let (tx, _rx) = mpsc::channel();
+        let worker = Worker::new(PathBuf::from("unused"), None, tx);
+        let mut active = worker.compile("inventory-test", r#"
+            hud_register("bar", "Items", 250.0, 40.0);
+            for item in inventory_definitions() {
+                if item.icon != "" { hud_preload(item.icon); }
+            }
+            fn on_update() {
+                let inv = inventory();
+                if inv == () { return; }
+                for item in inv.items {
+                    if item.owned && item.selectable && item.icon != "" {
+                        hud_image("bar", item.icon, 0.0, 0.0, 20.0, 20.0, [1.0,1.0,1.0,1.0]);
+                    }
+                }
+            }
+        "#).unwrap();
+        let mut ps = PlayerState::default();
+        ps.stats[2] = 1 << 3;
+        *active.state.lock().unwrap() = Some(GameStateSnapshot {
+            presented: Some(ps), authoritative: None, map_name: "t".into(), server_time: 1000,
+            viewer_client: Some(0), is_live: true, is_demo: false, screen_size: [1920, 1080],
+            selected_weapon: None, selected_inventory: Some(3), selected_force: None, inventory_jk2: false,
+        });
+        active.callback("on_update", None).unwrap();
+        let hud = active.hud.lock().unwrap();
+        assert!(hud.widgets["bar"].commands.iter().any(|cmd| matches!(cmd, HudCommand::Image { .. })));
+        let medpac = crate::items::holdable_definitions().iter().find(|item| item.tag == 3).unwrap();
+        assert!(hud.preload.contains(&medpac.icon));
     }
 
     #[test]
@@ -1767,6 +2143,21 @@ hides_native_hud = ['health', 'speedometer']
         assert_eq!(mask.names(), ["health", "speedometer"]);
         assert!(NativeHudMask::from_names(&["helth".to_owned()]).is_err());
         assert!(NativeHudMask::default().is_empty());
+    }
+
+    #[test]
+    fn selector_flags_are_independent_and_reject_unknown_names() {
+        let names = ["weapon_select", "force_select", "inventory_select", "jk2_prongs"];
+        let mask = NativeHudMask::from_names(&names.map(str::to_owned)).unwrap();
+        assert_eq!(mask.names(), names);
+        for element in [NativeHud::WeaponSelect, NativeHud::ForceSelect,
+            NativeHud::InventorySelect, NativeHud::Jk2Prongs] {
+            assert!(mask.contains(element));
+        }
+        assert!(!mask.contains(NativeHud::Health));
+        assert!(NativeHudMask::from_names(&["weapon_selct".to_string()]).is_err());
+        assert_eq!(mask.union(NativeHudMask::from_names(&["health".to_string()]).unwrap())
+            .names(), ["health", "weapon_select", "force_select", "inventory_select", "jk2_prongs"]);
     }
 
     #[test]
@@ -1811,7 +2202,7 @@ hides_native_hud = ['health', 'speedometer']
         *active.state.lock().unwrap() = Some(GameStateSnapshot {
             presented: Some(ps), authoritative: None, map_name: "t".into(), server_time: 1000,
             viewer_client: Some(0), is_live: true, is_demo: false, screen_size: [1920, 1080],
-            selected_weapon: None,
+            selected_weapon: None, selected_inventory: None, selected_force: None, inventory_jk2: false,
         });
         active.hud.lock().unwrap().widgets.get_mut("ups").unwrap().commands.clear();
         active.callback("on_update", None).unwrap();
@@ -1841,7 +2232,7 @@ hides_native_hud = ['health', 'speedometer']
         assert!(!valid_hud_image("gfx//a") && !valid_hud_image(&format!("gfx/{}", "a".repeat(80))));
         let widget = |names: &[&str]| PlacedHudWidget {
             widget: HudWidget { key: "k".into(), name: "n".into(), width: 10.0, height: 10.0,
-                anchor: HudAnchor::TopLeft,
+                anchor: HudAnchor::TopLeft, default_offset: [0.0, 0.0],
                 commands: names.iter().map(|n| HudCommand::Image { name: (*n).into(), x: 0.0, y: 0.0,
                     w: 1.0, h: 1.0, color: [1.0; 4] }).collect() },
             placement: HudPlacement::default(),
@@ -1860,12 +2251,56 @@ hides_native_hud = ['health', 'speedometer']
     }
 
     #[test]
+    fn reset_extension_placements_restores_authored_offsets_and_clears_inactive() {
+        let (tx, _commands) = mpsc::channel();
+        let (_response_tx, rx) = mpsc::channel();
+        let (frame_tx, _frames) = mpsc::sync_channel(1);
+        let key = "diabolic-hud/torch".to_string();
+        let mut manager = Manager {
+            root: PathBuf::new(), tx, rx, frame_tx, last_frame: None,
+            pending_events: VecDeque::new(), entries: Vec::new(), selected: None,
+            editor: String::new(), editor_dirty: false, new_id: String::new(),
+            diagnostic: String::new(),
+            hud_widgets: vec![HudWidget {
+                key: key.clone(), name: "Torch row".into(), width: 226.0,
+                height: 43.0, anchor: HudAnchor::BottomCenter,
+                default_offset: [0.0, -83.0], commands: Vec::new(),
+            }],
+            weapon_cycle: Vec::new(), hud_shaders: Vec::new(),
+            native_hidden: NativeHudMask::default(), hud_images: Vec::new(),
+            hud_preload: Vec::new(), hud_layouts: BTreeMap::new(),
+        };
+        let authored = manager.widget_placement(&key);
+        assert_eq!((authored.x, authored.y, authored.scale), (0.0, -83.0, 1.0));
+        manager.set_widget_placement(&key, HudPlacement {
+            x: 27.0, y: -42.0, scale: 1.6, visible: false,
+        });
+        assert!(manager.reset_widget_placement(&key));
+        assert_eq!(manager.widget_placement(&key), authored);
+        assert!(!manager.reset_widget_placement(&key));
+        manager.set_widget_placement(&key, HudPlacement {
+            x: 12.0, y: -50.0, scale: 0.7, visible: true,
+        });
+        manager.hud_layouts.insert("inactive/old".into(), HudPlacement::default());
+        assert!(manager.reset_all_widget_placements());
+        assert!(manager.hud_layouts.is_empty());
+        assert_eq!(manager.widget_placement(&key), authored);
+        assert!(!manager.reset_all_widget_placements());
+    }
+
+    #[test]
     fn right_anchored_widgets_hug_the_corner_and_grow_inward() {
         let place = HudPlacement::for_anchor(HudAnchor::BottomRight);
         assert_eq!(hud_widget_origin(HudAnchor::BottomRight, place, 100.0, 50.0, 1920.0, 1080.0), (1820.0, 1030.0));
+        assert_eq!(hud_widget_origin(HudAnchor::BottomCenter, HudPlacement::for_anchor(HudAnchor::BottomCenter),
+            100.0, 50.0, 1920.0, 1080.0), (910.0, 1030.0));
         let scaled = HudPlacement { scale: 2.0, ..place };
         assert_eq!(hud_widget_origin(HudAnchor::BottomRight, scaled, 100.0, 50.0, 1920.0, 1080.0), (1720.0, 980.0));
         assert_eq!(hud_widget_origin(HudAnchor::TopLeft, HudPlacement::default(), 100.0, 50.0, 1920.0, 1080.0), (24.0, 150.0));
+        let mut above = HudPlacement::for_anchor(HudAnchor::BottomCenter);
+        above.y -= 81.0;
+        assert_eq!(hud_widget_origin(HudAnchor::BottomCenter, above, 207.0, 39.0, 1920.0, 1080.0),
+            (856.5, 960.0));
     }
 
     #[test]

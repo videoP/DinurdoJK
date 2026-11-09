@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+// r_perfTrace prints detailed CPU encode timings at 1 Hz. It owns NO capture
+// files and is OFF by default; no additional timer calls in normal gameplay.
+static LIVE_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(in crate::renderer) fn set_live_trace(enabled: bool) {
+    LIVE_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 // Separately trace only the first map frame. Do not arm a performance capture,
 // write any files, or affect the existing capture's ownership of its flag.
 static FIRST_WORLD_FRAME_TRACE: AtomicBool = AtomicBool::new(false);
@@ -24,11 +32,12 @@ pub(crate) fn first_world_frame_trace() -> bool {
 pub(in crate::renderer) fn enabled() -> bool {
     CAPTURE_ENABLED.load(Ordering::Relaxed)
         || FIRST_WORLD_FRAME_TRACE.load(Ordering::Relaxed)
+        || LIVE_TRACE_ENABLED.load(Ordering::Relaxed)
 }
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 240] = [
+const FIELDS: [&str; 257] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -269,6 +278,24 @@ const FIELDS: [&str; 240] = [
     "camera_z",
     "camera_yaw",
     "camera_pitch",
+    // APPEND ONLY: audit_summary uses stable legacy numeric indices.
+    "encode_scene_before_world_ms",
+    "encode_scene_world_branch_ms",
+    "encode_scene_after_world_ms",
+    "encode_post_native_ui_ms",
+    "followup_egui_ms",
+    "followup_native_ui_ms",
+    "followup_other_ms",
+    "early_present_copy_ms",
+    "prepare_early_checks_ms",
+    "model_draw_encode_ms",
+    "rgb565_requested",
+    "rgb565_effective",
+    "native_ui_vertices",
+    "screen_fx_vertices",
+    "egui_paint_jobs",
+    "shitter_texture_pipeline_ready",
+    "shitter_native_enabled",
 ];
 
 /// Render-thread loop sections around `Renderer::render()`, measured only
@@ -585,6 +612,27 @@ impl PerfRow {
                 camera.position.z as f64,
                 camera.yaw as f64,
                 camera.pitch as f64,
+                info.perf_scene_before_world_ms,
+                info.perf_scene_world_branch_ms,
+                info.perf_scene_after_world_ms,
+                info.perf_post_native_ui_ms,
+                info.perf_followup_egui_ms,
+                info.perf_followup_native_ui_ms,
+                (info.perf_followup_ms - info.perf_followup_egui_ms
+                    - info.perf_followup_native_ui_ms).max(0.0),
+                info.perf_early_present_copy_ms,
+                info.perf_prepare_early_checks_ms,
+                renderer.dynamic_model_renderer.perf_phase_cpu_ms.get(),
+                f64::from(crate::renderer::rgb565_requested()),
+                f64::from(u8::from(crate::renderer::rgb565_effective())),
+                (renderer.ui_vertex_count as u64 + renderer.ui_dynamic_vertex_count as u64
+                    + renderer.ui_transient_vertex_count as u64) as f64,
+                (renderer.screen_fx_vertex_count as u64
+                    + renderer.enemy_icon_vertex_count as u64) as f64,
+                renderer.egui_paint_jobs.len() as f64,
+                f64::from(u8::from(renderer.collision_world_pipeline.as_ref()
+                    .is_some_and(|pipeline| pipeline.textured.is_some()))),
+                f64::from(u8::from(crate::renderer::collision_world_only())),
             ],
             gpu_passes: std::array::from_fn(|pass| {
                 gpu_timing.and_then(|timing| timing.milliseconds[pass]).unwrap_or(f64::NAN)
@@ -1114,8 +1162,34 @@ impl PerfCapture {
                 })
             });
         }
+        // Rank actual exclusive CPU intervals (not the inclusive world/model
+        // counters) so the CSV/JSON directly identifies the biggest costs.
+        // This ranking is by mean CPU cost; GPU pass durations are separate.
+        let exclusive_names = [
+            "cpu_prepare_ms", "cpu_acquire_ms", "encode_setup_ms",
+            "encode_pre_world_ms", "encode_scene_before_world_ms",
+            "encode_scene_world_branch_ms", "encode_scene_after_world_ms",
+            "encode_post_ui_ms", "encoder_finish_ms",
+            "profiler_readback_encode_ms", "encode_other_ms",
+            "primary_submit_api_ms", "followup_ms", "present_ms",
+        ];
+        let mut ranked_cpu: Vec<_> = exclusive_names.into_iter().filter_map(|name| {
+            let index = FIELDS.iter().position(|field| *field == name)?;
+            let values: Vec<_> = self.frames.iter()
+                .map(|row| row.numbers[index]).filter(|value| value.is_finite()).collect();
+            (!values.is_empty()).then(|| serde_json::json!({
+                "name": name,
+                "mean_ms": values.iter().sum::<f64>() / values.len() as f64,
+            }))
+        }).collect();
+        ranked_cpu.sort_unstable_by(|a, b| {
+            b["mean_ms"].as_f64().unwrap_or(0.0)
+                .total_cmp(&a["mean_ms"].as_f64().unwrap_or(0.0))
+        });
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v11-audit",
+            "schema": "dinurdojk-cpu-renderperf-v12-deep-encode",
+            "ranked_cpu_intervals": ranked_cpu,
+            "ranked_cpu_note": "Followup includes egui/native UI, which are nested; do NOT add those subintervals to followup. World branch includes model draws. CPU times are command recording, not GPU shader cost. Acquire includes waiting for a surface image; causes require clear-only A/B.",
             "audit": self.audit_summary(),
             "sample_count": self.frames.len(),
             "requested_seconds": self.target_duration.map(|d| d.as_secs_f64()),

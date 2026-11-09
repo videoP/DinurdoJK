@@ -353,7 +353,7 @@ impl Renderer {
                 taa: if self.taa_enabled { 1.0 } else if self.rt_taa_active() { 1.0 + self.rt_taa_mode as f32 } else { 0.0 },
             },
             taa_params: [
-                if self.hdr_enabled || self.native_atmosphere_active() || self.blue_water_environment.weather_backend == 1 { 1.0 } else { 0.0 },
+                if self.gameplay_scene_format() == wgpu::TextureFormat::Rgba16Float { 1.0 } else { 0.0 },
                 if self.reflection_debug_enabled {
                     1.0
                 } else {

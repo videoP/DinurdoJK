@@ -113,20 +113,16 @@ fn vs_main(input: VertexIn) -> VertexOut {
     return output;
 }
 
-fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
-    // BSP LIGHTGRID is pre-applied to the transient vertex colors while the
-    // CPU packs each dynamic surface. Preserve the previous fragment-lighting
-    // placeholder only for irradiance-volume mode until dynamic models sample
-    // the actual ambient-cube data.
-    // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
-    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y) * sky_world_model_gain(normal), tex_in.a);
-    if (entity_lighting.values.x != 2u) {
-        return tex;
+fn lit_color(normal: vec3<f32>, world_position: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
+    // BSP Lightgrid is CPU-packed into vertex colors. Irradiance Volume mode
+    // instead samples the actual map's ambient-cube atlas in world space.
+    let sky_gain = sky_world_model_gain(normal, world_position);
+    let brightness = bitcast<f32>(entity_lighting.values.y);
+    if (entity_lighting.values.x == 2u) {
+        return vec4<f32>(tex_in.rgb * brightness * sky_gain
+            * model_irradiance_volume_light(world_position, normal), tex_in.a);
     }
-    let light_dir = normalize(vec3<f32>(0.35, 0.75, 0.55));
-    let diffuse = max(dot(normalize(normal), light_dir), 0.0);
-    let lighting = 0.32 + 0.68 * diffuse;
-    return vec4<f32>(tex.rgb * lighting, tex.a);
+    return vec4<f32>(tex_in.rgb * brightness * sky_gain, tex_in.a);
 }
 
 // OpenJK r_drawfog 2 applies GL_EXP2 hardware fog to entities too: their fog
@@ -209,7 +205,7 @@ fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     let color = fogged(
-        model_wet_color_with_water(studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
+        model_wet_color_with_water(studio_light_color(lit_color(input.normal, input.world_position, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
@@ -223,7 +219,7 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     let color = fogged(
-        model_wet_color_with_water(studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
+        model_wet_color_with_water(studio_light_color(lit_color(input.normal, input.world_position, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );

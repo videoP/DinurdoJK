@@ -523,7 +523,7 @@ impl DynamicModelRenderer {
 
                 if surface.raster_visible {
                     self.draws.push(DynamicPreparedDraw {
-                        entity_num: surface.entity_num,
+                        entity_num: surface.entity_num, portal_only: surface.portal_only,
                         first_index,
                         index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
                         base_vertex: i32::try_from(base_vertex).unwrap_or(i32::MAX),
@@ -591,7 +591,7 @@ impl DynamicModelRenderer {
             indices.extend_from_slice(surface.indices.as_slice());
             if surface.raster_visible {
                 self.draws.push(DynamicPreparedDraw {
-                    entity_num: surface.entity_num,
+                    entity_num: surface.entity_num, portal_only: surface.portal_only,
                     first_index,
                     index_count: u32::try_from(surface.indices.len()).unwrap_or(u32::MAX),
                     base_vertex: i32::try_from(base_vertex).unwrap_or(i32::MAX),

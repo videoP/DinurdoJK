@@ -37,7 +37,7 @@ pub(in crate::ui) fn hud_line(
     let make = |x: f32, y: f32| UiVertex {
         position: to_ndc(x, y),
         uv: [0.0, 0.0],
-        color,
+        color: UiVertex::pack_color(color),
         textured: 0.0,
     };
     let a = make(x0 + nx, y0 + ny);
@@ -91,29 +91,9 @@ pub(in crate::ui) fn build_force_select(
     w: u32,
     h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::ForceSelect) { return; }
     // OpenJK/TaystJK forcePowerSorted[] and CG_DrawForceSelect().
-    const FORCE_POWER_SORTED: [u8; 18] =
-        [5, 0, 10, 9, 11, 1, 2, 3, 4, 14, 7, 13, 8, 6, 12, 15, 16, 17];
-    const NAMES: [&str; 18] = [
-        "Heal",
-        "Levitation",
-        "Speed",
-        "Push",
-        "Pull",
-        "Mind Trick",
-        "Grip",
-        "Lightning",
-        "Rage",
-        "Protect",
-        "Absorb",
-        "Team Heal",
-        "Team Energize",
-        "Drain",
-        "Seeing",
-        "Saber Offense",
-        "Saber Defense",
-        "Saber Throw",
-    ];
+    use super::movement::{FORCE_POWER_SORTED, FORCE_POWER_NAMES};
     // JK2 source: CODE-mp/cgame/cg_draw.c showPowersName[] / CT_ICON_BLUE.
     const JK2_NAMES: [&str; 18] = [
         "Heal", "Jump", "Speed", "Push", "Pull", "Mind Trick", "Grip",
@@ -233,7 +213,7 @@ pub(in crate::ui) fn build_force_select(
 
     let is_jk2_native = ui.jk2_mode && ui.video.hud_style == 1;
     let name = if is_jk2_native { JK2_NAMES[usize::from(selector.selected)] }
-        else { NAMES[usize::from(selector.selected)] };
+        else { FORCE_POWER_NAMES[usize::from(selector.selected)] };
     let tint = if is_jk2_native { [0.567, 0.685, 1.0, 0.75] } else { [1.0; 4] };
     let text_y = 455.0 * sy;
     if let Some(font) = small_font {
@@ -485,6 +465,7 @@ mod icon_aspect_tests {
     #[test]
     fn force_selector_artwork_remains_square_on_widescreen() {
         let mut ui = UiSnapshot::default();
+        ui.video.draw_hud = true;
         ui.force_select = Some(crate::ui::UiForceSelect {
             selected: 5, known_bits: (1 << 5) | (1 << 2),
             remaining_ms: 1400,
@@ -500,5 +481,13 @@ mod icon_aspect_tests {
         let rh = yy.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
             - yy.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!((rw - rh).abs() < 0.01);
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["force_select".to_string()]).unwrap();
+        vertices.clear();
+        build_force_select(&mut vertices, &ui, None, w, h);
+        assert!(vertices.is_empty());
+        ui.video.draw_hud = false;
+        build_force_select(&mut vertices, &ui, None, w, h);
+        assert!(!vertices.is_empty());
     }
 }

@@ -3,7 +3,7 @@
 //! view models, icons, pickup sounds) come from the pinned JK2 item list.
 use jka_movement::ItemInfo;
 use jka_protocol::jk2::presentation;
-use std::{collections::HashMap, sync::OnceLock};
+use std::{collections::{BTreeMap, HashMap}, sync::OnceLock};
 
 const IT_WEAPON: i32 = 1;
 const IT_POWERUP: i32 = 5;
@@ -78,6 +78,54 @@ pub fn item_count() -> i32 {
     if jk2() { PRESENTED_ITEMS } else { jka_movement::bg_item_count() }
 }
 
+
+/// Inventory definitions for any HUD extension or built-in UI. All metadata
+/// comes from the active game's pinned OpenJK item list (including JK2's
+/// presentation-tag translation), never from a particular HUD's artwork.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldableDefinition {
+    pub item_index: i32,
+    pub tag: i32,
+    pub classname: String,
+    pub icon: String,
+    /// bg_itemlist.quantity is the pickup's definition, NOT a carried stack count.
+    pub pickup_quantity: i32,
+    pub selectable: bool,
+}
+
+/// BG_IsItemSelectable / CG_NextInventory exclusions. The server can own
+/// jetpacks and Siege dispensers, but they are not on the normal item wheel.
+pub fn holdable_selectable(tag: i32) -> bool {
+    (1..12).contains(&tag) && !matches!(tag, 7 | 8 | 9)
+}
+
+/// A stable, tag-ordered list of the active game's actual holdable definitions.
+/// It is built once per game (JKA or JK2); extension updates only copy this
+/// small static list and overlay the current playerstate ownership/selection.
+pub fn holdable_definitions() -> &'static [HoldableDefinition] {
+    static JKA: OnceLock<Vec<HoldableDefinition>> = OnceLock::new();
+    static JK2: OnceLock<Vec<HoldableDefinition>> = OnceLock::new();
+    let store = if jk2() { &JK2 } else { &JKA };
+    store.get_or_init(|| {
+        let mut by_tag = BTreeMap::<i32, HoldableDefinition>::new();
+        for index in 1..item_count() {
+            let Some(item) = item(index) else { continue };
+            if item.item_type != IT_HOLDABLE || !(1..12).contains(&item.tag) {
+                continue;
+            }
+            by_tag.entry(item.tag).or_insert_with(|| HoldableDefinition {
+                item_index: index,
+                tag: item.tag,
+                classname: item.classname,
+                icon: item_icon(index).unwrap_or_default(),
+                pickup_quantity: item.quantity,
+                selectable: holdable_selectable(item.tag),
+            });
+        }
+        by_tag.into_values().collect()
+    })
+}
+
 /// CG_InitG2Weapons: world_model[0] of the last IT_WEAPON item per tag.
 pub fn weapon_world_model(weapon: i32) -> Option<String> {
     static JKA: OnceLock<HashMap<i32, String>> = OnceLock::new();
@@ -116,6 +164,22 @@ pub fn tagged_icon(item_type: i32, tag: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holdable_catalog_keeps_native_tag_order_and_metadata() {
+        let defs = holdable_definitions();
+        assert!(defs.windows(2).all(|pair| pair[0].tag < pair[1].tag));
+        assert!(!defs.is_empty());
+        for entry in defs {
+            let native = item(entry.item_index).expect("native item index");
+            assert_eq!(native.item_type, IT_HOLDABLE);
+            assert_eq!(entry.tag, native.tag);
+            assert_eq!(entry.classname, native.classname);
+            assert_eq!(entry.icon, item_icon(entry.item_index).unwrap_or_default());
+            assert_eq!(entry.pickup_quantity, native.quantity);
+            assert_eq!(entry.selectable, holdable_selectable(entry.tag));
+        }
+    }
 
     #[test]
     fn jk2_items_keep_jk2_assets_under_presentation_ids() {

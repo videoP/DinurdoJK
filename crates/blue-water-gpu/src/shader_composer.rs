@@ -336,6 +336,11 @@ pub const SURFACE_GODOT_WATER: u32 = 1 << 30;
 /// Opt-in FFT Hybrid material with Godot-style GGX, simple foam and filtered
 /// environment reflection. Geometry and every displacement consumer stay native.
 pub const SURFACE_FAST_HYBRID: u32 = 1 << 31;
+/// Compact Hybrid mode 3: per-pixel footprint LOD + inexpensive glints.
+/// Bit 29 is already a *native-only* diagnostic; compact Hybrid never uses
+/// native wave-statistics transforms. This alias avoids widening the 32-bit
+/// pipeline-key mask or introducing new bind groups. Do not set it by itself.
+pub const SURFACE_ADAPTIVE_HYBRID: u32 = SURFACE_WAVE_STATISTICS_DEBUG;
 /// `SURFACE_GODOT_WATER` cost probe (a bit the Blue Water probes leave free): the per-pixel wave frame stubbed (flat).
 pub const COST_PROBE_GODOT_PIXEL: u32 = 1 << 14;
 /// The cost probes that rewrite the FFT wave sample or the foam stack, which `SURFACE_GODOT_WATER` has replaced.
@@ -853,6 +858,10 @@ fn compose_surface_probed(
         ("REFLECTION_STEPS".to_owned(), ShaderDefValue::UInt(reflection_steps)),
     ];
     let fast_hybrid = cost_probe & SURFACE_FAST_HYBRID != 0 && cost_probe & SURFACE_GODOT_WATER == 0;
+    let adaptive_hybrid = fast_hybrid && cost_probe & SURFACE_ADAPTIVE_HYBRID != 0;
+    if adaptive_hybrid {
+        shader_defs.push(("JKA_ADAPTIVE_HYBRID".to_owned(), ShaderDefValue::UInt(1)));
+    }
     if fast_hybrid && cost_probe & COST_PROBE_SSR == 0 {
         shader_defs.push(("JKA_FAST_SSR".to_owned(), ShaderDefValue::UInt(1)));
     }
@@ -899,7 +908,7 @@ fn compose_surface_probed(
         // Cost probes alone (no lossless/lossy variant bits) decide whether reduced modes split the glints.
         let probe_only = cost_probe & !SURFACE_GODOT_WATER;
         let cost_probe = if fast_hybrid {
-            cost_probe & (SURFACE_FAST_HYBRID | COST_PROBE_SSR | COST_PROBE_FLOOR)
+            cost_probe & (SURFACE_FAST_HYBRID | SURFACE_ADAPTIVE_HYBRID | COST_PROBE_SSR | COST_PROBE_FLOOR)
         } else if godot { cost_probe & !GODOT_REPLACED_PROBES } else { cost_probe };
         let original = if godot { jka_godot_material(&original, cost_probe) } else { original };
         // Reduced-resolution variants execute the original *entire* material
@@ -944,7 +953,7 @@ fn compose_surface_probed(
             "return mix(color, aerial_apply(color, world), jka_water_sky_admission(world.xz));",
         ).replace(
             "let sky = shelter_reflect(contact, sky_lobe(sky_atlas, sky_sampler, sky_env, lobe));",
-            "let sky = shelter_reflect(contact, sky_lobe(sky_atlas, sky_sampler, sky_env, lobe)) * jka_admission;",
+            "let sky = shelter_reflect(contact, sky_lobe(sky_atlas, sky_sampler, sky_env, lobe)) * (jka_admission * jka_hybrid.breaker.w);",
         );
         let core = core.replace(entry, &format!("{entry}{admission}\n    let jka_admission = jka_water_sky_admission(input.grid);"));
         let core = if near_detail {
@@ -1359,7 +1368,10 @@ mod tests {
     #[test]
     fn fast_hybrid_material_validates_with_and_without_reflections() {
         for probe in [SURFACE_FAST_HYBRID, SURFACE_FAST_HYBRID | COST_PROBE_SSR,
-            SURFACE_FAST_HYBRID | FAR_SHADER_DEFAULT, SURFACE_FAST_HYBRID | COST_PROBE_FLOOR] {
+            SURFACE_FAST_HYBRID | FAR_SHADER_DEFAULT, SURFACE_FAST_HYBRID | COST_PROBE_FLOOR,
+            SURFACE_FAST_HYBRID | SURFACE_ADAPTIVE_HYBRID,
+            SURFACE_FAST_HYBRID | SURFACE_ADAPTIVE_HYBRID | COST_PROBE_SSR,
+            SURFACE_FAST_HYBRID | SURFACE_ADAPTIVE_HYBRID | FAR_SHADER_DEFAULT] {
             let mut composer = composer_with_surface_probes(probe, 1).expect("modules");
             let module = jka_surface_module_with_probe(&mut composer, 16, 0, probe)
                 .unwrap_or_else(|error| panic!("fast Hybrid {probe:#x}: {}", error.emit_to_string(&composer)));

@@ -985,8 +985,8 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_footer(&mut self, root: &mut egui::Ui) {
-        let on_video = self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
-        let restart = on_video && self.video_restart_required();
+        let in_setup = self.egui_display_overlay() == OverlayMode::Video;
+        let restart = in_setup && self.video_restart_required();
         let pending_video_changes = if restart {
             self.pending_video_changes()
         } else {
@@ -995,7 +995,8 @@ impl App {
         debug_assert_eq!(restart, !pending_video_changes.is_empty());
         // Only prepared map data is staged: Apply reloads the map in place and
         // leaves the renderer and window alone.
-        let map_only = restart && !self.display_restart_required() && self.map_reprep_wanted();
+        let map_only = restart && !self.display_restart_required()
+            && !self.framebuffer_format_restart_pending() && self.map_reprep_wanted();
         let footer = self.menu_shell(root.ctx()).footer;
         super::shell_layout::region(root, "jka_menu_footer", footer, |ui| {
                 let rect = ui.max_rect();
@@ -1015,7 +1016,7 @@ impl App {
                         "Renderer changes are staged. Apply Video Settings to rebuild required resources."
                     } else if self.front_end {
                         "ESC returns to the main menu.  ` opens the console."
-                    } else if on_video {
+                    } else if in_setup {
                         "Settings apply immediately.  ESC closes Setup."
                     } else {
                         "ESC goes back.  ` opens the console."

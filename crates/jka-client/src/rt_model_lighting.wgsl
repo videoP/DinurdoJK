@@ -2,7 +2,7 @@
 // Baked lightgrid is already in input.color. Local light uses the original
 // material tint, so a dark lightgrid cannot suppress a nearby saber or lamp.
 fn rt_model_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
-    let base = lit_color(input.normal, tex) * input.color;
+    let base = lit_color(input.normal, input.world_position, tex) * input.color;
     if (camera.render_flags.x != 0u || lighting_settings.values.x == 0u || lighting_settings.values.y == 0u) {
         return base;
     }

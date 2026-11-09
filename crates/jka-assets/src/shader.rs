@@ -111,6 +111,9 @@ pub enum AlphaGen {
     /// light. Near zero away from a highlight, so a `GL_SRC_ALPHA GL_ONE` stage
     /// using it only adds a glint. World surfaces treat it like identity.
     LightingSpecular,
+    /// TaystJK AGEN_PORTAL: vertex alpha is the distance to the view origin
+    /// divided by the authored portal range (default 256 world units).
+    Portal(f32),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -172,6 +175,27 @@ impl Bulge {
 pub struct VertexWave {
     pub div: f32,
     pub wave: Wave,
+}
+
+/// TaystJK `deformVertexes move x y z <wave>`: translate the entire tessellation
+/// by `vector * EvalWaveForm(wave)` in JKA map space. Unlike wave/bulge the
+/// displacement is identical for every vertex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveDeform {
+    pub vector: [f32; 3],
+    pub wave: Wave,
+}
+
+impl MoveDeform {
+    /// Exact conservative extent for all bounded legacy waveforms. Noise is
+    /// also bounded within [-1,1]; this is deliberately a culling bound,
+    /// not a guess at a specific animation frame.
+    pub fn bounds(self) -> ([f32; 3], [f32; 3]) {
+        let low = self.wave.base - self.wave.amplitude.abs();
+        let high = self.wave.base + self.wave.amplitude.abs();
+        let v = [self.vector[0], self.vector[2], -self.vector[1]];
+        (v.map(|x| (x * low).min(x * high)), v.map(|x| (x * low).max(x * high)))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -274,12 +298,18 @@ pub struct Stage {
     pub color: Option<[f32; 3]>,
     pub rgb_gen: RgbGen,
     pub alpha_gen: AlphaGen,
+    /// `rgbGen vertex` inherits vertex alpha only if no alphaGen was authored
+    /// earlier. Preserve the authored/default distinction for both defaults.
+    pub rgb_gen_explicit: bool,
+    pub alpha_gen_explicit: bool,
     /// Portal alpha (distance / portalRange) applies to this shader stage.
     pub alpha_portal: bool,
     pub tc_gen: TcGen,
     pub tc_mods: Vec<TcMod>,
     pub depth_write: bool,
     pub depth_equal: bool,
+    /// `depthFunc disable`: GL disables depth testing *and* depth writes.
+    pub depth_test_disabled: bool,
     /// OpenJK/Rend2 stage marker used by the glow/bloom path.
     pub glow: bool,
     /// Classic id Tech 3 `detail` marker. Jedi Academy content rarely uses it,
@@ -383,6 +413,10 @@ pub struct Shader {
     pub bulge: Option<Bulge>,
     /// `deformVertexes wave`. JKA model shaders author at most one.
     pub vertex_wave: Option<VertexWave>,
+    /// `deformVertexes move`: the shader vertex path handles the waveform at draw time.
+    pub move_deform: Option<MoveDeform>,
+    /// `deformVertexes autoSprite`: independent quads face the view on both axes.
+    pub auto_sprite: bool,
     /// `deformVertexes autoSprite2`: billboard rectangular quads about their long axis.
     pub auto_sprite2: bool,
     pub stages: Vec<Stage>,
@@ -683,6 +717,13 @@ fn surface_sprite_value(args: &[String], name: &str) -> Result<f32, String> {
         .ok_or_else(|| format!("invalid {name} value"))
 }
 
+/// TaystJK ParseStage: only source ONE or SRC_ALPHA selects identityLighting
+/// for an unspecified rgbGen. `blendFunc add|blend` are shorthand for these.
+fn default_rgb_identity_lighting(blend: &str) -> bool {
+    let mut parts = blend.split_whitespace();
+    matches!(parts.next(), Some("add" | "blend" | "gl_one" | "one" | "gl_src_alpha" | "src_alpha"))
+}
+
 /// Quake shader statements are line-oriented; braces delimit shaders and stages.
 pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
     parse_tokens_strict(&tokenize(text)?)
@@ -797,7 +838,14 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                 }
                 "}" => {
                     cursor += 1;
-                    if let Some(stage) = stage.take() {
+                    if let Some(mut stage) = stage.take() {
+                        // TaystJK ParseStage defaults an unspecified rgbGen to
+                        // identityLighting when the source blend factor is ONE
+                        // or SRC_ALPHA, otherwise identity. This applies *after*
+                        // every authored directive; alphaGen remains independent.
+                        if !stage.rgb_gen_explicit && default_rgb_identity_lighting(&stage.blend) {
+                            stage.rgb_gen = RgbGen::IdentityLighting;
+                        }
                         shader.stages.push(stage);
                         continue;
                     }
@@ -818,6 +866,17 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
             if let Some(stage) = &mut stage {
+                // Do not treat a misspelled/unsupported generator as authored.
+                // This also preserves alphaGen identity authored before rgbGen vertex.
+                if key == "alphagen" && matches!(first.as_str(),
+                    "const" | "identity" | "entity" | "oneminusentity" | "vertex" |
+                    "oneminusvertex" | "wave" | "portal" | "lightingspecular" | "dot" | "oneminusdot")
+                { stage.alpha_gen_explicit = true; }
+                if key == "rgbgen" && matches!(first.as_str(),
+                    "const" | "identity" | "identitylighting" | "vertex" | "vertexlit" |
+                    "exactvertex" | "exactvertexlit" | "oneminusvertex" | "entity" |
+                    "oneminusentity" | "wave" | "lightingdiffuse" | "lightingdiffuseentity")
+                { stage.rgb_gen_explicit = true; }
                 match key.as_str() {
                     "map" | "clampmap" => {
                         stage.image = first;
@@ -947,6 +1006,7 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                         shader.portal_range = Some(args.get(1).and_then(|s| s.parse::<f32>().ok())
                             .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(256.0));
                         stage.alpha_portal = true;
+                        stage.alpha_gen = AlphaGen::Portal(shader.portal_range.unwrap_or(256.0));
                     }
                     "alphagen" if first == "identity" => stage.alpha_gen = AlphaGen::Identity,
                     "alphagen" if first == "lightingspecular" => {
@@ -962,9 +1022,10 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                         .unsupported
                         .push(format!("alphagen {}", args.join(" "))),
                     "rgbgen" if first == "vertex" || first == "vertexlit" => {
-                        // Preserve Rend2's vertex-color modulation semantics here. BSP
-                        // LIGHTMAP_BY_VERTEX handling is applied separately by scene prep.
-                        stage.rgb_gen = RgbGen::Vertex
+                        // TaystJK only inherits vertex alpha when alphaGen has
+                        // not already been explicitly specified.
+                        stage.rgb_gen = RgbGen::Vertex;
+                        if !stage.alpha_gen_explicit { stage.alpha_gen = AlphaGen::Vertex; }
                     }
                     "rgbgen" if first == "exactvertex" || first == "exactvertexlit" => {
                         // exactVertexLit is the Rend2 counterpart of exactVertex.
@@ -1173,9 +1234,19 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                     }
                     "depthwrite" => stage.depth_write = true,
                     "glow" => stage.glow = true,
-                    "depthfunc" if first == "equal" => stage.depth_equal = true,
+                    "depthfunc" if first == "equal" => {
+                        stage.depth_equal = true;
+                        stage.depth_test_disabled = false;
+                    },
                     // The ordinary LEQUAL comparison is already the WGPU default.
-                    "depthfunc" if first == "lequal" => stage.depth_equal = false,
+                    "depthfunc" if first == "lequal" => {
+                        stage.depth_equal = false;
+                        stage.depth_test_disabled = false;
+                    },
+                    "depthfunc" if first == "disable" => {
+                        stage.depth_equal = false;
+                        stage.depth_test_disabled = true;
+                    },
                     "depthfunc" => stage.unsupported.push(format!("depthfunc {first}")),
                     "detail" => stage.detail = true,
                     _ => stage.unsupported.push(key),
@@ -1332,6 +1403,25 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                             _ => shader.unsupported.push(format!("deformvertexes wave {}", args[1..].join(" "))),
                         }
                     }
+                    "deformvertexes" | "deform" if first == "move" => {
+                        // TaystJK ParseDeform reads exactly three vector values
+                        // followed by the usual five-token waveform.
+                        if args.len() == 9 {
+                            let vector = args[1..4].iter().map(|s| s.parse::<f32>()).collect::<Result<Vec<_>, _>>();
+                            let wave = parse_wave(&args[4..]);
+                            match (vector, wave) {
+                                (Ok(v), Some(wave)) if v.iter().all(|n| n.is_finite()) && shader.move_deform.is_none() => {
+                                    shader.move_deform = Some(MoveDeform { vector: [v[0], v[1], v[2]], wave });
+                                }
+                                _ => shader.unsupported.push(format!("deformvertexes move {}", args[1..].join(" "))),
+                            }
+                        } else {
+                            shader.unsupported.push(format!("deformvertexes move {}", args[1..].join(" ")));
+                        }
+                    }
+                    "deformvertexes" | "deform" if first == "autosprite" && args.len() == 1 => {
+                        shader.auto_sprite = true;
+                    }
                     "deformvertexes" | "deform" if first == "autosprite2" && args.len() == 1 => {
                         shader.auto_sprite2 = true;
                     }
@@ -1342,6 +1432,15 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
         }
         if !closed {
             return Err(format!("unterminated shader {name}"));
+        }
+        if shader.move_deform.is_some()
+            && (shader.auto_sprite || shader.auto_sprite2
+                || shader.bulge.is_some() || shader.vertex_wave.is_some())
+        {
+            // The WGPU world path currently applies one move transform, not
+            // TaystJK's ordered deformation list. Never quietly claim parity
+            // for a material where the operation order changes the result.
+            shader.unsupported.push("ordered deformvertexes combination containing move".into());
         }
         shader.definition_text = Some(format_definition_tokens(
             &tokens[definition_start..cursor],
@@ -1476,6 +1575,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_move_deform_and_bounds_in_render_coordinates() {
+        let scripts = parse("textures/mover {\ndeformVertexes move 10 20 30 sin 0.5 0.25 0 1\n}\n").unwrap();
+        let shader = &scripts["textures/mover"];
+        assert!(shader.unsupported.is_empty());
+        let mover = shader.move_deform.unwrap();
+        assert_eq!(mover.vector, [10.0, 20.0, 30.0]);
+        assert_eq!(mover.wave.func, WaveFunc::Sin);
+        assert_eq!(mover.wave.frequency, 1.0);
+        let (lower, upper) = mover.bounds();
+        assert_eq!(lower, [2.5, 7.5, -15.0]);
+        assert_eq!(upper, [7.5, 22.5, -5.0]);
+    }
+
+    #[test]
+    fn flags_move_combined_with_other_deformations_until_ordered_port_exists() {
+        let scripts = parse("textures/mover {\ndeformVertexes move 1 0 0 sin 0 1 0 1\ndeformVertexes wave 10 sin 0 1 0 1\n}\n").unwrap();
+        let shader = &scripts["textures/mover"];
+        assert!(shader.move_deform.is_some());
+        assert!(shader.vertex_wave.is_some());
+        assert!(shader.unsupported.iter().any(|warning| warning.contains("ordered deformvertexes")));
+    }
+
+    #[test]
+    fn rejects_invalid_or_repeated_move_without_silently_overwriting_it() {
+        let scripts = parse("textures/mover {\ndeformVertexes move 1 0 0 sin 0 1 0 1\ndeformVertexes move 0 1 0 sin 0 1 0 1\n}\n").unwrap();
+        let shader = &scripts["textures/mover"];
+        assert_eq!(shader.move_deform.unwrap().vector, [1.0, 0.0, 0.0]);
+        assert_eq!(shader.unsupported.len(), 1);
+    }
+
+    #[test]
     fn parses_deform_vertexes_bulge() {
         let shaders = parse(
             "gfx/misc/electric {\nqer_editorimage gfx/misc/lightning3\ncull twosided\ndeformvertexes bulge 0 2 0\n{\nmap gfx/misc/lightning3\nblendFunc GL_ONE GL_ONE\n}\n}\n",
@@ -1507,6 +1637,39 @@ mod tests {
     }
 
     #[test]
+    fn taystjk_vertex_alpha_default_preserves_explicit_alpha() {
+        let definitions = parse(concat!(
+            "textures/test/implicit {\n{\nmap textures/a\nrgbGen vertex\n}\n}\n",
+            "textures/test/before {\n{\nmap textures/a\nalphaGen identity\nrgbGen vertex\n}\n}\n",
+            "textures/test/after {\n{\nmap textures/a\nrgbGen vertex\nalphaGen identity\n}\n}\n",
+        )).unwrap();
+        assert_eq!(definitions["textures/test/implicit"].stages[0].alpha_gen, AlphaGen::Vertex);
+        assert_eq!(definitions["textures/test/before"].stages[0].alpha_gen, AlphaGen::Identity);
+        assert_eq!(definitions["textures/test/after"].stages[0].alpha_gen, AlphaGen::Identity);
+    }
+
+    #[test]
+    fn taystjk_default_rgb_from_blend_source() {
+        let definitions = parse(concat!(
+            "textures/test/add {\n{\nmap textures/a\nblendFunc GL_ONE GL_ONE\n}\n}\n",
+            "textures/test/alpha {\n{\nmap textures/a\nblendFunc blend\n}\n}\n",
+            "textures/test/filter {\n{\nmap textures/a\nblendFunc filter\n}\n}\n",
+            "textures/test/explicit {\n{\nmap textures/a\nblendFunc add\nrgbGen identity\n}\n}\n",
+        )).unwrap();
+        assert_eq!(definitions["textures/test/add"].stages[0].rgb_gen, RgbGen::IdentityLighting);
+        assert_eq!(definitions["textures/test/alpha"].stages[0].rgb_gen, RgbGen::IdentityLighting);
+        assert_eq!(definitions["textures/test/filter"].stages[0].rgb_gen, RgbGen::Identity);
+        assert_eq!(definitions["textures/test/explicit"].stages[0].rgb_gen, RgbGen::Identity);
+    }
+
+    #[test]
+    fn taystjk_depthfunc_disable_is_render_state() {
+        let shaders = parse("textures/test/overlay {\n{\nmap textures/a\ndepthFunc disable\n}\n}\n").unwrap();
+        assert!(shaders["textures/test/overlay"].stages[0].depth_test_disabled);
+        assert!(!shaders["textures/test/overlay"].stages[0].depth_equal);
+    }
+
+    #[test]
     fn parses_autosprite2_deform() {
         let shaders = parse("textures/test/tree {\ndeformVertexes autoSprite2\n}\n").unwrap();
         assert!(shaders["textures/test/tree"].auto_sprite2);
@@ -1514,9 +1677,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_autosprite_deform() {
+        let shaders = parse("textures/test/flare {\ndeformVertexes autoSprite\n}\n").unwrap();
+        assert!(shaders["textures/test/flare"].auto_sprite);
+        assert!(!shaders["textures/test/flare"].auto_sprite2);
+        assert!(shaders["textures/test/flare"].unsupported.is_empty());
+    }
+
+    #[test]
     fn unrecognized_deform_is_recorded_unsupported() {
-        let shaders = parse("textures/test/wave {\ndeformvertexes autosprite\n}\n").unwrap();
-        assert_eq!(shaders["textures/test/wave"].unsupported, ["deformvertexes autosprite"]);
+        let shaders = parse("textures/test/wave {\ndeformvertexes text0\n}\n").unwrap();
+        assert_eq!(shaders["textures/test/wave"].unsupported, ["deformvertexes text0"]);
     }
 
     #[test]
@@ -1994,7 +2165,8 @@ rgbGen lightingDiffuse
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].rgb_gen, RgbGen::LightingDiffuse);
         assert_eq!(stages[0].alpha_gen, AlphaGen::Identity);
-        assert_eq!(stages[1].rgb_gen, RgbGen::Identity);
+        // An unspecified rgbGen with source SRC_ALPHA defaults to identityLighting.
+        assert_eq!(stages[1].rgb_gen, RgbGen::IdentityLighting);
         assert_eq!(stages[1].alpha_gen, AlphaGen::Const);
         assert_eq!(stages[1].alpha, Some(0.05));
         assert_eq!(stages[1].tc_gen, TcGen::Environment);

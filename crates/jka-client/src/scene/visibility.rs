@@ -99,7 +99,7 @@ pub(in crate::scene) fn auto4_piece_owners(
     owners
 }
 
-pub(in crate::scene) fn auto4_source_bounds(
+pub(crate) fn auto4_source_bounds(
     source: &DrawBatch,
     vertices: &[GpuVertex],
 ) -> ([f32; 3], [f32; 3]) {
@@ -113,9 +113,28 @@ pub(in crate::scene) fn auto4_source_bounds(
     let mut minimum = [f32::INFINITY; 3];
     let mut maximum = [f32::NEG_INFINITY; 3];
     for vertex in &vertices[start..end] {
+        // Camera-facing quads store their center/long-axis midpoint instead of
+        // their visible corners. Expand conservatively in all dimensions so
+        // AUTO4/GPU frustum culling cannot remove a visible billboard edge.
+        let billboard_radius = if source.pipeline.auto_sprite && vertex.normal[2] == -1337.0 {
+            vertex.normal[0].hypot(vertex.normal[1])
+        } else if source.pipeline.auto_sprite2 && vertex.lightmap_uv[1] == -1337.0 {
+            vertex.lightmap_uv[0].abs()
+        } else if source.pipeline.auto_sprite2 && vertex.normal[2] > 2048.0 {
+            (vertex.normal[2] - 8192.0).abs()
+        } else {
+            0.0
+        };
         for axis in 0..3 {
-            minimum[axis] = minimum[axis].min(vertex.position[axis]);
-            maximum[axis] = maximum[axis].max(vertex.position[axis]);
+            minimum[axis] = minimum[axis].min(vertex.position[axis] - billboard_radius);
+            maximum[axis] = maximum[axis].max(vertex.position[axis] + billboard_radius);
+        }
+    }
+    if let Some(deform) = source.move_deform {
+        let (lo, hi) = deform.bounds();
+        for axis in 0..3 {
+            minimum[axis] += lo[axis];
+            maximum[axis] += hi[axis];
         }
     }
     if source.foliage_wind {
@@ -176,6 +195,7 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         && a.specular_reflectance == b.specular_reflectance
         && a.parallax_depth == b.parallax_depth
         && a.lightmap == b.lightmap
+        && a.lightstyle_slot == b.lightstyle_slot
         && a.modulate_lightmap == b.modulate_lightmap
         && a.dlight_in_lightmap_stage == b.dlight_in_lightmap_stage
         && a.vertex_lit == b.vertex_lit
@@ -187,12 +207,14 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         && a.alpha_cutoff == b.alpha_cutoff
         && a.shader_time_offset == b.shader_time_offset
         && a.shader_clamp_time == b.shader_clamp_time
+        && a.move_deform == b.move_deform
         && a.no_picmip == b.no_picmip
         && a.authored_environment_composite == b.authored_environment_composite
         && a.fog == b.fog
         && a.fog_is_global == b.fog_is_global
         && a.fog_color_override == b.fog_color_override
         && a.legacy2_fog_in_stage_safe == b.legacy2_fog_in_stage_safe
+        && a.legacy_additive_only == b.legacy_additive_only
         && a.global_fog_post_eligible == b.global_fog_post_eligible
         && a.skybox == b.skybox
 }

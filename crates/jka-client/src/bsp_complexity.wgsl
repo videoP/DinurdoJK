@@ -18,6 +18,8 @@ struct Material {
     ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
     ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
     ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
+    deform_move_vector: vec4<f32>,
+    deform_move_wave: vec4<f32>,
 };
 
 @group(1) @binding(0) var base_texture: texture_2d<f32>;

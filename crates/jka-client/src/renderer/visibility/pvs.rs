@@ -1,7 +1,7 @@
 //! Visibility pvs.
 use crate::renderer::{
     auto4_accept_collapse, scene, Auto4CollapseRequest, Auto4GeometryState, Auto4PlanStats, Camera,
-    PreparedPortalPlanBatchRef, PvsMode, WorldBatch, WorldGpu,
+    PreparedPortalPlanBatchRef, PvsMode, WorldBatch, WorldGpu, DrawClass,
 };
 
 pub(in crate::renderer) fn visible_batches_by_cluster(
@@ -30,6 +30,44 @@ pub(in crate::renderer) fn visible_batches_by_cluster(
         }
     }
     by_cluster
+}
+
+/// Conservative main-view sky reachability, prepared at map upload / live shader remap.
+/// Use the exact FULL PVS pieces when present, not AUTO 4's changing draw plan
+/// (or coarse merged stages, whose union can include sky from other rooms).
+/// A cluster with no sky source cannot draw an authored BSP sky polygon.
+/// The caller still preserves portals, water, reflections, and unknown PVS.
+pub(in crate::renderer) fn sky_reachability_by_cluster(
+    batches: &[WorldBatch], visible: &[Vec<usize>],
+) -> Vec<bool> {
+    let sky = batches.iter().map(|batch| {
+        !batch.is_inline_entity && batch.source.pipeline.class == DrawClass::Sky
+    }).collect::<Vec<_>>();
+    sky_reachability_from_mask(&sky, visible)
+}
+
+fn sky_reachability_from_mask(sky: &[bool], visible: &[Vec<usize>]) -> Vec<bool> {
+    visible.iter().map(|indices| {
+        // Missing indices are unexpected; fail open rather than remove sky.
+        indices.iter().any(|&index| sky.get(index).copied().unwrap_or(true))
+    }).collect()
+}
+
+#[cfg(test)]
+mod sky_reachability_tests {
+    use super::sky_reachability_from_mask;
+
+    #[test]
+    fn only_clusters_with_a_sky_source_are_marked() {
+        let sky = [false, true, false, true];
+        let visible = vec![vec![0, 2], vec![0, 1], vec![2, 3], vec![]];
+        assert_eq!(sky_reachability_from_mask(&sky, &visible), [false, true, true, false]);
+    }
+
+    #[test]
+    fn unexpected_source_indices_fail_open() {
+        assert_eq!(sky_reachability_from_mask(&[false], &[vec![37]]), [true]);
+    }
 }
 
 pub(in crate::renderer) fn update_visibility(

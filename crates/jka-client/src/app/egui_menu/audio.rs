@@ -93,6 +93,12 @@ impl App {
             "GAMEPLAY SOUNDS",
             "jaPRO / TaystJK voice and feedback options. They apply on every server and are archived to DinurdoJK.cfg.",
         );
+        self.audio_choice_row(
+            ui, "Underwater audio",
+            "s_underwater. Smooth low-pass and attenuation on gameplay sounds while the listener is submerged. Independent of Steam Audio/EAL; level music and UI stay unfiltered.",
+            "s_underwater", self.audio.underwater,
+            &[(0, "Off"), (1, "Subtle"), (2, "Normal"), (3, "Heavy")],
+        );
         const WHO: [(u8, &str); 4] = [(0, "Off"), (1, "Everyone"), (2, "Others"), (3, "Only me")];
         theme::row(
             ui,

@@ -35,6 +35,14 @@ impl App {
                         ui.add_space(3.0);
                     }
                 });
+                theme::row(ui, "Team HUD tint", "cg_tintHud. Tint native JK2/JKA HUD artwork or DinurdoJK panel borders red/blue according to your team. Team gametypes only; Siege excluded.", theme::Reset::None, |ui| {
+                    for (enabled, name) in [(false, "Off"), (true, "On")] {
+                        if theme::chip(ui, name, self.video.tint_hud == enabled).clicked() && self.video.tint_hud != enabled {
+                            let _ = self.set_console_cvar("cg_tintHud", if enabled { "1" } else { "0" });
+                        }
+                        ui.add_space(3.0);
+                    }
+                });
                 theme::row(
                     ui,
                     "HUD layout",

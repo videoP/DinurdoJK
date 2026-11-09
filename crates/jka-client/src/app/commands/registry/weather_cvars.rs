@@ -93,7 +93,8 @@ app_cvars! {
                 |app| CvarValue::String(App::cvar_get_r_grass(app)),
                 |app, value| App::cvar_set_r_grass(app, APP_R_GRASS.entry.name, &value.to_string()),
             )
-            .with_text_setter(App::cvar_set_r_grass, None),
+            .with_text_setter(App::cvar_set_r_grass, None)
+            .with_restart_requirement(|app| app.video.grass && !app.applied_grass),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.grass = parse_bool(value).unwrap_or(settings.grass)

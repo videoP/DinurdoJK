@@ -397,7 +397,6 @@ impl ApplicationHandler<UserEvent> for App {
                         window.request_redraw();
                     }
                 }
-                self.show_window_after_restart();
             }
             UserEvent::CompanionReady { id } => {
                 if self
@@ -421,15 +420,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.companion_target_enabled = false;
                 }
             }
-            UserEvent::BlueWaterThunder(volume) => {
+            UserEvent::BlueWaterThunder { volume, sample } => {
                 if self.renderer_restart_suspended {
                     return;
                 }
                 if self.video.blue_water_environment.weather_backend==1 {
-                    if let Some(sound)=self.game_session.as_mut().and_then(|s|s.sound_presenter.as_mut()) {sound.play_weather_thunder(volume);}
+                    if let Some(sound)=self.game_session.as_mut().and_then(|s|s.sound_presenter.as_mut()) {sound.play_weather_thunder(volume, sample);}
                 }
             }
+            UserEvent::RendererRestartLoadingPresented => {
+                self.retire_renderer_after_loading_screen();
+            }
             UserEvent::RendererFirstFrame => {
+                self.show_window_after_restart();
                 crate::startup_timeline::mark(crate::startup_timeline::Milestone::FirstPresent);
                 // The main HWND has now presented. Move the already-visible
                 // startup console behind it and release queued terminal output.
@@ -438,6 +441,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_gamma_focus();
                 if self.startup_first_frame_seen {
                     if self.front_end || self.live_without_world || self.demo_without_world {
+                        self.renderer_restart_loading = false;
                         if let Some(restart_started) = self.renderer_restart_started.take() {
                             let total_ms = restart_started.elapsed().as_secs_f64() * 1000.0;
                             println!(
@@ -621,6 +625,7 @@ impl ApplicationHandler<UserEvent> for App {
                 crate::logging::activate_console_output();
                 self.restore_gamma_before_restart();
                 self.renderer_restart_started = None;
+                self.renderer_restart_loading = false;
                 self.show_window_after_restart();
                 eprintln!("Renderer: {error}");
                 self.console_status = format!("RENDERER ERROR: {error}");
@@ -682,16 +687,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::SunBakeProgress { completed, stage } => {
-                self.sun_bake_ready_at = if stage == crate::renderer::SunBakeStage::Ready {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
                 self.sun_bake_progress = if stage == crate::renderer::SunBakeStage::Off {
                     None
                 } else {
                     Some((completed.min(1000), stage))
                 };
+                self.publish_ui();
+            }
+            UserEvent::BakedSunAutoStatus(status) => {
+                self.baked_sun_auto_status = status;
                 self.publish_ui();
             }
             UserEvent::StaticAoProgress { completed, total } => {
@@ -1674,6 +1678,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                // The new GPU world is now resident. Track upload-only settings
+                // independently of CPU map preparation and end the restart
+                // loading overlay only after a successful world presentation.
+                self.applied_texture_compression = self.video.texture_compression;
+                self.renderer_restart_loading = false;
                 // The renderer clears map-relative debug geometry on every
                 // upload, including reloads whose promoted descriptors match.
                 self.coastal_debug_sent = None;

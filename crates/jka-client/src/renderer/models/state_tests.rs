@@ -295,7 +295,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
             material_trace: None,
             entity_num: 7,
             wireframe_class: DynamicWireframeClass::Entity,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             vertices: Arc::new(Vec::new()),
             indices: Arc::new(Vec::new()),
             lighting_origin: None,
@@ -356,7 +356,7 @@ fn ghoul2_adaptive_batching_detects_real_savings_without_sampling() {
 
     fn surface(entity: u16, mesh: &str, alpha: Alpha) -> Ghoul2PendingDraw {
         Ghoul2PendingDraw {
-            entity_num: entity,
+            entity_num: entity, portal_only: false,
             mesh_key: Arc::from(mesh),
             texture_key: Some(Arc::from("common_skin")),
             alpha_mode: alpha,
@@ -420,7 +420,7 @@ fn ghoul2_material_sort_keeps_instance_keys_contiguous_and_ordered() {
     use bytemuck::Zeroable;
     let make = |seq: u32, mesh: &str, texture_id: u64, source: bool, alpha: Alpha| {
         Ghoul2PendingDraw {
-            entity_num: seq as u16,
+            entity_num: seq as u16, portal_only: false,
             mesh_key: Arc::from(mesh),
             texture_key: Some(Arc::from(format!("skin{texture_id}"))),
             alpha_mode: alpha,
@@ -476,7 +476,7 @@ fn cached_ghoul2_grouping_updates_every_frame_without_full_surface_sort() {
     use crate::renderer::{DynamicModelAlphaMode as Alpha, Ghoul2BatchMode, Ghoul2PendingDraw};
     use bytemuck::Zeroable;
     let make = |entity: u16, id: Option<u64>, alpha: Alpha, texture: u64| Ghoul2PendingDraw {
-        entity_num: entity,
+        entity_num: entity, portal_only: false,
         mesh_key: Arc::from(format!("mesh{}", id.unwrap_or(0))),
         texture_key: Some(Arc::from(format!("texture{texture}"))),
         alpha_mode: alpha,
@@ -541,7 +541,7 @@ fn cached_ghoul2_grouping_honors_wireframe_class_and_alpha() {
     use crate::renderer::{DynamicModelAlphaMode as Alpha, Ghoul2BatchMode, Ghoul2PendingDraw};
     use bytemuck::Zeroable;
     let make = |num: u16, alpha, wireframe_class, group| Ghoul2PendingDraw {
-        entity_num: num, mesh_key: Arc::from("model#surface1"),
+        entity_num: num, portal_only: false, mesh_key: Arc::from("model#surface1"),
         texture_key: Some(Arc::from("common_skin")),
         alpha_mode: alpha, wireframe_class, authored_glow: false,
         source_material: false, texture_binding_id: 1,

@@ -14,7 +14,7 @@ fn composed_lightmap_receiver(input: VertexOut) -> bool {
     return (lighting_settings.baked_sun_debug_mode.z & 3u) != 0u && lightmapped_shadow_receiver(input);
 }
 fn lightmapped_shadow_receiver(input: VertexOut) -> bool {
-    return input.shell_kind == 0u
+    return (material_flags_w() & 262144u) == 0u && input.shell_kind == 0u
         && ((material_flags() & (2u | 8388608u | 16777216u)) != 0u || material_tc_gen() == 1u);
 }
 fn baked_local_receiver(input: VertexOut) -> bool {

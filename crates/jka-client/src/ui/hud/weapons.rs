@@ -59,6 +59,7 @@ pub(in crate::ui) fn build_weapon_select(
     w: u32,
     h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::WeaponSelect) { return; }
     // The App has already applied the 1400ms WEAPON_SELECT_TIME, dead-player,
     // spectator/follow, and emplaced-gun gates. The selection UI is independent
     // of cg_drawHud, just as the already-ported force selector is.
@@ -166,6 +167,7 @@ mod tests {
     #[test]
     fn draws_icons_only_when_visible() {
         let mut ui = UiSnapshot::default();
+        ui.video.draw_hud = true;
         let mut vertices = Vec::new();
         build_weapon_select(&mut vertices, &ui, None, 1280, 720);
         assert!(vertices.is_empty());
@@ -173,6 +175,10 @@ mod tests {
         build_weapon_select(&mut vertices, &ui, None, 1280, 720);
         assert_eq!(vertices.iter().filter(|v| v.textured == ICON_TEXTURE_SOURCE).count(), 18);
         vertices.clear();
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["weapon_select".to_string()]).unwrap();
+        build_weapon_select(&mut vertices, &ui, None, 1280, 720);
+        assert!(vertices.is_empty());
         ui.video.draw_hud = false; // cg_drawHud only gates the core status HUD.
         build_weapon_select(&mut vertices, &ui, None, 1280, 720);
         assert_eq!(vertices.iter().filter(|v| v.textured == ICON_TEXTURE_SOURCE).count(), 18);

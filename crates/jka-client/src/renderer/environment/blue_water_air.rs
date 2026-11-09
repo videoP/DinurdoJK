@@ -132,7 +132,17 @@ impl AirComposite {
                 targets: &[Some(key.3.into())],
             }),
             primitive: Default::default(),
-            depth_stencil: None,
+            // Reversed-Z: opaque pixels have depth > 0, clear sky has 0.
+            // The fullscreen triangle emits depth 0 and LESS tests only
+            // receivers with depth > 0, keeping the original color untouched
+            // on sky pixels without running the expensive fragment shader.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::renderer::depth_format(),
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: key.2,
                 ..Default::default()
@@ -195,6 +205,11 @@ impl AirComposite {
                     store: wgpu::StoreOp::Store,
                 },
             })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: None, // read-only; the scene depth is never changed
+                stencil_ops: None,
+            }),
             ..Default::default()
         });
         pass.set_pipeline(&self.pipeline);

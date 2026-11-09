@@ -88,6 +88,21 @@ impl App {
 
         theme::section(ui, "FOG", "Map fog and volumetric atmospheric scattering.");
         self.egui_fog(ui);
+        const AERIAL: [(bool, &str); 2] = [(false, "Off"), (true, "On")];
+        if let Some(enabled) = segmented_row(
+            ui,
+            "Aerial Perspective (Haze)",
+            "Applies Blue Water's atmospheric distance haze to opaque world geometry. Independent of map fog, clouds and Relighting. Off skips both the aerial volume and its costly full-screen color/depth composite (console: r_blueSkyAerial). Only visible with Blue Water Sky.",
+            theme::Reset::Environment(ui::ENV_ROW_BLUE_SKY_AERIAL),
+            self.video.blue_water_environment.aerial_perspective,
+            &AERIAL,
+        ) {
+            self.environment_selected = ui::ENV_ROW_BLUE_SKY_AERIAL;
+            self.video.blue_water_environment.aerial_perspective = enabled;
+            self.sync_post_effects();
+            self.mark_config_dirty();
+            self.publish_ui();
+        }
 
         theme::section(
             ui,

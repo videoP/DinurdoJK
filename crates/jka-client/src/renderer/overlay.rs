@@ -184,8 +184,9 @@ struct UiExtImageCache {
 
 struct UiExtImageResult {
     wanted: Vec<String>,
-    first_new: usize,
-    pixels: Vec<Option<Vec<u8>>>,
+    // Variable-sized native-resolution artwork, packed on the asset worker.
+    atlas: TextureData,
+    uvs: Vec<([f32; 2], [f32; 2])>,
     source_dimensions: Vec<Option<[u32; 2]>>,
     shader_flags: Vec<bool>,
     shader_stages: Vec<(usize, Vec<crate::fx::draw::FxMaterial>)>,
@@ -203,7 +204,7 @@ impl UiExtImageLoader {
 
     /// Submit CPU-only work without waiting. If the queue is full, leave the
     /// request unmarked so the renderer can retry on its next UI update.
-    fn enqueue(&mut self, wanted: Vec<String>, first_new: usize) -> bool {
+    fn enqueue(&mut self, wanted: Vec<String>, max_texture_size: u32) -> bool {
         let Some(pool) = crate::asset_jobs::pool() else { return false; };
         let cache = Arc::downgrade(&self.cache);
         let base = self.base.clone();
@@ -213,15 +214,16 @@ impl UiExtImageLoader {
             // A HUD unload or game switch invalidates its cache and cancels
             // queued work before any costly shader-library parsing begins.
             let Some(cache) = cache.upgrade() else { return; };
-            if first_new > wanted.len() { return; }
             let mut assets = match AssetSearchPath::open_game(&base, game.as_deref()) {
                 Ok(assets) => assets,
                 Err(err) => {
                     eprintln!("Extension HUD image asset search: {err}");
-                    let count = wanted.len().saturating_sub(first_new);
+                    let count = wanted.len();
+                    let (atlas, uvs) = assemble_native_icon_atlas(
+                        vec![None; count], max_texture_size,
+                    );
                     let _ = complete.send(UiExtImageResult {
-                        wanted, first_new,
-                        pixels: vec![None; count],
+                        wanted, atlas, uvs,
                         source_dimensions: vec![None; count],
                         shader_flags: vec![false; count],
                         shader_stages: Vec::new(),
@@ -246,14 +248,18 @@ impl UiExtImageLoader {
                     rverbose!(2, "Extension HUD shader library: {warning}");
                 }
             }
-            let (pixels, shader_flags, source_dimensions) = decode_ui_extension_image_cells(
-                &mut assets, cache.shaders.as_ref(), &wanted[first_new..],
+            let (images, shader_flags, source_dimensions) = decode_ui_extension_images(
+                &mut assets, cache.shaders.as_ref(), &wanted,
             );
+            // Reuse the *same* native-res shelf packer/gutters/size budget as
+            // ordinary JKA HUD icons. Nothing gets resampled to 256x256.
+            // Packing is off-thread and only runs after the image set changes.
+            let (atlas, uvs) = assemble_native_icon_atlas(images, max_texture_size);
             let mut shader_stages = Vec::new();
             let mut stage_resolver: Option<crate::cgame::entity_presenter::EntityPresenter> = None;
-            for (offset, &authored) in shader_flags.iter().enumerate() {
+            for (index, &authored) in shader_flags.iter().enumerate() {
                 if !authored { continue; }
-                let name = &wanted[first_new + offset];
+                let name = &wanted[index];
                 if !cache.stages.contains_key(name) {
                     if stage_resolver.is_none() {
                         stage_resolver = AssetSearchPath::open_game(&base, game.as_deref())
@@ -266,13 +272,13 @@ impl UiExtImageLoader {
                     cache.stages.insert(name.clone(), stages);
                 }
                 shader_stages.push((
-                    ui::ICON_NAMES.len() + first_new + offset,
+                    ui::ICON_NAMES.len() + index,
                     cache.stages.get(name).cloned().unwrap_or_default(),
                 ));
             }
             drop(cache);
             let _ = complete.send(UiExtImageResult {
-                wanted, first_new, pixels, source_dimensions, shader_flags, shader_stages,
+                wanted, atlas, uvs, source_dimensions, shader_flags, shader_stages,
             });
         });
         if queued { self.pending = true; }
@@ -291,6 +297,7 @@ impl Renderer {
         ui_state.icon_shader_flags.clone_from(&self.ui_state.icon_shader_flags);
         ui_state.extension_shader_flags.clone_from(&self.ui_state.extension_shader_flags);
         ui_state.extension_image_dimensions.clone_from(&self.ui_state.extension_image_dimensions);
+        ui_state.extension_image_uvs.clone_from(&self.ui_state.extension_image_uvs);
         // Likewise the clean font: loaded once by the renderer, never by the app.
         ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
         ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
@@ -360,6 +367,9 @@ impl Renderer {
         self.ui_state.native_hidden = hidden;
         self.ui_state.extension_images = images;
         self.sync_ui_extension_images();
+        // HUD extensions may be the *only* consumers of the native icon atlas.
+        // A stock selector need not be visible for native weapon/item/Force art.
+        self.load_ui_icons_if_needed();
         // Uses the existing dynamic HUD buffer/pass. No new egui pass or pipeline.
         self.rebuild_dynamic_ui();
     }
@@ -490,6 +500,9 @@ impl Renderer {
             || self.ui_state.force_select.is_some()
             || self.ui_state.weapon_select.is_some()
             || self.ui_state.inventory_select.is_some()
+            || self.ui_state.extension_hud.iter().any(|widget|
+                widget.widget.commands.iter().any(|command|
+                    matches!(command, crate::extensions::HudCommand::NativeIcon { .. })))
             || self.ui_state.zoom_scope.is_some()
             || self.ui_state.rocket_lock.is_some()
             || self.ui_state.hud.is_some_and(|hud| {
@@ -631,7 +644,7 @@ impl Renderer {
         let seconds = self.frame_time();
         let make_vertex = |x: f32, y: f32, uv: [f32; 2], color: [f32; 4], cut: f32| UiVertex {
             position: [x / w as f32 * 2.0 - 1.0, 1.0 - y / h as f32 * 2.0],
-            uv, color,
+            uv, color: UiVertex::pack_color(color),
             // The shared screen-FX fragment shader applies alphaFunc only
             // to specially tagged icon vertices (normal FX always uses 1).
             textured: if cut >= 0.74 { 3.0 } else if cut >= 0.49 { 2.0 }
@@ -710,47 +723,34 @@ impl Renderer {
         true
     }
 
-    /// Resolve Rhai HUD assets off-thread. First-use shader-library parsing and
-    /// texture decoding never block a frame. The existing atlas and stable
-    /// slots remain visible until each background batch is ready for upload.
+    /// Resolve extension and native HUD art off-thread with source-size packing.
+    /// This does NOT touch the per-present path or the native icon atlas.
     pub(in crate::renderer) fn sync_ui_extension_images(&mut self) {
         let wanted = self.ui_state.extension_images.clone();
         if wanted.is_empty() {
             self.ui_ext_image_loader = None;
             if !self.ui_ext_image_key.is_empty() {
                 self._ui_ext_images = upload_texture(
-                    &self.device, &self.queue,
-                    &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
+                    &self.device, &self.queue, &blank_ui_extension_atlas(),
                 );
                 self.ui_ext_image_key.clear();
                 self.ui_state.extension_shader_flags.clear();
                 self.ui_state.extension_image_dimensions.clear();
+                self.ui_state.extension_image_uvs.clear();
                 self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
                 self.rebuild_ui_bind_group();
             }
             return;
         }
 
-        // A non-prefix update is a full HUD reload, not a request to reassign
-        // existing cell indices. Results from the old request are discarded.
-        let atlas_rows = ui_extension_atlas_rows(wanted.len());
-        let atlas_height = atlas_rows * ui::EXT_IMAGE_CELL;
-        // Native JK2 can need more artwork than the 32 script-controlled slots.
-        // Grow the GPU atlas *only when needed*, never on the competitive HUD path.
-        if !wanted.starts_with(&self.ui_ext_image_key)
-            || self._ui_ext_images._texture.size().height != atlas_height
-        {
-            self._ui_ext_images = upload_texture(
-                &self.device, &self.queue, &blank_ui_extension_atlas_for_count(wanted.len()),
-            );
-            self.ui_ext_image_key.clear();
-            self.ui_ext_image_loader = None;
-            self.ui_state.extension_shader_flags.clear();
-            self.ui_state.extension_image_dimensions.clear();
-            self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
-            self.rebuild_ui_bind_group();
+        if wanted == self.ui_ext_image_key { return; }
+        if self.ui_ext_image_loader.is_none() {
+            self.ui_ext_image_loader = Some(UiExtImageLoader::start(
+                self.base.clone(), self.detail_texture_game.clone(),
+            ));
         }
-
+        // The previous image atlas remains valid until the new complete
+        // pack is ready. Never upload half an atlas with obsolete UVs.
         let completed = self.ui_ext_image_loader.as_mut().and_then(|loader| {
             match loader.results.try_recv() {
                 Ok(batch) => { loader.pending = false; Some(batch) }
@@ -762,62 +762,31 @@ impl Renderer {
             }
         });
         if let Some(batch) = completed {
-            if batch.first_new == self.ui_ext_image_key.len()
-                && wanted.starts_with(&batch.wanted)
-            {
+            // A reload may change the wanted image set while a job is running.
+            // Discard stale results without disturbing the live GPU atlas.
+            if batch.wanted == wanted {
                 let started = Instant::now();
-                let cell = ui::EXT_IMAGE_CELL;
-                for (offset, pixels) in batch.pixels.iter().enumerate() {
-                    let Some(pixels) = pixels else { continue };
-                    let index = (batch.first_new + offset) as u32;
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &self._ui_ext_images._texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: (index % ui::EXT_IMAGE_COLUMNS) * cell,
-                                y: (index / ui::EXT_IMAGE_COLUMNS) * cell,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        pixels,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(cell * 4),
-                            rows_per_image: Some(cell),
-                        },
-                        wgpu::Extent3d { width: cell, height: cell, depth_or_array_layers: 1 },
-                    );
-                }
-                self.ui_state.extension_shader_flags.extend(batch.shader_flags);
-                self.ui_state.extension_image_dimensions.extend(batch.source_dimensions);
+                self._ui_ext_images = upload_texture(
+                    &self.device, &self.queue, &batch.atlas,
+                );
+                self.ui_state.extension_shader_flags = batch.shader_flags;
+                self.ui_state.extension_image_dimensions = batch.source_dimensions;
+                self.ui_state.extension_image_uvs = batch.uvs;
+                self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
                 for (index, stages) in batch.shader_stages {
                     self.ui_icon_shader_materials.insert(index, stages);
                 }
                 self.ui_ext_image_key = batch.wanted;
-                // These vertices were built when the new shader flags were not
-                // yet available; retag them now for the authored-stage path.
+                self.rebuild_ui_bind_group();
                 self.rebuild_dynamic_ui();
-                rverbose!(1, "UI extension images: {} async-loaded, upload {:.2} ms ({} total)",
-                    batch.pixels.len(), started.elapsed().as_secs_f64() * 1000.0,
-                    self.ui_ext_image_key.len());
+                rverbose!(1, "UI extension images: {} native-size artwork entries, packed {}x{}, upload {:.2} ms",
+                    self.ui_ext_image_key.len(), batch.atlas.width, batch.atlas.height,
+                    started.elapsed().as_secs_f64() * 1000.0);
+                return;
             }
         }
-
-        if wanted == self.ui_ext_image_key { return; }
-        if self.ui_ext_image_loader.is_none() {
-            // Atlas allocation already matches wanted.len() above.
-            self.ui_ext_image_loader = Some(UiExtImageLoader::start(
-                self.base.clone(), self.detail_texture_game.clone(),
-            ));
-        }
         let Some(loader) = self.ui_ext_image_loader.as_mut() else { return; };
-        if loader.pending { return; }
-        let first_new = self.ui_ext_image_key.len();
-        if !loader.enqueue(wanted, first_new) {
-            // Pool is temporarily saturated or unavailable. Retry on the next
-            // UI sync rather than blocking the render thread or losing icons.
+        if !loader.pending && !loader.enqueue(wanted, self.device.limits().max_texture_dimension_2d) {
             rverbose!(2, "Extension HUD asset pool unavailable; retrying");
         }
     }
@@ -1141,7 +1110,7 @@ impl Renderer {
             let x1 = (x + w) / 640.0 * 2.0 - 1.0;
             let y0 = 1.0 - y / 480.0 * 2.0;
             let y1 = 1.0 - (y + h) / 480.0 * 2.0;
-            let color = draw.material.float_vertex_color(draw.color);
+            let color = UiVertex::pack_color(draw.material.float_vertex_color(draw.color));
             let [u0, v0, u1, v1] = draw.uv_rect;
             let vertex = |position, uv| UiVertex {
                 position,
@@ -1574,7 +1543,7 @@ impl Renderer {
                     let source_index = self.ui_state.extension_images.iter().position(|v| v == name);
                     if found {
                         if let (Some(source_index), Some(gpu)) = (source_index, self.hud_shader_gpu.as_mut()) {
-                            let (uv0, uv1) = ui::extension_image_cell_uv_for_count(source_index, self.ui_state.extension_images.len());
+                            let (uv0, uv1) = self.ui_state.extension_uv(source_index);
                             let uniform = HudShaderUniform {
                                 atlas_rect: [uv0[0], uv0[1], uv1[0]-uv0[0], uv1[1]-uv0[1]],
                                 values: *params,
@@ -1641,12 +1610,13 @@ impl Renderer {
                 let Some(resolver) = self.ui_icon_shader_resolver.as_mut() else { continue; };
                 let fallback = if !is_extension &&
                     (ui::ICON_WEAPON_NO_AMMO_BASE..ui::ICON_INVENTORY_BASE).contains(&index) {
-                    Some(if index >= ui::ICON_WEAPON_STAFF {
+                    Some((if index >= ui::ICON_WEAPON_STAFF {
                         "gfx/hud/w_icon_lightsaber"
-                    } else { name })
+                    } else { name }).to_owned())
                 } else { None };
                 let materials = resolver.fx_material_stages_if_present(&requested)
-                    .or_else(|| fallback.and_then(|path| resolver.fx_material_stages_if_present(path)));
+                    .or_else(|| fallback.as_deref()
+                        .and_then(|path| resolver.fx_material_stages_if_present(path)));
                 let Some(stages) = materials else {
                     eprintln!("HUD shader {requested}: unable to resolve authored material");
                     // Avoid repeating VFS lookups/log spam at 2000 FPS.
@@ -1673,7 +1643,7 @@ impl Renderer {
                     // Remap them into the original image's 0..1 UV domain
                     // before applying authored tcMods and sampling stage maps.
                     if index >= ui::ICON_NAMES.len() {
-                        let (uv0, uv1) = ui::extension_image_cell_uv_for_count(index - ui::ICON_NAMES.len(), self.ui_state.extension_images.len());
+                        let (uv0, uv1) = self.ui_state.extension_uv(index - ui::ICON_NAMES.len());
                         v.uv = [
                             (v.uv[0] - uv0[0]) / (uv1[0] - uv0[0]),
                             (v.uv[1] - uv0[1]) / (uv1[1] - uv0[1]),
@@ -1681,7 +1651,8 @@ impl Renderer {
                     }
                     v.uv = stage.tc_mods.iter().fold(v.uv, |uv, &modifier|
                         crate::fx::draw::modified_uv(uv, [0.0; 3], modifier, time));
-                    v.color = stage.float_vertex_color_at_time(v.color, seconds);
+                    v.color = UiVertex::pack_color(stage.float_vertex_color_at_time(
+                        UiVertex::unpack_color(v.color), seconds));
                     let cut = stage.alpha_test;
                     v.textured = if cut >= 0.74 { 3.0 } else if cut >= 0.49 { 2.0 }
                         else if cut > 0.0 { 4.0 } else if cut < 0.0 { 5.0 } else { 1.0 };
@@ -2534,6 +2505,7 @@ pub(in crate::renderer) fn load_ui_icon_atlas(
                         );
                     }
                 }
+
                 let Some(image) = image else {
                     if !shaders[index] { eprintln!("UI icon {requested}: not found"); }
                     continue;
@@ -2626,105 +2598,41 @@ mod native_icon_atlas_tests {
 }
 
 /// Atlas capacity in rows, with the 32-image Rhai budget unchanged.
-/// Native artwork uses additional rows only while a native HUD requests it.
-fn ui_extension_atlas_rows(wanted_count: usize) -> u32 {
-    (wanted_count.max(crate::extensions::MAX_HUD_IMAGES + 1) as u32)
-        .div_ceil(ui::EXT_IMAGE_COLUMNS)
-}
-
+/// Startup/unload placeholder; the asynchronous native-size packer replaces
+/// this with an exactly fitted atlas (with per-image UVs) on first use.
 pub(in crate::renderer) fn blank_ui_extension_atlas() -> TextureData {
-    blank_ui_extension_atlas_for_count(crate::extensions::MAX_HUD_IMAGES)
-}
-
-pub(in crate::renderer) fn blank_ui_extension_atlas_for_count(wanted_count: usize) -> TextureData {
-    let cell = ui::EXT_IMAGE_CELL;
-    let rows = ui_extension_atlas_rows(wanted_count);
-    let (width, height) = (ui::EXT_IMAGE_COLUMNS * cell, rows * cell);
     TextureData {
-        label: "JKA UI extension image atlas".into(),
-        source: None,
-        width,
-        height,
-        rgba: (vec![0u8; (width * height * 4) as usize]).into(),
-        rgba16f: None,
-        mip_level_count: 1,
-        clamp: true,
-        srgb: true,
+        label: "JKA UI extension image atlas (not loaded)".into(),
+        source: None, width: 4, height: 4,
+        rgba: vec![0u8; 4 * 4 * 4].into(),
+        rgba16f: None, mip_level_count: 1, clamp: true, srgb: true,
     }
 }
 
-/// Decode extension `hud_image()` pictures into `ui::EXT_IMAGE_CELL` squares
-/// (RGBA8, `None` when the image is missing). Images are stretched to the cell and
-/// drawn with the whole cell as UVs, so their aspect ratio survives.
-pub(in crate::renderer) fn load_ui_extension_images(
-    base: &Path,
-    game: Option<&Path>,
-    names: &[String],
-) -> Vec<Option<Vec<u8>>> {
-    load_ui_extension_images_with_shaders(base, game, names).0
-}
-
-/// RegisterShader semantics: explicit shader definitions take precedence over
-/// same-named bitmaps. Unauthored images still use the one-draw atlas path.
-/// This work runs only when extension image registrations change, not per present.
-pub(in crate::renderer) fn load_ui_extension_images_with_shaders(
-    base: &Path,
-    game: Option<&Path>,
-    names: &[String],
-) -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
-    let mut assets = match AssetSearchPath::open_game(base, game) {
-        Ok(assets) => assets,
-        Err(error) => {
-            eprintln!("Extension HUD image asset search: {error}");
-            return (vec![None; names.len()], vec![false; names.len()]);
-        }
-    };
-    let mut warnings = Vec::new();
-    let library = match crate::materials::shader_library(&mut assets, &mut warnings, false) {
-        Ok((library, _)) => Some(library),
-        Err(err) => { eprintln!("Extension HUD shader library: {err}"); None }
-    };
-    for warning in warnings { rverbose!(2, "Extension HUD shader library: {warning}"); }
-    let (pixels, flags, _) = decode_ui_extension_image_cells(&mut assets, library.as_ref(), names);
-    (pixels, flags)
-}
-
-/// Shared pure CPU decoding path, for the async loader and unit tests. The
-/// caller supplies a shader library parsed once for its active asset mount.
-fn decode_ui_extension_image_cells(
+/// Pure CPU image decode. Original pixel width, height and RGBA samples survive
+/// into the native-size atlas; only genuine GPU constraints may resize them.
+fn decode_ui_extension_images(
     assets: &mut AssetSearchPath,
     library: Option<&std::collections::BTreeMap<String, jka_assets::shader::Shader>>,
     names: &[String],
-) -> (Vec<Option<Vec<u8>>>, Vec<bool>, Vec<Option<[u32; 2]>>) {
-    let cell = ui::EXT_IMAGE_CELL;
+) -> (Vec<Option<image::RgbaImage>>, Vec<bool>, Vec<Option<[u32; 2]>>) {
     let flags: Vec<bool> = names.iter().map(|name| library.is_some_and(|library|
         ui_icon_has_authored_shader(library, name))).collect();
-    let decoded: Vec<_> = names
-        .iter().zip(flags.iter())
-        .map(|(name, &authored)| {
-            if authored { return (None, None); } // Authored materials use standalone stages.
-            let Some(image) = try_load_texture_asset_from_search_path(
-                assets, name, true, false, true, "extension HUD image",
-            ) else {
-                eprintln!("Extension HUD image {name}: not found");
-                return (None, None);
-            };
-            let (source_w, source_h) = (image.width, image.height);
-            let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba.into_vec()) else {
-                eprintln!("Extension HUD image {name}: unexpected pixel format");
-                return (None, None);
-            };
-            let pixels = if source_w == cell && source_h == cell {
-                source.into_raw()
-            } else {
-                image::imageops::resize(&source, cell, cell, image::imageops::FilterType::Triangle)
-                    .into_raw()
-            };
-            (Some(pixels), Some([source_w, source_h]))
-        })
-        .collect();
-    let (pixels, dimensions): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
-    (pixels, flags, dimensions)
+    let decoded: Vec<_> = names.iter().zip(flags.iter()).map(|(name, &authored)| {
+        if authored { return (None, None); } // Authored FX stages use their own textures.
+        let Some(image) = try_load_texture_asset_from_search_path(
+            assets, name, true, false, true, "extension HUD image",
+        ) else {
+            eprintln!("Extension HUD image {name}: not found");
+            return (None, None);
+        };
+        let dimensions = [image.width, image.height];
+        let source = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec());
+        if source.is_none() { eprintln!("Extension HUD image {name}: unexpected pixel format"); }
+        (source, Some(dimensions))
+    }).collect();
+    let (images, dimensions) = decoded.into_iter().unzip();
+    (images, flags, dimensions)
 }
 
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
@@ -3264,41 +3172,28 @@ pub(in crate::renderer) struct ScreenFxBatch {
 
 #[cfg(test)]
 mod extension_image_atlas_tests {
-    #[test]
-    fn native_jk2_can_grow_atlas_without_changing_the_extension_limit() {
-        assert_eq!(crate::extensions::MAX_HUD_IMAGES, 32);
-        let small = super::blank_ui_extension_atlas();
-        let jk2 = super::blank_ui_extension_atlas_for_count(76);
-        assert_eq!(small.width, jk2.width);
-        assert!(jk2.height > small.height);
-        assert!(jk2.width as usize * jk2.height as usize / (256 * 256) >= 76);
-    }
-
     use super::*;
 
     #[test]
-    fn blank_atlas_has_room_for_every_slot() {
-        let atlas = blank_ui_extension_atlas();
-        let cells = (atlas.width / ui::EXT_IMAGE_CELL) * (atlas.height / ui::EXT_IMAGE_CELL);
-        assert!(cells as usize >= crate::extensions::MAX_HUD_IMAGES);
-        assert!(atlas.rgba.iter().all(|&b| b == 0));
+    fn extension_art_keeps_original_dimensions_and_uses_individual_uvs() {
+        let tall = image::RgbaImage::new(35, 512);
+        let wide = image::RgbaImage::new(384, 17);
+        let (atlas, uvs) = assemble_native_icon_atlas(vec![Some(tall), Some(wide)], 8192);
+        assert!(atlas.width >= 384 && atlas.height >= 512);
+        let a = uvs[0];
+        let b = uvs[1];
+        let aw = (a.1[0] - a.0[0]) * atlas.width as f32;
+        let ah = (a.1[1] - a.0[1]) * atlas.height as f32;
+        let bw = (b.1[0] - b.0[0]) * atlas.width as f32;
+        let bh = (b.1[1] - b.0[1]) * atlas.height as f32;
+        assert!((aw - 35.0).abs() < 0.01 && (ah - 512.0).abs() < 0.01);
+        assert!((bw - 384.0).abs() < 0.01 && (bh - 17.0).abs() < 0.01);
     }
 
     #[test]
-    #[ignore = "requires JKA_TEST_BASE with stock assets"]
-    fn stock_hud_art_decodes_into_cells() {
-        let base = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE"));
-        let names: Vec<String> = [
-            "gfx/2d/numbers/t_one", "gfx/hud/armor_tic_1", "gfx/hud/hudleft", "gfx/hud/health_tic_1",
-            "gfx/hud/nonexistent_image",
-        ].iter().map(|n| (*n).to_owned()).collect();
-        let cells = load_ui_extension_images(&base, None, &names);
-        let opaque = |cell: &Vec<u8>| cell.chunks_exact(4).filter(|p| p[3] > 16).count();
-        for cell in &cells[..4] {
-            let cell = cell.as_ref().expect("stock image missing");
-            assert_eq!(cell.len() as u32, ui::EXT_IMAGE_CELL * ui::EXT_IMAGE_CELL * 4);
-            assert!(opaque(cell) > 500);
-        }
-        assert!(cells[4].is_none(), "a missing image must stay transparent");
+    fn blank_extension_atlas_does_not_preallocate_fixed_256_cells() {
+        let atlas = blank_ui_extension_atlas();
+        assert_eq!((atlas.width, atlas.height), (4, 4));
+        assert!(atlas.rgba.iter().all(|&b| b == 0));
     }
 }

@@ -251,6 +251,7 @@ pub use api::{
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand, SunBakeStage,
+    BakedSunAutoStatus,
     RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     StudioSourceFrame, StudioSceneFrame, StudioSceneLighting,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
@@ -442,7 +443,7 @@ use visibility::compaction::{
 use visibility::pvs::{
     active_batch_selection, ActiveBatchSelection, batch_area_visible, effective_area_mask, legacy_dlight_batch_selection,
     refresh_auto4_lazy_collapse, update_active_cull_indices, update_visibility,
-    visible_batches_by_cluster,
+    visible_batches_by_cluster, sky_reachability_by_cluster,
 };
 use visibility::readback::CullDiagnosticsReadback;
 use visibility::settings::{fast_sky_clear_color, world_blend_probe_bucket, world_stage_probe_excludes};
@@ -667,7 +668,7 @@ const CLOUD_INTERLEAVE_GRID: u32 = 2;
 const FALLBACK_SUN_DIRECTION: [f32; 3] = [-0.38, -0.84, -0.39];
 const FALLBACK_SUN_COLOR: [f32; 3] = [0.57735026, 0.57735026, 0.57735026];
 const FALLBACK_SUN_INTENSITY: f32 = 250.0;
-const PLANAR_AUTHORED_SCALE_DIVISOR: u32 = 2;
+const PLANAR_AUTHORED_SCALE_DIVISOR: u32 = 1;
 const PLANAR_ENVIRONMENT_SCALE_DIVISOR: u32 = 4;
 const PLANAR_REFLECTION_SLOTS: usize = 4;
 const PLANAR_REFLECTION_HYSTERESIS: f32 = 1.15;
@@ -720,7 +721,7 @@ const LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES: [wgpu::VertexAttribute; 1] =
 const UI_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
-    2 => Float32x4,
+    2 => Unorm8x4,
     3 => Float32
 ];
 
@@ -740,7 +741,7 @@ fn append_vignette_vertices(vertices: &mut Vec<UiVertex>) {
     let make_vertex = |radius: f32, angle: f32| UiVertex {
         position: [angle.cos() * radius, angle.sin() * radius],
         uv: [0.0, 0.0],
-        color: [0.0, 0.0, 0.0, alpha_at_radius(radius)],
+        color: UiVertex::pack_color([0.0, 0.0, 0.0, alpha_at_radius(radius)]),
         textured: 0.0,
     };
 
@@ -852,6 +853,8 @@ struct Renderer {
     studio_entity_mask: Option<studio_entity_mask::StudioEntityMask>,
     studio_revision: u64,
     scene_time: Option<f32>,
+    /// CGame's multiplayer/demo serverTime for deterministic native lightning.
+    weather_server_time_ms: Option<i32>,
     studio_settings_signature: String,
     scene_depth_capture: bool,
     device: wgpu::Device,
@@ -1150,6 +1153,7 @@ struct Renderer {
     /// `videoMap` cinematics of the current world, streamed into `world.textures`.
     world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
+    world_encoded_blend: Option<models::legacy_blend::LegacyModelBlend>,
     encoder_finish_threads: u32,
     igpu_ab_mode: u8,
     encoder_finisher: Option<frame::finish::EncoderFinisher>,
@@ -1223,6 +1227,7 @@ struct Renderer {
     dlss: dlss::DlssState,
     rt_taa_mode: u32,
     contact_shadows_enabled: bool,
+    relighting_mode: u8,
     sun_override: bool,
     sun_yaw: f32,
     sun_pitch: f32,
@@ -1233,6 +1238,7 @@ struct Renderer {
     sun_visibility: SunVisibilityMode,
     entity_sun_lighting: bool,
     baked_sun_removal: f32,
+    baked_sun_removal_auto: bool,
     baked_sun_cache: bool,
     lightmap_smoothing: u8,
     baked_sun_aa: u8,
@@ -1240,8 +1246,10 @@ struct Renderer {
     lightmap_signal: u8,
     sun_receiver_normals: u8,
     sun_terminator: bool,
-    /// r_skyWorldBake: 0 live screen pass, 1 baked, 2 baked with sky visibility.
-    sky_world_bake: u8,
+    /// Independent BSP lightmap A/B: 0 = original relighting, 1 = sky approximation.
+    sky_world_bake_ab: u8,
+    sky_world_light_isolation: bool,
+    sky_world_lighting_strength: f32,
     bake_threads: u8,
     /// UI drag guard: live sky and CSM remain responsive; static sun ray jobs wait.
     sun_bake_deferred: bool,
@@ -1256,6 +1264,10 @@ struct Renderer {
     baked_indirect_highlight_preserve: f32,
     sky_fractal_override: bool,
     sky_backend: u8,
+    /// Visible clear Blue Water sky A/B for Relighting Baked: 0 live, 1 cached cube.
+    blue_sky_cube_ab: u8,
+    /// Opt-in Blue Water pass-isolation A/B; zero leaves all rendering unchanged.
+    blue_sky_diag: u8,
     blue_water_environment: crate::blue_water_environment::Settings,
     cloud_backend: u8,
     /// `r_cloudPortalDepth`: 0 off, 1 redraw portal depth, 2 reuse portal pass depth.

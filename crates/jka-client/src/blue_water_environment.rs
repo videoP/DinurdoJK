@@ -50,8 +50,13 @@ pub struct Settings {
     pub world_lighting: f32,
     /// Sky-referenced eye adaptation with AgX and night readability; only active under the Blue Water sky.
     pub filmic: bool,
-    /// The dome's night glow and floor as a share of the authored level (1 upstream, 0 black). Dome only: the
-    /// environment bake and the world's night light keep the authored glow.
+    /// Independent Blue Water aerial perspective/haze over opaque geometry.
+    /// Does not affect the sky dome, clouds, weather or relighting.
+    pub aerial_perspective: bool,
+    /// The dome's night glow and floor as a share of the authored level (1 upstream, 0 black).
+    /// Native ocean sky-atlas reflections follow this control at night; direct
+    /// moonlight, stars, the environment bake for world objects, and world night
+    /// lighting remain unchanged.
     pub night_sky: f32,
     /// Apparent size of the sun's and the moon's discs on the dome (1 upstream). Appearance only.
     pub sun_size: f32,
@@ -99,6 +104,7 @@ impl Default for Settings {
             visibility: 17000.0,
             world_lighting: 0.0,
             filmic: true,
+            aerial_perspective: true,
             night_sky: 1.0,
             sun_size: 1.0,
             moon_size: 1.0,

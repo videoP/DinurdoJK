@@ -75,6 +75,19 @@ impl App {
 }
 
 commands! {
+    // TaystJK codemp/client/cl_input.cpp IN_CenterView. This is an engine
+    // input command, not a cgame/server command: never forward it over the wire.
+    cmd_centerview ["centerview"] ("centerview", "Center the view pitch (TaystJK IN_CenterView).", CommandScope::Always) |self, _command| {
+        self.live_input.center_view();
+        // Local /map and /devmap use a second OpenJK Pmove input accumulator.
+        if self.game_session.as_ref().is_some_and(|session| session.local) {
+            if let Some(server) = self.local_server.as_mut() {
+                server.center_view();
+            }
+        }
+        CommandResult::Handled
+    }
+
     // TaystJK cg_consolecmds.c: showPlayerId and clientlist share CG_ClientList_f.
     cmd_show_player_id ["showPlayerId", "clientlist"] ("showPlayerId", "List active client slots with team, name and bot marker (TaystJK).", CommandScope::Always) |self, _command| {
         let clients = self.game_session.as_ref()

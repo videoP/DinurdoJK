@@ -47,7 +47,7 @@ fn rotated_icon(out: &mut Vec<UiVertex>, ui: &UiSnapshot, index: usize,
         let y = cy + dx*w*sin + dy*h*cos;
         UiVertex {
             position: [2.0*x/viewport_w.max(1) as f32-1.0, 1.0-2.0*y/viewport_h.max(1) as f32],
-            uv: uvs[i], color, textured: ui.icon_texture_source(index),
+            uv: uvs[i], color: UiVertex::pack_color(color), textured: ui.icon_texture_source(index),
         }
     };
     out.extend_from_slice(&[vertex(0),vertex(1),vertex(2),vertex(0),vertex(2),vertex(3)]);
@@ -71,7 +71,8 @@ fn draw_active_force_icons(out: &mut Vec<UiVertex>, ui: &UiSnapshot, width: u32,
     const DURATION_POWER_MASK: i32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 8)
         | (1 << 9) | (1 << 10) | (1 << 14);
     let Some(hud) = ui.hud else { return; };
-    if hud.force_icons_hidden || ui.zoom_scope.is_some() { return; }
+    if hud.force_icons_hidden || ui.zoom_scope.is_some()
+        || ui.native_replaced(crate::extensions::NativeHud::ActiveForcePowers) { return; }
     let active = hud.force_powers_active & DURATION_POWER_MASK;
     let recovering = hud.rage_recovery_until_ms > hud.time_ms;
     if active == 0 && !recovering { return; }
@@ -291,7 +292,7 @@ mod tests {
             assert_eq!(contains_icon(&out, ICON_COMBAT_BASE+1), insert, "insert for scope={mode}");
             assert!(contains_icon(&out, ICON_COMBAT_BASE+2), "ammo ticks for scope={mode}");
             assert!(contains_icon(&out, ICON_COMBAT_BASE+3), "charge bar for scope={mode}");
-            let black_quads = out.iter().filter(|v| v.textured == 0.0 && v.color == [0.0,0.0,0.0,1.0]).count();
+            let black_quads = out.iter().filter(|v| v.textured == 0.0 && v.color == [0, 0, 0, 255]).count();
             assert_eq!(black_quads, if mode == 0 { 12 } else { 0 }, "side bars for scope={mode}");
         }
     }

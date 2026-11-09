@@ -43,6 +43,11 @@ video_cvars! {
     CvarType::Bool, Bool, draw_hud, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
+    TINT_HUD, APP_TINT_HUD, "cg_tintHud", "1", "0|1",
+    "TaystJK/jaPRO team-color tint: native JK2/JKA status HUD red/blue; DinurdoJK-style panel chrome red/blue. Only team modes, not Siege.",
+    CvarType::Bool, Bool, tint_hud, |value| value,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
     HUD_STYLE, APP_HUD_STYLE, "cg_hudStyle", "0", "0|1",
     "Native Rust HUD style: 0 DinurdoJK panels, 1 Native (JK2 or JKA retail HUD based on active game).",
     CvarType::Int { min: 0, max: 1 }, Int, hud_style, |value: i32| value as u8,

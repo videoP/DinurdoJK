@@ -726,6 +726,7 @@ impl PlayerPresenter {
         let previous_look = self.look;
         self.look = crate::japro_cg::Appearance::NORMAL;
         let footstep_count = self.footsteps.len();
+        let jk2_footstep_count = self.jk2_footsteps.len();
         let fx_request_count = self.fx_requests.len();
         let footstep_stages = self.footstep_stages;
         self.footstep_stages = FootstepStages {
@@ -751,7 +752,10 @@ impl PlayerPresenter {
         // footstep ground traces, and let no animation/force FX escape to the
         // shared event/audio/WeaponFx queues. Cosmetic model draws are retained.
         self.footstep_stages = footstep_stages;
-        if !studio_audio { self.footsteps.truncate(footstep_count); }
+        if !studio_audio {
+            self.footsteps.truncate(footstep_count);
+            self.jk2_footsteps.truncate(jk2_footstep_count);
+        }
         let ghost_fx=self.fx_requests.split_off(fx_request_count);
         if studio_sabers {
             self.fx_requests.extend(ghost_fx.into_iter().filter(|fx|matches!(fx,crate::cgame::player_presenter::PlayerFxRequest::SaberBlade{..})));
@@ -1523,7 +1527,22 @@ impl PlayerPresenter {
 
         // CG_TriggerAnimSounds: the footsteps the legs bone just stepped onto.
         let mut footsteps = Vec::new();
-        if self.footstep_stages.any()
+        // Jedi Outcast has no animevents.cfg: CG_RunLerpFrame hard-codes the step
+        // frames and CG_FootStep wants ground under the player (a wall run excepted).
+        let jk2 = jka_assets::pk3::active_jk2().is_some();
+        let mut jk2_step = false;
+        if jk2 && self.footstep_stages.sounds && entity.entity_type != ET_BODY {
+            if let Some(step) = runtime.animation.legs_frame_step() {
+                jk2_step = footsteps::jk2_step_due(animations, step.anim, step.old_frame, step.frame)
+                    .is_some_and(|wall_run| {
+                        wall_run
+                            || entity.state.field_i32("groundEntityNum").unwrap_or(jka_movement::ENTITY_NONE)
+                                != jka_movement::ENTITY_NONE
+                    });
+            }
+        }
+        if !jk2
+            && self.footstep_stages.any()
             && entity.entity_type != ET_BODY
             && footsteps::npc_class_steps(entity.state.field_i32("NPC_class").unwrap_or(0))
         {
@@ -1546,7 +1565,10 @@ impl PlayerPresenter {
             }
         }
         // Stock locomotion events are not in sync with a full-body emote.
-        if local_emote.is_some() { footsteps.clear(); }
+        if local_emote.is_some() {
+            footsteps.clear();
+            jk2_step = false;
+        }
         let cull_origin = ghoul2_render_origin(entity);
         let mut raster_visible = submit_geometry;
 
@@ -1564,6 +1586,19 @@ impl PlayerPresenter {
                         if !self.rt_shadow_casters_enabled && !self.studio_bone_masks.contains_key(&entity.number) {
                             // Out of view is not out of earshot: the pose is not built,
                             // so the feet are taken to be under the entity.
+                            if let (true, Some(world)) = (jk2_step, self.collision_world.as_mut()) {
+                                let down = [0.0, 0.0, -1.0];
+                                let step = if self.footstep_trace {
+                                    let mut trace = footsteps::FootstepEntityTrace::new(
+                                        world, &self.footstep_solids, self.viewer_client,
+                                        i32::from(entity.number),
+                                    );
+                                    footsteps::jk2_trace_footstep(&mut trace, entity.number, entity.origin, down)
+                                } else {
+                                    footsteps::jk2_trace_footstep(world, entity.number, entity.origin, down)
+                                };
+                                self.jk2_footsteps.extend(step);
+                            }
                             if let (false, Some(world)) =
                                 (footsteps.is_empty(), self.collision_world.as_mut())
                             {
@@ -1825,6 +1860,41 @@ impl PlayerPresenter {
                 model_settled,
                 ..anim_debug
             });
+        }
+        if let (true, Some(world)) = (jk2_step, self.collision_world.as_mut()) {
+            // CG_FootstepForSurface: from the lower-lumbar bolt, down its -Y axis.
+            let (origin, down) = match model_bolt_matrix_timed(
+                &mut self.perf, &model.glm, &model.gla, &pose, "lower_lumbar",
+            ) {
+                Ok(Some(m)) => {
+                    let local = [-m[0][1], -m[1][1], -m[2][1]];
+                    let mut down = [0.0; 3];
+                    for (j, out) in down.iter_mut().enumerate() {
+                        *out = render_axis[0][j] * local[0]
+                            + render_axis[1][j] * local[1]
+                            + render_axis[2][j] * local[2];
+                    }
+                    let length = (down[0] * down[0] + down[1] * down[1] + down[2] * down[2]).sqrt();
+                    let down = if length > f32::EPSILON {
+                        [down[0] / length, down[1] / length, down[2] / length]
+                    } else {
+                        [0.0, 0.0, -1.0]
+                    };
+                    let point = [m[0][3], m[1][3], m[2][3]];
+                    (transform_jka_model_point(point, render_axis, render_origin), down)
+                }
+                _ => (entity.origin, [0.0, 0.0, -1.0]),
+            };
+            let step = if self.footstep_trace {
+                let mut trace = footsteps::FootstepEntityTrace::new(
+                    world, &self.footstep_solids, self.viewer_client,
+                    i32::from(entity.number),
+                );
+                footsteps::jk2_trace_footstep(&mut trace, entity.number, origin, down)
+            } else {
+                footsteps::jk2_trace_footstep(world, entity.number, origin, down)
+            };
+            self.jk2_footsteps.extend(step);
         }
         if let (false, Some(world)) = (footsteps.is_empty(), self.collision_world.as_mut()) {
             // CG_PlayerFootsteps: the foot bolt in the legs' own frame.

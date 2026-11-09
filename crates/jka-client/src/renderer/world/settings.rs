@@ -38,6 +38,7 @@ impl Renderer {
         } else {
             self.queue.write_buffer(&world.vertex_buffer, 0, bytemuck::cast_slice(&world.static_ao_gpu_vertices));
         }
+        self.reapply_baked_vertex_sky();
     }
 
     pub(in crate::renderer) fn set_picmip(&mut self, picmip: u32) {
@@ -610,7 +611,7 @@ impl Renderer {
             // Blue Water moonlight shares this existing Relighting shader path.
             // Select the variant when Relighting is enabled, not every sunset.
             || (self.sky_backend == 1 && self.sun_override)
-            || (self.baked_sun_removal > 0.0
+            || ((self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto)
                 && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some()))
     }
 

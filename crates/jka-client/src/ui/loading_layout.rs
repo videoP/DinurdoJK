@@ -88,7 +88,8 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     let pad = 22.0 * s;
     let margin = (26.0 * s).min(w * 0.05).max(8.0);
     // Main-menu footer is its own compositor surface, not part of Taffy.
-    let bottom_safe = (70.0 * s).clamp(52.0, h * 0.16);
+    // Not clamp(): a minimized window's 16% falls below 52 and would panic.
+    let bottom_safe = (70.0 * s).max(52.0).min(h * 0.16);
     let panel_w = (830.0 * s).min(w - margin * 2.0).max(1.0);
     let inner = (panel_w - pad * 2.0).max(1.0);
     let rows_count = loading.bars.iter().filter(|bar| !bar.skipped).count();

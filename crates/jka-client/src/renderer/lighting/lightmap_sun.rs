@@ -55,6 +55,12 @@ pub(in crate::renderer) struct Geometry {
     sun_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
     auto_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
     model_materials: Vec<bool>,
+    /// The original world prefix has complete material stage lists. Inline
+    /// instances currently copy only their selected lightmap/vertex receivers.
+    world_batch_count: usize,
+    /// For each immutable sun receiver vertex, the actual indexed draw vertex.
+    /// Inline *N vertices live after the static-AO prefix.
+    vertex_gpu_indices: Arc<Vec<u32>>,
 }
 
 impl Geometry {
@@ -63,7 +69,10 @@ impl Geometry {
         batches: Vec<DrawBatch>,
         textures: Arc<Vec<TextureData>>,
         materials: &scene::MaterialDebugInfo,
+        world_batch_count: usize,
+        vertex_gpu_indices: Vec<u32>,
     ) -> Self {
+        debug_assert_eq!(vertices.len(), vertex_gpu_indices.len());
         let receivers = Arc::new(crate::renderer::collect_static_ao_lightmap_triangles(
             &vertices, &batches,
         ));
@@ -82,9 +91,12 @@ impl Geometry {
         let sun_receivers = Arc::new(sun_receivers);
         let auto_receivers = Arc::new(auto_receivers);
         let model_materials = batches
-            .iter()
-            .map(|b| {
-                materials
+            .iter().enumerate()
+            .map(|(index, b)| {
+                // r_drawBSPModelSurfaces is a WORLD built-in-model switch.
+                // Inline *N instances have their own entity visibility and
+                // must not lose vertex sky illumination based on this flag.
+                index < world_batch_count && materials
                     .entries
                     .get(b.material_debug_index as usize)
                     .is_some_and(|m| m.name.starts_with("models/"))
@@ -98,6 +110,8 @@ impl Geometry {
             sun_receivers,
             auto_receivers,
             model_materials,
+            world_batch_count,
+            vertex_gpu_indices: Arc::new(vertex_gpu_indices),
         }
     }
 
@@ -228,8 +242,34 @@ fn terminator_origin(triangle: &crate::renderer::StaticAoLightmapTriangle, bary:
     curved
 }
 
-/// Valid bit 31, octahedral normal (2 x 11 bits), sky visibility (8 bits).
-fn pack_sky_normal(normal: Vec3, open: f32) -> u32 {
+/// A compiled BSP surface can reference a lightmap page even when its actual
+/// authored shader never samples that page (e.g. an alpha-tested `rgbGen vertex`
+/// seaweed patch). The draw stage, not the BSP's lightmap metadata or
+/// LIGHTMAP_BY_VERTEX flag, determines whether the baked vertex RGB is visible.
+/// Do not also tint a range that *does* consume a lightmap in another stage:
+/// that would double-apply the cached sky gain to a lightmap-lit material.
+/// The model-surface visibility switch still applies only to world models/*.
+fn static_vertex_sky_receiver(
+    is_model_material: bool,
+    draw_model_surfaces: bool,
+    rgb_gen: jka_assets::shader::RgbGen,
+    class: DrawClass,
+    additive_sky_stage: bool,
+    has_lightmap_lighting: bool,
+    world_or_compiled_vertex: bool,
+) -> bool {
+    (!is_model_material || draw_model_surfaces)
+        && world_or_compiled_vertex
+        && !has_lightmap_lighting
+        && ((matches!(rgb_gen, jka_assets::shader::RgbGen::Vertex | jka_assets::shader::RgbGen::ExactVertex)
+            && matches!(class, DrawClass::Opaque | DrawClass::Mask))
+            || additive_sky_stage)
+}
+
+/// Valid bit 31, octahedral normal (2 x 10 bits), ambient sky visibility
+/// (6 bits), and direct-light visibility (5 bits). Mode 1 stores both at 1;
+/// mode 2 traces the two independent geometric visibility terms per luxel.
+fn pack_sky_normal(normal: Vec3, ambient_open: f32, direct_open: f32) -> u32 {
     let n = normal / (normal.x.abs() + normal.y.abs() + normal.z.abs()).max(1e-6);
     let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
     let e = if n.z < 0.0 {
@@ -237,8 +277,10 @@ fn pack_sky_normal(normal: Vec3, open: f32) -> u32 {
     } else {
         [n.x, n.y]
     };
-    let q = |v: f32| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 2047.0).round() as u32;
-    (1 << 31) | (q(e[1]) << 19) | (q(e[0]) << 8) | (open.clamp(0.0, 1.0) * 255.0).round() as u32
+    let q = |v: f32| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 1023.0).round() as u32;
+    let ambient = (ambient_open.clamp(0.0, 1.0) * 63.0).round() as u32;
+    let direct = (direct_open.clamp(0.0, 1.0) * 31.0).round() as u32;
+    (1 << 31) | (q(e[1]) << 21) | (q(e[0]) << 11) | (direct << 6) | ambient
 }
 
 /// Barycentrics of a lightmap UV in a receiver triangle, or None outside it.
@@ -379,17 +421,33 @@ struct Key {
     /// Baked sky world illumination: 0 off, 1 smoothed normals, 2 normals and
     /// sky visibility traced at the original lightmap resolution (`sky_sizes`).
     sky: u8,
+    /// A/B sky normal algorithm: 0 smoothed (existing), 1 geometric face (live-pass parity).
+    /// Only effective when sky > 0; toggling invalidates the static bake key.
+    sky_ab: u8,
     sky_sizes: Vec<[u32; 2]>,
     local_sources: u32,
     local_sizes: Vec<[u32; 2]>,
     locals: Vec<(usize, scene::DynamicLight)>,
 }
 
+/// A q3map LIGHTMAP_BY_VERTEX BSP receiver without a lightmap atlas coordinate.
+/// Its authored colour stays immutable; the sky-only GPU composition consumes
+/// this position-independent baked visibility using the same packed format as luxels.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct VertexSkySample {
+    /// Direct draw-buffer address, including private inline BMODEL vertices.
+    pub gpu_index: u32,
+    /// Original compiled RGB for inline models (world RGB uses AO-adjusted source).
+    pub authored_color: [f32; 4],
+    pub packed: u32,
+}
+
 struct BakeOutput {
     sun: Vec<Vec<f32>>,
     local: Vec<Vec<f32>>,
-    /// Per sun page: valid bit 31, octahedral normal 2x11 bits, sky visibility 8 bits.
+    /// Per sun page: valid bit, octahedral normal, ambient and direct visibility.
     sky: Vec<Vec<u32>>,
+    vertex_sky: Vec<VertexSkySample>,
 }
 
 /// Worker counts real completed receiver luxels.  The UI reserves 2% for the
@@ -432,6 +490,7 @@ pub(in crate::renderer) struct StaticSun {
     pub local_flux: Vec<GpuImage>,
     /// R32Uint packed smoothed normal + sky visibility per sun page.
     pub sky_normals: Vec<GpuImage>,
+    pub vertex_sky: Vec<VertexSkySample>,
     pub local_lights: Vec<(usize, scene::DynamicLight)>,
     pub generation: u64,
     failed: Option<Key>,
@@ -819,6 +878,24 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     };
     progress.set(1, 25);
     let receivers = geometry.sun_receivers(key.normals);
+    // B tests the normal the fullscreen shader sees on a flat BSP face.
+    // Only sky shading/sky rays use it; sunlight flux and shadow-terminator
+    // smoothing keep their original receiver normals in both A/B modes.
+    let sky_face_receivers: Option<Vec<crate::renderer::StaticAoLightmapTriangle>> =
+        (key.sky != 0 && key.sky_ab == 1).then(|| {
+            geometry.receivers.iter().cloned().map(|mut tri| {
+                let p = tri.positions.map(Vec3::from_array);
+                let mut normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                let authored = tri.normals.iter().fold(Vec3::ZERO, |a, &n| a + Vec3::from_array(n));
+                if normal.dot(authored) < 0.0 { normal = -normal; }
+                if normal.length_squared() < 0.5 {
+                    normal = authored.normalize_or_zero();
+                }
+                tri.normals = [normal.to_array(); 3];
+                tri
+            }).collect()
+        });
+    let sky_receivers = sky_face_receivers.as_deref().unwrap_or(receivers);
     let mut samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
         receivers, &key.sizes, 1,
     );
@@ -862,8 +939,8 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 first
             })
             .collect();
-        progress.set(5, 955);
-        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new() });
+        progress.set(6, 955);
+        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new(), vertex_sky: Vec::new() });
     }
     if key.bake_sun && key.terminator {
         samples.par_iter_mut().zip(&page_ids).zip(&key.sizes)
@@ -912,7 +989,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 .map(|(i, sample)| {
                     if i % 128 == 0 {
                         let n = sun_done.fetch_add(128, Ordering::Relaxed) + 128;
-                        progress.fraction(40, 610, n, sun_total);
+                        progress.fraction(40, 560, n, sun_total);
                     }
                     if cancel.load(Ordering::Relaxed) { return -1.0; }
                     let Some(sample) = sample else { return -1.0; };
@@ -929,11 +1006,11 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             flux
         })
         .collect();
-    progress.set(2, 650);
+    progress.set(2, 600);
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
     if key.bake_sun && key.aa != 0 {
-        progress.set(3, 650);
+        progress.set(3, 600);
         // Parallel by page; each update is gathered separately so no shared
         // GPU/CPU lightmap mutation or per-ray atomic overhead is introduced.
         let edge_pages: Vec<_> = samples.par_iter().zip(&pages).zip(&key.sizes).zip(&page_ids)
@@ -953,7 +1030,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     let updates: Vec<_> = edges.par_iter().enumerate().filter_map(|(ordinal, &i)| {
                         if ordinal % 32 == 0 {
                             let n=edge_done.fetch_add(32,Ordering::Relaxed)+32;
-                            progress.fraction(650, 220, n, edge_total);
+                            progress.fraction(600, 185, n, edge_total);
                         }
                         if cancel.load(Ordering::Relaxed) { return None; }
                         let sample=receiver_samples[i]?;
@@ -981,7 +1058,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     let updates: Vec<_> = edges.par_iter().enumerate().filter_map(|(ordinal, &i)| {
                         if ordinal % 32 == 0 {
                             let n=edge_done.fetch_add(32,Ordering::Relaxed)+32;
-                            progress.fraction(650, 220, n, edge_total);
+                            progress.fraction(600, 185, n, edge_total);
                         }
                         if cancel.load(Ordering::Relaxed) { return None; }
                         let sample=receiver_samples[i]?;
@@ -1000,19 +1077,115 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     for (i,value) in updates { flux[i]=value; }
                 }
             });
-        progress.set(3, 870);
+        progress.set(3, 785);
     }
+    // Use the shader stages actually consuming the original vertex RGB,
+    // including alpha-tested textures/* foliage with a BSP lightmap reference
+    // that none of their stages use. Keep explicit/implicit lightmap stages
+    // authoritative: a vertex-colored sibling must not receive another sky
+    // multiplier over an already composed lightmap. Stages share a geometry
+    // range, so classify that range once before tracing any vertex.
+    let vertex_sky: Vec<VertexSkySample> = if key.bake_sun && key.sky == 2 {
+        let lightmap_lit_ranges: std::collections::BTreeSet<(u32, u32)> = geometry.batches.iter()
+            .flat_map(|batch| std::iter::once(batch).chain(batch.additive_companions.iter()))
+            .filter(|batch| batch.modulate_lightmap || batch.texture_is_lightmap || batch.lightstyle_slot != 0)
+            .map(|batch| (batch.vertices.start, batch.vertices.end))
+            .collect();
+        let mut positions = std::collections::BTreeMap::<usize, Vec3>::new();
+        for (batch_index, batch) in geometry.batches.iter().enumerate() {
+            let range = (batch.vertices.start, batch.vertices.end);
+            let lightmap_lit = batch.lightstyle_slot != 0 || lightmap_lit_ranges.contains(&range);
+            // World stage lists include all siblings, so an unused BSP page
+            // must not veto vertex RGB. Inline models currently retain only
+            // selected bake stages; keep their old conservative eligibility
+            // until their complete sibling stage lists are available here.
+            let world_or_compiled_vertex = batch_index < geometry.world_batch_count
+                || (batch.vertex_lit && batch.lightmap.is_none());
+            if !static_vertex_sky_receiver(
+                geometry.model_materials[batch_index], key.models,
+                batch.rgb_gen, batch.pipeline.class,
+                batch.baked_sky_additive_stage() && batch.additive_companions.iter()
+                    .all(crate::scene::DrawBatch::baked_sky_additive_stage),
+                lightmap_lit, world_or_compiled_vertex,
+            ) {
+                continue;
+            }
+            for (tri_index, triangle) in geometry.vertices
+                [batch.vertices.start as usize..batch.vertices.end as usize]
+                .chunks_exact(3).enumerate()
+            {
+                let p = [
+                    Vec3::from_array(triangle[0].position),
+                    Vec3::from_array(triangle[1].position),
+                    Vec3::from_array(triangle[2].position),
+                ];
+                let mut normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                let authored = triangle.iter().fold(Vec3::ZERO, |sum, v| sum + Vec3::from_array(v.normal));
+                if normal.dot(authored) < 0.0 { normal = -normal; }
+                if normal.length_squared() < 0.5 { normal = authored.normalize_or_zero(); }
+                for corner in 0..3 {
+                    let index = batch.vertices.start as usize + tri_index * 3 + corner;
+                    positions.entry(index).or_insert(normal);
+                }
+            }
+        }
+        positions.into_par_iter().filter_map(|(source_index, normal)| {
+            let gpu_index = *geometry.vertex_gpu_indices.get(source_index)?;
+            if gpu_index == u32::MAX { return None; }
+            let vertex = &geometry.vertices[source_index];
+            let position = Vec3::from_array(vertex.position);
+            let normal = normal.normalize_or_zero();
+            if normal.length_squared() < 0.5 || cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let tangent = normal.cross(if normal.y.abs() < 0.9 { Vec3::Y } else { Vec3::X }).normalize();
+            let bitangent = normal.cross(tangent);
+            let origin = position + normal * 0.5;
+            let mut open = 0.0;
+            const RAYS: usize = 16;
+            for i in 0..RAYS {
+                let u = (i as f32 + 0.5) / RAYS as f32;
+                let phi = i as f32 * 2.399_963_1;
+                let radius = u.sqrt();
+                let direction = (tangent * (radius * phi.cos()) + bitangent * (radius * phi.sin())
+                    + normal * (1.0 - u).sqrt()).normalize();
+                let distance = if key.visibility == SunVisibilityMode::Legacy {
+                    Some(131072.0)
+                } else { sky.as_ref().and_then(|s| s.trace(origin, direction, 131072.0)) };
+                if let Some(distance) = distance { open += visibility(origin, direction, distance); }
+            }
+            let facing = normal.dot(toward).max(0.0);
+            let direct = if facing > 0.0 {
+                (sun_flux(StaticAoTexelSample {
+                    position: position.to_array(), normal: normal.to_array(),
+                }) / facing).clamp(0.0, 1.0)
+            } else { 0.0 };
+            Some(VertexSkySample { gpu_index, authored_color: vertex.color, packed: pack_sky_normal(normal, open / RAYS as f32, direct) })
+        }).collect()
+    } else { Vec::new() };
+    if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+
     let sky_pages = if key.bake_sun && key.sky != 0 {
-        progress.set(3, 870);
+        // The previous 87% "EDGE AA" state hid all sky tracing time. Reserve
+        // a measured interval for the sky's 16 ambient hemisphere rays.
+        // Direct visibility reuses the already completed sun/moon bake.
+        progress.set(4, 785);
         let charts = triangle_charts(receivers);
-        // Sky visibility changes slowly across a surface: trace it once per
-        // ORIGINAL luxel, then resample within the same lightmap chart.
+        // Trace at ORIGINAL resolution, then resample within the same chart.
+        // Only diffuse sky openness belongs on this lower-resolution grid.
+        // The compositor reads direct visibility from the antialiased sun flux.
         let base_visibility: Vec<Vec<f32>> = if key.sky == 2 {
             let base_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
-                receivers, &key.sky_sizes, 1,
+                sky_receivers, &key.sky_sizes, 1,
             );
             const RAYS: usize = 16;
-            base_samples.par_iter().map(|texels| texels.par_iter().map(|sample| {
+            let sky_total = base_samples.iter().map(|texels| texels.len() as u32).sum::<u32>().max(1);
+            let sky_done = AtomicU32::new(0);
+            base_samples.par_iter().map(|texels| texels.par_iter().enumerate().map(|(ordinal, sample)| {
+                if ordinal % 64 == 0 {
+                    let n = sky_done.fetch_add(64, Ordering::Relaxed) + 64;
+                    progress.fraction(785, 100, n, sky_total);
+                }
                 let Some(sample) = sample else { return -1.0; };
                 if cancel.load(Ordering::Relaxed) { return -1.0; }
                 let normal = Vec3::from_array(sample.normal);
@@ -1041,6 +1214,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         } else {
             Vec::new()
         };
+        progress.set(4, 885);
         let base_charts: Vec<Vec<u32>> = if key.sky == 2 {
             let mut charted = receivers.to_vec();
             for (triangle, &chart) in charted.iter_mut().zip(&charts) { triangle.owner = chart; }
@@ -1048,11 +1222,19 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         } else {
             Vec::new()
         };
+        // A uses the static sun's smoothed luxel normals. B rasterizes
+        // geometric face normals into the same luxels, without changing sun
+        // flux or allocating any additional GPU textures.
+        let face_samples = sky_face_receivers.as_ref().map(|face| {
+            crate::renderer::static_ao::bvh::rasterize_lightmap_texels(face, &key.sizes, 1)
+        });
+        let pack_done = AtomicU32::new(0);
+        let pack_total = samples.len() as u32;
         samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
             .map(|(page, ((texels, ids), &[w, h]))| {
                 let mut packed: Vec<u32> = texels.iter().enumerate().map(|(i, sample)| {
                     let Some(sample) = sample else { return 0; };
-                    let open = if key.sky == 2 {
+                    let exposure = if key.sky == 2 {
                         let chart = receivers.get(ids[i]).map_or(0, |_| charts[ids[i]]);
                         let [bw, bh] = key.sky_sizes[page];
                         let at = [((i % w as usize) as f32 + 0.5) * bw as f32 / w as f32 - 0.5,
@@ -1075,7 +1257,14 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     } else {
                         1.0
                     };
-                    pack_sky_normal(Vec3::from_array(sample.normal), open)
+                    let normal = face_samples.as_ref()
+                        .and_then(|pages| pages.get(page))
+                        .and_then(|page_samples| page_samples.get(i))
+                        .and_then(|sample| sample.as_ref())
+                        .map_or(Vec3::from_array(sample.normal), |face| Vec3::from_array(face.normal));
+                    // Luxel direct visibility stays in the existing R32F sun
+                    // texture; these packed bits are only used by vertex sky.
+                    pack_sky_normal(normal, exposure, 0.0)
                 }).collect();
                 // Border luxels take a covered neighbour so bilinear world
                 // sampling at chart edges never sees an ungained texel.
@@ -1088,13 +1277,15 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                         .find(|v| *v != 0)
                         .unwrap_or(0);
                 }
+                let completed = pack_done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.fraction(885, 30, completed, pack_total);
                 packed
             })
             .collect()
     } else {
         Vec::new()
     };
-    progress.set(4, 870);
+    progress.set(5, 915);
     let local_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
         &geometry.receivers,
         &key.local_sizes,
@@ -1137,15 +1328,15 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             }
             for c in 0..3 { page.extend(totals.iter().map(|total| total[c])); }
             let n=local_done.fetch_add(1,Ordering::Relaxed)+1;
-            progress.fraction(870, 80, n, local_total);
+            progress.fraction(915, 35, n, local_total);
             page
         })
         .collect();
-    progress.set(5, 955);
+    progress.set(6, 955);
     if cancel.load(Ordering::Relaxed) {
         Err("cancelled".into())
     } else {
-        Ok(BakeOutput { sun: pages, local, sky: sky_pages })
+        Ok(BakeOutput { sun: pages, local, sky: sky_pages, vertex_sky })
     }
 }
 
@@ -1156,7 +1347,7 @@ impl Renderer {
         // The cached static illumination needs flux/occlusion from the same
         // direction as the runtime CSM. Only its DIRECTION is part of the key;
         // moving the intensity slider must not re-raytrace static geometry.
-        let sun = if self.sun_override && self.blue_water_night() {
+        let sun = if self.sun_override {
             self.relit_celestial()
         } else {
             self.active_sun()
@@ -1168,10 +1359,11 @@ impl Renderer {
         let light_sources = self.added_map_light_sources();
         let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
         let debug_layers = if matches!(self.lightmap_signal, 7 | 8) { self.lightmap_signal } else { 0 };
-        // Only what changes the traced data keys the bake: the sky strength,
-        // light and environment are applied by the compositor.
-        let sky = if bake_sun && self.sky_backend == 1 && self.blue_water_environment.world_lighting > 0.0 {
-            self.sky_world_bake.min(2)
+        // B uses geometric normals and 16-ray ambient sky openness. Direct
+        // visibility comes from the existing sun/moon bake and its edge AA.
+        let sky = if bake_sun && self.sun_override && self.sky_world_bake_ab != 0
+            && self.sky_world_lighting_strength > 0.0 {
+            2
         } else {
             0
         };
@@ -1194,6 +1386,7 @@ impl Renderer {
             state.flux.clear();
             state.local_flux.clear();
             state.sky_normals.clear();
+            state.vertex_sky.clear();
             state.local_lights.clear();
             return;
         }
@@ -1221,6 +1414,7 @@ impl Renderer {
                     && k.terminator == self.sun_terminator
                     && k.debug_layers == debug_layers
                     && k.sky == sky
+                    && k.sky_ab == (if sky != 0 { 1 } else { 0 })
                     && k.local_sources
                         == if bake_local {
                             light_sources
@@ -1278,6 +1472,7 @@ impl Renderer {
             terminator: self.sun_terminator,
             debug_layers,
             sky,
+            sky_ab: if sky != 0 { 1 } else { 0 },
             sky_sizes: if sky == 2 { base.clone() } else { Vec::new() },
             local_sources: if bake_local {
                 light_sources
@@ -1399,7 +1594,11 @@ impl Renderer {
                         let view = texture.create_view(&Default::default());
                         GpuImage::new(texture, view)
                     }).collect();
+                    state.vertex_sky = pages.vertex_sky;
                     state.local_lights = key.locals.clone();
+                    if key.sky == 2 {
+                        println!("[SUN LIGHTMAP] B static BSP vertex-lit sky receivers: {}", state.vertex_sky.len());
+                    }
                     if let Some(started) = state.bake_started {
                         println!(
                             "[SUN LIGHTMAP] tracing + texture upload: {:.2}s ({} workers, AA {})",
@@ -1482,8 +1681,9 @@ impl Renderer {
             let stage = match pending.progress.stage.load(Ordering::Relaxed) {
                 2 => SunBakeStage::Tracing,
                 3 => SunBakeStage::Refining,
-                4 => SunBakeStage::Local,
-                5 => SunBakeStage::Uploading,
+                4 => SunBakeStage::SkyVisibility,
+                5 => SunBakeStage::Local,
+                6 => SunBakeStage::Uploading,
                 _ => SunBakeStage::Preparing,
             };
             return (pending.progress.done.load(Ordering::Relaxed).min(980), stage);
@@ -1531,6 +1731,43 @@ impl StaticSun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_sky_bake_uses_world_stage_lighting_not_bsp_lightmap_metadata() {
+        use jka_assets::shader::RgbGen;
+        let eligible = |model, draw_model, lightmap_lit, world_or_vertex, rgb, class| {
+            static_vertex_sky_receiver(model, draw_model, rgb, class,
+                false, lightmap_lit, world_or_vertex)
+        };
+        // seph_seaweed3: BSP references lm_0026, but the masked base is
+        // rgbGen vertex and no stage samples the lightmap. Its world receiver
+        // is eligible even without an original LIGHTMAP_BY_VERTEX flag.
+        assert!(eligible(false, true, false, true, RgbGen::Vertex, DrawClass::Mask));
+        assert!(eligible(false, false, false, true, RgbGen::Vertex, DrawClass::Mask));
+        // The compiled models/* receiver remains supported, but honors the
+        // built-in world model visibility switch.
+        assert!(eligible(true, true, false, true, RgbGen::ExactVertex, DrawClass::Opaque));
+        assert!(!eligible(true, false, false, true, RgbGen::Vertex, DrawClass::Mask));
+        // Do not multiply a stage already lit by an implicit or explicit
+        // lightmap (including a lightmap-consuming sibling in that range).
+        assert!(!eligible(false, true, true, true, RgbGen::Vertex, DrawClass::Opaque));
+        assert!(!eligible(false, true, false, true, RgbGen::Identity, DrawClass::Opaque));
+        assert!(!eligible(false, true, false, true, RgbGen::Vertex, DrawClass::Transparent));
+        // Constant/wave additive stages can also receive a cached sky gain:
+        // their authored RGB must remain unchanged, and the shader applies
+        // this gain *after* rgbGen wave evaluation. Alpha is never modified.
+        assert!(static_vertex_sky_receiver(false, true, RgbGen::Const,
+            DrawClass::Transparent, true, false, true));
+        assert!(static_vertex_sky_receiver(false, true, RgbGen::Wave(jka_assets::shader::Wave {
+            func: jka_assets::shader::WaveFunc::Sin, base: 1.0,
+            amplitude: 0.0, phase: 0.0, frequency: 0.0,
+        }), DrawClass::Transparent, true, false, true));
+        assert!(!static_vertex_sky_receiver(false, true, RgbGen::Const,
+            DrawClass::Transparent, true, true, true));
+        // Inline models with no compiled vertex lighting keep their previous
+        // conservative behavior until complete material stages are retained.
+        assert!(!eligible(false, true, false, false, RgbGen::Vertex, DrawClass::Mask));
+    }
     #[test]
     fn curved_bsp_receivers_smooth_only_matching_shared_edges() {
         use crate::renderer::StaticAoLightmapTriangle;
@@ -1675,11 +1912,14 @@ mod tests {
                 })
                 .collect(),
         );
+        let mapping = (0..vertices.len() as u32).collect();
         let geometry = Geometry::new(
             vertices,
             vec![floor.clone(), roof, sky],
             Arc::new(vec![]),
             &map.material_debug,
+            3,
+            mapping,
         );
         let key = Key {
             direction: [0.0, -1.0, 0.0],
@@ -1694,6 +1934,7 @@ mod tests {
             terminator: false,
             debug_layers: 0,
             sky: 0,
+            sky_ab: 0,
             sky_sizes: Vec::new(),
             local_sources: 0,
             local_sizes: Vec::new(),

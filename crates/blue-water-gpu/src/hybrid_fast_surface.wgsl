@@ -14,6 +14,19 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
     let dy = dpdy(xz);
     let footprint = max(min(length(dx), length(dy)), max(length(dx), length(dy)) / ANISOTROPY);
     let coast = shore_at(xz);
+#ifdef JKA_ADAPTIVE_HYBRID
+    // Evaluate *material* LOD at the water's projected pixel footprint, not
+    // distance from the camera or a block-sized render target. Wave geometry,
+    // water/depth/shore classification and every output pixel stay unchanged.
+    let span = max(length(dx), length(dy));
+    // Most of upstream's additional slope work matters only when the screen
+    // can resolve it. Smooth handoff avoids a camera-distance LOD ring.
+    let fine_share = 1.0 - smoothstep(0.12, 0.7, span);
+    var gust = 1.0;
+    if fine_share > 0.001 {
+        gust = mix(1.0, gust_gain(xz, span), fine_share);
+    }
+#endif
     var slope = vec2<f32>(0.0);
     var strain = vec3<f32>(0.0);
     var foam = 0.0;
@@ -21,6 +34,16 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
     for (var i = 0; i < CASCADES; i++) {
         let level = log2(max(footprint * waves.texels[i], 1e-6));
         let detail = 1.0 - smoothstep(waves.info.x - 1.0, waves.info.x, level);
+#ifdef JKA_ADAPTIVE_HYBRID
+        if detail <= 0.0 {
+            // Same variance as the fully filtered branch below, without the
+            // scattered FFT derivative/extra texture reads. This is exact at
+            // detail=0 and works independently per cascade and screen pixel.
+            let kept = coast.scales[i];
+            variance += waves.slopes[i] * kept * kept * gust;
+            continue;
+        }
+#endif
         let copies = scatter(xz, i);
         // Keep the SAME scattered phases as displacement. Two fields, no
         // wider bubble-spread reads or procedural gust/breaking-group stack.
@@ -30,11 +53,51 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
         let d = mix_zero(dr, copies) * kept;
         let e = mix_mean(er, copies);
         let cross_strain = mix_zero(er, copies).x * kept;
+#ifdef JKA_ADAPTIVE_HYBRID
+        // Original Bluewater applies a spatial gust gain to *resolved* slope
+        // samples; do not run its noise stack where the pixel cannot see it.
+        slope += d.xy * detail * (1.0 - calm * waves.slick_shares[i]) * sqrt(gust);
+#else
         slope += d.xy * detail * (1.0 - calm * waves.slick_shares[i]);
+#endif
         strain += vec3<f32>(d.zw, cross_strain) * detail;
         foam = max(foam, e.y * kept * kept * detail);
+#ifdef JKA_ADAPTIVE_HYBRID
+        // The reference's stochastic multi-copy variance avoids a uniform
+        // patchwork sheen when individual wave slopes are resolved. Only pay
+        // for it in the visible fine-detail region.
+        var filtered = max(e.z - dot(d.xy, d.xy), 0.0);
+        if fine_share > 0.001 {
+            filtered = mix(filtered, mix_variance(er, dr, copies), fine_share);
+        }
+        variance += mix(waves.slopes[i], filtered, detail) * kept * kept * gust;
+#else
         variance += mix(waves.slopes[i], max(e.z - dot(d.xy, d.xy), 0.0), detail) * kept * kept;
+#endif
     }
+#ifdef JKA_ADAPTIVE_HYBRID
+    // Port the original Bluewater's fine ripple read (wave_surface). This is
+    // the extra sub-cascade field absent in the compact material; its footprint
+    // fading and corresponding reduction of unresolved variance are preserved.
+    // Only execute its explicit-gradient texture read where fine ripples are
+    // actually screen-resolvable. No second render pass or pixel upscaling.
+    if fine_share > 0.001 && CASCADES > 1 {
+        let finest = CASCADES - 1;
+        let level = max(log2(max(footprint * waves.tail.w, 1e-6)), 0.0);
+        let shown = (1.0 - smoothstep(waves.info.x - 1.0, waves.info.x, level)) * fine_share;
+        if shown > 0.0 {
+            let read = textureSampleGrad(field_derivatives, field_sampler,
+                xz / waves.tail.z + 0.5 / waves.info.z, finest,
+                dx / waves.tail.z, dy / waves.tail.z);
+            let kept = coast.scales[finest];
+            let still = (1.0 - calm) * sqrt(gust);
+            slope += read.xy * shown * still * kept;
+            let drawn = -max(1.0 - level / waves.info.x, 0.0) * shown;
+            variance += min(waves.slopes[finest], waves.tail.x) * drawn * (1.0 - calm) * gust * kept * kept;
+        }
+    }
+    variance = max(variance, 0.0001);
+#endif
     slope = slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);
     strain = (strain * jka_hybrid.motion_mix.z + jka_hybrid_strain(xz)) * jka_hybrid_crest_scale();
     let xx = 1.0 + strain.x;
@@ -44,6 +107,53 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
         determinant, -(xx * slope.y - strain.z * slope.x)) + vec3<f32>(0.0, 1e-6, 0.0));
     return JkaFastWave(normal, foam / clamp(determinant, FOAM_JACOBIAN_MIN, FOAM_JACOBIAN_MAX), variance, determinant);
 }
+
+#ifdef JKA_ADAPTIVE_HYBRID
+// Compact glints are *material* detail, not reduced pixel shading. This is a
+// world-anchored Bernoulli sparkle distribution over the existing GGX lobe.
+// Each cell is approximately one pixel across and we blend adjacent power-of-two
+// footprints continuously as the camera moves. It is intentionally cheap.
+fn jka_glint_hash(cell: vec2<i32>, salt: u32) -> f32 {
+    var h = (bitcast<u32>(cell.x) * 0x8da6b343u)
+        ^ (bitcast<u32>(cell.y) * 0xd8163841u) ^ (salt * 0xcb1ab31fu);
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return (f32(h >> 8u) + 0.5) / 16777216.0;
+}
+
+fn jka_glint_cell(xz: vec2<f32>, size: f32, probability: f32, time: f32) -> f32 {
+    let cell = vec2<i32>(floor(xz / size));
+    let clock = time * 2.5 + jka_glint_hash(cell, 17u);
+    let slot = i32(floor(clock));
+    // Fade from sample N to sample N+1. The previous version blended two
+    // unrelated samples *within* N and popped at the slot boundary.
+    let a = select(0.0, 1.0, jka_glint_hash(cell, bitcast<u32>(slot) * 977u + 31u) < probability);
+    let b = select(0.0, 1.0, jka_glint_hash(cell, bitcast<u32>(slot + 1) * 977u + 31u) < probability);
+    return mix(a, b, smoothstep(0.0, 1.0, fract(clock)));
+}
+
+fn jka_cheap_glints(xz: vec2<f32>, pixel_area: f32, time: f32) -> f32 {
+    // Do NOT disable glints near the camera: the earlier smoothstep(0.1, 0.4)
+    // made the close water completely sparkle-free. Use the projected pixel
+    // footprint directly at every distance, with no material-LOD boundary.
+    let span = sqrt(max(pixel_area, 1e-10));
+    let lod = log2(max(span, 0.0009765625));
+    let size = exp2(floor(lod));
+    let probability = clamp(0.10 + 0.014 * max(lod, 0.0), 0.10, 0.23);
+    let a = jka_glint_cell(xz, size, probability, time);
+    let b = jka_glint_cell(xz, size * 2.0, probability, time);
+    let draw = mix(a, b, smoothstep(0.0, 1.0, fract(lod)));
+    // Bounded energy redistribution: a small part of the GGX sheen sparkles,
+    // rather than amplifying the entire far sun lobe by 2-6x. Continuous
+    // attenuation prevents a near/mid/far band (no hard cutoff at 24..64).
+    // Expected gain is 1 in linear light, before fog and tonemapping.
+    let strength = 0.26 / (1.0 + 0.30 * span);
+    return 1.0 + strength * (draw / probability - 1.0);
+}
+#endif
 
 // Godot's compact GGX distribution and Smith visibility, rather than the
 // anisotropic physical glitter/Poisson micro-glint stack.
@@ -99,8 +209,12 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
     let lit = mix(1.0, shadow, clamp(sun_intensity / 2.0, 0.0, 1.0));
     let beam = clamp((shadow - CLOUD_SHADOW_FLOOR) / (1.0 - CLOUD_SHADOW_FLOOR), 0.0, 1.0);
     let daylight = env_irradiance(sky_atlas, sky_sampler, sky_env, vec3<f32>(0.0, 1.0, 0.0));
+    // The compact BRDF's broad environment lobe otherwise overexposes the
+    // ocean horizon at night. Reduce ONLY sky-atlas radiance: moon/sun GGX,
+    // traced SSR, water transmission, and foam keep their authored lighting.
     let sky = env_radiance(sky_atlas, sky_sampler, sky_env,
-        normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z)), alpha) * jka_admission;
+        normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z)), alpha)
+        * (jka_admission * jka_hybrid.breaker.w);
     var reflected = sky;
 #ifdef JKA_FAST_SSR
     let to_view = camera.view;
@@ -149,7 +263,21 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
         max(blur, patterns.streaks_blur), 0.5);
     let windrows = clamp(max(windrow, streaks) * surface.crest_foam.a * jka_hybrid.breaker.y, 0.0, 1.0);
     let foam = clamp(max(crest_foam, shore_foam) * jka_hybrid.breaker.y, 0.0, 1.0);
-    var above = water + jka_fast_sun(up, view, sun_direction, sun_radiance, alpha) * beam;
+    var sun = jka_fast_sun(up, view, sun_direction, sun_radiance, alpha) * beam;
+#ifdef JKA_ADAPTIVE_HYBRID
+    // Sparse sparkle redistributes only the GGX sunlight, never ambient,
+    // sky/SSR, foam, or body light. No extra sun energy is introduced on average.
+    // Derivatives must be evaluated in uniform control flow, even when the
+    // glint itself is disabled in shadow or with the celestial light below the
+    // horizon. Shadow/cloud admission still gates the final contribution.
+    let grid_dx = dpdx(xz);
+    let grid_dy = dpdy(xz);
+    let pixel_area = abs(grid_dx.x * grid_dy.y - grid_dx.y * grid_dy.x);
+    if sun_intensity > 0.0 && sun_direction.y > 0.0 && beam > 0.0 {
+        sun *= jka_cheap_glints(xz, pixel_area, waves.wind.z);
+    }
+#endif
+    var above = water + sun;
     above = foam_over(above, water, foam_light * surface.surface_foam.rgb * thin_foam(absorption), reflected, reflectance, windrows);
     above = mix(above, foam_light * mix(surface.crest_foam.rgb, surface.shoreline_foam.rgb, shore_foam), clamp(foam, 0.0, 1.0));
     var color = jka_surface_legacy_fog(apply_fog(above, input.world), input.world);

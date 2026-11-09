@@ -72,7 +72,11 @@ impl App {
             (true, 2) => 1,
             _ => 0,
         };
-        let rules = ForceRules { max_rank: rank, free_saber, team_force, gametype, force_disable: value(b"g_forcePowerDisable") };
+        // ui_force.c UI_ReadLegalForce / UI_ForceConfigHandle legalize with
+        // fpDisabled 0: the UI never strips disabled powers from the string it
+        // sends, and servers that let saber styles survive g_forcePowerDisable
+        // read Saber Attack from it.
+        let rules = ForceRules { max_rank: rank, free_saber, team_force, gametype, force_disable: 0 };
         let current = self.jk2_effective_forcepowers();
         let native = |v: jka_protocol::jk2::Version| match v {
             jka_protocol::jk2::Version::V102 => jka_movement::jk2::Version::V102,

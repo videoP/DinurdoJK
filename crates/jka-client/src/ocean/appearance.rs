@@ -412,7 +412,6 @@ pub fn from_stage(
     match source.alpha_gen {
         AlphaGen::Vertex => tint[3] *= vertex[3],
         AlphaGen::OneMinusVertex => tint[3] *= 1.0 - vertex[3],
-        AlphaGen::Identity if matches!(source.rgb_gen, RgbGen::Vertex) => tint[3] *= vertex[3],
         _ => {}
     }
     for i in 0..4 {
@@ -437,9 +436,6 @@ pub fn from_stage(
     match source.alpha_gen {
         AlphaGen::Vertex => stage_color[3] *= vertex[3],
         AlphaGen::OneMinusVertex => stage_color[3] *= 1.0 - vertex[3],
-        AlphaGen::Identity if matches!(source.rgb_gen, RgbGen::Vertex) => {
-            stage_color[3] *= vertex[3]
-        }
         _ => {}
     }
     let blend = blend_factors(source.pipeline.blend);

@@ -9,6 +9,7 @@ pub(in crate::renderer) mod bsp_model_lod;
 pub(in crate::renderer) mod inline_models;
 pub(in crate::renderer) mod inline_transform;
 pub(in crate::renderer) mod lifecycle;
+pub(in crate::renderer) mod legacy_blend;
 pub(in crate::renderer) mod material_remap;
 pub(in crate::renderer) mod pipelines;
 pub(in crate::renderer) mod programs;

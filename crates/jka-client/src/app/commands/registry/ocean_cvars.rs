@@ -1,125 +1,287 @@
 //! Ocean cvars: declarative runtime and config bindings.
 use super::cvar_prelude::*;
 
-app_cvars! {
+use crate::console::cvars::CvarScalar;
+
+video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
     APP_R_BLUEWATERCOASTSHELTER {
-        runtime: CvarDef::new("r_blueWaterCoastShelter", "0", "0|1",
-            "Upstream coast: 1 includes land/wind-fetch shelter; 0 keeps depth breaking and moving surf only. Shelter can remove long waves under weak wind. Use bluewater_coast_debug to inspect local attenuation.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_coast_shelter),
-            |app,value| {let CvarValue::Bool(v)=value else {unreachable!()};
-                app.video.ocean_settings.blue_water_coast_shelter=v;app.commit_ocean_settings();Ok(())}),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {settings.ocean_settings.blue_water_coast_shelter=value=="1";}),
-            archive: Some((27345,|state|u8::from(state.video.ocean_settings.blue_water_coast_shelter).to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_blueWaterCoastShelter", default: "0",
+        range: "0|1", description: "Upstream coast: 1 includes land/wind-fetch shelter; 0 keeps depth breaking and moving surf only. Shelter can remove long waves under weak wind. Use bluewater_coast_debug to inspect local attenuation.",
+        kind: CvarType::Bool, field: ocean_settings.blue_water_coast_shelter, archive: 27345
     }
     APP_R_BLUEWATERCOAST {
-        runtime: CvarDef::new("r_blueWaterCoast", "0", "0|1",
-            "Original Blue Water coastal waves/surf on native or Hybrid: depth breaking, land fetch shelter and moving surf bands. Separate from the r_coastal shallow-bank solver; 0 restores open-ocean waves.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_coast),
-            |app,value| {let CvarValue::Bool(v)=value else {unreachable!()};
-                app.video.ocean_settings.blue_water_coast=v;app.commit_ocean_settings();Ok(())}),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {settings.ocean_settings.blue_water_coast=value=="1";}),
-            archive: Some((27344,|state|u8::from(state.video.ocean_settings.blue_water_coast).to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_blueWaterCoast", default: "0",
+        range: "0|1", description: "Original Blue Water coastal waves/surf on native or Hybrid: depth breaking, land fetch shelter and moving surf bands. Separate from the r_coastal shallow-bank solver; 0 restores open-ocean waves.",
+        kind: CvarType::Bool, field: ocean_settings.blue_water_coast, archive: 27344
     }
     APP_R_LAKESOURCEHINTS {
-        runtime: CvarDef::new("r_lakeSourceHints", "1", "0|1",
-            "Use each promoted JKA water shader's source hue, alpha-blend clarity, authored deformation, roughness and tcMod scroll heading in Lake mode. 0 restores the global Lake material.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.lake.source_hints),
-            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() };
-                app.video.ocean_settings.lake.source_hints = v; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { settings.ocean_settings.lake.source_hints = value == "1"; }),
-            archive: Some((27377, |state| u8::from(state.video.ocean_settings.lake.source_hints).to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
+        name: "r_lakeSourceHints", default: "1",
+        range: "0|1", description: "Use each promoted JKA water shader's source hue, alpha-blend clarity, authored deformation, roughness and tcMod scroll heading in Lake mode. 0 restores the global Lake material.",
+        kind: CvarType::Bool, field: ocean_settings.lake.source_hints, archive: 27377
     }
     APP_R_LAKEWINDSPEED {
-        runtime: CvarDef::new("r_lakeWindSpeed", "0", "0..40", "Lake ripple wind speed in metres per second; independent of ocean spectrum.",
-            CvarType::Float { min: 0.0, max: 40.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.wind_speed),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.lake.wind_speed=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() {settings.ocean_settings.lake.wind_speed=v;}
-            }),
-            archive: Some((27340, |state| state.video.ocean_settings.lake.wind_speed.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_lakeWindSpeed", default: "0",
+        range: "0..40", description: "Lake ripple wind speed in metres per second; independent of ocean spectrum.",
+        kind: CvarType::Float { min: 0.0, max: 40.0 }, field: ocean_settings.lake.wind_speed, archive: 27340
     }
     APP_R_LAKEDIRECTION {
-        runtime: CvarDef::new("r_lakeDirection", "52", "-180..180", "Lake ripple direction in degrees from +X toward world +Z.",
-            CvarType::Float { min: -180.0, max: 180.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.direction),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.lake.direction=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() {settings.ocean_settings.lake.direction=v;}
-            }),
-            archive: Some((27341, |state| state.video.ocean_settings.lake.direction.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_lakeDirection", default: "52",
+        range: "-180..180", description: "Lake ripple direction in degrees from +X toward world +Z.",
+        kind: CvarType::Float { min: -180.0, max: 180.0 }, field: ocean_settings.lake.direction, archive: 27341
     }
     APP_R_LAKETRANSPARENCY {
-        runtime: CvarDef::new("r_lakeTransparency", "0.5", "0.1..10", "Lake optical clarity multiplier; higher values reveal more of the bed.",
-            CvarType::Float { min: 0.1, max: 10.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.transparency),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.lake.transparency=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() {settings.ocean_settings.lake.transparency=v;}
-            }),
-            archive: Some((27342, |state| state.video.ocean_settings.lake.transparency.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_lakeTransparency", default: "0.5",
+        range: "0.1..10", description: "Lake optical clarity multiplier; higher values reveal more of the bed.",
+        kind: CvarType::Float { min: 0.1, max: 10.0 }, field: ocean_settings.lake.transparency, archive: 27342
     }
     APP_R_LAKEREFLECTIONS {
-        runtime: CvarDef::new("r_lakeReflections", "0.525", "0..1", "Lake world/sky reflection and sun glitter strength; 0 removes reflections.",
-            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.reflections),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.reflections=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.reflections=v.clamp(0.0,1.0); } }
-            }),
-            archive: Some((27363, |state| state.video.ocean_settings.lake.reflections.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_lakeReflections", default: "0.525",
+        range: "0..1", description: "Lake world/sky reflection and sun glitter strength; 0 removes reflections.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.reflections, archive: 27363
     }
     APP_R_LAKEAMPLITUDE {
-        runtime: CvarDef::new("r_lakeAmplitude", "6.65", "0..12", "Lake geometric amplitude in inches above/below the map plane; 0 is flat.",
-            CvarType::Float { min: 0.0, max: 12.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.amplitude),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.lake.amplitude=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() {
-                    if v.is_finite() {settings.ocean_settings.lake.amplitude=v.clamp(0.0,12.0);}
-                }
-            }),
-            archive: Some((27360, |state| state.video.ocean_settings.lake.amplitude.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
+        name: "r_lakeAmplitude", default: "6.65",
+        range: "0..12", description: "Lake geometric amplitude in inches above/below the map plane; 0 is flat.",
+        kind: CvarType::Float { min: 0.0, max: 12.0 }, field: ocean_settings.lake.amplitude, archive: 27360
     }
+    APP_R_LAKESPEED {
+        name: "r_lakeSpeed", default: "1.45",
+        range: "0..3", description: "Lake deformation animation speed; 0 freezes it, 1 is normal.",
+        kind: CvarType::Float { min: 0.0, max: 3.0 }, field: ocean_settings.lake.speed, archive: 27364
+    }
+    APP_R_LAKETRANSMISSION {
+        name: "r_lakeTransmission", default: "1",
+        range: "0..1.0", description: "Cheapwater transmission: 0 preserves opaque shading, 1 reveals the bed with depth absorption.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.cheap_transmission, archive: 27369
+    }
+    APP_R_LAKEREFRACTION {
+        name: "r_lakeRefraction", default: "0.026",
+        range: "0..0.05", description: "Cheapwater screen-space refraction strength; reuses its moving normal layers. Zero disables distortion.",
+        kind: CvarType::Float { min: 0.0, max: 0.05 }, field: ocean_settings.lake.cheap_refraction, archive: 27370
+    }
+    APP_R_LAKEDEPTHCOLOR {
+        name: "r_lakeDepthColor", default: "0.52",
+        range: "0.0..1.0", description: "Cheapwater shallow/deep color blend. Zero preserves the base material.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.depth_color_strength, archive: 27371
+    }
+    APP_R_LAKECOLORDEPTH {
+        name: "r_lakeColorDepth", default: "52",
+        range: "0.1..100.0", description: "Vertical bed depth in metres at which Cheapwater reaches its deep color.",
+        kind: CvarType::Float { min: 0.1, max: 100.0 }, field: ocean_settings.lake.color_depth, archive: 27372
+    }
+    APP_R_LAKEOPAQUEDEPTH {
+        name: "r_lakeOpaqueDepth", default: "8",
+        range: "0.25..100 feet", description: "Cheapwater vertical bed depth in feet where nonlinear transparency reaches zero. 3-inch water remains almost fully clear at the default 8 feet.",
+        kind: CvarType::Float { min: 0.25, max: 100.0 }, field: ocean_settings.lake.opaque_depth, archive: 27375
+    }
+    APP_R_LAKESHADER {
+        name: "r_lakeShader", default: "1",
+        range: "0|1", description: "Lake material A/B: 0 original optical water, 1 Cheapwater material with neutral water reflections. Geometry and reflection selection are shared.",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.lake.shader, archive: 27367
+    }
+    APP_R_LAKEREFLECTIONMODE {
+        name: "r_lakeReflectionMode", default: "2",
+        range: "0..2", description: "Lake-local reflections: 0 Sky, 1 SSR, 2 Planar. Independent of global reflection mode and quality.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.lake.reflection_mode, archive: 27368
+    }
+    APP_R_HYBRIDGERSTNERAMPLITUDE {
+        name: "r_hybridGerstnerAmplitude", default: "128",
+        range: "0.0..16384.0", description: "Hybrid-only directional Gerstner amplitude; independent of Godot and Blue Water FFT.",
+        kind: CvarType::Float { min: 0.0, max: 16384.0 }, field: ocean_settings.hybrid_swell.amplitude, archive: 25180
+    }
+    APP_R_HYBRIDGERSTNERWAVELENGTH {
+        name: "r_hybridGerstnerWavelength", default: "1400",
+        range: "64.0..32768.0", description: "Hybrid-only directional Gerstner wavelength; independent of Godot and Blue Water FFT.",
+        kind: CvarType::Float { min: 64.0, max: 32768.0 }, field: ocean_settings.hybrid_swell.wavelength, archive: 25181
+    }
+    APP_R_HYBRIDGERSTNERSPEED {
+        name: "r_hybridGerstnerSpeed", default: "180",
+        range: "-4096.0..4096.0", description: "Hybrid-only directional Gerstner speed; independent of Godot and Blue Water FFT.",
+        kind: CvarType::Float { min: -4096.0, max: 4096.0 }, field: ocean_settings.hybrid_swell.speed, archive: 25183
+    }
+    APP_R_HYBRIDGERSTNERSTEEPNESS {
+        name: "r_hybridGerstnerSteepness", default: "0.65",
+        range: "0.0..1.0", description: "Hybrid-only directional Gerstner steepness; independent of Godot and Blue Water FFT.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.hybrid_swell.steepness, archive: 25184
+    }
+    APP_R_HYBRIDFFTBLEND {
+        name: "r_hybridFftBlend", default: "1",
+        range: "0..1", description: "Hybrid ocean: 1 pure Blue Water FFT; 0 authored Gerstner; intermediate values mix FFT and analytical displacement. Native and Godot unaffected.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.hybrid_fft_blend, archive: 25189
+    }
+    APP_R_HYBRIDBREAKER {
+        name: "r_hybridBreaker", default: "0",
+        range: "0..2", description: "Hybrid crest A/B: 0 original; 1 conservative horizontal compression limit; 2 bounded crest folds, signed normals and spilling foam. Preserves vertical wave height. Applies live.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.hybrid_breaker, archive: 25221
+    }
+    APP_R_BLUEWATERMESHLEVELS {
+        name: "r_blueWaterMeshLevels", default: "6",
+        range: "6..9", description: "Blue Water clipmap level count; 9 is native reference. Rebuilds geometry.",
+        kind: CvarType::Int { min: 6, max: 9 }, field: ocean_settings.blue_water_mesh_levels, archive: 25191
+    }
+    APP_R_BLUEWATERSSRSTEPS {
+        name: "r_blueWaterSSRSteps", default: "16",
+        range: "4..32", description: "Native Blue Water reflection ray steps (compile-time specialization; rebuilds only its surface pipeline).",
+        kind: CvarType::Int { min: 4, max: 32 }, field: ocean_settings.blue_water_ssr_steps, archive: 25201
+    }
+    APP_R_OCEANWAKE {
+        name: "r_oceanWake", default: "0",
+        range: "0..1", description: "Native / Hybrid ocean: 0 JKA's own water interaction only; 1 Blue Water's ship wake (dispersive wake field, trail foam, bow waves, hull foam, impact rings) for A/B. Drive it with the oceanwake command.",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.blue_wake, archive: 27330
+    }
+    APP_R_OCEANSPINDRIFT {
+        name: "r_oceanSpindrift", default: "0",
+        range: "0..1", description: "Native / Hybrid ocean: Blue Water's spindrift, wisps of spray torn off breaking crests from a gale's wind (13 m/s, set the wind in Water settings). 0 off.",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.spindrift, archive: 27331
+    }
+    APP_R_HYBRIDREFRACTIONMODE {
+        name: "r_hybridRefractionMode", default: "1",
+        range: "0..2", description: "Hybrid only: 0 off, 1 cheap screen offset, 2 ray trace.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.hybrid_refraction_mode, archive: 25202
+    }
+    APP_R_HYBRIDCAUSTICSMODE {
+        name: "r_hybridCausticsMode", default: "3",
+        range: "0..4", description: "Hybrid: 0 native, 1 native FFT only, 2 off, 3 Godot wave curvature, 4 animated procedural.",
+        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.hybrid_caustics_mode, archive: 25203
+    }
+    APP_R_HYBRIDUNDERWATERMODE {
+        name: "r_hybridUnderwaterMode", default: "4",
+        range: "0..4", description: "Hybrid only: 4 Godot surface+optics when submerged, 0/1/3 native, 2 composite off.",
+        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.hybrid_underwater_mode, archive: 25204
+    }
+    APP_R_HYBRIDMATERIAL {
+        name: "r_hybridMaterial", default: "1",
+        range: "0..3", description: "Hybrid ocean quality: 0 original Bluewater material; 1 compact full-resolution GGX/foam (default, honors r_hybridSSR); 2 compact with SSR disabled; 3 experimental adaptive compact: restores resolved near ripples, skips unresolvable FFT cascade reads and draws inexpensive stable world-space sun glints. Material 3 honors r_hybridSSR. All fast modes shade at native pixel resolution, independent of r_oceanPixelDetail; native FFT geometry, sky admission, and underwater behavior are preserved.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.hybrid_material, archive: 25206
+    }
+    APP_R_HYBRIDSSR {
+        name: "r_hybridSSR", default: "0",
+        range: "0|1", description: "Hybrid only: native screen-space reflection tracing (sky/env reflection remains).",
+        kind: CvarType::Bool, field: ocean_settings.hybrid_ssr, archive: 25205
+    }
+    APP_R_HYBRIDCAUSTICSFAST {
+        name: "r_hybridCausticsFast", default: "0",
+        range: "0|1", description: "Hybrid A/B: 3-tap forward-difference caustics versus reference 4-tap central differences.",
+        kind: CvarType::Bool, field: ocean_settings.hybrid_caustics_fast, archive: 25215
+    }
+    APP_R_BLUEWATERBOUNDARY {
+        name: "r_blueWaterBoundaryMode", default: "3",
+        range: "0..3", description: "0 exact JKA footprint+PVS; 1 bounds/PVS only; 2 no boundary/PVS test (diagnostic); 3 exact with per-tile candidate masks.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.blue_water_boundary_mode, archive: 25192
+    }
+    APP_R_BLUEWATERCAUSTICMODE {
+        name: "r_blueWaterCausticsMode", default: "0",
+        range: "0..3", description: "Native: 0 compute every frame, 1 on FFT updates, 2 disabled. Legacy 3 (Godot) now belongs to r_hybridCausticsMode.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.blue_water_caustics_mode, archive: 25193
+    }
+    APP_R_BLUEWATERUNDERWATERMODE {
+        name: "r_blueWaterUnderwaterMode", default: "0",
+        range: "0..4", description: "Native: 0 full, 1 no motes, 2 no composite, 3 submerged-only. Legacy 4 now belongs to r_hybridUnderwaterMode.",
+        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.blue_water_underwater_mode, archive: 25197
+    }
+    APP_R_BLUEWATERPREPAREGODOTMESH {
+        name: "r_blueWaterPrepareGodotMesh", default: "0",
+        range: "0|1", description: "A/B: update Godot ocean clipmap indices above water in Blue Water mode. Hybrid mode always prepares them for submersion.",
+        kind: CvarType::Bool, field: ocean_settings.blue_water_prepare_godot_mesh, archive: 25194
+    }
+    APP_R_BLUEWATERADAPTER {
+        name: "r_blueWaterAdapter", default: "1",
+        range: "0|1", description: "A/B: generate legacy displacement/normal textures for JKA water consumers. 0 freezes these textures, Blue Water surface unaffected.",
+        kind: CvarType::Bool, field: ocean_settings.blue_water_adapter, archive: 25195
+    }
+    APP_R_BLUEWATERSSR {
+        name: "r_blueWaterSSR", default: "1",
+        range: "0|1", description: "A/B: native screen-space reflection rays only; sky/environment reflection remains.",
+        kind: CvarType::Bool, field: ocean_settings.blue_water_ssr, archive: 25196
+    }
+    APP_R_BLUEWATERREFRACTIONMODE {
+        name: "r_blueWaterRefractionMode", default: "2",
+        range: "0..2", description: "A/B: 0 off; 1 inexpensive Godot-style screen offset; 2 physical scene ray trace.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.blue_water_refraction_mode, archive: 25199
+    }
+    APP_R_GERSTNERWAVESCALE {
+        name: "r_gerstnerWaveScale", default: "1",
+        range: "0.1..20", description: "Gerstner ocean (r_oceanType 5): godot-water-shader's sea this many times larger. Lengths scale by it and time by its square root, so a larger sea keeps the same shape and slows as real swell does. 1 is the original (0.4 m, 6 m waves). Applies live.",
+        kind: CvarType::Float { min: 0.1, max: 20.0 }, field: ocean_settings.gerstner_wave_scale, archive: 25231
+    }
+    APP_R_GERSTNERFOAM {
+        name: "r_gerstnerFoam", default: "7",
+        range: "0..7", description: "Gerstner ocean (r_oceanType 5) foam bits: 1 near persistent cascade (15 m), 2 far persistent cascade (30 m), 4 distant compression foam past them (per pixel, no persistence). 3 is the original; 7 all. Distances scale with r_gerstnerWaveScale. Applies live.",
+        kind: CvarType::Int { min: 0, max: 7 }, field: ocean_settings.gerstner_foam, archive: 25232
+    }
+    APP_R_GERSTNERFOAMRATE {
+        name: "r_gerstnerFoamRate", default: "60",
+        range: "0..60", description: "Gerstner ocean (r_oceanType 5): persistent foam simulation steps per second for each cascade, staggered so the near and far cascades rarely step in the same frame. 0 steps every rendered frame (the original). Applies live.",
+        kind: CvarType::Float { min: 0.0, max: 60.0 }, field: ocean_settings.gerstner_foam_rate, archive: 25233
+    }
+    APP_R_OCEANSCREENLODPIXELS {
+        name: "r_oceanScreenLodPixels", default: "0",
+        range: "0..16", description: "Native/Hybrid screen-space ring LOD. Protects closest 3 rings with adaptive mesh Off; with curvature-adaptive On, coarsens selected rings as requested instead of being overridden. Boundary vertices remain stitched.",
+        kind: CvarType::Float { min: 0.0, max: 16.0 }, field: ocean_settings.screen_lod_pixels, archive: 25227
+    }
+    APP_R_OCEANPIXELDETAIL {
+        name: "r_oceanPixelDetail", default: "0",
+        range: "0..5", description: "Native Blue Water: 0 full resolution; 1 true 1/2 resolution (2x2); 2 true 1/4 resolution (4x4); 3 distance-aware 2x2; 4 distance-aware 4x4; 5 adaptive 2x2 (full shading only on 2x2 blocks the 2x2 shading cannot reconstruct, see r_oceanPixelContrast). Full-res wave geometry/depth remains.",
+        kind: CvarType::Int { min: 0, max: 5 }, field: ocean_settings.pixel_detail_mode, archive: 25228
+    }
+    APP_R_OCEANPIXELDISTANCE {
+        name: "r_oceanPixelDistance", default: "100",
+        range: "1..2000", description: "Native/Hybrid metres from camera where full-resolution near-water shading transitions to true reduced-resolution material.",
+        kind: CvarType::Float { min: 1.0, max: 2000.0 }, field: ocean_settings.pixel_detail_distance, archive: 25229
+    }
+    APP_R_OCEANPIXELCONTRAST {
+        name: "r_oceanPixelContrast", default: "0.1",
+        range: "0.001..0.5", description: "Native/Hybrid r_oceanPixelDetail 5: how far the 2x2-shaded water's luminance may curve across a 2x2 block (share of its level); a 16x16 tile with 8+ such blocks gets full shading. Lower = more full-shaded tiles (closer to Full, slower). Costa: 0.1 = +20% FPS, 0.05 = break-even.",
+        kind: CvarType::Float { min: 0.001, max: 0.5 }, field: ocean_settings.pixel_detail_contrast, archive: 25230
+    }
+    APP_R_OCEANVISUALFIXES {
+        name: "r_oceanVisualFixes", default: "0",
+        range: "0..2", description: "0 original; 1 balanced whitecaps + lit foam + promoted-water body; 2 stronger Godot-like look. No FFT reset.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.visual_fixes, archive: 25018
+    }
+    APP_R_OCEANFOAMSOURCE {
+        name: "r_oceanFoamSource", default: "0",
+        range: "0..2", description: "FFT Jacobian foam generation: 0 original, 1 slightly earlier crests and 1.3x growth, 2 stronger earlier crests and 1.6x growth. Bundle selects minimum level.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.foam_source_mode, archive: 25019
+    }
+    APP_R_OCEANLINKS {
+        name: "r_oceanLinks", default: "127",
+        range: "0..127", description: "Bitmask of ocean controls that follow the swell amplitude: 1 wavelength, 2 speed, 4 choppiness, 8 wind chop, 16 foam, 32 spray, 64 roughness. 127 all linked (default), 0 none.",
+        kind: CvarType::Int { min: 0, max: 127 }, field: ocean_settings.links, archive: 25020
+    }
+    APP_R_OCEANFOAMDETAIL {
+        name: "r_oceanFoamDetail", default: "1",
+        range: "0|1", description: "0 keep whitecaps when normals LOD out, 1 (default) sample all cascades at any distance like Godot and keep far normals.",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.foam_detail_mode, archive: 25010
+    }
+    APP_R_OCEANFOAMACTIVITY {
+        name: "r_oceanFoamActivity", default: "0",
+        range: "0..3", description: "Promoted water foam attenuation: 0 original, 1 omit texture heuristic, 2 omit amplitude gate, 3 omit both. No FFT reset.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.foam_activity_mode, archive: 25011
+    }
+    APP_R_OCEANCOLORMODE {
+        name: "r_oceanColorMode", default: "0",
+        range: "0..3", description: "Color A/B: 0 original, 1 override authored base with configured ocean color, 2 opaque lit water, 3 both.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.color_mode, archive: 25014
+    }
+    APP_R_OCEANFOAMDEBUG {
+        name: "r_oceanFoamDebug", default: "0",
+        range: "0..3", description: "Foam diagnostic: 0 shaded water, 1 raw sampled FFT foam, 2 after promoted gates, 3 final breaker + windrows.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.foam_debug, archive: 25017
+    }
+    APP_R_OCEANDYNAMICUPDATES {
+        name: "r_oceanDynamicUpdates", default: "0",
+        range: "0|1", description: "0 original; 1 near two ocean mesh LODs sample the live 48 Hz FFT, third LOD uses a 32 Hz cached displacement, outer LODs 24 Hz; wind foam appearance follows the same ring rates. FFT cascades remain synchronized.",
+        kind: CvarType::Bool, field: ocean_settings.dynamic_update_rates, archive: 25030
+    }
+    APP_R_OCEANWINDFOAMSYNC {
+        name: "r_oceanWindFoamSync", default: "1",
+        range: "0|1", description: "1 update wind-foam transport only when the finest FFT cascade publishes its new normal/foam field; 0 legacy every-render-frame update.",
+        kind: CvarType::Bool, field: ocean_settings.wind_foam_sync, archive: 25031
+    }
+}
+
+app_cvars! {
     APP_R_LAKEWATERCOLOR {
         runtime: CvarDef::new("r_lakeWaterColor", "0.41818184 0.9619174 1", "r g b (0..1)",
             "Lake optical color for absorption and scattering; independent of surface tint and fog.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
@@ -144,68 +306,6 @@ app_cvars! {
                 Ok(())
             }
         }]
-    }
-    APP_R_LAKESPEED {
-        runtime: CvarDef::new("r_lakeSpeed", "1.45", "0..3", "Lake deformation animation speed; 0 freezes it, 1 is normal.",
-            CvarType::Float { min: 0.0, max: 3.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.speed),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.speed=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| {
-                if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.speed=v.clamp(0.0,3.0); } }
-            }),
-            archive: Some((27364, |state| state.video.ocean_settings.lake.speed.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKETRANSMISSION {
-        runtime: CvarDef::new("r_lakeTransmission", "1", "0..1.0", "Cheapwater transmission: 0 preserves opaque shading, 1 reveals the bed with depth absorption.",
-            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.cheap_transmission),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.cheap_transmission=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.cheap_transmission=v.clamp(0.0,1.0); } } }),
-            archive: Some((27369, |state| state.video.ocean_settings.lake.cheap_transmission.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKEREFRACTION {
-        runtime: CvarDef::new("r_lakeRefraction", "0.026", "0..0.05", "Cheapwater screen-space refraction strength; reuses its moving normal layers. Zero disables distortion.",
-            CvarType::Float { min: 0.0, max: 0.05 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.cheap_refraction),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.cheap_refraction=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.cheap_refraction=v.clamp(0.0,0.05); } } }),
-            archive: Some((27370, |state| state.video.ocean_settings.lake.cheap_refraction.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKEDEPTHCOLOR {
-        runtime: CvarDef::new("r_lakeDepthColor", "0.52", "0.0..1.0", "Cheapwater shallow/deep color blend. Zero preserves the base material.",
-            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.depth_color_strength),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.depth_color_strength=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.depth_color_strength=v.clamp(0.0,1.0); } } }),
-            archive: Some((27371, |state| state.video.ocean_settings.lake.depth_color_strength.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKECOLORDEPTH {
-        runtime: CvarDef::new("r_lakeColorDepth", "52", "0.1..100.0", "Vertical bed depth in metres at which Cheapwater reaches its deep color.",
-            CvarType::Float { min: 0.1, max: 100.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.color_depth),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.color_depth=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.color_depth=v.clamp(0.1,100.0); } } }),
-            archive: Some((27372, |state| state.video.ocean_settings.lake.color_depth.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
     }
     APP_R_LAKESHALLOWCOLOR {
         runtime: CvarDef::new("r_lakeShallowColor", "0 0.043898553 0.025940072", "r g b (0..1)", "Cheapwater shallow color for depth coloring.",
@@ -241,18 +341,6 @@ app_cvars! {
             }
         }]
     }
-    APP_R_LAKEOPAQUEDEPTH {
-        runtime: CvarDef::new("r_lakeOpaqueDepth", "8", "0.25..100 feet", "Cheapwater vertical bed depth in feet where nonlinear transparency reaches zero. 3-inch water remains almost fully clear at the default 8 feet.",
-            CvarType::Float { min: 0.25, max: 100.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.lake.opaque_depth),
-            |app,value| { let CvarValue::Float(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.opaque_depth=v;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.lake.opaque_depth=v.clamp(0.25,100.0); } } }),
-            archive: Some((27375, |state| state.video.ocean_settings.lake.opaque_depth.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_LAKEWAKE {
         // Compatibility console alias only; never load a second independent
         // wake strength from an old video.cfg or archive it a second time.
@@ -273,30 +361,6 @@ app_cvars! {
                 app.video.ocean_settings.lake.reflection_mode=if v {2} else {0};app.commit_ocean_settings();Ok(()) }),
         config: CvarBinding {
             load_video: Some(|settings,_name,value,_context| { settings.ocean_settings.lake.reflection_mode=if value=="1" {2} else {0}; }),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKESHADER {
-        runtime: CvarDef::new("r_lakeShader", "1", "0|1", "Lake material A/B: 0 original optical water, 1 Cheapwater material with neutral water reflections. Geometry and reflection selection are shared.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.lake.shader as i32),
-            |app,value| { let CvarValue::Int(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.shader=v as u8;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<u8>() {settings.ocean_settings.lake.shader=v.min(1);} }),
-            archive: Some((27367, |state| state.video.ocean_settings.lake.shader.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_LAKEREFLECTIONMODE {
-        runtime: CvarDef::new("r_lakeReflectionMode", "2", "0..2", "Lake-local reflections: 0 Sky, 1 SSR, 2 Planar. Independent of global reflection mode and quality.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.lake.reflection_mode as i32),
-            |app,value| { let CvarValue::Int(v)=value else {unreachable!()};
-                app.video.ocean_settings.lake.reflection_mode=v as u8;app.commit_ocean_settings();Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Ok(v)=value.parse::<u8>() {settings.ocean_settings.lake.reflection_mode=v.min(2);} }),
-            archive: Some((27368, |state| state.video.ocean_settings.lake.reflection_mode.to_string())),
             ..CvarBinding::NONE
         }, implementations: []
     }
@@ -348,122 +412,6 @@ app_cvars! {
             }
         }]
     }
-    APP_R_HYBRIDGERSTNERAMPLITUDE {
-        runtime: CvarDef::new("r_hybridGerstnerAmplitude", "128", "0.0..16384.0",
-            "Hybrid-only directional Gerstner amplitude; independent of Godot and Blue Water FFT.",
-            CvarType::Float { min: 0.0, max: 16384.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_swell.amplitude),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_swell.amplitude = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.hybrid_swell.amplitude = v.clamp(0.0, 16384.0); }
-                }
-            }),
-            archive: Some((25180, |state| state.video.ocean_settings.hybrid_swell.amplitude.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDGERSTNERWAVELENGTH {
-        runtime: CvarDef::new("r_hybridGerstnerWavelength", "1400", "64.0..32768.0",
-            "Hybrid-only directional Gerstner wavelength; independent of Godot and Blue Water FFT.",
-            CvarType::Float { min: 64.0, max: 32768.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_swell.wavelength),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_swell.wavelength = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.hybrid_swell.wavelength = v.clamp(64.0, 32768.0); }
-                }
-            }),
-            archive: Some((25181, |state| state.video.ocean_settings.hybrid_swell.wavelength.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDGERSTNERSPEED {
-        runtime: CvarDef::new("r_hybridGerstnerSpeed", "180", "-4096.0..4096.0",
-            "Hybrid-only directional Gerstner speed; independent of Godot and Blue Water FFT.",
-            CvarType::Float { min: -4096.0, max: 4096.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_swell.speed),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_swell.speed = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.hybrid_swell.speed = v.clamp(-4096.0, 4096.0); }
-                }
-            }),
-            archive: Some((25183, |state| state.video.ocean_settings.hybrid_swell.speed.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDGERSTNERSTEEPNESS {
-        runtime: CvarDef::new("r_hybridGerstnerSteepness", "0.65", "0.0..1.0",
-            "Hybrid-only directional Gerstner steepness; independent of Godot and Blue Water FFT.",
-            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_swell.steepness),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_swell.steepness = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.hybrid_swell.steepness = v.clamp(0.0, 1.0); }
-                }
-            }),
-            archive: Some((25184, |state| state.video.ocean_settings.hybrid_swell.steepness.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDBREAKER {
-        runtime: CvarDef::new("r_hybridBreaker", "0", "0..2",
-            "Hybrid crest A/B: 0 original; 1 conservative horizontal compression limit; 2 bounded crest folds, signed normals and spilling foam. Preserves vertical wave height. Applies live.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.hybrid_breaker)),
-            |app, value| { let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_breaker = v as u8;
-                app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_breaker = v.min(2); }
-            }),
-            archive: Some((25221, |state| state.video.ocean_settings.hybrid_breaker.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDFFTBLEND {
-        runtime: CvarDef::new("r_hybridFftBlend", "1", "0..1",
-            "Hybrid ocean: 1 pure Blue Water FFT; 0 authored Gerstner; intermediate values mix FFT and analytical displacement. Native and Godot unaffected.",
-            CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.hybrid_fft_blend),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_fft_blend = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.hybrid_fft_blend = v.clamp(0.0, 1.0); }
-                }
-            }),
-            archive: Some((25189, |state| state.video.ocean_settings.hybrid_fft_blend.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_BLUEWATERMESHSEGMENTS {
         runtime: CvarDef::new("r_blueWaterMeshSegments", "64", "64|128|256",
             "Blue Water native clipmap segments per level: 64/128/256. Independent of r_oceanMeshQuality.", CvarType::Int { min: 64, max: 256 }, CvarFlags::ARCHIVE, LatchScope::None,
@@ -486,120 +434,6 @@ app_cvars! {
         },
         implementations: []
     }
-    APP_R_BLUEWATERMESHLEVELS {
-        runtime: CvarDef::new("r_blueWaterMeshLevels", "6", "6..9",
-            "Blue Water clipmap level count; 9 is native reference. Rebuilds geometry.", CvarType::Int { min: 6, max: 9 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_mesh_levels as i32),
-            |app, value| {
-                let CvarValue::Int(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_mesh_levels = value as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() {
-                    if matches!(v, 6..=9) { settings.ocean_settings.blue_water_mesh_levels = v; }
-                }
-            }),
-            archive: Some((25191, |state| state.video.ocean_settings.blue_water_mesh_levels.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERSSRSTEPS {
-        runtime: CvarDef::new("r_blueWaterSSRSteps", "16", "4..32",
-            "Native Blue Water reflection ray steps (compile-time specialization; rebuilds only its surface pipeline).",
-            CvarType::Int { min: 4, max: 32 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_ssr_steps as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_ssr_steps = v as u32;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u32>() { settings.ocean_settings.blue_water_ssr_steps = v.clamp(4, 32); }
-            }),
-            archive: Some((25201, |state| state.video.ocean_settings.blue_water_ssr_steps.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_OCEANWAKE {
-        runtime: CvarDef::new("r_oceanWake", "0", "0..1",
-            "Native / Hybrid ocean: 0 JKA's own water interaction only; 1 Blue Water's ship wake (dispersive wake field, trail foam, bow waves, hull foam, impact rings) for A/B. Drive it with the oceanwake command.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.blue_wake)),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.blue_wake = v as u8;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.blue_wake = v.min(1); }
-            }),
-            archive: Some((27330, |state| state.video.ocean_settings.blue_wake.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_OCEANSPINDRIFT {
-        runtime: CvarDef::new("r_oceanSpindrift", "0", "0..1",
-            "Native / Hybrid ocean: Blue Water's spindrift, wisps of spray torn off breaking crests from a gale's wind (13 m/s, set the wind in Water settings). 0 off.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.spindrift)),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.spindrift = v as u8;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.spindrift = v.min(1); }
-            }),
-            archive: Some((27331, |state| state.video.ocean_settings.spindrift.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_HYBRIDREFRACTIONMODE {
-        runtime: CvarDef::new("r_hybridRefractionMode", "1", "0..2",
-            "Hybrid only: 0 off, 1 cheap screen offset, 2 ray trace.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_refraction_mode as i32),
-            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_refraction_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_refraction_mode = v.min(2); } }),
-            archive: Some((25202, |state| state.video.ocean_settings.hybrid_refraction_mode.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDCAUSTICSMODE {
-        runtime: CvarDef::new("r_hybridCausticsMode", "3", "0..4",
-            "Hybrid: 0 native, 1 native FFT only, 2 off, 3 Godot wave curvature, 4 animated procedural.",
-            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_caustics_mode as i32),
-            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_caustics_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_caustics_mode = v.min(4); } }),
-            archive: Some((25203, |state| state.video.ocean_settings.hybrid_caustics_mode.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_HYBRIDUNDERWATERMODE {
-        runtime: CvarDef::new("r_hybridUnderwaterMode", "4", "0..4",
-            "Hybrid only: 4 Godot surface+optics when submerged, 0/1/3 native, 2 composite off.",
-            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_underwater_mode as i32),
-            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_underwater_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_underwater_mode = v.min(4); } }),
-            archive: Some((25204, |state| state.video.ocean_settings.hybrid_underwater_mode.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_HYBRIDWATERLINEDEBUG {
         runtime: CvarDef::new("r_hybridWaterlineDebug", "0", "0..3",
             "Hybrid mode 4 debug: 0 off; 1 CPU/optics log; 2 color Godot mesh; 3 CAMERA-XZ GPU height gauge drawn 100u forward: yellow displaced wave, orange raw wave, magenta native eye probe, cyan flat, green/red eye tick. No GPU readback.",
@@ -612,26 +446,6 @@ app_cvars! {
                 Ok(())
             }),
         config: CvarBinding::NONE,
-        implementations: []
-    }
-    APP_R_HYBRIDMATERIAL {
-        runtime: CvarDef::new("r_hybridMaterial", "1", "0..2",
-            "Hybrid ocean quality: 0 original material; 1 optimized full-resolution Godot-style GGX/foam material honoring r_hybridSSR (default); 2 same with environment reflections only. Keeps native wave geometry and sky/roof admission; simpler foam and smoother glints. Fast material uses full resolution regardless of r_oceanPixelDetail. No effect on Gerstner or pure Blue Water.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.hybrid_material)),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.hybrid_material = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_material = v.min(2); }
-            }),
-            archive: Some((25206, |state| state.video.ocean_settings.hybrid_material.to_string())),
-            ..CvarBinding::NONE
-        },
         implementations: []
     }
     APP_R_HYBRIDFASTFOAM {
@@ -661,18 +475,6 @@ app_cvars! {
             }),
         config: CvarBinding::NONE,
         implementations: []
-    }
-    APP_R_HYBRIDSSR {
-        runtime: CvarDef::new("r_hybridSSR", "0", "0|1",
-            "Hybrid only: native screen-space reflection tracing (sky/env reflection remains).",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.hybrid_ssr),
-            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_ssr = v; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { settings.ocean_settings.hybrid_ssr = parse_bool(value).unwrap_or(settings.ocean_settings.hybrid_ssr); }),
-            archive: Some((25205, |state| u8::from(state.video.ocean_settings.hybrid_ssr).to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
     }
     APP_R_HYBRIDTRANSPARENCY {
         runtime: CvarDef::new("r_hybridTransparency", "1", "0.1..10",
@@ -787,17 +589,6 @@ app_cvars! {
             }
         }]
     }
-    APP_R_HYBRIDCAUSTICSFAST {
-        runtime: CvarDef::new("r_hybridCausticsFast", "0", "0|1",
-            "Hybrid A/B: 3-tap forward-difference caustics versus reference 4-tap central differences.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.hybrid_caustics_fast),
-            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_caustics_fast = v; app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { settings.ocean_settings.hybrid_caustics_fast = parse_bool(value).unwrap_or(settings.ocean_settings.hybrid_caustics_fast); }),
-            archive: Some((25215, |state| u8::from(state.video.ocean_settings.hybrid_caustics_fast).to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_HYBRIDPROCEDURALSCALE {
         runtime: CvarDef::new("r_hybridProceduralScale", "1", "0.25..4",
             "Hybrid animated caustic pattern density. Does not increase FFT or GPU generation cost.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
@@ -840,128 +631,6 @@ app_cvars! {
             }
         }]
     }
-    APP_R_BLUEWATERBOUNDARY {
-        runtime: CvarDef::new("r_blueWaterBoundaryMode", "3", "0..3",
-            "0 exact JKA footprint+PVS; 1 bounds/PVS only; 2 no boundary/PVS test (diagnostic); 3 exact with per-tile candidate masks.", CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_boundary_mode as i32),
-            |app, value| {
-                let CvarValue::Int(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_boundary_mode = value as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() {
-                    if matches!(v, 0..=3) { settings.ocean_settings.blue_water_boundary_mode = v; }
-                }
-            }),
-            archive: Some((25192, |state| state.video.ocean_settings.blue_water_boundary_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERCAUSTICMODE {
-        runtime: CvarDef::new("r_blueWaterCausticsMode", "0", "0..3",
-            "Native: 0 compute every frame, 1 on FFT updates, 2 disabled. Legacy 3 (Godot) now belongs to r_hybridCausticsMode.", CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_caustics_mode as i32),
-            |app, value| {
-                let CvarValue::Int(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_caustics_mode = value as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() {
-                    if matches!(v, 0..=3) { settings.ocean_settings.blue_water_caustics_mode = v; }
-                }
-            }),
-            archive: Some((25193, |state| state.video.ocean_settings.blue_water_caustics_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERUNDERWATERMODE {
-        runtime: CvarDef::new("r_blueWaterUnderwaterMode", "0", "0..4",
-            "Native: 0 full, 1 no motes, 2 no composite, 3 submerged-only. Legacy 4 now belongs to r_hybridUnderwaterMode.",
-            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_underwater_mode as i32),
-            |app, value| {
-                let CvarValue::Int(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_underwater_mode = value as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() {
-                    if v <= 4 { settings.ocean_settings.blue_water_underwater_mode = v; }
-                }
-            }),
-            archive: Some((25197, |state| state.video.ocean_settings.blue_water_underwater_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERPREPAREGODOTMESH {
-        runtime: CvarDef::new("r_blueWaterPrepareGodotMesh", "0", "0|1", "A/B: update Godot ocean clipmap indices above water in Blue Water mode. Hybrid mode always prepares them for submersion.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_prepare_godot_mesh),
-            |app, value| {
-                let CvarValue::Bool(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_prepare_godot_mesh = value;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_prepare_godot_mesh = v; }
-            }),
-            archive: Some((25194, |state| if state.video.ocean_settings.blue_water_prepare_godot_mesh { "1".into() } else { "0".into() })),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERADAPTER {
-        runtime: CvarDef::new("r_blueWaterAdapter", "1", "0|1", "A/B: generate legacy displacement/normal textures for JKA water consumers. 0 freezes these textures, Blue Water surface unaffected.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_adapter),
-            |app, value| {
-                let CvarValue::Bool(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_adapter = value;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_adapter = v; }
-            }),
-            archive: Some((25195, |state| if state.video.ocean_settings.blue_water_adapter { "1".into() } else { "0".into() })),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_BLUEWATERSSR {
-        runtime: CvarDef::new("r_blueWaterSSR", "1", "0|1",
-            "A/B: native screen-space reflection rays only; sky/environment reflection remains.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_ssr),
-            |app, value| {
-                let CvarValue::Bool(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_ssr = value;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_ssr = v; }
-            }),
-            archive: Some((25196, |state| if state.video.ocean_settings.blue_water_ssr { "1".into() } else { "0".into() })),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
     APP_R_BLUEWATERREFRACTION {
         runtime: CvarDef::new("r_blueWaterRefraction", "0.1", "0..0.15",
             "Blue Water refraction strength; 0 disables. Select cheap screen offset or physical trace with r_blueWaterRefractionMode.",
@@ -985,28 +654,6 @@ app_cvars! {
                 Ok(())
             }
         }]
-    }
-    APP_R_BLUEWATERREFRACTIONMODE {
-        runtime: CvarDef::new("r_blueWaterRefractionMode", "2", "0..2",
-            "A/B: 0 off; 1 inexpensive Godot-style screen offset; 2 physical scene ray trace.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_refraction_mode as i32),
-            |app, value| {
-                let CvarValue::Int(value) = value else { unreachable!() };
-                app.video.ocean_settings.blue_water_refraction_mode = value as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() {
-                    if v <= 2 { settings.ocean_settings.blue_water_refraction_mode = v; }
-                }
-            }),
-            archive: Some((25199, |state| state.video.ocean_settings.blue_water_refraction_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
     }
     APP_R_BLUEWATERTRANSPARENCY {
         runtime: CvarDef::new("r_blueWaterTransparency", "1", "0.1..10",
@@ -1265,64 +912,6 @@ app_cvars! {
         },
         implementations: []
     }
-    APP_R_GERSTNERWAVESCALE {
-        runtime: CvarDef::new("r_gerstnerWaveScale", "1", "0.1..20",
-            "Gerstner ocean (r_oceanType 5): godot-water-shader's sea this many times larger. Lengths scale by it and time by its square root, so a larger sea keeps the same shape and slows as real swell does. 1 is the original (0.4 m, 6 m waves). Applies live.",
-            CvarType::Float { min: 0.1, max: 20.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.gerstner_wave_scale),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.gerstner_wave_scale = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.gerstner_wave_scale = v.clamp(0.1, 20.0); }
-                }
-            }),
-            archive: Some((25231, |state| state.video.ocean_settings.gerstner_wave_scale.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_GERSTNERFOAM {
-        runtime: CvarDef::new("r_gerstnerFoam", "7", "0..7",
-            "Gerstner ocean (r_oceanType 5) foam bits: 1 near persistent cascade (15 m), 2 far persistent cascade (30 m), 4 distant compression foam past them (per pixel, no persistence). 3 is the original; 7 all. Distances scale with r_gerstnerWaveScale. Applies live.",
-            CvarType::Int { min: 0, max: 7 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.gerstner_foam)),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.gerstner_foam = v.clamp(0, 7) as u8;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.gerstner_foam = v.min(7); }
-            }),
-            archive: Some((25232, |state| state.video.ocean_settings.gerstner_foam.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_GERSTNERFOAMRATE {
-        runtime: CvarDef::new("r_gerstnerFoamRate", "60", "0..60",
-            "Gerstner ocean (r_oceanType 5): persistent foam simulation steps per second for each cascade, staggered so the near and far cascades rarely step in the same frame. 0 steps every rendered frame (the original). Applies live.",
-            CvarType::Float { min: 0.0, max: 60.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.gerstner_foam_rate),
-            |app, value| {
-                let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.gerstner_foam_rate = v;
-                app.commit_ocean_settings(); Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<f32>() {
-                    if v.is_finite() { settings.ocean_settings.gerstner_foam_rate = v.clamp(0.0, 60.0); }
-                }
-            }),
-            archive: Some((25233, |state| state.video.ocean_settings.gerstner_foam_rate.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_GERSTNERWATERCOLOR {
         runtime: CvarDef::new("r_gerstnerWaterColor", "0 0.21568628 0.25490198", "r g b (0..1)",
             "Gerstner ocean (r_oceanType 5) water color, sRGB (the original's 0, 55, 65). Crests blend toward r_gerstnerCrestColor.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
@@ -1439,34 +1028,6 @@ app_cvars! {
                 app.commit_ocean_settings(); Ok(()) }),
         config: CvarBinding::NONE, implementations: []
     }
-    APP_R_OCEANSCREENLODPIXELS {
-        runtime: CvarDef::new("r_oceanScreenLodPixels", "0", "0..16",
-            "Native/Hybrid screen-space ring LOD. Protects closest 3 rings with adaptive mesh Off; with curvature-adaptive On, coarsens selected rings as requested instead of being overridden. Boundary vertices remain stitched.",
-            CvarType::Float { min: 0.0, max: 16.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.screen_lod_pixels),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.screen_lod_pixels = v;
-                app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.screen_lod_pixels = v.clamp(0.0, 16.0); } } }),
-            archive: Some((25227, |state| state.video.ocean_settings.screen_lod_pixels.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_OCEANPIXELDETAIL {
-        runtime: CvarDef::new("r_oceanPixelDetail", "0", "0..5",
-            "Native Blue Water: 0 full resolution; 1 true 1/2 resolution (2x2); 2 true 1/4 resolution (4x4); 3 distance-aware 2x2; 4 distance-aware 4x4; 5 adaptive 2x2 (full shading only on 2x2 blocks the 2x2 shading cannot reconstruct, see r_oceanPixelContrast). Full-res wave geometry/depth remains.",
-            CvarType::Int { min: 0, max: 5 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.pixel_detail_mode as i32),
-            |app, value| { let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.pixel_detail_mode = v as u8;
-                app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.pixel_detail_mode = v.min(5); } }),
-            archive: Some((25228, |state| state.video.ocean_settings.pixel_detail_mode.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_OCEANCOSTPROBE {
         runtime: CvarDef::new("r_oceanCostProbe", "0", "0..67108863",
             "Diagnostic A/B, not archived: bitmask stubbing Blue Water surface features to size their GPU cost (changes the image). 1 SSR, 2 foam, 4 glints, 8 wake, 16 rain, 32 refraction, 64 FFT waves, 128 fog, 256 shadows, 512 sky lobe, 1024 hull shelter, 2048 underside, 4096 admission floor only; equivalent-math experiments 8192 defer water body until after SSR, 32768 serial SSR refinement; 16384 native FFT single-copy tiling (changes wave pattern); foam parts 131072 spread reads, 262144 breaking groups, 524288 gale streaks, 1048576 pattern reads; 2097152 value_noise reduced to a fract (noise cost bound); 4194304 wave sample + foam patterns as 8 reads (baked-cache bound); register packing across the reflection march: 8388608 fp16 pack2x16float, 16777216 fp16 wider set (sky, daylight, variances), 33554432 bfloat16 by shifts (not folded by the driver).",
@@ -1565,34 +1126,6 @@ app_cvars! {
         config: CvarBinding::NONE,
         implementations: []
     }
-    APP_R_OCEANPIXELDISTANCE {
-        runtime: CvarDef::new("r_oceanPixelDistance", "100", "1..2000",
-            "Native/Hybrid metres from camera where full-resolution near-water shading transitions to true reduced-resolution material.",
-            CvarType::Float { min: 1.0, max: 2000.0 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.pixel_detail_distance),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.pixel_detail_distance = v;
-                app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.pixel_detail_distance = v.clamp(1.0, 2000.0); } } }),
-            archive: Some((25229, |state| state.video.ocean_settings.pixel_detail_distance.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
-    APP_R_OCEANPIXELCONTRAST {
-        runtime: CvarDef::new("r_oceanPixelContrast", "0.1", "0.001..0.5",
-            "Native/Hybrid r_oceanPixelDetail 5: how far the 2x2-shaded water's luminance may curve across a 2x2 block (share of its level); a 16x16 tile with 8+ such blocks gets full shading. Lower = more full-shaded tiles (closer to Full, slower). Costa: 0.1 = +20% FPS, 0.05 = break-even.",
-            CvarType::Float { min: 0.001, max: 0.5 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Float(app.video.ocean_settings.pixel_detail_contrast),
-            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
-                app.video.ocean_settings.pixel_detail_contrast = v;
-                app.commit_ocean_settings(); Ok(()) }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.pixel_detail_contrast = v.clamp(0.001, 0.5); } } }),
-            archive: Some((25230, |state| state.video.ocean_settings.pixel_detail_contrast.to_string())),
-            ..CvarBinding::NONE
-        }, implementations: []
-    }
     APP_R_OCEANBACKEND {
         runtime: CvarDef::new("r_oceanBackend", "0", "0|1",
             "Legacy compatibility alias: 0 Godot; 1 native Blue Water. Use r_oceanType for Off/Hybrid.",
@@ -1672,88 +1205,6 @@ app_cvars! {
     }
     // A single switch for the opt-in visual corrections; does not mutate
     // the individual A/B CVar values or the simulation state.
-    APP_R_OCEANVISUALFIXES {
-        runtime: CvarDef::new("r_oceanVisualFixes", "0", "0..2",
-            "0 original; 1 balanced whitecaps + lit foam + promoted-water body; 2 stronger Godot-like look. No FFT reset.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.visual_fixes as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.visual_fixes = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.visual_fixes = v.min(2); }
-            }),
-            archive: Some((25018, |state| state.video.ocean_settings.visual_fixes.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    APP_R_OCEANFOAMSOURCE {
-        runtime: CvarDef::new("r_oceanFoamSource", "0", "0..2",
-            "FFT Jacobian foam generation: 0 original, 1 slightly earlier crests and 1.3x growth, 2 stronger earlier crests and 1.6x growth. Bundle selects minimum level.",
-            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_source_mode as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.foam_source_mode = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_source_mode = v.min(2); }
-            }),
-            archive: Some((25019, |state| state.video.ocean_settings.foam_source_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    // Which swell controls follow the master amplitude (see ocean::links).
-    APP_R_OCEANLINKS {
-        runtime: CvarDef::new("r_oceanLinks", "127", "0..127",
-            "Bitmask of ocean controls that follow the swell amplitude: 1 wavelength, 2 speed, 4 choppiness, 8 wind chop, 16 foam, 32 spray, 64 roughness. 127 all linked (default), 0 none.",
-            CvarType::Int { min: 0, max: 127 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.links as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.links = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.links = v & crate::ocean::links::ALL; }
-            }),
-            archive: Some((25020, |state| state.video.ocean_settings.links.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-    // Independent surface-shading A/B controls. Defaults retain the current look.
-    APP_R_OCEANFOAMDETAIL {
-        runtime: CvarDef::new("r_oceanFoamDetail", "1", "0|1",
-            "0 keep whitecaps when normals LOD out, 1 (default) sample all cascades at any distance like Godot and keep far normals.",
-            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_detail_mode as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.foam_detail_mode = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_detail_mode = v.min(1); }
-            }),
-            archive: Some((25010, |state| state.video.ocean_settings.foam_detail_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
     APP_R_OCEANFOAMDRIFT {
         runtime: CvarDef::new("r_oceanFoamDrift", "0", "0..2",
             "Rolls the persistent FFT whitecap foam downwind at this fraction of wind speed, so foam is not pinned to the tile that formed it (the visible 88 m repeat). 0 off, 0.2 is the Unity port's default.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
@@ -1777,26 +1228,6 @@ app_cvars! {
             }
         }]
     }
-    APP_R_OCEANFOAMACTIVITY {
-        runtime: CvarDef::new("r_oceanFoamActivity", "0", "0..3",
-            "Promoted water foam attenuation: 0 original, 1 omit texture heuristic, 2 omit amplitude gate, 3 omit both. No FFT reset.",
-            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_activity_mode as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.foam_activity_mode = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_activity_mode = v.min(3); }
-            }),
-            archive: Some((25011, |state| state.video.ocean_settings.foam_activity_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
     APP_R_OCEANFOAMGAIN {
         runtime: CvarDef::new("r_oceanFoamGain", "1", "0..16",
             "Post-simulation breaker foam strength before smoothstep. 1 unchanged, 4 or 8 shows marginal foam.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
@@ -1819,26 +1250,6 @@ app_cvars! {
                 Ok(())
             }
         }]
-    }
-    APP_R_OCEANCOLORMODE {
-        runtime: CvarDef::new("r_oceanColorMode", "0", "0..3",
-            "Color A/B: 0 original, 1 override authored base with configured ocean color, 2 opaque lit water, 3 both.",
-            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.color_mode as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.color_mode = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.color_mode = v.min(3); }
-            }),
-            archive: Some((25014, |state| state.video.ocean_settings.color_mode.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
     }
     APP_R_OCEANFOAMBRIGHTNESS {
         runtime: CvarDef::new("r_oceanFoamBrightness", "1", "0..8",
@@ -1885,26 +1296,6 @@ app_cvars! {
                 Ok(())
             }
         }]
-    }
-    APP_R_OCEANFOAMDEBUG {
-        runtime: CvarDef::new("r_oceanFoamDebug", "0", "0..3",
-            "Foam diagnostic: 0 shaded water, 1 raw sampled FFT foam, 2 after promoted gates, 3 final breaker + windrows.",
-            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_debug as i32),
-            |app, value| {
-                let CvarValue::Int(v) = value else { unreachable!() };
-                app.video.ocean_settings.foam_debug = v as u8;
-                app.commit_ocean_settings();
-                Ok(())
-            }),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_debug = v.min(3); }
-            }),
-            archive: Some((25017, |state| state.video.ocean_settings.foam_debug.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
     }
     APP_R_OCEANINTERACTION {
         runtime: CvarDef::new("r_oceanInteraction", "", "0|1",
@@ -2075,7 +1466,8 @@ app_cvars! {
                 |app| CvarValue::String(App::cvar_get_r_ocean(app)),
                 |app, value| App::cvar_set_r_ocean(app, APP_R_OCEAN.entry.name, &value.to_string()),
             )
-            .with_text_setter(App::cvar_set_r_ocean, None),
+            .with_text_setter(App::cvar_set_r_ocean, None)
+            .with_restart_requirement(|app| app.video.ocean && !app.applied_ocean),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.ocean = parse_bool(value).unwrap_or(settings.ocean)
@@ -3283,54 +2675,6 @@ app_cvars! {
                 }
             }
         ]
-    }
-
-    APP_R_OCEANDYNAMICUPDATES {
-        runtime: CvarDef::new(
-            "r_oceanDynamicUpdates", "0", "0|1",
-            "0 original; 1 near two ocean mesh LODs sample the live 48 Hz FFT, third LOD uses a 32 Hz cached displacement, outer LODs 24 Hz; wind foam appearance follows the same ring rates. FFT cascades remain synchronized.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.dynamic_update_rates),
-            |app, value| {
-                let CvarValue::Bool(enabled) = value else { unreachable!() };
-                app.video.ocean_settings.dynamic_update_rates = enabled;
-                app.commit_ocean_settings();
-                Ok(())
-            },
-        ),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                settings.ocean_settings.dynamic_update_rates =
-                    parse_bool(value).unwrap_or(settings.ocean_settings.dynamic_update_rates);
-            }),
-            archive: Some((25030, |state| u8::from(state.video.ocean_settings.dynamic_update_rates).to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
-    }
-
-    APP_R_OCEANWINDFOAMSYNC {
-        runtime: CvarDef::new(
-            "r_oceanWindFoamSync", "1", "0|1",
-            "1 update wind-foam transport only when the finest FFT cascade publishes its new normal/foam field; 0 legacy every-render-frame update.",
-            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.video.ocean_settings.wind_foam_sync),
-            |app, value| {
-                let CvarValue::Bool(enabled) = value else { unreachable!() };
-                app.video.ocean_settings.wind_foam_sync = enabled;
-                app.commit_ocean_settings();
-                Ok(())
-            },
-        ),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                settings.ocean_settings.wind_foam_sync =
-                    parse_bool(value).unwrap_or(settings.ocean_settings.wind_foam_sync);
-            }),
-            archive: Some((25031, |state| u8::from(state.video.ocean_settings.wind_foam_sync).to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: []
     }
 
     APP_R_OCEANWATERCOLOR {

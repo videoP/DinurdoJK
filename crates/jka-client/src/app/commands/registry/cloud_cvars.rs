@@ -282,11 +282,12 @@ app_cvars! {
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.moon_custom=parse_bool(value).unwrap_or(settings.blue_water_environment.moon_custom);}),archive:Some((27323,|state|state.video.blue_water_environment.moon_custom.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_moon_custom(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_custom=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
+    // One saved strength, routed to the bake or live pass by the relighting mode.
     APP_R_BLUESKYWORLDLIGHTING {
-        runtime:CvarDef::new("r_blueSkyWorldLighting","","0..1","Sky world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
-            |app:&App|CvarValue::String(app.video.blue_water_environment.world_lighting.to_string()),|app,value|App::cvar_set_bluesky_world_lighting(app,APP_R_BLUESKYWORLDLIGHTING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_world_lighting,None),
-        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.world_lighting=v.clamp(0.0, 1.0);}}}),archive:Some((27324,|state|state.video.blue_water_environment.world_lighting.to_string())),..CvarBinding::NONE},
-        implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.world_lighting=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0); app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+        runtime:CvarDef::new("r_blueSkyWorldLighting","1","0..1","World day/night sky lighting strength (Blue Water or vanilla): 0 off, 1 full. Baked composes the adjustment into cached lighting; Realtime uses Blue Water live shading or vanilla change-triggered lightmaps and CSM shadows.",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.sky_world_lighting_strength.to_string()),|app,value|App::cvar_set_bluesky_world_lighting(app,APP_R_BLUESKYWORLDLIGHTING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_world_lighting,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.sky_world_lighting_strength=v.clamp(0.0,1.0);}}}),archive:Some((27324,|state|state.video.sky_world_lighting_strength.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.sky_world_lighting_strength=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0);app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYSTRIKEPREVIEW {
         runtime:CvarDef::new("r_blueSkyStrikePreview","0","0|1","Hold a branched ground strike in front of the camera for inspection",CvarType::String,CvarFlags::NONE,LatchScope::None,
@@ -301,7 +302,7 @@ app_cvars! {
         implementations:[impl App {fn cvar_set_bluesky_filmic(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.filmic=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYNIGHTSKY {
-        runtime:CvarDef::new("r_blueSkyNightSky","1","0.0..1.0","Native night sky brightness (dome glow and floor)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+        runtime:CvarDef::new("r_blueSkyNightSky","1","0.0..1.0","Night sky dome glow and ocean sky reflection; not moonlight/world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.night_sky.to_string()),|app,value|App::cvar_set_bluesky_night_sky(app,APP_R_BLUESKYNIGHTSKY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_night_sky,None),
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.night_sky=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27327,|state|state.video.blue_water_environment.night_sky.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_night_sky(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.night_sky=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
@@ -319,6 +320,65 @@ app_cvars! {
         implementations:[impl App {fn cvar_set_bluesky_moon_size(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_size=App::parse_cvar_finite(name,value)?.clamp(0.1,30.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
 
+    APP_R_BLUESKYAERIAL {
+        runtime: CvarDef::new("r_blueSkyAerial", "1", "0|1",
+            "Blue Water aerial perspective (haze) on opaque map geometry. 0 skips GPU aerial-volume generation AND fullscreen scene compositing; sky dome, cloud shading, authored fog and relighting remain independent.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_water_environment.aerial_perspective as i32),
+            |app, value| {
+                let CvarValue::Int(enabled) = value else { unreachable!() };
+                app.video.blue_water_environment.aerial_perspective = enabled != 0;
+                app.sync_post_effects(); app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.blue_water_environment.aerial_perspective = parse_bool(value)
+                    .unwrap_or(settings.blue_water_environment.aerial_perspective);
+            }),
+            archive: Some((36842, |state| (state.video.blue_water_environment.aerial_perspective as u8).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUESKYDIAG {
+        runtime: CvarDef::new("r_blueSkyDiag", "0", "0..15",
+            "Session-only Blue Water performance isolation, independent of Relighting: bit 1 skip visible sky pixels, bit 2 skip aerial volume build AND composite, bit 4 skip aerial composite ONLY, bit 8 skip Blue Water scene-light/cloud pass. Combine bits; 0 restores all. Use r_gpuTimings 1 and render_perf_capture for timings. Visually destructive, diagnostic only.",
+            CvarType::Int { min: 0, max: 15 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_sky_diag as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_sky_diag = value as u8;
+                app.render_command(RenderCommand::SetBlueSkyDiag(value as u8));
+                app.push_console_line(format!("^3BLUE SKY DIAG:^7 {} (1=no BSP sky pixels, 2=no aerial build/composite, 4=no aerial composite, 8=no native scene-light/cloud pass; 0=normal). Use r_gpuTimings 1 and render_perf_capture.", value));
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_BLUESKYCUBEAB {
+        runtime: CvarDef::new("r_blueSkyCubeAB", "1", "0|1",
+            "Clear Blue Water sky A/B in Relighting Baked (r_relightMap 1): 0 original live atmosphere on BSP sky polygons, 1 cached five r_picmip-scaled faces (2048x2048 at picmip 0) + a 2x2 down face. Default 1 preserves existing Baked behavior. Native clouds or Blue Water native weather use the live fallback. Does NOT change r_skyWorldBakeAB, world lighting, CSM, or the sky environment used by ocean/models. Saved in video settings; benchmark with fixed time/camera and r_gpuTimings 1.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.blue_sky_cube_ab as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.blue_sky_cube_ab = value as u8;
+                app.render_command(RenderCommand::SetBlueSkyCubeAB(value as u8));
+                app.mark_config_dirty();
+                app.publish_ui();
+                app.push_console_line(format!("^3BLUE SKY CUBE A/B:^7 {} ({}). Active with r_skyBackend 1, r_relightMap 1, r_fastsky 0, native clouds/weather off; other relighting modes retain their original sky path.", value,
+                    if value == 0 { "A: live atmosphere" } else { "B: cached cube" }));
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() { settings.blue_sky_cube_ab = mode.min(1); }
+            }),
+            archive: Some((36843, |state| state.video.blue_sky_cube_ab.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_R_SKYBACKEND {
         runtime: CvarDef::new("r_skyBackend", "0", "0|1",
             "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting. Fastsky and Star Nest remain separate archived compatibility cvars.",

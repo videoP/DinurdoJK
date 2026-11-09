@@ -421,7 +421,7 @@ fn triangle(out: &mut Vec<UiVertex>, points: [Vec2; 3], color: [f32; 4], width: 
             1.0 - p.y / height.max(1) as f32 * 2.0,
         ],
         uv: [0.0; 2],
-        color,
+        color: UiVertex::pack_color(color),
         textured: 0.0,
     }));
 }
@@ -526,7 +526,7 @@ mod tests {
             .unwrap()
             .vertices
             .iter()
-            .all(|v| v.color[3] == 0.5));
+            .all(|v| v.color[3] == crate::ui::UiVertex::pack_color([0.0, 0.0, 0.0, 0.5])[3]));
     }
 
     #[test]

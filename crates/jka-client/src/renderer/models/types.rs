@@ -76,7 +76,7 @@ pub(in crate::renderer) fn source_fresnel(material: Option<&SourceMaterialParams
 }
 
 /// Everything needed to swap the baked map sun in a lightgrid sample for the
-/// runtime sun. Built per frame by `Renderer::entity_sun_relight`.
+/// runtime sun. Its inputs key the cached entity-grid update.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::renderer) struct EntitySunRelight {
     /// Unit direction toward the sun baked into the lightgrid.
@@ -93,7 +93,7 @@ pub(in crate::renderer) fn sample_entity_classic_light(
     relight: Option<EntitySunRelight>,
 ) -> Option<scene::ClassicEntityLight> {
     let mut light = grid.sample_classic_entity_light(origin)?;
-    if let Some(relight) = relight {
+    if let Some(relight) = relight.filter(|_| !grid.sun_relight_cached()) {
         light.relight_sun(relight.map_toward_sun, relight.toward_sun, relight.gain);
     }
     Some(light)
@@ -258,6 +258,7 @@ pub(in crate::renderer) struct Ghoul2RtSkinningResources {
 
 pub(in crate::renderer) struct Ghoul2PreparedDraw {
     pub(in crate::renderer) entity_num: u16,
+    pub(in crate::renderer) portal_only: bool,
     pub(in crate::renderer) mesh_key: Arc<str>,
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
@@ -272,6 +273,7 @@ pub(in crate::renderer) struct Ghoul2PreparedDraw {
 
 pub(in crate::renderer) struct Ghoul2PendingDraw {
     pub(in crate::renderer) entity_num: u16,
+    pub(in crate::renderer) portal_only: bool,
     pub(in crate::renderer) mesh_key: Arc<str>,
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
@@ -294,8 +296,8 @@ pub(in crate::renderer) struct Ghoul2PendingDraw {
 pub(in crate::renderer) struct DynamicEntityLightingUniform {
     // x: EntityAmbientLightingMode (0=off, 1=BSP lightgrid, 2=irradiance volume).
     // BSP lightgrid is applied during dynamic-model preparation (CPU vertices)
-    // or in the Ghoul2 vertex shader (GPU skinning); mode 2 retains the legacy
-    // placeholder until dynamic models sample the actual irradiance volume.
+    // or in the Ghoul2 vertex shader. Mode 2 samples the map's irradiance
+    // volume atlas, shared with BSP, in the MD3/Ghoul2 fragment shader.
     // y: f32 bits of the model brightness multiplier (Setup > Video > Models).
     pub(in crate::renderer) values: [u32; 4],
     // Self-applied Legacy fog, see md3.wgsl apply_self_legacy_fog.
@@ -312,8 +314,8 @@ pub(in crate::renderer) struct DynamicEntityLightingUniform {
     pub(in crate::renderer) studio_ambient: [f32;4],
     pub(in crate::renderer) studio_sun: [f32;4],
     pub(in crate::renderer) studio_sun_direction: [f32;4],
-    // Blue Water sky world light on models (r_blueSkyWorldLighting with
-    // r_skyWorldBake), GPU-written by blue_water_scene.rs model_sky_light and
+    // Model sky-light uniform for the optional material path (not used by the
+    // standalone fullscreen lighting effect). Written by model_sky_light and
     // never by write_entity_lighting: [0..6) ambient cube +X -X +Y -Y +Z -Z
     // (already * 0.5), [6] rgb direct * 0.2, w strength (0 = off), [7] xyz
     // unit direction toward the light. All render space.
@@ -385,7 +387,11 @@ pub(in crate::renderer) struct DynamicGpuTexture {
     /// The surface's `$bumpmap`, kept alive for as long as its bind group. Not
     /// registered with baked brightness: it is linear, which `register` skips.
     pub(in crate::renderer) _normal_image: Option<GpuImage>,
+    /// Preserve the original albedo sampler when rebinding map-owned volume data.
+    pub(in crate::renderer) clamp: bool,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
+    /// Depth passes must not bind the cascade texture they are writing.
+    pub(in crate::renderer) caster_bind_group: wgpu::BindGroup,
 }
 
 pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
@@ -402,6 +408,7 @@ pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
 
 pub(in crate::renderer) struct DynamicPreparedDraw {
     pub(in crate::renderer) entity_num: u16,
+    pub(in crate::renderer) portal_only: bool,
     pub(in crate::renderer) first_index: u32,
     pub(in crate::renderer) index_count: u32,
     pub(in crate::renderer) base_vertex: i32,
@@ -430,6 +437,19 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) texture_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) camera_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) entity_lighting_buffer: wgpu::Buffer,
+    /// The current BSP map's Bevy ambient-cube volume; rebound only on map
+    /// changes, never uploaded or reconstructed during a render frame.
+    pub(in crate::renderer) irradiance_volume_view: wgpu::TextureView,
+    pub(in crate::renderer) irradiance_volume_info_buffer: wgpu::Buffer,
+    pub(in crate::renderer) _irradiance_fallback_texture: wgpu::Texture,
+    pub(in crate::renderer) irradiance_fallback_view: wgpu::TextureView,
+    pub(in crate::renderer) irradiance_fallback_info_buffer: wgpu::Buffer,
+    pub(in crate::renderer) fallback_white_view: wgpu::TextureView,
+    pub(in crate::renderer) celestial_shadow_view: wgpu::TextureView,
+    pub(in crate::renderer) celestial_shadow_sampler: wgpu::Sampler,
+    pub(in crate::renderer) celestial_shadow_uniform: wgpu::Buffer,
+    pub(in crate::renderer) celestial_fallback_view: wgpu::TextureView,
+    pub(in crate::renderer) fallback_caster_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) entity_ambient_lighting: EntityAmbientLightingMode,
     /// Set by the renderer each frame before `prepare`; None keeps the stock
     /// lightgrid sample untouched.
@@ -467,6 +487,18 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Lazy per-alpha-mode pipelines; built only for modes with draws.
     pub(in crate::renderer) model_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Single-sample scene-view pipelines for TaystJK-style mirror portals.
+    pub(in crate::renderer) planar_model_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) planar_skin_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) planar_skin_source_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Mirror-view FX PSOs (single-sample, lazy); saber core and glow are FX.
+    pub(in crate::renderer) planar_fx_sprite_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) planar_fx_rope_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) planar_model_format: Option<wgpu::TextureFormat>,
     /// Capture variants keep material coverage separate from additive light.
     pub(in crate::renderer) studio_capture_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
@@ -599,6 +631,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) capture_prepare: bool,
     pub(in crate::renderer) perf_prepare: super::prepare::PreparePerf,
     pub(in crate::renderer) perf_phase_calls: std::cell::Cell<super::submission::ModelPhaseCalls>,
+    pub(in crate::renderer) perf_phase_cpu_ms: std::cell::Cell<f64>,
     /// Entity hidden only when drawing the secondary first-person spectator view.
     /// `prepare` keeps this entity out of cross-entity Ghoul2 instance batches so
     /// the companion draw can reject it without changing the primary draw list.

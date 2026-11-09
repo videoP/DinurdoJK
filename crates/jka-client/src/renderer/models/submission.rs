@@ -154,6 +154,7 @@ mod tests {
     fn model(entity_num: u16, first_index: u32, index_count: u32) -> DynamicPreparedDraw {
         DynamicPreparedDraw {
             entity_num,
+            portal_only: false,
             first_index,
             index_count,
             base_vertex: 0,

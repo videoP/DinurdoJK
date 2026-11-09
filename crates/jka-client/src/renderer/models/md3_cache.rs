@@ -191,7 +191,7 @@ mod tests {
             material_trace: None,
             entity_num: 3,
             wireframe_class: DynamicWireframeClass::Entity,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             vertices: Arc::new((0..count).map(|i| DynamicModelVertex { foliage_wind: 0.0,
                 position: [i as f32, 2.0, 3.0], normal: [0.0, 2.0, 0.0],
                 uv: [0.2, 0.8], color: [0.8, 0.6, 0.4, 0.3], depth_hack: 1.0,

@@ -1804,6 +1804,43 @@ app_cvars! {
         ]
     }
 
+    APP_R_RAGDOLLJOINTMODEL {
+        runtime: CvarDef::new(
+            "r_ragdollJointModel", "0", "0..1",
+            "Ragdoll joints: 0 classic hard limits; 1 experimental bounded soft limits + bind-informed neutral tension. Switching modes re-seeds simulated ragdolls.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_ragdolljointmodel(app)),
+            |app, value| App::cvar_set_r_ragdolljointmodel(
+                app, APP_R_RAGDOLLJOINTMODEL.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_ragdolljointmodel, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    if mode <= 1 { settings.ragdoll_joint_model = mode; }
+                }
+            }),
+            archive: Some((36374, |state| state.video.ragdoll_joint_model.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ragdolljointmodel(&self) -> String {
+                    self.video.ragdoll_joint_model.to_string()
+                }
+                fn cvar_set_r_ragdolljointmodel(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .map_err(|_| format!("{name}: expected 0 or 1"))?;
+                    if mode > 1 { return Err(format!("{name}: expected 0 or 1")); }
+                    if self.video.ragdoll_joint_model == mode { return Ok(()); }
+                    self.video.ragdoll_joint_model = mode;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_RAGDOLLSELFCOLLISION {
         runtime: CvarDef::new(
                 "r_ragdollSelfCollision",

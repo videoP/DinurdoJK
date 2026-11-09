@@ -718,6 +718,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         surface_sprite_effects: Vec::new(),
         surface_sprite_bake: Default::default(),
         global_fog: None,
+        local_fogs: Vec::new(),
         warnings,
         spawns,
         fx_runners: Vec::new(),

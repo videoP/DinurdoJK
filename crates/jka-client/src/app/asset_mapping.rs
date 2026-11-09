@@ -299,7 +299,7 @@ impl AssetMappingState {
                 // real availability without turning it into an INI override.
                 Ok(None) if i==0 => Some(crate::filesystem_paths::default_base_directory()
                     .is_ok_and(|default|default.is_dir())),
-                Ok(None) if i==2 => Some(jka_assets::pk3::jk2_base_directory(base,roots).is_dir()),
+                // Unset JK2 root: JK2 mode is simply off, not an error.
                 Ok(None)=>None,
                 Err(_)=>Some(false),
             };

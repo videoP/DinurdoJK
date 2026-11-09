@@ -316,7 +316,7 @@ fn local_cubemap_captured_entity_blocks_baked_light_on_all_faces_on_gpu() {
             material_trace: None,
             entity_num: 1,
             wireframe_class: DynamicWireframeClass::Entity,
-            raster_visible: true,
+            raster_visible: true, portal_only: false,
             indices: Arc::new((0..vertices.len() as u32).collect()),
             vertices: Arc::new(vertices),
             lighting_origin: None,

@@ -260,7 +260,7 @@ fn neon_stroke(out: &mut Vec<UiVertex>, p: [f32; 2], q: [f32; 2],
     let n = [-dy * radius / len, dx * radius / len];
     let xy = |x: f32, y: f32| [2.0 * x / w.max(1) as f32 - 1.0,
         1.0 - 2.0 * y / h.max(1) as f32];
-    let v = |point| UiVertex { position: point, uv: [0.0, 0.0], color, textured: 0.0 };
+    let v = |point| UiVertex { position: point, uv: [0.0, 0.0], color: UiVertex::pack_color(color), textured: 0.0 };
     let a = xy(p[0] + n[0], p[1] + n[1]);
     let b = xy(p[0] - n[0], p[1] - n[1]);
     let c = xy(q[0] - n[0], q[1] - n[1]);

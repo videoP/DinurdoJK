@@ -216,6 +216,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetOceanTime(..) => "SetOceanTime",
         RenderCommand::SetPerfTrace(..) => "SetPerfTrace",
         RenderCommand::SetGpuTimings(..) => "SetGpuTimings",
+        RenderCommand::SetBlueSkyDiag(..) => "SetBlueSkyDiag",
+        RenderCommand::SetBlueSkyCubeAB(..) => "SetBlueSkyCubeAB",
         RenderCommand::SetFrameTimeGraph(..) => "SetFrameTimeGraph",
         RenderCommand::SetFxZeroAlphaDiscard(..) => "SetFxZeroAlphaDiscard",
         RenderCommand::SetDebugWorldVertexAlphaOne(..) => "SetDebugWorldVertexAlphaOne",
@@ -354,8 +356,7 @@ impl RenderThread {
         // draw (measured on an Intel UHD 630). Our indirect arguments are built by
         // the renderer itself; WGPU_VALIDATION_INDIRECT_CALL=1 turns it back on.
         instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
-        instance_desc.flags = instance_desc.flags.with_env();
-        if instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION) {
+        instance_desc.flags = instance_desc.flags.with_env();        if instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION) {
             eprintln!("[GPU] backend validation layers enabled: {:?}", instance_desc.flags);
         }
         instance_desc.backends = match backend {
@@ -668,6 +669,8 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         .surface_deformation
         .set_mode(&renderer.queue, video.footprints);
     let effective_lighting = video.effective_relighting();
+    // Session-only A/B still needs to apply if changed before renderer startup.
+    renderer.blue_sky_cube_ab = video.blue_sky_cube_ab.min(1);
     renderer.set_post_effects(PostEffects {
         thermal_vision: video.thermal_vision,
         hdr: video.hdr,
@@ -696,6 +699,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         contact_shadows: video.contact_shadows,
         fog_mode: video.fog_mode,
         fog_strength: video.fog_strength,
+        relighting_mode: video.active_relighting_mode(),
         sun_override: video.sun_override,
         sun_yaw: video.sun_yaw,
         sun_pitch: video.sun_pitch,
@@ -706,13 +710,16 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         sun_visibility: video.sun_visibility,
         entity_sun_lighting: effective_lighting.entity_sun_lighting,
         baked_sun_removal: effective_lighting.baked_sun_removal,
-        baked_sun_cache: video.baked_sun_cache,
+        baked_sun_removal_auto: effective_lighting.baked_sun_removal_auto,
+        baked_sun_cache: effective_lighting.baked_sun_cache,
         lightmap_smoothing: video.lightmap_smoothing,
         baked_sun_aa: video.baked_sun_aa,
         lightmap_signal: video.lightmap_signal,
         sun_receiver_normals: video.sun_receiver_normals,
         sun_terminator: video.sun_terminator,
-        sky_world_bake: video.sky_world_bake,
+        sky_world_bake_ab: effective_lighting.sky_world_bake_ab,
+        sky_world_light_isolation: effective_lighting.sky_world_light_isolation,
+        sky_world_lighting_strength: effective_lighting.sky_world_lighting_strength,
         bake_threads: video.bake_threads,
         baked_sun_shadow_map: video.baked_sun_shadow_map,
         baked_sun_edge_softness: video.baked_sun_edge_softness,
@@ -946,6 +953,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut user_gpu_timings = initial_ui.video.gpu_timings;
     let mut diag_forced_gpu_timings = false;
     let mut perf_trace = initial_ui.video.perf_trace;
+    crate::renderer::diagnostics::perf_capture::set_live_trace(perf_trace);
     renderer.set_ui(initial_ui);
     renderer.set_dynamic_hud(snapshot.hud, snapshot.movement_hud);
     renderer.set_player_names(snapshot.player_names.clone());
@@ -976,7 +984,13 @@ pub(in crate::renderer) fn render_thread_main(
     });
     let mut companion_renderers: HashMap<CompanionId, CompanionRenderThread> = HashMap::new();
     // Coalesce live static-sun bake progress; no event per ray or per frame.
+    // One pending entry per native storm event; deadline in multiplayer serverTime.
+    let mut pending_server_thunder: Vec<(i64, i64, f32, u8)> = Vec::new();
+    let mut last_thunder_clock_ms: Option<i64> = None;
+    let mut last_thunder_map_hash: Option<u64> = None;
     let mut last_sun_bake_status: Option<(u32, crate::renderer::SunBakeStage)> = None;
+    // This is a one-event-per-change status channel, not per-frame telemetry.
+    let mut last_baked_sun_auto_status: Option<crate::renderer::BakedSunAutoStatus> = None;
 
     let mut stats_started = Instant::now();
     // Start of the current cap interval. Pacing from a fixed cadence rather than
@@ -1072,6 +1086,9 @@ pub(in crate::renderer) fn render_thread_main(
     let mut trace_gpu_n = [0_u64; TRACE_GPU_PASSES.len()];
     // Advanced-path prepare breakdown: camera, shadow, world, reflection.
     let mut trace_prep_stage_ms = [0.0_f64; 4];
+    // r_perfTrace CPU recording intervals, summed per frame. Captures use the
+    // same opt-in timers and detailed CSV fields; normal FPS path is untouched.
+    let mut trace_deep_ms = [0.0_f64; 20];
     if perf_trace {
         println!("JKA perf trace enabled (enable GPU TIMESTAMPS too for per-pass GPU timings)");
     }
@@ -1079,6 +1096,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut shader_progress_polled_at = Instant::now() - Duration::from_millis(100);
     let mut gamma_preparation = None;
     let mut first_frame_notified = false;
+    let mut restart_loading_notified = false;
     let mut first_menu_frame_notified = false;
     let mut neon_compositor_ready_notified = false;
     let mut last_stage_token: Option<u64> = None;
@@ -1266,6 +1284,9 @@ pub(in crate::renderer) fn render_thread_main(
                 let upload_started = Instant::now();
                 let received_at = load_map_received_at.take().unwrap_or(upload_started);
                 let upload_timings = renderer.load_studio_map(*map, studio_world);
+                // A new world must emit its own status even if the previous
+                // map happened to have the same calibrated coefficient.
+                last_baked_sun_auto_status = None;
                 let upload_ended_at = Instant::now();
                 let upload_ms = upload_ended_at.duration_since(upload_started).as_secs_f64() * 1000.0;
                 pending_first_world_phases = Some((started, received_at, upload_started, upload_ended_at));
@@ -1281,6 +1302,7 @@ pub(in crate::renderer) fn render_thread_main(
                 let bsp_stats = plan.base.bsp_stats.clone();
                 let upload_started = Instant::now();
                 let upload_timings = renderer.load_remapped_map(*plan, base_texture_count, studio_world);
+                last_baked_sun_auto_status = None;
                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                 pending_world_uploaded = Some((
                     request_id, started, name, triangles, batches, upload_ms,
@@ -1682,6 +1704,7 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetPerfTrace(enabled)) => {
                         perf_trace = enabled;
+                        crate::renderer::diagnostics::perf_capture::set_live_trace(enabled);
                         trace_started = Instant::now();
                         trace_frames = 0;
                         trace_frame_ms = 0.0;
@@ -1695,6 +1718,7 @@ pub(in crate::renderer) fn render_thread_main(
                         trace_ocean_topology_ms=0.0;
                         trace_ocean_topology_max_ms=0.0;
                         trace_prep_stage_ms = [0.0; 4];
+                        trace_deep_ms = [0.0; 20];
                         println!(
                             "JKA perf trace {}",
                             if enabled { "enabled" } else { "disabled" }
@@ -1702,6 +1726,19 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetFrameTimeGraph(enabled)) => {
                         renderer.frame_time_graph.set_enabled(enabled);
+                    }
+                    Ok(RenderCommand::SetBlueSkyCubeAB(mode)) => {
+                        renderer.blue_sky_cube_ab = mode.min(1);
+                        println!("[BLUE SKY CUBE A/B] {} (Baked Relighting only; clouds/weather fall back live)",
+                            if renderer.blue_sky_cube_ab == 0 { "A: live" } else { "B: cached cube" });
+                    }
+                    Ok(RenderCommand::SetBlueSkyDiag(mask)) => {
+                        renderer.blue_sky_diag = mask & 15;
+                        println!("[BLUE SKY DIAG] mask={} sky_backend={} relighting={} clouds={} cloud_backend={} native_world_lighting={:.2} scene_format={:?} aerial_skip={} composite_skip={}",
+                            renderer.blue_sky_diag, renderer.sky_backend, renderer.relighting_mode,
+                            renderer.clouds_enabled, renderer.cloud_backend,
+                            renderer.blue_water_environment.world_lighting, renderer.scene_format(),
+                            renderer.blue_sky_diag & 2 != 0, renderer.blue_sky_diag & 6 != 0);
                     }
                     Ok(RenderCommand::SetGpuTimings(enabled)) => {
                         user_gpu_timings = enabled;
@@ -2157,9 +2194,13 @@ pub(in crate::renderer) fn render_thread_main(
                     }) => renderer.request_collision_world(
                         map_hash, root, game, source, allow_asset_overrides,
                     ),
-                    Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
+                    Ok(RenderCommand::UnloadMap) => {
+                        renderer.unload_map();
+                        last_baked_sun_auto_status = None;
+                    },
                     Ok(RenderCommand::GrowInlineInstances { map }) => {
                         renderer.load_map(*map);
+                        last_baked_sun_auto_status = None;
                     }
                     Ok(RenderCommand::LoadMap {
                         request_id,
@@ -2407,6 +2448,7 @@ pub(in crate::renderer) fn render_thread_main(
                     .count();
             }
             renderer.model_frame_log.set_source(model_source);
+            renderer.weather_server_time_ms = snapshot.weather_server_time_ms;
             renderer.studio_lens=snapshot.studio_lens;
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
             if let Some(ocean) = renderer.ocean.as_mut() {
@@ -2490,6 +2532,11 @@ pub(in crate::renderer) fn render_thread_main(
                 stage: sun_status.1,
             });
         }
+        let auto_status = renderer.baked_sun_auto_status();
+        if last_baked_sun_auto_status != Some(auto_status) {
+            last_baked_sun_auto_status = Some(auto_status);
+            let _ = proxy.send_event(UserEvent::BakedSunAutoStatus(auto_status));
+        }
         if gamma_preparation.is_some() && render_result.is_ok() && !renderer.baked_brightness.busy {
             let generation = gamma_preparation.take().unwrap();
             let _ = proxy.send_event(UserEvent::GammaPrepared(generation));
@@ -2548,14 +2595,57 @@ pub(in crate::renderer) fn render_thread_main(
                 if let Some(scene)=snapshot.studio_scene.as_ref().filter(|_|renderer.studio_world_viewport.is_some()) {
                     let _=proxy.send_event(UserEvent::StudioTestScenePresented {overlap:scene.incoming.is_some()});
                 }
+                let current_map_hash = renderer.world.as_ref().map(|world| world.remap_asset_hash);
+                if last_thunder_map_hash != current_map_hash {
+                    pending_server_thunder.clear();
+                }
+                last_thunder_map_hash = current_map_hash;
+                // Clear stale audio BEFORE adding events reconstructed by a
+                // new timeline, otherwise late-join/seek thunder is discarded.
+                let server_ms = snapshot.weather_server_time_ms.map(i64::from);
+                if server_ms.is_none()
+                    || renderer.blue_water_environment.weather_backend != 1
+                    || match (last_thunder_clock_ms, server_ms) {
+                        (Some(previous), Some(now)) => now < previous || now - previous > 2000,
+                        _ => false,
+                    }
+                {
+                    pending_server_thunder.clear();
+                }
+                // Synchronized strikes use the SAME absolute serverTime for
+                // their sound on every client. No per-strike sleeping threads.
+                // The original local timer remains for offline weather.
                 for cue in &info.native_thunder {
-                    if cue.loudness<=0.0 {continue;}
-                    let proxy=proxy.clone();let cue=*cue;
-                    let _=std::thread::Builder::new().name("Blue Water thunder".into()).spawn(move || {
-                        std::thread::sleep(Duration::from_secs_f64(cue.delay.clamp(0.0,180.0)));
-                        let _=proxy.send_event(UserEvent::BlueWaterThunder(cue.loudness as f32));
+                    if cue.loudness <= 0.0 { continue; }
+                    if let (Some(strike_ms), Some(sample)) = (cue.strike_time_ms, cue.sample) {
+                        // Rebuilding the atmosphere must not queue the same
+                        // not-yet-heard strike a second time.
+                        if !pending_server_thunder.iter().any(|entry| entry.0 == strike_ms) {
+                            pending_server_thunder.push((
+                                strike_ms,
+                                strike_ms + (cue.delay.max(0.0) * 1000.0).round() as i64,
+                                cue.loudness as f32,
+                                sample,
+                            ));
+                        }
+                    } else {
+                        let proxy = proxy.clone();
+                        let cue = *cue;
+                        let _ = std::thread::Builder::new().name("Blue Water thunder".into()).spawn(move || {
+                            std::thread::sleep(Duration::from_secs_f64(cue.delay.clamp(0.0, 180.0)));
+                            let _ = proxy.send_event(UserEvent::BlueWaterThunder { volume: cue.loudness as f32, sample: None });
+                        });
+                    }
+                }
+                if let Some(now) = server_ms {
+                    pending_server_thunder.retain(|&(_strike, due, volume, sample)| {
+                        if now >= due {
+                            let _ = proxy.send_event(UserEvent::BlueWaterThunder { volume, sample: Some(sample) });
+                            false
+                        } else { true }
                     });
                 }
+                last_thunder_clock_ms = server_ms;
 
                 if crate::fx::diagnostics::enabled()
                     && last_fx_diag_gpu.elapsed() >= Duration::from_secs(1)
@@ -2670,6 +2760,10 @@ pub(in crate::renderer) fn render_thread_main(
                         worker.publish_scene(scene_frame);
                     }
                 }
+                if renderer.ui_state.video_restart_loading && !restart_loading_notified {
+                    restart_loading_notified = true;
+                    let _ = proxy.send_event(UserEvent::RendererRestartLoadingPresented);
+                }
                 if !first_frame_notified {
                     first_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstFrame);
@@ -2719,6 +2813,31 @@ pub(in crate::renderer) fn render_thread_main(
                     trace_prep_stage_ms[1] += info.prep_shadow_ms;
                     trace_prep_stage_ms[2] += info.prep_world_ms;
                     trace_prep_stage_ms[3] += info.prep_reflection_ms;
+                    let deep = [
+                        info.perf_encode_setup_ms,
+                        info.perf_encode_pre_world_ms,
+                        info.perf_encode_scene_ms,
+                        info.perf_encode_post_ui_ms,
+                        info.perf_encoder_finish_ms,
+                        info.perf_profiler_readback_encode_ms,
+                        info.perf_scene_before_world_ms,
+                        info.perf_scene_world_branch_ms,
+                        info.perf_scene_after_world_ms,
+                        renderer.dynamic_model_renderer.perf_phase_cpu_ms.get(),
+                        info.perf_post_native_ui_ms,
+                        info.perf_primary_submit_api_ms,
+                        info.perf_followup_ms,
+                        info.perf_followup_egui_ms,
+                        info.perf_followup_native_ui_ms,
+                        info.perf_early_present_copy_ms,
+                        info.perf_prepare_early_checks_ms,
+                        info.perf_pre_world_ocean_ms,
+                        info.perf_pre_world_shadows_ms,
+                        info.perf_pre_world_remaining_ms,
+                    ];
+                    for (sum, sample) in trace_deep_ms.iter_mut().zip(deep) {
+                        *sum += sample;
+                    }
                 }
                 last_info = info;
                 previous_graph_frame_complete = true;
@@ -3063,6 +3182,42 @@ pub(in crate::renderer) fn render_thread_main(
                 trace_encode_ms / frames,
                 trace_submit_ms / frames,
                 trace_present_ms / frames,
+            );
+            let deep = |i: usize| trace_deep_ms[i] / frames;
+            let encode_known = (0..6).map(deep).sum::<f64>();
+            println!(
+                "[JKA PERF CPU ENCODE] setup={:.4} pre_world={:.4}[ocean={:.4} shadow={:.4} other={:.4}] scene={:.4}[before_main={:.4} world_branch={:.4} after={:.4} models_nested={:.4}] post_ui={:.4}[native_nested={:.4}] finish={:.4} readback={:.4} other={:.4}ms; render-passes={} compute-passes={} mdi={} indexed={} cbuffers={}",
+                deep(0), deep(1), deep(17), deep(18), deep(19),
+                deep(2), deep(6), deep(7), deep(8), deep(9),
+                deep(3), deep(10), deep(4), deep(5),
+                (trace_encode_ms / frames - encode_known).max(0.0),
+                last_info.perf_encode_calls.render_passes,
+                last_info.perf_encode_calls.compute_passes,
+                last_info.perf_encode_calls.multi_draw_indexed_indirect_count,
+                last_info.perf_encode_calls.draw_indexed,
+                last_info.perf_primary_command_buffers,
+            );
+            println!(
+                "[JKA PERF CPU FOLLOWUP] queue_submit_api={:.4}ms followup={:.4}ms[egui={:.4} native_ui={:.4} other={:.4}] early_present_copy={:.4}ms prep_early_checks={:.4}ms; submit_legacy={:.4}ms",
+                deep(11), deep(12), deep(13), deep(14),
+                (deep(12) - deep(13) - deep(14)).max(0.0), deep(15), deep(16),
+                trace_submit_ms / frames,
+            );
+            let actual_surface = crate::renderer::context::presentation_config(
+                &renderer.config, renderer.surface_linear_present);
+            println!(
+                "[JKA PERF PRESENT/FORMATS] rgb565_requested={} rgb565_effective={} actual_swapchain={:?} render_target={:?} depth={:?} samples={} display={}x{} early_submit={} present_copy={} shitter={} shitter_texture={} vsync={} present={:?} latency={} profiler={} (the requested format is NOT evidence it is active)",
+                crate::renderer::rgb565_requested(),
+                u8::from(crate::renderer::rgb565_effective()),
+                actual_surface.format, renderer.config.format,
+                crate::renderer::depth_format(), renderer.msaa_samples,
+                renderer.config.width, renderer.config.height,
+                u8::from(last_info.early_submit), u8::from(last_info.present_copy),
+                u8::from(crate::renderer::collision_world_only()),
+                u8::from(crate::renderer::shitter_texture_enabled()),
+                renderer.vsync.label(), renderer.config.present_mode,
+                renderer.config.desired_maximum_frame_latency,
+                renderer.gpu_profiler.enabled(),
             );
             let client = snapshot.client_perf;
             println!(
@@ -3539,6 +3694,7 @@ pub(in crate::renderer) fn render_thread_main(
             trace_ocean_topology_ms=0.0;
             trace_ocean_topology_max_ms=0.0;
             trace_prep_stage_ms = [0.0; 4];
+            trace_deep_ms = [0.0; 20];
         }
 
         let diag_pacer_active = input_diagnostic.is_recording();

@@ -395,6 +395,9 @@ impl GameSession {
         );
         let audio_started = Instant::now();
         if !self.suppress_audio {
+            let audio_eye = scene::jka_position(sample.eye_position);
+            let bsp_submerged = self.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
+                && self.player_presenter.audio_listener_in_bsp_water(audio_eye);
             if let Some(sound) = &mut self.sound_presenter {
                 sound.update_loops(
                     &self.client_game,
@@ -418,6 +421,7 @@ impl GameSession {
                     },
                     &self.presented_entities,
                     followed_entity.as_ref(),
+                    bsp_submerged,
                 );
                 // TaystJK CG_Init invokes CG_StartMusic(qfalse) from the
                 // initial CS_MUSIC gamestate. Live sessions previously never
@@ -879,6 +883,7 @@ impl GameSession {
         // player and must be submitted so spectator outlines (and ordinary world
         // rendering) can see it.
         let render_followed_body = !sample_owns_camera || sample_third_person || first_person_saber;
+        let portal_only_body = !render_followed_body && self.portal_body_enabled;
         let followed_started = Instant::now();
         let intermission = sample.policy.pm_type == crate::cgame::PM_INTERMISSION;
         if let Some(entity) = followed_entity
@@ -920,20 +925,24 @@ impl GameSession {
                         target_server_time,
                         render_followed_body && !first_person_saber,
                     );
-                    dynamic_models.extend(self.player_presenter.present_player_entity(
+                    let mut body_draws = self.player_presenter.present_player_entity(
                         &entity,
                         &info,
                         target_server_time,
                         local_player_alpha(third_person.alpha),
                         look_target_origin,
                         sample.teleported,
-                        render_followed_body,
+                        render_followed_body || portal_only_body,
                         first_person_saber,
                         // Without a view the presenter cannot pick a Ghoul2 LOD,
                         // so the local player's own model would stay at LOD 0.
                         ghoul2_view,
                         sample.policy.pm_type == 0, // PM_NORMAL, never PM_NOCLIP (3).
-                    )?);
+                    )?;
+                    if portal_only_body {
+                        for surface in &mut body_draws { surface.portal_only = true; }
+                    }
+                    dynamic_models.extend(body_draws);
                     // Snapshot players already submit their thrown sabers in
                     // present_snapshot_players. The local/followed player can
                     // instead be synthesized from playerState (and therefore
@@ -1159,6 +1168,24 @@ impl GameSession {
         // CG_PlayerFootsteps: the sound, dust and print of each footfall the
         // animations found. The local solo player's snow belongs to Snowflow.
         let stages = self.player_presenter.footstep_stages();
+        // JK2 CG_FootStep: boot or clank, no dust or prints.
+        for step in self.player_presenter.drain_jk2_footsteps() {
+            if stages.sounds && !self.suppress_audio {
+                if let Some(sound) = &mut self.sound_presenter {
+                    let kind = if step.metal {
+                        crate::cgame::footsteps::Jk2StepKind::Metal
+                    } else {
+                        crate::cgame::footsteps::Jk2StepKind::Boot
+                    };
+                    let variant = crate::cgame::footsteps::jk2_sound_variant(step.entity, target_server_time);
+                    sound.play_footstep(
+                        &crate::cgame::footsteps::jk2_step_sound(kind, variant),
+                        step.entity,
+                        step.position,
+                    );
+                }
+            }
+        }
         for impact in self.player_presenter.drain_footsteps() {
             if stages.sounds && !self.suppress_audio {
                 if let Some(sound) = &mut self.sound_presenter {

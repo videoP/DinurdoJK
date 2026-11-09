@@ -10,6 +10,8 @@ use jka_assets::pk3::AssetSearchPath;
 const MAX_STRING_FILE_BYTES: usize = 1024 * 1024;
 /// MAX_STRINGED_SV_STRING.
 const MAX_SV_STRING: usize = 1024;
+/// JK2 `strip/<name>.sp` files the in-game text comes from.
+const JK2_STRIP_FILES: [&str; 3] = ["mp_ingame", "mp_svgame", "sp_ingame"];
 
 #[derive(Debug, Default, Clone)]
 pub struct StringEd {
@@ -39,7 +41,58 @@ impl StringEd {
                 .to_ascii_uppercase();
             table.parse_file(&file, &asset.bytes);
         }
+        // JK2 ships the same text as `strip/*.sp` (StripEd); JKA's are `.str`.
+        let strips: Vec<String> = assets
+            .names()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.strip_prefix("strip/").and_then(|file| file.strip_suffix(".sp"))
+                    .is_some_and(|stem| JK2_STRIP_FILES.contains(&stem))
+            })
+            .map(str::to_owned)
+            .collect();
+        for name in strips {
+            let Ok(Some(asset)) = assets.read(&name, MAX_STRING_FILE_BYTES) else { continue };
+            let stem = name
+                .rsplit('/')
+                .next()
+                .and_then(|base| base.rsplit_once('.').map(|(stem, _)| stem))
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            table.parse_strip_file(&stem, &asset.bytes);
+        }
         table
+    }
+
+    /// JK2 StripEd `.sp`: a header `REFERENCE <FILE>` followed by
+    /// `INDEX n { REFERENCE <KEY> ... TEXT_LANGUAGE1 "English" }` blocks
+    /// (jk2 `cg_event.c` looks up "INGAME_<CLASSNAME>" / "INGAMETEXT_PICKUPLINE").
+    /// Each entry is stored under that header key and under the file name key
+    /// (`MP_INGAME_PICKUPLINE`, `MP_SVGAME_...`) the JKA lookups already use.
+    fn parse_strip_file(&mut self, stem: &str, bytes: &[u8]) {
+        let mut header: Option<String> = None;
+        let mut reference: Option<String> = None;
+        let mut in_block = false;
+        for line in bytes.split(|&b| b == b'\n') {
+            let line = trim(line);
+            if line.starts_with(b"{") {
+                in_block = true;
+            } else if line.starts_with(b"}") {
+                in_block = false;
+                reference = None;
+            } else if let Some(rest) = line.strip_prefix(b"REFERENCE") {
+                let name = String::from_utf8_lossy(trim(rest)).to_ascii_uppercase();
+                if in_block { reference = Some(name); } else { header = Some(name); }
+            } else if let Some(rest) = line.strip_prefix(b"TEXT_LANGUAGE1") {
+                if let Some(reference) = reference.take() {
+                    let text = unquote(trim(rest));
+                    if let Some(header) = &header {
+                        self.strings.entry(format!("{header}_{reference}")).or_insert_with(|| text.clone());
+                    }
+                    self.strings.entry(format!("{stem}_{reference}")).or_insert(text);
+                }
+            }
+        }
     }
 
     /// The subset of the .str format SE_GetString needs: REFERENCE names
@@ -146,5 +199,17 @@ REFERENCE JOINEDTHEBATTLE\r\nLANG_ENGLISH \"joined the battle.\"\r\n",
         // Unknown references disappear (SE_GetString returns "").
         assert_eq!(table.translate_server_text(b"a @@@NOPE b"), b"a  b");
         assert_eq!(table.translate_server_text(b"no refs"), b"no refs");
+    }
+
+    #[test]
+    fn jk2_strip_files_answer_both_header_and_file_name_keys() {
+        let mut table = StringEd::default();
+        table.parse_strip_file(
+            "SP_INGAME",
+            b"VERSION 1\r\nREFERENCE INGAME\r\nCOUNT 2\r\nINDEX 0\r\n{\r\n   REFERENCE AMMO_BLASTER\r\n   \
+TEXT_LANGUAGE1 \"Blaster Pack Ammo\"\r\n   TEXT_LANGUAGE2 \"Munition\"\r\n}\r\n",
+        );
+        assert_eq!(table.get("INGAME_ammo_blaster"), b"Blaster Pack Ammo");
+        assert_eq!(table.get("SP_INGAME_AMMO_BLASTER"), b"Blaster Pack Ammo");
     }
 }

@@ -20,7 +20,7 @@ const ITEM_NAMES: [&str; HI_NUM_HOLDABLE] = [
 
 /// BG_IsItemSelectable excludes the jetpack and Siege dispensers from scrolling.
 fn selectable(tag: usize) -> bool {
-    (1..HI_NUM_HOLDABLE).contains(&tag) && !matches!(tag, 7 | 8 | 9)
+    crate::items::holdable_selectable(tag as i32)
 }
 
 fn visible_items(selector: UiInventorySelect) -> Vec<usize> {
@@ -36,6 +36,7 @@ pub(in crate::ui) fn build_inventory_select(
     w: u32,
     h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::InventorySelect) { return; }
     let Some(selector) = ui.inventory_select else { return; };
     if ui.jk2_mode && ui.video.hud_style == 1 && selector.remaining_ms <= 130 { return; }
     let selected = usize::from(selector.selected);
@@ -106,6 +107,7 @@ mod tests {
     #[test]
     fn holdable_selector_uses_shared_icon_atlas() {
         let mut ui = UiSnapshot::default();
+        ui.video.draw_hud = true;
         let mut verts = Vec::new();
         build_inventory_select(&mut verts, &ui, None, 1280, 720);
         assert!(verts.is_empty());
@@ -116,6 +118,14 @@ mod tests {
         });
         build_inventory_select(&mut verts, &ui, None, 1280, 720);
         assert_eq!(verts.iter().filter(|v| v.textured == ICON_TEXTURE_SOURCE).count(), 18);
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["inventory_select".to_string()]).unwrap();
+        verts.clear();
+        build_inventory_select(&mut verts, &ui, None, 1280, 720);
+        assert!(verts.is_empty());
+        ui.video.draw_hud = false;
+        build_inventory_select(&mut verts, &ui, None, 1280, 720);
+        assert!(!verts.is_empty());
     }
     #[test]
     fn unowned_selection_does_not_draw_anything() {

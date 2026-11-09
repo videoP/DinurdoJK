@@ -8,7 +8,7 @@ use hud::draw::{HUD_INK_BOTTOM, HUD_INK_TOP, HUD_VALUE};
 #[allow(unused_imports)]
 pub use hud::layout::HudAnchor;
 #[allow(unused_imports)]
-pub use hud::movement::FORCE_ICON_NAMES;
+pub use hud::movement::{FORCE_ICON_NAMES, FORCE_EXTENSION_ICON_NAMES, FORCE_POWER_INTERNAL_NAMES, FORCE_POWER_NAMES, FORCE_POWER_SIDES, FORCE_POWER_SORTED};
 #[allow(unused_imports)]
 pub use text::ProportionalGlyph;
 mod chat;
@@ -19,6 +19,29 @@ pub(crate) use hud::siege::{append_mp_timer_image, load_mp_timer};
 /// Register only the stock artwork matching the active game protocol.
 /// Never mount both JK2 and JKA HUD names in a single native image atlas.
 pub(crate) use hud::jk2_retail::jk2_ammo_index;
+
+/// Resolve a read-only native HUD atlas cell. Extensions reference category +
+/// game ID, never duplicated qpaths or extension-image atlas slots. The JK2
+/// atlas already resolves presented weapon/holdable IDs to native JK2 art.
+pub(crate) fn native_hud_icon_index(category: &str, id: i64) -> Option<usize> {
+    use hud::movement::{
+        ICON_FORCE_BASE, ICON_INVENTORY_BASE, ICON_WEAPON_BASE,
+        ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF, ICON_WEAPON_DUAL,
+        ICON_RAGE_RECOVERY, FORCE_ICON_NAMES, INVENTORY_ICON_NAMES,
+        WEAPON_ICON_NAMES,
+    };
+    let id = usize::try_from(id).ok()?;
+    match category {
+        "force" if id < FORCE_ICON_NAMES.len() => Some(ICON_FORCE_BASE + id),
+        "weapon" if id > 0 && id < WEAPON_ICON_NAMES.len() => Some(ICON_WEAPON_BASE + id),
+        "weapon_no_ammo" if id > 0 && id < WEAPON_ICON_NAMES.len() => Some(ICON_WEAPON_NO_AMMO_BASE + id),
+        "inventory" if id > 0 && id < INVENTORY_ICON_NAMES.len() => Some(ICON_INVENTORY_BASE + id),
+        "saber_staff" if id == 3 => Some(ICON_WEAPON_STAFF),
+        "saber_dual" if id == 3 => Some(ICON_WEAPON_DUAL),
+        "rage_recovery" if id == 8 => Some(ICON_RAGE_RECOVERY),
+        _ => None,
+    }
+}
 
 pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_mode: bool) {
     if jk2_mode {
@@ -91,9 +114,7 @@ use hud::draw::{
 use hud::layout::draw_placed;
 use hud::extensions::build_extension_hud;
 pub(crate) use hud::extensions::hud_element_replaced;
-pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
-pub(crate) use hud::extensions::{EXT_IMAGE_TEXTURE_SOURCE, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_USER_SHADER_SOURCE_BASE,
-    image_cell_uv as extension_image_cell_uv, image_cell_uv_for_count as extension_image_cell_uv_for_count};
+pub(crate) use hud::extensions::{EXT_IMAGE_TEXTURE_SOURCE, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_USER_SHADER_SOURCE_BASE};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
@@ -125,7 +146,7 @@ pub use settings::environment::{
     ENV_ROW_CLOUD_COVERAGE, ENV_ROW_CLOUD_HEIGHT, ENV_ROW_CLOUD_QUALITY,
     ENV_ROW_CLOUD_RENDER_RESOLUTION, ENV_ROW_CLOUD_SHADOWS, ENV_ROW_CLOUD_TEMPORAL,
     ENV_ROW_CLOUD_THICKNESS, ENV_ROW_CLOUD_TUNING, ENV_ROW_CLOUD_TYPE, ENV_ROW_FOG_MODE,
-    ENV_ROW_FOG_STRENGTH, ENV_ROW_FOOTPRINTS, ENV_ROW_PUDDLE_SCATTER, ENV_ROW_PUDDLE_WATER,
+    ENV_ROW_FOG_STRENGTH, ENV_ROW_BLUE_SKY_AERIAL, ENV_ROW_FOOTPRINTS, ENV_ROW_PUDDLE_SCATTER, ENV_ROW_PUDDLE_WATER,
     ENV_ROW_RAIN, ENV_ROW_RAIN_FAST_POST, ENV_ROW_RAIN_FAST_VERTEX, ENV_ROW_RAIN_GLASS,
     ENV_ROW_RAIN_GRADE, ENV_ROW_RAIN_INTENSITY, ENV_ROW_RAIN_LEAN_DEPTH,
     ENV_ROW_RAIN_LEAN_MODELS, ENV_ROW_RAIN_LEAN_POST, ENV_ROW_RAIN_OPAQUE_DEPTH,
@@ -877,6 +898,9 @@ pub struct HudState {
     pub health: i32,
     pub max_health: i32,
     pub armor: i32,
+    /// Remapped to JKA gametype numbering even in JK2 mode (JK2 TFFA -> 6).
+    /// TaystJK applies the native HUD tint only in team modes other than Siege.
+    pub gametype: i32,
     /// `PERS_TEAM` for the retail HUD's red/blue backing tint.
     pub team: i32,
     /// Current weapon ammo slot, for the stock four-tic ammo meter.
@@ -1545,6 +1569,8 @@ pub struct UiSnapshot {
     pub studio_race: Option<studio_race::StudioRaceUi>,
     /// The live frontend Main page: render it at its original color and contrast.
     pub frontend_main_scene: bool,
+    /// A native loading frame requested by vid_restart, acknowledged after present.
+    pub video_restart_loading: bool,
     pub setup_selected: usize,
     pub mode: OverlayMode,
     pub console_input: String,
@@ -1635,6 +1661,8 @@ pub struct UiSnapshot {
     /// Renderer-owned original pixel dimensions for the atlas slots above.
     /// Never supplied by Rhai or the app, only by the async decoder.
     pub(crate) extension_image_dimensions: Vec<Option<[u32; 2]>>,
+    /// Source-native packed RGBA atlas UVs, returned by the async image loader.
+    pub(crate) extension_image_uvs: Vec<([f32; 2], [f32; 2])>,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
@@ -1692,6 +1720,7 @@ impl Default for UiSnapshot {
         Self {
             jk2_mode: false,
             frontend_main_scene: false,
+            video_restart_loading: false,
             setup_selected: 1,
             mode: OverlayMode::None,
             console_input: String::new(),
@@ -1755,6 +1784,7 @@ impl Default for UiSnapshot {
             extension_images: Vec::new(),
             extension_shader_flags: Vec::new(),
             extension_image_dimensions: Vec::new(),
+            extension_image_uvs: Vec::new(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,
@@ -1802,6 +1832,16 @@ mod shadow_mode_tests;
 mod siege_tests;
 
 impl UiSnapshot {
+    /// Extension/native HUD art shares the renderer-owned, native-size atlas.
+    /// Missing/unloaded images never accidentally sample unrelated artwork.
+    pub(crate) fn extension_uv(&self, index: usize) -> ([f32; 2], [f32; 2]) {
+        if self.extension_shader_flags.get(index).copied().unwrap_or(false) {
+            return ([0.0, 0.0], [1.0, 1.0]);
+        }
+        self.extension_image_uvs.get(index).copied()
+            .unwrap_or(([0.0, 0.0], [0.0, 0.0]))
+    }
+
     /// Resolve atlas UVs from the renderer's packing result. The legacy
     /// fixed-grid fallback supports builds/tests before the lazy atlas loads.
     pub(crate) fn icon_uv(&self, index: usize) -> ([f32; 2], [f32; 2]) {

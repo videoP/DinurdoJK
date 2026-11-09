@@ -447,13 +447,15 @@ fn main() -> std::process::ExitCode {
     // let Asset Mapping show what was rejected so it can be fixed in place.
     let validate = |options: &Options, roots: &jka_assets::pk3::FilesystemRoots| {
         filesystem_paths::validate_root_layout(
-            &options.base, &jka_assets::pk3::jk2_root_directory(&options.base, roots), &install)
+            &options.base, roots, &install)
     };
     if let Err(error) = validate(&options, &fs_roots) {
         eprintln!("[FILESYSTEM] {error}; using default roots");
         let configured = fs_roots.clone();
         fs_roots.basepath = None;
         fs_roots.jk2basepath = None;
+        fs_roots.homepath = None;
+        fs_roots.jk2homepath = None;
         if !options.base_overridden {
             options.base = match filesystem_paths::default_base_directory() {
                 Ok(base) => base,

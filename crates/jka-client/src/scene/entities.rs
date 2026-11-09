@@ -276,7 +276,9 @@ pub(crate) fn append_authored_ocean_planes(
         b.pipeline = PipelineKey {
             legacy_srgb_three_stage: false,
         additive_fusion_count: 0,
+            auto_sprite: false,
             auto_sprite2: false,
+            deform_move: false,
             sky_outer: false,
             class: DrawClass::Transparent,
             blend: BlendMode::Opaque,
@@ -284,6 +286,7 @@ pub(crate) fn append_authored_ocean_planes(
             offset: false,
             depth_write: true,
             depth_equal: false,
+        depth_test_disabled: false,
         };
         b.pvs_signature.clear();
         b.area_signature = [0; 4];

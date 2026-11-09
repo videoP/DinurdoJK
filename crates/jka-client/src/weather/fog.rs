@@ -21,11 +21,88 @@ const FALLBACK_SUN_DIRECTION: [f32; 3] = [-0.38, -0.84, -0.39];
 const FALLBACK_SUN_COLOR: [f32; 3] = [0.57735026, 0.57735026, 0.57735026];
 const FALLBACK_SUN_INTENSITY: f32 = 250.0;
 
+// BSP fog brushes are authored local volumes, not an alternative global fog.
+// Keep a small fixed array in the existing fog uniforms: no extra draw, texture,
+// or bind group, and zero overhead in fog-off/minimal pipeline variants.
+pub(crate) const MAX_LOCAL_FOG_VOLUMES: usize = 16;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct LocalFogVolume {
+    pub mins: [f32; 4], // render-space AABB (OpenJK's first six axial brush sides)
+    pub maxs: [f32; 4],
+    pub color_depth: [f32; 4], // linear RGB, mapper's depthForOpaque
+}
+
+/// Extract BSP local brush fog as OpenJK R_LoadFogs does: the fog record names
+/// a brush, whose first six axial planes define its bounds. Global fog has
+/// brushNum == -1 and is handled separately. Invalid/unbounded brushes cannot
+/// safely participate in volumetric fog.
+pub(crate) fn bsp_local_fog_volumes(
+    bsp: &Bsp,
+    library: &BTreeMap<String, Shader>,
+) -> Vec<LocalFogVolume> {
+    let mut result = Vec::new();
+    for (index, fog) in bsp.fogs.iter().enumerate() {
+        if fog.brush_num < 0 { continue; }
+        let Some(brush) = usize::try_from(fog.brush_num).ok()
+            .and_then(|id| bsp.brushes.get(id)) else { continue; };
+        // All six axial sides are mandatory in the OpenJK fog-brush format.
+        if brush.sides.len() < 6 { continue; }
+        let mut mins = [f32::NEG_INFINITY; 3];
+        let mut maxs = [f32::INFINITY; 3];
+        for side in &bsp.brush_sides[brush.sides.start..brush.sides.start + 6] {
+            let plane = &bsp.planes[side.plane];
+            let Some(axis) = (0..3).find(|&axis| {
+                plane.normal[axis].abs() > 0.999
+                    && (0..3).all(|other| other == axis || plane.normal[other].abs() < 0.001)
+            }) else { continue; };
+            if plane.normal[axis] > 0.0 {
+                maxs[axis] = maxs[axis].min(plane.distance / plane.normal[axis]);
+            } else {
+                mins[axis] = mins[axis].max(plane.distance / plane.normal[axis]);
+            }
+        }
+        if !(0..3).all(|axis| mins[axis].is_finite() && maxs[axis].is_finite()
+            && mins[axis] < maxs[axis]) { continue; }
+        let raw = bsp_fog_params(bsp, library, index as i32);
+        if !raw.iter().all(|x| x.is_finite()) || raw[3] <= 0.001 { continue; }
+        let a = jka_render_core::coordinates::render_position(mins);
+        let b = jka_render_core::coordinates::render_position(maxs);
+        let linear = legacy_authored_fog_color([raw[0], raw[1], raw[2]]);
+        result.push(LocalFogVolume {
+            mins: [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2]), 0.0],
+            maxs: [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2]), 0.0],
+            color_depth: [linear[0], linear[1], linear[2], raw[3]],
+        });
+    }
+    result
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FogColorOverride {
     None,
     Black,
     White,
+    /// Separate black-only fog modulation for authored glow replay. The glow
+    /// buffer is composited after world fog, so it must carry transmittance.
+    GlowReplayBlack,
+}
+
+/// A surface made exclusively of additive stages contributes emitted light
+/// without replacing the already-fogged background. Fog must attenuate each
+/// contribution toward black; a fog-colour geometry redraw would fog the
+/// underlying framebuffer a second time.
+fn legacy_additive_blend(blend: Option<BlendFunc>) -> bool {
+    matches!(blend, Some(BlendFunc {
+        src: BlendFactor::One | BlendFactor::SrcAlpha | BlendFactor::OneMinusSrcAlpha,
+        dst: BlendFactor::One,
+    }))
+}
+
+pub(crate) fn material_legacy_additive_only(stages: &[MaterialStage]) -> bool {
+    !stages.is_empty() && stages.iter().all(|stage| !stage.depth_write && legacy_additive_blend(stage.blend))
 }
 
 pub(crate) fn material_legacy2_in_stage_safe(stages: &[MaterialStage]) -> bool {
@@ -82,7 +159,7 @@ pub(crate) fn stage_fog_color_override(
     // multiply stage fogs toward white rather than toward the map fog color.
     match stage.blend {
         Some(BlendFunc {
-            src: BlendFactor::One,
+            src: BlendFactor::One | BlendFactor::SrcAlpha | BlendFactor::OneMinusSrcAlpha,
             dst: BlendFactor::One,
         }) => FogColorOverride::Black,
         Some(BlendFunc {
@@ -249,6 +326,8 @@ pub(crate) struct FroxelUniform {
     pub split_depths: [f32; 4],
     pub shadow_params: [f32; 4],
     pub grid: [u32; 4],
+    pub local_fog_count: [u32; 4],
+    pub local_fogs: [LocalFogVolume; MAX_LOCAL_FOG_VOLUMES],
 }
 
 #[repr(C)]
@@ -269,6 +348,8 @@ struct LegacyFogControl {
     // non-zero value is a multiplier of that authored curve. z says the map
     // has authored fog at all. Without map fog, y remains the manual strength.
     values: [f32; 4],
+    local_fog_count: [u32; 4],
+    local_fogs: [LocalFogVolume; MAX_LOCAL_FOG_VOLUMES],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,13 +372,18 @@ pub(crate) struct FogSystem {
     legacy_control_buffer: wgpu::Buffer,
     map_fog: Option<MapFogSummary>,
     global_fog: Option<MapFogSummary>,
+    local_fogs: [LocalFogVolume; MAX_LOCAL_FOG_VOLUMES],
+    local_fog_count: usize,
 }
 
 impl FogSystem {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let legacy_control_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA legacy fog control uniform"),
-            contents: bytemuck::bytes_of(&LegacyFogControl { values: [0.0; 4] }),
+            contents: bytemuck::bytes_of(&LegacyFogControl {
+                values: [0.0; 4], local_fog_count: [0; 4],
+                local_fogs: [LocalFogVolume::zeroed(); MAX_LOCAL_FOG_VOLUMES],
+            }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         Self {
@@ -307,13 +393,25 @@ impl FogSystem {
             legacy_control_buffer,
             map_fog: None,
             global_fog: None,
+            local_fogs: [LocalFogVolume::zeroed(); MAX_LOCAL_FOG_VOLUMES],
+            local_fog_count: 0,
         }
     }
 
-    pub(crate) fn install_map<I>(&mut self, global_fog: Option<[f32; 4]>, batches: I)
+    pub(crate) fn install_map<I>(&mut self, global_fog: Option<[f32; 4]>, local_fogs: &[LocalFogVolume], batches: I)
     where
         I: IntoIterator<Item = ([f32; 4], u64)>,
     {
+        self.local_fogs.fill(LocalFogVolume::zeroed());
+        self.local_fog_count = local_fogs.len().min(MAX_LOCAL_FOG_VOLUMES);
+        self.local_fogs[..self.local_fog_count]
+            .copy_from_slice(&local_fogs[..self.local_fog_count]);
+        if local_fogs.len() > MAX_LOCAL_FOG_VOLUMES {
+            rverbose!(1, "BSP local fog: {} volumes, only first {} fit GPU fog uniforms",
+                local_fogs.len(), MAX_LOCAL_FOG_VOLUMES);
+        }
+        rverbose!(1, "BSP fog volumes: {} local brush(es), global={}",
+            self.local_fog_count, global_fog.is_some());
         self.global_fog = global_fog.and_then(map_fog_summary);
         // Prefer the compiled global-fog parameters for the MAP control. Surface
         // participation remains driven by each BSP dsurface fog assignment.
@@ -339,12 +437,20 @@ impl FogSystem {
         }
     }
 
+    pub(crate) fn local_fogs(&self) -> [LocalFogVolume; MAX_LOCAL_FOG_VOLUMES] {
+        self.local_fogs
+    }
+
+    pub(crate) fn local_fog_count(&self) -> usize {
+        self.local_fog_count
+    }
+
     pub(crate) fn legacy_control_buffer(&self) -> &wgpu::Buffer {
         &self.legacy_control_buffer
     }
 
     pub(crate) fn legacy_effective(&self) -> bool {
-        self.mode.is_legacy() && (self.strength > 0.001 || self.map_fog.is_some())
+        self.mode.is_legacy() && (self.strength > 0.001 || self.map_fog.is_some() || self.local_fog_count > 0)
     }
 
     pub(crate) fn legacy_drawfog_value(&self) -> u8 {
@@ -376,7 +482,11 @@ impl FogSystem {
         fog_is_global: bool,
         _legacy2_in_stage_safe: bool,
         global_post_eligible: bool,
+        additive_only: bool,
     ) -> bool {
+        // The additive material is fogged directly in its fragment program:
+        // blending a fog-color pass over it would also fog the background.
+        if additive_only { return false; }
         match self.legacy_drawfog_value() {
             // Opaque/depth-writing global Legacy 1 fog is composited in the final
             // display-space pass to match OpenJK's gamma/LDR framebuffer blend.
@@ -417,7 +527,7 @@ impl FogSystem {
         if drawfog == 0 {
             return None;
         }
-        if self.map_fog.is_some() {
+        if self.map_fog.is_some() || self.local_fog_count > 0 {
             if drawfog != 2 {
                 return None;
             }
@@ -447,7 +557,8 @@ impl FogSystem {
     }
 
     pub(crate) fn volumetric_effective(&self) -> bool {
-        self.mode == FogMode::Volumetric && (self.strength > 0.001 || self.map_fog.is_some())
+        self.mode == FogMode::Volumetric
+            && (self.strength > 0.001 || self.map_fog.is_some() || self.local_fog_count > 0)
     }
 
     pub(crate) fn volumetric_density_color(&self) -> (f32, [f32; 3], f32, f32) {
@@ -457,18 +568,24 @@ impl FogSystem {
         if self.mode != FogMode::Volumetric {
             return (0.0, VOLUMETRIC_FOG_DEFAULT_COLOR, 0.00032, 0.0);
         }
-        if let Some(map_fog) = self.map_fog {
+        if let Some(map_fog) = self.global_fog {
             return (
+                // Only genuine BSP global fog uses the fullscreen EXP2 law.
+                // Local brushes are clipped independently per froxel below.
                 // For authored fog this field is a scale, not a Beer-Lambert
                 // density. MAP (the zero sentinel) and an explicit 1.0x must
                 // produce exactly the same curve and color.
                 authored_fog_strength_scale(self.strength),
                 legacy_authored_fog_color(map_fog.color),
-                // Authored MAP fog follows the JKA EXP2 extinction curve in
-                // the froxel integrator, without our stylized height fog.
-                0.0,
+                // Slot y is unused by global MAP EXP2, but carries the local
+                // brush strength when a map has both global and local fog.
+                authored_fog_strength_scale(self.strength),
                 map_fog.depth_for_opaque,
             );
+        }
+        if self.map_fog.is_some() || self.local_fog_count > 0 {
+            // Local brush fog must never become a global fullscreen density.
+            return (0.0, VOLUMETRIC_FOG_DEFAULT_COLOR, authored_fog_strength_scale(self.strength), 0.0);
         }
         if self.strength > 0.001 {
             return (
@@ -483,10 +600,12 @@ impl FogSystem {
 
     pub(crate) fn write_legacy_control(&self, queue: &wgpu::Queue) {
         let fog_control = LegacyFogControl {
+            local_fog_count: [self.local_fog_count as u32, 0, 0, 0],
+            local_fogs: self.local_fogs,
             values: [
                 if self.legacy_effective() { 1.0 } else { 0.0 },
                 self.strength,
-                if self.map_fog.is_some() { 1.0 } else { 0.0 },
+                if self.map_fog.is_some() || self.local_fog_count > 0 { 1.0 } else { 0.0 },
                 f32::from(self.legacy_drawfog_value()),
             ],
         };
@@ -498,25 +617,10 @@ impl FogSystem {
     }
 
     pub(crate) fn clear_color(&self) -> wgpu::Color {
-        // A compiled global fog is also the legacy renderer's background clear,
-        // so preserve that behavior even when the user's fog mode is disabled.
-        //
-        // Local-only authored fog needs one extra case in this renderer: WGPU
-        // deterministically clears the scene target every frame, while the old GL
-        // backend normally left the color buffer alone unless a global fog/other
-        // feature requested a clear. If distanceCull exposes pixels with no world
-        // geometry behind a dense local fog, using our arbitrary blue fallback
-        // therefore creates a visible rectangle at the cull boundary. When authored
-        // fog is active, converge those uncovered pixels to the same dominant map
-        // fog color. This changes only the existing clear value; it adds no pass or
-        // draw work.
-        let fog = self.global_fog.or_else(|| {
-            if (self.mode.is_legacy() && self.legacy_effective()) || self.volumetric_effective() {
-                self.map_fog
-            } else {
-                None
-            }
-        });
+        // Only brushNum=-1 is global fog (OpenJK). A local-only brush must not
+        // repaint every unoccupied pixel with its color: doing so makes vast
+        // opaque rectangles at sky/distance-cull boundaries.
+        let fog = self.global_fog;
         if let Some(fog) = fog {
             let color = if self.mode.is_legacy() || self.mode == FogMode::Volumetric {
                 // BSP fog colors are authored in the legacy display-space
@@ -549,6 +653,7 @@ pub(crate) fn surface_fog_uniform(
     color_override: FogColorOverride,
     legacy2_in_stage_safe: bool,
     global_post_eligible: bool,
+    additive_only: bool,
 ) -> SurfaceFogUniform {
     SurfaceFogUniform {
         // Keep the BSP surface's actual fog assignment. OpenJK's
@@ -561,8 +666,13 @@ pub(crate) fn surface_fog_uniform(
                 FogColorOverride::None => 0.0,
                 FogColorOverride::Black => 1.0,
                 FogColorOverride::White => 2.0,
+                // Negative is reserved for the glow-source replay. Unlike the
+                // scene stage, it must be attenuated even in Legacy 1.
+                FogColorOverride::GlowReplayBlack => -1.0,
             },
-            if legacy2_in_stage_safe { 1.0 } else { 0.0 },
+            // z > 1.5 is a shared, pure-additive material (both modes).
+            // Otherwise z retains the Legacy 2 in-stage-safe flag.
+            if additive_only { 3.0 } else if legacy2_in_stage_safe { 1.0 } else { 0.0 },
             if global_post_eligible { 1.0 } else { 0.0 },
         ],
     }
@@ -736,6 +846,8 @@ fn create_froxel_resources(device: &wgpu::Device) -> FroxelResources {
             split_depths: SHADOW_SPLITS,
             shadow_params: [SHADOW_MAP_SIZE as f32, 0.0006, 0.0, 0.0],
             grid: [FROXEL_X, FROXEL_Y, FROXEL_Z, 0],
+            local_fog_count: [0; 4],
+            local_fogs: [LocalFogVolume::zeroed(); MAX_LOCAL_FOG_VOLUMES],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -763,6 +875,46 @@ mod tests {
         assert!((authored_fog_strength_scale(1.0) - 1.0).abs() < 1e-6);
         assert!((authored_fog_strength_scale(0.5) - 0.5).abs() < 1e-6);
         assert!((authored_fog_strength_scale(2.0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_additive_and_glow_fog_policy() {
+        let add = BlendFunc { src: BlendFactor::One, dst: BlendFactor::One };
+        let alpha_add = BlendFunc { src: BlendFactor::SrcAlpha, dst: BlendFactor::One };
+        let normal = BlendFunc { src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha };
+        assert!(legacy_additive_blend(Some(add)));
+        assert!(legacy_additive_blend(Some(alpha_add)));
+        assert!(!legacy_additive_blend(Some(normal)));
+        assert!(!legacy_additive_blend(None));
+        let first = MaterialStage {
+            texture: StageTexture::White,
+            animation: None,
+            enhancements: crate::materials::StageEnhancements::default(),
+            blend: Some(add),
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: crate::materials::RgbGen::Identity,
+            alpha_gen: crate::materials::AlphaGen::Identity,
+            tc_gen: crate::materials::TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+            depth_test_disabled: false,
+            glow: true,
+        };
+        let second = MaterialStage { blend: Some(alpha_add), ..first.clone() };
+        assert!(material_legacy_additive_only(&[first.clone(), second]));
+        assert!(!material_legacy_additive_only(&[first.clone(), MaterialStage {
+            blend: Some(normal), ..first.clone()
+        }]));
+        assert!(!material_legacy_additive_only(&[MaterialStage {
+            depth_write: true, ..first
+        }]));
+        let glow = surface_fog_uniform([0.27, 0.15, 0.10, 1000.0], false,
+            FogColorOverride::GlowReplayBlack, true, false, true);
+        assert_eq!(glow.flags[1], -1.0);
+        assert!(glow.flags[2] > 1.5);
     }
 
     #[test]

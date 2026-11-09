@@ -325,7 +325,7 @@ fn one_zero_world_base_is_opaque_and_seeds_depth() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let material = SurfaceMaterial {
         stages: vec![stage.clone()],
@@ -361,6 +361,7 @@ fn sun_test_grid(cells: Vec<ClassicLightGridCell>) -> ClassicEntityLightGrid {
         external_hdr: false,
         cells,
         map_toward_sun: None,
+        relit: None,
     }
 }
 
@@ -464,7 +465,7 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let mut diffuse = MaterialStage {
         texture: StageTexture::Image(7),
@@ -483,7 +484,7 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     if enhanced {
         diffuse.enhancements.normal_texture = Some(8);
@@ -634,6 +635,23 @@ fn plain_jka_lightmap_then_dst_color_diffuse_collapses_to_modulation() {
 }
 
 #[test]
+fn depth_test_disabled_lightmap_stages_are_not_collapsed() {
+    for disabled_slot in 0..2 {
+        let mut stages = legacy_lightmap_modulate_pair(false);
+        stages[disabled_slot].depth_test_disabled = true;
+        let material = SurfaceMaterial {
+            explicit: true, stages: stages.to_vec(), ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 0, None, false,
+            0..6, Some(0), &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 2);
+        assert!(draws[disabled_slot].pipeline.depth_test_disabled);
+        assert!(!draws[disabled_slot].pipeline.depth_write);
+    }
+}
+
+#[test]
 fn enhanced_lightmap_then_dst_color_diffuse_still_collapses_to_modulation() {
     let [lightmap, diffuse] = legacy_lightmap_modulate_pair(true);
     assert!(can_fold_jka_lightmap_pair(&lightmap, &diffuse));
@@ -776,7 +794,7 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
         tc_mods: Vec::new(),
         depth_write: true,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let lightmap = MaterialStage {
         texture: StageTexture::Lightmap,
@@ -795,7 +813,7 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let material = SurfaceMaterial {
         stages: vec![diffuse, lightmap],
@@ -842,7 +860,7 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     base.enhancements.normal_texture = Some(8);
     base.enhancements.roughness_texture = Some(9);
@@ -864,7 +882,7 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let material = SurfaceMaterial {
         stages: vec![base, glow],
@@ -893,7 +911,7 @@ fn classic_explicit_vertex_lit_identity_stage_is_not_forced() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let material = SurfaceMaterial {
         stages: vec![base],
@@ -922,7 +940,7 @@ fn guaranteed_alpha_discard_render_cull_keeps_surface_light_semantics() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-                    glow: false,
+                    depth_test_disabled: false, glow: false,
 }],
         surface_light: Some(materials::SurfaceLight {
             value: 750.0,
@@ -958,7 +976,7 @@ fn black_additive_surface_light_render_cull_keeps_surface_light_semantics() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-                    glow: false,
+                    depth_test_disabled: false, glow: false,
 }],
         surface_light: Some(materials::SurfaceLight {
             value: 500.0,
@@ -994,7 +1012,7 @@ fn black_additive_non_light_shader_is_not_mapload_culled() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-                    glow: false,
+                    depth_test_disabled: false, glow: false,
 }],
         explicit: true,
         ..Default::default()
@@ -1019,7 +1037,7 @@ fn guaranteed_alpha_discard_render_cull_requires_every_stage_to_discard() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-            glow: false,
+            depth_test_disabled: false, glow: false,
 };
     let visible = MaterialStage {
         opacity: 1.0,
@@ -1661,7 +1679,7 @@ fn promoted_water_inherits_stage_tint_alpha_and_material_hints() {
         alpha_cutoff: 0.0, opacity: 0.4, color: [0.2, 0.4, 0.8],
         rgb_gen: RgbGen::Const, alpha_gen: AlphaGen::Vertex,
         tc_gen: TcGen::Base, tc_mods: Vec::new(),
-        depth_write: false, depth_equal: false, glow: false,
+        depth_write: false, depth_equal: false, depth_test_disabled: false, glow: false,
     };
     let material = SurfaceMaterial { water: true, stages: vec![stage.clone()], ..Default::default() };
     let batch = stage_batch(&material, &stage, true, false, 0..3,
@@ -1697,7 +1715,7 @@ fn promoted_water_screen_stage_uses_analyzed_color_without_texture_mapping() {
         blend:Some(materials::BlendFunc {src:materials::BlendFactor::OneMinusDstColor,dst:materials::BlendFactor::One}),
         alpha_cutoff:0.0,opacity:1.0,color:[1.0;3],rgb_gen:RgbGen::Vertex,alpha_gen:AlphaGen::Identity,
         tc_gen:TcGen::Base,tc_mods:vec![TcMod::Turb {base:0.5,amplitude:0.03,phase:0.0,frequency:0.3}],
-        depth_write:false,depth_equal:false,glow:false,
+        depth_write:false,depth_equal:false,depth_test_disabled: false, glow:false,
     };
     let material = SurfaceMaterial {water:true,stages:vec![stage.clone()],..Default::default()};
     let batch = stage_batch(&material,&stage,true,false,0..3,None,None,None,&[],[0;4],[0.0;4],false);
@@ -1760,7 +1778,7 @@ fn reflection_test_stage(texture: usize, tc_gen: TcGen, blend: Option<materials:
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-        glow: false,
+        depth_test_disabled: false, glow: false,
     }
 }
 
@@ -1893,7 +1911,7 @@ fn remapped_clear_bsp_surface_has_no_wireframe_but_keeps_geometry() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-        glow: false,
+        depth_test_disabled: false, glow: false,
     };
     let clear = SurfaceMaterial {
         stages: vec![clear_stage.clone()],

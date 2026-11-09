@@ -93,11 +93,17 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", rt_taa: 0", "")
         .replace(", dlss: false, dlss_mode: Dlaa, dlss_model: Transformer", "")
         .replace(", baked_sun_removal: 0.0", "")
+        .replace(", baked_sun_removal_auto: false", "")
+        .replace(", relighting_mode: 0", "")
+        .replace(", sky_world_light_isolation: false", "")
+        .replace(", sky_world_lighting_strength: 1.0", "")
         .replace(", relight_time: 15.0", "")
         .replace(", baked_sun_cache: false", "")
         .replace(", lightmap_smoothing: 0", "")
         .replace(", baked_sun_aa: 1", "")
-        .replace(", lightmap_signal: 0, sun_receiver_normals: 1, sun_terminator: false, sky_world_bake: 1", "")
+        .replace(", lightmap_signal: 0, sun_receiver_normals: 1, sun_terminator: false", "")
+        .replace(", sky_world_bake_ab: 0", "")
+        .replace(", sky_world_bake_ab: 1", "")
         .replace(", bake_threads: 0", "")
         .replace(", sun_shadow_strength: 0.3", "")
         .replace(", sun_shadow_strength: 0.6", "")
@@ -116,6 +122,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", swim_turn_bank: 0.7", "")
         .replace(", swim_turn_bank: 1.0", "")
         .replace(", move_lean: 0.75", "")
+        .replace(", underwater: 2", "")
         .replace(", footstep_trace: false", "")
         .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "");
     for byte in projected.bytes() {
@@ -167,6 +174,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
                     && !line.starts_with("seta cg_scoreSpectatorGuess ")
+                    && !line.starts_with("seta s_underwater ")
                     && !line.starts_with("seta s_steamAudioHrtfInterpolation ")
                     && !line.starts_with("seta r_jiggleBreastRemeshBottomZ ")
                     && !line.starts_with("seta r_jiggleBreastRemeshTopZ ")
@@ -189,6 +197,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cl_serverFilters ")
                     // New controls are outside the frozen pre-registry archive.
                     && !line.starts_with("seta r_blueCloudQuality ")
+                    && !line.starts_with("seta r_skyWorldLightIsolation ")
                     && !line.starts_with("seta r_skyBackend ")
                     && !line.starts_with("seta r_cloudBackend ")
                     && !line.starts_with("seta r_cloudPortalDepth ")
@@ -695,6 +704,7 @@ fn baked_sun_removal_loads_and_archives_without_changing_legacy_fixtures() {
     fs::write(&path, "seta r_bakedSunRemoval \"0.750\"\nseta r_bakedSunCache \"1\"\nseta r_sunShadowStrength \"0.85\"\nseta r_sunLighting \"1\"\n").unwrap();
     let video = config::load_video_settings(&path);
     assert_eq!(video.baked_sun_removal, 0.75);
+    assert!(video.baked_sun_removal_auto);
     assert!(video.baked_sun_cache);
     assert_eq!(video.sun_shadow_strength, 0.85);
     assert!(video.sun_lighting);

@@ -138,7 +138,7 @@ pub(super) fn build(
 
         if !batch.pipeline.depth_write
             || !matches!(batch.pipeline.class, DrawClass::Opaque | DrawClass::Mask)
-            || batch.pipeline.auto_sprite2
+            || (batch.pipeline.auto_sprite || batch.pipeline.auto_sprite2)
             || !seen_ranges.insert((batch.vertices.start, batch.vertices.end))
         {
             continue;

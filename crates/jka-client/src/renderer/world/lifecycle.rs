@@ -140,6 +140,7 @@ impl Renderer {
         let scene_format_before_fog = self.scene_format();
         self.weather.fog.install_map(
             map.global_fog,
+            &map.local_fogs,
             map.batches.iter().map(|batch| {
                 (
                     batch.fog,
@@ -194,7 +195,7 @@ impl Renderer {
         // lazily compile/switch to the dedicated RT pipeline variant.
         let mut initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
         // The incoming BSP's sun is not installed in self.world yet.
-        initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0
+        initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto
             && !source_map && map.sun.is_some();
         initial_shader_variant.ray_traced_shadows = false;
 
@@ -314,6 +315,10 @@ impl Renderer {
         self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
         self.shadow_resources.last_csm_mode = None;
         self.world = Some(world);
+        // Both BSP and model shaders sample the same immutable map irradiance
+        // volume. Rebind model materials only at map install (not each frame).
+        self.dynamic_model_renderer.install_irradiance_volume(
+            &self.device, self.world.as_ref().map(|world| &world._static_light_grid));
         if snow_fields_changed {
             if let Some(mut world) = self.world.take() {
                 self.rebuild_world_surface_bind_groups(&mut world);
@@ -558,6 +563,8 @@ impl Renderer {
         self.shadow_resources.last_csm_mode = None;
         self.shadow_resources.sky_snapshot = None;
         self.world = None;
+        // Drop old map-owned irradiance references even when returning to menu.
+        self.dynamic_model_renderer.install_irradiance_volume(&self.device, None);
         self.dynamic_model_renderer.lightning_gpu = None;
         self.dynamic_model_renderer.lightning_gpu_attempted = false;
         self.coastal_atlas = None;
@@ -573,7 +580,7 @@ impl Renderer {
         let scene_format_before_fog = self.scene_format();
         self.weather
             .fog
-            .install_map(None, std::iter::empty::<([f32; 4], u64)>());
+            .install_map(None, &[], std::iter::empty::<([f32; 4], u64)>());
         if self.scene_format() != scene_format_before_fog {
             self.request_scene_rebuild();
         }

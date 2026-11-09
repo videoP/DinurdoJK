@@ -95,6 +95,49 @@ macro_rules! app_cvars {
         pub(crate) static DEFINITIONS: &[super::CvarDefinition] = &[$(super::CvarDefinition { runtime: &$id, config: $config }),*];
     };
 }
+/// Scalar video cvars are described once. The typed field is the only
+/// accessor: console get/set, archived readback and config loading use
+/// the same type/range validation. Irregular JKA syntax stays explicit in
+/// app_cvars! next to the other definitions.
+macro_rules! video_scalar_cvars {
+    ($collection:ident, $after_set:ident; $($id:ident {
+        name: $name:literal, default: $default:literal,
+        range: $range:literal, description: $description:literal,
+        kind: $kind:expr, field: $first:ident $(.$field:ident)*,
+        archive: $order:literal
+    })*) => {
+        $(pub(super) static $id: CvarDef<App> = CvarDef::new(
+            $name, $default, $range, $description,
+            $kind, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarScalar::cvar_value(app.video.$first $(.$field)*),
+            |app, value| {
+                app.video.$first $(.$field)* = CvarScalar::from_cvar_value(value)?;
+                app.$after_set();
+                Ok(())
+            },
+        );)*
+        pub(crate) static $collection: &[super::CvarDefinition] = &[$(
+            super::CvarDefinition {
+                runtime: &$id,
+                config: CvarBinding {
+                    load_video: Some(|settings, _name, value, _context| {
+                        if let Ok(value) = $id.parse(value) {
+                            if let Ok(parsed) = CvarScalar::from_cvar_value(value) {
+                                settings.$first $(.$field)* = parsed;
+                            }
+                        }
+                    }),
+                    archive: Some(($order, |state| {
+                        CvarScalar::cvar_value(state.video.$first $(.$field)*).to_string()
+                    })),
+                    ..CvarBinding::NONE
+                },
+            },
+        )*];
+    };
+}
+
+
 macro_rules! settings_cvars {
     ($state:ty; $($id:ident { runtime: $runtime:expr, config: $config:expr,
        settings: $settings:ident = $binding:expr, implementations: [$($implementation:item)*] })*) => {
@@ -269,6 +312,35 @@ pub(crate) struct CvarDefinition {
     pub runtime: &'static crate::console::cvars::CvarDef<App>,
     pub config: crate::config::cvars::CvarBinding,
 }
+impl CvarDefinition {
+    /// Config still supports legacy migration adapters, but the adapter and
+    /// the runtime definition are always selected through the same registry
+    /// entry (including case-insensitive names).
+    pub(crate) fn load_video(
+        &self, video: &mut VideoSettings, text: &str,
+        context: &mut crate::config::cvars::VideoLoadState,
+    ) -> bool {
+        if let Some(load) = self.config.load_video {
+            load(video, self.runtime.entry.name, text, context);
+            true
+        } else { false }
+    }
+    pub(crate) fn load_audio(&self, audio: &mut crate::config::AudioSettings, text: &str) -> bool {
+        if let Some(load) = self.config.load_audio {
+            load(audio, self.runtime.entry.name, text);
+            true
+        } else { false }
+    }
+    pub(crate) fn load_presentation(&self, presentation: &mut crate::config::ClientPresentationSettings, text: &str) -> bool {
+        if let Some(load) = self.config.load_presentation {
+            load(presentation, self.runtime.entry.name, text);
+            true
+        } else { false }
+    }
+    pub(crate) fn apply_latched(&self, video: &mut VideoSettings, text: &str) {
+        if let Some(apply) = self.config.apply_latched { apply(video, text); }
+    }
+}
 pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
     static DEFINITIONS: OnceLock<Vec<&'static CvarDefinition>> = OnceLock::new();
     DEFINITIONS.get_or_init(|| {
@@ -292,6 +364,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(cloud_cvars::DEFINITIONS.iter());
         definitions.extend(weather_cvars::DEFINITIONS.iter());
         definitions.extend(ocean_cvars::DEFINITIONS.iter());
+        definitions.extend(ocean_cvars::SCALAR_DEFINITIONS.iter());
         definitions.extend(river_cvars::DEFINITIONS.iter());
         definitions.extend(renderer_cvars::DEFINITIONS.iter());
         definitions.extend(patch_cvars::DEFINITIONS.iter());
@@ -309,10 +382,12 @@ pub(crate) fn cvar_definition(name: &str) -> Option<&'static CvarDefinition> {
     static LOOKUP: OnceLock<HashMap<String, &'static CvarDefinition>> = OnceLock::new();
     LOOKUP
         .get_or_init(|| {
-            cvar_definitions()
-                .iter()
-                .map(|def| (def.runtime.entry.name.to_ascii_lowercase(), *def))
-                .collect()
+            let mut by_name = HashMap::new();
+            for def in cvar_definitions() {
+                assert!(by_name.insert(def.runtime.entry.name.to_ascii_lowercase(), *def).is_none(),
+                    "duplicate cvar config binding: {}", def.runtime.entry.name);
+            }
+            by_name
         })
         .get(&name.to_ascii_lowercase())
         .copied()
@@ -402,6 +477,49 @@ mod tests {
         }
     }
     #[test]
+    fn scalar_video_cvars_have_one_validated_console_config_archive_path() {
+        use crate::config::cvars::{ArchiveState, VideoLoadState};
+        // These used to have distinct parsing rules in the console and .cfg.
+        for (name, valid, invalid) in [
+            ("r_lakeWindSpeed", "12.5", "NaN"),
+            ("r_lakeDirection", "-45", "inf"),
+            ("r_lakeShader", "0", "9"),
+            ("r_lakeSourceHints", "off", "maybe"),
+            ("r_blueWaterSSRSteps", "32", "999999"),
+        ] {
+            let def = cvar_definition(name).expect("scalar declaration");
+            let parsed = def.runtime.parse(valid).expect("valid cvar input");
+            let mut video = VideoSettings::default();
+            let mut context = VideoLoadState::default();
+            assert!(def.load_video(&mut video, valid, &mut context));
+            let presentation = crate::config::ClientPresentationSettings::default();
+            let audio = crate::config::AudioSettings::default();
+            let snapshot = ArchiveState { video: &video, presentation: &presentation, audio: &audio };
+            let (_, get) = def.config.archive.expect("scalar archive");
+            assert_eq!(get(&snapshot), parsed.to_string(), "{name}");
+            // Malformed or out-of-range values cannot corrupt persisted state.
+            def.load_video(&mut video, invalid, &mut context);
+            let snapshot = ArchiveState { video: &video, presentation: &presentation, audio: &audio };
+            assert_eq!(get(&snapshot), parsed.to_string(), "{name} after {invalid}");
+        }
+    }
+
+    #[test]
+    fn conditional_video_restarts_are_registered_with_the_cvar() {
+        for name in ["r_ocean", "r_grass", "r_ext_compress_textures"] {
+            assert!(cvar_registry().find(name).unwrap().restart_required.is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn all_registered_latches_share_one_validator() {
+        for def in cvar_registry().iter().filter(|def| def.entry.latch != LatchScope::None) {
+            assert!(def.normalize_for_latch(def.entry.default).is_ok(), "{}", def.entry.name);
+            assert!(cvar_definition(def.entry.name).is_some(), "{}", def.entry.name);
+        }
+    }
+
+    #[test]
     fn cg_remaps_is_live_session_only_and_defaults_to_one() {
         use crate::console::cvars::CvarFlags;
         let definition = cvar_registry().find("cg_remaps").expect("cg_remaps registered");
@@ -480,11 +598,34 @@ mod tests {
     }
 
     #[test]
+    fn centerview_is_a_registered_local_input_command() {
+        let def = command_registry().find("CENTERVIEW").expect("centerview registered");
+        assert_eq!(def.scope, CommandScope::Always);
+        assert_eq!(def.game_command, None);
+        assert_eq!(crate::console::find_command("centerview", false).unwrap().name, "centerview");
+    }
+
+    #[test]
     fn in_restart_is_a_local_discoverable_command() {
         let def = command_registry().find("IN_RESTART").expect("in_restart registered");
         assert_eq!(def.scope, CommandScope::Always);
         assert_eq!(crate::console::find_command("in_restart", false).unwrap().name, "in_restart");
         assert!(crate::console::commands(false).any(|entry| entry.name == "in_restart"));
+    }
+
+    #[test]
+    fn play_is_a_taystjk_style_local_sound_command() {
+        let def = command_registry().find("PLAY").expect("play command registered");
+        assert_eq!(def.scope, CommandScope::Always);
+        assert_eq!(crate::console::find_command("play", false).unwrap().name, "play");
+        assert!(crate::console::commands(false).any(|entry| entry.name == "play"));
+    }
+
+    #[test]
+    fn serverstatus_is_an_always_available_local_command() {
+        let def = command_registry().find("SERVERSTATUS").expect("serverstatus registered");
+        assert_eq!(def.scope, CommandScope::Always);
+        assert_eq!(crate::console::find_command("serverstatus", false).unwrap().name, "serverstatus");
     }
 
     #[test]

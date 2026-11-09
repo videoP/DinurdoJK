@@ -64,8 +64,8 @@ impl App {
         let d = crate::ocean::OceanSettings::default();
         let mut changed = false;
         if hybrid && !gerstner {
-            theme::row(ui, "Ocean quality", "Optimized uses lighter shading with the same waves and reflection setting. Original adds finer foam shading and sun glints at a higher GPU cost. Changes apply live.", theme::Reset::None, |ui| {
-                for (mode, label) in [(0, "Original"), (1, "Optimized")] {
+            theme::row(ui, "Ocean quality", "Adaptive (experimental) keeps native-resolution pixels and FFT geometry, restores near fine ripples and pixel-size sun sparkles, and skips fully filtered FFT reads farther away. Optimized removes those details. Sky only is optimized with SSR forced off (r_hybridMaterial 2). Original is the full Bluewater material. The r_oceanPixelDetail setting is not used in optimized/adaptive modes. Changes apply live.", theme::Reset::None, |ui| {
+                for (mode, label) in [(0, "Original"), (1, "Optimized"), (2, "Sky only"), (3, "Adaptive + glints")] {
                     if theme::chip(ui, label, ocean.hybrid_material == mode).clicked() {
                         ocean.hybrid_material = mode;
                         changed = true;

@@ -18,7 +18,7 @@ pub(super) struct Scene {
     merge_layout: wgpu::BindGroupLayout,
     merge_uniform: wgpu::Buffer,
     merge: wgpu::RenderPipeline,
-    model_sky_layout: wgpu::BindGroupLayout,
+    model_sky_group: wgpu::BindGroup,
     model_sky_uniform: wgpu::Buffer,
     model_sky_buffer: wgpu::Buffer,
     model_sky: wgpu::ComputePipeline,
@@ -42,7 +42,7 @@ struct Params { strength:vec4<f32>, moon:vec4<f32> }
   let moon=params.strength.y>0.5;
   let color=select(env.light_color*env.light_intensity,vec3<f32>(0.70,0.82,1.)*params.moon.w,moon);
   model_sky[6]=vec4<f32>(color*0.2,params.strength.x);
-  model_sky[7]=vec4<f32>(select(env.light_direction,params.moon.xyz,moon),0.);
+  model_sky[7]=vec4<f32>(select(env.light_direction,params.moon.xyz,moon),params.strength.z);
  }
 }
 ";
@@ -393,6 +393,14 @@ impl Scene {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let model_sky_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native model sky light"),
+            layout: &model_sky_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: model_sky_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: model_sky_uniform.as_entire_binding() },
+            ],
+        });
         let model_sky_module = blue_water_clouds::shaders::compose(MODEL_SKY_LIGHT, "JKA model sky light", &[])
             .expect("model sky light shader");
         let model_sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -429,7 +437,7 @@ impl Scene {
             merge_layout,
             merge_uniform,
             merge,
-            model_sky_layout,
+            model_sky_group,
             model_sky_uniform,
             model_sky_buffer,
             model_sky,
@@ -622,37 +630,30 @@ impl Scene {
     /// the previous frame's values; the sky changes far slower than that.
     pub fn model_sky_light(
         &self,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         sky: &Sky,
         strength: f32,
+        isolation: bool,
         moon_light: Option<([f32; 3], f32)>,
         target: (&wgpu::Buffer, u64),
     ) {
         let mut params = [0f32; 8];
         params[0] = strength.clamp(0.0, 1.0);
+        params[2] = u8::from(isolation) as f32;
         if let Some((direction, intensity)) = moon_light {
             params[1] = 1.0;
             params[4..7].copy_from_slice(&direction);
             params[7] = intensity;
         }
         queue.write_buffer(&self.model_sky_uniform, 0, bytemuck::cast_slice(&params));
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("native model sky light"),
-            layout: &self.model_sky_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.model_sky_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.model_sky_uniform.as_entire_binding() },
-            ],
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("native model sky light"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.model_sky);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, &self.model_sky_group, &[]);
             pass.set_bind_group(1, &sky.environment().bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }

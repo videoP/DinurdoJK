@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 47;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 50;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -99,6 +99,10 @@ pub(in crate::renderer) enum GpuPass {
     /// Core primary BSP render-pass interval, excluding most model/post tails.
     /// Nested within World; never add WorldMainPass to World or Frame.
     WorldMainPass = 46,
+    // Nested within BlueWaterSkyPrepare. Do not sum with the parent interval.
+    BlueWaterAtmoTables = 47,
+    BlueWaterEnvironment = 48,
+    BlueWaterAerialBuild = 49,
 }
 
 impl GpuPass {
@@ -156,6 +160,9 @@ impl GpuPass {
         Self::LocalShadowStatic,
         Self::LocalShadowMoving,
         Self::WorldMainPass,
+        Self::BlueWaterAtmoTables,
+        Self::BlueWaterEnvironment,
+        Self::BlueWaterAerialBuild,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -196,6 +203,9 @@ impl GpuPass {
             Self::BlueWaterSkyDraw => "blue_water_sky_draw",
             Self::BlueWaterClouds => "blue_water_clouds",
             Self::BlueWaterAerial => "blue_water_aerial",
+            Self::BlueWaterAtmoTables => "blue_water_atmo_tables",
+            Self::BlueWaterEnvironment => "blue_water_environment",
+            Self::BlueWaterAerialBuild => "blue_water_aerial_build",
             Self::BlueWaterCausticsCompute => "blue_water_caustics_compute",
             Self::BlueWaterCausticsReceiver => "blue_water_caustics_receiver",
             Self::BlueWaterSceneCapture => "blue_water_scene_capture",

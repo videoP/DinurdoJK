@@ -129,6 +129,9 @@ impl GameSession {
         forced_player_models: Option<ForcedPlayerModels>,
     ) -> Self {
         Self {
+            portal_body_enabled: false,
+            portal_body_map_token: None,
+            portal_body_map_has_authored: false,
             live: false,
             local: false,
             live_snapshots: VecDeque::new(),

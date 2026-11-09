@@ -60,6 +60,10 @@ pub(in crate::app) struct SiegeExtendedClient {
 }
 
 pub(in crate::app) struct GameSession {
+    /// Main camera suppresses the body; authored mirror views retain it.
+    pub(in crate::app) portal_body_enabled: bool,
+    pub(in crate::app) portal_body_map_token: Option<usize>,
+    pub(in crate::app) portal_body_map_has_authored: bool,
     /// Live sessions take snapshots from `live_snapshots` (filled by the
     /// network pump) instead of the demo reader, and their clock comes from
     /// CL_SetCGameTime rather than the demo timeline.

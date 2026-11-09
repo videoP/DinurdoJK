@@ -518,16 +518,20 @@ impl SurfaceConfig {
             // coarse/adaptive setting available when returning to material 0.
             pixel_detail_mode: if fast { 0 } else { settings.pixel_detail_mode }, cost_probe: settings.surface_cost_probe
                 | if settings.skip_faded_cascades { blue_water_gpu::shader_composer::SURFACE_SKIP_FADED_CASCADES } else { 0 }
-                | match settings.wave_statistics {
+                // The native statistical-wave bits share a flag space with the
+                // compact Hybrid's experimental adaptive specialization. They
+                // never apply to compact Hybrid (or its current shader) anyway.
+                | if fast { 0 } else { match settings.wave_statistics {
                     0 => 0,
                     1 => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS,
                     2 => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
                         | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_FOAM,
                     _ => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
                         | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_DEBUG,
-                }
+                }}
                 | if settings.gerstner_active() { blue_water_gpu::shader_composer::SURFACE_GODOT_WATER } else { 0 }
                 | if fast { blue_water_gpu::shader_composer::SURFACE_FAST_HYBRID
+                    | if settings.hybrid_material == 3 { blue_water_gpu::shader_composer::SURFACE_ADAPTIVE_HYBRID } else { 0 }
                     | if settings.blue_water_ssr { 0 } else { blue_water_gpu::shader_composer::COST_PROBE_SSR }
                 } else { 0 },
             ssr_tiles: settings.blue_water_ssr_tiles,
@@ -777,6 +781,7 @@ impl OceanGpu {
         camera_water_surface: f32,
         sky_environment: Option<&::blue_water_sky::EnvironmentMap>,
         sky_light: Option<::blue_water_sky::CelestialLight>,
+        sky_reflection_gains: [f32; 2], // [original, compact] (sky atlas only)
         aerial: Option<&::blue_water_render::AerialVolume>,
         cloud: Option<&::blue_water_clouds::CloudShadow>,
         volumes: &super::optics::Uniform,
@@ -1236,7 +1241,12 @@ impl OceanGpu {
                 &super::hybrid_swell_uniform(&promoted.settings, self.elapsed));
             slot.bindings.write_breaker_mode(queue,
                 if promoted.settings.backend == 2 { promoted.settings.hybrid_breaker } else { 0 },
-                self.settings.hybrid_fast_foam, self.settings.hybrid_fast_foam_detail);
+                self.settings.hybrid_fast_foam, self.settings.hybrid_fast_foam_detail,
+                // Material 0 is the reference: do not alter its default night
+                // appearance. The compact GGX material needs a separate night
+                // correction for the overly broad environment reflection lobe.
+                sky_reflection_gains[usize::from(renderer.config.cost_probe
+                    & blue_water_gpu::shader_composer::SURFACE_FAST_HYBRID != 0)]);
             slot.bindings.write_godot_water(queue,
                 &super::gerstner_uniform(&promoted.settings, self.elapsed, gerstner_foam.unwrap_or([0.0; 4])));
             let sun = self.environment.sun_direction_intensity;
@@ -1731,6 +1741,16 @@ impl OceanGpu {
         })
     }
 
+    /// A receiver pass samples and reblends the opaque scene even when the
+    /// visible native water surface is disabled. Used by the presentation
+    /// planner to avoid binding a non-sampleable swapchain image.
+    pub fn original_caustic_receivers_active(&self) -> bool {
+        self.blue_water.as_ref()
+            .and_then(|blue| blue.original_surface.as_ref())
+            .is_some_and(|renderer| renderer.slots.iter().flatten()
+                .any(|slot| slot.ready && slot.caustic_receiver.enabled))
+    }
+
     pub fn apply_original_caustics(
         &self,
         device: &wgpu::Device,
@@ -2222,6 +2242,36 @@ impl OceanGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_material_pipeline_keys_keep_modes_distinct() {
+        use blue_water_gpu::shader_composer::{COST_PROBE_SSR, SURFACE_ADAPTIVE_HYBRID, SURFACE_FAST_HYBRID,
+            SURFACE_WAVE_STATISTICS};
+        let target = (1920, 1080, 1, wgpu::TextureFormat::Rgba16Float);
+        let mut settings = super::super::OceanSettings::default();
+        settings.backend = 2;
+        settings.gerstner_water = false;
+        settings.hybrid_ssr = true;
+        // Statistics are native-only and must not accidentally turn on the
+        // adaptive flag in compact Hybrid's shared pipeline-key namespace.
+        settings.wave_statistics = 3;
+        settings.pixel_detail_mode = 4;
+        for mode in 0..=3 {
+            settings.hybrid_material = mode;
+            let resolved = settings.resolved_for_gpu();
+            let key = SurfaceConfig::new(target, resolved);
+            assert_eq!(key.pixel_detail_mode, if mode == 0 { 4 } else { 0 });
+            assert_eq!(key.cost_probe & SURFACE_FAST_HYBRID != 0, mode > 0);
+            assert_eq!(key.cost_probe & SURFACE_ADAPTIVE_HYBRID != 0, mode == 3);
+            assert_eq!(key.cost_probe & SURFACE_WAVE_STATISTICS != 0, mode == 0);
+            assert_eq!(key.cost_probe & COST_PROBE_SSR != 0, mode == 2);
+        }
+        settings.hybrid_material = 3;
+        settings.hybrid_ssr = false;
+        let key = SurfaceConfig::new(target, settings.resolved_for_gpu());
+        assert_ne!(key.cost_probe & COST_PROBE_SSR, 0);
+        assert_ne!(key.cost_probe & SURFACE_ADAPTIVE_HYBRID, 0);
+    }
 
     #[test]
     fn native_pool_visibility_matches_godot_pvs_semantics() {

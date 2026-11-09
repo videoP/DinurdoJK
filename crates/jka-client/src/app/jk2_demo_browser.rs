@@ -105,7 +105,7 @@ pub(super) fn scan_folders(
     // Optional read-only JK2 retail GameData remains a separate source.
     if let Some(root) = retail_root {
         if !root.is_dir() && !local_base.is_dir() && !home_base.is_some_and(Path::is_dir) {
-            return Err(format!("JK2 GameData directory does not exist: {}", root.display()));
+            return Err(format!("JK2 retail directory does not exist: {}", root.display()));
         }
         if let Ok(dirs) = fs::read_dir(root) {
             for game_dir in dirs.flatten() {

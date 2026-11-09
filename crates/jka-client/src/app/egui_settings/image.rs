@@ -105,7 +105,7 @@ impl App {
         if let Some(target) = quality_table_row(
             ui,
             "Texture quality",
-            "Classic r_picmip. Omits the highest map-texture mip levels at upload: 0 keeps full resolution, 1 halves each dimension, 2 quarters it, and so on. Matches TaystJK's latched texture-quality behavior; Apply Video Settings reloads the current map.",
+            "Classic r_picmip. Omits the highest map-texture mip levels at upload: 0 keeps full resolution, 1 halves each dimension, 2 quarters it, and so on. The cached Blue Water sky uses this setting too (2K base; down face remains 2x2). Apply Video Settings reloads the map to apply the latched setting.",
             theme::Reset::Video(ui::VIDEO_ROW_PICMIP),
             self.video.picmip.min(4),
             &PICMIP,
@@ -140,8 +140,8 @@ impl App {
 
         theme::row(
             ui,
-            "Detail textures",
-            "Adds textures/japro/detail/* to eligible opaque BSP materials using neutral 2× modulation. Authored detail stages are unchanged.",
+            "Auto detail textures",
+            "r_autoDetailTextures: add textures/japro/detail/* to eligible opaque BSP materials using neutral 2× modulation. The separate r_detailTextures cvar controls authored legacy detail stages.",
             theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
             |ui| {
                 let mut enabled = theme::preview_toggle_value(

@@ -10,7 +10,7 @@ fn triangle(out: &mut Vec<UiVertex>, points: [[f32; 2]; 3], color: [f32; 4], wid
     out.extend(points.map(|[x, y]| UiVertex {
         position: [x / width.max(1) as f32 * 2.0 - 1.0, 1.0 - y / height.max(1) as f32 * 2.0],
         uv: [0.0; 2],
-        color,
+        color: UiVertex::pack_color(color),
         textured: 0.0,
     }));
 }
@@ -193,7 +193,7 @@ pub(in crate::ui) fn avatar(
         UiVertex {
             position: [x / width.max(1) as f32 * 2.0 - 1.0, 1.0 - y / height.max(1) as f32 * 2.0],
             uv: [u, v],
-            color: [1.0, 1.0, 1.0, a],
+            color: UiVertex::pack_color([1.0, 1.0, 1.0, a]),
             textured: AVATAR_SOURCE,
         }
     };

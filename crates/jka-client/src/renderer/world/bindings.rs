@@ -550,11 +550,16 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             .unwrap_or(white)
     });
     for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
-        let local_lightmaps = if !batch.is_inline_entity && baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition()) && static_sun.local_ready() { static_sun.local_flux.as_slice() } else { &[] };
+        let local_lightmaps = if (!batch.is_inline_entity || batch.inline_baked_lightmap)
+            && baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition())
+            && static_sun.local_ready() { static_sun.local_flux.as_slice() } else { &[] };
         let sun_aux = baked_sun_cache.as_ref().filter(|c| c.active).map_or(&[][..], |c| c.sun_aux());
-        // Local-light flux stays disabled for moving models, since its
-        // UV-space receivers were traced for the static world only.
-        let lightmaps = lightmaps.as_slice();
+        // Only model surfaces with original BSP lightmap charts use the
+        // composed bake; vertex-lit/no-chart surfaces retain authored pages.
+        let lightmaps = if batch.is_inline_entity && !batch.inline_baked_lightmap {
+            baked_sun_cache.as_ref().filter(|c| c.active)
+                .map_or(lightmaps.as_slice(), |c| c.original.as_slice())
+        } else { lightmaps.as_slice() };
         let selected_detail_texture = detail_texture_for_source(
             &batch.source,
             detail_texture,

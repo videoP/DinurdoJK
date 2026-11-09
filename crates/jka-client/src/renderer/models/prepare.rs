@@ -231,7 +231,7 @@ mod tests {
         };
         let mut cache = BatchKeyCache::default();
         let mut draw = Ghoul2PendingDraw {
-            entity_num: 7,
+            entity_num: 7, portal_only: false,
             mesh_key: "model#lod0#surface1".into(),
             texture_key: Some("skin1".into()),
             alpha_mode: DynamicModelAlphaMode::Opaque,
@@ -278,7 +278,7 @@ mod tests {
         let mut mesh_a = BatchKeyCache::default();
         let mut mesh_b = BatchKeyCache::default();
         let mut draw = Ghoul2PendingDraw {
-            entity_num: 1, mesh_key: "model#surface1".into(),
+            entity_num: 1, portal_only: false, mesh_key: "model#surface1".into(),
             texture_key: Some("skin".into()), alpha_mode: DynamicModelAlphaMode::Opaque,
             wireframe_class: DynamicWireframeClass::Player,
             authored_glow: false, source_material: false, texture_binding_id: 9,

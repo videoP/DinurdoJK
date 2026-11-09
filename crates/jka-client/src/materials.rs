@@ -160,6 +160,8 @@ pub struct MaterialStage {
     pub tc_mods: Vec<TcMod>,
     pub depth_write: bool,
     pub depth_equal: bool,
+    /// GL depthFunc disable (independent from depthWrite).
+    pub depth_test_disabled: bool,
     /// Exact JKA shader-stage `glow` marker used by Dynamic Glow.
     pub glow: bool,
 }
@@ -194,6 +196,19 @@ pub const SHADER_LIGHT_ALL: u32 =
 /// Independent authored-area source in the unified added-map-light mask.
 pub const ADDED_MAP_LIGHT_AUTHORED: u32 = 1 << 3;
 pub const ADDED_MAP_LIGHT_ALL: u32 = SHADER_LIGHT_ALL | ADDED_MAP_LIGHT_AUTHORED;
+
+// Matches TaystJK r_detailTextures (default enabled): discard stages explicitly
+// marked `detail` at material preparation, before stage fusion/batching.
+// Separate from DinurdoJK's optional r_autoDetailTextures.
+static LEGACY_DETAIL_TEXTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn legacy_detail_textures_enabled() -> bool {
+    LEGACY_DETAIL_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_legacy_detail_textures_enabled(enabled: bool) {
+    LEGACY_DETAIL_TEXTURES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
 
 static GLASS_PROMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -317,6 +332,8 @@ pub struct SurfaceMaterial {
     pub light_filter: bool,
     /// q3map_nofog or runtime noglfog exemption from local/global BSP fog.
     pub no_fog: bool,
+    /// Authored CONTENTS_FOG permits a fog pass even after SS_SEE_THROUGH.
+    pub fog_volume: bool,
     pub sky: bool,
     pub skybox: Option<[usize; 6]>,
     /// `skyParms` cloud height for a sky shader that authored one; zero otherwise.
@@ -346,8 +363,12 @@ pub struct SurfaceMaterial {
     /// cull state to leak between passes, so scene preparation uses this bit to
     /// reproduce the visible retail result deterministically for world geometry.
     pub surface_sprite_cull_quirk: bool,
+    /// Fully view-facing independent BSP quads (TaystJK autoSprite).
+    pub auto_sprite: bool,
     /// Camera-facing rectangular BSP quads about their long axis (TaystJK autoSprite2).
     pub auto_sprite2: bool,
+    /// TaystJK animated full-surface translation, JKA coordinate space.
+    pub move_deform: Option<jka_assets::shader::MoveDeform>,
     /// False for the implicit "texture + map lighting" material synthesized when
     /// no shader script exists. This lets scene preparation keep that path in one
     /// draw call while explicit multi-pass scripts remain ordered passes.
@@ -384,6 +405,7 @@ impl Default for SurfaceMaterial {
             baked_shadow_texture: None,
             light_filter: false,
             no_fog: false,
+            fog_volume: false,
             sky: false,
             skybox: None,
             sky_cloud_height: 0.0,
@@ -394,7 +416,9 @@ impl Default for SurfaceMaterial {
             grass_stages: Vec::new(),
             surface_sprite_effects: Vec::new(),
             surface_sprite_cull_quirk: false,
+            auto_sprite: false,
             auto_sprite2: false,
+            move_deform: None,
             explicit: false,
             authored_detail: false,
         }
@@ -2621,6 +2645,9 @@ pub fn primary_texture_requests(
                 }
                 let keep_authored_env = keeps_authored_environment_stages(shader);
                 for stage in &shader.stages {
+                    if stage.detail && !legacy_detail_textures_enabled() {
+                        continue;
+                    }
                     if omit_environment_stages
                         && !keep_authored_env
                         && matches!(stage.tc_gen, TcGen::Environment)
@@ -2692,6 +2719,9 @@ fn sky_cloud_stages(
 ) -> Vec<MaterialStage> {
     let mut stages = Vec::new();
     for source in &definition.stages {
+        if source.detail && !legacy_detail_textures_enabled() {
+            continue;
+        }
         if source.image.is_empty()
             || source.image == "$lightmap"
             || source.surface_sprite.is_some()
@@ -2733,6 +2763,7 @@ fn sky_cloud_stages(
             tc_mods: source.tc_mods.clone(),
             depth_write: source.depth_write,
             depth_equal: source.depth_equal,
+            depth_test_disabled: source.depth_test_disabled,
             glow: source.glow,
         });
     }
@@ -2758,9 +2789,9 @@ pub fn describe(
     let keep_authored_env = (flags & MATERIAL_MASK) == MATERIAL_GLASS
         || keeps_authored_environment_stages(definition);
     let stage_is_omitted = |stage: &shader::Stage| {
-        omit_environment_stages
+        (stage.detail && !legacy_detail_textures_enabled()) || (omit_environment_stages
             && !keep_authored_env
-            && matches!(stage.tc_gen, TcGen::Environment)
+            && matches!(stage.tc_gen, TcGen::Environment))
     };
     let preferred_source = origin
         .filter(|origin| origin.mtr_override)
@@ -2837,6 +2868,9 @@ pub fn describe(
     if !sky && !base_hidden {
         if explicit {
             for source in &definition.stages {
+                if source.detail && !legacy_detail_textures_enabled() {
+                    continue;
+                }
                 let procedural_sprite_only = source.surface_sprite.is_some_and(|sprite| {
                     matches!(
                         sprite.kind,
@@ -3026,6 +3060,7 @@ pub fn describe(
                     // removed base already populated depth. Once promoted to the
                     // base pass there is no earlier depth value to compare with.
                     depth_equal: source.depth_equal && !promote_to_base,
+                    depth_test_disabled: source.depth_test_disabled,
                     glow: source.glow,
                 });
                 saw_authored_ordinary_stage |= authored_ordinary_stage;
@@ -3061,6 +3096,7 @@ pub fn describe(
                     tc_mods: Vec::new(),
                     depth_write: true,
                     depth_equal: false,
+                                    depth_test_disabled: false,
                                     glow: false,
                 });
             }
@@ -3078,7 +3114,7 @@ pub fn describe(
                 let transparent_window = stages[0].blend
                     == Some(BlendFunc { src: BlendFactor::One, dst: BlendFactor::OneMinusSrcAlpha })
                     && matches!(stages[0].rgb_gen, RgbGen::Identity | RgbGen::IdentityLighting)
-                    && matches!(stages[0].alpha_gen, AlphaGen::Identity)
+                    && matches!(stages[0].alpha_gen, AlphaGen::Identity | AlphaGen::Portal(_))
                     && !stages[0].glow
                     && stages[0].animation.is_none()
                     && matches!(stages[0].texture, StageTexture::Image(index)
@@ -3100,6 +3136,7 @@ pub fn describe(
                     tc_mods: Vec::new(),
                     depth_write: true,
                     depth_equal: false,
+                    depth_test_disabled: false,
                     glow: false,
                 });
             }
@@ -3134,6 +3171,7 @@ pub fn describe(
                 tc_mods: Vec::new(),
                 depth_write: false,
                 depth_equal: false,
+                            depth_test_disabled: false,
                             glow: false,
             });
         }
@@ -3202,6 +3240,7 @@ pub fn describe(
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
+            depth_test_disabled: false,
             glow: false,
         });
     }
@@ -3262,7 +3301,12 @@ pub fn describe(
         surface_sprite_effects,
         surface_sprite_cull_quirk,
         foliage_wind: crate::foliage::promotes_shader(name, definition),
+        auto_sprite: definition.auto_sprite,
         auto_sprite2: definition.auto_sprite2,
+        // This is a single-deform port. A move interleaved with other
+        // geometry deforms needs the full ordered tessellation pass.
+        move_deform: definition.move_deform.filter(|_| !definition.auto_sprite && !definition.auto_sprite2
+            && definition.bulge.is_none() && definition.vertex_wave.is_none()),
         stages,
         cull: cull_mode(&definition.cull),
         offset: definition.polygon_offset,
@@ -3276,6 +3320,7 @@ pub fn describe(
         baked_shadow_texture,
         light_filter: definition.light_filter,
         no_fog: definition.no_fog || definition.no_gl_fog,
+        fog_volume: definition.fog,
         clamp_time: definition.clamp_time,
         no_picmip: definition.no_picmip,
         sky,
@@ -3288,7 +3333,8 @@ pub fn describe(
         // or texture filenames; if a map omitted the marker, we still treat the
         // material as lacking authored detail and fall back to MATERIAL_* or
         // the generic AUTO texture choice.
-        authored_detail: definition.stages.iter().any(|stage| stage.detail),
+        authored_detail: legacy_detail_textures_enabled()
+            && definition.stages.iter().any(|stage| stage.detail),
     }
 }
 
@@ -4018,6 +4064,7 @@ rgbGen const ( 0 0 0 )
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
+            depth_test_disabled: false,
             glow: false,
         };
         let promoted = shader_light_promotion(&[stage], &textures).expect("emissive map should promote");

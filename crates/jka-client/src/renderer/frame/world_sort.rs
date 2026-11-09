@@ -82,7 +82,7 @@ fn safe_opaque_stage(batches: &[WorldBatch], indices: &[usize], position: usize)
         || material.authored_environment_composite
         || material.fog[3] > 0.001 || material.fog_is_global
         || pipeline.legacy_srgb_three_stage || pipeline.additive_fusion_count > 0
-        || pipeline.auto_sprite2 || pipeline.offset || pipeline.depth_equal
+        || (pipeline.auto_sprite || pipeline.auto_sprite2 || pipeline.deform_move) || pipeline.offset || pipeline.depth_equal
         || !pipeline.depth_write || pipeline.blend != BlendMode::Opaque
         || !matches!(pipeline.class, DrawClass::Opaque | DrawClass::Mask)
     {

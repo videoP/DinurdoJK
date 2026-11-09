@@ -15,8 +15,20 @@ use crate::renderer::StudioLens;
 /// Visibility bake status sent from render worker to the native HUD and Relighting UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SunBakeStage {
-    Off, Preparing, Tracing, Refining, Local, Uploading, Composing, Ready, Fallback, Failed,
+    Off, Preparing, Tracing, Refining, SkyVisibility, Local, Uploading, Composing, Ready, Fallback, Failed,
 }
+/// Report of the original BSP sunlight calibration, independent of the live
+/// sun-lightmap bake and the user's saved manual removal multiplier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BakedSunAutoStatus {
+    /// The original authored-sun mask is being prepared or loaded from cache.
+    Calibrating,
+    /// No reliable multiplier was recovered (including unsupported lightmaps).
+    Unavailable,
+    /// Map-specific measured sunlight subtraction coefficient.
+    Calibrated(f32),
+}
+
 impl SunBakeStage {
     pub fn label(self) -> &'static str {
         match self {
@@ -24,6 +36,7 @@ impl SunBakeStage {
             Self::Preparing => "Preparing geometry",
             Self::Tracing => "Tracing static sun",
             Self::Refining => "Antialiasing shadow edges",
+            Self::SkyVisibility => "Tracing sky visibility",
             Self::Local => "Baking map lights",
             Self::Uploading => "Uploading lightmaps",
             Self::Composing => "Compositing lighting",
@@ -467,6 +480,9 @@ pub struct DynamicModelSurface {
     /// False for conservative RT-only Ghoul2 casters that were rejected by the
     /// main-camera frustum. They still feed skinning/BLAS but never color/depth.
     pub raster_visible: bool,
+    /// Only render into an authored mirror portal; never draw on the primary
+    /// first-person camera. Mirrors reuse the predicted player's actual pose.
+    pub portal_only: bool,
     pub vertices: Arc<Vec<DynamicModelVertex>>,
     pub indices: Arc<Vec<u32>>,
     /// JKA-space point used for classic BSP entity-lighting lookup. Effects and
@@ -764,6 +780,8 @@ pub struct SpectatorHighlight {
 
 #[derive(Clone)]
 pub struct RenderSnapshot {
+    /// Presented JKA serverTime, absent outside a live/demo game session.
+    pub weather_server_time_ms: Option<i32>,
     pub studio_lens: Option<StudioLens>,
     pub studio_environment: Option<StudioSceneLighting>,
     /// Independent Studio scenes. Never references the gameplay session/world.
@@ -883,6 +901,8 @@ pub struct PostEffects {
     pub contact_shadows: bool,
     pub fog_mode: FogMode,
     pub fog_strength: f32,
+    /// 0 Off, 1 Baked, 2 Realtime. Sky display uses the same mode as relighting.
+    pub relighting_mode: u8,
     pub sun_override: bool,
     pub sun_yaw: f32,
     pub sun_pitch: f32,
@@ -894,6 +914,7 @@ pub struct PostEffects {
     pub entity_sun_lighting: bool,
     /// 0..1: estimated subtraction of authored direct sunlight from BSP baked lighting.
     pub baked_sun_removal: f32,
+    pub baked_sun_removal_auto: bool,
     pub baked_sun_cache: bool,
     pub lightmap_smoothing: u8,
     pub baked_sun_aa: u8,
@@ -903,7 +924,9 @@ pub struct PostEffects {
     pub sun_receiver_normals: u8,
     pub sun_terminator: bool,
     /// Sky world illumination for lightmapped world: 0 live pass, 1 baked, 2 + sky visibility.
-    pub sky_world_bake: u8,
+    pub sky_world_bake_ab: u8,
+    pub sky_world_light_isolation: bool,
+    pub sky_world_lighting_strength: f32,
     pub bake_threads: u8,
     pub baked_sun_shadow_map: bool,
     pub baked_sun_edge_softness: f32,
@@ -1263,6 +1286,11 @@ pub enum RenderCommand {
     SetFoliageWind(bool),
     SetPom(bool),
     SetGpuTimings(bool),
+    /// Blue Water diagnosis: 1 skip sky pixels, 2 skip aerial build/composite,
+    /// 4 skip aerial composite only, 8 skip Blue Water scene-light/cloud pass.
+    SetBlueSkyDiag(u8),
+    /// Switch clear-sky display in Relighting Baked without changing lighting bakes.
+    SetBlueSkyCubeAB(u8),
     /// Native top-of-screen frame-interval graph, updated at 30Hz.
     SetFrameTimeGraph(bool),
     SetFxZeroAlphaDiscard(bool),
@@ -1551,6 +1579,20 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_encoder_dispatch_ms: f64,
     pub(in crate::renderer) perf_encoder_join_wait_ms: f64,
     pub(in crate::renderer) perf_profiler_readback_encode_ms: f64,
+    /// Additional opt-in, non-overlapping CPU intervals. These are command
+    /// recording times, not GPU execution times. The world branch INCLUDES
+    /// models/FX; model draw is additionally reported as a nested interval.
+    pub(in crate::renderer) perf_scene_before_world_ms: f64,
+    pub(in crate::renderer) perf_scene_world_branch_ms: f64,
+    pub(in crate::renderer) perf_scene_after_world_ms: f64,
+    pub(in crate::renderer) perf_post_native_ui_ms: f64,
+    /// CPU time recording/submitting UI after the primary queue submit.
+    pub(in crate::renderer) perf_followup_egui_ms: f64,
+    pub(in crate::renderer) perf_followup_native_ui_ms: f64,
+    /// Only populated by late-acquire/early-submit frames.
+    pub(in crate::renderer) perf_early_present_copy_ms: f64,
+    /// Work before scene setup, including sun/menu/weather/model policy checks.
+    pub(in crate::renderer) perf_prepare_early_checks_ms: f64,
     /// Isolated first `queue.submit()` API call, not the old `cpu_submit_ms`.
     pub(in crate::renderer) perf_primary_submit_api_ms: f64,
     /// Time AFTER the first queue submit until `cpu_submit_ms` stops. Includes

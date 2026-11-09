@@ -16,7 +16,7 @@ use crate::app::egui_settings::{
     PHYS_JIGGLE_STOMACH_STIFFNESS, PHYS_JIGGLE_STOMACH_DAMPING,
     PHYS_MAX_SUBSTEPS, PHYS_PLAYER_PUSH, PHYS_PROPS,
     PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME, PHYS_RAGDOLL_MAX,
-    PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS, PHYS_WEAPON_IMPULSES,
+    PHYS_RAGDOLL_SELF_COLLISION, PHYS_RAGDOLL_JOINT_MODEL, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS, PHYS_WEAPON_IMPULSES,
 };
 
 impl App {
@@ -140,6 +140,19 @@ impl App {
         ) {
             self.video.ragdoll_lifetime = RAGDOLL_LIFE[index].0 as f32;
             self.physics_menu_changed();
+        }
+        const JOINT_MODELS: [(u8, &str); 2] = [
+            (0, "Classic"), (1, "Soft limits + tension"),
+        ];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Ragdoll joints",
+            "Classic uses the original Rapier hard angular limits. Soft limits adds bounded spring resistance near the limits and weak tension toward the skeleton's bind pose. Changing this resets current ragdoll simulation; server movement is unaffected.",
+            theme::Reset::Physics(PHYS_RAGDOLL_JOINT_MODEL),
+            self.video.ragdoll_joint_model,
+            &JOINT_MODELS,
+        ) {
+            let _ = self.set_console_cvar("r_ragdollJointModel", &mode.to_string());
         }
         self.egui_physics_toggle(
             ui,

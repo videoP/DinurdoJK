@@ -20,6 +20,7 @@ impl App {
         let e = crate::blue_water_environment::Settings::default();
         let mut flags = vec![
             v.sky_backend != d.sky_backend,
+            v.blue_sky_cube_ab != d.blue_sky_cube_ab,
             v.fast_sky != d.fast_sky,
             v.sky_fractal_override != d.sky_fractal_override,
             v.sun_visibility != d.sun_visibility,
@@ -57,6 +58,7 @@ impl App {
         let e = crate::blue_water_environment::Settings::default();
         let v = &mut self.video;
         v.sky_backend = d.sky_backend;
+        let reset_sky_cube = v.blue_sky_cube_ab != d.blue_sky_cube_ab;
         // r_fastsky also needs its dedicated render-thread command.
         let reset_fastsky = v.fast_sky != d.fast_sky;
         v.sky_fractal_override = d.sky_fractal_override;
@@ -83,6 +85,9 @@ impl App {
         s.moon_size = e.moon_size;
         // Reset appearance without changing the Relight map master switch.
         if reset_fastsky { let _ = self.set_console_cvar("r_fastsky", "0"); }
+        // Unlike the other sky settings, this A/B has a dedicated render-thread
+        // command. Reset through its cvar so the renderer updates immediately.
+        if reset_sky_cube { let _ = self.set_console_cvar("r_blueSkyCubeAB", "1"); }
         self.sun_custom_initialized = true;
         self.baked_sun_debug_view = 0;
         self.sun_ray_until = None;
@@ -162,6 +167,16 @@ impl App {
                             self.publish_ui();
                         }
                     }
+                }
+            });
+            theme::row(ui, "Blue Water skybox", "Live evaluates the Blue Water atmosphere directly. Baked draws its cached sky faces (resolution follows r_picmip) for better FPS. This is separate from world Relighting. The baked skybox is used with Relighting Baked and no native Blue Water clouds/weather; otherwise the renderer uses the live sky.", theme::Reset::None, |ui| {
+                for (mode, name) in [(0u8, "Live"), (1, "Baked")] {
+                    if theme::chip(ui, name, self.video.blue_sky_cube_ab == mode).clicked()
+                        && self.video.blue_sky_cube_ab != mode
+                    {
+                        let _ = self.set_console_cvar("r_blueSkyCubeAB", if mode == 0 { "0" } else { "1" });
+                    }
+                    ui.add_space(3.0);
                 }
             });
         }

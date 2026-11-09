@@ -201,6 +201,10 @@ pub(in crate::renderer) fn create_menu_backdrop_resources(
     height: u32,
     format: wgpu::TextureFormat,
 ) -> MenuBackdropResources {
+    // The world can render straight into the menu backdrop when post is off.
+    // Its legacy encoded-blend stages then need a UNORM view of the same sRGB
+    // storage, just like the normal world color target (no extra texture).
+    let encoded_view_formats = [format.remove_srgb_suffix()];
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("JKA lazy menu backdrop source"),
         size: wgpu::Extent3d {
@@ -213,7 +217,7 @@ pub(in crate::renderer) fn create_menu_backdrop_resources(
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
+        view_formats: if format.is_srgb() { &encoded_view_formats } else { &[] },
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -313,6 +317,8 @@ pub(in crate::renderer) fn create_targets(
         view_formats: &[],
     });
     let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let encoded_formats = [color_format.remove_srgb_suffix()];
+    let color_view_formats = if color_format.is_srgb() { &encoded_formats[..] } else { &[] };
     let msaa_texture = (samples > 1).then(|| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("JKA MSAA color"),
@@ -326,7 +332,7 @@ pub(in crate::renderer) fn create_targets(
             dimension: wgpu::TextureDimension::D2,
             format: color_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            view_formats: color_view_formats,
         })
     });
     let msaa_view = msaa_texture
@@ -345,7 +351,7 @@ pub(in crate::renderer) fn create_targets(
             dimension: wgpu::TextureDimension::D2,
             format: color_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            view_formats: color_view_formats,
         })
     };
     let scene_texture = scene_color("JKA post-process scene color", output_size);

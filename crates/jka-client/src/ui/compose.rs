@@ -60,6 +60,7 @@ pub fn build_vertices(
         ui.mode,
         OverlayMode::None
             | OverlayMode::Chat
+            | OverlayMode::Console
             | OverlayMode::Vgs
             | OverlayMode::HudEdit
             | OverlayMode::CameraEdit
@@ -127,6 +128,7 @@ pub(crate) fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> 
             ui.mode,
             OverlayMode::None
                 | OverlayMode::Chat
+                | OverlayMode::Console
                 | OverlayMode::Vgs
                 | OverlayMode::HudEdit
                 | OverlayMode::CameraEdit
@@ -149,8 +151,9 @@ pub fn build_dynamic_static_vertices(
     // cg_drawHud; movement helpers and other screen overlays are not.
     if ui.video.draw_hud {
         build_hud(out, ui, width, height);
-        build_extension_hud(out, &ui.extension_hud, &ui.extension_images,
-            &ui.extension_shader_flags, &ui.extension_image_dimensions, width, height);
+        build_extension_hud(ui, out, &ui.extension_hud, &ui.extension_images,
+            &ui.extension_shader_flags, &ui.extension_image_dimensions,
+            &ui.extension_image_uvs, width, height);
     }
 }
 
@@ -185,6 +188,7 @@ pub fn build_transient_vertices(
         ui.mode,
         OverlayMode::None
             | OverlayMode::Chat
+            | OverlayMode::Console
             | OverlayMode::Vgs
             | OverlayMode::HudEdit
             | OverlayMode::CameraEdit
@@ -355,6 +359,61 @@ mod draw2d_tests {
         ui.game_timer = Some("1:23".to_owned());
         build_transient_vertices(&mut vertices, &ui, None, 1920, 1080);
         assert!(!vertices.is_empty()); // unrelated 2D survives cg_drawHud 0
+    }
+
+
+    #[test]
+    fn console_keeps_gameplay_hud_for_jk2_and_jka_but_menus_do_not() {
+        for jk2 in [false, true] {
+            let mut ui = UiSnapshot::default();
+            ui.jk2_mode = jk2;
+            ui.mode = OverlayMode::Console;
+            ui.hud = Some(crate::ui::HudState {
+                health: 100,
+                max_health: 100,
+                armor: 50,
+                ..Default::default()
+            });
+            ui.game_timer = Some("1:23".to_owned());
+
+            assert!(gameplay_hud_visible(&ui, 1920, 1080));
+            let mut stable = Vec::new();
+            build_dynamic_static_vertices(&mut stable, &ui, 1920, 1080);
+            assert!(!stable.is_empty(), "status HUD missing with console open (JK2={jk2})");
+            let mut transient = Vec::new();
+            build_transient_vertices(&mut transient, &ui, None, 1920, 1080);
+            assert!(!transient.is_empty(), "game timer missing with console open (JK2={jk2})");
+
+            // Menus should still suppress the gameplay HUD.
+            ui.mode = OverlayMode::Game;
+            assert!(!gameplay_hud_visible(&ui, 1920, 1080));
+            stable.clear();
+            build_dynamic_static_vertices(&mut stable, &ui, 1920, 1080);
+            assert!(stable.is_empty());
+        }
+    }
+
+    #[test]
+    fn scoreboard_stays_behind_console() {
+        let mut ui = UiSnapshot::default();
+        ui.mode = OverlayMode::Console;
+        ui.scoreboard = Some(crate::ui::UiScoreboard {
+            team_scores: [0, 0],
+            ready_clients: 0,
+            team_game: false,
+            ctf: false,
+            siege: false,
+            siege_win_team: 0,
+            spectator_scores: false,
+            show_deaths: false,
+            icon_paths: Vec::new(),
+            entries: Vec::new(),
+            chrome: Default::default(),
+        });
+        let with_scoreboard = build_vertices(&ui, 1920, 1080, None, None).len();
+        ui.scoreboard = None;
+        let console_only = build_vertices(&ui, 1920, 1080, None, None).len();
+        assert!(with_scoreboard > console_only);
     }
 
     #[test]

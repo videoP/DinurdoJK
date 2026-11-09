@@ -28,6 +28,7 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "NO-ROLL DUCK", command: "+duck", group: "Movement" },
     ControlAction { label: "LOW JUMP", command: "lowjump", group: "Movement" },
     ControlAction { label: "WALK", command: "+speed", group: "Movement" },
+    ControlAction { label: "CENTER VIEW", command: "centerview", group: "Movement" },
 
     ControlAction { label: "USE / INTERACT", command: "+use", group: "Interaction" },
     ControlAction { label: "USE SELECTED ITEM", command: "+button2", group: "Interaction" },
@@ -209,7 +210,7 @@ impl Default for Bindings {
         let mut bindings = Self { map: HashMap::new(), spectator_map: HashMap::new(), demo_map: HashMap::new() };
         // Mirrors the stock MP mpdefault.cfg, which jaPRO also runs on (it ships no
         // default binds of its own). Commands this client does not implement yet
-        // (+strafe, +lookup/+lookdown, +left/+right, centerview, +mlook,
+        // (+strafe, +lookup/+lookdown, +left/+right, +mlook,
         // scoresUp/Down, automap_toggle) are left
         // out so a keypress never lands on "unknown command". N is DinurdoJK's own
         // noclip key; the stock keys it would otherwise collide with stay stock.
@@ -705,6 +706,27 @@ pub fn parse_key(name: &str) -> Option<BindKey> {
         "HOME" => Some(KeyCode::Home),
         "END" => Some(KeyCode::End),
         "PAUSE" => Some(KeyCode::Pause),
+        // OpenJK/JKA names identify physical keypad keys, independently of
+        // the number row, navigation cluster, and Num Lock state. KP_0..KP_9
+        // are accepted as aliases, but configs use the classic JKA names.
+        "KP_INS" | "KP_0" => Some(KeyCode::Numpad0),
+        "KP_END" | "KP_1" => Some(KeyCode::Numpad1),
+        "KP_DOWNARROW" | "KP_2" => Some(KeyCode::Numpad2),
+        "KP_PGDN" | "KP_3" => Some(KeyCode::Numpad3),
+        "KP_LEFTARROW" | "KP_4" => Some(KeyCode::Numpad4),
+        "KP_5" => Some(KeyCode::Numpad5),
+        "KP_RIGHTARROW" | "KP_6" => Some(KeyCode::Numpad6),
+        "KP_HOME" | "KP_7" => Some(KeyCode::Numpad7),
+        "KP_UPARROW" | "KP_8" => Some(KeyCode::Numpad8),
+        "KP_PGUP" | "KP_9" => Some(KeyCode::Numpad9),
+        "KP_DEL" | "KP_DECIMAL" | "KP_PERIOD" | "KP_DOT" => Some(KeyCode::NumpadDecimal),
+        "KP_ENTER" | "KP_RETURN" => Some(KeyCode::NumpadEnter),
+        "KP_SLASH" | "KP_DIVIDE" => Some(KeyCode::NumpadDivide),
+        "KP_STAR" | "KP_MULTIPLY" => Some(KeyCode::NumpadMultiply),
+        "KP_MINUS" | "KP_SUBTRACT" => Some(KeyCode::NumpadSubtract),
+        "KP_PLUS" | "KP_ADD" => Some(KeyCode::NumpadAdd),
+        "KP_NUMLOCK" | "KP_NUM_LCK" => Some(KeyCode::NumLock),
+        "KP_EQUALS" | "KP_EQUAL" => Some(KeyCode::NumpadEqual),
         "SEMICOLON" | ";" => Some(KeyCode::Semicolon),
         "APOSTROPHE" | "'" => Some(KeyCode::Quote),
         "COMMA" | "," => Some(KeyCode::Comma),
@@ -771,7 +793,19 @@ pub fn key_name(key: BindKey) -> String {
             KeyCode::ShiftLeft => "SHIFT".into(), KeyCode::ShiftRight => "RSHIFT".into(),
             KeyCode::Insert => "INS".into(), KeyCode::Delete => "DEL".into(), KeyCode::PageUp => "PGUP".into(),
             KeyCode::PageDown => "PGDN".into(), KeyCode::Home => "HOME".into(), KeyCode::End => "END".into(),
-            KeyCode::Pause => "PAUSE".into(), KeyCode::Semicolon => "SEMICOLON".into(), KeyCode::Quote => "APOSTROPHE".into(),
+            KeyCode::Pause => "PAUSE".into(),
+            // Save canonical OpenJK/JKA keypad names (not Winit Debug names),
+            // so /bind, /bindlist and cfg reload all agree.
+            KeyCode::Numpad0 => "KP_INS".into(), KeyCode::Numpad1 => "KP_END".into(),
+            KeyCode::Numpad2 => "KP_DOWNARROW".into(), KeyCode::Numpad3 => "KP_PGDN".into(),
+            KeyCode::Numpad4 => "KP_LEFTARROW".into(), KeyCode::Numpad5 => "KP_5".into(),
+            KeyCode::Numpad6 => "KP_RIGHTARROW".into(), KeyCode::Numpad7 => "KP_HOME".into(),
+            KeyCode::Numpad8 => "KP_UPARROW".into(), KeyCode::Numpad9 => "KP_PGUP".into(),
+            KeyCode::NumpadDecimal => "KP_DEL".into(), KeyCode::NumpadEnter => "KP_ENTER".into(),
+            KeyCode::NumpadDivide => "KP_SLASH".into(), KeyCode::NumpadMultiply => "KP_STAR".into(),
+            KeyCode::NumpadSubtract => "KP_MINUS".into(), KeyCode::NumpadAdd => "KP_PLUS".into(),
+            KeyCode::NumLock => "KP_NUMLOCK".into(), KeyCode::NumpadEqual => "KP_EQUALS".into(),
+            KeyCode::Semicolon => "SEMICOLON".into(), KeyCode::Quote => "APOSTROPHE".into(),
             KeyCode::Comma => "COMMA".into(), KeyCode::Period => "PERIOD".into(), KeyCode::Slash => "SLASH".into(),
             KeyCode::Backslash => "BACKSLASH".into(), KeyCode::Minus => "MINUS".into(), KeyCode::Equal => "EQUALS".into(),
             KeyCode::BracketLeft => "LBRACKET".into(), KeyCode::BracketRight => "RBRACKET".into(),
@@ -876,6 +910,77 @@ mod tests {
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyQ)), Some("forceprev"));
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyO)), Some("ui_opensiegemenu ingame_objectives"));
         assert_eq!(bindings.get(BindKey::WheelUp), Some("weapprev"));
+    }
+
+    #[test]
+    fn keypad_names_match_jka_and_round_trip_through_cfg() {
+        let cases = [
+            (KeyCode::Numpad0, "KP_INS", "KP_0"),
+            (KeyCode::Numpad1, "KP_END", "KP_1"),
+            (KeyCode::Numpad2, "KP_DOWNARROW", "KP_2"),
+            (KeyCode::Numpad3, "KP_PGDN", "KP_3"),
+            (KeyCode::Numpad4, "KP_LEFTARROW", "KP_4"),
+            (KeyCode::Numpad5, "KP_5", "kp_5"),
+            (KeyCode::Numpad6, "KP_RIGHTARROW", "KP_6"),
+            (KeyCode::Numpad7, "KP_HOME", "KP_7"),
+            (KeyCode::Numpad8, "KP_UPARROW", "KP_8"),
+            (KeyCode::Numpad9, "KP_PGUP", "KP_9"),
+            (KeyCode::NumpadDecimal, "KP_DEL", "KP_DECIMAL"),
+            (KeyCode::NumpadEnter, "KP_ENTER", "KP_RETURN"),
+            (KeyCode::NumpadDivide, "KP_SLASH", "KP_DIVIDE"),
+            (KeyCode::NumpadMultiply, "KP_STAR", "KP_MULTIPLY"),
+            (KeyCode::NumpadSubtract, "KP_MINUS", "KP_SUBTRACT"),
+            (KeyCode::NumpadAdd, "KP_PLUS", "KP_ADD"),
+            (KeyCode::NumLock, "KP_NUMLOCK", "KP_NUM_LCK"),
+            (KeyCode::NumpadEqual, "KP_EQUALS", "KP_EQUAL"),
+        ];
+        let mut bindings = Bindings::default();
+        bindings.clear();
+        for (code, canonical, alias) in cases {
+            let key = BindKey::Keyboard(code);
+            assert_eq!(bind_key_for_code(code), key);
+            assert_eq!(parse_key(canonical), Some(key));
+            assert_eq!(parse_key(alias), Some(key));
+            assert_eq!(key_name(key), canonical);
+            bindings.set(key, format!("say {canonical}"));
+        }
+        // Numpad5, number-row 5 and the navigation keys are independent.
+        assert_ne!(parse_key("KP_5"), parse_key("5"));
+        assert_ne!(parse_key("KP_ENTER"), parse_key("ENTER"));
+        assert_ne!(parse_key("KP_INS"), parse_key("INS"));
+        let mut cfg = String::new();
+        bindings.write_cfg(&mut cfg);
+        let mut restored = Bindings::default();
+        assert!(apply_cfg(&mut restored, &cfg));
+        for (code, canonical, _) in cases {
+            assert!(cfg.contains(&format!("bind {canonical} \"say {canonical}\"")));
+            let expected = format!("say {canonical}");
+            assert_eq!(restored.get(BindKey::Keyboard(code)), Some(expected.as_str()));
+        }
+        assert_eq!(restored.get(BindKey::Keyboard(KeyCode::Digit5)), None);
+    }
+
+    #[test]
+    fn keypad_names_work_for_all_bind_scopes() {
+        let mut bindings = Bindings::default();
+        bindings.clear();
+        bindings.clear_spectator();
+        bindings.clear_demo();
+        let key = BindKey::Keyboard(KeyCode::Numpad5);
+        bindings.set(key, "centerview");
+        bindings.set_spectator(key, "follownext");
+        bindings.set_demo(key, "demo_pause");
+        let mut cfg = String::new();
+        bindings.write_cfg(&mut cfg);
+        assert!(cfg.contains("bind KP_5 \"centerview\""));
+        assert!(cfg.contains("bindspec KP_5 \"follownext\""));
+        assert!(cfg.contains("binddemo KP_5 \"demo_pause\""));
+        let mut restored = Bindings::default();
+        assert!(apply_cfg(&mut restored, &cfg));
+        assert_eq!(restored.get(key), Some("centerview"));
+        assert_eq!(restored.get_spectator(key), Some("follownext"));
+        assert_eq!(restored.get_demo(key), Some("demo_pause"));
+        assert_eq!(restored.get(BindKey::Keyboard(KeyCode::Digit5)), None);
     }
 
     #[test]

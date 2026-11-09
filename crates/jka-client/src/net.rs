@@ -645,6 +645,12 @@ fn random_u32() -> u32 {
 
 /// NET_StringToAdr: `host[:port]`, IPv4, default port 29070.
 pub fn resolve_server(text: &str) -> Result<SocketAddr, String> {
+    resolve_server_with_default_port(text, jka_protocol::DEFAULT_PORT)
+}
+
+/// Resolve the destination once before selecting an endpoint-bound secret.
+/// JK2 uses a different default port, but explicit ports are always honored.
+pub fn resolve_server_with_default_port(text: &str, default_port: u16) -> Result<SocketAddr, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("Bad server address".into());
@@ -652,7 +658,7 @@ pub fn resolve_server(text: &str) -> Result<SocketAddr, String> {
     let with_port = if text.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
         text.to_owned()
     } else {
-        format!("{text}:{}", jka_protocol::DEFAULT_PORT)
+        format!("{text}:{default_port}")
     };
     with_port
         .to_socket_addrs()
@@ -705,12 +711,12 @@ impl NetClient {
     fn connect_game(server_name: &str, userinfo: Vec<u8>, net_port: u16, preflight: bool,
         jk2: Option<jka_protocol::jk2::Version>) -> Result<Self, String>
     {
-        let address;
-        let server_name = if jk2.is_some() && !server_name.rsplit_once(':').is_some_and(|(_, port)| port.parse::<u16>().is_ok()) {
-            address = format!("{server_name}:{}", jka_protocol::jk2::DEFAULT_PORT);
-            &address
-        } else { server_name };
-        let server = resolve_server(server_name)?;
+        let default_port = if jk2.is_some() {
+            jka_protocol::jk2::DEFAULT_PORT
+        } else {
+            jka_protocol::DEFAULT_PORT
+        };
+        let server = resolve_server_with_default_port(server_name, default_port)?;
         let socket = bind_live_socket(net_port)?;
         socket
             .set_nonblocking(true)
@@ -943,6 +949,14 @@ impl LiveInput {
             self.weapon_initialized = true;
             self.last_spawn_count = spawn_count;
         }
+    }
+
+    /// TaystJK codemp/client/cl_input.cpp IN_CenterView:
+    /// cl.viewangles[PITCH] = -SHORT2ANGLE(cl.snap.ps.delta_angles[PITCH]).
+    /// Clear *only* command pitch, compensating for the latest snapshot's
+    /// delta_angles so the next Pmove resolves the actual view to level.
+    pub fn center_view(&mut self) {
+        self.view_angles[0] = -(self.delta_angles[0] as f32) * (360.0 / 65536.0);
     }
 
     /// CL_MouseMove: yaw/pitch accumulate in cl.viewangles.
@@ -1324,7 +1338,7 @@ impl LiveInput {
             tag = if forward {
                 if tag >= HI_NUM_HOLDABLE - 1 { 1 } else { tag + 1 }
             } else if tag <= 1 { HI_NUM_HOLDABLE - 1 } else { tag - 1 };
-            if owned & (1 << tag) != 0 && !matches!(tag, 7 | 8 | 9) {
+            if owned & (1 << tag) != 0 && crate::items::holdable_selectable(tag) {
                 self.inventory_select = tag as u8;
                 return;
             }
@@ -3073,6 +3087,52 @@ impl Predictor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_server_port_and_game_default_are_stable() {
+        let host = "203.0.113.9";
+        assert_eq!(
+            super::resolve_server_with_default_port(host, 29070).unwrap().to_string(),
+            "203.0.113.9:29070",
+        );
+        assert_eq!(
+            super::resolve_server_with_default_port(host, 28070).unwrap().to_string(),
+            "203.0.113.9:28070",
+        );
+        assert_eq!(
+            super::resolve_server_with_default_port("203.0.113.9:29081", 28070).unwrap().to_string(),
+            "203.0.113.9:29081",
+        );
+    }
+
+    #[test]
+    fn centerview_uses_snapshot_delta_and_preserves_yaw_and_roll() {
+        let mut input = super::LiveInput::default();
+        input.view_angles = [52.0, 127.0, 13.0];
+        input.center_view();
+        assert_eq!(input.view_angles, [0.0, 127.0, 13.0]);
+
+        // IN_CenterView must compensate for forced pitch (not just write 0).
+        input.delta_angles[0] = 8192; // +45 degrees
+        input.center_view();
+        assert_eq!(input.view_angles, [-45.0, 127.0, 13.0]);
+        let cmd = input.preview_cmd(&super::CommandButtons {
+            active: &std::collections::HashSet::new(),
+            forced_moveup: false, idrive: true, any_key: false, talking: false,
+        });
+        assert_eq!(cmd.angles[0], jka_movement::angle_to_short(-45.0));
+
+        // OpenJK delta_angles can wrap past the signed short domain.
+        input.delta_angles[0] = -65_335;
+        input.center_view();
+        let resolved_pitch = cmd_pitch_with_delta(input.view_angles[0], input.delta_angles[0]);
+        assert_eq!(resolved_pitch, 0);
+        assert_eq!(input.view_angles[1..], [127.0, 13.0]);
+    }
+
+    fn cmd_pitch_with_delta(command_pitch: f32, delta: i32) -> i16 {
+        jka_movement::angle_to_short(command_pitch).wrapping_add(delta) as i16
+    }
+
     #[test]
     fn video_restart_drops_pending_usercmd_actions_but_preserves_view_and_selection() {
         let mut input = super::LiveInput::default();

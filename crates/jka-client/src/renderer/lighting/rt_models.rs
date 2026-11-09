@@ -370,7 +370,7 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             1,
         ),
         (
-            "studio_light_color(lit_color(input.normal, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness)",
+            "studio_light_color(lit_color(input.normal, input.world_position, tex) * input.color, tex * input.color, input.normal, input.world_position), input.normal, input.world_position, input.water_wetness)",
             "rt_model_color(input, tex), input.normal, input.world_position, input.water_wetness)",
             2,
         ),
@@ -517,6 +517,13 @@ mod tests {
                     texture_entry(0),
                     sampler_entry(1),
                     uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                    texture_entry(3),
+                    crate::renderer::texture_3d_entry(4),
+                    uniform_entry(5, wgpu::ShaderStages::FRAGMENT),
+                    sampler_entry(6),
+                    crate::renderer::depth_array_texture_entry(7),
+                    crate::renderer::comparison_sampler_entry(8),
+                    uniform_entry(9, wgpu::ShaderStages::FRAGMENT),
                 ],
             });
             let lights = light_layout(&device);

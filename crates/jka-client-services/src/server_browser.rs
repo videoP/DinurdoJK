@@ -630,6 +630,8 @@ impl BrowserUiState {
                 }
                 self.status_cache.insert(status.address, status);
             }
+            // Handled by App's console event receiver, not browser UI state.
+            BrowserEvent::ConsoleServerStatus { .. } => {}
             BrowserEvent::StatusBatchFinished { requested } => {
                 for address in requested {
                     if self.status_pending.remove(&address) {
@@ -777,6 +779,8 @@ pub enum BrowserCommand {
     QueryStatus(SocketAddr),
     /// Fresh full getstatus request initiated explicitly by the user.
     GetServerInfo(SocketAddr),
+    /// Console /serverstatus, deliberately separate from browser row queries.
+    ConsoleServerStatus(SocketAddr),
     QueryStatusBatch(Vec<SocketAddr>),
 }
 
@@ -800,6 +804,8 @@ pub enum BrowserEvent {
     Status(ServerStatus),
     /// Full getstatus result requested from the server-row context menu.
     ServerInfo(ServerStatus),
+    /// Console-only result, including timeouts. No selection/clipboard effects.
+    ConsoleServerStatus { address: SocketAddr, result: Result<ServerStatus, String> },
     StatusBatchFinished {
         requested: Vec<SocketAddr>,
     },
@@ -833,6 +839,11 @@ fn worker(commands: Receiver<BrowserRequest>, event_tx: Sender<TaggedBrowserEven
             }
             BrowserCommand::QueryStatus(address) => query_status(&events, address),
             BrowserCommand::GetServerInfo(address) => get_server_info(&events, address),
+            BrowserCommand::ConsoleServerStatus(address) => {
+                let result = fetch_status(address).map_err(|(_, message)| message);
+                events.send(BrowserEvent::ConsoleServerStatus { address, result })
+                    .map_err(|_| (None, "browser UI disconnected".to_owned()))
+            }
             BrowserCommand::QueryStatusBatch(addresses) => {
                 let requested = addresses.clone();
                 let result = query_status_batch(&events, addresses);
@@ -1375,6 +1386,25 @@ pub fn format_server_status(status: &ServerStatus) -> String {
     out.trim_end().to_owned()
 }
 
+/// Match OpenJK CL_ServerStatusResponse console layout, rather than the
+/// separate copy-friendly layout used by the browser's Get Server Info menu.
+pub fn format_openjk_server_status(status: &ServerStatus) -> String {
+    let mut out = format!("Server ({})\nServer settings:\n", status.address);
+    for (key, value) in &status.fields {
+        out.push_str(&format!("{key:<24}{value}\n"));
+    }
+    out.push_str("\nPlayers:\nnum: score: ping: name:\n");
+    for (index, player) in status.players.iter().enumerate() {
+        out.push_str(&format!(
+            "{index:<2}   {score:<3}    {ping:<3}   \"{name}\"\n",
+            score = player.score,
+            ping = player.ping,
+            name = player.name,
+        ));
+    }
+    out.trim_end_matches('\n').to_owned()
+}
+
 fn parse_status_response(address: SocketAddr, packet: &[u8]) -> Option<ServerStatus> {
     const PREFIX: &[u8] = b"\xff\xff\xff\xffstatusResponse\n";
     let body = packet.strip_prefix(PREFIX)?;
@@ -1818,6 +1848,28 @@ mod tests {
         assert!(dump.contains("12"));
         assert!(dump.contains("54"));
         assert!(dump.contains("^3Kyle Katarn"));
+    }
+
+    #[test]
+    fn formats_openjk_console_serverstatus_with_all_fields_and_players() {
+        let status = ServerStatus {
+            address: "127.0.0.1:29070".parse().unwrap(),
+            fields: vec![
+                ("sv_hostname".to_owned(), "^2Test Server".to_owned()),
+                ("mapname".to_owned(), "mp/ffa3".to_owned()),
+            ],
+            players: vec![ServerPlayer {
+                name: "^3Kyle Katarn".to_owned(),
+                score: 12,
+                ping: 54,
+            }],
+        };
+        let output = format_openjk_server_status(&status);
+        assert!(output.starts_with("Server (127.0.0.1:29070)\nServer settings:\n"));
+        assert!(output.contains("sv_hostname             ^2Test Server\n"));
+        assert!(output.contains("mapname                 mp/ffa3\n"));
+        assert!(output.contains("\nPlayers:\nnum: score: ping: name:\n"));
+        assert!(output.contains("0    12     54    \"^3Kyle Katarn\""));
     }
 
     #[test]

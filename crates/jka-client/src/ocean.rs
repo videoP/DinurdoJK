@@ -1629,6 +1629,7 @@ pub struct OceanSettings {
     pub hybrid_waterline_debug: u8,
     pub hybrid_ssr: bool,
     /// Hybrid quality: 0 original; 1 optimized honoring SSR; 2 optimized sky-only.
+    /// 0 original; 1 compact; 2 compact without SSR; 3 adaptive compact with fine ripples and cheap glints.
     pub hybrid_material: u8,
     pub hybrid_fast_foam: f32,
     pub hybrid_fast_foam_detail: bool,
@@ -1931,7 +1932,7 @@ impl OceanSettings {
     pub fn sanitize(mut self) -> Self {
         self.backend = self.backend.min(3);
         self.hybrid_breaker = self.hybrid_breaker.min(2);
-        self.hybrid_material = self.hybrid_material.min(2);
+        self.hybrid_material = self.hybrid_material.min(3);
         self.hybrid_fast_foam = if self.hybrid_fast_foam.is_finite() {
             self.hybrid_fast_foam.clamp(0.0, 3.0)
         } else { 1.0 };
@@ -3496,6 +3497,52 @@ fn ocean_phases_due(now:f32, start:f32, period:f32, count:usize) -> usize {
 
 fn srgb_channel_to_linear(c:f32)->f32 { if c<=0.04045 { c/12.92 } else { ((c+0.055)/1.055).powf(2.4) } }
 fn linear_color(rgb:[f32;3])->[f32;4] { [srgb_channel_to_linear(rgb[0]),srgb_channel_to_linear(rgb[1]),srgb_channel_to_linear(rgb[2]),1.0] }
+/// Per-material sky-atlas reflection gains; never touch SSR or the celestial
+/// GGX/direct glints. The native Blue Water dome-only slider does not modify
+/// the upstream environment atlas used by the water. At night, make water's
+/// ambient sky reflection follow that slider explicitly. The compact GGX
+/// material also needs a lower baseline sky lobe than original Blue Water.
+/// The transition is based on the actual solar direction, NOT the moon
+/// selected by the environment's active celestial light.
+pub(crate) fn night_sky_reflection_gains(sun_travel_y: f32, blue_sky_active: bool,
+    night_brightness: f32) -> [f32; 2] {
+    if !blue_sky_active { return [1.0; 2]; }
+    // Sun's travel vector points downward by day, upward after sunset.
+    // Begin at ~2.3 degrees above the horizon, finish at ~5.7 below.
+    let t = ((sun_travel_y + 0.04) / 0.14).clamp(0.0, 1.0);
+    let night = t * t * (3.0 - 2.0 * t);
+    let brightness = night_brightness.clamp(0.0, 1.0);
+    [1.0 - night * (1.0 - brightness),
+     1.0 - night * (1.0 - 0.35 * brightness)]
+}
+
+#[cfg(test)]
+mod night_sky_reflection_tests {
+    use super::night_sky_reflection_gains;
+
+    #[test]
+    fn original_defaults_and_compact_night_rebalance() {
+        assert_eq!(night_sky_reflection_gains(-0.7, true, 0.0), [1.0, 1.0]);
+        let full_night = night_sky_reflection_gains(0.5, true, 1.0);
+        assert!((full_night[0] - 1.0).abs() < 1e-6);
+        assert!((full_night[1] - 0.35).abs() < 1e-6);
+        assert_eq!(night_sky_reflection_gains(0.5, true, 0.0), [0.0, 0.0]);
+        assert_eq!(night_sky_reflection_gains(0.5, false, 0.0), [1.0, 1.0]);
+    }
+
+    #[test]
+    fn twilight_is_continuous_and_bounded() {
+        let first = night_sky_reflection_gains(-0.04, true, 0.5);
+        let mid = night_sky_reflection_gains(0.03, true, 0.5);
+        let last = night_sky_reflection_gains(0.10, true, 0.5);
+        assert_eq!(first, [1.0, 1.0]);
+        assert!(first[0] > mid[0] && mid[0] > last[0]);
+        assert!(first[1] > mid[1] && mid[1] > last[1]);
+        assert!((last[0] - 0.5).abs() < 1e-6);
+        assert!((last[1] - 0.175).abs() < 1e-6);
+    }
+}
+
 /// Identical analytic wave parameters for the Hybrid native mesh and eye probe.
 /// xy: travel direction, z: radians/metre, w: amplitude in metres.
 /// xyzw motion: radians/s, horizontal displacement ratio, FFT weight, seconds.

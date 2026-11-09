@@ -8,6 +8,10 @@ use crate::renderer::{
 };
 use wgpu::util::DeviceExt;
 
+#[path = "planar_target.rs"]
+mod target;
+pub(in crate::renderer) use target::COLOR_FORMAT as PLANAR_COLOR_FORMAT;
+
 impl Renderer {
     pub(in crate::renderer) fn lake_planar_enabled(&self) -> bool {
         self.ocean_enabled
@@ -45,7 +49,7 @@ impl Renderer {
         // Promoted tcGen-environment surfaces are intentionally broad/rough
         // reflections, so an environment-only pool can be rendered at quarter
         // resolution. If a real authored mirror is active, keep the pool at
-        // half resolution so the authored mirror remains crisp.
+        // full scene resolution to match JKA/TaystJK portal rendering.
         let has_authored = self.world.as_ref().is_some_and(|world| {
             world.planar_reflectors.iter().any(|reflector| {
                 reflector.kind == PlanarReflectorKind::Authored
@@ -74,7 +78,6 @@ impl Renderer {
         self.planar_reflection = create_planar_reflection_resources(
             &self.device,
             &self.planar_reflection_layout,
-            self.scene_format(),
             width,
             height,
             active,
@@ -913,27 +916,14 @@ pub(in crate::renderer) fn select_planar_reflection_views(
 pub(in crate::renderer) fn create_planar_reflection_resources(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    color_format: wgpu::TextureFormat,
     width: u32,
     height: u32,
     active: bool,
 ) -> PlanarReflectionResources {
+    let color_format = PLANAR_COLOR_FORMAT;
     let width = width.max(1);
     let height = height.max(1);
-    let color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("JKA planar reflection color array"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: PLANAR_REFLECTION_SLOTS as u32,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: color_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
+    let color = target::color_texture(device, width, height, PLANAR_REFLECTION_SLOTS as u32);
     let color_array_view = color.create_view(&wgpu::TextureViewDescriptor {
         label: Some("JKA planar reflection color array view"),
         dimension: Some(wgpu::TextureViewDimension::D2Array),

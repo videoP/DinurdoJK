@@ -10,7 +10,7 @@ use crate::ui::{
     UiSnapshot, UiVertex,
 };
 use super::extensions::{
-    image_cell_uv_for_count, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE,
+    EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE,
 };
 
 
@@ -169,6 +169,7 @@ struct Painter<'a> {
     out: &'a mut Vec<UiVertex>,
     images: &'a [String],
     shader_flags: &'a [bool],
+    uvs: &'a [([f32; 2], [f32; 2])],
     screen: [u32; 2],
     origin: [f32; 2],
     /// Uniform 640x480-to-pixel factor. HUD artwork must never stretch on widescreen.
@@ -192,7 +193,11 @@ impl Painter<'_> {
         u_range: [f32; 2], color: [f32; 4],
     ) {
         let Some(index) = self.images.iter().position(|image| image == name) else { return; };
-        let (mut uv0, mut uv1) = image_cell_uv_for_count(index, self.images.len());
+        let (mut uv0, mut uv1) = if self.shader_flags.get(index).copied().unwrap_or(false) {
+            ([0.0, 0.0], [1.0, 1.0])
+        } else {
+            self.uvs.get(index).copied().unwrap_or(([0.0, 0.0], [0.0, 0.0]))
+        };
         let u_start = uv0[0];
         let u_span = uv1[0] - uv0[0];
         uv0[0] = u_start + u_span * u_range[0];
@@ -248,11 +253,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     let Some(hud) = ui.hud else { return; };
     if hud.spectating { return; }
     let ctx = HudRectContext::from_snapshot(ui);
-    let tint = match hud.team {
-        1 => [1.0, 0.5, 0.5, 1.0],
-        2 => [0.5, 0.5, 1.0, 1.0],
-        _ => WHITE,
-    };
+    let tint = super::draw::native_hud_tint(&hud, ui.video.tint_hud);
     // Match the aspect-safe HUD convention used by lagometer, JA+ and JKA:
     // cgs.widthRatioCoef cancels horizontal widescreen stretch. Keep the
     // original 640x480 artwork proportions, but anchor panels to real edges.
@@ -262,7 +263,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     if !ui.native_replaced(crate::extensions::NativeHud::Health) {
         let left = hud_element_rect(HudElementId::Health, ui.hud_layout.health, &ctx, w, h);
         let mut painter = Painter {
-            out, images, shader_flags: shaders, screen: [w, h],
+            out, images, shader_flags: shaders, uvs: &ui.extension_image_uvs, screen: [w, h],
             origin: [left.x, left.y], unit: unit * ui.hud_layout.health.scale.clamp(0.5, 2.0),
         };
         // Original layering: inner frame, armor rings and tic, health ring
@@ -291,7 +292,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
     if !ui.native_replaced(crate::extensions::NativeHud::Ammo) {
         let right = hud_element_rect(HudElementId::Ammo, ui.hud_layout.ammo, &ctx, w, h);
         let mut painter = Painter {
-            out, images, shader_flags: shaders, screen: [w, h],
+            out, images, shader_flags: shaders, uvs: &ui.extension_image_uvs, screen: [w, h],
             origin: [right.x, right.y], unit: unit * ui.hud_layout.ammo.scale.clamp(0.5, 2.0),
         };
         painter.frame(RIGHT_INNER, tint);
@@ -346,9 +347,12 @@ fn select_background(
 pub(in crate::ui) fn build_select_chrome(
     out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::Jk2Prongs) { return; }
     if !ui.jk2_mode || ui.video.hud_style != 1 || !ui.video.draw_hud || w == 0 || h == 0 {
         return;
     }
+    // The status clusters are hidden for spectators; the idle prongs must be too.
+    if ui.hud.is_some_and(|hud| hud.spectating) { return; }
     let selections = [
         ui.weapon_select.map(|value| (value.remaining_ms, SELECT_BG_WEAPON, SELECT_PRONG_WEAPON)),
         ui.force_select.map(|value| (value.remaining_ms, SELECT_BG_FORCE, SELECT_PRONG_FORCE)),
@@ -358,7 +362,7 @@ pub(in crate::ui) fn build_select_chrome(
     let selected = selections.into_iter().flatten().find(|(ms, _, _)| *ms > 0);
     let unit = super::layout::hud_art_scale(w, h);
     let mut painter = Painter {
-        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags, uvs: &ui.extension_image_uvs,
         screen: [w, h], origin: [0.0, 0.0], unit,
     };
     // Prongs are tied to the left and right viewport edges, respectively.
@@ -411,6 +415,7 @@ pub(in crate::ui) fn build_weapon_select(
     out: &mut Vec<UiVertex>, ui: &UiSnapshot,
     font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::WeaponSelect) { return; }
     let Some(selection) = ui.weapon_select else { return; };
     if selection.remaining_ms <= 130 || !(1..=13).contains(&selection.selected) { return; }
     // JK2 displays every owned weapon; weapons without ammo use their
@@ -424,7 +429,7 @@ pub(in crate::ui) fn build_weapon_select(
     };
     let scale = h as f32 / 480.0;
     let mut painter = Painter {
-        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags, uvs: &ui.extension_image_uvs,
         screen: [w, h], origin: [w as f32 * 0.5 - 320.0 * scale, 0.0],
         unit: scale,
     };
@@ -451,6 +456,7 @@ pub(in crate::ui) fn build_inventory_select(
     out: &mut Vec<UiVertex>, ui: &UiSnapshot,
     font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
 ) {
+    if ui.native_replaced(crate::extensions::NativeHud::InventorySelect) { return; }
     let Some(selection) = ui.inventory_select else { return; };
     if selection.remaining_ms <= 130 || !(1..=6).contains(&selection.selected) { return; }
     let visible: Vec<usize> = (1..=6).filter(|id| {
@@ -461,7 +467,7 @@ pub(in crate::ui) fn build_inventory_select(
     let right = (visible.len()-1).min(6) - left;
     let scale = h as f32 / 480.0;
     let mut painter = Painter {
-        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags, uvs: &ui.extension_image_uvs,
         screen: [w, h], origin: [w as f32 * 0.5 - 320.0 * scale, 0.0],
         unit: scale,
     };
@@ -515,6 +521,55 @@ mod tests {
         ui.force_select.as_mut().unwrap().remaining_ms = 65;
         build_select_chrome(&mut out, &ui, 1280, 720);
         assert_eq!(out.len(), 48); // six background slices + two off prongs
+    }
+
+    #[test]
+    fn extension_can_hide_jk2_prongs_without_hiding_selection_icons() {
+        let mut ui = UiSnapshot::default();
+        ui.video.draw_hud = true;
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        ui.weapon_select = Some(crate::ui::UiWeaponSelect {
+            selected: 2, owned_bits: 1 << 2, selectable_bits: 1 << 2,
+            ammo_available_bits: 1 << 2, saber_style: 0, remaining_ms: 1000,
+        });
+        let mut chrome = Vec::new();
+        let mut icons = Vec::new();
+        build_select_chrome(&mut chrome, &ui, 1280, 720);
+        build_weapon_select(&mut icons, &ui, None, 1280, 720);
+        assert!(!chrome.is_empty() && !icons.is_empty());
+
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["jk2_prongs".to_string()]).unwrap();
+        chrome.clear();
+        icons.clear();
+        build_select_chrome(&mut chrome, &ui, 1280, 720);
+        build_weapon_select(&mut icons, &ui, None, 1280, 720);
+        assert!(chrome.is_empty());
+        assert!(!icons.is_empty());
+
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["weapon_select".to_string()]).unwrap();
+        chrome.clear();
+        icons.clear();
+        build_select_chrome(&mut chrome, &ui, 1280, 720);
+        build_weapon_select(&mut icons, &ui, None, 1280, 720);
+        assert!(!chrome.is_empty());
+        assert!(icons.is_empty());
+
+        ui.native_hidden = crate::extensions::NativeHudMask::from_names(
+            &["weapon_select".to_string(), "jk2_prongs".to_string()]).unwrap();
+        chrome.clear();
+        icons.clear();
+        build_select_chrome(&mut chrome, &ui, 1280, 720);
+        build_weapon_select(&mut icons, &ui, None, 1280, 720);
+        assert!(chrome.is_empty() && icons.is_empty());
+        // With the extension hidden by cg_drawHud 0, the weapon selector
+        // returns to native behavior (but JK2's prongs obey cg_drawHud).
+        ui.video.draw_hud = false;
+        build_weapon_select(&mut icons, &ui, None, 1280, 720);
+        assert!(!icons.is_empty());
     }
 
     #[test]

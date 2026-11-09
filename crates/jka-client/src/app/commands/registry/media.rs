@@ -29,7 +29,7 @@ commands! {
         }
     }
 
-    cmd_record ["record", ] ("record [demoname]", "Start recording the current live session to a native demos/*.dm_26 file.", CommandScope::Always) |self, command| {
+    cmd_record ["record", ] ("record [demoname]", "Record the current JKA (.dm_26) or JK2 1.02/1.04 (.dm_15/.dm_16) live session in its native demo format.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb, demo_name] => {

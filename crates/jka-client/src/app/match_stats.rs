@@ -68,6 +68,24 @@ impl MatchStats {
         *self = Self { map, ..Self::default() };
     }
 
+    /// The borrowed follow-camera playerState must not feed personal deltas.
+    /// Keep real match counters intact if we return from spectating later.
+    fn suspend_personal_sampling(&mut self) {
+        if self.last_health.is_none() && self.last_force.is_none()
+            && self.last_hits.is_none() && self.last_scan.is_none()
+        {
+            return;
+        }
+        self.last_health = None;
+        self.last_force = None;
+        self.last_hits = None;
+        self.last_scan = None;
+        for opponent in &mut self.opponents {
+            opponent.seen_since = None;
+            opponent.last_seen = None;
+        }
+    }
+
     /// `kills`/`deaths` against `client` as (you killed them, they killed you).
     pub(in crate::app) fn head_to_head(&self, client: i32) -> Option<(u16, u16)> {
         let opponent = self.opponents.get(usize::try_from(client).ok()?)?;
@@ -80,9 +98,34 @@ fn average(values: impl Iterator<Item = f64>) -> Option<f64> {
     (count > 0).then(|| sum / f64::from(count))
 }
 
+/// Live player identity comes from the connection, never the follow camera.
+/// Spectators must not accumulate personal stats under any client slot.
+fn personal_stats_owner(live: bool, connected: Option<i32>, presented: Option<i32>, spectating: bool) -> Option<i32> {
+    if spectating { None } else if live { connected } else { presented }
+}
+
 impl App {
-    fn stats_viewer(&self) -> Option<i32> {
-        self.game_session.as_ref()?.client_game.presentation_client_num()
+    /// Spectator status is based on our own connection/team, rather than the
+    /// followed player's borrowed PERS_TEAM or clientNum.
+    pub(in crate::app) fn stats_spectating(&self) -> bool {
+        let Some(session) = self.game_session.as_ref() else { return false };
+        if session.live {
+            return self.live_spec_hud_eligible();
+        }
+        if session.local {
+            return self.local_server.as_ref().is_some_and(|server| server.mode() == jka_movement::JoinMode::Spectator);
+        }
+        false
+    }
+
+    pub(in crate::app) fn stats_viewer(&self) -> Option<i32> {
+        let session = self.game_session.as_ref()?;
+        personal_stats_owner(
+            session.live,
+            self.net.as_ref().map(|net| net.session().client_num()),
+            session.client_game.presentation_client_num(),
+            self.stats_spectating(),
+        )
     }
 
     fn stats_team(&self, client: i32) -> i32 {
@@ -102,15 +145,16 @@ impl App {
 
     /// One EV_OBITUARY, already resolved to client numbers.
     pub(in crate::app) fn note_match_obituary(&mut self, target: i32, attacker: Option<i32>, mod_: i32) {
-        let Some(me) = self.stats_viewer() else { return };
+        let me = self.stats_viewer();
         let target_team = self.stats_team(target);
         let attacker_team = attacker.map(|client| self.stats_team(client));
         let target_name = self.game_session.as_ref()
             .and_then(|session| session.client_game.client_name(usize::try_from(target).ok()?))
             .unwrap_or_default();
-        let airborne = self.current_player_state()
+        let airborne = me.is_some_and(|me| self.current_player_state()
+            .filter(|ps| ps.field_i32("clientNum") == Some(me))
             .and_then(|ps| ps.field_i32("groundEntityNum"))
-            .is_some_and(|ground| ground == ENTITYNUM_NONE);
+            .is_some_and(|ground| ground == ENTITYNUM_NONE));
         let stats = &mut self.match_stats;
         stats.team_deaths[target_team.clamp(0, 3) as usize] += 1;
         if let (Some(attacker), Some(team)) = (attacker, attacker_team) {
@@ -118,6 +162,9 @@ impl App {
                 stats.team_kills[team.clamp(0, 3) as usize] += 1;
             }
         }
+        // Team totals remain observable while spectating; personal kills and
+        // deaths only belong to our connected slot while we're playing.
+        let Some(me) = me else { return };
         let now = Instant::now();
         if attacker == Some(me) && target != me {
             stats.kills += 1;
@@ -170,7 +217,16 @@ impl App {
         if map != self.match_stats.map {
             self.match_stats.reset(map);
         }
-        let Some(ps) = self.current_player_state() else { return };
+        let Some(me) = self.stats_viewer() else {
+            self.match_stats.suspend_personal_sampling();
+            return;
+        };
+        // Follow mode uses the watched player's playerState, even when the
+        // network slot still identifies us. Never sample another player's PS.
+        let Some(ps) = self.current_player_state().filter(|ps| ps.field_i32("clientNum") == Some(me)) else {
+            self.match_stats.suspend_personal_sampling();
+            return;
+        };
         let health = ps.stats[0];
         let armor = ps.stats[5];
         let spawn = ps.persistant[4];
@@ -179,14 +235,13 @@ impl App {
         let hits = ps.persistant[1];
         let origin = playerstate_vec3(ps, "origin");
         let angles = playerstate_vec3(ps, "viewangles");
-        let me = self.stats_viewer();
 
         let stats = &mut self.match_stats;
         if let Some((last_health, last_armor, last_spawn)) = stats.last_health {
             let lost = (last_health - health).max(0) + (last_armor - armor).max(0);
             if spawn == last_spawn && health > 0 && lost > 0 {
                 stats.damage_taken += lost;
-                if Some(attacker) != me {
+                if attacker != me {
                     if let Some(opponent) = stats.opponent(attacker) {
                         opponent.damage_taken += lost;
                     }
@@ -208,7 +263,7 @@ impl App {
             return;
         }
         stats.last_scan = Some(now);
-        let (Some(origin), Some(angles), Some(me)) = (origin, angles, me) else { return };
+        let (Some(origin), Some(angles)) = (origin, angles) else { return };
         let eye = [origin[0], origin[1], origin[2] + 36.0];
         let (yaw, pitch) = (angles[1].to_radians(), angles[0].to_radians());
         let forward = [pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), -pitch.sin()];
@@ -321,6 +376,37 @@ mod tests {
         stats.reset("mp/ffa3".into());
         assert_eq!(stats.head_to_head(4), None);
         assert_eq!(stats.map, "mp/ffa3");
+    }
+
+    #[test]
+    fn spectator_follow_does_not_take_the_watched_players_identity() {
+        // Own slot 2, following slot 7: no personal stats as a spectator.
+        assert_eq!(personal_stats_owner(true, Some(2), Some(7), true), None);
+        // When playing, camera ownership still cannot replace connection identity.
+        assert_eq!(personal_stats_owner(true, Some(2), Some(7), false), Some(2));
+        assert_eq!(personal_stats_owner(true, None, Some(7), false), None);
+        // Local and demo play still use their presentation slot.
+        assert_eq!(personal_stats_owner(false, None, Some(7), false), Some(7));
+    }
+
+    #[test]
+    fn spectating_clears_sampling_baselines_but_preserves_real_kills() {
+        let mut stats = MatchStats::default();
+        stats.kills = 2;
+        stats.opponent(4).unwrap().kills = 2;
+        stats.last_health = Some((100, 25, 1));
+        stats.last_force = Some(45);
+        stats.last_hits = Some(6);
+        stats.last_scan = Some(Instant::now());
+        stats.opponent(4).unwrap().seen_since = Some(Instant::now());
+        stats.suspend_personal_sampling();
+        assert!(stats.last_health.is_none());
+        assert!(stats.last_force.is_none());
+        assert!(stats.last_hits.is_none());
+        assert!(stats.last_scan.is_none());
+        assert!(stats.opponents[4].seen_since.is_none());
+        assert_eq!(stats.kills, 2);
+        assert_eq!(stats.head_to_head(4), Some((2, 0)));
     }
 
     #[test]

@@ -232,6 +232,11 @@ impl App {
             Arc::new(Vec::new())
         };
         RenderSnapshot {
+            weather_server_time_ms: (!isolated_preview && !self.front_end).then(|| {
+                self.game_session.as_ref().and_then(|session| {
+                    session.current_snapshot.as_ref().map(|_| session.cgame_time)
+                })
+            }).flatten(),
             studio_lens: (self.front_end&&self.frontend_page==FrontendPage::RenderStudio)
                 .then(|| {
                     let key=self.render_studio.camera_rig_runtime.camera.filter(|_|self.render_studio.timeline.camera_rig.active())
@@ -553,9 +558,20 @@ impl App {
             || !(1..12).contains(&selected)
             || ps.stats[2] & (1 << selected) == 0
         { return None; }
+        // Presented holdable tags are JKA's; the native JK2 HUD uses JK2 HI_*.
+        let (selected, owned_bits) = if self.live_input.is_jk2() {
+            use jka_protocol::jk2::presentation::presented_holdable;
+            let wire = |presented: i32| (1..7).find(|&tag| presented_holdable(tag) == Some(presented));
+            let Some(tag) = wire(i32::from(selected)) else { return None; };
+            (tag as u8, (1..7).filter(|&tag| presented_holdable(tag)
+                .is_some_and(|id| ps.stats[2] & (1 << id) != 0))
+                .fold(0_u32, |bits, tag| bits | 1 << tag))
+        } else {
+            (selected, ps.stats[2] as u32)
+        };
         Some(ui::UiInventorySelect {
             selected,
-            owned_bits: ps.stats[2] as u32,
+            owned_bits,
             remaining_ms: until.saturating_duration_since(now).as_millis().min(u32::MAX as u128) as u32,
         })
     }
@@ -593,7 +609,16 @@ impl App {
         { return None; }
         let mut selectable_bits = 0_u32;
         let mut ammo_available_bits = 0_u32;
-        for weapon in 1..=(if self.live_input.is_jk2() { 13 } else { 16 }) {
+        // The presented playerState and live_input use JKA weapon_t; the native
+        // JK2 carousel (icons, ammo table, detpack id) is JK2-numbered.
+        let jk2 = self.live_input.is_jk2();
+        let owns = |weapon: i32| {
+            let presented = if jk2 {
+                jka_protocol::jk2::presentation::presented_weapon(weapon)
+            } else { Some(weapon) };
+            presented.is_some_and(|id| ps.stats[4] & (1 << id) != 0)
+        };
+        for weapon in 1..=(if jk2 { 13 } else { 16 }) {
             let (ammo_index, primary_cost, alt_cost) = if self.live_input.is_jk2() {
                 let index = ui::jk2_ammo_index(weapon);
                 (index, 1, 1)
@@ -609,13 +634,22 @@ impl App {
             let detpack_valid = weapon != detpack_id || ammo > 0
                 || ps.field_i32("hasDetPackPlanted").unwrap_or(0) != 0;
             if has_ammo { ammo_available_bits |= 1 << weapon; }
-            if ps.stats[4] & (1 << weapon) != 0 && has_ammo && detpack_valid {
+            if owns(weapon) && has_ammo && detpack_valid {
                 selectable_bits |= 1 << weapon;
             }
         }
+        let (selected, owned_bits) = if jk2 {
+            (
+                jka_protocol::jk2::presentation::wire_weapon(i32::from(self.live_input.weapon_select))
+                    .unwrap_or(0) as u8,
+                (1..=13).filter(|&weapon| owns(weapon)).fold(0_u32, |bits, weapon| bits | 1 << weapon),
+            )
+        } else {
+            (self.live_input.weapon_select, ps.stats[4] as u32)
+        };
         Some(ui::UiWeaponSelect {
-            selected: self.live_input.weapon_select,
-            owned_bits: ps.stats[4] as u32,
+            selected,
+            owned_bits,
             selectable_bits,
             ammo_available_bits,
             saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),

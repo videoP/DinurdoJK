@@ -177,7 +177,7 @@ impl App {
         theme::section(
             ui,
             "MOON",
-            "Blue Water sky only. Map illumination requires Relight map and Sky world illumination on Relighting. Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
+            "Blue Water sky only. Map moon illumination uses Relight map, while the Sky bake A/B controls baked sky ambient in Relighting (requires CSM and baked sun cache). Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
         );
         changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. The automatic moon light follows phase, independently of its position lock.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
         theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. The world needs Relight map; the water always follows it. Separate from moon disc brightness.", theme::Reset::None, |ui| {
@@ -234,7 +234,7 @@ impl App {
         changed |= sky_slider(ui, "Mie / sun aureole", "Strength of the glow around the sun.", &mut s.mie, d.mie, 0.0, 2.0);
         changed |= sky_slider(ui, "Mie directionality", "How tightly the aureole hugs the sun. Higher is a smaller, brighter halo.", &mut s.mie_g, d.mie_g, 0.0, 0.95);
         changed |= sky_slider(ui, "Multiple scattering", "Light scattered more than once; brightens the sky away from the sun.", &mut s.multiple, d.multiple, 0.0, 3.0);
-        changed |= sky_slider(ui, "Night sky brightness", "Dims the dome's flat night glow only (1 is upstream). Stars, the Milky Way and the world's night light are unchanged.", &mut s.night_sky, d.night_sky, 0.0, 1.0);
+        changed |= sky_slider(ui, "Night sky brightness", "Dims the dome's flat night glow and the native ocean's reflected night-sky fill. The optimized Hybrid material also corrects its brighter night horizon. Stars, direct moon highlights and world night lighting are unchanged.", &mut s.night_sky, d.night_sky, 0.0, 1.0);
         changed |= sky_slider(ui, "Sun size", "Apparent size of the sun's disc and corona (1 is upstream). Appearance only; sunlight is unchanged.", &mut s.sun_size, d.sun_size, 0.25, 30.0);
         changed |= sky_slider(ui, "Moon size", "Apparent size of the moon's disc and halo (1 is upstream). Appearance only; moonlight is unchanged.", &mut s.moon_size, d.moon_size, 0.25, 30.0);
         if changed {

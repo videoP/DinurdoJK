@@ -208,7 +208,7 @@ fn force_shockwave_surface(
         material_trace: Some(Arc::from("INTERNAL: depth-aware Force Push/Pull screen-space shockwave")),
         entity_num: cosmetic.entity_num,
         wireframe_class: DynamicWireframeClass::Effect,
-        raster_visible: true,
+        raster_visible: true, portal_only: false,
         vertices: Arc::new(vertices),
         // The basis is (forward, left, up). With the positions above, the
         // triangle normal points back to the eye and survives backface culling.
@@ -1478,7 +1478,7 @@ impl EntityPresenter {
                     ))),
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Entity,
-                    raster_visible: true,
+                    raster_visible: true, portal_only: false,
                     vertices,
                     indices,
                     lighting_origin: Some(origin),
@@ -1904,7 +1904,7 @@ impl EntityPresenter {
                 crate::renderer::Ghoul2GpuSkinning{ foliage_wind: false,mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
             })}else{None};
             let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
-            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
+            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
         }}Ok(draws)
     }
 
@@ -2015,7 +2015,7 @@ impl EntityPresenter {
                 ))),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices, indices,
                 lighting_origin: Some(origin),
                 // Reflection, detail, translucency and other overlay stages do
@@ -2122,7 +2122,7 @@ impl EntityPresenter {
                 }),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices,
                 indices: surface_asset.two_sided_indices.as_ref()
                     .map(Arc::clone).unwrap_or(indices),
@@ -2222,7 +2222,7 @@ impl EntityPresenter {
                 material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Entity,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices,
                 indices: surface_asset.two_sided_indices.as_ref()
                     .map(Arc::clone).unwrap_or(indices),
@@ -2471,7 +2471,7 @@ impl EntityPresenter {
                 material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices,
                 indices: surface_asset.two_sided_indices.as_ref()
                     .map(Arc::clone).unwrap_or(indices),
@@ -2552,7 +2552,7 @@ impl EntityPresenter {
                 material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices,
                 indices: surface_asset.two_sided_indices.as_ref()
                     .map(Arc::clone).unwrap_or(indices),
@@ -2609,7 +2609,7 @@ impl EntityPresenter {
                     mesh_key:Arc::from(format!("{}#surface{}",asset.key,surface.surface_index)),vertices:gpu.clone(),indices:indices.clone(),
                     bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:surface.source_material.clone()
                 })}else{None};
-                draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
+                draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
             }
         }Ok(draws)
     }
@@ -3078,7 +3078,7 @@ impl EntityPresenter {
                 material_trace: Some(Arc::from(shader)),
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Effect,
-                raster_visible: true,
+                raster_visible: true, portal_only: false,
                 vertices: Arc::clone(&vertices),
                 indices: Arc::clone(&indices),
                 lighting_origin: None,
@@ -3145,7 +3145,8 @@ impl EntityPresenter {
         let has_shader_definition = jka_assets::shader::find_shader(&self.shaders, &effective).is_some();
         let stages = jka_assets::shader::find_shader(&self.shaders, &effective).map(|shader| {
             shader.stages.iter().filter(|stage| {
-                !stage.image.is_empty()
+                !(stage.detail && !crate::materials::legacy_detail_textures_enabled())
+                    && !stage.image.is_empty()
                     && (!stage.image.starts_with('$') || stage.image == "$whiteimage" || stage.image == "$lightmap")
             }).cloned().collect::<Vec<_>>()
         }).unwrap_or_default();
@@ -3177,8 +3178,7 @@ impl EntityPresenter {
                 texture,
                 blend: FxBlend::from_blend_func(&stage.blend),
                 rgb_vertex: stage.rgb_gen.uses_vertex_color() || stage.entity_rgb,
-                alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex)
-                    || (stage.alpha_gen == AlphaGen::Identity && stage.rgb_gen == RgbGen::Vertex),
+                alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
                 rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
                 alpha_const: stage.alpha.unwrap_or(1.0),
                 rgb_wave: match stage.rgb_gen { RgbGen::Wave(wave) => Some(wave), _ => None },

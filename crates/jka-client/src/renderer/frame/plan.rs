@@ -151,7 +151,8 @@ impl Renderer {
         // pass can resolve the float scene to the swapchain. Keep HDR out of the
         // full-post bucket so forced Unified/Advanced + r_hdr 1 pays only the
         // unavoidable 16F bandwidth and one tiny fullscreen resolve.
-        let hdr_resolve = self.hdr_enabled || self.native_atmosphere_active()
+        let hdr_resolve = self.hdr_enabled
+            || (self.cloud_backend == 1 && self.clouds_enabled)
             || self.blue_water_environment.weather_backend == 1;
         let rain_spatial_post = self.weather.rain.enabled && !self.weather.rain.fast_post;
         let rain_lens_copy = self.weather.rain.enabled
@@ -218,9 +219,7 @@ impl Renderer {
             || self.ssr_enabled
             || self.reflection_debug_enabled
             || self.motion_blur_strength > 0.001
-            || self.dof_draws_this_plan()
-            // The policy mask marks lightmapped world for baked sky light.
-            || self.sky_world_baked();
+            || self.dof_draws_this_plan();
         let needs_linear_depth = other_linear_depth || rain_spatial_post;
         // Which consumers asked for the full prepass (bit order matches the
         // `other_linear_depth` terms, then rain); recorded by render_perf_capture.

@@ -16,15 +16,20 @@ struct Composition {
     /// r_staticWorldCsm: also write the unshadowed-minus-baked sun amount so
     /// static cascades can replace baked visibility near the camera.
     static_csm: bool,
-    /// Baked Blue Water sky world illumination: strength and a quantized key of
-    /// the sky's light (recompose only when it visibly changes).
-    sky: Option<(f32, [i32; 5])>,
+    /// Cached, ray-traced sky openness gates only the sky component.
+    isolate_sky: bool,
+    /// Sky illumination (Blue Water environment or vanilla sunlight curve):
+    /// strength and quantized input key, so unchanged frames do not recompose.
+    sky: Option<(f32, [i32; 6])>,
 }
 
-/// Blue Water sky world illumination inputs for one composition.
+/// Shared BSP sky-bake inputs. Vanilla doesn't initialize Blue Water just to
+/// sample a sun-elevation curve; the existing dummy atlas satisfies bindings.
 pub(in crate::renderer) struct SkyInputs<'a> {
     pub normals: &'a [GpuImage],
-    pub environment: &'a ::blue_water_sky::environment::EnvironmentMap,
+    pub environment: Option<&'a ::blue_water_sky::environment::EnvironmentMap>,
+    pub moon: Option<([f32; 3], f32)>,
+    pub vanilla_toward_sun: Option<[f32; 3]>,
 }
 
 pub(in crate::renderer) struct LightmapCache {
@@ -47,6 +52,7 @@ pub(in crate::renderer) struct LightmapCache {
     dummy_environment: (GpuImage, wgpu::Sampler, wgpu::Buffer),
     /// Time-of-day drift recomposes in place at most once per second.
     sky_composed_at: Option<std::time::Instant>,
+    vertex_sky: Option<VertexSkyGpu>,
 }
 
 #[repr(C)]
@@ -60,236 +66,131 @@ struct Parameters {
     direction_strength: [f32; 4],
     smoothing: [f32; 4],
     sky: [f32; 4],
+    moon: [f32; 4],
 }
 
-const SKY_AND_AUX_WGSL: &str = r#"
-@group(0) @binding(7) var sun_aux:texture_storage_2d<rgba8unorm,write>;
-@group(0) @binding(8) var sky_normals:texture_2d<u32>;
-@group(0) @binding(9) var sky_atlas:texture_2d<f32>;
-@group(0) @binding(10) var sky_atlas_sampler:sampler;
-@group(0) @binding(11) var<uniform> sky_environment:SkyEnvironment;
-fn sky_octahedral_decode(e:vec2<f32>)->vec3<f32> {
-    var n=vec3(e.x,e.y,1.0-abs(e.x)-abs(e.y));
-    let t=max(-n.z,0.0);
-    n.x+=select(t,-t,n.x>=0.0);
-    n.y+=select(t,-t,n.y>=0.0);
-    return normalize(n);
+/// GPU-only, change-triggered sky gain for static LIGHTMAP_BY_VERTEX BSP
+/// surfaces (including foliage/patches as well as compiled model materials). Original RGB is retained in a tiny immutable receiver list;
+/// the existing indexed world buffer is rewritten only on sky changes, never
+/// on draw. Nothing is added to the minimal world fragment/vertex pipelines.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VertexSkyInput {
+    gpu_index: u32,
+    packed: u32,
+    reserved: [u32; 2],
+    authored_color: [f32; 4],
 }
-// The Blue Water sky world illumination of blue_water_scene.wgsl `light`,
-// evaluated once per luxel with the bake's smoothed normal (and optional sky
-// visibility) instead of a per-pixel depth-derived facet normal.
-fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
-    if parameters.sky.y<0.5 { return vec3(1.0); }
-    let packed=textureLoad(sky_normals,at,0).r;
-    if (packed & 0x80000000u)==0u { return vec3(1.0); }
-    let e=vec2(f32((packed>>8u)&2047u),f32((packed>>19u)&2047u))/2047.0*2.0-1.0;
-    let n=sky_octahedral_decode(e);
-    let visibility=f32(packed&255u)/255.0;
-    let ambient=env_irradiance(sky_atlas,sky_atlas_sampler,sky_environment,n)/3.14159265*visibility;
-    let incidence=max(dot(n,sky_environment.light_direction),0.0);
-    let direct=sky_environment.light_color*sky_environment.light_intensity*incidence;
-    return mix(vec3(1.0),clamp(ambient*0.5+direct*0.2,vec3(0.03),vec3(4.0)),parameters.sky.x);
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct VertexSkySettings {
+    moon: [f32; 4],
+    flags: [u32; 4],
 }
-"#;
+struct VertexSkyGpu {
+    pipeline: wgpu::ComputePipeline,
+    source: wgpu::Buffer,
+    generation: u64,
+    count: u32,
+    /// Receiver offset of first inline *N RGB; use this for mover-only redo.
+    inline_start: u32,
+    active: bool,
+    moon: Option<([f32; 3], f32)>,
+    vanilla_toward_sun: Option<[f32; 3]>,
+    strength: f32,
+    isolate_sky: bool,
+}
+impl VertexSkyGpu {
+    fn new(device: &wgpu::Device, generation: u64, samples: &[VertexSkyInput], static_vertex_count: usize) -> Self {
+        let shader_text = format!("{}\n{}", include_str!("vertex_sky.wgsl"), include_str!("vanilla_sky_lighting.wgsl"));
+        let module = blue_water_clouds::shaders::compose(
+            &shader_text, "static BSP vertex sky bake", &[],
+        ).expect("vertex sky bake shader");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("static BSP vertex sky bake"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("static BSP vertex sky bake"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("authored static vertex sky receivers"),
+            contents: bytemuck::cast_slice(samples),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let inline_start = samples.partition_point(|s| (s.gpu_index as usize) < static_vertex_count) as u32;
+        Self { pipeline, source, generation, count: samples.len() as u32, inline_start, active: false, moon: None, vanilla_toward_sun: None, strength: 0.0, isolate_sky: false }
+    }
 
-fn cache_shader() -> String {
-    // Both the live fallback and the bake execute the same subtraction/tone
-    // functions. There is one compositor regardless of which input changed.
-    let world = include_str!("../../bsp.wgsl");
-    let tone = world.find("fn baked_indirect_tone(").unwrap();
-    let start = world.find("fn baked_file_to_linear(").unwrap();
-    let end = world.find("fn sample_authored_baked_sun(").unwrap();
-    let shader = format!(
-        r#"#import naval_sky::environment::{{SkyEnvironment, env_irradiance}}
-struct Settings {{ baked_sun_direction_strength:vec4<f32>, baked_sun_radiance:vec4<f32>, baked_sun_debug_mode:vec4<u32>, baked_indirect_adjust:vec4<f32>, baked_indirect_curve:vec4<f32> }}
-var<private> lighting_settings:Settings;
-struct VertexOut {{baked_sun_fit:vec4<f32>,world_normal:vec3<f32>}}
-struct Parameters {{fit:vec4<f32>,radiance_strength:vec4<f32>,adjust:vec4<f32>,curve:vec4<f32>,sun:vec4<f32>,direction_strength:vec4<f32>, smoothing:vec4<f32>, sky:vec4<f32>}}
-@group(0) @binding(0) var source:texture_2d<f32>;
-@group(0) @binding(1) var corrected:texture_storage_2d<rgba16float,write>;
-@group(0) @binding(2) var<uniform> parameters:Parameters;
-@group(0) @binding(3) var sun_flux:texture_2d<f32>;
-@group(0) @binding(4) var baked_local_texture:texture_2d_array<f32>;
-@group(0) @binding(5) var<storage,read> local_colors:array<vec4<f32>>;
-@group(0) @binding(6) var charts:texture_2d<u32>;
-fn baked_luminance(rgb:vec3<f32>)->f32 {{return dot(rgb,vec3(0.2126,0.7152,0.0722));}}
-{}
-{}
-fn source_luxel(at:vec2<i32>)->vec4<f32> {{
-    let texel=textureLoad(source,clamp(at,vec2(0),vec2<i32>(textureDimensions(source))-1),0);
-    var input:VertexOut; input.baked_sun_fit=parameters.fit;input.world_normal=vec3(0.0,1.0,0.0);
-    var rgb=texel.rgb;
-    if parameters.fit.z==4.0 {{rgb=subtract_authored_baked_sun(rgb,texel.a,input);}}
-    return vec4(rgb,texel.a);
-}}
+    fn replace_samples(&mut self, device: &wgpu::Device, generation: u64, samples: &[VertexSkyInput], static_vertex_count: usize) {
+        // Keep the lazily compiled pipeline alive across sun/sky re-bakes.
+        self.source = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("authored static vertex sky receivers"),
+            contents: bytemuck::cast_slice(samples),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        self.generation = generation;
+        self.count = samples.len() as u32;
+        self.inline_start = samples.partition_point(|s| (s.gpu_index as usize) < static_vertex_count) as u32;
+    }
 
-// Reconstruct from immutable luxels, not from previously smoothed output.
-// Both kernels use a 4x4 neighborhood only during the change-triggered bake.
-fn cubic_weight(d:f32, mode:f32)->f32 {{
-    let x=abs(d);
-    if mode > 1.5 {{
-        // Cubic B-spline: gentle low-pass with continuous gradients.
-        if x < 1.0 {{ return (4.0-6.0*x*x+3.0*x*x*x)/6.0; }}
-        if x < 2.0 {{ let t=2.0-x; return t*t*t/6.0; }}
-    }} else {{
-        // Catmull-Rom: interpolate the authored luxels without softening them.
-        if x < 1.0 {{ return 1.0-2.5*x*x+1.5*x*x*x; }}
-        if x < 2.0 {{ return 2.0-4.0*x+2.5*x*x-0.5*x*x*x; }}
-    }}
-    return 0.0;
-}}
-fn chart_at(at:vec2<i32>)->u32 {{
-    if parameters.smoothing.z < 0.5 {{ return 0u; }}
-    return textureLoad(charts,clamp(at,vec2(0),vec2<i32>(textureDimensions(charts))-1),0).r;
-}}
-fn filtered_source(at:vec2<f32>)->vec4<f32> {{
-    let p=vec2<i32>(floor(at));
-    let f=fract(at);
-    let c00=source_luxel(p);
-    let c10=source_luxel(p+vec2(1,0));
-    let c01=source_luxel(p+vec2(0,1));
-    let c11=source_luxel(p+vec2(1,1));
-    let bilinear=mix(mix(c00,c10,f.x),mix(c01,c11,f.x),f.y);
-    if parameters.smoothing.x < 0.5 {{ return bilinear; }}
-    // The chart of the nearest original luxel owns this output luxel. Taps
-    // from any other atlas chart are dropped and the kernel renormalized, so
-    // neighbouring islands in the packed lightmap can never bleed in.
-    let nearest=p+select(vec2(0),vec2(1),f>=vec2(0.5));
-    let owner=chart_at(nearest);
-    var value=vec4(0.0);
-    var weights=0.0;
-    var lo=vec4(1e30);
-    var hi=vec4(-1e30);
-    for (var y=0; y<4; y+=1) {{
-        for (var x=0; x<4; x+=1) {{
-            let offset=vec2<i32>(x-1,y-1);
-            if owner != 0u && chart_at(p+offset) != owner {{ continue; }}
-            let luxel=source_luxel(p+offset);
-            let weight=cubic_weight(f.x-f32(offset.x),parameters.smoothing.x)
-                       *cubic_weight(f.y-f32(offset.y),parameters.smoothing.x);
-            value+=luxel*weight;
-            weights+=weight;
-            // Limit halo/overshoot to the same-chart 2x2 footprint.
-            if all(offset>=vec2(0)) && all(offset<=vec2(1)) {{ lo=min(lo,luxel); hi=max(hi,luxel); }}
-        }}
-    }}
-    if weights <= 1e-4 {{ return source_luxel(nearest); }}
-    return clamp(value/weights,lo,hi);
-}}
-fn raw_bilinear(at:vec2<f32>)->vec4<f32> {{
-    let p=vec2<i32>(floor(at));
-    let f=fract(at);
-    let size=vec2<i32>(textureDimensions(source))-1;
-    let a=textureLoad(source,clamp(p,vec2(0),size),0);
-    let b=textureLoad(source,clamp(p+vec2(1,0),vec2(0),size),0);
-    let c=textureLoad(source,clamp(p+vec2(0,1),vec2(0),size),0);
-    let d=textureLoad(source,clamp(p+vec2(1,1),vec2(0),size),0);
-    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
-}}
-fn signal_hue(h:f32)->vec3<f32> {{
-    return clamp(abs(fract(h+vec3(0.0,2.0/3.0,1.0/3.0))*6.0-3.0)-1.0,vec3(0.0),vec3(1.0));
-}}
-// r_lightmapSignal: show ONE input of the composition in place of the result.
-fn lightmap_signal(which:u32,id:vec2<u32>,at:vec2<f32>,base:vec4<f32>,dims:vec2<u32>)->vec3<f32> {{
-    if which==1u {{ return raw_bilinear(at).rgb; }}
-    if which==2u {{ return baked_indirect_tone(base.rgb); }}
-    if which==3u {{ return vec3(raw_bilinear(at).a); }}
-    // New-sun layers exist only once the static sun bake is composed.
-    if parameters.sun.w<=0.0 {{ return vec3(1.0,0.0,1.0); }}
-    let at_flux=vec2<i32>(id);
-    let layer_a=textureLoad(sun_flux,at_flux,0).r;
-    let layer_b=textureLoad(sun_flux,at_flux+vec2(0,i32(dims.y)),0).r;
-    if which==4u {{ return vec3(max(layer_a,0.0)); }}
-    if which==5u {{ return vec3(max(layer_b,0.0)); }}
-    if which==6u {{
-        if layer_b<=0.001 {{ return vec3(0.02,0.05,0.6); }}
-        return mix(vec3(1.0,0.03,0.02),vec3(0.02,1.0,0.03),clamp(layer_a/layer_b,0.0,1.0));
-    }}
-    if layer_a<=0.0 && layer_b<=0.0 {{ return vec3(0.0); }}
-    // Triangle boundary: the receiver-triangle hash differs from a neighbour.
-    var offsets=array<vec2<i32>,4>(vec2(1,0),vec2(-1,0),vec2(0,1),vec2(0,-1));
-    var edge=false;
-    for (var i=0; i<4; i+=1) {{
-        let n=clamp(at_flux+offsets[i],vec2(0),vec2<i32>(dims)-1);
-        let other=textureLoad(sun_flux,n+vec2(0,i32(dims.y)),0).r;
-        if other>0.0 && abs(other-layer_b)>1e-5 {{ edge=true; }}
-    }}
-    var color=signal_hue(layer_a)*0.75+0.1;
-    if which==8u {{ color=mix(vec3(0.08),vec3(1.0,0.75,0.1),clamp(layer_a,0.0,1.0)); }}
-    return select(color,vec3(1.0),edge);
-}}
-@compute @workgroup_size(8,8)
-fn main(@builtin(global_invocation_id) id:vec3<u32>) {{
-    let dims=textureDimensions(corrected);if any(id.xy>=dims) {{return;}}
-    lighting_settings.baked_sun_direction_strength=vec4(0.0,1.0,0.0,parameters.radiance_strength.w);
-    lighting_settings.baked_sun_radiance=vec4(parameters.radiance_strength.rgb,1.0);
-    lighting_settings.baked_sun_debug_mode=vec4<u32>(0u);
-    lighting_settings.baked_indirect_adjust=parameters.adjust;
-    lighting_settings.baked_indirect_curve=parameters.curve;
-    // Subtract each original luxel BEFORE resampling, matching normal filtering.
-    let at=(vec2<f32>(id.xy)+0.5)*vec2<f32>(textureDimensions(source))/vec2<f32>(dims)-0.5;
-    let base=filtered_source(at);
-    var result=base;
-    if parameters.sun.w>0.0 {{
-        let incident=max(textureLoad(sun_flux,vec2<i32>(id.xy),0).r,0.0);
-        let indirect=baked_indirect_tone(base.rgb);
-        if parameters.sun.w<1.5 {{
-            result=vec4(indirect+parameters.sun.rgb*incident,incident);
-        }} else {{
-            // Keep static-world darkening separate from moving actors: baked
-            // world shadows already have contrast in the original lightmap.
-            let facing=parameters.direction_strength.w;
-            // Flux already includes cosine; the unoccluded facing is stored
-            // separately in the second half of the incident image (below).
-            let cosine=max(textureLoad(sun_flux,vec2<i32>(id.xy)+vec2(0,i32(dims.y)),0).r,0.0);
-            let factor=max(1.0-facing*(cosine-incident),1e-5);
-            result=vec4(indirect*factor,clamp(parameters.curve.w*incident/factor,0.0,1.0));
-        }}
-    }}
-    if parameters.smoothing.y > 0.5 {{
-        textureStore(corrected,vec2<i32>(id.xy),vec4(lightmap_signal(u32(parameters.smoothing.y),id.xy,at,base,dims),0.0));
-        return;
-    }}
-    if parameters.curve.z > 0.0 {{
-        if parameters.sun.w <= 0.0 {{ result = vec4(baked_indirect_tone(base.rgb),0.0); }}
-        var local = vec3(0.0);
-        let uv=(vec2<f32>(id.xy)+0.5)/vec2<f32>(dims);
-        for (var i=0u;i<u32(parameters.curve.z);i+=1u) {{ local += local_colors[i].rgb*sample_baked_local(uv,i32(i)); }}
-        result=vec4(result.rgb+local,result.a);
-    }}
-    // Sky world illumination scales all baked light, like the screen pass it
-    // replaces for lightmapped world. Explicit-sun alpha is sun flux in
-    // lightmap units, so it carries the same (luminance) gain.
-    let explicit_sun=parameters.sun.w>0.0 && parameters.sun.w<1.5;
-    let gain=sky_world_gain(vec2<i32>(id.xy));
-    let gain_y=max(baked_luminance(gain),1e-4);
-    result=vec4(result.rgb*gain,result.a*select(1.0,gain_y,explicit_sun));
-    if parameters.sky.z>0.5 {{
-        // Unshadowed minus baked static sunlight, in alpha units: inside
-        // cascade range the static-world CSM re-applies visibility to it.
-        var shadowed=0.0;
-        if explicit_sun {{
-            let incident=max(textureLoad(sun_flux,vec2<i32>(id.xy),0).r,0.0);
-            let cosine=max(textureLoad(sun_flux,vec2<i32>(id.xy)+vec2(0,i32(dims.y)),0).r,0.0);
-            shadowed=max(cosine-incident,0.0)*gain_y;
-        }}
-        textureStore(sun_aux,vec2<i32>(id.xy),vec4(clamp(shadowed*0.25,0.0,1.0),0.0,0.0,1.0));
-    }}
-    textureStore(corrected,vec2<i32>(id.xy),result);
-}}
-"#,
-        &world[tone..start],
-        &world[start..end]
-    );
-    let helpers = include_str!("lightmap_local.wgsl")
-        .split("// Runtime receiver helpers.")
-        .next()
-        .unwrap();
-    shader.replace(
-        "@compute @workgroup_size",
-        &format!("{helpers}\n{SKY_AND_AUX_WGSL}\n@compute @workgroup_size"),
-    )
+    fn dispatch(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &wgpu::Buffer,
+        environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
+        fallback: (&GpuImage, &wgpu::Sampler, &wgpu::Buffer),
+        moon: Option<([f32; 3], f32)>, vanilla_toward_sun: Option<[f32; 3]>,
+        active: bool, strength: f32, isolate_sky: bool, receiver_offset: u32,
+    ) {
+        if receiver_offset >= self.count { return; }
+        let settings = VertexSkySettings {
+            moon: vanilla_toward_sun.map_or_else(
+                || moon.map_or([0.0; 4], |(d, intensity)| [d[0], d[1], d[2], intensity]),
+                |d| [d[0], d[1], d[2], 0.0],
+            ),
+            flags: [u32::from(active), u32::from(moon.is_some()), strength.to_bits(),
+                u32::from(vanilla_toward_sun.is_some()) | (u32::from(isolate_sky) << 1) | (receiver_offset << 2)],
+        };
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("static vertex sky bake parameters"),
+            contents: bytemuck::bytes_of(&settings),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("static vertex sky bake inputs"),
+            layout: &self.pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.source.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: vertices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(environment.map_or(&fallback.0.view, |e| &e.view)) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(environment.map_or(fallback.1, |e| &e.sampler)) },
+                wgpu::BindGroupEntry { binding: 4, resource: environment.map_or(fallback.2, |e| &e.uniforms).as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: uniform.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("update baked vertex sky RGB"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("update baked vertex sky RGB"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups((self.count - receiver_offset).div_ceil(64), 1, 1);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
 }
+
+#[path = "baked_sun_shader.rs"]
+mod composition_shader;
+use composition_shader::cache_shader;
 
 fn cache_module() -> Result<wgpu::naga::Module, String> {
     blue_water_clouds::shaders::compose(&cache_shader(), "JKA lightmap composition", &[])
@@ -298,7 +199,7 @@ fn cache_module() -> Result<wgpu::naga::Module, String> {
 fn sun_aux_images(device: &wgpu::Device, sizes: &[[u32; 2]]) -> Vec<GpuImage> {
     sizes.iter().map(|s| {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("composed static sun shadow amount"),
+            label: Some("composed static sun shadow and sky overlay gain"),
             size: wgpu::Extent3d { width: s[0], height: s[1], depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -342,19 +243,33 @@ impl LightmapCache {
     pub(in crate::renderer) fn has_composition(&self) -> bool {
         self.composition.is_some()
     }
-    /// Per-page static sun shadow amounts while r_staticWorldCsm composes.
+
+    pub(in crate::renderer) fn vertex_sky_active(&self) -> bool {
+        self.vertex_sky.as_ref().is_some_and(|state| state.active)
+    }
+
+    /// A cold material remap replaces the immutable receiver list. Its next
+    /// generation may numerically match the previous map's first generation.
+    pub(in crate::renderer) fn invalidate_vertex_sky(&mut self) {
+        if let Some(state) = self.vertex_sky.as_mut() {
+            state.generation = u64::MAX;
+        }
+    }
+    /// Per-page static sun shadow (R) and baked sky overlay gain (G/B/A).
     pub(in crate::renderer) fn sun_aux(&self) -> &[GpuImage] {
         &self.sun_aux
+    }
+
+    /// True only after a composed sky page with the overlay gain has been
+    /// installed. Other composition modes leave overlay shaders unchanged.
+    pub(in crate::renderer) fn sky_overlay_active(&self) -> bool {
+        self.active && self.signal == 0 && !self.sun_aux.is_empty()
+            && self.composition.as_ref().and_then(|c| c.sky).is_some_and(|s| s.0 > 0.0)
     }
     pub(in crate::renderer) fn static_csm_active(&self) -> bool {
         self.active && !self.sun_aux.is_empty()
             && self.composition.as_ref().is_some_and(|c| c.static_csm && c.mode > 0.0 && c.mode < 1.5)
     }
-    /// Lightmapped world already carries the sky world illumination.
-    pub(in crate::renderer) fn sky_baked(&self) -> bool {
-        self.active && self.composition.as_ref().is_some_and(|c| c.mode > 0.0 && c.sky.is_some())
-    }
-
     /// `charts` are per-page original-resolution chart IDs; empty disables
     /// chart-aware reconstruction (pages without geometry, unit tests).
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, original: &[GpuImage], charts: &[Vec<u32>]) -> Self {
@@ -573,6 +488,93 @@ impl LightmapCache {
             dummy_normals,
             dummy_environment,
             sky_composed_at: None,
+            vertex_sky: None,
+        }
+    }
+
+    /// Restore A's authored vertex RGB or compose B's traced sky gain. The
+    /// source is cached by static bake generation; when B is disabled we use
+    /// that same saved source to restore RGB before discarding its GPU buffer.
+    fn compose_vertex_sky(
+        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        vertex_buffer: &wgpu::Buffer, original: &[crate::renderer::GpuVertex],
+        samples: &[super::lightmap_sun::VertexSkySample], generation: u64,
+        sky: Option<(Option<&::blue_water_sky::environment::EnvironmentMap>, Option<([f32; 3], f32)>, Option<[f32; 3]>, f32, bool)>,
+        environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
+        _debug_alpha_one: bool,
+    ) {
+        if let Some((environment, moon, vanilla_toward_sun, strength, isolate_sky)) = sky {
+            if !samples.is_empty() && self.vertex_sky.as_ref().is_none_or(|g| g.generation != generation) {
+                // Indexed upload interns coincident vertices across BSP
+                // batches. Writing one RGB slot from multiple workgroups would
+                // be an unordered storage race, so each GPU index is unique.
+                let mut unique = std::collections::BTreeMap::new();
+                for sample in samples {
+                    let gpu_index = sample.gpu_index;
+                    // Static world vertices use the AO-adjusted immutable RGB.
+                    // Inline models are outside that prefix and retain their
+                    // original compiled vertex color in the bake receiver.
+                    let authored_color = original.get(gpu_index as usize)
+                        .map_or(sample.authored_color, |vertex| vertex.color);
+                    unique.entry(gpu_index).or_insert(VertexSkyInput {
+                        gpu_index, packed: sample.packed, reserved: [0; 2],
+                        authored_color,
+                    });
+                }
+                let gpu_samples: Vec<_> = unique.into_values().collect();
+                if !gpu_samples.is_empty() {
+                    if let Some(state) = self.vertex_sky.as_mut() {
+                        state.replace_samples(device, generation, &gpu_samples, original.len());
+                    } else {
+                        self.vertex_sky = Some(VertexSkyGpu::new(device, generation, &gpu_samples, original.len()));
+                    }
+                    println!("[SUN LIGHTMAP] {} vertex-lit BSP model receivers gain sky bake B", gpu_samples.len());
+                }
+            }
+            if let Some(state) = self.vertex_sky.as_mut() {
+                state.dispatch(device, queue, vertex_buffer, environment,
+                    (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
+                    moon, vanilla_toward_sun, true, strength, isolate_sky, 0);
+                state.active = true;
+                state.moon = moon;
+                state.vanilla_toward_sun = vanilla_toward_sun;
+                state.strength = strength;
+                state.isolate_sky = isolate_sky;
+            }
+        } else if let Some(state) = self.vertex_sky.as_mut().filter(|g| g.active) {
+            // Restore the original (AO-adjusted) vertex RGB, even with no Blue
+            // Water atlas. The dummy bindings make the zero-gain kernel safe.
+            state.dispatch(device, queue, vertex_buffer, environment,
+                (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
+                None, None, false, 0.0, false, 0);
+            state.active = false;
+        }
+    }
+
+    fn reapply_vertex_sky(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        vertices: &wgpu::Buffer,
+        environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
+    ) {
+        if let Some(state) = &self.vertex_sky {
+            state.dispatch(device, queue, vertices, environment,
+                (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
+                state.moon, state.vanilla_toward_sun, state.active, state.strength, state.isolate_sky, 0);
+        }
+    }
+
+    /// A CPU-posed inline model overwrote only its own RGB slots. Repaint
+    /// those, not every static-world vertex on each moving snapshot.
+    fn reapply_inline_vertex_sky(
+        &self, device: &wgpu::Device, queue: &wgpu::Queue,
+        vertices: &wgpu::Buffer,
+        environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
+    ) {
+        if let Some(state) = self.vertex_sky.as_ref().filter(|state| state.active) {
+            state.dispatch(device, queue, vertices, environment,
+                (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
+                state.moon, state.vanilla_toward_sun, true, state.strength,
+                state.isolate_sky, state.inline_start);
         }
     }
 
@@ -647,14 +649,14 @@ impl LightmapCache {
             self.corrected = corrected_images(device, &sizes);
         }
         let static_csm = composition.is_some_and(|c| c.static_csm);
-        if !static_csm {
+        let sky_strength = composition.and_then(|c| c.sky).map_or(0.0, |(strength, _)| strength);
+        if !static_csm && sky_strength <= 0.0 {
             self.sun_aux.clear();
         } else if self.sun_aux.len() != sizes.len() || self.sun_aux.iter().zip(&sizes)
             .any(|(i, s)| i._texture.width() != s[0] || i._texture.height() != s[1])
         {
             self.sun_aux = sun_aux_images(device, &sizes);
         }
-        let sky_strength = composition.and_then(|c| c.sky).map_or(0.0, |(strength, _)| strength);
         let sky = sky.filter(|_| sky_strength > 0.0);
         let colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("baked local colors"),
@@ -699,13 +701,21 @@ impl LightmapCache {
                 direction_strength: composition.map_or([0.0; 4], |c| {
                     [c.direction[0], c.direction[1], c.direction[2], c.strength]
                 }),
-                smoothing: [smoothing as f32, signal as f32, if self.has_charts { 1.0 } else { 0.0 }, 0.0],
+                smoothing: [smoothing as f32, signal as f32, if self.has_charts { 1.0 } else { 0.0 }, u8::from(composition.is_some_and(|c| c.isolate_sky)) as f32],
                 sky: [
                     sky_strength,
-                    if sky.as_ref().is_some_and(|s| s.normals.get(index).is_some()) { 1.0 } else { 0.0 },
+                    if sky.as_ref().is_some_and(|s| s.normals.get(index).is_some()) {
+                        if sky.as_ref().is_some_and(|s| s.vanilla_toward_sun.is_some()) { 2.0 } else { 1.0 }
+                    } else { 0.0 },
                     if static_csm { 1.0 } else { 0.0 },
-                    0.0,
+                    u8::from(sky.as_ref().is_some_and(|s| s.moon.is_some())) as f32,
                 ],
+                moon: sky.as_ref().map_or([0.0; 4], |s| {
+                    s.vanilla_toward_sun.map_or_else(
+                        || s.moon.map_or([0.0; 4], |(direction, intensity)| [direction[0], direction[1], direction[2], intensity]),
+                        |d| [d[0], d[1], d[2], 0.0],
+                    )
+                }),
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
@@ -767,19 +777,19 @@ impl LightmapCache {
                     wgpu::BindGroupEntry {
                         binding: 9,
                         resource: wgpu::BindingResource::TextureView(
-                            sky.as_ref().map_or(&self.dummy_environment.0.view, |s| &s.environment.view),
+                            sky.as_ref().and_then(|s| s.environment).map_or(&self.dummy_environment.0.view, |e| &e.view),
                         ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 10,
                         resource: wgpu::BindingResource::Sampler(
-                            sky.as_ref().map_or(&self.dummy_environment.1, |s| &s.environment.sampler),
+                            sky.as_ref().and_then(|s| s.environment).map_or(&self.dummy_environment.1, |e| &e.sampler),
                         ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 11,
-                        resource: sky.as_ref()
-                            .map_or(&self.dummy_environment.2, |s| &s.environment.uniforms)
+                        resource: sky.as_ref().and_then(|s| s.environment)
+                            .map_or(&self.dummy_environment.2, |e| &e.uniforms)
                             .as_entire_binding(),
                     },
                 ],
@@ -820,22 +830,42 @@ impl Renderer {
             .and_then(|w| w.baked_sun_cache.as_ref())
             .is_some_and(|c| c.static_csm_active())
     }
-    /// Lightmapped world pixels already carry the Blue Water sky illumination.
-    pub(in crate::renderer) fn sky_world_baked(&self) -> bool {
-        self.world.as_ref()
-            .and_then(|w| w.baked_sun_cache.as_ref())
-            .is_some_and(|c| c.sky_baked())
-    }
     pub(in crate::renderer) fn static_sun_lightmap_active(&self) -> bool {
         self.world
             .as_ref()
             .and_then(|w| w.baked_sun_cache.as_ref())
             .is_some_and(|c| c.active && c.composition.as_ref().is_some_and(|c| c.mode > 0.0))
     }
+    /// AO/debug reuploads overwrite the indexed vertex buffer. Restore B's
+    /// already-traced sky colour without retracing, changing cvars or rebuilding
+    /// any world pipeline. This is called only after an explicit reupload.
+    pub(in crate::renderer) fn reapply_baked_vertex_sky(&self) {
+        let Some(world) = self.world.as_ref() else { return; };
+        let Some(cache) = world.baked_sun_cache.as_ref() else { return; };
+        let environment = self.blue_water_sky.as_ref().map(|s| s.sky.environment());
+        cache.reapply_vertex_sky(&self.device, &self.queue, &world.vertex_buffer, environment);
+    }
+    /// CPU-posed BMODEL RGB is reuploaded from authored data. Reapply only
+    /// inline receivers; static-world sky RGB is unchanged.
+    pub(in crate::renderer) fn reapply_baked_inline_vertex_sky(&self) {
+        let Some(world) = self.world.as_ref() else { return; };
+        let Some(cache) = world.baked_sun_cache.as_ref() else { return; };
+        let environment = self.blue_water_sky.as_ref().map(|s| s.sky.environment());
+        cache.reapply_inline_vertex_sky(&self.device, &self.queue, &world.vertex_buffer, environment);
+    }
     /// All callers meet here: sun changes, removal controls, AO uploads and
     /// worker completion only invalidate inputs; warm frames allocate nothing.
     pub(in crate::renderer) fn sync_baked_sun_lightmap_cache(&mut self) {
         let sun = self.relit_celestial();
+        let moon_light = if self.blue_water_night() {
+            let direction = self.blue_water_moon_toward();
+            Some((
+                direction.unwrap_or(crate::renderer::Vec3::Y).to_array(),
+                if direction.is_some() {
+                    self.blue_water_environment.effective_moon_intensity()
+                } else { 0.0 },
+            ))
+        } else { None };
         let overcast_direct = self.relight_direct_fraction();
         let requested_removal = self.effective_baked_sun_removal();
         let Some(world) = self.world.as_ref() else {
@@ -853,20 +883,36 @@ impl Renderer {
             && (removal || requested_removal <= 0.0 || world.sun.is_none());
         let local_ready = (self.added_map_light_sources() != 0) && world.static_sun.local_ready();
         let explicit_sun = self.sun_lighting || (self.sun_override && self.blue_water_night());
-        // Baked sky world illumination needs the bake's smoothed normals and
-        // the live Blue Water sky environment it is evaluated against.
-        let sky_light = self.blue_water_sky.as_ref()
-            .filter(|_| sun_ready && self.sky_world_bake != 0 && self.sky_backend == 1
-                && self.blue_water_environment.world_lighting > 0.0
-                && !world.static_sun.sky_normals.is_empty())
-            .map(|atmosphere| {
-                let light = atmosphere.sky.light();
-                let q = |v: f32, scale: f32| (v * scale).round() as i32;
-                (self.blue_water_environment.world_lighting, [
-                    q(light.direction.x, 200.0), q(light.direction.y, 200.0), q(light.direction.z, 200.0),
-                    q(light.intensity.max(1e-6).log2(), 16.0), q(light.color.x - light.color.z, 100.0),
-                ])
-            });
+        // The vanilla sky's daylight curve is independent of Blue Water's
+        // atmosphere. Keep the precomputed openness and smoothed normals from
+        // the existing static sun bake; evaluate gain only on input changes.
+        let vanilla_toward_sun = (self.sky_backend != 1 && self.sun_override).then(||
+            (-crate::renderer::Vec3::from_array(self.active_sun().direction).normalize_or_zero()).to_array()
+        );
+        let sky_light = if sun_ready && self.sun_override && self.sky_world_bake_ab != 0
+            && self.sky_world_lighting_strength > 0.0
+            && (!world.static_sun.sky_normals.is_empty() || !world.static_sun.vertex_sky.is_empty()) {
+            let q = |v: f32, scale: f32| (v * scale).round() as i32;
+            if let Some(toward) = vanilla_toward_sun {
+                Some((self.sky_world_lighting_strength, [
+                    q(toward[0], 200.0), q(toward[1], 200.0), q(toward[2], 200.0), 0, 0, 2,
+                ]))
+            } else {
+                self.blue_water_sky.as_ref().map(|atmosphere| {
+                    let light = atmosphere.sky.light();
+                    let (direction, intensity, color_delta, moon) = if let Some((direction, intensity)) = moon_light {
+                        (direction, intensity, 0.70 - 1.0, 1)
+                    } else {
+                        ([light.direction.x, light.direction.y, light.direction.z],
+                         light.intensity, light.color.x - light.color.z, 0)
+                    };
+                    (self.sky_world_lighting_strength, [
+                        q(direction[0], 200.0), q(direction[1], 200.0), q(direction[2], 200.0),
+                        q(intensity.max(1e-6).log2(), 16.0), q(color_delta, 100.0), moon,
+                    ])
+                })
+            }
+        } else { None };
         let composition = (supported
             && (sun_ready || local_ready)
             && self.baked_sun_debug_mode == 0)
@@ -900,6 +946,7 @@ impl Renderer {
                     0.0,
                     0.0,
                 ],
+                isolate_sky: self.sky_world_light_isolation,
                 static_csm: sun_ready && explicit_sun
                     && self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMaps,
                 sky: sky_light,
@@ -971,10 +1018,26 @@ impl Renderer {
                 } else {
                     Vec::new()
                 },
-                self.blue_water_sky.as_ref().filter(|_| sky_light.is_some()).map(|atmosphere| SkyInputs {
+                sky_light.map(|_| SkyInputs {
                     normals: &world.static_sun.sky_normals,
-                    environment: atmosphere.sky.environment(),
+                    environment: self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
+                        .map(|atmosphere| atmosphere.sky.environment()),
+                    moon: if self.sky_backend == 1 { moon_light } else { None },
+                    vanilla_toward_sun,
                 }),
+            );
+            let environment = self.blue_water_sky.as_ref().map(|atmosphere| atmosphere.sky.environment());
+            c.compose_vertex_sky(
+                &self.device, &self.queue, &world.vertex_buffer,
+                &world.static_ao_gpu_vertices,
+                &world.static_sun.vertex_sky, world.static_sun.generation,
+                sky_light.map(|_| (
+                    environment.filter(|_| self.sky_backend == 1),
+                    if self.sky_backend == 1 { moon_light } else { None },
+                    vanilla_toward_sun,
+                    self.sky_world_lighting_strength, self.sky_world_light_isolation,
+                )),
+                environment, self.debug_world_vertex_alpha_one,
             );
             c.sky_composed_at = sky_light.map(|_| std::time::Instant::now());
             if sky_only {
@@ -995,6 +1058,13 @@ impl Renderer {
             world.lightmaps = c.original.clone();
             c.active = false;
             c.composition = None;
+            let environment = self.blue_water_sky.as_ref().map(|a| a.sky.environment());
+            c.compose_vertex_sky(
+                &self.device, &self.queue, &world.vertex_buffer,
+                &world.static_ao_gpu_vertices,
+                &[], world.static_sun.generation, None, environment,
+                self.debug_world_vertex_alpha_one,
+            );
             rebound = true;
         }
         if rebound {
@@ -1015,6 +1085,21 @@ impl Renderer {
 
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_sky_bake_shader_and_packed_vertex_layout_validate() {
+        assert_eq!(std::mem::size_of::<crate::renderer::GpuVertex>(), 15 * 4,
+            "vertex sky compute RGB offsets require the packed indexed layout");
+        assert_eq!(std::mem::size_of::<VertexSkyInput>(), 32);
+        let shader_text = format!("{}\n{}", include_str!("vertex_sky.wgsl"), include_str!("vanilla_sky_lighting.wgsl"));
+        let sky = blue_water_clouds::shaders::compose(
+            &shader_text, "static BSP vertex sky bake", &[],
+        ).unwrap_or_else(|e| panic!("vertex sky: {e}"));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        ).validate(&sky).unwrap_or_else(|e| panic!("vertex sky: {e:?}"));
+    }
 
     #[test]
     fn lightmap_composition_and_receivers_validate() {
@@ -1159,6 +1244,7 @@ mod tests {
                     adjust: [1.0, 1.0, 0.0, 0.0],
                     curve: [1.0, 1.0, 0.0, 0.0],
                     static_csm: false,
+                    isolate_sky: false,
                     sky: None,
                 };
                 cache.compose(

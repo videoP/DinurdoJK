@@ -210,7 +210,7 @@ pub use jka_studio::render_studio_profile::VideoFrameTiming;
 
 pub enum UserEvent {
     Update(crate::updater::Event),
-    BlueWaterThunder(f32),
+    BlueWaterThunder { volume: f32, sample: Option<u8> },
     /// Credential Manager enumeration completes on a separate thread; the main
     /// window must not wait for it to show its first interactive frame.
     SavedAccountsReady(Result<Vec<crate::credential_store::SavedAccount>, String>),
@@ -236,6 +236,9 @@ pub enum UserEvent {
     CompanionReady { id: u32 },
     CompanionError { id: u32, error: String },
     RendererFirstFrame,
+    /// The outgoing renderer has presented the restart loading screen, so its
+    /// swapchain can now be retired without exposing a stale gameplay frame.
+    RendererRestartLoadingPresented,
     /// Emitted only after a frame with egui has successfully presented.
     RendererFirstMenuFrame,
     /// The renderer presented a frame whose egui paint data carried this token.
@@ -272,6 +275,8 @@ pub enum UserEvent {
         completed: u32,
         stage: crate::renderer::SunBakeStage,
     },
+    /// Original authored-sun removal calibration result (not static-sun relighting progress).
+    BakedSunAutoStatus(crate::renderer::BakedSunAutoStatus),
     /// Targeted current-BSP acoustic preparation requested by `snd_restart`.
     /// This does not rebuild or upload the rendered world.
     SteamAudioScenePrepared {

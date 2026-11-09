@@ -9,9 +9,25 @@ hides_native_hud = ["health", "shield", "ammo", "force", "speedometer"]
 ```
 
 Elements: `health`, `shield`, `ammo` (also the saber-style panel), `force`,
-`speedometer` (readout, jump counter and speed graph). Only elements whose data
-a script can read through `playerstate()`/`session_info()` are offered. An
-unknown name makes the manifest fail to load (the previous revision stays active).
+`speedometer` (readout, jump counter and speed graph), plus four independent
+selection-UI flags:
+
+- `weapon_select`: native weapon carousel/icons and weapon name, both JK2 and JKA.
+- `force_select`: native Force-power carousel/icons and name, both JK2 and JKA.
+- `inventory_select`: native item carousel/icons and name, both JK2 and JKA.
+- `jk2_prongs`: JK2 HUD style 1 edge prongs (idle and selected) and animated
+  selection background. Has no effect in JKA HUD mode.
+
+These flags suppress **rendering only**, not selecting, cycling, activating, or
+using the items and powers. The selector flags are separate from `ammo`/`force`,
+which govern the permanent status HUD clusters. Choose only the pieces the
+extension actually replaces: for example a permanent weapon bar should request
+`weapon_select`, not `force_select` or `inventory_select` unless it also provides
+a way for the player to see those selections. `jk2_prongs` is independent of
+all three selectors: turning it off alone does not remove native icons/labels.
+
+An unknown name makes the manifest fail to load (the previous revision stays
+active).
 
 ## Rules
 

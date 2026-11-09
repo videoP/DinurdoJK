@@ -153,6 +153,7 @@ pub(crate) fn promotes_shader(name: &str, shader: &Shader) -> bool {
         && (shader.cull.eq_ignore_ascii_case("twosided")
             || shader.cull.eq_ignore_ascii_case("none")
             || shader.cull.eq_ignore_ascii_case("disable")
+            || shader.auto_sprite
             || shader.auto_sprite2)
         && !shader.sky
         && !shader.water

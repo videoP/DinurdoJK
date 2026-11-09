@@ -32,10 +32,10 @@ app_cvars! {
     }
     APP_FS_JK2BASEPATH {
         runtime: CvarDef::new(
-            "fs_jk2basepath", "", "JK2 GameData root",
-            "JK2 installation root containing base/ and unprefixed mod folders; defaults to <executable directory>/JK2 GameData/. Never mounted in JKA. Restart required.",
+            "fs_jk2basepath", "", "JK2 game root",
+            "JK2 installation root containing base/ and unprefixed mod folders. JK2 mode is unavailable while this is unset. Never mounted in JKA. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |app| CvarValue::String(jka_assets::pk3::jk2_root_directory(&app.base, &app.fs_roots).display().to_string()),
+            |app| CvarValue::String(app.fs_roots.jk2basepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_jk2basepath(app, &value.to_string())
         ).with_text_setter(|app, _, value| App::set_fs_jk2basepath(app, value), None),
         config: CvarBinding::NONE,
@@ -54,12 +54,23 @@ app_cvars! {
     }
     APP_FS_HOMEPATH {
         runtime: CvarDef::new(
-            "fs_homepath", "", "writable/readable GameData root",
-            "Optional writable overlay root. JKA uses it directly (homepath/base); JK2 uses homepath/JK2 GameData/. Restart required.",
+            "fs_homepath", "", "JKA writable root",
+            "Optional writable JKA root holding base/ and mod folders directly (configs, demos, screenshots, downloads). Blank = write beside the JKA root. Must differ from fs_jk2homepath. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_homepath(app, &value.to_string())
         ).with_text_setter(|app, _, value| App::set_fs_homepath(app, value), None),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_FS_JK2HOMEPATH {
+        runtime: CvarDef::new(
+            "fs_jk2homepath", "", "JK2 writable root",
+            "Optional writable JK2 root holding base/ and mod folders directly. Blank = write inside the JK2 root. Must differ from fs_homepath. Never mounted in JKA. Restart required.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.fs_roots.jk2homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
+            |app, value| App::set_fs_jk2homepath(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_jk2homepath(app, value), None),
         config: CvarBinding::NONE,
         implementations: []
     }
@@ -98,6 +109,15 @@ impl App {
         let mut proposed = self.fs_roots.clone();
         proposed.homepath = crate::filesystem_paths::parse_root(&self.base, value)?;
         self.store_fs_roots(proposed)
+    }
+
+    fn set_fs_jk2homepath(&mut self, value: &str) -> Result<(), String> {
+        let mut proposed = self.fs_roots.clone();
+        proposed.jk2homepath = crate::filesystem_paths::parse_root(&self.base, value)?;
+        let changed = proposed.jk2homepath != self.fs_roots.jk2homepath;
+        self.store_fs_roots(proposed)?;
+        if changed { self.jk2_demo_browser.reset(); }
+        Ok(())
     }
 
     fn set_fs_cdpath(&mut self, value: &str) -> Result<(), String> {

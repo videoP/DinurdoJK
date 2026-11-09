@@ -485,10 +485,11 @@ impl App {
     /// and footer text, mute marks, crowns and the cursor state.
     pub(in crate::app) fn decorate_scoreboard(&self, board: &mut UiScoreboard) {
         let leaders = self.score_leaders();
+        let spectating = self.stats_spectating();
         for entry in &mut board.entries {
             entry.muted = self.muted_clients.contains_key(&entry.client);
             entry.crowned = leaders.contains(&entry.client);
-            entry.h2h = self.match_stats.head_to_head(entry.client);
+            entry.h2h = if spectating { None } else { self.match_stats.head_to_head(entry.client) };
             let info = self.game_session.as_ref()
                 .and_then(|session| session.client_game.client_info(usize::try_from(entry.client).ok()?, &session.siege_classes));
             (entry.model, entry.model_fallback) = info.map(|info| {
@@ -518,10 +519,10 @@ impl App {
             japro: self.active_server_mod() == crate::net::mod_support::ServerMod::Japro,
             scroll: self.scoreboard_cursor.scroll,
             avatars: self.scoreboard_settings.avatars,
-            head_to_head: self.scoreboard_settings.head_to_head,
+            head_to_head: self.scoreboard_settings.head_to_head && !spectating,
             stats: Some({
                 let mut stats = self.match_stats_ui();
-                let me = self.game_session.as_ref().and_then(|session| session.client_game.presentation_client_num());
+                let me = self.stats_viewer();
                 if let Some(row) = board.entries.iter().find(|entry| Some(entry.client) == me) {
                     stats.accuracy = (row.accuracy > 0).then_some(row.accuracy);
                     stats.excellent = row.excellent.max(0);

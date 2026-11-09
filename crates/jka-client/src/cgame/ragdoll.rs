@@ -8,6 +8,7 @@
 use crate::cgame::{weapon_fx::{ChunkModel, ChunkSpec, ShardSpec}, PresentedEntity};
 use crate::fx::system::FxDraw;
 use jka_assets::ghoul2::{multiply_3x4, GlaAnimation, Matrix3x4};
+use glam::Mat3;
 use rapier3d::{
     math::{Matrix, Pose, Rotation, Vector},
     prelude::*,
@@ -21,6 +22,16 @@ const RAPIER_TO_JKA: f32 = 1.0 / JKA_TO_RAPIER;
 const LIVING_RAGDOLL_RECOVERY_MS: i32 = 180;
 const KNOCKDOWN_RAGDOLL_RECOVERY_MS: i32 = 240;
 const JKA_GRAVITY: f32 = 800.0;
+// Volko61/better-ragdoll (solver.py Params, GPL-3.0-or-later): exact
+// angular spring / damping coefficients, in seconds and SI units.
+// Rapier's position solver remains responsible for anchors and collision;
+// spring angular XPBD corrections are mapped to equal/opposite impulses.
+const JOINT_TENSION: f32 = 10.0;
+const JOINT_TENSION_DAMPING: f32 = 0.35;
+const JOINT_SOFT_ZONE: f32 = 0.25;
+const JOINT_SOFT_STRENGTH: f32 = 400.0;
+const JOINT_SOFT_DAMPING: f32 = 30.0;
+const JOINT_BASE_DAMPING: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RagdollConfig {
@@ -42,6 +53,9 @@ pub struct RagdollConfig {
     pub max_detached_limbs: u32,
     pub detached_limb_lifetime_seconds: f32,
     pub self_collision: bool,
+    /// 0 = historical death-pose hard limits; 1 = same stable joint geometry
+    /// with bounded progressive soft-limit resistance and bind-informed tension.
+    pub joint_model: u8,
     pub weapon_impulses: bool,
     pub explosion_impulses: bool,
     pub force_impulses: bool,
@@ -67,6 +81,7 @@ impl Default for RagdollConfig {
             max_detached_limbs: 24,
             detached_limb_lifetime_seconds: 16.0,
             self_collision: false,
+            joint_model: 0,
             weapon_impulses: true,
             explosion_impulses: true,
             force_impulses: true,
@@ -216,6 +231,22 @@ struct LivingRagdollRecovery {
     from_pose: Vec<Matrix3x4>,
 }
 
+/// Anatomical joint description from the Blender Better Ragdoll model:
+/// parent/child frames define flexion (+X), abduction (+Z), axial twist (+Y).
+/// Its hard-limit constraint stays in Rapier; these are the separate soft
+/// angular corrections and velocity damping, NOT motor targets.
+#[derive(Debug, Clone, Copy)]
+struct SoftJoint {
+    parent: RigidBodyHandle,
+    child: RigidBodyHandle,
+    frame_p: Rotation,
+    frame_c: Rotation,
+    /// (minimum, maximum, neutral) in radians, mirrored for right limbs.
+    ranges: [[f32; 3]; 3],
+    /// Sum of subtree mass * distance-to-joint squared plus link inertia.
+    effective_inertia: f32,
+}
+
 #[derive(Debug)]
 struct RagdollInstance {
     model_key: String,
@@ -241,6 +272,7 @@ struct RagdollInstance {
     /// frame.
     last_applied_pose: Vec<Matrix3x4>,
     driven: Vec<DrivenBone>,
+    soft_joints: Vec<SoftJoint>,
 }
 
 /// Stable identity of one server-authored `G2_MODEL_PART` presentation entity.
@@ -441,7 +473,10 @@ impl RagdollWorld {
             && config.enabled
             && (self.config.ccd != config.ccd
                 || self.config.sleeping != config.sleeping
-                || self.config.self_collision != config.self_collision);
+                || self.config.self_collision != config.self_collision
+                // Existing joints are physically different. Keeping old ones
+                // made selecting Classic appear ineffective after using mode 1.
+                || self.config.joint_model != config.joint_model);
         let rebuild_detached = self.config.physics_enabled
             && config.physics_enabled
             && self.config.dismemberment != 0
@@ -455,6 +490,7 @@ impl RagdollWorld {
             debris_lifetime_seconds: config.debris_lifetime_seconds.clamp(1.0, 300.0),
             lifetime_seconds: config.lifetime_seconds.clamp(0.0, 300.0),
             dismemberment: config.dismemberment.min(2),
+            joint_model: config.joint_model.min(1),
             max_detached_limbs: config.max_detached_limbs.min(128),
             detached_limb_lifetime_seconds: config.detached_limb_lifetime_seconds.clamp(0.0, 300.0),
             ..config
@@ -665,6 +701,8 @@ impl RagdollWorld {
                 }
             }
             self.capture_previous_poses();
+            // Classic stays byte-for-byte on its old solver path.
+            if self.config.joint_model == 1 { self.update_soft_joint_springs(step_dt); }
             self.pipeline.step(
                 Vector::new(0.0, 0.0, -JKA_GRAVITY * JKA_TO_RAPIER),
                 &self.integration,
@@ -679,6 +717,7 @@ impl RagdollWorld {
                 &(),
                 &(),
             );
+            if self.config.joint_model == 1 { self.update_soft_joint_damping(step_dt); }
             self.accumulator -= step_dt;
             steps += 1;
         }
@@ -703,6 +742,74 @@ impl RagdollWorld {
                 steps,
                 self.accumulator * 1000.0,
             );
+        }
+    }
+
+    /// Position-constraint part of Better Ragdoll solver.py: neutral tension,
+    /// then separate progressive boundary correction. Blender's XPBD solves
+    /// these on positions; in Rapier the corresponding compliant angular
+    /// correction is applied as paired velocity impulses ahead of integration.
+    fn update_soft_joint_springs(&mut self, h: f32) {
+        for instance in self.instances.values() {
+            for joint in &instance.soft_joints {
+                let Some((qp, qc, angles)) = soft_joint_angles(&self.bodies, joint) else { continue; };
+                if joint_both_sleeping(&self.bodies, joint) { continue; }
+                // _rotate_joint_to(neutral) in source solver, separate spring.
+                apply_soft_joint_spring(&mut self.bodies, joint, qp, qc,
+                    [joint.ranges[0][2], joint.ranges[1][2], joint.ranges[2][2]],
+                    JOINT_TENSION * joint.effective_inertia, h);
+                // Recompute angles after the neutral impulse only for damping:
+                // unlike the original XPBD position solver, an impulse doesn't
+                // rotate until Rapier integrates the next substep.
+                let mut target = angles;
+                let mut depth: f32 = 0.0;
+                for (index, range) in joint.ranges.iter().enumerate() {
+                    let width = (range[1] - range[0]) * JOINT_SOFT_ZONE;
+                    if width <= 1.0e-6 { continue; }
+                    if angles[index] > range[1] - width {
+                        depth = depth.max(((angles[index] - (range[1] - width)) / width).min(1.0));
+                        target[index] = range[1] - width;
+                    } else if angles[index] < range[0] + width {
+                        depth = depth.max((((range[0] + width) - angles[index]) / width).min(1.0));
+                        target[index] = range[0] + width;
+                    }
+                }
+                if depth > 0.0 {
+                    apply_soft_joint_spring(&mut self.bodies, joint, qp, qc, target,
+                        JOINT_SOFT_STRENGTH * joint.effective_inertia * depth, h);
+                }
+            }
+        }
+    }
+
+    /// Velocity-constraint part of Better Ragdoll solver.py, executed AFTER
+    /// Rapier's position/contact step, as in the original XPBD substep.
+    fn update_soft_joint_damping(&mut self, h: f32) {
+        for instance in self.instances.values() {
+            for joint in &instance.soft_joints {
+                if joint_both_sleeping(&self.bodies, joint) { continue; }
+                let Some((qp, qc, angles)) = soft_joint_angles(&self.bodies, joint) else { continue; };
+                let axes = [qp * Vector::X, qp * Vector::Z, qc * Vector::Y];
+                for (index, axis) in axes.iter().copied().enumerate() {
+                    let [lo, hi, _] = joint.ranges[index];
+                    let width = (hi - lo) * JOINT_SOFT_ZONE;
+                    let zone = if width > 1.0e-6 {
+                        (((lo + width - angles[index]).max(0.0))
+                            .max((angles[index] - (hi - width)).max(0.0)) / width).min(1.0)
+                    } else { 0.0 };
+                    let rate = JOINT_BASE_DAMPING
+                        + 2.0 * JOINT_TENSION_DAMPING * JOINT_TENSION.sqrt()
+                        + JOINT_SOFT_DAMPING * zone;
+                    let inv = joint_inverse_inertia(&self.bodies, joint, axis);
+                    if inv <= 1.0e-12 { continue; }
+                    let (Some(parent), Some(child)) =
+                        (self.bodies.get(joint.parent), self.bodies.get(joint.child)) else { continue; };
+                    let relative_speed = (child.angvel() - parent.angvel()).dot(axis);
+                    let chw = rate * joint.effective_inertia * h * inv;
+                    let delta_speed = -relative_speed * chw / (1.0 + chw);
+                    apply_joint_torque_impulse(&mut self.bodies, joint, axis * (delta_speed / inv));
+                }
+            }
         }
     }
 
@@ -1080,6 +1187,7 @@ impl RagdollWorld {
             })
             .collect::<Vec<_>>();
         let mut driven = Vec::new();
+        let mut soft_joints = Vec::new();
         let mut handles_by_bone = HashMap::<usize, RigidBodyHandle>::new();
 
         for spec in BODY_SPECS {
@@ -1102,8 +1210,8 @@ impl RagdollWorld {
                 RigidBodyBuilder::dynamic()
                     .pose(world_pose)
                     .linvel(velocity)
-                    .linear_damping(0.8)
-                    .angular_damping(4.5)
+                    .linear_damping(if self.config.joint_model == 1 { 0.02 } else { 0.8 })
+                    .angular_damping(if self.config.joint_model == 1 { 0.05 } else { 4.5 })
                     .ccd_enabled(self.config.ccd)
                     .can_sleep(self.config.sleeping)
                     .additional_solver_iterations(8)
@@ -1258,28 +1366,53 @@ impl RagdollWorld {
             let parent_anchor = inverse_pose_point(parent_body.position(), anchor_world);
             let child_anchor = inverse_pose_point(child_body.position(), anchor_world);
 
-            // Give the spherical joint a reference orientation matching the
-            // exact death pose. Limits are therefore relative to the handoff
-            // pose instead of snapping every limb toward an arbitrary identity
-            // orientation on the first solver step.
-            let parent_frame_rotation =
-                parent_body.position().rotation.inverse() * child_body.position().rotation;
-            let limits = joint_limits_for_bone(
-                gla.skeleton
-                    .get(child.bone_index)
-                    .map(|bone| bone.name.as_str())
-                    .unwrap_or(""),
-            );
+            let bone_name = gla.skeleton
+                .get(child.bone_index)
+                .map(|bone| bone.name.as_str())
+                .unwrap_or("");
+            if self.config.joint_model == 0 {
+                // Exact legacy path: hard limits centered on the handoff pose.
+                let frame = parent_body.position().rotation.inverse() * child_body.position().rotation;
+                let limits = joint_limits_for_bone(bone_name);
+                let joint = SphericalJointBuilder::new()
+                    .local_frame1(Pose::from_parts(parent_anchor, frame))
+                    .local_frame2(Pose::from_parts(child_anchor, Rotation::IDENTITY))
+                    .limits(JointAxis::AngX, limits[0])
+                    .limits(JointAxis::AngY, limits[1])
+                    .limits(JointAxis::AngZ, limits[2])
+                    .contacts_enabled(false);
+                self.impulse_joints.insert(parent_handle, child.body, joint, true);
+                continue;
+            }
+
+            // Never change the stable Rapier anchors / hard stops from Classic.
+            // The Blender solver also uses a separate anatomical joint frame;
+            // it must not be silently substituted for the Rapier joint frame.
+            let frame = parent_body.position().rotation.inverse() * child_body.position().rotation;
+            let limits = joint_limits_for_bone(bone_name);
             let joint = SphericalJointBuilder::new()
-                .local_frame1(Pose::from_parts(parent_anchor, parent_frame_rotation))
+                .local_frame1(Pose::from_parts(parent_anchor, frame))
                 .local_frame2(Pose::from_parts(child_anchor, Rotation::IDENTITY))
                 .limits(JointAxis::AngX, limits[0])
                 .limits(JointAxis::AngY, limits[1])
                 .limits(JointAxis::AngZ, limits[2])
-                // Adjacent capsules overlap by design around the joint.
                 .contacts_enabled(false);
-            self.impulse_joints
-                .insert(parent_handle, child.body, joint, true);
+            self.impulse_joints.insert(parent_handle, child.body, joint, true);
+
+            // Mirror model.py's anatomical frames and per-role preset angles.
+            // A rig lacking reliable bone directions gets Classic constraints
+            // on that joint; never invent an axis from the death animation.
+            if let Some((frame_p, frame_c, ranges)) = anatomical_soft_joint(
+                gla, parent_index, child.bone_index, bone_name,
+            ) {
+                let effective_inertia = subtree_joint_inertia(
+                    gla, child.bone_index, model_scale, &driven, &self.bodies,
+                );
+                soft_joints.push(SoftJoint {
+                    parent: parent_handle, child: child.body,
+                    frame_p, frame_c, ranges, effective_inertia,
+                });
+            }
         }
 
         Ok(RagdollInstance {
@@ -1295,6 +1428,7 @@ impl RagdollWorld {
             last_applied_pose: spawn_pose.clone(),
             spawn_pose,
             driven,
+            soft_joints,
         })
     }
 
@@ -2061,6 +2195,208 @@ fn joint_limits_for_bone(name: &str) -> [[f32; 2]; 3] {
     [range(degrees[0]), range(degrees[1]), range(degrees[2])]
 }
 
+/// Presets from better_ragdoll/presets.py. Bone names are the JKA/JK2
+/// Ghoul2 names. Each triple is (low, high, neutral) in degrees.
+fn soft_joint_preset(name: &str) -> Option<([[f32; 3]; 3], bool, bool)> {
+    let name = name.to_ascii_lowercase();
+    let (angles, down, parent_direction) = match name.as_str() {
+        "lower_lumbar" | "upper_lumbar" | "thoracic" =>
+            ([[-20.,35.,4.],[-20.,20.,0.],[-20.,20.,0.]],false,false),
+        "cranium" => ([[-30.,35.,10.],[-20.,20.,0.],[-35.,35.,0.]],false,false),
+        "rhumerus" | "lhumerus" =>
+            ([[-50.,170.,38.],[-30.,165.,42.],[-70.,70.,10.]],true,false),
+        "rradius" | "lradius" =>
+            ([[0.,145.,65.],[-4.,4.,0.],[-80.,80.,0.]],false,true),
+        "rhand" | "lhand" =>
+            ([[-70.,70.,0.],[-20.,30.,5.],[-8.,8.,0.]],false,false),
+        "rfemuryz" | "lfemuryz" =>
+            ([[-20.,125.,48.],[-20.,45.,10.],[-35.,35.,5.]],true,false),
+        "rtibia" | "ltibia" =>
+            ([[0.,145.,50.],[-4.,4.,0.],[-8.,8.,0.]],false,true),
+        "rtalus" | "ltalus" =>
+            ([[-50.,20.,-20.],[-15.,15.,0.],[-20.,20.,0.]],false,false),
+        // The Blender model merges toes with feet; they keep Classic joints.
+        _ => return None,
+    };
+    let mut ranges: [[f32; 3]; 3] = angles;
+    for channel in 0..3 {
+        for term in 0..3 { ranges[channel][term] = ranges[channel][term].to_radians(); }
+    }
+    // Source model._limits mirrors abduction and axial twist, NOT flexion.
+    if name.starts_with('r') {
+        for range in &mut ranges[1..3] {
+            let [lo, hi, mid] = *range;
+            *range = [-hi, -lo, -mid];
+        }
+    }
+    Some((ranges, down, parent_direction))
+}
+
+fn bind_bone_point(gla: &GlaAnimation, bone: usize) -> Option<Vector> {
+    let m = &gla.skeleton.get(bone)?.base_pose;
+    Some(Vector::new(m[0][3], m[1][3], m[2][3]))
+}
+
+/// Port of model.py's zero-direction, flex-direction, and frame construction.
+/// JKA bones don't consistently point their local +Y toward the tail, so the
+/// already-used Ghoul2 segment endpoints provide the equivalent rest vectors.
+fn anatomical_soft_joint(
+    gla: &GlaAnimation, parent: usize, child: usize, name: &str,
+) -> Option<(Rotation, Rotation, [[f32; 3]; 3])> {
+    let (ranges, down, continue_parent) = soft_joint_preset(name)?;
+    let child_head = bind_bone_point(gla, child)?;
+    let end_name = BODY_SPECS.iter().find(|spec| spec.name.eq_ignore_ascii_case(name))?.end;
+    let child_bind = matrix_to_pose(&gla.skeleton[child].base_pose).rotation;
+    let parent_bind = matrix_to_pose(&gla.skeleton[parent].base_pose).rotation;
+    let rest_direction = end_name
+        .and_then(|end| bone_index(gla, end))
+        .and_then(|end| bind_bone_point(gla, end))
+        .map(|tail| (tail - child_head).normalize_or_zero())
+        .filter(|d| d.length_squared() > 0.25)
+        .unwrap_or(child_bind * Vector::Y);
+    if rest_direction.length_squared() < 0.25 { return None; }
+    let y = if down { -Vector::Z }
+        else if continue_parent {
+            (child_head - bind_bone_point(gla, parent)?).normalize_or_zero()
+        } else { rest_direction };
+    if y.length_squared() < 0.25 { return None; }
+    let right_hip = bone_index(gla, "rfemurYZ").and_then(|i| bind_bone_point(gla, i));
+    let left_hip = bone_index(gla, "lfemurYZ").and_then(|i| bind_bone_point(gla, i));
+    let root = bone_index(gla, "pelvis").and_then(|i| bind_bone_point(gla, i));
+    let head = bone_index(gla, "cranium").and_then(|i| bind_bone_point(gla, i));
+    let forward = match (right_hip, left_hip, root, head) {
+        (Some(r), Some(l), Some(p), Some(h)) => {
+            let direction = (r - l).cross(h - p).normalize_or_zero();
+            if direction.length_squared() > 0.25 { direction } else { Vector::X }
+        }
+        _ => Vector::X,
+    };
+    let role = name.to_ascii_lowercase();
+    let flex_dir = if role == "rtibia" || role == "ltibia" { -forward }
+        else if role == "rtalus" || role == "ltalus" { Vector::Z }
+        else { forward };
+    let mut x = y.cross(flex_dir);
+    if x.length_squared() < 0.0625 {
+        let alt = if role == "rtalus" || role == "ltalus" { forward } else { Vector::Z };
+        x = y.cross(alt);
+    }
+    x = x.normalize_or_zero();
+    if x.length_squared() < 0.25 { return None; }
+    let z = x.cross(y).normalize_or_zero();
+    let frame_world = Rotation::from_mat3(&Mat3::from_cols(x, y, z));
+    let child_world = Rotation::from_rotation_arc(y, rest_direction) * frame_world;
+    Some((parent_bind.inverse() * frame_world,
+          child_bind.inverse() * child_world, ranges))
+}
+
+/// Equivalent of model.py joint i_eff: all distal body masses and their
+/// rotational inertia around the joint anchor (Rapier bodies are SI-scaled).
+fn subtree_joint_inertia(
+    gla: &GlaAnimation, child: usize, model_scale: f32,
+    driven: &[DrivenBone], bodies: &RigidBodySet,
+) -> f32 {
+    // Blender model.py measures all subtree offsets in the REST pose,
+    // never from the animation pose sampled at death.
+    let Some(anchor) = bind_bone_point(gla, child) else { return 1.0e-6; };
+    let to_meters = model_scale * JKA_TO_RAPIER;
+    let mut moment = 0.0;
+    for bone in driven {
+        let mut current = Some(bone.bone_index);
+        let mut distal = false;
+        while let Some(index) = current {
+            if index == child { distal = true; break; }
+            current = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, index);
+        }
+        if !distal { continue; }
+        let Some(body) = bodies.get(bone.body) else { continue; };
+        let mass = body.mass();
+        let Some(head) = bind_bone_point(gla, bone.bone_index) else { continue; };
+        let end = BODY_SPECS.iter().find(|spec| {
+            gla.skeleton[bone.bone_index].name.eq_ignore_ascii_case(spec.name)
+        }).and_then(|spec| spec.end)
+            .and_then(|name| bone_index(gla, name))
+            .and_then(|index| bind_bone_point(gla, index))
+            .unwrap_or(head);
+        let rest_com = (head + end) * 0.5;
+        let offset = (rest_com - anchor) * to_meters;
+        let principal_inv = body.mass_properties().local_mprops.inv_principal_inertia;
+        let inv_to_moment = |inv: f32| if inv > 1.0e-8 { 1.0 / inv } else { 0.0 };
+        let local_inertia = (inv_to_moment(principal_inv.x)
+            + inv_to_moment(principal_inv.y) + inv_to_moment(principal_inv.z)) / 3.0;
+        moment += mass * offset.length_squared() + local_inertia;
+    }
+    moment.max(1.0e-6)
+}
+
+fn joint_both_sleeping(bodies: &RigidBodySet, joint: &SoftJoint) -> bool {
+    match (bodies.get(joint.parent), bodies.get(joint.child)) {
+        (Some(p), Some(c)) => p.is_sleeping() && c.is_sleeping(),
+        _ => true,
+    }
+}
+
+/// Split the joint rotation into swing (X,Z) and twist (Y), as in solver.py.
+fn soft_joint_angles(bodies: &RigidBodySet, joint: &SoftJoint) -> Option<(Rotation, Rotation, [f32; 3])> {
+    let parent = bodies.get(joint.parent)?;
+    let child = bodies.get(joint.child)?;
+    let qp = *parent.rotation() * joint.frame_p;
+    let qc = *child.rotation() * joint.frame_c;
+    let mut rel = qp.inverse() * qc;
+    if rel.w < 0.0 { rel = Rotation::from_xyzw(-rel.x, -rel.y, -rel.z, -rel.w); }
+    let tl = rel.w.hypot(rel.y);
+    let (tw, twist) = if tl < 1.0e-6 {
+        (Rotation::IDENTITY, 0.0)
+    } else {
+        (Rotation::from_xyzw(0.0, rel.y / tl, 0.0, rel.w / tl),
+         2.0 * rel.y.atan2(rel.w))
+    };
+    let swing = rotation_vector(rel * tw.inverse());
+    Some((qp, qc, [swing.x, swing.z, twist]))
+}
+
+fn rotation_vector(mut q: Rotation) -> Vector {
+    if q.w < 0.0 { q = Rotation::from_xyzw(-q.x, -q.y, -q.z, -q.w); }
+    let v = Vector::new(q.x, q.y, q.z);
+    let magnitude = v.length();
+    if magnitude < 1.0e-8 { return v * 2.0; }
+    v * (2.0 * magnitude.atan2(q.w) / magnitude)
+}
+
+fn joint_inverse_inertia(bodies: &RigidBodySet, joint: &SoftJoint, axis: Vector) -> f32 {
+    [joint.parent, joint.child].iter().filter_map(|&handle| bodies.get(handle))
+        .filter(|body| body.is_dynamic())
+        .map(|body| axis.dot(body.mass_properties().effective_world_inv_inertia * axis))
+        .sum()
+}
+
+/// Equal and opposite torques: no artificial world-space force or root pin.
+fn apply_joint_torque_impulse(bodies: &mut RigidBodySet, joint: &SoftJoint, impulse: Vector) {
+    if impulse.length_squared() < 1.0e-16 || !impulse.is_finite() { return; }
+    if let Some(child) = bodies.get_mut(joint.child) { child.apply_torque_impulse(impulse, true); }
+    if let Some(parent) = bodies.get_mut(joint.parent) { parent.apply_torque_impulse(-impulse, true); }
+}
+
+/// Source _ang_correction: C / (w + compliance / dt²), with compliance
+/// 1/(spring_strength * subtree_inertia). A pre-step angular impulse divided
+/// by dt produces the equivalent first-order angular displacement in Rapier.
+fn apply_soft_joint_spring(
+    bodies: &mut RigidBodySet, joint: &SoftJoint,
+    qp: Rotation, qc: Rotation, target: [f32; 3], stiffness: f32, h: f32,
+) {
+    if stiffness <= 0.0 || h <= 0.0 { return; }
+    let swing = Rotation::from_scaled_axis(Vector::new(target[0], 0.0, target[1]));
+    let twist = Rotation::from_axis_angle(Vector::Y, target[2]);
+    let desired = qp * swing * twist;
+    let error = rotation_vector(desired * qc.inverse());
+    let length = error.length();
+    if length <= 1.0e-9 { return; }
+    let axis = error / length;
+    let inv = joint_inverse_inertia(bodies, joint, axis);
+    let denom = inv + 1.0 / (stiffness * h * h);
+    if denom <= 1.0e-12 { return; }
+    apply_joint_torque_impulse(bodies, joint, axis * (length / (h * denom)));
+}
+
 fn bone_index(gla: &GlaAnimation, name: &str) -> Option<usize> {
     gla.skeleton
         .iter()
@@ -2489,6 +2825,126 @@ mod tests {
         for (i, bone) in jka.skeleton.iter().enumerate() {
             assert_eq!(jka_assets::skeleton::mesh_pose_parent(&jka.skeleton, i), usize::try_from(bone.parent).ok());
         }
+    }
+
+    #[test]
+    fn source_preset_and_zone_match_blender() {
+        let (elbow, down, parent) = soft_joint_preset("lradius").unwrap();
+        assert!(!down && parent);
+        assert!((elbow[0][0] - 0.0).abs() < 0.001);
+        assert!((elbow[0][1] - 145_f32.to_radians()).abs() < 0.001);
+        assert!((elbow[0][2] - 65_f32.to_radians()).abs() < 0.001);
+        let (mirrored, _, _) = soft_joint_preset("rradius").unwrap();
+        assert_eq!(mirrored[1][0], -elbow[1][1]);
+        assert_eq!(mirrored[1][1], -elbow[1][0]);
+        assert!(soft_joint_preset("rtarsal").is_none());
+    }
+
+    #[test]
+    fn anatomical_soft_frames_exist_on_both_ghoul2_skeletons() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        for rig in [HumanoidRig::Jka53, HumanoidRig::Jk2_72] {
+            let gla = humanoid_reference(rig);
+            for name in ["rradius", "lradius", "rtibia", "ltibia", "rhumerus", "lfemurYZ"] {
+                let child = bone_index(&gla, name).unwrap();
+                let mut bodies = RigidBodySet::new();
+                let handles = BODY_SPECS.iter().filter_map(|spec| {
+                    bone_index(&gla, spec.name)
+                        .map(|i| (i, bodies.insert(RigidBodyBuilder::dynamic().build())))
+                }).collect::<HashMap<_, _>>();
+                let parent = nearest_driven_parent(&gla, child, &handles).unwrap();
+                let (fp, fc, _) = anatomical_soft_joint(&gla, parent, child, name).unwrap();
+                assert!(fp.is_finite() && fc.is_finite(), "{rig:?} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn soft_joint_springs_do_not_push_or_pin_a_free_falling_corpse() {
+        let mut bodies = RigidBodySet::new();
+        let parent = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.0, 5.0)).build());
+        let child = bodies.insert(RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.0, 4.0)).build());
+        let mut colliders = ColliderSet::new();
+        for handle in [parent, child] {
+            colliders.insert_with_parent(ColliderBuilder::ball(0.2).mass(2.0), handle, &mut bodies);
+        }
+        let joint = SoftJoint {
+            parent, child, frame_p: Rotation::IDENTITY, frame_c: Rotation::IDENTITY,
+            ranges: [[-1.0, 1.0, 0.5], [-1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]],
+            effective_inertia: 1.0,
+        };
+        apply_soft_joint_spring(&mut bodies, &joint, Rotation::IDENTITY, Rotation::IDENTITY,
+            [0.5, 0.0, 0.0], 10.0, 1.0 / 60.0);
+        // Pure angular impulses cannot create upward force or net linear
+        // momentum in midair; only gravity and contacts move the COM.
+        assert_eq!(bodies[parent].linvel(), Vector::ZERO);
+        assert_eq!(bodies[child].linvel(), Vector::ZERO);
+    }
+
+    #[test]
+    fn both_joint_modes_fall_under_gravity_after_death() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        let rig = humanoid_reference(HumanoidRig::Jka53);
+        let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+        for joint_model in [0, 1] {
+            let mut world = contact_world();
+            world.set_config(RagdollConfig {
+                physics_enabled: true, enabled: true,
+                joint_model, lifetime_seconds: 20.0,
+                ..RagdollConfig::default()
+            });
+            let corpse = world.spawn_instance(
+                "test", &rig, &vec![identity; rig.skeleton.len()],
+                [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 96.], 1.0,
+                CorpseGeneration { client_num: 1, body_queue_time: 0 },
+                RagdollKind::Corpse, Vector::ZERO, 0,
+            ).unwrap();
+            let pelvis = corpse.driven.iter()
+                .find(|driven| rig.skeleton[driven.bone_index].name.eq_ignore_ascii_case("pelvis"))
+                .unwrap().body;
+            let start_z = world.bodies[pelvis].translation().z;
+            world.instances.insert(1, corpse);
+            world.begin_frame(0);
+            for tick in 1..=25 { world.begin_frame(tick * 17); }
+            let end_z = world.bodies[pelvis].translation().z;
+            assert!(end_z.is_finite() && end_z < start_z - 0.2,
+                "joint_model={joint_model}: corpse failed to fall under gravity: {start_z} -> {end_z}");
+        }
+    }
+
+    #[test]
+    fn mode_switch_rebuilds_articulations_and_removes_old_joint_motors() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        let rig = humanoid_reference(HumanoidRig::Jka53);
+        let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+        let mut world = contact_world();
+        world.set_config(RagdollConfig {
+            physics_enabled: true, enabled: true, joint_model: 1,
+            ..RagdollConfig::default()
+        });
+        let active = world.spawn_instance(
+            "test", &rig, &vec![identity; rig.skeleton.len()],
+            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 32.], 1.0,
+            CorpseGeneration { client_num: 1, body_queue_time: 0 },
+            RagdollKind::Corpse, Vector::ZERO, 0,
+        ).unwrap();
+        assert!(!active.soft_joints.is_empty());
+        world.instances.insert(1, active);
+        assert!(!world.impulse_joints.is_empty());
+        world.set_config(RagdollConfig {
+            physics_enabled: true, enabled: true, joint_model: 0,
+            ..RagdollConfig::default()
+        });
+        assert!(world.instances.is_empty());
+        assert!(world.impulse_joints.is_empty());
+        let classic = world.spawn_instance(
+            "test", &rig, &vec![identity; rig.skeleton.len()],
+            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 32.], 1.0,
+            CorpseGeneration { client_num: 1, body_queue_time: 0 },
+            RagdollKind::Corpse, Vector::ZERO, 0,
+        ).unwrap();
+        assert!(classic.soft_joints.is_empty());
+        assert!(!world.impulse_joints.is_empty());
     }
 
     #[test]
